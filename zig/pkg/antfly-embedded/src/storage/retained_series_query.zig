@@ -24,7 +24,17 @@ const A = std.mem.Allocator;
 pub const Entry = struct { binding: capture.Binding, progress: series.Progress };
 pub const Status = struct { root_incarnation: []const u8, entries: []const Entry };
 pub const Revocation = struct { root_incarnation: []const u8, fence: control.Fence, revoked: bool, reclaimed: bool = false };
-pub const Replay = struct { root_incarnation: []const u8, cursor: series.Cursor, frames: []const series.Frame, admitted_ns: i128 = 0 };
+pub const Replay = struct {
+    root_incarnation: []const u8,
+    cursor: series.Cursor,
+    frames: []const series.Frame,
+    admitted_ns: i128 = 0,
+    latest_sequence: u64 = 0,
+    pub fn jsonStringify(self: Replay, writer: anytype) !void {
+        if (self.latest_sequence == 0) return @import("../retained_dataset_types.zig").writeFieldsOmitting(self, .{}, .{"latest_sequence"}, writer);
+        try @import("../retained_dataset_types.zig").writeFields(self, .{}, writer);
+    }
+};
 pub const max_response_bytes = 6 * 1024 * 1024;
 
 pub fn executeJson(a: A, txn: anytype, root_incarnation: u128, request: contract.Request) ![]u8 {
@@ -61,7 +71,7 @@ pub fn executeJson(a: A, txn: anytype, root_incarnation: u128, request: contract
             const progress = try engine.status(temp, txn);
             var cursor = poll.cursor;
             if (frames.len != 0) cursor.sequence = frames[frames.len - 1].sequence;
-            break :result try std.json.Stringify.valueAlloc(a, Replay{ .root_incarnation = root, .cursor = cursor, .frames = frames, .admitted_ns = progress.admitted_ns }, .{});
+            break :result try std.json.Stringify.valueAlloc(a, Replay{ .root_incarnation = root, .cursor = cursor, .frames = frames, .admitted_ns = progress.admitted_ns, .latest_sequence = if (poll.include_latest) progress.feed_latest else 0 }, .{});
         },
     };
     errdefer a.free(response);

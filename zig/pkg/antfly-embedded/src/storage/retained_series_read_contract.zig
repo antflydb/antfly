@@ -38,5 +38,6 @@ pub const Request = union(enum) {
         root_incarnation: u128,
         cursor: @import("retained_series.zig").Cursor,
         limit: u16 = 8,
+        include_latest: bool = false,
     },
 };

@@ -196,6 +196,11 @@ pub const CreateNamespaceResponse = union(enum) {
     }
 };
 
+pub const GetRetainedDatasetParams = struct {
+    after_group: ?[]const u8 = null,
+    max_owners: ?[]const u8 = null,
+};
+
 pub const ListNamespaceTablesParams = struct {
     /// Filter tables by name prefix.
     prefix: ?[]const u8 = null,
@@ -2098,15 +2103,39 @@ pub const Client = struct {
 
     /// Get retained summary status
     /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}
-    pub fn getRetainedDataset(self: *@This(), database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !ApiResponse(types.RetainedDatasetInfo) {
+    pub fn getRetainedDataset(self: *@This(), database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8, params: GetRetainedDatasetParams) !ApiResponse(types.RetainedDatasetInfo) {
         const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
         defer self.allocator.free(encoded_database_name);
         const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
         defer self.allocator.free(encoded_namespace_name);
         const encoded_dataset_name = try httpx.PercentEncoding.encode(self.allocator, dataset_name);
         defer self.allocator.free(encoded_dataset_name);
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/datasets/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_dataset_name });
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/datasets/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_dataset_name });
         defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.after_group) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "after_group=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.max_owners) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "max_owners=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.RetainedDatasetInfo).fromResponse(self.allocator, &resp);
     }

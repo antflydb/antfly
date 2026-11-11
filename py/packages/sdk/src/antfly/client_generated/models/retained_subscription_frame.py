@@ -25,6 +25,8 @@ class RetainedSubscriptionFrame:
         kind (RetainedSubscriptionFrameKind):
         cursor (str):
         events (list[RetainedSubscriptionFrameEventsItem]):
+        resynchronized (bool | Unset): True when the server caught up through a fresh bounded snapshot instead of
+            replaying every intermediate state.
         initial_history (RetainedSubscriptionFrameInitialHistory | Unset):
         dimensions (list[str] | Unset):
         measures (list[RetainedDatasetMeasure] | Unset):
@@ -33,6 +35,7 @@ class RetainedSubscriptionFrame:
     kind: RetainedSubscriptionFrameKind
     cursor: str
     events: list[RetainedSubscriptionFrameEventsItem]
+    resynchronized: bool | Unset = UNSET
     initial_history: RetainedSubscriptionFrameInitialHistory | Unset = UNSET
     dimensions: list[str] | Unset = UNSET
     measures: list[RetainedDatasetMeasure] | Unset = UNSET
@@ -47,6 +50,8 @@ class RetainedSubscriptionFrame:
         for events_item_data in self.events:
             events_item = events_item_data.to_dict()
             events.append(events_item)
+
+        resynchronized = self.resynchronized
 
         initial_history: str | Unset = UNSET
         if not isinstance(self.initial_history, Unset):
@@ -72,6 +77,8 @@ class RetainedSubscriptionFrame:
                 "events": events,
             }
         )
+        if resynchronized is not UNSET:
+            field_dict["resynchronized"] = resynchronized
         if initial_history is not UNSET:
             field_dict["initial_history"] = initial_history
         if dimensions is not UNSET:
@@ -98,6 +105,8 @@ class RetainedSubscriptionFrame:
 
             events.append(events_item)
 
+        resynchronized = d.pop("resynchronized", UNSET)
+
         _initial_history = d.pop("initial_history", UNSET)
         initial_history: RetainedSubscriptionFrameInitialHistory | Unset
         if isinstance(_initial_history, Unset):
@@ -120,6 +129,7 @@ class RetainedSubscriptionFrame:
             kind=kind,
             cursor=cursor,
             events=events,
+            resynchronized=resynchronized,
             initial_history=initial_history,
             dimensions=dimensions,
             measures=measures,

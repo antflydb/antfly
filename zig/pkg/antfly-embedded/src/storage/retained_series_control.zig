@@ -21,27 +21,26 @@ const capture = @import("retained_series_capture.zig");
 const A = std.mem.Allocator;
 pub const Fence = @import("retained_series_revocation.zig").Fence;
 pub const Command = struct {
-    action: enum { install, backfill, tick, cleanup, close, revoke, drain, purge, admit_retention, archive_handoff },
+    action: enum { install, backfill, tick, cleanup, close, revoke, drain, purge, admit_retention, archive_handoff, diagnostic },
     fence: Fence,
     binding: ?capture.Binding = null,
     complete_from_ns: i128 = 0,
     expected_source_schema: ?series.Id = null,
     expected_admitted_ns: ?i128 = null,
+    diagnostic_error: ?[]const u8 = null,
     expected_cursor: []const u8 = "",
     work_limit: u16 = 128,
 
     pub fn jsonStringify(self: Command, writer: anytype) !void {
-        const t = @import("../retained_dataset_types.zig");
-        if (self.expected_admitted_ns == null) {
-            if (self.expected_source_schema == null) return t.writeFieldsOmitting(self, .{}, .{ "expected_source_schema", "expected_admitted_ns" }, writer);
-            return t.writeFieldsOmitting(self, .{}, .{"expected_admitted_ns"}, writer);
-        }
-        if (self.expected_source_schema == null) return t.writeFieldsOmitting(self, .{}, .{"expected_source_schema"}, writer);
-        try t.writeFields(self, .{}, writer);
+        try @import("../retained_dataset_types.zig").writeFieldsOmittingNulls(self, .{ "expected_source_schema", "expected_admitted_ns", "diagnostic_error" }, writer);
     }
     pub fn validate(self: Command) !void {
         if (self.fence.generation == 0 or self.fence.incarnation == 0 or self.work_limit == 0 or self.work_limit > series.max_changes or self.expected_cursor.len > 16384 or
             std.mem.allEqual(u8, &self.fence.id, 0) or std.mem.allEqual(u8, &self.fence.definition, 0) or std.mem.allEqual(u8, &self.fence.partition, 0)) return error.InvalidRetainedSeries;
+        if (self.diagnostic_error) |message| {
+            if (self.action != .diagnostic or message.len == 0 or message.len > 128) return error.InvalidRetainedSeries;
+            for (message) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return error.InvalidRetainedSeries;
+        }
         if (self.expected_admitted_ns != null and self.action != .revoke) return error.InvalidRetainedSeries;
         if ((self.action == .install) != (self.binding != null)) return error.InvalidRetainedSeries;
         if (self.expected_source_schema) |digest| if (self.action != .install or std.mem.allEqual(u8, &digest, 0)) return error.InvalidRetainedSeries;
@@ -143,9 +142,14 @@ pub fn stage(a: A, txn: anytype, command: Command, source_sequence: u64, admitte
         .tick => _ = try engine.tick(txn, admitted_ns, command.work_limit),
         .admit_retention => try engine.admitRetentionClock(txn, admitted_ns),
         .archive_handoff => try engine.beginArchiveHandoff(txn, admitted_ns),
+        .diagnostic => try engine.recordDiagnostic(txn, command.diagnostic_error, admitted_ns),
         .cleanup => _ = try engine.cleanupBackfill(txn, command.work_limit),
         .close => try capture.closeBinding(a, txn, spec.id, spec.generation, admitted_ns),
         .drain => try engine.beginClose(txn, admitted_ns),
+    }
+    switch (command.action) {
+        .backfill, .tick, .cleanup, .close, .drain => try engine.recordDiagnostic(txn, null, admitted_ns),
+        else => {},
     }
     // Persist the next fair slot with the command's effects. Recreating a
     // host planner after each task or leader change cannot starve cleanup.

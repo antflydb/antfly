@@ -120,8 +120,8 @@ fn capture(server: anytype, a: A, snapshot: read.Snapshot, definition: dataset.D
         defer part.deinit();
         const rows = try a.alloc(series.Bucket, part.rows.len);
         for (part.rows, rows) |row, *out| {
-            try spend(budget, row.dimensions.len + row.metrics.len * @sizeOf(series.Metric) + @sizeOf(series.Bucket));
-            out.* = .{ .start_ns = row.start_ns, .rows = row.rows, .dimensions = try a.dupe(u8, row.dimensions), .metrics = try a.dupe(series.Metric, row.metrics) };
+            try spend(budget, row.dimensions.len + series.metricBytes(row.metrics) + @sizeOf(series.Bucket));
+            out.* = .{ .start_ns = row.start_ns, .rows = row.rows, .dimensions = try a.dupe(u8, row.dimensions), .metrics = try series.ownMetrics(a, row.metrics) };
         }
         return .{ .group = owner.group, .owner_revision = owner.revision, .rows = rows };
     }
@@ -161,7 +161,10 @@ fn event(a: A, summary: dataset.Summary, row: series.Bucket) !Event {
 }
 fn equal(left: series.Bucket, right: series.Bucket) bool {
     if (left.rows != right.rows or left.metrics.len != right.metrics.len or !std.mem.eql(u8, left.dimensions, right.dimensions)) return false;
-    for (left.metrics, right.metrics) |l, r| if (!std.meta.eql(l, r)) return false;
+    for (left.metrics, right.metrics) |l, r| if (l.count != r.count or l.sum != r.sum or l.minimum != r.minimum or l.maximum != r.maximum or (l.exact_sum == null) != (r.exact_sum == null)) return false;
+    for (left.metrics, right.metrics) |l, r| if (l.exact_sum) |bytes| {
+        if (!std.mem.eql(u8, bytes, r.exact_sum.?)) return false;
+    };
     return true;
 }
 fn diff(a: A, summary: dataset.Summary, before: []const series.Bucket, after: []const series.Bucket) ![]const Event {
@@ -263,16 +266,34 @@ pub fn poll(server: anytype, alloc: A, sessions: *registry.Registry, secret: []c
     var observed_clock: i128 = @max(platform.realtimeNs(), original.clock_ns);
     const replays = try a.alloc(?wire.Replay, snapshot.owners.len);
     @memset(replays, null);
+    const refreshes = try a.alloc(?read.NativeReply, snapshot.owners.len);
+    @memset(refreshes, null);
+    var resynchronized = false;
     var budget: usize = registry.max_state_bytes;
-    for (snapshot.owners, original.parts, replays) |owner, old, *replay| {
+    for (snapshot.owners, original.parts, replays, refreshes) |owner, old, *replay, *refresh| {
         if (old.group != owner.group or old.owner_revision != owner.revision or (old.cursor == null) != (owner.independent_receipt != null)) return error.RetainedSeriesResetRequired;
         if (old.cursor) |cursor| {
             const source = snapshot.source_table orelse return error.RetainedSeriesResetRequired;
-            const raw = try server.pollRetainedOwnerReplay(a, source.name, owner.group, .{ .scope = scopeFor(snapshot, owner), .root_incarnation = old.root, .cursor = cursor, .clock_ns = observed_clock }, ctx);
-            try spend(&budget, raw.len);
-            replay.* = try std.json.parseFromSliceLeaky(wire.Replay, a, raw, .{});
-            try validateReplay(old, replay.*.?);
-            observed_clock = @max(observed_clock, replay.*.?.admitted_ns);
+            const raw = server.pollRetainedOwnerReplay(a, source.name, owner.group, .{ .scope = scopeFor(snapshot, owner), .root_incarnation = old.root, .cursor = cursor, .clock_ns = observed_clock }, ctx) catch |err| switch (err) {
+                error.RetainedSeriesResetRequired => null,
+                else => return err,
+            };
+            if (raw) |bytes| {
+                try spend(&budget, bytes.len);
+                replay.* = try std.json.parseFromSliceLeaky(wire.Replay, a, bytes, .{});
+                try validateReplay(old, replay.*.?);
+                observed_clock = @max(observed_clock, replay.*.?.admitted_ns);
+            }
+            // This API subscribes to result state, not every intermediate
+            // transaction. Catch up through a certified snapshot when replay
+            // is truncated or cannot reach the captured head in one batch.
+            if (replay.* == null or replay.*.?.latest_sequence > replay.*.?.cursor.sequence) {
+                const observed = try read.observeNative(server, a, source.name, scopeFor(snapshot, owner), observed_clock, ctx);
+                try requireSameProducer(old, observed);
+                refresh.* = observed;
+                observed_clock = @max(observed_clock, observed.admitted_ns);
+                resynchronized = true;
+            }
         }
     }
     const now = try admitArchiveClock(server, a, snapshot, definition, if (archive) |*opened| opened else null, observed_clock, ctx);
@@ -281,8 +302,17 @@ pub fn poll(server: anytype, alloc: A, sessions: *registry.Registry, secret: []c
     next.parts = try a.alloc(Part, original.parts.len);
     next.bounds = bounds;
     next.clock_ns = now;
-    for (snapshot.owners, original.parts, next.parts, replays) |owner, old, *part, replay| {
+    for (snapshot.owners, original.parts, next.parts, replays, refreshes) |owner, old, *part, replay, refresh| {
         if (old.group != owner.group or old.owner_revision != owner.revision or (old.cursor == null) != (owner.independent_receipt != null)) return error.RetainedSeriesResetRequired;
+        if (refresh) |observed| {
+            const spec = try specFor(a, definition, owner);
+            const visible: Bounds = .{ .start = @max(bounds.start, try spec.bucket(try std.math.sub(i128, now, spec.retention_ns))), .end = bounds.end };
+            if (visible.start < visible.end) {
+                part.* = try capture(server, a, snapshot, definition, owner, visible, now, if (archive) |*opened| opened else null, ctx, &budget);
+                try requireSameProducer(old, .{ .rows = &.{}, .root_incarnation = part.root, .cursor = part.cursor.? });
+            } else part.* = .{ .group = old.group, .owner_revision = old.owner_revision, .root = observed.root_incarnation, .cursor = observed.cursor };
+            continue;
+        }
         part.* = try advancePart(server, a, snapshot, definition, owner, old, original.bounds, bounds, now, if (archive) |*opened| opened else null, ctx, &budget, replay);
     }
     var before = try aggregate(a, snapshot, original, ctx);
@@ -293,7 +323,7 @@ pub fn poll(server: anytype, alloc: A, sessions: *registry.Registry, secret: []c
     var successor = position;
     successor.sequence = std.math.add(u64, position.sequence, 1) catch return error.RetainedSeriesResetRequired;
     const cursor = registry.token(secret, successor);
-    const response = try std.json.Stringify.valueAlloc(a, .{ .kind = "changes", .cursor = cursor[0..], .events = try diff(a, summary, before.rows, after.rows) }, .{ .emit_null_optional_fields = false });
+    const response = try std.json.Stringify.valueAlloc(a, .{ .kind = "changes", .cursor = cursor[0..], .resynchronized = resynchronized, .events = try diff(a, summary, before.rows, after.rows) }, .{ .emit_null_optional_fields = false });
     try ctx.ensureActive();
     return sessions.commit(server.alloc, alloc, position, principal, platform.monotonicNs(), payload, response);
 }
@@ -316,6 +346,11 @@ fn applyFrames(a: A, rows: *std.AutoHashMapUnmanaged(dataset.RowKey, series.Buck
     }
     if (sequence != replay.cursor.sequence) return error.RetainedSeriesResetRequired;
     return sequence;
+}
+
+fn requireSameProducer(old: Part, fresh: read.NativeReply) !void {
+    const previous = old.cursor orelse return error.RetainedSeriesResetRequired;
+    if (!std.mem.eql(u8, old.root, fresh.root_incarnation) or !std.mem.eql(u8, &previous.definition, &fresh.cursor.definition) or !std.mem.eql(u8, &previous.partition, &fresh.cursor.partition) or previous.incarnation != fresh.cursor.incarnation or fresh.cursor.sequence < previous.sequence) return error.RetainedSeriesResetRequired;
 }
 
 fn validateReplay(old: Part, replay: wire.Replay) !void {
@@ -519,4 +554,20 @@ test "retained subscription native polling applies the durable retention clock w
     const next = try advancePart(&server, a, snapshot, def, owner, prior, bounds, bounds, 1050, null, .{}, &budget, null);
     try std.testing.expect(try spec.expired(0, server.admitted_ns));
     try std.testing.expectEqual(@as(usize, 0), next.rows.len);
+}
+
+test "retained subscription snapshot catchup preserves physical producer identity" {
+    const cursor: series.Cursor = .{ .definition = @splat(1), .partition = @splat(2), .incarnation = 3, .sequence = 100 };
+    const old: Part = .{ .group = 7, .owner_revision = 1, .root = "42", .cursor = cursor };
+    var fresh: read.NativeReply = .{ .root_incarnation = "42", .cursor = cursor, .rows = &.{} };
+    fresh.cursor.sequence = 10000;
+    try requireSameProducer(old, fresh);
+    fresh.root_incarnation = "43";
+    try std.testing.expectError(error.RetainedSeriesResetRequired, requireSameProducer(old, fresh));
+    fresh.root_incarnation = "42";
+    fresh.cursor.incarnation += 1;
+    try std.testing.expectError(error.RetainedSeriesResetRequired, requireSameProducer(old, fresh));
+    fresh.cursor = cursor;
+    fresh.cursor.sequence -= 1;
+    try std.testing.expectError(error.RetainedSeriesResetRequired, requireSameProducer(old, fresh));
 }

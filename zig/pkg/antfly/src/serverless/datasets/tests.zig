@@ -249,7 +249,7 @@ test "retained dataset eviction resumes after ambiguous deletion and rejects reb
     try std.testing.expectError(error.DatasetLocationConflict, store.reclaimLocal(segment().id, wrong));
     var fault = objects.scripted_fault.Client.init(a, memory.client());
     defer fault.deinit();
-    fault.commitNextDeleteThenFail(error.DatasetDeleteFault);
+    fault.commitNextPutThenFail(error.DatasetDeleteFault);
     hot.client = fault.client();
     try std.testing.expectError(error.DatasetDeleteFault, store.reclaimLocal(segment().id, hot));
     try std.testing.expect(try store.reclaimLocal(segment().id, hot));
@@ -1169,4 +1169,72 @@ test "retained dataset tuple metadata work scales with files rather than bucket 
     try std.testing.expect(operations < 64);
     try std.testing.expectEqual(@as(usize, 512), result.rows.len);
     try std.testing.expectEqual(page.bytes.len, result.bytes_read);
+}
+
+test "retained dataset abandoned uploads are fenced before discard acknowledges collection" {
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    const hot = location(&memory, false);
+    try store.create(definition(.records));
+    var fault = objects.scripted_fault.Client.init(a, memory.client());
+    defer fault.deinit();
+    var failed_location = hot;
+    failed_location.client = fault.client();
+    fault.commitNextPutThenFail(error.DatasetCopyFault);
+    try std.testing.expectError(error.DatasetCopyFault, store.publish(segment(), failed_location, "states"));
+    try std.testing.expectError(error.DatasetSegmentNotFound, store.getSegment(segment().id));
+    var client = memory.client();
+    var blobs = try client.listObjects(hot.bucket, .{ .prefix = "segments/", .recursive = true });
+    defer blobs.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), blobs.entries.len);
+    const key = blobs.entries[0].key;
+    try std.testing.expect(!try store.reclaimUpload(hot));
+    try store.beginDiscard(definition(.records));
+    try std.testing.expectError(error.DatasetDependencyPending, store.nextDiscard(null));
+    try std.testing.expect(try store.reclaimUpload(hot));
+    try std.testing.expect(!try store.reclaimUpload(hot));
+    var tombstone = try client.getObject(hot.bucket, key, .{});
+    defer tombstone.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), tombstone.body.len);
+    try std.testing.expectError(error.PreconditionFailed, client.putObject(hot.bucket, key, "states", .{ .if_none_match = true }));
+    try std.testing.expectEqual(@as(?t.Id, null), try store.nextDiscard(null));
+    try std.testing.expect((try store.discardReceipt()) != null);
+}
+
+test "retained dataset terminal empty proof seals and serves a partial bucket suffix" {
+    const local = @import("antfly_local_sources");
+    const series = local.storage_retained_series;
+    const exported = @import("closure_export.zig");
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    const cold = location(&memory, true);
+    const def = definition(.summary);
+    try store.create(def);
+    const fingerprint = try def.fingerprint(a);
+    const spec: series.Spec = .{ .id = def.id, .generation = 1, .definition = fingerprint, .source_partition = @splat(5), .source_incarnation = 1, .interval_ns = 60, .mutable_for_ns = 100, .retention_ns = def.retention_ns, .laws = &.{.count} };
+    var metrics = [_]series.Metric{.{ .count = 1 }};
+    const row: series.Bucket = .{ .start_ns = 1200, .dimensions = "[]", .rows = 1, .metrics = &metrics };
+    const cut: exported.Cut = .{ .closure = @splat(8), .sequence = 20, .complete_from_ns = 0, .admitted_ns = 1000 };
+    const page = (try exported.encode(a, def, spec, cut, t.rowKey(0, @splat(0)), &.{row}, true, cold)).?;
+    defer exported.deinit(a, page);
+    try exported.publish(store, spec, cut, page, cold);
+    const manifest = try store.sealClosedExport(spec, cut, t.rowKey(1260, @splat(0)));
+    try std.testing.expect(manifest.empty_from != null);
+    const reopened = (try store.getClosedExport(spec, cut)).?;
+    try std.testing.expectEqualDeep(try manifest.receipt(), try reopened.receipt());
+    const Resolver = struct {
+        value: api.Location,
+        pub fn location(self: @This(), _: t.Id) !api.Location {
+            return self.value;
+        }
+    };
+    var result = try @import("summary_read.zig").readClosed(a, store, def, spec, .{ .start_ns = "1200", .end_ns = "1320" }, .{}, cut, try manifest.receipt(), Resolver{ .value = cold });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
 }

@@ -41,11 +41,16 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             pytest.skip(f"{command} is required for standalone archive integration")
     data = tmp_path
     # Allocate independent ports so this fixture can run alongside other servers.
-    with socket.socket() as s1, socket.socket() as s2, socket.socket() as s3:
-        for listener in (s1, s2, s3):
+    with (
+        socket.socket() as s1,
+        socket.socket() as s2,
+        socket.socket() as s3,
+        socket.socket() as s4,
+    ):
+        for listener in (s1, s2, s3, s4):
             listener.bind(("127.0.0.1", 0))
-        object_port, console_port, server_port = (
-            s.getsockname()[1] for s in (s1, s2, s3)
+        object_port, console_port, server_port, pgwire_port = (
+            s.getsockname()[1] for s in (s1, s2, s3, s4)
         )
     endpoint = f"http://127.0.0.1:{object_port}"
     base = f"http://127.0.0.1:{server_port}/db/v1"
@@ -189,6 +194,11 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             json.dumps(
                 {
                     "deployment_mode": "standalone",
+                    "pgwire": {
+                        "enabled": True,
+                        "bind_host": "127.0.0.1",
+                        "bind_port": pgwire_port,
+                    },
                     "storage": {
                         **primary,
                         "artifacts": {
@@ -453,6 +463,31 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             f"SELECT sample_count FROM retained_summary(public.sensor_counts, '{first_bucket}', '{first_bucket + interval}') WHERE site = 'site-4242'"
         )
         assert selective["rows"] == [["1"]]
+        # Exercise the actual pgwire catalog wrapper with both simple and
+        # prepared execution when the optional SQL driver is installed.
+        try:
+            import psycopg
+        except ImportError:
+            psycopg = None
+        if psycopg is not None:
+            with psycopg.connect(
+                host="127.0.0.1",
+                port=pgwire_port,
+                dbname="default",
+                user="admin",
+                sslmode="disable",
+                autocommit=True,
+            ) as connection:
+                for prepared in (False, True):
+                    result = connection.execute(
+                        f"SELECT sample_count FROM retained_summary(public.sensor_counts, '{first_bucket}', '{first_bucket + interval}') WHERE site = 'site-4242'",
+                        prepare=prepared,
+                    ).fetchall()
+                    assert len(result) == 1 and int(result[0][0]) == 1
+        status = api("GET", path + "?max_owners=1")
+        assert status["progress"]["registered_owners"] == 1
+        assert len(status["progress"]["owners"]) == 1
+        assert status["progress"]["owners"][0]["native"]["ready"]
         limited = sql(
             f"SELECT sample_count FROM retained_summary(public.sensor_counts, '{first_bucket}', '{first_bucket + interval}') LIMIT 1"
         )

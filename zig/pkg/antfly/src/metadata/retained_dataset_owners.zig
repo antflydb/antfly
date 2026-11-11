@@ -89,6 +89,7 @@ pub const Read = union(enum) {
     work_key: Cursor,
     selection: WorkKey,
     plan: struct { resource: u64, generation: u64 },
+    summary: struct { resource: u64, generation: u64, after_group: u64 = 0, limit: u16 = 16 },
     owner: struct { resource: u64, generation: u64, plan: Id, group: u64, revision: u64 },
 
     pub fn validate(self: Read) !void {
@@ -102,6 +103,10 @@ pub const Read = union(enum) {
                 if (q.cursor.resource == 0 or types.zero(q.plan)) return error.InvalidRetainedOwnerPlan;
             },
             .plan => |q| if (q.resource == 0 or q.generation == 0 or q.generation > types.max_public_counter) return error.InvalidRetainedOwnerPlan,
+            .summary => |q| {
+                try (Read{ .plan = .{ .resource = q.resource, .generation = q.generation } }).validate();
+                if (q.limit == 0 or q.limit > 64) return error.InvalidRetainedOwnerPlan;
+            },
             .owner => |q| if (q.resource == 0 or q.generation == 0 or q.generation > types.max_public_counter or
                 types.zero(q.plan) or q.group == 0 or q.revision == 0 or q.revision > types.max_public_counter) return error.InvalidRetainedOwnerPlan,
         }

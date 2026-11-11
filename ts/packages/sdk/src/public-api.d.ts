@@ -7442,6 +7442,8 @@ export interface components {
             /** @enum {string} */
             kind: "snapshot" | "changes";
             cursor: string;
+            /** @description True when the server caught up through a fresh bounded snapshot instead of replaying every intermediate state. */
+            resynchronized?: boolean;
             /** @enum {string} */
             initial_history?: "certified" | "retained_source_rows";
             dimensions?: string[];
@@ -7478,6 +7480,52 @@ export interface components {
             retention_ns: string;
             interval_ns: string;
             origin_ns: string;
+            progress?: components["schemas"]["RetainedDatasetProgress"] | null;
+        };
+        RetainedDatasetNativeProgress: {
+            ready: boolean;
+            draining: boolean;
+            closed: boolean;
+            archive_handoff: boolean;
+            backfill_cleanup_complete: boolean;
+            source_sequence: string;
+            replay_floor: string;
+            replay_latest: string;
+            retention_clock_ns: string;
+            last_attempt_ns?: string | null;
+            /** @description Durable error name from the most recent failed maintenance operation; cleared by successful maintenance. */
+            last_error?: string | null;
+        };
+        RetainedDatasetArchiveProgress: {
+            pages: string;
+            sealed: boolean;
+            next_bucket_ns: string;
+        };
+        RetainedDatasetOwnerProgress: {
+            group: string;
+            /** @enum {string} */
+            mode: "registered" | "installed" | "ready" | "closed" | "revoked";
+            archive_authoritative: boolean;
+            native?: components["schemas"]["RetainedDatasetNativeProgress"] | null;
+            archive?: components["schemas"]["RetainedDatasetArchiveProgress"] | null;
+            /** @description Failure to obtain this owner's current status; distinct from a persisted maintenance failure. */
+            status_error?: string | null;
+        };
+        RetainedDatasetProgress: {
+            /** @enum {string} */
+            phase: "activating" | "active" | "closing" | "closed" | "retiring" | "retired";
+            registration_complete: boolean;
+            /** Format: uint32 */
+            registered_owners: number;
+            /** Format: uint32 */
+            ready_owners: number;
+            /** Format: uint32 */
+            revoked_owners: number;
+            /** Format: uint32 */
+            archived_owners: number;
+            owners: components["schemas"]["RetainedDatasetOwnerProgress"][];
+            /** @description Pass as after_group to obtain the next bounded owner page. */
+            next_group?: string | null;
         };
         PrivacyProducer: {
             /** @enum {string} */
@@ -38715,7 +38763,10 @@ export interface operations {
     };
     getRetainedDataset: {
         parameters: {
-            query?: never;
+            query?: {
+                after_group?: string;
+                max_owners?: number;
+            };
             header?: never;
             path: {
                 databaseName: string;

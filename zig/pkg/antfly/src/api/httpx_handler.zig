@@ -3002,7 +3002,7 @@ pub const AntflyApiHandler = struct {
             const mutation: system_catalog.Mutation = .{ .action = .create, .kind = .dataset, .database = route.database, .namespace = route.namespace, .name = name, .source_json = json };
             const applied = source.systemCatalog(a, context, .{ .mutate = .{ .mutation = mutation, .expected_catalog_revision = candidate.catalog_revision } }) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
             defer a.free(applied);
-            return retainedDatasetInfo(ctx, 201, name, definition);
+            return retainedDatasetInfo(ctx, 201, name, definition, null);
         }
         const bytes = source.systemCatalog(a, context, .{ .read = .{ .kind = .dataset, .database = route.database, .namespace = route.namespace, .name = name } }) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
         defer a.free(bytes);
@@ -3012,13 +3012,20 @@ pub const AntflyApiHandler = struct {
         } else return textResponse(ctx, 404, "dataset not found");
         var descriptor = try retained.parse(a, resource.source_json);
         defer descriptor.deinit();
-        if (action == .get) return retainedDatasetInfo(ctx, 200, name, descriptor.value);
+        if (action == .get) {
+            const after = if (ctx.query("after_group")) |value| std.fmt.parseInt(u64, value, 10) catch return textResponse(ctx, 400, "invalid owner cursor") else 0;
+            const limit = if (ctx.query("max_owners")) |value| std.fmt.parseInt(u16, value, 10) catch return textResponse(ctx, 400, "invalid owner limit") else 16;
+            if (limit == 0 or limit > 64) return textResponse(ctx, 400, "owner limit must be between 1 and 64");
+            const progress = @import("retained_dataset_status.zig").inspect(self.api_server, a, resource.id, descriptor.value, after, limit, context) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
+            if (!try http_server_mod.resourcePermissionCurrentlyAllowed(identity, .dataset, logical, .read)) return textResponse(ctx, 403, "forbidden");
+            return retainedDatasetInfo(ctx, 200, name, descriptor.value, progress);
+        }
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "dataset revision required");
         if (body.len > 4096) return textResponse(ctx, 413, "close request too large");
         const request = std.json.parseFromSliceLeaky(struct { expected_revision: u64, cancel_activation: bool = false, discard: bool = false }, a, body, .{}) catch return textResponse(ctx, 400, "invalid dataset revision");
         if (request.discard and request.cancel_activation) return textResponse(ctx, 400, "choose discard or cancel_activation");
         if (descriptor.value.revision != request.expected_revision) return textResponse(ctx, 409, "dataset phase or revision changed");
-        if (request.discard and descriptor.value.phase == .retiring) return retainedDatasetInfo(ctx, 202, name, descriptor.value);
+        if (request.discard and descriptor.value.phase == .retiring) return retainedDatasetInfo(ctx, 202, name, descriptor.value, null);
         if (!request.discard and descriptor.value.phase != (if (request.cancel_activation) @as(retained.Phase, .activating) else .active)) return textResponse(ctx, 409, "dataset phase or revision changed");
         var next = descriptor.value;
         // Cancelling activation must revoke installed capture before releasing the source.
@@ -3027,15 +3034,15 @@ pub const AntflyApiHandler = struct {
         const json = try std.json.Stringify.valueAlloc(a, next, .{});
         const applied = source.systemCatalog(a, context, .{ .mutate = .{ .mutation = .{ .action = .set_definition, .kind = .dataset, .database = route.database, .namespace = route.namespace, .name = name, .source_json = json, .expected_dataset_revision = request.expected_revision } } }) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
         defer a.free(applied);
-        return retainedDatasetInfo(ctx, 202, name, next);
+        return retainedDatasetInfo(ctx, 202, name, next, null);
     }
 
-    fn retainedDatasetInfo(ctx: *httpx.Context, code: u16, name: []const u8, descriptor: @import("antfly_local_sources").system_catalog_retained_datasets.Descriptor) !httpx.Response {
+    fn retainedDatasetInfo(ctx: *httpx.Context, code: u16, name: []const u8, descriptor: @import("antfly_local_sources").system_catalog_retained_datasets.Descriptor, progress: ?@import("retained_dataset_status.zig").Details) !httpx.Response {
         const summary = descriptor.definition.summary orelse return textResponse(ctx, 409, "dataset is not a summary");
         const id = std.fmt.bytesToHex(descriptor.definition.id, .lower);
         const retention = try std.fmt.allocPrint(ctx.allocator, "{d}", .{descriptor.definition.retention_ns});
         const interval = try std.fmt.allocPrint(ctx.allocator, "{d}", .{summary.interval_ns});
-        return ctx.status(code).json(.{ .id = &id, .name = name, .revision = descriptor.revision, .phase = descriptor.phase, .source_released = descriptor.source == null, .initial_history = summary.initial_history, .dimensions = summary.dimensions, .measures = summary.measures, .retention_ns = retention, .interval_ns = interval, .origin_ns = summary.origin_ns });
+        return ctx.status(code).json(.{ .id = &id, .name = name, .revision = descriptor.revision, .phase = descriptor.phase, .source_released = descriptor.source == null, .initial_history = summary.initial_history, .dimensions = summary.dimensions, .measures = summary.measures, .retention_ns = retention, .interval_ns = interval, .origin_ns = summary.origin_ns, .progress = progress });
     }
 
     pub fn queryRetainedDataset(self: *AntflyApiHandler, ctx: *httpx.Context, _: []const u8, _: []const u8, _: []const u8) !httpx.Response {

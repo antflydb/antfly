@@ -8,9 +8,11 @@ from attrs import field as _attrs_field
 
 from ..models.retained_dataset_info_initial_history import RetainedDatasetInfoInitialHistory
 from ..models.retained_dataset_info_phase import RetainedDatasetInfoPhase
+from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.retained_dataset_measure import RetainedDatasetMeasure
+    from ..models.retained_dataset_progress import RetainedDatasetProgress
 
 
 T = TypeVar("T", bound="RetainedDatasetInfo")
@@ -32,6 +34,7 @@ class RetainedDatasetInfo:
         retention_ns (str):
         interval_ns (str):
         origin_ns (str):
+        progress (None | RetainedDatasetProgress | Unset):
     """
 
     id: str
@@ -45,9 +48,12 @@ class RetainedDatasetInfo:
     retention_ns: str
     interval_ns: str
     origin_ns: str
+    progress: None | RetainedDatasetProgress | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.retained_dataset_progress import RetainedDatasetProgress
+
         id = self.id
 
         name = self.name
@@ -73,6 +79,14 @@ class RetainedDatasetInfo:
 
         origin_ns = self.origin_ns
 
+        progress: dict[str, Any] | None | Unset
+        if isinstance(self.progress, Unset):
+            progress = UNSET
+        elif isinstance(self.progress, RetainedDatasetProgress):
+            progress = self.progress.to_dict()
+        else:
+            progress = self.progress
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -90,12 +104,15 @@ class RetainedDatasetInfo:
                 "origin_ns": origin_ns,
             }
         )
+        if progress is not UNSET:
+            field_dict["progress"] = progress
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.retained_dataset_measure import RetainedDatasetMeasure
+        from ..models.retained_dataset_progress import RetainedDatasetProgress
 
         d = dict(src_dict)
         id = d.pop("id")
@@ -125,6 +142,23 @@ class RetainedDatasetInfo:
 
         origin_ns = d.pop("origin_ns")
 
+        def _parse_progress(data: object) -> None | RetainedDatasetProgress | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                progress_type_1 = RetainedDatasetProgress.from_dict(data)
+
+                return progress_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(None | RetainedDatasetProgress | Unset, data)
+
+        progress = _parse_progress(d.pop("progress", UNSET))
+
         retained_dataset_info = cls(
             id=id,
             name=name,
@@ -137,6 +171,7 @@ class RetainedDatasetInfo:
             retention_ns=retention_ns,
             interval_ns=interval_ns,
             origin_ns=origin_ns,
+            progress=progress,
         )
 
         retained_dataset_info.additional_properties = d

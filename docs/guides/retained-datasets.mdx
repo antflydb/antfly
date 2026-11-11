@@ -81,10 +81,18 @@ Contents are limited to 16 MiB per segment. Split larger outputs into disjoint s
 
 ## Migration and retention behavior
 
-Migration publishes remote placement only after full source/destination SHA-256 verification. Local reclamation is separate and waits for older readers. A failed operation can be retried from status; migration retries must use the currently reported placement revision. Failed publication can leave unreferenced immutable objects, which are retained conservatively rather than collected without a publication proof.
+Migration publishes remote placement only after full source/destination SHA-256 verification. Local reclamation is separate and waits for older readers. A failed operation can be retried from status; migration retries must use the currently reported placement revision. New uploads are durably inventoried before writing. Automatic archive maintenance reclaims abandoned payloads after fencing publication; administrative catalogs can run `reclaim_upload`. Cleanup retains a zero-byte object fence to reject delayed conditional uploads. Preserve these fences in provider lifecycle policies.
 
 A retained archive survives restore. Permanent expiration must collect every recorded physical copy. Completed collection keeps a tombstone so an old publication retry cannot resurrect deleted history.
 
 Logical expiration blocks new reads even when a downstream hold protects the physical bytes. A read admitted before expiration has only its original bounded lease. Clock rollback cannot extend its authority. Missing coverage, an unavailable resolution, an expired lease, a restore requirement, and a physical binding conflict are explicit errors.
 
 The host API is exported as `serverless.datasets`. It provides typed catalog operations, bounded range planning, reader leases, and a distinct `requireSourceReclamation` proof. Hosts must check current authorization, decoder versions, source topology, and downstream retention dependencies before using these primitives in automatic table workflows.
+
+### Maintenance diagnostics and catch-up
+
+GET a dataset with `max_owners` (1–64, default 16) and optional decimal `after_group` to page through `progress.owners`; use `progress.next_group` for the next page. Status includes registration counters, native readiness, replay bounds, retention clock, last maintenance error/attempt, and archive export frontier. RPC failures appear separately as `status_error`. These diagnostics do not grant read or deletion authority.
+
+Subscription frames may include `resynchronized: true` when replay is unavailable or behind the current head. The server reads a fresh bounded owner snapshot and emits the resulting changes. Intermediate source changes can be coalesced. Changed producer identity still requires a reset.
+
+SUM and AVG now preserve exact binary64 contribution sums across corrections and archive merges, rounding only the served value. Existing nonempty generations written with legacy floating state must be rebuilt into a fresh generation before corrections; their archives remain readable.

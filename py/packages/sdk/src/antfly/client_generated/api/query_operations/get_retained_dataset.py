@@ -7,14 +7,25 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.retained_dataset_info import RetainedDatasetInfo
-from ...types import Response
+from ...types import UNSET, Response, Unset
 
 
 def _get_kwargs(
     database_name: str,
     namespace_name: str,
     dataset_name: str,
+    *,
+    after_group: str | Unset = UNSET,
+    max_owners: int | Unset = 16,
 ) -> dict[str, Any]:
+
+    params: dict[str, Any] = {}
+
+    params["after_group"] = after_group
+
+    params["max_owners"] = max_owners
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
 
     _kwargs: dict[str, Any] = {
         "method": "get",
@@ -23,6 +34,7 @@ def _get_kwargs(
             namespace_name=quote(str(namespace_name), safe=""),
             dataset_name=quote(str(dataset_name), safe=""),
         ),
+        "params": params,
     }
 
     return _kwargs
@@ -67,6 +79,8 @@ def sync_detailed(
     dataset_name: str,
     *,
     client: AuthenticatedClient,
+    after_group: str | Unset = UNSET,
+    max_owners: int | Unset = 16,
 ) -> Response[Any | RetainedDatasetInfo]:
     """Get retained summary status
 
@@ -74,6 +88,8 @@ def sync_detailed(
         database_name (str):
         namespace_name (str):
         dataset_name (str):
+        after_group (str | Unset):
+        max_owners (int | Unset):  Default: 16.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -87,6 +103,8 @@ def sync_detailed(
         database_name=database_name,
         namespace_name=namespace_name,
         dataset_name=dataset_name,
+        after_group=after_group,
+        max_owners=max_owners,
     )
 
     response = client.get_httpx_client().request(
@@ -102,6 +120,8 @@ def sync(
     dataset_name: str,
     *,
     client: AuthenticatedClient,
+    after_group: str | Unset = UNSET,
+    max_owners: int | Unset = 16,
 ) -> Any | RetainedDatasetInfo | None:
     """Get retained summary status
 
@@ -109,6 +129,8 @@ def sync(
         database_name (str):
         namespace_name (str):
         dataset_name (str):
+        after_group (str | Unset):
+        max_owners (int | Unset):  Default: 16.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -123,6 +145,8 @@ def sync(
         namespace_name=namespace_name,
         dataset_name=dataset_name,
         client=client,
+        after_group=after_group,
+        max_owners=max_owners,
     ).parsed
 
 
@@ -132,6 +156,8 @@ async def asyncio_detailed(
     dataset_name: str,
     *,
     client: AuthenticatedClient,
+    after_group: str | Unset = UNSET,
+    max_owners: int | Unset = 16,
 ) -> Response[Any | RetainedDatasetInfo]:
     """Get retained summary status
 
@@ -139,6 +165,8 @@ async def asyncio_detailed(
         database_name (str):
         namespace_name (str):
         dataset_name (str):
+        after_group (str | Unset):
+        max_owners (int | Unset):  Default: 16.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -152,6 +180,8 @@ async def asyncio_detailed(
         database_name=database_name,
         namespace_name=namespace_name,
         dataset_name=dataset_name,
+        after_group=after_group,
+        max_owners=max_owners,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -165,6 +195,8 @@ async def asyncio(
     dataset_name: str,
     *,
     client: AuthenticatedClient,
+    after_group: str | Unset = UNSET,
+    max_owners: int | Unset = 16,
 ) -> Any | RetainedDatasetInfo | None:
     """Get retained summary status
 
@@ -172,6 +204,8 @@ async def asyncio(
         database_name (str):
         namespace_name (str):
         dataset_name (str):
+        after_group (str | Unset):
+        max_owners (int | Unset):  Default: 16.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -187,5 +221,7 @@ async def asyncio(
             namespace_name=namespace_name,
             dataset_name=dataset_name,
             client=client,
+            after_group=after_group,
+            max_owners=max_owners,
         )
     ).parsed

@@ -65,6 +65,7 @@ pub fn parseAfter(raw: []const u8) !dataset.RowKey {
 pub const NativeQuery = struct {
     version: u8 = 2,
     observe_only: bool = false,
+    status_only: bool = false,
     clock_ns: i128 = 0,
     scope: owner_model.ArchiveScope,
     start_ns: []const u8,
@@ -73,8 +74,12 @@ pub const NativeQuery = struct {
     after: ?dataset.RowKey = null,
     dimensions_json: ?[]const u8 = null,
     allow_more: bool = false,
+    pub fn jsonStringify(self: NativeQuery, writer: anytype) !void {
+        if (!self.status_only) return dataset.writeFieldsOmitting(self, .{}, .{"status_only"}, writer);
+        try dataset.writeFields(self, .{}, writer);
+    }
     pub fn validate(self: NativeQuery, group: u64) !void {
-        if (self.version != 2) return error.InvalidRetainedOwnerPlan;
+        if ((self.version != 2 and self.version != 3) or (self.status_only and self.version != 3) or (self.observe_only and self.status_only)) return error.InvalidRetainedOwnerPlan;
         try (owner_model.Read{ .owner = self.scope }).validate();
         if (self.scope.group != group or self.start_ns.len > 40 or self.end_ns.len > 40 or self.limit == 0 or self.limit > max_input_rows) return error.InvalidRetainedOwnerPlan;
         const range: dataset.Range = .{ .start_ns = self.start_ns, .end_ns = self.end_ns };
@@ -102,16 +107,28 @@ pub const Observation = struct {
     }
 };
 pub const Capture = struct { table: []const u8, scope: owner_model.ArchiveScope, observation: Observation };
-pub const NativeReply = struct { rows: []const series.Bucket, root_incarnation: []const u8, cursor: series.Cursor, next: ?dataset.RowKey = null, admitted_ns: i128 = 0, observation: ?Observation = null };
+pub const NativeReply = struct {
+    rows: []const series.Bucket,
+    root_incarnation: []const u8,
+    cursor: series.Cursor,
+    next: ?dataset.RowKey = null,
+    admitted_ns: i128 = 0,
+    observation: ?Observation = null,
+    progress: ?series.Progress = null,
+    pub fn jsonStringify(self: NativeReply, writer: anytype) !void {
+        if (self.progress == null) return dataset.writeFieldsOmitting(self, .{}, .{"progress"}, writer);
+        try dataset.writeFields(self, .{}, writer);
+    }
+};
 pub const NativeReplay = struct {
-    version: u8 = 2,
+    version: u8 = 3,
     scope: owner_model.ArchiveScope,
     root_incarnation: []const u8,
     cursor: series.Cursor,
     limit: u16 = 8,
     clock_ns: i128 = 0,
     pub fn validate(self: NativeReplay, group: u64) !void {
-        if (self.version != 2) return error.InvalidRetainedOwnerPlan;
+        if (self.version != 2 and self.version != 3) return error.InvalidRetainedOwnerPlan;
         try (owner_model.Read{ .owner = self.scope }).validate();
         if (self.scope.group != group or self.root_incarnation.len == 0 or self.root_incarnation.len > 40 or self.limit == 0 or self.limit > 32) return error.InvalidRetainedOwnerPlan;
         if ((std.fmt.parseInt(u128, self.root_incarnation, 10) catch return error.InvalidRetainedOwnerPlan) == 0) return error.InvalidRetainedOwnerPlan;
@@ -139,6 +156,7 @@ pub const NativePort = struct {
     }
 };
 pub const Snapshot = struct {
+    catalog_revision: u64 = 0,
     resource: local.system_catalog_domain.Resource,
     plan: owner_model.Plan,
     owners: []const owner_model.Owner,
@@ -234,14 +252,14 @@ pub fn read(a: A, snapshot: Snapshot, input: Request, context: operation.Request
                 const merged = &rows.items[index];
                 if (!std.mem.eql(u8, merged.dimensions, row.dimensions)) return error.RetainedSeriesCorrupt;
                 merged.rows = std.math.add(i64, merged.rows, row.rows) catch return error.RetainedSeriesNumericOverflow;
-                for (merged.metrics, row.metrics) |*target, metric| target.* = try target.merge(metric);
+                for (merged.metrics, row.metrics) |*target, metric| target.* = try target.merge(scratch, metric);
             } else {
                 if (rows.items.len >= (if (input.page) @as(usize, max_input_rows) else input.max_rows)) return error.DatasetPageBudgetExceeded;
-                const cost = @sizeOf(series.Bucket) + row.dimensions.len + row.metrics.len * @sizeOf(series.Metric);
+                const cost = @sizeOf(series.Bucket) + row.dimensions.len + series.metricBytes(row.metrics);
                 if (cost > max_result_bytes - row_bytes) return error.DatasetPageBudgetExceeded;
                 row_bytes += cost;
                 try positions.put(a, key, rows.items.len);
-                try rows.append(scratch, .{ .start_ns = row.start_ns, .dimensions = try scratch.dupe(u8, row.dimensions), .rows = row.rows, .metrics = try scratch.dupe(series.Metric, row.metrics) });
+                try rows.append(scratch, .{ .start_ns = row.start_ns, .dimensions = try scratch.dupe(u8, row.dimensions), .rows = row.rows, .metrics = try series.ownMetrics(scratch, row.metrics) });
             }
         }
     }

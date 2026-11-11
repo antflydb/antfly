@@ -150,7 +150,7 @@ test "retained series correction maintains exact extrema and weighted average" {
     try e.apply(&s, 3, 7, .mutation, &.{.{ .key = "b", .before = sample(2, &v3) }});
     b = try latest(e, arena.allocator(), &s, cut);
     try std.testing.expectEqual(@as(?f64, 3), b.metrics[2].value(.avg));
-    const merged = try series.Metric.merge(.{ .sum = 100, .count = 10 }, .{ .sum = 0, .count = 1 });
+    const merged = try series.Metric.merge(.{ .sum = 100, .count = 10 }, a, .{ .sum = 0, .count = 1 });
     try std.testing.expectApproxEqAbs(@as(f64, 100.0 / 11.0), merged.value(.avg).?, 1e-12);
 }
 test "retained series expiration cannot outrun backfill or correction finality" {
@@ -723,12 +723,12 @@ test "retained series generation closure drains even no-op prepares and finalize
     try std.testing.expectError(error.RetainedSeriesSourceClosed, e.prepare(&store, @splat(2), 6, &.{.{ .key = "new", .after = row }}));
     const progress = try e.status(temp, &store);
     try std.testing.expect(try e.expirationReady(temp, &store, progress, row, 5));
-    // Closed extrema no longer require source evidence, even before event time.
+    // Closed state belongs to the immutable export until revocation purges it.
     const closure = try progress.closureCut();
     try std.testing.expectEqual(@as(i128, 5), closure.admitted_ns);
-    try std.testing.expectEqual(@as(usize, 2), try e.tick(&store, 6, 1024));
+    try std.testing.expectEqual(@as(usize, 0), try e.tick(&store, 6, 1024));
     const after_tick = try e.status(temp, &store);
-    try std.testing.expectEqual(@as(i128, 6), after_tick.admitted_ns);
+    try std.testing.expectEqual(@as(i128, 5), after_tick.admitted_ns);
     try std.testing.expectEqualDeep(closure, try after_tick.closureCut());
     const page = try e.scan(temp, &store, 1000, 1010, 6, null, 10);
     try std.testing.expectEqual(@as(i64, 1), page.rows[0].rows);
@@ -870,4 +870,32 @@ test "retained series closed export preserves its frozen coverage after live clo
     const final_page = try e.scanArchive(alloc, &store, request, null, 10);
     try std.testing.expectEqual(@as(i128, 120), final_page.admitted_ns);
     try std.testing.expectEqual(@as(usize, 1), final_page.rows.len);
+}
+
+test "retained series exact numeric state survives correction and archive merge" {
+    var store = Store.init();
+    defer store.deinit();
+    const e = engine();
+    try ready(e, &store);
+    const large = [_]?f64{ null, 0x1p120, 0x1p120, 0x1p120, 0x1p120 };
+    const small = [_]?f64{ null, 1, 1, 1, 1 };
+    try e.apply(&store, 1, 1, .mutation, &.{ .{ .key = "large", .after = sample(1, &large) }, .{ .key = "small", .after = sample(1, &small) } });
+    try e.apply(&store, 2, 2, .mutation, &.{.{ .key = "large", .before = sample(1, &large) }});
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const page = try e.scan(temp, &store, 0, 10, 2, null, 10);
+    const row = page.rows[0];
+    try std.testing.expectEqual(@as(f64, 1), (try row.metrics[1].finalize(.sum)).number);
+    try std.testing.expectEqual(@as(f64, 1), (try row.metrics[2].finalize(.avg)).number);
+    const archive = @import("retained_series_archive.zig");
+    const bytes = try archive.encode(temp, e.spec, .{ .source_sequence = 2, .source_closed = true, .admitted_ns = 2, .complete_from_ns = -1000, .span = try @import("../retained_dataset_types.zig").KeySpan.fromRange(.{ .start_ns = "0", .end_ns = "10" }) }, &.{row});
+    const decoded = try archive.decode(temp, e.spec, bytes);
+    const merged = try row.metrics[1].merge(temp, decoded.rows[0].metrics[1]);
+    try std.testing.expectEqual(@as(f64, 2), (try merged.finalize(.sum)).number);
+    try std.testing.expectEqual(@as(f64, 1), (try merged.finalize(.avg)).number);
+    try e.close(&store, 3);
+    try std.testing.expectEqual(@as(usize, 0), try e.tick(&store, std.math.maxInt(u64), 10));
+    const frozen = try e.scanArchive(temp, &store, .{ .sequence = 2, .complete_from_ns = -1000, .closed_at_ns = 3, .first_key = @import("../retained_dataset_types.zig").rowKey(0, @splat(0)) }, null, 10);
+    try std.testing.expectEqual(@as(usize, 1), frozen.rows.len);
 }

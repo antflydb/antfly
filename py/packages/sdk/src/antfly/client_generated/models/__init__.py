@@ -2406,11 +2406,17 @@ from .restore_job_scope import RestoreJobScope
 from .restore_request import RestoreRequest
 from .result_extract_document_job_response_200 import ResultExtractDocumentJobResponse200
 from .result_read_document_job_response_200 import ResultReadDocumentJobResponse200
+from .retained_dataset_archive_progress import RetainedDatasetArchiveProgress
 from .retained_dataset_info import RetainedDatasetInfo
 from .retained_dataset_info_initial_history import RetainedDatasetInfoInitialHistory
 from .retained_dataset_info_phase import RetainedDatasetInfoPhase
 from .retained_dataset_measure import RetainedDatasetMeasure
 from .retained_dataset_measure_law import RetainedDatasetMeasureLaw
+from .retained_dataset_native_progress import RetainedDatasetNativeProgress
+from .retained_dataset_owner_progress import RetainedDatasetOwnerProgress
+from .retained_dataset_owner_progress_mode import RetainedDatasetOwnerProgressMode
+from .retained_dataset_progress import RetainedDatasetProgress
+from .retained_dataset_progress_phase import RetainedDatasetProgressPhase
 from .retained_subscription_frame import RetainedSubscriptionFrame
 from .retained_subscription_frame_events_item import RetainedSubscriptionFrameEventsItem
 from .retained_subscription_frame_events_item_type import RetainedSubscriptionFrameEventsItemType
@@ -4899,11 +4905,17 @@ __all__ = (
     "RestoreRequest",
     "ResultExtractDocumentJobResponse200",
     "ResultReadDocumentJobResponse200",
+    "RetainedDatasetArchiveProgress",
     "RetainedDatasetInfo",
     "RetainedDatasetInfoInitialHistory",
     "RetainedDatasetInfoPhase",
     "RetainedDatasetMeasure",
     "RetainedDatasetMeasureLaw",
+    "RetainedDatasetNativeProgress",
+    "RetainedDatasetOwnerProgress",
+    "RetainedDatasetOwnerProgressMode",
+    "RetainedDatasetProgress",
+    "RetainedDatasetProgressPhase",
     "RetainedSubscriptionFrame",
     "RetainedSubscriptionFrameEventsItem",
     "RetainedSubscriptionFrameEventsItemType",

@@ -209,6 +209,10 @@ pub const Segment = struct {
     byte_len: u64,
     placement_revision: u64 = 1,
     location: Id,
+    /// Immutable upload attempt identities fence abandoned object writes.
+    location_object: ?Id = null,
+    archive_object: ?Id = null,
+    previous_local_object: ?Id = null,
     access: Access = .local,
     /// A previous local copy awaiting reader-safe reclamation.
     previous_local: ?Id = null,
@@ -220,6 +224,8 @@ pub const Segment = struct {
     retiring: bool = false,
 
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        if (self.location_object == null and self.archive_object == null and self.previous_local_object == null)
+            return writeFieldsOmitting(self, .{}, .{ "location_object", "archive_object", "previous_local_object" }, writer);
         try writeFields(self, .{}, writer);
     }
 
@@ -250,6 +256,9 @@ pub const Segment = struct {
             self.source.incarnation == 0 or self.source.incarnation > max_public_counter or self.placement_revision > max_public_counter or self.state_encoding == 0 or self.byte_len == 0 or self.placement_revision == 0 or
             !std.mem.eql(u8, &self.dataset, &definition.id) or self.definition_generation != definition.generation or
             !std.mem.eql(u8, &self.schema, &definition.schema)) return error.InvalidDatasetSegment;
+        for ([_]?Id{ self.location_object, self.archive_object, self.previous_local_object }) |attempt| if (attempt) |id| if (zero(id)) return error.InvalidDatasetSegment;
+        if (self.archive == null and self.archive_object != null) return error.InvalidDatasetSegment;
+        if (self.previous_local == null and self.previous_local_object != null) return error.InvalidDatasetSegment;
         if (self.previous_local) |previous| if (zero(previous) or std.mem.eql(u8, &previous, &self.location) or self.access == .local) return error.InvalidDatasetSegment;
         if (self.local_retiring and self.previous_local == null) return error.InvalidDatasetSegment;
         if ((self.location_collected or self.archive_collected) and !self.retiring) return error.InvalidDatasetSegment;
@@ -347,6 +356,12 @@ pub fn writeFields(value: anytype, comptime names: anytype, writer: anytype) !vo
 }
 
 pub fn writeFieldsOmitting(value: anytype, comptime names: anytype, comptime omitted: anytype, writer: anytype) !void {
+    return writeFieldsSelective(value, names, omitted, .{}, writer);
+}
+pub fn writeFieldsOmittingNulls(value: anytype, comptime optional_names: anytype, writer: anytype) !void {
+    return writeFieldsSelective(value, .{}, .{}, optional_names, writer);
+}
+fn writeFieldsSelective(value: anytype, comptime names: anytype, comptime omitted: anytype, comptime optional_names: anytype, writer: anytype) !void {
     try writer.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |field| {
         const skip = comptime blk: {
@@ -354,6 +369,11 @@ pub fn writeFieldsOmitting(value: anytype, comptime names: anytype, comptime omi
             break :blk false;
         };
         if (comptime skip) continue;
+        const optional = comptime blk: {
+            for (optional_names) |name| if (std.mem.eql(u8, name, field)) break :blk true;
+            break :blk false;
+        };
+        if (comptime optional) if (@field(value, field) == null) continue;
         try writer.objectField(field);
         const decimal = comptime blk: {
             for (names) |name| {

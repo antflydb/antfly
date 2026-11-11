@@ -736,6 +736,9 @@ pub const Adapter = struct {
         const a = arena.allocator();
         const read = @import("retained_dataset_read.zig");
         const snapshot = try read.fetchReadCut(self.server, a, target, self.context);
+        if (snapshot.catalog_revision == 0) return error.InvalidSqlBackendResponse;
+        if (self.revision) |expected| if (expected != snapshot.catalog_revision) return error.CatalogGenerationChanged;
+        self.revision = snapshot.catalog_revision;
         var descriptor = try @import("antfly_local_sources").system_catalog_retained_datasets.parse(a, snapshot.resource.source_json);
         defer descriptor.deinit();
         const definition = descriptor.value.definition;

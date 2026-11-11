@@ -196,10 +196,10 @@ fn readImpl(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
         bytes_read += part.bytes_read;
         for (part.rows) |row| {
             if (rows.items.len == limits.rows) return error.DatasetPageBudgetExceeded;
-            const cost = @sizeOf(series.Bucket) + row.dimensions.len + row.metrics.len * @sizeOf(series.Metric);
+            const cost = @sizeOf(series.Bucket) + row.dimensions.len + series.metricBytes(row.metrics);
             if (cost > 32 * 1024 * 1024 - row_bytes) return error.DatasetPageBudgetExceeded;
             row_bytes += cost;
-            try rows.append(temp, .{ .start_ns = row.start_ns, .dimensions = try temp.dupe(u8, row.dimensions), .rows = row.rows, .metrics = try temp.dupe(series.Metric, row.metrics) });
+            try rows.append(temp, .{ .start_ns = row.start_ns, .dimensions = try temp.dupe(u8, row.dimensions), .rows = row.rows, .metrics = try series.ownMetrics(temp, row.metrics) });
         }
         if (part.next) |key| {
             if (after) |previous| if (std.mem.order(u8, &key, &previous) != .gt) return error.InvalidDatasetCoverage;
@@ -244,6 +244,9 @@ fn readPage(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
         if (try range.end() > tail) scan_range.end_ns = try std.fmt.bufPrint(&tail_buffer, "{d}", .{tail});
     }
     var requested = try t.KeySpan.fromRange(scan_range);
+    if (closed) |manifest| if (manifest.empty_from) |empty| {
+        if (std.mem.order(u8, &empty, &requested.end) == .lt) requested.end = empty;
+    };
     if (limits.after) |after| {
         const next = try successor(after);
         if (std.mem.order(u8, &next, &requested.start) == .gt) requested.start = next;
@@ -273,7 +276,7 @@ fn readPage(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
     var total_bytes: usize = 0;
     var next_key: ?t.RowKey = if (plan.next) |end| try predecessor(end) else null;
     segment_loop: for (plan.segments) |segment| {
-        if ((segment.state_encoding != 1 and segment.state_encoding != codec.encoding) or !segment.finalized or !std.mem.eql(u8, &segment.schema, &definition.schema)) return error.InvalidDatasetSegment;
+        if ((segment.state_encoding != 1 and segment.state_encoding != 2 and segment.state_encoding != codec.encoding) or !segment.finalized or !std.mem.eql(u8, &segment.schema, &definition.schema)) return error.InvalidDatasetSegment;
         const cost: usize = if (cache.matches(segment)) 0 else @intCast(segment.byte_len);
         if (cost > limits.bytes - total_bytes) {
             if (!limits.page or total_bytes == 0) return error.DatasetPageBudgetExceeded;
@@ -304,7 +307,7 @@ fn readPage(a: A, store: catalog.Catalog, definition: t.Definition, spec: series
             }
             var owned = row;
             owned.dimensions = try temp.dupe(u8, row.dimensions);
-            owned.metrics = try temp.dupe(series.Metric, row.metrics);
+            owned.metrics = try series.ownMetrics(temp, row.metrics);
             try rows.append(temp, owned);
         }
         if (limits.dimensions_json != null) {

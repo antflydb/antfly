@@ -15,6 +15,7 @@
 
 test {
     _ = @import("storage/retained_series.zig");
+    _ = @import("storage/retained_exact_sum.zig");
     _ = @import("retained_dataset_projection.zig");
     _ = @import("storage/retained_series_revocation.zig");
     _ = @import("storage/retained_series_maintenance.zig");

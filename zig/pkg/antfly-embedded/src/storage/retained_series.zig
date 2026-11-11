@@ -67,6 +67,10 @@ pub const Spec = struct {
         if (b.rows <= 0 or b.metrics.len != self.laws.len or b.dimensions.len > 4096 or !std.unicode.utf8ValidateSlice(b.dimensions) or
             try self.bucket(b.start_ns) != b.start_ns) return error.RetainedSeriesCorrupt;
         for (self.laws, b.metrics, 0..) |law, m, i| {
+            if (m.exact_sum) |bytes| {
+                _ = try ExactSum.parse(bytes);
+                if ((law != .sum and law != .avg) or m.sum != 0) return error.RetainedSeriesCorrupt;
+            }
             if (m.count < 0 or m.count > b.rows or !std.math.isFinite(m.sum)) return error.RetainedSeriesCorrupt;
             if (m.minimum) |n| if (!std.math.isFinite(n)) return error.RetainedSeriesCorrupt;
             if (m.maximum) |n| if (!std.math.isFinite(n)) return error.RetainedSeriesCorrupt;
@@ -114,6 +118,9 @@ pub const Progress = struct {
     revoked: bool = false,
     /// Freeze retention admission before publishing independent authority.
     archive_handoff: bool = false,
+    /// Diagnostic evidence never changes source/replay or retention authority.
+    last_error: ?[]const u8 = null,
+    last_attempt_ns: ?i128 = null,
     /// Stop new admissions while previously prepared transactions drain.
     draining: bool = false,
     backfill_cursor: []const u8 = "",
@@ -127,6 +134,10 @@ pub const Progress = struct {
     maintenance_next_slot: u2 = 0,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         const types = @import("../retained_dataset_types.zig");
+        if (self.last_error == null and self.last_attempt_ns == null) {
+            if (!self.archive_handoff) return types.writeFieldsOmitting(self, .{}, .{ "archive_handoff", "last_error", "last_attempt_ns" }, writer);
+            return types.writeFieldsOmitting(self, .{}, .{ "last_error", "last_attempt_ns" }, writer);
+        }
         if (!self.archive_handoff) return types.writeFieldsOmitting(self, .{}, .{"archive_handoff"}, writer);
         try types.writeFields(self, .{}, writer);
     }
@@ -137,14 +148,27 @@ pub const Progress = struct {
     }
 };
 pub const Scalar = union(enum) { null, integer: i64, number: f64 };
+pub const ExactSum = @import("retained_exact_sum.zig").Exact;
 pub const Metric = struct {
+    /// Canonical exact binary64 units. Absent only for nonnumeric/legacy state.
+    exact_sum: ?[]const u8 = null,
     count: i64 = 0,
-    // A finite f64 input times an i64 row count fits in f128. Keep the
-    // accumulation domain wider than the SQL result to avoid rejecting an
-    // already-decided transaction merely because its float result overflows.
+    // Legacy read-only accumulation. Exact state never duplicates a rounded
+    // floating cache: sum is canonical zero when exact_sum is present.
     sum: f128 = 0,
     minimum: ?f64 = null,
     maximum: ?f64 = null,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        const types = @import("../retained_dataset_types.zig");
+        if (self.exact_sum == null) return types.writeFieldsOmitting(self, .{}, .{"exact_sum"}, writer);
+        try types.writeFields(self, .{}, writer);
+    }
+    pub fn owned(self: Metric, a: A) !Metric {
+        var copy = self;
+        if (self.exact_sum) |bytes| copy.exact_sum = try a.dupe(u8, bytes);
+        return copy;
+    }
 
     /// SQL adapters use this projection to preserve counts beyond 2^53.
     pub fn finalize(self: Metric, op: Law) !Scalar {
@@ -155,6 +179,10 @@ pub const Metric = struct {
     }
     /// Numeric display projection. Use finalize for typed query results.
     pub fn value(self: Metric, op: Law) ?f64 {
+        if ((op == .sum or op == .avg) and self.count != 0) if (self.exact_sum) |bytes| {
+            const exact = ExactSum.parse(bytes) catch return std.math.nan(f64);
+            return exact.number(if (op == .avg) @intCast(self.count) else 1);
+        };
         return switch (op) {
             .count => @floatFromInt(self.count),
             .sum => if (self.count == 0) null else @floatCast(self.sum),
@@ -164,18 +192,37 @@ pub const Metric = struct {
         };
     }
     /// AVG remains a mergeable (sum,count) state, never an average of averages.
-    pub fn merge(left: Metric, right: Metric) !Metric {
+    pub fn merge(left: Metric, a: A, right: Metric) !Metric {
         if (left.count < 0 or right.count < 0) return error.RetainedSeriesCorrupt;
         const sum = left.sum + right.sum;
         if (!std.math.isFinite(sum)) return error.RetainedSeriesNumericOverflow;
+        var exact: ?[]const u8 = null;
+        if ((left.exact_sum != null or left.count == 0) and (right.exact_sum != null or right.count == 0) and (left.exact_sum != null or right.exact_sum != null)) {
+            const l = if (left.exact_sum) |bytes| try ExactSum.parse(bytes) else ExactSum{};
+            const r = if (right.exact_sum) |bytes| try ExactSum.parse(bytes) else ExactSum{};
+            exact = try (try l.add(r)).encode(a);
+        }
         return .{
+            .exact_sum = exact,
             .count = std.math.add(i64, left.count, right.count) catch return error.RetainedSeriesNumericOverflow,
-            .sum = sum,
+            .sum = if (exact != null) 0 else sum,
             .minimum = if (left.minimum) |l| if (right.minimum) |r| @min(l, r) else l else right.minimum,
             .maximum = if (left.maximum) |l| if (right.maximum) |r| @max(l, r) else l else right.maximum,
         };
     }
 };
+pub fn ownMetrics(a: A, input: []const Metric) ![]Metric {
+    const output = try a.alloc(Metric, input.len);
+    for (input, output) |metric, *out| out.* = try metric.owned(a);
+    return output;
+}
+pub fn metricBytes(input: []const Metric) usize {
+    var result: usize = input.len * @sizeOf(Metric);
+    for (input) |metric| if (metric.exact_sum) |bytes| {
+        result += bytes.len;
+    };
+    return result;
+}
 pub const Bucket = struct { start_ns: i128, dimensions: []const u8, rows: i64 = 0, metrics: []Metric };
 pub const Edit = struct { key: []const u8, row: ?Bucket };
 pub const Frame = struct { sequence: u64, source_sequence: u64, edits: []const Edit };
@@ -291,6 +338,17 @@ pub const Engine = struct {
         p.revoked = revoking;
         try self.save(a, txn, p);
     }
+    pub fn recordDiagnostic(self: Engine, txn: anytype, message: ?[]const u8, attempted_ns: i128) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var progress = try self.load(a, txn);
+        if (progress.revoked) return error.RetainedSeriesSourceRevoked;
+        if (progress.last_attempt_ns != null and attempted_ns < progress.last_attempt_ns.?) return;
+        progress.last_attempt_ns = attempted_ns;
+        progress.last_error = message;
+        try self.save(a, txn, progress);
+    }
     pub fn recordMaintenance(self: Engine, txn: anytype, next_slot: u2) !void {
         if (next_slot > 2) return error.InvalidRetainedSeries;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -365,9 +423,17 @@ pub const Engine = struct {
             switch (op) {
                 .count => {},
                 .sum, .avg => {
-                    m.sum += @as(f128, @floatFromInt(sign)) * @as(f128, n);
-                    if (!std.math.isFinite(m.sum)) return error.RetainedSeriesNumericOverflow;
-                    if (m.count == 0) m.sum = 0;
+                    // A rounded predecessor cannot be repaired without its
+                    // source evidence. Fail closed rather than certify it as
+                    // retractable; recreate that legacy generation explicitly.
+                    if (m.exact_sum == null and m.count - sign != 0) return error.RetainedSeriesDefinitionMismatch;
+                    const previous = if (m.exact_sum) |bytes| try ExactSum.parse(bytes) else ExactSum{};
+                    var delta_sum = try ExactSum.input(n);
+                    if (sign < 0) delta_sum.units = -delta_sum.units;
+                    const exact = try previous.add(delta_sum);
+                    m.exact_sum = try exact.encode(a);
+                    m.sum = 0;
+                    if (m.count == 0 and exact.units != 0) return error.RetainedSeriesCorrupt;
                 },
                 .min, .max => {
                     const support = try self.supportKey(a, k, i, n, document);
@@ -793,7 +859,9 @@ pub const Engine = struct {
         var state = try self.load(a, txn);
         if (state.revoked) return error.RetainedSeriesSourceRevoked;
         if (!state.ready) return error.RetainedSeriesNotReady;
-        if (state.archive_handoff) return 0;
+        // Closure freezes export contents. Serving expiry still advances via
+        // read admission, but physical state belongs to the handoff until purge.
+        if (state.closed) return 0;
         state.admitted_ns = @max(state.admitted_ns, admitted_ns);
         state.last_tick_ns = state.admitted_ns;
         var touched = std.StringHashMap(void).init(a);

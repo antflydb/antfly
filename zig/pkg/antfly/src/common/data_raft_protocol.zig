@@ -41,9 +41,10 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
 /// Version 32 reclaims revoked retained state in bounded batches.
-pub const batch_protocol_version: u16 = 34;
+pub const batch_protocol_version: u16 = 35;
+/// Version 35 requires exact retained numeric state and archive encoding 3.
 /// Version 34 fences archival revocation against the transferred retention clock.
-pub const batch_retained_clock_handoff_protocol_version: u16 = 34;
+pub const batch_retained_clock_handoff_protocol_version: u16 = 35;
 /// Version 33 durably admits retention read clocks without changing replay.
 pub const batch_retained_read_admission_protocol_version: u16 = 33;
 /// Version 28 preserves neutral document-version semantics when decoding
@@ -57,7 +58,7 @@ pub const batch_graph_cleanup_neutral_protocol_version: u16 = 28;
 /// retention clock, and a fair maintenance cursor which survives leader changes.
 /// Version 31 fences owner-derived installs against the actual source schema,
 /// including legacy extraction programs without a compiled projection.
-pub const batch_retained_series_protocol_version: u16 = 32;
+pub const batch_retained_series_protocol_version: u16 = 35;
 pub fn retainedSeriesCommandVersion(command: anytype) u16 {
     if (command.action == .archive_handoff or command.expected_admitted_ns != null) return batch_retained_clock_handoff_protocol_version;
     return if (command.action == .admit_retention) batch_retained_read_admission_protocol_version else batch_retained_series_protocol_version;

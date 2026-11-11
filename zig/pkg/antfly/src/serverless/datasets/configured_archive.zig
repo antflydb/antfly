@@ -155,9 +155,11 @@ pub const ExpiryMaintenance = struct {
         const archive_catalog = archive.store(io, context);
         if (descriptor.value.phase == .retiring) {
             try archive_catalog.beginDiscard(descriptor.value.definition);
+            if (try archive_catalog.reclaimUpload(archive.location())) return .{ .progress = true };
             const work = (try archive_catalog.nextMaintenanceDiscard()) orelse return .{ .receipt = try archive_catalog.discardReceipt() };
             return .{ .progress = try archive_catalog.discardOne(work, archive.location()) };
         }
+        if (try archive_catalog.reclaimUpload(archive.location())) return .{ .progress = true };
         const work = (try archive_catalog.nextMaintenanceExpiry()) orelse return .{};
         return .{ .progress = try archive_catalog.collectExpired(work.segment, archive.location()) };
     }

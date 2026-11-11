@@ -406,6 +406,11 @@ pub const GetRetainedDatasetPathParams = struct {
     dataset_name: []const u8,
 };
 
+pub const GetRetainedDatasetParams = struct {
+    after_group: ?[]const u8 = null,
+    max_owners: ?[]const u8 = null,
+};
+
 /// Create a retained summary
 pub const CreateRetainedDatasetPathParams = struct {
     database_name: []const u8,
@@ -2756,7 +2761,7 @@ pub const routes = [_]Route{
 //   fn listNamespaces(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
 //   fn createNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
 //   fn dropNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
-//   fn getRetainedDataset(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response
+//   fn getRetainedDataset(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8, params: GetRetainedDatasetParams) !httpx.Response
 //   fn createRetainedDataset(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response
 //   fn closeRetainedDataset(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response
 //   fn queryRetainedDataset(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response

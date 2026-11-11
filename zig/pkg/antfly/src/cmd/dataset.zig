@@ -24,7 +24,7 @@ const t = datasets.types;
 pub const Binding = struct { id: t.Id, uri: []const u8, access: t.Access };
 pub const Request = struct {
     format: u8 = 1,
-    action: enum { create, evolve, status, list, plan, publish, migrate, restore, reclaim_local, read, hold, release_hold, retire, collect, compact },
+    action: enum { create, evolve, status, list, plan, publish, migrate, restore, reclaim_local, reclaim_upload, read, hold, release_hold, retire, collect, compact },
     catalog_uri: []const u8,
     dataset: t.Id,
     definition: ?t.Definition = null,
@@ -139,6 +139,7 @@ pub fn run(init: std.process.Init, request: Request) !void {
                     defer destination.deinit();
                     if (request.action == .migrate) try catalog.migrate(request.segment_id orelse return error.InvalidArguments, request.expected_revision orelse return error.InvalidArguments, location, binding(&destination, target)) else try catalog.restore(request.segment_id orelse return error.InvalidArguments, request.expected_revision orelse return error.InvalidArguments, location, binding(&destination, target));
                 },
+                .reclaim_upload => return emit(init, .{ .complete = try catalog.reclaimUpload(location) }),
                 .reclaim_local => return emit(init, .{ .complete = try catalog.reclaimLocal(request.segment_id orelse return error.InvalidArguments, location) }),
                 .collect => try catalog.collect(request.segment_id orelse return error.InvalidArguments, location),
                 else => unreachable,

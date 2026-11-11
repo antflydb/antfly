@@ -20,10 +20,11 @@ const std = @import("std");
 const series = @import("retained_series.zig");
 const types = @import("../retained_dataset_types.zig");
 const A = std.mem.Allocator;
-pub const encoding: u32 = 2;
+pub const encoding: u32 = 3;
 pub const max_bytes = 16 * 1024 * 1024;
 pub const max_rows = 65536;
-const magic = "AFRS\x00\x00\x00\x02";
+const magic = "AFRS\x00\x00\x00\x03";
+const v2_magic = "AFRS\x00\x00\x00\x02";
 const legacy_magic = "AFRS\x00\x00\x00\x01";
 pub const Receipt = struct {
     source_sequence: u64,
@@ -112,6 +113,9 @@ pub fn encode(a: A, spec: series.Spec, receipt: Receipt, rows: []const series.Bu
         for (row.metrics) |metric| {
             try out.int(i64, metric.count);
             try out.int(u128, @bitCast(metric.sum));
+            const exact = metric.exact_sum orelse "";
+            try out.int(u16, @intCast(exact.len));
+            try out.append(exact);
             try out.optional(metric.minimum);
             try out.optional(metric.maximum);
         }
@@ -143,6 +147,7 @@ const Decoder = struct {
 pub fn formatEncoding(bytes: []const u8) !u32 {
     if (bytes.len < magic.len) return error.RetainedSeriesCorrupt;
     if (std.mem.eql(u8, bytes[0..magic.len], magic)) return encoding;
+    if (std.mem.eql(u8, bytes[0..v2_magic.len], v2_magic)) return 2;
     if (std.mem.eql(u8, bytes[0..legacy_magic.len], legacy_magic)) return 1;
     return error.RetainedSeriesCorrupt;
 }
@@ -176,12 +181,22 @@ pub fn decode(a: A, spec: series.Spec, bytes: []const u8) !Decoded {
         row.dimensions = try input.take(dimension_len);
         row.rows = try input.int(i64);
         row.metrics = try a.alloc(series.Metric, spec.laws.len);
-        for (row.metrics) |*metric| metric.* = .{
-            .count = try input.int(i64),
-            .sum = @bitCast(try input.int(u128)),
-            .minimum = try input.optional(),
-            .maximum = try input.optional(),
-        };
+        for (row.metrics) |*metric| {
+            metric.* = .{
+                .count = try input.int(i64),
+                .sum = @bitCast(try input.int(u128)),
+                .exact_sum = if (version >= 3) exact: {
+                    const len = try input.int(u16);
+                    if (len == 0) break :exact null;
+                    if (len > 550) return error.RetainedSeriesCorrupt;
+                    const bytes_exact = try input.take(len);
+                    _ = try series.ExactSum.parse(bytes_exact);
+                    break :exact bytes_exact;
+                } else null,
+                .minimum = try input.optional(),
+                .maximum = try input.optional(),
+            };
+        }
     }
     if (input.offset != bytes.len) return error.RetainedSeriesCorrupt;
     try validateRows(spec, receipt, rows);

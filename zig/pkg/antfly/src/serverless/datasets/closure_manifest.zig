@@ -54,6 +54,12 @@ pub const Manifest = struct {
     /// Once sealed, `next` starts a complete empty tail. No sentinel file
     /// with an unbounded expiry is needed, even for a completely empty owner.
     sealed: bool = false,
+    /// A terminal native scan may certify an empty suffix of a partial bucket.
+    empty_from: ?t.RowKey = null,
+    pub fn jsonStringify(self: Manifest, writer: anytype) !void {
+        if (self.empty_from == null) return t.writeFieldsOmitting(self, .{}, .{"empty_from"}, writer);
+        try t.writeFields(self, .{}, writer);
+    }
 
     pub fn init(spec: series.Spec, cut: Cut) !Manifest {
         try spec.validate();
@@ -77,6 +83,10 @@ pub const Manifest = struct {
             std.mem.order(u8, &self.next, &self.first) == .lt or (self.pages == 0) != (self.last == null) or
             (self.pages == 0 and (!std.mem.eql(u8, &self.first, &self.next) or !std.mem.eql(u8, &self.chain, &initial.chain))) or
             (self.sealed and !std.mem.allEqual(u8, self.next[32..], '0'))) return error.InvalidDatasetCoverage;
+        if (self.empty_from) |empty| {
+            if (!self.sealed or self.pages == 0 or std.mem.order(u8, &empty, &self.first) != .gt or std.mem.order(u8, &empty, &self.next) != .lt) return error.InvalidDatasetCoverage;
+            try (t.KeySpan{ .start = empty, .end = self.next }).validate();
+        }
         if (self.pages > 0) try (t.KeySpan{ .start = self.first, .end = self.next }).validate();
         if (self.expired_before_ns) |floor| {
             if (!self.sealed or self.pages == 0 or floor <= try t.rowKeyTimestamp(self.first) or
@@ -107,8 +117,10 @@ pub const Manifest = struct {
     /// Only the owner scan can certify that no rows follow this key. A gap or
     /// a page ending partway through a bucket is not a terminal scan result.
     pub fn seal(self: Manifest, empty_tail: t.RowKey) !Manifest {
-        if (!std.mem.eql(u8, &self.next, &empty_tail) or !std.mem.allEqual(u8, empty_tail[32..], '0')) return error.InvalidDatasetCoverage;
+        if (std.mem.order(u8, &empty_tail, &self.next) == .lt or !std.mem.allEqual(u8, empty_tail[32..], '0') or (self.pages == 0 and !std.mem.eql(u8, &self.next, &empty_tail)) or (self.sealed and !std.mem.eql(u8, &self.next, &empty_tail))) return error.InvalidDatasetCoverage;
         var result = self;
+        if (!std.mem.eql(u8, &self.next, &empty_tail)) result.empty_from = self.next;
+        result.next = empty_tail;
         result.sealed = true;
         return result;
     }
@@ -120,6 +132,10 @@ pub const Manifest = struct {
         hash.update(&self.cut.closure);
         hash.update(&self.chain);
         hash.update(&self.next);
+        if (self.empty_from) |empty| {
+            hash.update("/empty-suffix/v1");
+            hash.update(&empty);
+        }
         return hash.finalResult();
     }
 };

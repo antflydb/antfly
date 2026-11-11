@@ -9150,6 +9150,19 @@ paths:
       tags:
         - query_operations
       operationId: getRetainedDataset
+      parameters:
+        - name: after_group
+          in: query
+          schema:
+            type: string
+            pattern: ^[0-9]+$
+        - name: max_owners
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 64
+            default: 16
       responses:
         '200':
           description: Retained summary definition and lifecycle phase.
@@ -24977,6 +24990,10 @@ components:
         cursor:
           type: string
           maxLength: 128
+        resynchronized:
+          type: boolean
+          description: True when the server caught up through a fresh bounded snapshot instead of replaying
+            every intermediate state.
         initial_history:
           type: string
           enum:
@@ -25088,6 +25105,137 @@ components:
           type: string
         origin_ns:
           type: string
+        progress:
+          allOf:
+            - $ref: '#/components/schemas/RetainedDatasetProgress'
+          nullable: true
+    RetainedDatasetNativeProgress:
+      type: object
+      required:
+        - ready
+        - draining
+        - closed
+        - archive_handoff
+        - backfill_cleanup_complete
+        - source_sequence
+        - replay_floor
+        - replay_latest
+        - retention_clock_ns
+      properties:
+        ready:
+          type: boolean
+        draining:
+          type: boolean
+        closed:
+          type: boolean
+        archive_handoff:
+          type: boolean
+        backfill_cleanup_complete:
+          type: boolean
+        source_sequence:
+          type: string
+        replay_floor:
+          type: string
+        replay_latest:
+          type: string
+        retention_clock_ns:
+          type: string
+        last_attempt_ns:
+          type: string
+          nullable: true
+        last_error:
+          type: string
+          nullable: true
+          description: Durable error name from the most recent failed maintenance operation; cleared by
+            successful maintenance.
+    RetainedDatasetArchiveProgress:
+      type: object
+      required:
+        - pages
+        - sealed
+        - next_bucket_ns
+      properties:
+        pages:
+          type: string
+        sealed:
+          type: boolean
+        next_bucket_ns:
+          type: string
+    RetainedDatasetOwnerProgress:
+      type: object
+      required:
+        - group
+        - mode
+        - archive_authoritative
+      properties:
+        group:
+          type: string
+        mode:
+          type: string
+          enum:
+            - registered
+            - installed
+            - ready
+            - closed
+            - revoked
+        archive_authoritative:
+          type: boolean
+        native:
+          allOf:
+            - $ref: '#/components/schemas/RetainedDatasetNativeProgress'
+          nullable: true
+        archive:
+          allOf:
+            - $ref: '#/components/schemas/RetainedDatasetArchiveProgress'
+          nullable: true
+        status_error:
+          type: string
+          nullable: true
+          description: Failure to obtain this owner's current status; distinct from a persisted maintenance
+            failure.
+    RetainedDatasetProgress:
+      type: object
+      required:
+        - phase
+        - registration_complete
+        - registered_owners
+        - ready_owners
+        - revoked_owners
+        - archived_owners
+        - owners
+      properties:
+        phase:
+          type: string
+          enum:
+            - activating
+            - active
+            - closing
+            - closed
+            - retiring
+            - retired
+        registration_complete:
+          type: boolean
+        registered_owners:
+          type: integer
+          format: uint32
+        ready_owners:
+          type: integer
+          format: uint32
+        revoked_owners:
+          type: integer
+          format: uint32
+        archived_owners:
+          type: integer
+          format: uint32
+        owners:
+          type: array
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/RetainedDatasetOwnerProgress'
+        next_group:
+          type: string
+          nullable: true
+          description: Pass as after_group to obtain the next bounded owner page.
     PrivacyProducer:
       type: object
       additionalProperties: false

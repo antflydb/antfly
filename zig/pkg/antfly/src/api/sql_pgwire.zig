@@ -94,6 +94,20 @@ fn resolveOnPath(native_backend: catalog.Backend, alloc: std.mem.Allocator, name
     return error.TableNotFound;
 }
 
+fn resolveRetainedOnPath(backend: catalog.Backend, alloc: std.mem.Allocator, reference: ast.RetainedTable, path: ?*const @import("../pgwire/search_path.zig").Path) !catalog.Table {
+    const resolve = backend.vtable.resolve_retained orelse return error.UnsupportedSqlExecution;
+    if (reference.name.namespace != null or reference.name.database != null or path == null) return resolve(backend.ptr, alloc, reference);
+    for (path.?.entries[0..path.?.len]) |*entry| {
+        var scoped = reference;
+        scoped.name.namespace = entry.slice();
+        return resolve(backend.ptr, alloc, scoped) catch |err| switch (err) {
+            error.CatalogNotFound => continue,
+            else => return err,
+        };
+    }
+    return error.CatalogNotFound;
+}
+
 test "SQL pgwire ordered native resolver falls back only on exact table absence" {
     // sql-0038 / sql-0040: SET SESSION and SET LOCAL share this ordered,
     // authorization-fenced native binding path after pgwire scope selection.
@@ -1294,8 +1308,24 @@ const GuardedCatalog = struct {
     fn backend(self: *GuardedCatalog) catalog.Backend {
         var result = self.native;
         result.ptr = self;
-        result.vtable = &.{ .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
+        result.vtable = &.{ .resolve = resolve, .resolve_graph = resolveGraph, .resolve_retained = resolveRetained, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
         return result;
+    }
+    fn resolveRetained(raw: *anyopaque, alloc: std.mem.Allocator, reference: ast.RetainedTable) !catalog.Table {
+        const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
+        try checkpoint(raw);
+        try self.authority.credential.validate();
+        const table = try resolveRetainedOnPath(self.native, alloc, reference, if (self.authority.request.search_path) |*path| path else null);
+        if (self.expected_guard) |guard| try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
+        try self.checkTableRead(table);
+        return table;
+    }
+    fn authorityName(alloc: std.mem.Allocator, table: catalog.Table) ![]u8 {
+        if (table.retained != null) {
+            const scope = table.scope orelse return error.InvalidSqlBackendResponse;
+            return (@import("antfly_local_sources").system_catalog_domain.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(alloc);
+        }
+        return alloc.dupe(u8, table.physical_name);
     }
     fn resolveGraph(raw: *anyopaque, alloc: std.mem.Allocator, definition: ast.GraphTable) !catalog.Table {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
@@ -1307,7 +1337,14 @@ const GuardedCatalog = struct {
         return table;
     }
     fn checkTableRead(self: *GuardedCatalog, table: catalog.Table) !void {
-        if (table.graph) |binding| {
+        if (table.retained != null) {
+            try checkpoint(self);
+            try self.authority.credential.validate();
+            var buffer: [4096]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+            const name = try authorityName(fixed.allocator(), table);
+            if (!try http.resourcePermissionCurrentlyAllowed(self.authority.identity.*, .dataset, name, .read)) return error.Forbidden;
+        } else if (table.graph) |binding| {
             try checkpoint(self);
             if (!try http.resourcePermissionCurrentlyAllowed(self.authority.identity.*, .graph, binding.graph.name, .read)) return error.Forbidden;
             for (binding.dependencies) |dependency| try self.checkRead(dependency.physical_name);
@@ -1378,10 +1415,17 @@ const GuardedCatalog = struct {
         guard: *GuardedCatalog,
         table: []u8,
         is_graph: bool = false,
+        is_dataset: bool = false,
         graph_dependencies: [][]u8 = &.{},
         inner: catalog.Cursor,
 
         fn checkAuthority(self: *@This()) !void {
+            if (self.is_dataset) {
+                try GuardedCatalog.checkpoint(self.guard);
+                try self.guard.authority.credential.validate();
+                if (!try http.resourcePermissionCurrentlyAllowed(self.guard.authority.identity.*, .dataset, self.table, .read)) return error.Forbidden;
+                return;
+            }
             if (!self.is_graph) return self.guard.checkRead(self.table);
             try GuardedCatalog.checkpoint(self.guard);
             if (!try http.resourcePermissionCurrentlyAllowed(self.guard.authority.identity.*, .graph, self.table, .read)) return error.Forbidden;
@@ -1434,7 +1478,7 @@ const GuardedCatalog = struct {
         }
         fn wantsExactFilter(raw: *anyopaque, columns: []const @import("antfly_local_sources").sql_dynamic_filter.Column) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.guard.checkRead(self.table);
+            try self.checkAuthority();
             return self.inner.wants_exact_filter.?(self.inner.ptr, columns);
         }
         fn setDynamicFilter(raw: *anyopaque, filter: *const @import("antfly_local_sources").sql_dynamic_filter.Filter) !bool {
@@ -1465,7 +1509,7 @@ const GuardedCatalog = struct {
                 const deps = try GuardedCatalog.copyDependencies(alloc, self.graph_dependencies);
                 errdefer GuardedCatalog.freeDependencies(alloc, deps);
                 const owner = try alloc.create(ReadCursor);
-                owner.* = .{ .alloc = alloc, .guard = self.guard, .table = name, .is_graph = self.is_graph, .graph_dependencies = deps, .inner = child };
+                owner.* = .{ .alloc = alloc, .guard = self.guard, .table = name, .is_graph = self.is_graph, .is_dataset = self.is_dataset, .graph_dependencies = deps, .inner = child };
                 out.* = owner.cursor(close);
                 wrapped += 1;
             }
@@ -1504,12 +1548,12 @@ const GuardedCatalog = struct {
         const open = self.native.vtable.open_scan orelse return null;
         const inner = (try open(self.native.ptr, alloc, table, request)) orelse return null;
         errdefer inner.close(inner.ptr);
-        const name = try alloc.dupe(u8, table.physical_name);
+        const name = try authorityName(alloc, table);
         errdefer alloc.free(name);
         const deps = try dependencies(alloc, table);
         errdefer freeDependencies(alloc, deps);
         const cursor = try alloc.create(ReadCursor);
-        cursor.* = .{ .alloc = alloc, .guard = self, .table = name, .is_graph = table.graph != null, .graph_dependencies = deps, .inner = inner };
+        cursor.* = .{ .alloc = alloc, .guard = self, .table = name, .is_graph = table.graph != null, .is_dataset = table.retained != null, .graph_dependencies = deps, .inner = inner };
         // Materialized execution closes before returning; streaming execution
         // retains the heap-owned guard and authority in its OwnedRead capsule.
         return cursor.cursor(ReadCursor.close);
@@ -1571,7 +1615,7 @@ const GuardedCatalog = struct {
         for (scans, inner.cursors, wrappers, cursors) |scan_request, cursor, *wrapper, *out| {
             const deps = try dependencies(alloc, scan_request.table);
             errdefer freeDependencies(alloc, deps);
-            wrapper.* = .{ .alloc = alloc, .guard = self, .table = try alloc.dupe(u8, scan_request.table.physical_name), .is_graph = scan_request.table.graph != null, .graph_dependencies = deps, .inner = cursor };
+            wrapper.* = .{ .alloc = alloc, .guard = self, .table = try authorityName(alloc, scan_request.table), .is_graph = scan_request.table.graph != null, .is_dataset = scan_request.table.retained != null, .graph_dependencies = deps, .inner = cursor };
             count += 1;
             out.* = wrapper.cursor(StatementRead.borrowedClose);
         }
@@ -2150,4 +2194,42 @@ test "SQL pgwire native trusted credential and identity allocation failures rele
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{ &server, token });
+}
+
+test "SQL retained source pgwire resolves namespaces and binds dataset authority" {
+    const path_api = @import("../pgwire/search_path.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        denied: bool = false,
+        fn resolve(raw: *anyopaque, _: std.mem.Allocator, reference: ast.RetainedTable) !catalog.Table {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.denied) return error.Forbidden;
+            if (!std.mem.eql(u8, reference.name.namespace.?, "analytics")) return error.CatalogNotFound;
+            return .{ .id = 7, .physical_name = "retained:opaque", .schema_version = 1, .columns = &.{} };
+        }
+    };
+    var fixture: Fixture = .{};
+    const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = undefined, .resolve_retained = Fixture.resolve, .scan = undefined, .mutate = undefined, .checkpoint = undefined } };
+    var path: path_api.Path = .{};
+    try path.append(try path_api.Namespace.init("missing"));
+    try path.append(try path_api.Namespace.init("analytics"));
+    const reference: ast.RetainedTable = .{ .name = .{ .table = "stats" }, .start = .{ .string = "0" }, .end = .{ .string = "60" } };
+    const table = try resolveRetainedOnPath(backend, std.testing.allocator, reference, &path);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    fixture.denied = true;
+    try std.testing.expectError(error.Forbidden, resolveRetainedOnPath(backend, std.testing.allocator, reference, &path));
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
+    var guarded: GuardedCatalog = undefined;
+    guarded.native = backend;
+    try std.testing.expect(guarded.backend().vtable.resolve_retained != null);
+    var retained_binding: catalog.Table.RetainedBinding = .{ .dataset = @splat(1), .fingerprint = @splat(2), .generation = 1, .definition = reference };
+    var retained = table;
+    retained.retained = &retained_binding;
+    retained.scope = .{ .database = "default", .namespace = "analytics", .name = "stats", .revision = 1 };
+    const logical = try GuardedCatalog.authorityName(std.testing.allocator, retained);
+    defer std.testing.allocator.free(logical);
+    const expected = try (@import("antfly_local_sources").system_catalog_domain.Target{ .database = "default", .namespace = "analytics", .table = "stats" }).resourceNameAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, logical);
 }

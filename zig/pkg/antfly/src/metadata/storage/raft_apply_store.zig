@@ -12800,6 +12800,12 @@ pub const RaftApplyStore = struct {
         defer arena.deinit();
         const a = arena.allocator();
         if (request == .work_key) return std.json.Stringify.valueAlloc(alloc, try retained_owner_journal.nextWork(&txn, group, request.work_key), .{});
+        if (request == .summary) {
+            const q = request.summary;
+            const plan = (try retained_owner_journal.getPlan(a, &txn, group, q.resource, q.generation)) orelse return error.RetainedSeriesNotReady;
+            const page = try retained_owner_journal.readOwnerPage(a, &txn, group, plan, q.after_group, q.limit);
+            return std.json.Stringify.valueAlloc(alloc, .{ .plan = plan, .owners = page.owners, .next_group = page.next_group }, .{});
+        }
         if (request == .plan) {
             const q = request.plan;
             return std.json.Stringify.valueAlloc(alloc, try retained_owner_journal.getPlan(a, &txn, group, q.resource, q.generation), .{});
@@ -12891,7 +12897,7 @@ pub const RaftApplyStore = struct {
             var key: [160]u8 = undefined;
             source_table = try decodeTableRecord(a, try txn.get(try tableKeyForGroup(&key, group, plan.source_table)));
         }
-        const reply = try std.json.Stringify.valueAlloc(alloc, .{ .resource = resource, .plan = plan, .owners = owners, .source_table = source_table }, .{});
+        const reply = try std.json.Stringify.valueAlloc(alloc, .{ .catalog_revision = meta.revision, .resource = resource, .plan = plan, .owners = owners, .source_table = source_table }, .{});
         errdefer alloc.free(reply);
         if (reply.len > 8 * 1024 * 1024) return error.CatalogCommandTooLarge;
         return reply;

@@ -105,6 +105,29 @@ pub fn readOwners(a: A, txn: anytype, metadata_group: u64, plan: model.Plan) ![]
     return result;
 }
 
+pub const OwnerPage = struct { owners: []const model.Owner, next_group: ?u64 = null };
+pub fn readOwnerPage(a: A, txn: anytype, group: u64, plan: model.Plan, after: u64, limit: u16) !OwnerPage {
+    if (limit == 0 or limit > 64) return error.InvalidRetainedOwnerPlan;
+    var buffer: [193]u8 = undefined;
+    const first = try ownerKey(&buffer, group, plan.id, after);
+    const prefix = first[0 .. first.len - 16];
+    buffer[first.len] = 0;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var row = try cursor.seekAtOrAfter(buffer[0 .. first.len + 1]);
+    var owners_page = std.ArrayList(model.Owner).empty;
+    while (row) |item| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, item.key, prefix)) break;
+        if (owners_page.items.len == limit) return .{ .owners = owners_page.items, .next_group = owners_page.items[owners_page.items.len - 1].group };
+        if (item.value.len > owner_limit) return error.InvalidRetainedOwnerPlan;
+        const owner = try std.json.parseFromSliceLeaky(model.Owner, a, item.value, .{ .allocate = .alloc_always });
+        try owner.validate();
+        if (item.key.len != first.len or !std.mem.eql(u8, &owner.plan, &plan.id) or owner.group <= after or (try std.fmt.parseInt(u64, item.key[prefix.len..], 16)) != owner.group) return error.InvalidRetainedOwnerPlan;
+        try owners_page.append(a, owner);
+    }
+    return .{ .owners = owners_page.items };
+}
+
 fn savePlan(a: A, txn: anytype, metadata_group: u64, plan: model.Plan) !void {
     try plan.validate();
     const bytes = try std.json.Stringify.valueAlloc(a, plan, .{});

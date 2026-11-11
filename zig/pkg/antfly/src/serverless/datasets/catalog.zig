@@ -234,12 +234,12 @@ pub const Catalog = struct {
     /// The caller supplies a bounded, complete immutable segment. Content is
     /// uploaded and read-verified before the authoritative metadata is committed.
     pub fn publish(self: Catalog, value: t.Segment, location: Location, bytes: []const u8) !void {
-        return self.publishImpl(value, location, bytes, null);
+        return self.publishImpl(value, location, bytes, null, null, null);
     }
 
     const ClosedPage = struct { spec: series.Spec, cut: closure.Cut };
     pub fn publishClosedPage(self: Catalog, spec: series.Spec, cut: closure.Cut, value: t.Segment, location: Location, bytes: []const u8) !void {
-        return self.publishImpl(value, location, bytes, .{ .spec = spec, .cut = cut });
+        return self.publishImpl(value, location, bytes, .{ .spec = spec, .cut = cut }, null, null);
     }
     fn closedKey(a: A, generation: u64, partition: t.Id, incarnation: u64) ![]u8 {
         return std.fmt.allocPrint(a, "closed/{d}/{s}/{d}", .{ generation, std.fmt.bytesToHex(partition, .lower), incarnation });
@@ -293,10 +293,12 @@ pub const Catalog = struct {
         return sealed;
     }
 
-    fn publishImpl(self: Catalog, value: t.Segment, location: Location, bytes: []const u8, closed_page: ?ClosedPage) !void {
-        var session = try self.open(true);
-        defer session.deinit();
+    fn publishImpl(self: Catalog, value: t.Segment, location: Location, bytes: []const u8, closed_page: ?ClosedPage, upload: ?t.Id, admission: ?*const std.json.Parsed(Header)) !void {
+        var owned_session = if (admission == null) try self.open(true) else null;
+        defer if (owned_session) |value_owned| value_owned.deinit();
+        const session = admission orelse &owned_session.?;
         try self.requireLive(session.value);
+        if (upload) |attempt| try self.requireUpload(session.value, attempt, value, location) else if (value.location_object != null) return error.InvalidDatasetSegment;
         const def = try self.definition(session.value);
         defer def.deinit();
         try value.validate(def.value);
@@ -368,8 +370,15 @@ pub const Catalog = struct {
         const encoded = try std.json.Stringify.valueAlloc(self.context.alloc, value, .{});
         defer self.context.alloc.free(encoded);
         if (encoded.len > 32768) return error.DatasetSegmentBudgetExceeded;
-        try self.writeVerified(value, location, bytes);
-        var extra: [2]coordinator.Command = undefined;
+        if (upload == null) {
+            try verify(value, bytes);
+            const staged = try self.prepareUpload(value, location);
+            const fenced = try self.open(true);
+            defer fenced.deinit();
+            try self.writeVerified(staged, location, bytes);
+            return self.publishImpl(staged, location, bytes, closed_page, staged.location_object.?, &fenced);
+        }
+        var extra: [4]coordinator.Command = undefined;
         var extra_len: usize = 0;
         var expiry: ?ExpiryCursor = null;
         if (progress_key) |progress| {
@@ -381,6 +390,16 @@ pub const Catalog = struct {
                 extra_len = 2;
             }
         }
+        const attempt = upload.?;
+        const attempt_key = try uploadKey(self.context.alloc, attempt);
+        defer self.context.alloc.free(attempt_key);
+        const pending = (try self.get(session.value, Upload, attempt_key)) orelse return error.DatasetLeaseExpired;
+        defer pending.deinit();
+        const expiry_key = try uploadExpiryKey(self.context.alloc, attempt, pending.value.expires_ns);
+        defer self.context.alloc.free(expiry_key);
+        extra[extra_len] = .{ .kind = .delete, .key = attempt_key };
+        extra[extra_len + 1] = .{ .kind = .delete, .key = expiry_key };
+        extra_len += 2;
         try self.putSegmentWithLocation(session.value, value, location, extra[0..extra_len]);
     }
 
@@ -420,7 +439,7 @@ pub const Catalog = struct {
     /// Copy first, then change one authoritative placement with exact-root CAS.
     /// A failed/cancelled attempt cannot authorize local reclamation.
     pub fn migrate(self: Catalog, id: t.Id, expected_revision: u64, source: Location, destination: Location) !void {
-        var session = try self.open(true);
+        const session = try self.open(true);
         defer session.deinit();
         try self.requireLive(session.value);
         const current = try self.segment(session.value, id);
@@ -433,13 +452,36 @@ pub const Catalog = struct {
         _ = try self.checkLocation(session.value, destination, true);
         const bytes = try self.readVerified(next, source);
         defer self.context.alloc.free(bytes);
-        try self.writeVerified(next, destination, bytes);
+        // A restored local copy already has independent archive ownership.
+        // Reuse that exact object rather than orphaning it with a fresh copy.
+        if (next.archive != null) {
+            const archived = try self.readVerified(next, destination);
+            defer self.context.alloc.free(archived);
+            next.previous_local = source.id;
+            next.previous_local_object = next.location_object;
+            next.location = destination.id;
+            next.location_object = next.archive_object;
+            next.access = destination.access;
+            next.placement_revision = try nextPlacementRevision(next.placement_revision);
+            return self.putSegmentWithLocation(session.value, next, destination, &.{});
+        }
+        const staged = try self.prepareUpload(next, destination);
+        const fresh = try self.open(true);
+        defer fresh.deinit();
+        try self.requireLive(fresh.value);
+        const observed = try self.segment(fresh.value, id);
+        defer observed.deinit();
+        if (observed.value.placement_revision != expected_revision or observed.value.retiring) return error.DatasetPlacementConflict;
+        try self.writeVerified(staged, destination, bytes);
         next.previous_local = source.id;
+        next.previous_local_object = next.location_object;
         next.archive = destination.id;
+        next.archive_object = staged.location_object;
         next.location = destination.id;
+        next.location_object = staged.location_object;
         next.access = destination.access;
-        next.placement_revision = nextPlacementRevision(next.placement_revision) catch return error.DatasetPlacementConflict;
-        try self.putSegmentWithLocation(session.value, next, destination, &.{});
+        next.placement_revision = try nextPlacementRevision(next.placement_revision);
+        try self.commitUploadPlacement(fresh.value, next, destination);
     }
 
     fn list(self: Catalog, session: Header, prefix: []const u8, after: []const u8, limit: usize) !std.json.Parsed(Read) {
@@ -599,6 +641,9 @@ pub const Catalog = struct {
             return value.value.id;
         }
         if (after != null) return null;
+        const uploads = try self.list(session.value, "uploads/", "", 1);
+        defer uploads.deinit();
+        if (uploads.value.results[0].len != 0) return error.DatasetDependencyPending;
         var complete = state.value;
         complete.complete = true;
         const bytes = try std.json.Stringify.valueAlloc(self.context.alloc, complete, .{});
@@ -832,6 +877,7 @@ pub const Catalog = struct {
         _ = try self.checkLocation(session.value, location, false);
         try self.removeObject(next, location);
         next.previous_local = null;
+        next.previous_local_object = null;
         next.local_retiring = false;
         try self.putSegment(session.value, next);
         return true;
@@ -1078,8 +1124,8 @@ pub const Catalog = struct {
         defer self.context.alloc.free(coverage_key);
         const coverage = try std.json.Stringify.valueAlloc(self.context.alloc, Coverage{ .segment = value.id, .start_ns = value.coverage.start_ns, .end_ns = value.coverage.end_ns, .key_span = value.key_span }, .{});
         defer self.context.alloc.free(coverage);
-        if (extra.len > 2) return error.DatasetPageBudgetExceeded;
-        var commands: [5]coordinator.Command = undefined;
+        if (extra.len > 4) return error.DatasetPageBudgetExceeded;
+        var commands: [7]coordinator.Command = undefined;
         commands[0] = .{ .kind = .put, .key = binding_key, .value = binding };
         commands[1] = .{ .kind = .put, .key = key, .value = raw };
         commands[2] = .{ .kind = .put, .key = coverage_key, .value = coverage };
@@ -1100,6 +1146,12 @@ pub const Catalog = struct {
         defer self.context.alloc.free(key);
         var client = location.client;
         client.allocator = self.context.alloc;
+        const attempt = if (std.mem.eql(u8, &location.id, &value.location)) value.location_object else if (value.previous_local != null and std.mem.eql(u8, &location.id, &value.previous_local.?)) value.previous_local_object else value.archive_object;
+        if (attempt != null) {
+            var fence = try client.putObject(location.bucket, key, "", .{ .cancellation = self.context.cancellation });
+            fence.deinit(self.context.alloc);
+            return;
+        }
         client.deleteObject(location.bucket, key, .{ .cancellation = self.context.cancellation }) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
@@ -1107,7 +1159,7 @@ pub const Catalog = struct {
     }
 
     pub fn restore(self: Catalog, id: t.Id, expected_revision: u64, source: Location, destination: Location) !void {
-        var session = try self.open(true);
+        const session = try self.open(true);
         defer session.deinit();
         try self.requireLive(session.value);
         const current = try self.segment(session.value, id);
@@ -1119,18 +1171,134 @@ pub const Catalog = struct {
         _ = try self.checkLocation(session.value, destination, true);
         const bytes = try self.readVerified(next, source);
         defer self.context.alloc.free(bytes);
-        try self.writeVerified(next, destination, bytes);
-        // The archive remains durable until an independent logical-retention
-        // decision. Restore does not authorize deleting its source copy.
+        const staged = try self.prepareUpload(next, destination);
+        const fresh = try self.open(true);
+        defer fresh.deinit();
+        try self.requireLive(fresh.value);
+        const observed = try self.segment(fresh.value, id);
+        defer observed.deinit();
+        if (observed.value.placement_revision != expected_revision or observed.value.retiring) return error.DatasetPlacementConflict;
+        try self.writeVerified(staged, destination, bytes);
         next.archive = source.id;
+        next.archive_object = next.location_object;
         next.location = destination.id;
+        next.location_object = staged.location_object;
         next.access = .local;
-        next.placement_revision = nextPlacementRevision(next.placement_revision) catch return error.DatasetPlacementConflict;
-        try self.putSegmentWithLocation(session.value, next, destination, &.{});
+        next.placement_revision = try nextPlacementRevision(next.placement_revision);
+        try self.commitUploadPlacement(fresh.value, next, destination);
+    }
+
+    fn commitUploadPlacement(self: Catalog, session: Header, value: t.Segment, location: Location) !void {
+        const id = value.location_object orelse return error.InvalidDatasetBinding;
+        try self.requireUpload(session, id, value, location);
+        const key = try uploadKey(self.context.alloc, id);
+        defer self.context.alloc.free(key);
+        const pending = (try self.get(session, Upload, key)) orelse return error.DatasetLeaseExpired;
+        defer pending.deinit();
+        const due = try uploadExpiryKey(self.context.alloc, id, pending.value.expires_ns);
+        defer self.context.alloc.free(due);
+        try self.putSegmentWithLocation(session, value, location, &.{ .{ .kind = .delete, .key = key }, .{ .kind = .delete, .key = due } });
+    }
+
+    const Upload = struct { segment: t.Segment, location: t.Id, storage_identity: t.Id, expires_ns: u64, retiring: bool = false };
+    const upload_duration_ns = 5 * std.time.ns_per_min;
+    fn uploadKey(a: A, id: t.Id) ![]u8 {
+        return std.fmt.allocPrint(a, "uploads/{s}", .{std.fmt.bytesToHex(id, .lower)});
+    }
+    fn uploadExpiryKey(a: A, id: t.Id, deadline: u64) ![]u8 {
+        return std.fmt.allocPrint(a, "upload_expiry/{d:0>20}/{s}", .{ deadline, std.fmt.bytesToHex(id, .lower) });
+    }
+    fn prepareUpload(self: Catalog, value: t.Segment, location: Location) !t.Segment {
+        var next = value;
+        var id: t.Id = undefined;
+        self.context.io.random(&id);
+        if (t.zero(id)) return error.InvalidDatasetBinding;
+        next.location = location.id;
+        next.location_object = id;
+        const expires = std.math.add(u64, self.clock.unix(), upload_duration_ns) catch return error.DatasetLeaseExpired;
+        const key = try uploadKey(self.context.alloc, id);
+        defer self.context.alloc.free(key);
+        const due = try uploadExpiryKey(self.context.alloc, id, expires);
+        defer self.context.alloc.free(due);
+        const binding_key = try locationKey(self.context.alloc, location.id);
+        defer self.context.alloc.free(binding_key);
+        const binding = try std.json.Stringify.valueAlloc(self.context.alloc, .{ .storage_identity = location.storage_identity, .access = location.access }, .{});
+        defer self.context.alloc.free(binding);
+        const raw = try std.json.Stringify.valueAlloc(self.context.alloc, Upload{ .segment = next, .location = location.id, .storage_identity = location.storage_identity, .expires_ns = expires }, .{});
+        defer self.context.alloc.free(raw);
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            const session = try self.open(true);
+            defer session.deinit();
+            try self.requireLive(session.value);
+            _ = try self.checkLocation(session.value, location, true);
+            if (try self.get(session.value, Upload, key)) |existing| {
+                existing.deinit();
+                return error.DatasetPlacementConflict;
+            }
+            self.commit(session.value, &.{ .{ .kind = .put, .key = binding_key, .value = binding }, .{ .kind = .put, .key = key, .value = raw }, .{ .kind = .put, .key = due, .value = key } }) catch |err| switch (err) {
+                error.PreconditionFailed => {
+                    try self.retryConflict(attempt);
+                    continue;
+                },
+                else => return err,
+            };
+            return next;
+        }
+    }
+    fn requireUpload(self: Catalog, session: Header, id: t.Id, value: t.Segment, location: Location) !void {
+        const key = try uploadKey(self.context.alloc, id);
+        defer self.context.alloc.free(key);
+        const record = (try self.get(session, Upload, key)) orelse return error.DatasetLeaseExpired;
+        defer record.deinit();
+        const pending = record.value;
+        if (pending.retiring or self.clock.unix() >= pending.expires_ns) return error.DatasetLeaseExpired;
+        if (!std.mem.eql(u8, &pending.location, &location.id) or !std.mem.eql(u8, &pending.storage_identity, &location.storage_identity) or !std.mem.eql(u8, &pending.segment.id, &value.id) or !std.mem.eql(u8, &pending.segment.checksum, &value.checksum) or !std.meta.eql(value.location_object, @as(?t.Id, id))) return error.InvalidDatasetBinding;
+    }
+    /// One bounded abort-reclamation step. Publication consumes this record
+    /// atomically with its placement CAS. Collection fences it first, then puts
+    /// an empty permanent object: a delayed If-None-Match upload can never
+    /// recreate payload after collection has acknowledged completion.
+    pub fn reclaimUpload(self: Catalog, location: Location) !bool {
+        const session = try self.open(true);
+        defer session.deinit();
+        const discarding = try self.get(session.value, Discard, "discard");
+        defer if (discarding) |value| value.deinit();
+        const work = try self.list(session.value, if (discarding != null) "uploads/" else "upload_expiry/", "", 1);
+        defer work.deinit();
+        if (work.value.results[0].len == 0) return false;
+        const item = work.value.results[0][0];
+        const key = if (discarding != null) item.key else item.value;
+        const parsed = (try self.get(session.value, Upload, key)) orelse return error.InvalidDatasetCoverage;
+        defer parsed.deinit();
+        var pending = parsed.value;
+        if (discarding == null and self.clock.unix() < pending.expires_ns) return false;
+        if (!std.mem.eql(u8, &pending.location, &location.id) or !std.mem.eql(u8, &pending.storage_identity, &location.storage_identity)) return error.DatasetLocationUnavailable;
+        const id = pending.segment.location_object orelse return error.InvalidDatasetCoverage;
+        if (!pending.retiring) {
+            pending.retiring = true;
+            const raw = try std.json.Stringify.valueAlloc(self.context.alloc, pending, .{});
+            defer self.context.alloc.free(raw);
+            try self.commit(session.value, &.{.{ .kind = .put, .key = key, .value = raw }});
+        }
+        const object = try self.objectKey(self.context.alloc, pending.segment, location);
+        defer self.context.alloc.free(object);
+        var client = location.client;
+        client.allocator = self.context.alloc;
+        var fence = try client.putObject(location.bucket, object, "", .{ .cancellation = self.context.cancellation });
+        fence.deinit(self.context.alloc);
+        const current = try self.open(true);
+        defer current.deinit();
+        const due = try uploadExpiryKey(self.context.alloc, id, pending.expires_ns);
+        defer self.context.alloc.free(due);
+        try self.commit(current.value, &.{ .{ .kind = .delete, .key = key }, .{ .kind = .delete, .key = due } });
+        return true;
     }
 
     fn objectKey(self: Catalog, alloc: A, value: t.Segment, location: Location) ![]u8 {
         if (t.zero(location.id) or location.prefix.len == 0 or location.bucket.len == 0) return error.InvalidDatasetBinding;
+        const attempt = if (std.mem.eql(u8, &location.id, &value.location)) value.location_object else if (value.previous_local != null and std.mem.eql(u8, &location.id, &value.previous_local.?)) value.previous_local_object else if (value.archive != null and std.mem.eql(u8, &location.id, &value.archive.?)) value.archive_object else return error.DatasetLocationUnavailable;
+        if (attempt) |id| return std.fmt.allocPrint(alloc, "{s}/datasets/{s}/{s}/{d}/{s}/{s}/{s}", .{ location.prefix, std.fmt.bytesToHex(location.id, .lower), std.fmt.bytesToHex(self.dataset, .lower), value.definition_generation, std.fmt.bytesToHex(value.id, .lower), std.fmt.bytesToHex(value.checksum, .lower), std.fmt.bytesToHex(id, .lower) });
         return std.fmt.allocPrint(alloc, "{s}/datasets/{s}/{s}/{d}/{s}/{s}", .{ location.prefix, std.fmt.bytesToHex(location.id, .lower), std.fmt.bytesToHex(self.dataset, .lower), value.definition_generation, std.fmt.bytesToHex(value.id, .lower), std.fmt.bytesToHex(value.checksum, .lower) });
     }
 
