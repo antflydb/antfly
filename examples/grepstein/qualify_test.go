@@ -28,7 +28,7 @@ import (
 )
 
 func TestExtractionQualificationDoesNotEquateServingWithOCRCoverage(t *testing.T) {
-	for _, problem := range []string{"", "embedded_only", "ocr_failed", "unknown_ocr", "stale_artifact", "stale_source", "missing_page", "unqualified_source", "failed_reprocess", "in_progress", "last_error", "unknown_raw_ocr", "missing_manifest"} {
+	for _, problem := range []string{"", "embedded_only", "ocr_failed", "unknown_ocr", "stale_artifact", "stale_source", "missing_page", "unqualified_source", "failed_reprocess", "in_progress", "last_error", "unknown_raw_ocr", "missing_manifest", "incomplete", "retryable_incomplete", "unknown_completion", "invalid_completion"} {
 		t.Run(problem, func(t *testing.T) {
 			state := t.TempDir()
 			hash := strings.Repeat("a", 64)
@@ -71,7 +71,18 @@ func TestExtractionQualificationDoesNotEquateServingWithOCRCoverage(t *testing.T
 					case "last_error":
 						artifact["last_error_code"] = "InvalidPdf"
 					}
-					manifest := map[string]any{"ocr_attempted_count": artifact["ocr_attempted_count"], "ocr_failed_count": artifact["ocr_failed_count"]}
+					manifest := map[string]any{"ocr_attempted_count": artifact["ocr_attempted_count"], "ocr_failed_count": artifact["ocr_failed_count"], "incomplete_unit_count": 0, "retryable_incomplete_unit_count": 0}
+					switch problem {
+					case "incomplete":
+						manifest["incomplete_unit_count"] = 1
+					case "retryable_incomplete":
+						manifest["incomplete_unit_count"] = 1
+						manifest["retryable_incomplete_unit_count"] = 1
+					case "unknown_completion":
+						delete(manifest, "incomplete_unit_count")
+					case "invalid_completion":
+						manifest["retryable_incomplete_unit_count"] = 1
+					}
 					if problem == "unknown_raw_ocr" {
 						// The public summary normalizes absent raw counters to zero.
 						artifact["ocr_attempted_count"] = 0
