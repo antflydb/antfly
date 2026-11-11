@@ -198,7 +198,7 @@ OCR failure block qualification, even when full-text search is ready. Run it
 before semantic/graph enrichment; a successful receipt measures extraction
 coverage, not OCR transcription accuracy, source authorization or public readiness.
 
-The showcase OCR profile uses revision-pinned LightOnOCR-3-4B on shared Antfly
+The PDF OCR profile uses revision-pinned LightOnOCR-3-4B on shared Antfly
 inference. Qualify both reader sizes on the deployed pool and run a representative
 PDF pilot before backfill. Its native `/read` contract uses
 an image-only prompt; the extraction producer sends no prompt to readers.
@@ -683,7 +683,8 @@ bounded cursor pages, checks text plus valid timestamp/character spans, and
 rechecks its artifact generation. Missing, failed, untimed or stale units remain
 incomplete even if the index is serving. Receipts report audio records, transcript
 segments and native units separately from PDF pages. The local native smoke
-covers GCS fetching, remote STT orchestration, append/resume, retained sample
+covers GCS fetching, shared Antfly and OpenAI-compatible STT orchestration,
+append/resume, retained sample
 generation and both grep streams; provider outputs are loopback fixtures, so it
 does not establish real-model transcript quality or live Cloud identity exchange.
 
@@ -691,15 +692,67 @@ Profiles live in `profiles.go`; the transcription recipe shares
 `antfly-sources.NativeTranscriptProducer`. Additional profiles must explicitly
 provide source selection, a native recipe, stream provenance and a coverage
 policy. There is no inferred OCR/transcription for newly preserved media. Video
-transcription, images, summaries and captions can compose existing native
-producers through further profiles, but are not silently enabled here.
+transcription and summaries can compose existing native producers through further
+profiles, but are not silently enabled here. The `images` profile below
+explicitly enables LightOn grounding for still images.
 
 LightOnOCR-3 supports **grounded image descriptions**: its `grounding` output
 includes image-region descriptions and chart data. The model card recommends
 only an empty prompt (text extraction) or `grounding`; arbitrary caption prompts
 are out of distribution. The `caption` grounding label identifies existing
-figure/table captions; descriptions appear in `image` blocks. A future image
-profile should preserve those grounded regions separately from extracted text,
-while a general scene-caption profile can use the existing source caption preset
+figure/table captions; descriptions appear in `image` blocks. The `images` profile
+preserves this labeled output in its own table;
+it does not silently mix descriptions into the accepted PDF extraction table.
+A general scene-caption profile can use the existing source caption preset
 with an appropriate model. See the
 [LightOnOCR-3 model card](https://huggingface.co/lightonai/LightOnOCR-3-4B).
+
+### Grounded images
+
+Use `images` for PNG, JPEG and WebP originals. It uses native document extraction
+with an explicit image route and the shared LightOnOCR-3 reader, sending
+`ocr.prompt: "grounding"` through `/read`. No local captioning or OCR is performed.
+Use a separate state/table on the same Cloud instance:
+
+```sh
+./grepstein prepare --profile images --state ./grepstein-images \
+  --source 'doj-09=/absolute/path/image-selection' --limit-files 3
+./grepstein publish --state ./grepstein-images --bucket antfly-showcases-originals
+./grepstein load --state ./grepstein-images --url "$ANTFLY_URL" \
+  --table grepstein_images --create-table --source-connection "$GCS_CONNECTION" \
+  --reader-config lightonocr-reader.example.json \
+  --inference-url "$INFERENCE_URL" --inference-secret "$INFERENCE_SECRET_NAME"
+./grepstein qualify --state ./grepstein-images --url "$ANTFLY_URL" \
+  --table grepstein_images --output ./grepstein-images/qualification.json
+./grepstein grep --state ./grepstein-images --url "$ANTFLY_URL" --table grepstein_images
+antfly-grep --table-config ./grepstein-images/grep.json 'vehicle'
+antfly-grep --table-config ./grepstein-images/grep.json --artifact chunks 'vehicle'
+```
+
+The default `grounded` stream has purpose `caption`, is marked generated, and exposes the native unit's
+verbatim labeled text, including image descriptions, OCR text and chart data.
+For example, `![image](0,300,1000,1000)` identifies an image-description block.
+These coordinates are **normalized to 0–1000**, not pixels. Labels and boxes
+remain in the unit artifact text; the example does not invent pixel-space
+provenance or claim to expose separately parsed regions. The native `provenance`
+keeps the immutable source identity and reader evidence. Semantic/graph enrichment
+can consume the same chunk artifacts. Combine this table binding with the PDF
+and transcript bindings to search all three profiles with antfly-grep.
+
+Qualification requires one successful native image read, zero extraction debt,
+nonempty text in every labeled block, valid normalized rectangles, native OCR
+provenance and a stable source/artifact generation. It reports image records and
+grounded blocks separately from pages/audio. Images without an `image` label may
+still contain valid text, tables or charts; qualification does not assert model
+accuracy or require an invented description. Missing/unstructured/truncated
+output fails qualification. Originals are bounded to 64 MiB and native inference
+still enforces decoded-pixel and request/admission limits. The public explorer
+continues to serve PDFs only; this profile uses native queries and grep.
+
+
+Both the image reader and hosted transcriber consume the bytes already acquired
+under the source connection's policy. The inference provider does not need bucket
+credentials or a second fetch of the private GCS URL. Native STT preserves the
+recording MIME for negotiated framed transport; older local callbacks receive an
+inline recording at their existing URL boundary. These engine fixes must be in
+the deployed Antfly runtime before using the new profiles against Cloud.

@@ -22,6 +22,10 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"net"
 	"net/http"
@@ -38,22 +42,61 @@ import (
 )
 
 // Runs the real standalone, storage owner, GCS JSON client, PDF extractor and
-// artifact indexes. Only Google storage is a loopback protocol fixture; this
-// does not qualify GKE identity exchange or a real-model OCR/embedding workload.
+// artifact indexes. Google storage and remote inference use loopback fixtures;
+// this does not qualify GKE identity exchange or real-model output quality.
 func TestLocalNativeGCSExtraction(t *testing.T) {
 	for _, ocr := range []bool{false, true} {
-		t.Run(fmt.Sprintf("ocr=%t", ocr), func(t *testing.T) { testLocalNativeGCSExtraction(t, ocr) })
+		t.Run(fmt.Sprintf("ocr=%t", ocr), func(t *testing.T) { testLocalNativeGCSExtraction(t, nativeCorpusSmokeOptions{OCR: ocr}) })
 	}
 }
 
-func TestLocalNativeGCSTranscription(t *testing.T) { testLocalNativeGCSExtraction(t, false, true) }
+func TestLocalNativeGCSTranscription(t *testing.T) {
+	t.Run("openai", func(t *testing.T) {
+		testLocalNativeGCSExtraction(t, nativeCorpusSmokeOptions{Profile: "transcription"})
+	})
+	t.Run("antfly", func(t *testing.T) {
+		testLocalNativeGCSExtraction(t, nativeCorpusSmokeOptions{Profile: "transcription", HostedSTT: true})
+	})
+}
+func TestLocalNativeGCSImages(t *testing.T) {
+	t.Run("png", func(t *testing.T) { testLocalNativeGCSExtraction(t, nativeCorpusSmokeOptions{Profile: "images"}) })
+	t.Run("jpeg", func(t *testing.T) {
+		testLocalNativeGCSExtraction(t, nativeCorpusSmokeOptions{Profile: "images", JPEG: true})
+	})
+}
 
-func testLocalNativeGCSExtraction(t *testing.T, ocr bool, transcription ...bool) {
-	speech := len(transcription) > 0 && transcription[0]
-	hostedSTT := len(transcription) > 1 && transcription[1]
+func nativeImageFixture(t *testing.T, variant uint8, asJPEG ...bool) []byte {
+	t.Helper()
+	picture := image.NewRGBA(image.Rect(0, 0, 32, 32))
+	picture.Set(0, 0, color.RGBA{R: variant, A: 255})
+	var data bytes.Buffer
+	if len(asJPEG) > 0 && asJPEG[0] {
+		if err := jpeg.Encode(&data, picture, &jpeg.Options{Quality: 90}); err != nil {
+			t.Fatal(err)
+		}
+	} else if err := png.Encode(&data, picture); err != nil {
+		t.Fatal(err)
+	}
+	return data.Bytes()
+}
+
+type nativeCorpusSmokeOptions struct {
+	Profile              string
+	OCR, HostedSTT, JPEG bool
+}
+
+func testLocalNativeGCSExtraction(t *testing.T, options nativeCorpusSmokeOptions) {
+	speech, pictures := options.Profile == "transcription", options.Profile == "images"
+	ocr, hostedSTT, jpegInput := options.OCR, options.HostedSTT, options.JPEG
 	profile, extension, mime := "pdf", ".pdf", "application/pdf"
 	if speech {
 		profile, extension, mime = "transcription", ".wav", "audio/wav"
+	}
+	if pictures {
+		profile, extension, mime = "images", ".png", "image/png"
+		if jpegInput {
+			extension, mime = ".jpg", "image/jpeg"
+		}
 	}
 	binary := os.Getenv("ANTFLY_GREPSTEIN_E2E_BINARY")
 	if binary == "" {
@@ -77,10 +120,13 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool, transcription ...bool)
 		newPDF = append([]byte(nil), pdf...)
 		newPDF[len(newPDF)-1] = 1
 	}
+	if pictures {
+		pdf, newPDF = nativeImageFixture(t, 12, jpegInput), nativeImageFixture(t, 230, jpegInput)
+	}
 	newDigest := fmt.Sprintf("%x", sha256.Sum256(newPDF))
 	newKey := "objects/sha256/" + newDigest + extension
 	var ocrCalls atomic.Int64
-	readerServer := nativeAppendReaderFixture(t, &ocrCalls)
+	readerServer := nativeAppendReaderFixture(t, &ocrCalls, pictures)
 	digest := fmt.Sprintf("%x", sha256.Sum256(pdf))
 	key := "objects/sha256/" + digest + extension
 	var reads atomic.Int64
@@ -175,10 +221,14 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool, transcription ...bool)
 		t.Fatal("local native server did not become ready")
 	}
 	readerConfig, inferenceURL := "", ""
-	if ocr {
+	if ocr || pictures {
 		readerConfig = filepath.Join(root, "reader.json")
 		inferenceURL = readerServer.URL
-		if err := atomicCorpusJSON(readerConfig, map[string]any{"provider": "antfly", "model": "e2e-reader", "max_tokens": 8192}); err != nil {
+		model := "e2e-reader"
+		if pictures {
+			model = imageFixtureModel
+		}
+		if err := atomicCorpusJSON(readerConfig, map[string]any{"provider": "antfly", "model": model, "max_tokens": 8192}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -231,12 +281,12 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool, transcription ...bool)
 	var last error
 	for started := time.Now(); time.Since(started) < 90*time.Second; {
 		qualification, last = qualifyCorpus(client, tableURL, root)
-		if last == nil {
+		if last == nil || t.Failed() {
 			break
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	if last != nil || !qualification.Complete || (profile == "pdf" && qualification.Pages != 1) || (speech && (qualification.AudioRecords != 1 || qualification.TranscriptSegments != 2)) {
+	if last != nil || !qualification.Complete || (profile == "pdf" && qualification.Pages != 1) || (speech && (qualification.AudioRecords != 1 || qualification.TranscriptSegments != 2)) || (pictures && (qualification.ImageRecords != 1 || qualification.GroundedBlocks != 2)) {
 		t.Fatalf("native GCS qualification: %+v %v", qualification, last)
 	}
 	// Expand through a separate sealed catalog containing both the accepted
@@ -252,7 +302,7 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool, transcription ...bool)
 		t.Fatal("missing accepted extraction generation", err)
 	}
 	readsBefore, callsBefore := reads.Load(), ocrCalls.Load()
-	if (ocr || speech) && callsBefore != 1 {
+	if (ocr || speech || pictures) && callsBefore != 1 {
 		t.Fatalf("sample must actually OCR once, got %d", callsBefore)
 	}
 	appendState := t.TempDir()
@@ -298,7 +348,7 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool, transcription ...bool)
 		t.Fatal("append changed sample generation", err)
 	}
 	expectedCalls := callsBefore
-	if speech {
+	if speech || pictures {
 		expectedCalls++
 	}
 	if ocrCalls.Load() != expectedCalls {
@@ -334,13 +384,20 @@ func testLocalNativeGCSExtraction(t *testing.T, ocr bool, transcription ...bool)
 			if stream == "chunks" {
 				args = append(args, "--artifact", stream)
 			}
-			args = append(args, "Native GCS extraction evidence")
+			pattern := "Native GCS extraction evidence"
+			if pictures {
+				pattern = "A red vehicle"
+			}
+			args = append(args, pattern)
 			command := exec.CommandContext(ctx, grepBinary, args...)
 			command.Dir = root
 			command.Env = append(os.Environ(), "XDG_CACHE_HOME="+filepath.Join(root, "grep-cache"))
 			output, err := command.CombinedOutput()
-			if err != nil || !bytes.Contains(output, []byte("Native GCS extraction evidence")) {
+			if err != nil || !bytes.Contains(output, []byte(pattern)) {
 				t.Fatalf("native grep %s failed: %v\n%s", stream, err, output)
+			}
+			if pictures && (!bytes.Contains(output, []byte("A red vehicle")) || !bytes.Contains(output, []byte(`"generated":true`))) {
+				t.Fatalf("grep lost image description: %s", output)
 			}
 			if speech && !bytes.Contains(output, []byte("transcript_spans")) {
 				t.Fatalf("native grep %s lost transcript timing: %s", stream, output)
@@ -485,7 +542,7 @@ func nativeAppendTranscriberFixture(t *testing.T, calls *atomic.Int64, hosted bo
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		if hosted {
-			fmt.Fprintf(w, `{"object":"list","model":%q,"data":[{"object":"read","index":0,"source_id":"audio-0","number":1,"kind":"audio","coordinate_space":"none","origin":"transcription","text":"Native GCS extraction evidence. Launch at dawn.","status":"complete","audio":{"duration_ms":1000,"language":"en","language_source":"detected","segments":[{"text":"Native GCS extraction evidence.","granularity":"phrase","text_start":0,"text_end":31,"start_ms":0,"end_ms":400},{"text":"Launch at dawn.","granularity":"phrase","text_start":32,"text_end":47,"start_ms":500,"end_ms":1000}]}}]}`, defaultTranscriberModel)
+			fmt.Fprintf(w, `{"object":"list","model":%q,"usage":null,"data":[{"object":"read","index":0,"source_id":"audio-0","number":1,"kind":"audio","coordinate_space":"none","origin":"transcription","text":"Native GCS extraction evidence. Launch at dawn.","status":"complete","audio":{"duration_ms":1000,"language":"en","language_source":"detected","segments":[{"text":"Native GCS extraction evidence.","granularity":"phrase","text_start":0,"text_end":31,"start_ms":0,"end_ms":400},{"text":"Launch at dawn.","granularity":"phrase","text_start":32,"text_end":47,"start_ms":500,"end_ms":1000}]}}]}`, defaultTranscriberModel)
 			return
 		}
 		fmt.Fprint(w, `{"text":"Native GCS extraction evidence. Launch at dawn.","language":"en","duration":1,"segments":[{"start":0,"end":0.4,"text":"Native GCS extraction evidence."},{"start":0.5,"end":1,"text":"Launch at dawn."}]}`)

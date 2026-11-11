@@ -44,6 +44,8 @@ type extractionQualification struct {
 	Pages              int     `json:"pages"`
 	Units              int     `json:"units"`
 	AudioRecords       int     `json:"audio_records"`
+	ImageRecords       int     `json:"image_records"`
+	GroundedBlocks     int     `json:"grounded_blocks"`
 	TranscriptSegments int     `json:"transcript_segments"`
 	OCRAttempted       int     `json:"ocr_attempted"`
 	OCRFailed          int     `json:"ocr_failed"`
@@ -158,6 +160,8 @@ func qualifyCorpusWithConcurrency(ctx context.Context, client *http.Client, tabl
 			q.Pages += result.Pages
 			q.Units += result.Units
 			q.AudioRecords += result.AudioRecords
+			q.ImageRecords += result.ImageRecords
+			q.GroundedBlocks += result.GroundedBlocks
 			q.TranscriptSegments += result.TranscriptSegments
 			q.OCRAttempted += result.OCRAttempted
 			q.OCRFailed += result.OCRFailed
@@ -195,6 +199,9 @@ func qualifyCorpusRecord(ctx context.Context, client *http.Client, tableURL stri
 	profileName := "pdf"
 	if strings.HasPrefix(mime, "audio/") {
 		profileName = "transcription"
+	}
+	if strings.HasPrefix(mime, "image/") {
+		profileName = "images"
 	}
 	profile, _ := processingProfile(profileName)
 	if mime != "" && !profile.accepts(mime) {
@@ -275,8 +282,11 @@ func qualifyCorpusRecord(ctx context.Context, client *http.Client, tableURL stri
 	if *coverage.Failed != 0 {
 		return q, fmt.Errorf("%s: %d OCR pages failed; index readiness does not establish extraction coverage", record.ID, *coverage.Failed)
 	}
-	if profile.Name == "transcription" {
-		segments, err := qualifyTranscriptUnits(ctx, client, tableURL, record.ID, source, *artifact.Units)
+	if profile.Name != "pdf" {
+		if profile.Name == "images" && (*artifact.Units != 1 || *coverage.Attempted != 1) {
+			return q, fmt.Errorf("%s: image requires exactly one completed native reader unit", record.ID)
+		}
+		segments, err := qualifyMediaUnits(ctx, client, tableURL, record.ID, source, *artifact.Units, profile.Name == "images")
 		if err != nil {
 			return q, err
 		}
@@ -296,7 +306,7 @@ func qualifyCorpusRecord(ctx context.Context, client *http.Client, tableURL stri
 			return q, err
 		}
 		if after.Generation != artifact.Generation || after.Source != source || after.Merge != "converged" || after.LastError != "" {
-			return q, fmt.Errorf("%s: transcription changed during qualification", record.ID)
+			return q, fmt.Errorf("%s: native extraction changed during qualification", record.ID)
 		}
 		current, err = corpusRequestWithContext(ctx, client, "GET", tableURL+"/documents/"+url.PathEscape(record.ID)+"?fields=url,version", nil)
 		if err != nil {
@@ -310,10 +320,15 @@ func qualifyCorpusRecord(ctx context.Context, client *http.Client, tableURL stri
 			finalDoc = nested
 		}
 		if finalDoc["url"] != source || finalDoc["version"] != version {
-			return q, fmt.Errorf("%s: source changed during transcript qualification", record.ID)
+			return q, fmt.Errorf("%s: source changed during native unit qualification", record.ID)
 		}
-		q.AudioRecords = 1
-		q.TranscriptSegments = segments
+		if profile.Name == "images" {
+			q.ImageRecords = 1
+			q.GroundedBlocks = segments
+		} else {
+			q.AudioRecords = 1
+			q.TranscriptSegments = segments
+		}
 	} else {
 		q.Pages = *artifact.Units
 	}

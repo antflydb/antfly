@@ -3091,8 +3091,10 @@ pub const Runtime = struct {
         }
         for (out) |*item| item.* = "";
         for (requests, 0..) |request, i| {
+            const inline_audio = try localTranscriberSourceAlloc(alloc, request, cfg_parsed.value.max_download_bytes);
+            defer if (inline_audio) |uri| alloc.free(uri);
             const transcribe_request = transcribing.Request{
-                .url = request.source_text,
+                .url = inline_audio orelse request.source_text,
                 .language = cfg_parsed.value.language_code,
                 .timestamps = cfg_parsed.value.timestamps orelse true,
                 .diarization = cfg_parsed.value.diarization orelse false,
@@ -4148,6 +4150,7 @@ pub const Runtime = struct {
         if (request.media.len > 0) {
             if (!request.inline_media_trusted) return error.UntrustedInlineMedia;
             if (!cfg_parsed.value.provider.supportsResolvedAudio() or request.media.len != 1) return error.UnsupportedTranscriptionMedia;
+            if (request.media[0].bytes.len > transcribing.effectiveMaxDownloadBytes(cfg_parsed.value.max_download_bytes)) return error.ResponseTooLarge;
         }
         const antfly_model = if (cfg_parsed.value.provider == .antfly)
             try requiredAntflyTranscriberModel(cfg_parsed.value)
@@ -4156,8 +4159,10 @@ pub const Runtime = struct {
 
         if (isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) {
             const local = self.antfly_provider orelse return error.UnsupportedTranscriberProvider;
+            const inline_audio = try localTranscriberSourceAlloc(alloc, request, cfg_parsed.value.max_download_bytes);
+            defer if (inline_audio) |uri| alloc.free(uri);
             const transcribe_request = transcribing.Request{
-                .url = request.source_text,
+                .url = inline_audio orelse request.source_text,
                 .language = cfg_parsed.value.language_code,
                 .timestamps = cfg_parsed.value.timestamps orelse true,
                 .diarization = cfg_parsed.value.diarization orelse false,
@@ -4239,6 +4244,7 @@ pub const Runtime = struct {
             },
             .{
                 .resolved_audio = if (request.media.len == 1) request.media[0].bytes else null,
+                .resolved_audio_content_type = if (request.media.len == 1) request.media[0].mime_type else null,
                 .source_table = self.execution.routing.source_table,
                 .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
                 .cancellation = httpx.CancellationToken.fromCallback(
@@ -4527,6 +4533,23 @@ fn isLocalReaderProvider(provider: readers.Provider, url: ?[]const u8) bool {
 
 fn isLocalTranscriberProvider(provider: transcribing.Provider, url: ?[]const u8) bool {
     return provider == .antfly and url == null;
+}
+
+// Local callbacks retain their URL contract. Adapt caller-owned recordings at
+// this one boundary for single and batched calls; never fetch a private source
+// again or accept untrusted media through a batch shortcut.
+fn localTranscriberSourceAlloc(alloc: Allocator, request: asset_producer.Request, max_download_bytes: ?usize) !?[]u8 {
+    if (request.media.len == 0) return null;
+    if (!request.inline_media_trusted) return error.UntrustedInlineMedia;
+    if (request.media.len != 1) return error.UnsupportedTranscriptionMedia;
+    const media = request.media[0];
+    if (media.bytes.len > transcribing.effectiveMaxDownloadBytes(max_download_bytes)) return error.ResponseTooLarge;
+    const prefix_len = "data:;base64,".len + media.mime_type.len;
+    const uri = try alloc.alloc(u8, prefix_len + std.base64.standard.Encoder.calcSize(media.bytes.len));
+    errdefer alloc.free(uri);
+    _ = try std.fmt.bufPrint(uri[0..prefix_len], "data:{s};base64,", .{media.mime_type});
+    _ = std.base64.standard.Encoder.encode(uri[prefix_len..], media.bytes);
+    return uri;
 }
 
 fn requiredAntflyTranscriberModel(cfg: transcribing.Config) ![]const u8 {
@@ -8511,6 +8534,8 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
             _ = self.transcribe_calls.fetchAdd(1, .monotonic);
             try std.testing.expectEqualStrings("local-transcriber", model);
             try std.testing.expectEqualStrings("en-US", request.language.?);
+            if (std.mem.startsWith(u8, request.url, "gs://")) return error.TestUnexpectedResult;
+            if (std.mem.startsWith(u8, request.url, "data:")) try std.testing.expectEqualStrings("data:audio/wav;base64,ZmFrZQ==", request.url);
             const text = if (std.mem.endsWith(u8, request.url, "a.wav")) "first transcript" else "second transcript";
             return .{
                 .text = try a.dupe(u8, text),
@@ -8571,6 +8596,23 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
     try std.testing.expectEqualStrings("first transcript", results[0]);
     try std.testing.expectEqualStrings("second transcript", results[1]);
     try std.testing.expectEqual(@as(usize, 2), local.transcribe_calls.load(.monotonic));
+    const borrowed = try runtime.transcribe(alloc, .{
+        .producer_type = .transcriber,
+        .config_json = requests[0].config_json,
+        .source_text = "gs://private/must-not-fetch.wav",
+        .content_type = "text/plain",
+        .inline_media_trusted = true,
+        .media = &.{.{ .bytes = "fake", .mime_type = "audio/wav" }},
+    });
+    defer alloc.free(borrowed);
+    try std.testing.expectEqualStrings("second transcript", borrowed);
+    try std.testing.expectError(error.ResponseTooLarge, runtime.transcribe(alloc, .{
+        .producer_type = .transcriber,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"local-transcriber\",\"max_download_bytes\":1}",
+        .source_text = "gs://private/must-not-fetch.wav",
+        .inline_media_trusted = true,
+        .media = &.{.{ .bytes = "fake", .mime_type = "audio/wav" }},
+    }));
 }
 
 test "asset producer runtime routes antfly transcriber without url to local provider" {

@@ -38,17 +38,19 @@ func processingProfile(name string) (corpusProfile, error) {
 	switch name {
 	case "", "pdf":
 		return corpusProfile{"pdf", "extraction", "pdf"}, nil
+	case "images":
+		return corpusProfile{"images", "caption", "image"}, nil
 	case "transcription":
 		return corpusProfile{"transcription", "transcription", "audio"}, nil
 	default:
-		return corpusProfile{}, fmt.Errorf("unknown processing profile %q (available: pdf, transcription)", name)
+		return corpusProfile{}, fmt.Errorf("unknown processing profile %q (available: pdf, transcription, images)", name)
 	}
 }
 func (p corpusProfile) accepts(mime string) bool {
 	if p.Name == "pdf" {
 		return mime == "application/pdf"
 	}
-	return p.Name == "transcription" && strings.HasPrefix(mime, "audio/")
+	return (p.Name == "transcription" && strings.HasPrefix(mime, "audio/")) || (p.Name == "images" && strings.HasPrefix(mime, "image/"))
 }
 
 func nativeTranscriptionConfig(filename, inferenceURL, secretRef string) (map[string]any, error) {

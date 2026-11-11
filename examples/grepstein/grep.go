@@ -59,8 +59,11 @@ func nativeGrepConfig(endpoint, table string) map[string]any {
 func nativeGrepConfigForProfile(endpoint, table string, profile corpusProfile) map[string]any {
 	bindingName := "grepstein"
 	name := "extracted"
-	if profile.Name == "transcription" {
+	if profile.Name != "pdf" {
 		name = "transcript"
+		if profile.Name == "images" {
+			name = "grounded"
+		}
 		bindingName = table
 	}
 	fields := sources.DocumentFields{URI: "original_url", Path: "filename", Revision: "version", IndexedAt: "indexed_at", Permissions: "permissions", Metadata: "metadata"}
@@ -69,8 +72,8 @@ func nativeGrepConfigForProfile(endpoint, table string, profile corpusProfile) m
 		"tables": []any{map[string]any{
 			"name": bindingName, "table": table, "fields": fields,
 			"streams": []sources.TextStream{
-				{Name: name, Artifact: corpusUnits, Index: corpusUnitsIndex, Field: "text", Purpose: profile.Purpose, Default: true, Boundary: "unit", LocationField: "provenance"},
-				{Name: "chunks", Artifact: corpusChunks, Index: corpusTextIndex, Field: "text", Purpose: "semantic-chunks", Boundary: "unit", LocationField: "provenance"},
+				{Name: name, Artifact: corpusUnits, Index: corpusUnitsIndex, Field: "text", Purpose: profile.Purpose, Generated: profile.Name == "images", Default: true, Boundary: "unit", LocationField: "provenance"},
+				{Name: "chunks", Artifact: corpusChunks, Index: corpusTextIndex, Field: "text", Purpose: "semantic-chunks", Generated: profile.Name == "images", Boundary: "unit", LocationField: "provenance"},
 			},
 		}},
 	}

@@ -25,9 +25,9 @@ import (
 
 // Verify every native unit, including units without searchable chunks. Work is
 // bounded by the manifest count and 100-row pages, never a corpus-sized list.
-func qualifyTranscriptUnits(ctx context.Context, client *http.Client, tableURL, id, source string, expected int) (int, error) {
+func qualifyMediaUnits(ctx context.Context, client *http.Client, tableURL, id, source string, expected int, grounded bool) (int, error) {
 	const pageSize = 100
-	units, segments := 0, 0
+	units, evidence := 0, 0
 	var cursor []string
 	snapshot := ""
 	for {
@@ -56,6 +56,7 @@ func qualifyTranscriptUnits(ctx context.Context, client *http.Client, tableURL, 
 							Provenance struct {
 								Source          string `json:"source_url"`
 								Used            bool   `json:"transcript_used"`
+								OCRUsed         bool   `json:"ocr_used"`
 								TranscriptSpans []struct {
 									Start     *uint64 `json:"start_ms"`
 									End       *uint64 `json:"end_ms"`
@@ -72,21 +73,33 @@ func qualifyTranscriptUnits(ctx context.Context, client *http.Client, tableURL, 
 			return 0, err
 		}
 		if len(response.Responses) != 1 {
-			return 0, fmt.Errorf("%s: invalid transcript traversal response", id)
+			return 0, fmt.Errorf("%s: invalid native unit traversal response", id)
 		}
 		page := response.Responses[0]
 		if page.Status != 200 || page.Hits == nil || (len(page.Error) > 0 && string(page.Error) != "null") {
-			return 0, fmt.Errorf("%s: transcript traversal is incomplete", id)
+			return 0, fmt.Errorf("%s: native unit traversal is incomplete", id)
 		}
 		if snapshot != "" && page.Snapshot != snapshot {
-			return 0, fmt.Errorf("%s: transcript snapshot changed", id)
+			return 0, fmt.Errorf("%s: native unit snapshot changed", id)
 		}
 		snapshot = page.Snapshot
 		hits := page.Hits.Hits
 		for _, hit := range hits {
 			unit := hit.Source
-			if units >= expected || hit.ID == "" || strings.TrimSpace(unit.Text) == "" || unit.Provenance.Source != source || !unit.Provenance.Used || len(unit.Provenance.TranscriptSpans) == 0 {
-				return 0, fmt.Errorf("%s: missing transcript text/timestamp evidence", id)
+			if units >= expected || hit.ID == "" || strings.TrimSpace(unit.Text) == "" || unit.Provenance.Source != source {
+				return 0, fmt.Errorf("%s: missing native unit text/source evidence", id)
+			}
+			if grounded {
+				blocks, err := validateGroundedImage(unit.Text)
+				if err != nil || !unit.Provenance.OCRUsed {
+					return 0, fmt.Errorf("%s: missing grounded image evidence: %v", id, err)
+				}
+				evidence += blocks
+				units++
+				continue
+			}
+			if !unit.Provenance.Used || len(unit.Provenance.TranscriptSpans) == 0 {
+				return 0, fmt.Errorf("%s: missing transcript timing", id)
 			}
 			var previous uint64
 			for _, span := range unit.Provenance.TranscriptSpans {
@@ -94,7 +107,7 @@ func qualifyTranscriptUnits(ctx context.Context, client *http.Client, tableURL, 
 					return 0, fmt.Errorf("%s: invalid transcript timestamp/span evidence", id)
 				}
 				previous = *span.Start
-				segments++
+				evidence++
 			}
 			units++
 		}
@@ -103,12 +116,12 @@ func qualifyTranscriptUnits(ctx context.Context, client *http.Client, tableURL, 
 		}
 		next := hits[len(hits)-1].Sort
 		if len(next) != 2 || (len(cursor) == 2 && cursor[0] == next[0] && cursor[1] == next[1]) {
-			return 0, fmt.Errorf("%s: transcript traversal has no stable continuation", id)
+			return 0, fmt.Errorf("%s: native unit traversal has no stable continuation", id)
 		}
 		cursor = next
 	}
 	if units != expected {
-		return 0, fmt.Errorf("%s: transcript unit inventory differs from manifest", id)
+		return 0, fmt.Errorf("%s: native unit inventory differs from manifest", id)
 	}
-	return segments, nil
+	return evidence, nil
 }

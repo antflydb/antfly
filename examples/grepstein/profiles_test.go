@@ -35,8 +35,9 @@ func TestProcessingProfilesSelectInputsBeforePreparation(t *testing.T) {
 	source := t.TempDir()
 	writeCorpusFixture(t, filepath.Join(source, "evidence.pdf"), nativeGCSFixturePDF())
 	writeCorpusFixture(t, filepath.Join(source, "recording.wav"), nativeTranscriptFixtureAudio())
+	writeCorpusFixture(t, filepath.Join(source, "picture.png"), nativeImageFixture(t, 12))
 	writeCorpusFixture(t, filepath.Join(source, "video.mp4"), []byte("raw-only video"))
-	for _, name := range []string{"pdf", "transcription"} {
+	for _, name := range []string{"pdf", "transcription", "images"} {
 		t.Run(name, func(t *testing.T) {
 			state := t.TempDir()
 			if err := corpusPrepareCmd([]string{"--profile", name, "--state", state, "--source", "test=" + source}); err != nil {
@@ -154,7 +155,7 @@ func TestTranscriptQualificationChecksEveryUnitAndTimeSpan(t *testing.T) {
 				json.NewEncoder(w).Encode(map[string]any{"responses": []any{page}})
 			}))
 			defer server.Close()
-			segments, err := qualifyTranscriptUnits(context.Background(), server.Client(), server.URL, "recording", source, 129)
+			segments, err := qualifyMediaUnits(context.Background(), server.Client(), server.URL, "recording", source, 129, false)
 			if problem == "" {
 				if err != nil || segments != 129 || requests != 2 {
 					t.Fatalf("qualification segments=%d requests=%d err=%v", segments, requests, err)
@@ -166,11 +167,21 @@ func TestTranscriptQualificationChecksEveryUnitAndTimeSpan(t *testing.T) {
 	}
 }
 
-func TestPublishAudioLocatorUsesImmutableGCSIdentity(t *testing.T) {
+func TestPublishMediaLocatorUsesImmutableGCSIdentity(t *testing.T) {
+	for _, profile := range []string{"transcription", "images"} {
+		t.Run(profile, func(t *testing.T) { testPublishMediaLocator(t, profile) })
+	}
+}
+func testPublishMediaLocator(t *testing.T, profile string) {
 	source, state := t.TempDir(), t.TempDir()
 	data := nativeTranscriptFixtureAudio()
-	writeCorpusFixture(t, filepath.Join(source, "recording.wav"), data)
-	if err := corpusPrepareCmd([]string{"--profile", "transcription", "--state", state, "--source", "test=" + source}); err != nil {
+	name, mime, suffix := "recording.wav", "audio/wav", ".wav"
+	if profile == "images" {
+		data = nativeImageFixture(t, 12)
+		name, mime, suffix = "picture.png", "image/png", ".png"
+	}
+	writeCorpusFixture(t, filepath.Join(source, name), data)
+	if err := corpusPrepareCmd([]string{"--profile", profile, "--state", state, "--source", "test=" + source}); err != nil {
 		t.Fatal(err)
 	}
 	records := testCorpusRecords(t, state)
@@ -191,7 +202,7 @@ func TestPublishAudioLocatorUsesImmutableGCSIdentity(t *testing.T) {
 			return response(404, ""), nil
 		}
 		body, _ := io.ReadAll(r.Body)
-		if r.Header.Get("Content-Type") != "audio/wav" || !bytes.Equal(body, data) || r.URL.Query().Get("ifGenerationMatch") != "0" {
+		if r.Header.Get("Content-Type") != mime || !bytes.Equal(body, data) || r.URL.Query().Get("ifGenerationMatch") != "0" {
 			t.Error("audio source was transformed or uploaded without its precondition")
 		}
 		return response(200, fmt.Sprintf(`{"generation":"77","size":%q,"md5Hash":%q}`, fmt.Sprint(len(data)), base64.StdEncoding.EncodeToString(checksum[:]))), nil
@@ -201,10 +212,90 @@ func TestPublishAudioLocatorUsesImmutableGCSIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	uri, err := url.Parse(locator)
-	if err != nil || !validProcessingLocator(uri) || !strings.HasSuffix(version, ":77") || !strings.Contains(locator, ".wav?generation=77") {
+	if err != nil || !validProcessingLocator(uri) || !strings.HasSuffix(version, ":77") || !strings.Contains(locator, suffix+"?generation=77") {
 		t.Fatalf("invalid immutable audio identity: %s %s %v", locator, version, err)
 	}
 	if validOriginalLocator(uri, "originals") {
 		t.Fatal("audio widened the public PDF-only delivery gate")
+	}
+}
+
+func TestImageProfileNativeGrounding(t *testing.T) {
+	config := filepath.Join(t.TempDir(), "reader.json")
+	if err := atomicCorpusJSON(config, map[string]any{"provider": "antfly", "model": imageFixtureModel, "max_tokens": 8192}); err != nil {
+		t.Fatal(err)
+	}
+	indexes, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, "https://inference.example", config, false, false, corpusIndexOptions{Profile: "images", SourceConnection: "gcs", InferenceSecret: "inference.key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(indexes)
+	for _, part := range []string{"grounding", "explicit_only", "image", "${secret:inference.key}"} {
+		if !bytes.Contains(raw, []byte(part)) {
+			t.Fatalf("missing native setting %s: %s", part, raw)
+		}
+	}
+	if _, err := corpusIndexes("", "", "", "", false, false, corpusIndexOptions{Profile: "images"}); err == nil {
+		t.Fatal("missing image reader accepted")
+	}
+	for _, invalid := range []map[string]any{
+		{"provider": "openai", "model": imageFixtureModel},
+		{"provider": "antfly", "model": "whisper-small"},
+		{"provider": "antfly", "model": imageFixtureModel, "prompt": "Describe this picture"},
+	} {
+		if err := atomicCorpusJSON(config, invalid); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := corpusIndexes("", "", "", config, false, false, corpusIndexOptions{Profile: "images"}); err == nil {
+			t.Fatalf("accepted incompatible grounding reader: %v", invalid)
+		}
+	}
+	profile, _ := processingProfile("images")
+	binding, _ := json.Marshal(nativeGrepConfigForProfile("https://cloud.example", "pictures", profile))
+	if !bytes.Contains(binding, []byte(`"name":"grounded"`)) || !bytes.Contains(binding, []byte(`"purpose":"caption"`)) || !bytes.Contains(binding, []byte(`"generated":true`)) {
+		t.Fatal(string(binding))
+	}
+	for _, item := range []struct {
+		text  string
+		valid bool
+	}{
+		{imageFixtureGrounding, true}, {"unstructured description", false},
+		{"![image](0,0,1001,1000)\nDescription", false},
+		{"![image](10,0,1,1000)\nDescription", false},
+		{"![image](0,0,1000,1000)", false},
+		{"![unknown](0,0,1000,1000)\nDescription", false},
+	} {
+		blocks, err := validateGroundedImage(item.text)
+		if (err == nil) != item.valid || (item.valid && blocks != 2) {
+			t.Fatalf("%q: blocks=%d err=%v", item.text, blocks, err)
+		}
+	}
+}
+
+func TestImageQualificationRequiresNativeGroundingEvidence(t *testing.T) {
+	for _, problem := range []string{"", "unstructured", "missing-reader", "wrong-source", "empty"} {
+		t.Run(problem, func(t *testing.T) {
+			text, source, used := imageFixtureGrounding, "gs://originals/picture.png?generation=1", true
+			if problem == "unstructured" {
+				text = "A red vehicle"
+			}
+			if problem == "empty" {
+				text = ""
+			}
+			if problem == "missing-reader" {
+				used = false
+			}
+			if problem == "wrong-source" {
+				source = "gs://other/private.png"
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(map[string]any{"responses": []any{map[string]any{"status": 200, "hits": map[string]any{"hits": []any{map[string]any{"_id": "image-unit", "_source": map[string]any{"text": text, "provenance": map[string]any{"source_url": source, "ocr_used": used}}}}}}}})
+			}))
+			defer server.Close()
+			blocks, err := qualifyMediaUnits(context.Background(), server.Client(), server.URL, "picture", "gs://originals/picture.png?generation=1", 1, true)
+			if (err == nil) != (problem == "") || (err == nil && blocks != 2) {
+				t.Fatalf("blocks=%d err=%v", blocks, err)
+			}
+		})
 	}
 }

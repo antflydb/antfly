@@ -85,6 +85,12 @@ type corpusRecord struct {
 
 func corpusMIME(name string) string {
 	switch strings.ToLower(path.Ext(name)) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
 	case ".pdf":
 		return "application/pdf"
 	case ".ogg", ".opus":

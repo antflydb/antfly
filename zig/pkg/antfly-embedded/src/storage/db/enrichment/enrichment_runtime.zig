@@ -23043,7 +23043,13 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         .transcript => config.transcription_config_json,
     };
     const borrowed_audio = kind == .transcript and (try supportsBorrowedTranscriptionAudio(working_alloc, config_json));
-    const audio_media = [_]asset_producer_mod.EncodedMedia{.{ .bytes = source_bytes, .mime_type = source_content_type }};
+    // Standalone images are already fetched and authorized by the extraction
+    // owner. Borrow those exact bytes, just as for audio, instead of asking a
+    // remote reader to fetch a private locator again. Metadata carries the same
+    // explicit task prompt used for rendered PDF pages.
+    const borrowed_image = kind == .ocr and std.mem.eql(u8, route_type, "image");
+    const reader_mime = if (borrowed_image) source_content_type else "image/png";
+    const source_media = [_]asset_producer_mod.EncodedMedia{.{ .bytes = source_bytes, .mime_type = source_content_type }};
     const method = switch (kind) {
         .ocr => "ocr_text",
         .transcript => "transcript_text",
@@ -23071,12 +23077,12 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             .producer_type = producer_type,
             .config_json = config_json,
             .source_text = "",
-            .content_type = "image/png",
+            .content_type = reader_mime,
             .inline_media_trusted = true,
         };
         if (try invocation_producer.capabilitiesForRequests(working_alloc, &.{prototype})) |capabilities| {
             if (!capabilities.supports(.{ .image = true }) or
-                (!use_pdf_borrowed_rasters and !capabilities.acceptsMimeType("image/png")))
+                (!use_pdf_borrowed_rasters and !capabilities.acceptsMimeType(reader_mime)))
                 return error.UnsupportedInferenceModality;
             admitted_batch_policy.max_items = @min(admitted_batch_policy.max_items, capabilities.batch.max_items);
             if (!use_pdf_borrowed_rasters) {
@@ -23311,7 +23317,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         const has_rendered_media = rendered != null or rendered_raster != null;
         const parts_json = if (planned_parts_json) |planned|
             planned
-        else if (has_rendered_media)
+        else if (has_rendered_media or borrowed_image)
             try document_extraction_mod.ocrPagePartsMetadataJsonAlloc(item_alloc, config, route_type, source_content_type, unit)
         else
             try runtimeDocumentGeneratedTextPartsJsonAlloc(item_alloc, route_type, source_content_type, unit);
@@ -23320,11 +23326,11 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         var request = asset_producer_mod.Request{
             .producer_type = producer_type,
             .config_json = config_json,
-            .source_text = if (has_rendered_media) "" else source_url,
+            .source_text = if (has_rendered_media or borrowed_image) "" else source_url,
             .source_parts_json = parts_json,
             .content_type = runtimeGeneratedTextContentType(kind, producer_type),
-            .inline_media_trusted = has_rendered_media or borrowed_audio,
-            .media = if (borrowed_audio) &audio_media else &.{},
+            .inline_media_trusted = has_rendered_media or borrowed_audio or borrowed_image,
+            .media = if (borrowed_audio or borrowed_image) &source_media else &.{},
             .source_fingerprint = source_fingerprint,
             .item_id = unit.unit_id,
             .page_number = unit.page_number,
