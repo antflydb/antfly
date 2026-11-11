@@ -888,6 +888,27 @@ fn downloadFileAllocWithIo(
     };
 }
 
+/// Storage-side authorization uses a fresh remote-content snapshot for every
+/// source extraction, including continuation and repair. The inference worker
+/// independently applies its own local filesystem policy before reading.
+pub fn authorizeLocalSource(alloc: Allocator, io: std.Io, uri: []const u8, remote: ?*const RemoteContentConfig) !void {
+    const config = remote orelse return error.PathNotAllowed;
+    var snapshot = try config.acquire();
+    defer snapshot.deinit();
+    const security = if (snapshot.config.security) |*value| value else null;
+    try requireFileAccess(security);
+    const parsed = try std.Uri.parse(uri);
+    const path_buf = try alloc.dupe(u8, parsed.path.percent_encoded);
+    defer alloc.free(path_buf);
+    const path = std.Uri.percentDecodeInPlace(path_buf);
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidSourceReference;
+    try validateFilePathSecurityBeforeOpen(alloc, io, path, security);
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{ .allow_directory = false });
+    defer file.close(io);
+    try validateOpenFilePathSecurity(alloc, io, file, security);
+    if ((try file.stat(io)).kind != .file) return error.InvalidSourceReference;
+}
+
 fn requireFileAccess(security: ?*const ContentSecurityConfig) !void {
     const cfg = security orelse return error.PathNotAllowed;
     const allowed_paths = cfg.allowed_paths orelse return error.PathNotAllowed;
@@ -922,6 +943,54 @@ fn downloadHttpConfig(security: ?*const ContentSecurityConfig, body_allocator: A
     return config;
 }
 
+/// Bounded process-local verification receipts. Metadata is only trusted after
+/// hashing an authorized open file. Every request still opens and authorizes its
+/// own descriptor; changed metadata always forces a fresh streaming hash.
+/// This assumes the filesystem reports writes through mtime/ctime, just as the
+/// per-range change guard does. Never persist these receipts across restarts.
+pub const LocalVerificationCache = struct {
+    const Entry = struct { key: [32]u8, stat: std.Io.File.Stat, used: u64 };
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: [64]?Entry = @splat(null),
+    clock: u64 = 0,
+
+    fn contains(self: *LocalVerificationCache, key: [32]u8, stat: std.Io.File.Stat) bool {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        for (&self.entries) |*slot| if (slot.*) |*entry| {
+            if (std.mem.eql(u8, &key, &entry.key) and sameFileVersion(stat, entry.stat)) {
+                self.clock +%= 1;
+                entry.used = self.clock;
+                return true;
+            }
+        };
+        return false;
+    }
+    fn remember(self: *LocalVerificationCache, key: [32]u8, stat: std.Io.File.Stat) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        var victim: usize = 0;
+        for (self.entries, 0..) |slot, i| {
+            const entry = slot orelse {
+                victim = i;
+                break;
+            };
+            if (std.mem.eql(u8, &key, &entry.key)) {
+                victim = i;
+                break;
+            }
+            if (entry.used < self.entries[victim].?.used) victim = i;
+        }
+        self.clock +%= 1;
+        self.entries[victim] = .{ .key = key, .stat = stat, .used = self.clock };
+    }
+};
+
+fn sameFileVersion(a: std.Io.File.Stat, b: std.Io.File.Stat) bool {
+    return a.kind == .file and b.kind == .file and a.inode == b.inode and a.size == b.size and
+        std.meta.eql(a.mtime, b.mtime) and std.meta.eql(a.ctime, b.ctime);
+}
+
 /// Version-pinned range transport under the same URI, DNS and credential
 /// boundaries as ordinary downloads. No redirects or mutable-object fallback.
 pub const PinnedRange = struct {
@@ -937,8 +1006,17 @@ pub const PinnedRange = struct {
     length: u64,
     bucket: []u8 = &.{},
     key: []u8 = &.{},
-    backend: ?union(enum) { http: httpx.Client, s3: objectstore.S3.Client } = null,
+    backend: ?union(enum) { http: httpx.Client, s3: objectstore.S3.Client, file: LocalFile } = null,
     headers: []const HTTPHeader = &.{},
+
+    const LocalFile = struct {
+        file: std.Io.File,
+        stat: std.Io.File.Stat,
+        fn check(self: *const LocalFile, io: std.Io) !void {
+            const current = try self.file.stat(io);
+            if (!sameFileVersion(current, self.stat)) return error.SourceVersionChanged;
+        }
+    };
 
     /// Validate the immutable source contract without allocation, credential
     /// resolution, transport construction or I/O. Destination policy and
@@ -948,17 +1026,21 @@ pub const PinnedRange = struct {
     }
 
     pub fn create(alloc: Allocator, context: DownloadContext, uri: []const u8, version: []const u8, kind: VersionKind, length: u64, security: ?*const ContentSecurityConfig, credentials: ?*const S3CredentialsConfig, headers: []const HTTPHeader) !*PinnedRange {
+        return createWithLocalCache(alloc, context, uri, version, kind, length, security, credentials, headers, null);
+    }
+
+    pub fn createWithLocalCache(alloc: Allocator, context: DownloadContext, uri: []const u8, version: []const u8, kind: VersionKind, length: u64, security: ?*const ContentSecurityConfig, credentials: ?*const S3CredentialsConfig, headers: []const HTTPHeader, cache: ?*LocalVerificationCache) !*PinnedRange {
         try context.check();
         if (headers.len > 128) return error.InvalidSourceReference;
         const parsed = try validateReference(uri, version, kind, length);
         const self = try alloc.create(PinnedRange);
         self.* = .{ .allocator = alloc, .context = context, .transport = .{ .backing = alloc, .limit = context.transport_memory_limit_bytes }, .security = security, .kind = kind, .length = length, .headers = headers };
         errdefer self.destroy();
-        self.initBackend(uri, version, parsed, credentials) catch |err| return transportError(&self.transport, err);
+        self.initBackend(uri, version, parsed, credentials, cache) catch |err| return transportError(&self.transport, err);
         return self;
     }
 
-    fn initBackend(self: *PinnedRange, uri: []const u8, version: []const u8, parsed: std.Uri, credentials: ?*const S3CredentialsConfig) !void {
+    fn initBackend(self: *PinnedRange, uri: []const u8, version: []const u8, parsed: std.Uri, credentials: ?*const S3CredentialsConfig, cache: ?*LocalVerificationCache) !void {
         const alloc = self.allocator;
         const transport_alloc = self.transport.allocator();
         const context = self.context;
@@ -992,12 +1074,57 @@ pub const PinnedRange = struct {
                 return err;
             };
             self.backend = .{ .s3 = client };
+        } else if (std.ascii.eqlIgnoreCase(parsed.scheme, "file")) {
+            if (headers.len != 0) return error.InvalidSourceReference;
+            try requireFileAccess(security);
+            if ((context.timeout_ms orelse 0) != 0) return error.FileTimeoutUnsupported;
+            const path_buf = try alloc.dupe(u8, parsed.path.percent_encoded);
+            defer alloc.free(path_buf);
+            const path = std.Uri.percentDecodeInPlace(path_buf);
+            if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidSourceReference;
+            try validateFilePathSecurityBeforeOpen(alloc, context.io, path, security);
+            const file = try std.Io.Dir.openFileAbsolute(context.io, path, .{ .allow_directory = false });
+            errdefer file.close(context.io);
+            try validateOpenFilePathSecurity(alloc, context.io, file, security);
+            const stat = try file.stat(context.io);
+            if (stat.kind != .file) return error.InvalidSourceReference;
+            if (stat.size != self.length) return error.SourceVersionChanged;
+            const local = LocalFile{ .file = file, .stat = stat };
+            var canonical_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            self.identity = try std.fmt.allocPrint(alloc, "file:{s}", .{canonical_buf[0..try file.realPath(context.io, &canonical_buf)]});
+            var key_hash = std.crypto.hash.sha2.Sha256.init(.{});
+            key_hash.update(self.identity);
+            key_hash.update(version);
+            const key = key_hash.finalResult();
+            if (cache == null or !cache.?.contains(key, stat)) {
+                // Hash outside the cache lock. Warm continuation requests use
+                // verified metadata without rescanning a multi-GB recording.
+                var hash = std.crypto.hash.sha2.Sha256.init(.{});
+                const buffer = try alloc.alloc(u8, 256 * 1024);
+                defer alloc.free(buffer);
+                var offset: u64 = 0;
+                while (offset < self.length) {
+                    try context.check();
+                    const n = try file.readPositional(context.io, &.{buffer[0..@intCast(@min(buffer.len, self.length - offset))]}, offset);
+                    if (n == 0) return error.SourceVersionChanged;
+                    hash.update(buffer[0..n]);
+                    offset += n;
+                }
+                try context.check();
+                try local.check(context.io);
+                const digest = std.fmt.bytesToHex(hash.finalResult(), .lower);
+                if (!std.mem.eql(u8, &digest, version)) return error.SourceVersionChanged;
+                if (cache) |receipts| receipts.remember(key, stat);
+            }
+            try local.check(context.io);
+            self.backend = .{ .file = local };
         } else return error.UnsupportedUrlScheme;
     }
     pub fn destroy(self: *PinnedRange) void {
         if (self.backend) |*backend| switch (backend.*) {
             .http => |*client| client.deinit(),
             .s3 => |*client| client.deinit(),
+            .file => |*local| local.file.close(self.context.io),
         };
         const a = self.allocator;
         a.free(self.uri);
@@ -1006,6 +1133,18 @@ pub const PinnedRange = struct {
         a.free(self.bucket);
         a.free(self.key);
         a.destroy(self);
+    }
+    /// Also guard completion when the media read-ahead cache serves every read.
+    pub fn validate(self: *PinnedRange) !void {
+        try self.context.check();
+        if (self.backend) |*backend| switch (backend.*) {
+            .file => |*local| {
+                try requireFileAccess(self.security);
+                try validateOpenFilePathSecurity(self.allocator, self.context.io, local.file, self.security);
+                try local.check(self.context.io);
+            },
+            else => {},
+        };
     }
     pub fn readAt(self: *PinnedRange, offset: u64, out: []u8) !usize {
         return self.readAtInternal(offset, out) catch |err| transportError(&self.transport, err);
@@ -1016,6 +1155,20 @@ pub const PinnedRange = struct {
         if (out.len > maxDownloadSize(self.security)) return error.StreamTooLong;
         const ceiling = try DownloadCeiling.init(self.context, self.security);
         switch (self.backend.?) {
+            .file => |*local| {
+                try requireFileAccess(self.security);
+                try validateOpenFilePathSecurity(self.allocator, self.context.io, local.file, self.security);
+                try local.check(self.context.io);
+                var done: usize = 0;
+                while (done < out.len) {
+                    try self.context.check();
+                    const n = try local.file.readPositional(self.context.io, &.{out[done..]}, offset + done);
+                    if (n == 0) return error.SourceVersionChanged;
+                    done += n;
+                }
+                try local.check(self.context.io);
+                try self.context.check();
+            },
             .http => |*client| {
                 const headers = try self.allocator.alloc([2][]const u8, self.headers.len + 3);
                 defer self.allocator.free(headers);
@@ -2688,4 +2841,133 @@ test "S3 downloads and pinned ranges detach results from scoped transport alloca
     if (failure) |err| return err;
     try std.testing.expectEqual(@as(usize, 1), upstream.routeHitCount(0));
     try std.testing.expectEqual(@as(usize, 2), upstream.routeHitCount(1));
+}
+
+test "pinned local ranges verify digest, bound reads, detect edits and revoke access" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = "0123456789";
+    try tmp.dir.writeFile(io, .{ .sub_path = "video file.mp4", .data = data });
+    const path = try tmp.dir.realPathFileAlloc(io, "video file.mp4", a);
+    defer a.free(path);
+    const raw = try std.fmt.allocPrint(a, "file://{s}", .{path});
+    defer a.free(raw);
+    const uri = try std.mem.replaceOwned(u8, a, raw, " ", "%20");
+    defer a.free(uri);
+    const paths = [_][]u8{path};
+    // The object exceeds the download cap; only individual ranges are capped.
+    var security = ContentSecurityConfig{ .allowed_paths = &paths, .max_download_size_bytes = 4 };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
+    const version = std.fmt.bytesToHex(digest, .lower);
+    const range = try PinnedRange.create(a, .{ .io = io }, uri, &version, .file_sha256, data.len, &security, null, &.{});
+    defer range.destroy();
+    var out: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), try range.readAt(3, &out));
+    try std.testing.expectEqualStrings("3456", &out);
+    try std.testing.expectError(error.InvalidRemoteRange, range.readAt(8, &out));
+    var too_big: [5]u8 = undefined;
+    try std.testing.expectError(error.StreamTooLong, range.readAt(0, &too_big));
+    security.allowed_paths = &.{};
+    try std.testing.expectError(error.PathNotAllowed, range.readAt(0, &out));
+    security.allowed_paths = &paths;
+    try std.testing.expectEqual(@as(usize, 4), try range.readAt(0, &out));
+    // Same length changes are detected, even without a length mismatch.
+    try tmp.dir.writeFile(io, .{ .sub_path = "video file.mp4", .data = "abcdefghij" });
+    try std.testing.expectError(error.SourceVersionChanged, range.readAt(0, &out));
+    try std.testing.expectError(error.SourceVersionChanged, PinnedRange.create(a, .{ .io = io }, uri, &version, .file_sha256, data.len, &security, null, &.{}));
+    try std.testing.expectError(error.SourceVersionChanged, PinnedRange.create(a, .{ .io = io }, uri, &version, .file_sha256, data.len + 1, &security, null, &.{}));
+    try std.testing.expectError(error.PathNotAllowed, PinnedRange.create(a, .{ .io = io }, uri, &version, .file_sha256, data.len, null, null, &.{}));
+    try std.testing.expectError(error.FileTimeoutUnsupported, PinnedRange.create(a, .{ .io = io, .timeout_ms = 1 }, uri, &version, .file_sha256, data.len, &security, null, &.{}));
+}
+
+test "pinned local ranges reject canonical symlink escape" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "allowed");
+    try tmp.dir.writeFile(io, .{ .sub_path = "secret", .data = "secret" });
+    try tmp.dir.symLink(io, "../secret", "allowed/link", .{});
+    const root = try tmp.dir.realPathFileAlloc(io, "allowed", a);
+    defer a.free(root);
+    const uri = try std.fmt.allocPrint(a, "file://{s}/link", .{root});
+    defer a.free(uri);
+    const paths = [_][]u8{root};
+    const security = ContentSecurityConfig{ .allowed_paths = &paths };
+    const version = "0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expectError(error.PathNotAllowed, PinnedRange.create(a, .{ .io = io }, uri, version, .file_sha256, 6, &security, null, &.{}));
+}
+
+test "local verification receipts avoid repeated full-file reads and invalidate on change" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "media", .data = "0123456789" });
+    const path = try tmp.dir.realPathFileAlloc(io, "media", a);
+    defer a.free(path);
+    const uri = try std.fmt.allocPrint(a, "file://{s}", .{path});
+    defer a.free(uri);
+    const paths = [_][]u8{path};
+    var security = ContentSecurityConfig{ .allowed_paths = &paths };
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("0123456789", &hash, .{});
+    const version = std.fmt.bytesToHex(hash, .lower);
+    var cache: LocalVerificationCache = .{};
+    const cold = try PinnedRange.createWithLocalCache(a, .{ .io = io }, uri, &version, .file_sha256, 10, &security, null, &.{}, &cache);
+    cold.destroy();
+    // A warm continuation cannot allocate the 256 KiB streaming hash buffer.
+    var bytes: [32 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&bytes);
+    const warm = try PinnedRange.createWithLocalCache(bounded.allocator(), .{ .io = io }, uri, &version, .file_sha256, 10, &security, null, &.{}, &cache);
+    defer warm.destroy();
+    var out: [4]u8 = undefined;
+    _ = try warm.readAt(6, &out);
+    try std.testing.expectEqualStrings("6789", &out);
+    security.allowed_paths = &.{};
+    try std.testing.expectError(error.PathNotAllowed, PinnedRange.createWithLocalCache(a, .{ .io = io }, uri, &version, .file_sha256, 10, &security, null, &.{}, &cache));
+    security.allowed_paths = &paths;
+    try tmp.dir.writeFile(io, .{ .sub_path = "media", .data = "abcdefghij" });
+    try std.testing.expectError(error.SourceVersionChanged, warm.validate());
+    try std.testing.expectError(error.SourceVersionChanged, PinnedRange.createWithLocalCache(a, .{ .io = io }, uri, &version, .file_sha256, 10, &security, null, &.{}, &cache));
+}
+
+test "local source authorization acquires hot-reloaded policy for every extraction" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "media", .data = "media" });
+    const path = try tmp.dir.realPathFileAlloc(io, "media", a);
+    defer a.free(path);
+    const uri = try std.fmt.allocPrint(a, "file://{s}", .{path});
+    defer a.free(uri);
+    const paths = [_][]u8{path};
+    const Publisher = struct {
+        config: RemoteContentConfig = .{ .security = .{ .allowed_paths = &.{} } },
+        acquires: usize = 0,
+        releases: usize = 0,
+        fn acquire(raw: *anyopaque, out: *RemoteContentConfig.Snapshot) callconv(.c) RemoteContentConfig.RemoteContentRuntime.AcquireStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.acquires += 1;
+            out.* = .{ .config = &self.config, .context = self, .release_fn = release };
+            return .ok;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.releases += 1;
+        }
+    };
+    var publisher: Publisher = .{};
+    const facade = RemoteContentConfig{ .runtime = .{ .context = &publisher, .acquire_fn = Publisher.acquire } };
+    try std.testing.expectError(error.PathNotAllowed, authorizeLocalSource(a, io, uri, &facade));
+    publisher.config.security.?.allowed_paths = &paths;
+    try authorizeLocalSource(a, io, uri, &facade);
+    publisher.config.security.?.allowed_paths = &.{};
+    try std.testing.expectError(error.PathNotAllowed, authorizeLocalSource(a, io, uri, &facade));
+    try std.testing.expectEqual(@as(usize, 3), publisher.acquires);
+    try std.testing.expectEqual(publisher.acquires, publisher.releases);
 }

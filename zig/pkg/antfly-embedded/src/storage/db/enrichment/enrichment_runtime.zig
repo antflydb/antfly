@@ -39898,6 +39898,7 @@ fn extractModelChunkSourceCached(a: Allocator, config: Config, raw: []const u8, 
             return .{ .input = .{ .text = text }, .bytes = text };
         },
         .source => |borrowed| {
+            if (borrowed.version_kind == .file_sha256) try scraping.authorizeLocalSource(a, config.io orelse return error.UnsupportedPlatform, borrowed.uri, config.remote_content);
             var reference = borrowed;
             var result = ModelChunkSource{};
             errdefer result.deinit(a);
@@ -44547,6 +44548,30 @@ test "backup preflight literal fields match enrichment execution" {
     const json = try report.jsonAlloc("{\"version\":1,\"configuration_id\":\"empty-destination\"}");
     defer a.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
+}
+
+test "model aware media local source recipes enforce current policy without loading bytes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "media", .data = "media" });
+    const path = try tmp.dir.realPathFileAlloc(io, "media", a);
+    defer a.free(path);
+    const uri = try std.fmt.allocPrint(a, "file://{s}", .{path});
+    defer a.free(uri);
+    const paths = [_][]u8{path};
+    var remote = scraping.RemoteContentConfig{ .security = .{ .allowed_paths = &paths, .max_download_size_bytes = 1 } };
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .body = .{ .type = "source", .uri = uri, .mime_type = "video/mp4", .version_kind = "file_sha256", .version = "721c9525ade2ea8903d343ef25cf68b9b1fabb61f35b5210966e3cc9e454cd27", .length = 5 } }, .{});
+    defer a.free(raw);
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .chunk_text, .index_name = "idx", .artifact_name = "chunks", .embedding_name = "embedding", .doc_key = "doc", .source_field = "body" };
+    var source = try extractModelChunkSource(a, .{ .io = io, .remote_content = &remote }, raw, request, null);
+    defer source.deinit(a);
+    try std.testing.expectEqual(.file_sha256, source.input.?.source.version_kind);
+    try std.testing.expectEqualStrings(uri, source.input.?.source.uri);
+    try std.testing.expect(source.bytes == null);
+    remote.security.?.allowed_paths = &.{};
+    try std.testing.expectError(error.PathNotAllowed, extractModelChunkSource(a, .{ .io = io, .remote_content = &remote }, raw, request, null));
 }
 
 test "model aware media retained source recipes own their immutable object reference" {

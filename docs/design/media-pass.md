@@ -60,3 +60,46 @@ Serverless output receipts persist in the derived document. Unfinished outputs k
 To reproduce the decoder and AAC metadata component benchmark, run `zig build inference-test -Doptimize=ReleaseFast '-Dtest-filter=benchmark media seek windows'` from `zig/`. It checks sample checksums and reports cold index construction/copy separately from paging. These timings exclude network and model inference; cache retention remains subject to admission and the shared 64 MiB/eight-entry limit.
 
 Generation probes use named outputs, `observe_only: true`, and `execute: false` on every target. Enrichment workers normalize legacy single-embedding configurations into that observation contract. They resolve immutable source and model planning identities and return `observation` metadata separately from `data`. They do not enumerate source units, decode media, execute output models, or acknowledge chunk coverage. The response has no continuation and does not certify source completion. Local, supervised, and HTTP chunk providers use the same observation contract; older callbacks may still return a planned first member. Cold immutable MP3 and FLAC observation probes read no encoded audio bytes.
+
+## Local files in place
+
+A model-aware source field can hold a versioned local file reference:
+
+```json
+{
+  "type": "source",
+  "uri": "file:///Users/me/Videos/recording.mp4",
+  "mime_type": "video/mp4",
+  "version_kind": "file_sha256",
+  "version": "<64 lowercase hexadecimal SHA-256 characters>",
+  "length": 4294967296
+}
+```
+
+The file must be visible at the same absolute path to storage and inference.
+Standalone desktop deployments share that filesystem. Configure an explicit
+`remote_content.security.allowed_paths` allowlist in storage and the worker's
+content-security allowlist when inference runs separately. Storage acquires the
+current remote-content policy on every extraction, including continuation and
+repair; the worker independently authorizes the open descriptor. Both lexical
+path boundaries and canonical descriptor paths are checked, including symlink
+escapes. Empty or omitted path allowlists deny access. Worker policy remains
+an independent ceiling: storage policy reload cannot grant paths the worker
+does not allow.
+
+The worker verifies the caller's SHA-256 using a 256 KiB streaming buffer and
+retains the descriptor for that request. Media parsing uses the existing paged
+range reader; the file size can exceed `max_download_size_bytes`, which bounds
+individual ranges. A fixed 64-entry process-local verification cache avoids
+rehashing unchanged files on continuation pages. Cache hits still reopen and
+authorize the file and compare inode, size, mtime and ctime. Cache misses and
+metadata changes require a fresh hash; receipts never survive process restart.
+No file contents or decoded media are retained by this cache.
+
+Checks around each range read and at request completion reject modifications
+with `SourceVersionChanged`, including when read-ahead served the final bytes.
+This relies on a filesystem that updates mtime/ctime for writes; it is not a
+snapshot against a privileged writer or a filesystem that conceals mutations.
+As with other local-file fetches, explicit hard I/O deadlines fail with
+`FileTimeoutUnsupported`; cancellation is checked between file operations.
+Use a source object for local media: a plain `file://` string remains text.

@@ -4370,6 +4370,7 @@ const SileroWeightCache = struct {
 const HostCaches = struct {
     allocator: std.mem.Allocator,
     media_index_cache: @import("../pipelines/media_index_cache.zig").Cache = .{},
+    local_source_verifications: scraping.LocalVerificationCache = .{},
     silero_weights: SileroWeightCache = .{},
     silero_weights_lock: std.atomic.Mutex = .unlocked,
 
@@ -14680,7 +14681,11 @@ pub const Node = struct {
             const transport_allocator = transport_bound.allocator();
             var security = effectiveRequestContentSecurity(self);
             const download_context = InferenceDownloadRequestContext{ .io = io, .control = control };
-            const remote = try scraping.PinnedRange.create(transport_allocator, try inferenceDownloadContext(&download_context), reference.uri, reference.version, if (reference.version_kind == .strong_etag) .strong_etag else .s3_version_id, reference.length, &security, if (self.config.s3_credentials) |*credentials| credentials else null, &.{});
+            const remote = try scraping.PinnedRange.createWithLocalCache(transport_allocator, try inferenceDownloadContext(&download_context), reference.uri, reference.version, switch (reference.version_kind) {
+                .strong_etag => .strong_etag,
+                .s3_version_id => .s3_version_id,
+                .file_sha256 => .file_sha256,
+            }, reference.length, &security, if (self.config.s3_credentials) |*credentials| credentials else null, &.{}, &self.host_caches.local_source_verifications);
             defer remote.destroy();
             const Range = struct {
                 fn read(raw: *anyopaque, offset: u64, out: []u8, check: media.source.Control) !usize {
@@ -14709,7 +14714,9 @@ pub const Node = struct {
             resolved.native_source = &source;
             resolved.native_transport_bytes = 0; // Transport allocations already own shared admission.
             resolved.source_version = reference.version;
-            return self.chunkAndEmbedAdmitted(a, io, control, resolved, target, sink);
+            const execution = try self.chunkAndEmbedAdmitted(a, io, control, resolved, target, sink);
+            try remote.validate();
+            return execution;
         }
         if (request.transcribe_boundary) return self.chunkTranscribeBoundary(a, io, control, request, target, sink);
         if (target.model.len == 0 or (target.dimensions != null and target.dimensions.? == 0)) return error.InvalidChunkModel;
@@ -47887,6 +47894,40 @@ test "context checkpoint HTTP errors distinguish stale revisions from corrupt pa
         try std.testing.expectEqualStrings(if (failure == error.StaleCheckpoint) "CONTEXT_CHECKPOINT_STALE_REVISION" else "CONTEXT_CHECKPOINT_MISMATCH", payload.value.@"error");
         try std.testing.expect(!payload.value.retryable);
     }
+}
+
+test "model aware media local source validates transport before model execution" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "media", .data = "0123456789" });
+    const path = try tmp.dir.realPathFileAlloc(io, "media", a);
+    defer a.free(path);
+    const uri = try std.fmt.allocPrint(a, "file://{s}", .{path});
+    defer a.free(uri);
+    const paths = [_][]u8{path};
+    var node = try Node.init(a, .{ .content_security = .{ .allowed_paths = &paths } });
+    defer node.deinit();
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("0123456789", &digest, .{});
+    const version = std.fmt.bytesToHex(digest, .lower);
+    const chunks = @import("../pipelines/media_chunking.zig");
+    var request = chunks.Request{ .input = .{ .source = .{ .uri = uri, .mime_type = "video/mp4", .version_kind = .file_sha256, .version = &version, .length = 10 } } };
+    const Discard = struct {
+        fn accept(_: *anyopaque, _: chunks.Item) !void {
+            return error.UnexpectedOutput;
+        }
+    };
+    const sink = chunks.Sink{ .context = &node, .accept = Discard.accept };
+    // An empty model is rejected only after the local transport is resolved.
+    try std.testing.expectError(error.InvalidChunkModel, node.chunkAndEmbedAdmitted(a, io, .{}, request, .{ .model = "" }, sink));
+    try std.testing.expectError(error.InvalidChunkModel, node.chunkAndEmbedAdmitted(a, io, .{}, request, .{ .model = "" }, sink));
+    request.input.source.version = "0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expectError(error.SourceVersionChanged, node.chunkAndEmbedAdmitted(a, io, .{}, request, .{ .model = "" }, sink));
+    request.input.source.version = &version;
+    node.config.content_security.?.allowed_paths = &.{};
+    try std.testing.expectError(error.PathNotAllowed, node.chunkAndEmbedAdmitted(a, io, .{}, request, .{ .model = "" }, sink));
 }
 
 test "model aware media borrowed PCM transcription rejects empty input before model work" {
