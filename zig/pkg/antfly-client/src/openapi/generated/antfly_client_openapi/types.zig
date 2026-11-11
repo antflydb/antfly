@@ -36052,14 +36052,18 @@ pub const LeannIndexConfig = struct {
     max_degree: ?i64 = null,
     /// Compact code used to steer the graph walk. "rabitq" (default) carries error bounds, so only candidates that can still reach the top k are recomputed. "pq" follows the LEANN paper's fixed rerank ratio; prefer it only for very low dimensions (below about 64).
     quantizer: ?[]const u8 = null,
-    /// Whether document embeddings stay stored after the graph covers them. "transient" (the default when possible) keeps only a small stub per document and re-embeds a few candidates per query from the document's field or template through the index's embedder, so the index stores about 15% of the raw vectors' bytes. "persistent" keeps every embedding, and is the only choice for external vectors, chunked indexes, indexes fed by other enrichments, and the pq quantizer.
+    /// Whether document embeddings stay stored after the graph covers them. "auto" (the default when the index has its own embedder) keeps only a small stub for each embedding computed from text (a field, a text-only template, or a text chunk) and re-embeds a few such candidates per query, while embeddings computed from media (images, audio windows, model outputs) stay stored. "transient" stubs every covered embedding, so it requires inputs that re-embed from text: no media chunkers. "persistent" keeps every embedding, and is the only choice for external vectors, indexes fed by other enrichments, and the pq quantizer.
     vector_storage: ?[]const u8 = null,
     /// Beam width for searches. 0 picks the default for the quantizer (512 for rabitq, 64 for pq).
     search_ef: ?i64 = null,
     /// Multiplier on RaBitQ error bounds (rabitq only). Larger recomputes more candidates and loses fewer true neighbors.
     bound_scale: ?f32 = null,
-    /// Candidates recomputed per batch. 0 uses k.
+    /// Candidates recomputed per batch. 0 uses k for bounded search and 128 for full-effort search.
     batch_size: ?i64 = null,
+    /// Time a query may spend re-embedding candidates whose stored vectors were dropped. If the budget is spent before scoring finishes, the search returns an incomplete-coverage error; retry with a larger budget. 0 means no limit.
+    reembed_budget_ms: ?i64 = null,
+    /// How vectors that cannot be re-embedded from text (images, audio windows, model outputs) are kept once the graph covers them. "full" keeps the stored float32 vector. "int8" replaces it with a stub holding an int8 copy (about a quarter of the size), read back instead of re-embedding. Requires "auto" or "transient" storage.
+    media_vectors: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -36069,6 +36073,8 @@ pub const LeannIndexConfig = struct {
         .{ "search_ef", "search_ef", true },
         .{ "bound_scale", "bound_scale", true },
         .{ "batch_size", "batch_size", true },
+        .{ "reembed_budget_ms", "reembed_budget_ms", true },
+        .{ "media_vectors", "media_vectors", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -36103,6 +36109,14 @@ pub const LeannIndexConfig = struct {
         }
         if (self.batch_size) |value| {
             try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        if (self.reembed_budget_ms) |value| {
+            try jw.objectField("reembed_budget_ms");
+            try jw.write(value);
+        }
+        if (self.media_vectors) |value| {
+            try jw.objectField("media_vectors");
             try jw.write(value);
         }
         try jw.endObject();

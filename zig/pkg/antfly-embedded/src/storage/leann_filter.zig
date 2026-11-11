@@ -47,6 +47,14 @@ pub const Filter = struct {
         self.ids.deinit(alloc);
     }
 
+    pub fn nodeActive(self: *const Filter) bool {
+        return !self.ids.isTrivial() or self.request.key_predicate != null or self.request.filter_prefix.len != 0;
+    }
+
+    pub fn distanceActive(self: *const Filter) bool {
+        return self.request.distance_over != null or self.request.distance_under != null;
+    }
+
     pub fn active(self: *const Filter) bool {
         return !self.ids.isTrivial() or self.request.key_predicate != null or self.request.filter_prefix.len != 0 or
             self.request.distance_over != null or self.request.distance_under != null;

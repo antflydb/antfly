@@ -45,6 +45,13 @@ pub fn validatePayload(value: ?[]const u8) !void {
     const header = codec.decodeHeader(bytes) catch return error.InvalidMergePage;
     if (header.flags.has_graph_generation or header.flags.portable_unbound_graph_generation or header.flags._reserved != 0 or header.payload_len < 4)
         return error.InvalidMergePage;
+    if (header.flags.vector_elided) {
+        // A transient LEANN stub: dims and a digest, no vector.
+        if (header.kind != .dense_embedding) return error.InvalidMergePage;
+        const stub = (codec.elidedDenseEmbedding(bytes) catch return error.InvalidMergePage) orelse return error.InvalidMergePage;
+        if (stub.dims == 0) return error.InvalidMergePage;
+        return;
+    }
     const payload = bytes[codec.header_len..];
     const count: usize = std.mem.readInt(u32, payload[0..4], .little);
     const stride: usize = switch (header.kind) {
@@ -75,6 +82,20 @@ test "online direct vector artifacts validate exact bounded values and tombstone
     try validate(key, dense);
     try validate(key, null);
     try std.testing.expectError(error.InvalidMergePage, validate(key, dense[0 .. dense.len - 1]));
+    // A transient LEANN stub carries dims and a digest, not a vector.
+    const stub = try codec.encodeElidedDenseEmbeddingAlloc(alloc, try codec.decodeHeader(dense), 2, 99);
+    defer alloc.free(stub);
+    try validate(key, stub);
+    try std.testing.expectError(error.InvalidMergePage, validate(key, stub[0 .. stub.len - 1]));
+
+    const quantized = try codec.encodeInt8ElidedDenseEmbeddingAlloc(alloc, try codec.decodeHeader(dense), &.{ 1, 2 }, 99);
+    defer alloc.free(quantized);
+    try validate(key, quantized);
+    const scale_offset = codec.header_len + @sizeOf(u32) + @sizeOf(u64);
+    for ([_]f32{ 0, -1, std.math.inf(f32), std.math.nan(f32), std.math.floatMax(f32) }) |invalid| {
+        std.mem.writeInt(u32, quantized[scale_offset..][0..4], @bitCast(invalid), .little);
+        try std.testing.expectError(error.InvalidMergePage, validate(key, quantized));
+    }
     const sparse = try codec.encodeSparseEmbeddingAlloc(alloc, 10, &.{ 2, 7 }, &.{ 1, 3 });
     defer alloc.free(sparse);
     try validate(key, sparse);
