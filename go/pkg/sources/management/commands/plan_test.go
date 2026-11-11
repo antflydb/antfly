@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package commands
 
@@ -243,11 +255,12 @@ func TestPlanManifestUnchangedCarriesServerDefaults(t *testing.T) {
 
 func TestPlanManifestSortedChangesAndCompleteReplacement(t *testing.T) {
 	current := manifestCurrent("docs")
-	current.Streams = []management.SearchStream{{Name: "text", Field: "body"}}
+	current.SearchVersion = 2
+	current.Streams = []management.SearchStream{{Name: "text", Field: "body", Retrieval: &management.RetrievalBindings{Exact: &management.ExactRetrieval{}}}}
 	current.Artifacts = []management.ArtifactBinding{{Name: "original", Artifact: "original", ContentType: "application/pdf"}}
 	current.Processing = &management.ProcessingDeclaration{}
 	current.Identity = management.SourceIdentity{Namespace: "stable-namespace"}
-	current.Knowledge = &management.KnowledgeDeclaration{Audience: "team", Version: 1}
+	current.Knowledge = &management.KnowledgeDeclaration{Audience: "team", Version: 1, Mode: "instance_one_audience"}
 	api := newManifestAPI(t, current)
 	entry := manifestEntry("docs")
 	entry.Name = "Renamed"
@@ -520,7 +533,7 @@ func TestApplyManifestPartialFailureAndRerunConverges(t *testing.T) {
 	failure := assertCode(t, err, CodeFailed)
 	requireApplyOutcomes(t, results, []string{"first", "second", "third"}, []string{"created", "failed", "created"})
 	wantMessage := Classify(management.Failure(http.StatusInternalServerError, "acquisition_failed")).Error()
-	if results[1].Error != wantMessage || failure.Message != "1 of 3 sources failed to apply; rerunning apply is safe" || len(api.writes) != 3 {
+	if results[1].Error != wantMessage || failure.Message != "1 of 3 sources failed to apply; inspect per-source results; rerunning apply is safe" || len(api.writes) != 3 {
 		t.Fatalf("failure=%#v results=%#v writes=%#v", failure, results, api.writes)
 	}
 	if !strings.Contains(out.String(), "Applied: 2 created, 0 updated, 0 unchanged, 0 conflicts, 1 failed.") || !strings.Contains(out.String(), wantMessage) {

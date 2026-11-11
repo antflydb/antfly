@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package commands
 
@@ -13,6 +25,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/antflydb/antfly/go/pkg/sources/internal/declarations"
 	"github.com/antflydb/antfly/go/pkg/sources/management"
 )
 
@@ -50,12 +63,15 @@ type Plan struct {
 }
 
 type ApplyResult struct {
-	Key      string     `json:"key"`
-	SourceID string     `json:"source_id"`
-	Action   PlanAction `json:"action"`
-	Outcome  string     `json:"outcome"`
-	Revision string     `json:"revision,omitempty"`
-	Error    string     `json:"error,omitempty"`
+	Key        string     `json:"key"`
+	SourceID   string     `json:"source_id"`
+	Action     PlanAction `json:"action"`
+	Outcome    string     `json:"outcome"`
+	Revision   string     `json:"revision,omitempty"`
+	Error      string     `json:"error,omitempty"`
+	ErrorCode  string     `json:"error_code,omitempty"`
+	HTTPStatus int        `json:"http_status,omitempty"`
+	ServerCode string     `json:"server_code,omitempty"`
 }
 
 // PlanManifest prints a read-only plan in manifest order.
@@ -141,6 +157,9 @@ func planManifest(ctx context.Context, api API, m Manifest, opts PlanOptions) (P
 		if err != nil {
 			return Plan{}, c, Classify(err)
 		}
+		if err := validateDesired(desired, c); err != nil {
+			return Plan{}, c, manifestInvalid(manifestSourcePath(i, entry.Key), err.Error())
+		}
 		item := PlanItem{Key: entry.Key, SourceID: id, Action: PlanCreate, Desired: desired}
 		if !create {
 			item.Revision = sourceRevision(current)
@@ -160,8 +179,10 @@ func planManifest(ctx context.Context, api API, m Manifest, opts PlanOptions) (P
 
 func manifestDesired(ctx context.Context, current management.Source, entry ManifestSource, id, connection string, create bool, opts PlanOptions) (management.Source, error) {
 	desired := manifestDeclaration(current)
-	desired.Id, desired.Name = id, entry.Name
-	if desired.Name == "" {
+	desired.Id = id
+	if entry.Name != "" {
+		desired.Name = entry.Name
+	} else if create {
 		desired.Name = entry.Key
 	}
 	desired.Connection, desired.Table, desired.Config = connection, entry.Table, entry.Config
@@ -204,6 +225,21 @@ func manifestDesired(ctx context.Context, current management.Source, entry Manif
 		desired.Knowledge = entry.Knowledge
 	}
 	return desired, nil
+}
+
+// Validate the complete effective declaration before any source is written.
+// Provider access, native admission and authorization remain server checks.
+func validateDesired(source management.Source, c management.Capabilities) error {
+	if err := declarations.ValidateSearchBindings(source.SearchVersion, source.Streams, source.Artifacts); err != nil {
+		return fmt.Errorf("search bindings: %w", err)
+	}
+	if err := declarations.ValidateProcessing(source.Processing); err != nil {
+		return fmt.Errorf("processing: %w", err)
+	}
+	if err := declarations.ValidateKnowledgeProcessing(source.Knowledge, source.Processing, c.KnowledgeAudience); err != nil {
+		return fmt.Errorf("knowledge: %w", err)
+	}
+	return nil
 }
 
 func manifestDeclaration(source management.Source) management.Source {
@@ -279,6 +315,7 @@ func ApplyManifest(ctx context.Context, env Env, m Manifest, opts PlanOptions) (
 	}
 	results := make([]ApplyResult, 0, len(plan.Items))
 	counts := make(map[string]int)
+	var failures []error
 	for _, item := range plan.Items {
 		result := ApplyResult{Key: item.Key, SourceID: item.SourceID, Action: item.Action, Outcome: "unchanged"}
 		if item.Action != PlanUnchanged {
@@ -298,6 +335,15 @@ func ApplyManifest(ctx context.Context, env Env, m Manifest, opts PlanOptions) (
 				result.Outcome, result.Revision = "created", sourceRevision(source)
 			default:
 				result.Outcome, result.Revision = "updated", sourceRevision(source)
+			}
+			if err != nil {
+				classified := Classify(err)
+				failures = append(failures, classified)
+				result.ErrorCode = CodeFailed
+				var failure *Error
+				if errors.As(classified, &failure) {
+					result.ErrorCode, result.HTTPStatus, result.ServerCode = failure.Code, failure.HTTPStatus, failure.ServerCode
+				}
 			}
 		}
 		counts[result.Outcome]++
@@ -322,11 +368,35 @@ func ApplyManifest(ctx context.Context, env Env, m Manifest, opts PlanOptions) (
 			counts["created"], counts["updated"], counts["unchanged"], conflicts, failed)
 		outputErr = env.writeHuman(out.String())
 	}
-	if conflicts != 0 {
-		return results, &Error{Code: CodeConflict, Message: fmt.Sprintf("%d source(s) changed since plan; review with plan and rerun apply", conflicts)}
-	}
-	if failed != 0 {
-		return results, &Error{Code: CodeFailed, Message: fmt.Sprintf("%d of %d sources failed to apply; rerunning apply is safe", failed, len(results))}
+	if len(failures) != 0 {
+		return results, applyFailure(failures, len(results))
 	}
 	return results, Classify(outputErr)
+}
+
+// A uniform failure category retains its scripting exit. Mixed categories use a
+// generic aggregate; every source keeps its own machine-readable error detail.
+func applyFailure(failures []error, total int) error {
+	aggregate := Error{Code: CodeFailed}
+	var first *Error
+	if errors.As(failures[0], &first) {
+		aggregate = *first
+		for _, err := range failures[1:] {
+			var next *Error
+			if !errors.As(err, &next) || next.Code != first.Code {
+				aggregate = Error{Code: CodeFailed}
+				break
+			}
+			// HTTP and server codes describe the aggregate only when identical.
+			if next.HTTPStatus != aggregate.HTTPStatus {
+				aggregate.HTTPStatus = 0
+			}
+			if next.ServerCode != aggregate.ServerCode {
+				aggregate.ServerCode = ""
+			}
+		}
+	}
+	aggregate.Message = fmt.Sprintf("%d of %d sources failed to apply; inspect per-source results; rerunning apply is safe", len(failures), total)
+	aggregate.err = errors.Join(failures...)
+	return &aggregate
 }

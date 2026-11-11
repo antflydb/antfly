@@ -884,6 +884,10 @@ the shared handler answers `501` for runtimes that do not. Use
 `Client.PutSourceIfMatch` with the revision from a prior read; the server's
 revision is authoritative (do not recompute it client-side).
 
+Optional empty stream/artifact arrays have the same revision as omitted arrays,
+matching their HTTP representation. Clearing either collection converges after
+one write.
+
 ### Reusable CLI handlers
 
 `sources/management/commands` packages management operations as framework-neutral
@@ -915,6 +919,18 @@ the shared declaration types:
 Fields an entry omits are left as the server has them. Plan never writes; apply
 writes only changed sources and never deletes one that is absent from the file —
 retire sources explicitly with archive or purge.
+
+Omitted names preserve existing display names; a new source defaults to its key.
+Planning validates every effective search, processing and knowledge declaration
+before any write, using the same pure validators as the runtime adapters.
+Provider access, authorization and native index admission are checked by the
+server. These shared validators live in `internal/declarations`, keeping command
+handlers independent of connector dependencies.
+
+Apply reports `error_code`, `http_status` and `server_code` on failed source
+results when available. If every failure has the same category, the command
+retains that category's exit status. Mixed categories exit 1; each result retains
+its own error details. Successful sources are kept and can converge on rerun.
 
 ## Native source records and searchable artifacts
 
