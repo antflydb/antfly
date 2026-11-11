@@ -298,6 +298,8 @@ pub const SearchOptions = struct {
     /// PQ distances. Costs roughly levels x M recomputations per query but
     /// avoids starting layer 0 in the wrong region when PQ is coarse. Filtered
     /// searches use approximate descent to avoid loading rejected vectors.
+    /// A closed recomputation gate also falls back to approximate descent;
+    /// cancellation aborts before dispatching the next exact batch.
     exact_descent: bool = false,
     rerank: Rerank = .auto,
     /// Multiplies RaBitQ error bounds in `bounds` mode. Larger is safer and
@@ -570,6 +572,9 @@ pub const PreparedSearch = struct {
                     const offset = if (estimates != null) candidates_view.len - 1 - position else position;
                     const p = candidates_view[offset];
                     if ((!opts.score_quantized_source and position < i and p.retained)) continue;
+                    if (!std.math.isFinite(p.est)) continue;
+                    if (opts.distance_over) |over| if (!(p.est > over)) continue;
+                    if (opts.distance_under) |under| if (!(p.est < under)) continue;
                     const c = FilteredCandidate{ .dist = p.est, .id = p.id, .order = if (source.result_order) |order| order(source.ctx, p.id) else p.id };
                     if (top.len() < k) {
                         try top.push(alloc, c);
@@ -1035,7 +1040,8 @@ pub const Index = struct {
 
         // A filtered search must not load rejected upper-layer vectors.
         const start = if (eff.candidate_ids != null) self.entry else if (eff.exact_descent and eff.filter == null)
-            try self.greedyDescentRecompute(alloc, source, q, self.entry, self.max_level, &stats)
+            (try self.greedyDescentRecompute(alloc, source, q, self.entry, self.max_level, &stats, eff.gate)) orelse
+                try self.greedyDescentApprox(&approx, self.entry, self.max_level, 0, &stats, 0, eff.gate)
         else
             try self.greedyDescentApprox(&approx, self.entry, self.max_level, 0, &stats, if (eff.filter != null and eff.filter_visit_limit > 0) @max(eff.filter_visit_limit / 4, 1) else 0, eff.gate);
 
@@ -1949,7 +1955,7 @@ pub const Index = struct {
 
     /// Greedy descent to layer 1 with exact distances. Each step recomputes
     /// the unseen neighbors of the current node in one batch.
-    fn greedyDescentRecompute(self: *const Index, alloc: Allocator, source: EmbeddingSource, q: []const f32, start: u32, from: u8, stats: *SearchStats) !u32 {
+    fn greedyDescentRecompute(self: *const Index, alloc: Allocator, source: EmbeddingSource, q: []const f32, start: u32, from: u8, stats: *SearchStats, gate: ?RecomputeGate) !?u32 {
         if (from == 0) return start;
         var seen = std.AutoHashMapUnmanaged(u32, f32).empty;
         defer seen.deinit(alloc);
@@ -1962,6 +1968,11 @@ pub const Index = struct {
 
         try ids.append(alloc, start);
         try dists.resize(alloc, 1);
+        try RecomputeGate.checkCancellation(gate);
+        if (!try RecomputeGate.open(gate)) {
+            stats.budget_exhausted = true;
+            return null;
+        }
         try self.recomputeDistances(alloc, source, q, ids.items, &buf, dists.items, stats);
         try seen.put(alloc, start, dists.items[0]);
         var cur = start;
@@ -1975,6 +1986,11 @@ pub const Index = struct {
                 ids.clearRetainingCapacity();
                 for (nbs) |nb| if (!seen.contains(nb)) try ids.append(alloc, nb);
                 try dists.resize(alloc, ids.items.len);
+                try RecomputeGate.checkCancellation(gate);
+                if (ids.items.len != 0 and !try RecomputeGate.open(gate)) {
+                    stats.budget_exhausted = true;
+                    return null;
+                }
                 try self.recomputeDistances(alloc, source, q, ids.items, &buf, dists.items, stats);
                 for (ids.items, dists.items) |id, dist| try seen.put(alloc, id, dist);
                 for (nbs) |nb| {
@@ -5184,4 +5200,76 @@ test "leann: prepared scoring validates dimensions and consumes zero-k and empty
     defer empty.deinit(std.testing.failing_allocator);
     try testing.expectEqual(@as(usize, 0), empty.results.len);
     try testing.expect(empty.stats.matches.complete);
+}
+
+test "leann: estimate fallback preserves distance predicates and finite scores" {
+    const Gate = struct {
+        remaining: usize = 1,
+        fn open(raw: *const anyopaque) !bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.remaining == 0) return false;
+            self.remaining -= 1;
+            return true;
+        }
+        fn recompute(_: *anyopaque, ids: []const u32, out: []f32) !void {
+            for (ids, out) |id, *value| value.* = @floatFromInt(id);
+        }
+    };
+    const alloc = testing.allocator;
+    for ([_]bool{ false, true }) |bounds| {
+        const estimates = [_]f32{ 0, 1, 2, 3, 4, std.math.nan(f32), std.math.inf(f32), -1, 5 };
+        const candidates = try alloc.alloc(PreparedCandidate, estimates.len);
+        for (candidates, estimates, 0..) |*candidate, estimate, id| candidate.* = .{ .id = @intCast(id), .lower = @as(f32, @floatFromInt(id)) - 1000, .est = estimate };
+        var plan = PreparedSearch{ .candidates = candidates, .metric = .l2_squared, .dims = 1, .has_bounds = bounds };
+        defer plan.deinit(alloc);
+        var gate = Gate{};
+        var response = try plan.score(alloc, .{ .ctx = &gate, .recompute_fn = Gate.recompute }, &.{0}, .{ .k = 8, .ef = 8, .batch_size = 2, .distance_over = 1, .distance_under = 4, .gate = .{ .ctx = &gate, .check_fn = Gate.open } });
+        defer response.deinit(alloc);
+        try testing.expect(response.stats.budget_exhausted);
+        try testing.expect(response.results.len > 0);
+        for (response.results) |result| {
+            try testing.expect(std.math.isFinite(result.distance));
+            try testing.expect(result.distance > 1 and result.distance < 4);
+        }
+    }
+}
+
+test "leann: exact descent gates every source batch and falls back on budget closure" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 256, 1, 8, 8, 43);
+    defer fx.deinit(alloc);
+    const Gate = struct {
+        remaining: usize,
+        cancel: bool,
+        fn open(raw: *const anyopaque) !bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (self.remaining == 0) {
+                if (self.cancel) return error.Cancelled;
+                return false;
+            }
+            self.remaining -= 1;
+            return true;
+        }
+    };
+    for ([_]Quantizer{ .rabitq, .pq }) |quantizer| {
+        var index = try Index.build(alloc, .{ .dims = 8, .quantizer = quantizer, .max_degree = 8 }, fx.data);
+        defer index.deinit();
+        try testing.expect(index.max_level > 0);
+        for ([_]usize{ 0, 1 }) |allowed| {
+            for ([_]bool{ false, true }) |cancel| {
+                var source = SliceEmbeddingSource{ .vectors = fx.data, .dims = 8 };
+                var gate = Gate{ .remaining = allowed, .cancel = cancel };
+                const options = SearchOptions{ .k = 4, .exact_descent = true, .gate = .{ .ctx = &gate, .check_fn = Gate.open } };
+                if (cancel) {
+                    try testing.expectError(error.Cancelled, index.search(alloc, source.source(), fx.query(0), options));
+                } else {
+                    var response = try index.search(alloc, source.source(), fx.query(0), options);
+                    defer response.deinit(alloc);
+                    try testing.expect(response.stats.budget_exhausted);
+                    if (quantizer == .rabitq) try testing.expectEqual(@as(usize, 4), response.results.len);
+                }
+                try testing.expectEqual(@as(u64, @intCast(allowed)), source.recomputed);
+            }
+        }
+    }
 }
