@@ -173,14 +173,14 @@ fn canonicalEndpointAlloc(a: Allocator, endpoint: []const u8, base: bool) ![]u8 
     if (uri.port == @as(u16, if (secure) 443 else 80)) uri.port = null;
     var output = std.Io.Writer.Allocating.init(a);
     defer output.deinit();
-    try uri.writeToStream(&output.writer, .{ .scheme = true, .authentication = true, .authority = true });
+    uri.writeToStream(&output.writer, .{ .scheme = true, .authentication = true, .authority = true }) catch return error.OutOfMemory;
     // Base endpoints are prefixes for /read, /audio/transcriptions or the
     // Vertex resource path. Trim separators here before adapters append them.
     const path = uri.path.percent_encoded;
-    try output.writer.writeAll(if (base) std.mem.trimEnd(u8, path, "/") else if (path.len == 0) "/" else path);
+    output.writer.writeAll(if (base) std.mem.trimEnd(u8, path, "/") else if (path.len == 0) "/" else path) catch return error.OutOfMemory;
     if (uri.query) |query| {
-        try output.writer.writeByte('?');
-        try query.formatQuery(&output.writer);
+        output.writer.writeByte('?') catch return error.OutOfMemory;
+        query.formatQuery(&output.writer) catch return error.OutOfMemory;
     }
     return output.toOwnedSlice();
 }
@@ -530,6 +530,15 @@ fn cloneResponse(alloc: Allocator, value: Response) !Response {
                     copy.word = try dupOpt(alloc, word.word);
                 }
             }
+        }
+    }
+    if (value.speakers) |speakers| {
+        const owned = try alloc.alloc(Speaker, speakers.len);
+        for (owned) |*speaker| speaker.* = .{};
+        result.speakers = owned;
+        for (speakers, owned) |source, *target| {
+            target.id = try dupOpt(alloc, source.id);
+            target.label = try dupOpt(alloc, source.label);
         }
     }
     return result;
@@ -1151,8 +1160,10 @@ fn antflySegmentsAlloc(alloc: Allocator, api_segments: []const inference_api.typ
     for (api_segments, 0..) |api_segment, i| {
         const words = try alloc.alloc(WordTimestamp, 0);
         errdefer alloc.free(words);
+        const text = try alloc.dupe(u8, api_segment.text);
+        errdefer alloc.free(text);
         segments[i] = .{
-            .text = try alloc.dupe(u8, api_segment.text),
+            .text = text,
             .start_ms = api_segment.start_ms,
             .end_ms = api_segment.end_ms,
             .words = words,
@@ -1235,8 +1246,7 @@ const CloudflareTranscriberState = struct {
 };
 
 fn cloudflareTimestamp(seconds: f64) !i64 {
-    if (!std.math.isFinite(seconds) or seconds < 0 or seconds >= 9e15) return error.InvalidCloudflareResponse;
-    return @intFromFloat(@round(seconds * 1000));
+    return secondsToMs(seconds) catch return error.InvalidCloudflareResponse;
 }
 
 fn cloudflareTranscript(a: Allocator, value: std.json.Value, timestamps: bool) !Response {
@@ -1314,12 +1324,17 @@ const OpenAiTranscriberState = struct {
             .alloc = alloc,
             .options = options,
             .http = http,
-            .base_url = (try cfg.effectiveEndpointAlloc(alloc)).?,
-            .model = try alloc.dupe(u8, cfg.effectiveModel().?),
-            .language_code = try dupOpt(alloc, cfg.language_code),
+            .base_url = "",
+            .model = "",
+            .language_code = null,
             .max_response_bytes = cfg.max_response_bytes,
             .max_download_bytes = cfg.max_download_bytes,
         };
+        errdefer state.deinitState();
+        state.base_url = (try cfg.effectiveEndpointAlloc(alloc)).?;
+        state.model = try alloc.dupe(u8, cfg.effectiveModel().?);
+        state.language_code = try dupOpt(alloc, cfg.language_code);
+
         if (cfg.bearer_token orelse cfg.api_key) |token| try state.setBearer(token);
 
         return .{
@@ -1333,11 +1348,15 @@ const OpenAiTranscriberState = struct {
 
     pub fn deinit(ptr: *anyopaque) void {
         const self: *OpenAiTranscriberState = @ptrCast(@alignCast(ptr));
+        self.deinitState();
+        self.alloc.destroy(self);
+    }
+
+    fn deinitState(self: *OpenAiTranscriberState) void {
         self.alloc.free(self.base_url);
         self.alloc.free(self.model);
         freeOpt(self.alloc, self.language_code);
         if (self.auth_header) |header| self.alloc.free(header[1]);
-        self.alloc.destroy(self);
     }
 
     fn setBearer(self: *OpenAiTranscriberState, token: []const u8) !void {
@@ -1405,9 +1424,10 @@ fn parseOpenAiVerboseResponseAlloc(alloc: Allocator, payload: []const u8) !Respo
     };
     var parsed = try std.json.parseFromSlice(Body, alloc, payload, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
+    const duration_ms = if (parsed.value.duration) |seconds| try secondsToMs(seconds) else null;
     var response = Response{
         .text = try dupOpt(alloc, parsed.value.text),
-        .duration_ms = if (parsed.value.duration) |seconds| secondsToMs(seconds) else null,
+        .duration_ms = duration_ms,
     };
     errdefer deinitResponse(alloc, &response);
     response.language = try dupOpt(alloc, parsed.value.language);
@@ -1422,10 +1442,13 @@ fn parseOpenAiVerboseResponseAlloc(alloc: Allocator, payload: []const u8) !Respo
             alloc.free(segments);
         }
         for (parsed.value.segments, 0..) |segment, i| {
+            const start_ms = try secondsToMs(segment.start);
+            const end_ms = try secondsToMs(segment.end);
+            if (end_ms < start_ms) return error.InvalidInferenceResponse;
             segments[i] = .{
                 .text = try dupOpt(alloc, if (segment.text) |text| std.mem.trim(u8, text, " ") else null),
-                .start_ms = secondsToMs(segment.start),
-                .end_ms = secondsToMs(segment.end),
+                .start_ms = start_ms,
+                .end_ms = end_ms,
             };
             filled += 1;
         }
@@ -1434,9 +1457,12 @@ fn parseOpenAiVerboseResponseAlloc(alloc: Allocator, payload: []const u8) !Respo
     return response;
 }
 
-fn secondsToMs(seconds: f64) i64 {
-    if (!std.math.isFinite(seconds) or seconds <= 0) return 0;
-    return @intFromFloat(@round(seconds * 1000.0));
+fn secondsToMs(seconds: f64) !i64 {
+    if (!std.math.isFinite(seconds) or seconds < 0) return error.InvalidInferenceResponse;
+    const milliseconds = @round(seconds * 1000.0);
+    // f64(maxInt(i64)) rounds up to 2^63, which is already out of range.
+    if (!std.math.isFinite(milliseconds) or milliseconds >= 0x1p63) return error.InvalidInferenceResponse;
+    return @intFromFloat(milliseconds);
 }
 
 const VertexTranscriberState = struct {
@@ -1468,11 +1494,11 @@ const VertexTranscriberState = struct {
             .alloc = alloc,
             .options = options,
             .http = http,
-            .base_url = (try cfg.effectiveEndpointAlloc(alloc)).?,
-            .project_id = try cfg.effectiveProjectId(alloc) orelse return error.InvalidTranscribingConfig,
-            .location = try alloc.dupe(u8, cfg.effectiveLocation().?),
-            .model = try alloc.dupe(u8, cfg.effectiveModel().?),
-            .language_code = try alloc.dupe(u8, cfg.language_code orelse "en-US"),
+            .base_url = "",
+            .project_id = "",
+            .location = "",
+            .model = "",
+            .language_code = "",
             .enable_automatic_punctuation = cfg.enable_automatic_punctuation,
             .max_response_bytes = cfg.max_response_bytes,
             .max_download_bytes = cfg.max_download_bytes,
@@ -1480,6 +1506,11 @@ const VertexTranscriberState = struct {
             .diarization = cfg.diarization,
         };
         errdefer state.deinitState();
+        state.base_url = (try cfg.effectiveEndpointAlloc(alloc)).?;
+        state.project_id = try cfg.effectiveProjectId(alloc) orelse return error.InvalidTranscribingConfig;
+        state.location = try alloc.dupe(u8, cfg.effectiveLocation().?);
+        state.model = try alloc.dupe(u8, cfg.effectiveModel().?);
+        state.language_code = try alloc.dupe(u8, cfg.language_code orelse "en-US");
 
         if (cfg.bearer_token orelse cfg.api_key) |token| {
             try state.setBearer(token);
@@ -1672,9 +1703,11 @@ fn parseVertexRecognizeResponseAlloc(alloc: Allocator, payload: []const u8) !Res
         }
         if (alternative.words.len == 0) {
             if (transcript.len == 0) continue;
-            const end_ms = if (result.resultEndOffset) |offset| vertexDurationToMs(offset) orelse last_end_ms else last_end_ms;
+            const end_ms = if (result.resultEndOffset) |offset| try vertexDurationToMs(offset) else last_end_ms;
+            const segment_text = try alloc.dupe(u8, transcript);
+            errdefer alloc.free(segment_text);
             try segments.append(alloc, .{
-                .text = try alloc.dupe(u8, transcript),
+                .text = segment_text,
                 .start_ms = last_end_ms,
                 .end_ms = @max(end_ms, last_end_ms),
             });
@@ -1719,8 +1752,8 @@ fn parseVertexRecognizeResponseAlloc(alloc: Allocator, payload: []const u8) !Res
                         slice_end = scan;
                     }
                 }
-                const start_ms = if (word.startOffset) |offset| vertexDurationToMs(offset) orelse last_end_ms else last_end_ms;
-                const end_ms = if (word.endOffset) |offset| vertexDurationToMs(offset) orelse start_ms else start_ms;
+                const start_ms = if (word.startOffset) |offset| try vertexDurationToMs(offset) else last_end_ms;
+                const end_ms = if (word.endOffset) |offset| try vertexDurationToMs(offset) else start_ms;
                 words[filled] = .{
                     .word = try alloc.dupe(u8, spelled),
                     .start_ms = start_ms,
@@ -1755,12 +1788,13 @@ fn parseVertexRecognizeResponseAlloc(alloc: Allocator, payload: []const u8) !Res
 
     var response = Response{
         .text = try alloc.dupe(u8, text.items),
-        .language = try dupOpt(alloc, results[0].languageCode),
+        .language = null,
         // Recognition endpoints describe evidence positions, not the source
         // recording's duration (which may include leading/trailing silence).
         .duration_ms = null,
     };
     errdefer deinitResponse(alloc, &response);
+    response.language = try dupOpt(alloc, results[0].languageCode);
     if (segments.items.len > 0) response.segments = try segments.toOwnedSlice(alloc);
     if (speakers_seen.count() > 0) {
         const speakers = try alloc.alloc(Speaker, speakers_seen.count());
@@ -1770,7 +1804,9 @@ fn parseVertexRecognizeResponseAlloc(alloc: Allocator, payload: []const u8) !Res
             alloc.free(speakers);
         }
         for (speakers_seen.keys()) |label| {
-            speakers[filled] = .{ .id = try alloc.dupe(u8, label), .label = try alloc.dupe(u8, label) };
+            const id = try alloc.dupe(u8, label);
+            errdefer alloc.free(id);
+            speakers[filled] = .{ .id = id, .label = try alloc.dupe(u8, label) };
             filled += 1;
         }
         response.speakers = speakers;
@@ -1784,13 +1820,24 @@ fn sameSpeaker(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
-/// Parses a protobuf JSON duration such as `"1.500s"` or `"12s"` into
-/// milliseconds; anything else is treated as absent.
-fn vertexDurationToMs(text: []const u8) ?i64 {
-    const trimmed = std.mem.trimEnd(u8, text, "s");
-    if (trimmed.len == 0 or trimmed.len == text.len) return null;
-    const seconds = std.fmt.parseFloat(f64, trimmed) catch return null;
-    return secondsToMs(seconds);
+/// Protobuf duration offsets use integer seconds and at most nine fractional
+/// digits. Parse without floating-point loss, then round once to milliseconds.
+fn vertexDurationToMs(text: []const u8) !i64 {
+    if (text.len < 2 or text[text.len - 1] != 's') return error.InvalidInferenceResponse;
+    var parts = std.mem.splitScalar(u8, text[0 .. text.len - 1], '.');
+    const whole = parts.next().?;
+    if (whole.len == 0) return error.InvalidInferenceResponse;
+    for (whole) |ch| if (!std.ascii.isDigit(ch)) return error.InvalidInferenceResponse;
+    const seconds = std.fmt.parseInt(u64, whole, 10) catch return error.InvalidInferenceResponse;
+    if (seconds > 315576000000) return error.InvalidInferenceResponse;
+    var nanos: u32 = 0;
+    if (parts.next()) |fraction| {
+        if (fraction.len == 0 or fraction.len > 9 or parts.next() != null) return error.InvalidInferenceResponse;
+        for (fraction) |ch| if (!std.ascii.isDigit(ch)) return error.InvalidInferenceResponse;
+        nanos = std.fmt.parseInt(u32, fraction, 10) catch return error.InvalidInferenceResponse;
+        for (fraction.len..9) |_| nanos *= 10;
+    }
+    return @intCast(seconds * 1000 + (nanos + 500000) / 1000000);
 }
 
 test "vertex recognize response yields speaker turns with word timing" {
@@ -1985,10 +2032,10 @@ test "a zero download ceiling is treated as unset" {
 }
 
 test "vertex durations parse protobuf seconds" {
-    try std.testing.expectEqual(@as(?i64, 1500), vertexDurationToMs("1.500s"));
-    try std.testing.expectEqual(@as(?i64, 12000), vertexDurationToMs("12s"));
-    try std.testing.expectEqual(@as(?i64, null), vertexDurationToMs("12"));
-    try std.testing.expectEqual(@as(?i64, null), vertexDurationToMs("s"));
+    try std.testing.expectEqual(@as(i64, 1500), try vertexDurationToMs("1.500s"));
+    try std.testing.expectEqual(@as(i64, 12000), try vertexDurationToMs("12s"));
+    try std.testing.expectError(error.InvalidInferenceResponse, vertexDurationToMs("12"));
+    try std.testing.expectError(error.InvalidInferenceResponse, vertexDurationToMs("s"));
 }
 
 fn initVertexTokenSource(alloc: Allocator, credentials_path: ?[]const u8) !*google_auth.CachedTokenSource {
@@ -2148,49 +2195,6 @@ fn resolveAudioContentAlloc(alloc: Allocator, url: []const u8, max_download_byte
         },
         .ok => |response| return response,
     }
-}
-
-fn cloneSegments(alloc: Allocator, segments: ?[]const Segment) !?[]Segment {
-    const src = segments orelse return null;
-    const out = try alloc.alloc(Segment, src.len);
-    errdefer alloc.free(out);
-    for (src, 0..) |segment, i| {
-        out[i] = .{
-            .text = try dupOpt(alloc, segment.text),
-            .start_ms = segment.start_ms,
-            .end_ms = segment.end_ms,
-            .speaker = try dupOpt(alloc, segment.speaker),
-            .words = try cloneWords(alloc, segment.words),
-        };
-    }
-    return out;
-}
-
-fn cloneWords(alloc: Allocator, words: ?[]const WordTimestamp) !?[]WordTimestamp {
-    const src = words orelse return null;
-    const out = try alloc.alloc(WordTimestamp, src.len);
-    errdefer alloc.free(out);
-    for (src, 0..) |word, i| {
-        out[i] = .{
-            .word = try dupOpt(alloc, word.word),
-            .start_ms = word.start_ms,
-            .end_ms = word.end_ms,
-        };
-    }
-    return out;
-}
-
-fn cloneSpeakers(alloc: Allocator, speakers: ?[]const Speaker) !?[]Speaker {
-    const src = speakers orelse return null;
-    const out = try alloc.alloc(Speaker, src.len);
-    errdefer alloc.free(out);
-    for (src, 0..) |speaker, i| {
-        out[i] = .{
-            .id = try dupOpt(alloc, speaker.id),
-            .label = try dupOpt(alloc, speaker.label),
-        };
-    }
-    return out;
 }
 
 fn dupOpt(alloc: Allocator, value: ?[]const u8) !?[]const u8 {
@@ -2959,4 +2963,70 @@ test "multipart boundary selection retries actual payload collisions" {
     const selected = try selectMultipartBoundary(&second, seed, original, "whisper-1", null);
     try std.testing.expect(!std.mem.eql(u8, original, selected));
     try std.testing.expect(std.mem.indexOf(u8, original, selected) == null);
+}
+
+test "transcription constructors release every partial allocation" {
+    const Case = struct {
+        fn run(a: Allocator, cfg: Config) !void {
+            var http = httpx.Client.init(a, std.testing.io);
+            defer http.deinit();
+            const transcriber = try initTranscriberWithOptions(a, &http, cfg, .{ .source_table = "fixture" });
+            defer transcriber.deinit();
+        }
+    };
+    const cases = [_]Config{
+        .{ .provider = .openai, .api_key = "fixture", .language_code = "en", .base_url = "http://localhost/v1?fixture=yes" },
+        .{ .provider = .vertex, .project_id = "fixture", .api_key = "fixture", .language_code = "en" },
+        .{ .provider = .antfly, .model = "speech", .api_key = "fixture", .language_code = "en" },
+        .{ .provider = .cloudflare, .account_id = "fixture", .model = "@cf/openai/whisper-large-v3-turbo", .api_key = "fixture" },
+    };
+    for (cases) |cfg| try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{cfg});
+}
+
+test "transcription result builders release every partial allocation" {
+    const Case = struct {
+        fn run(a: Allocator, kind: usize) !void {
+            var response = switch (kind) {
+                0 => try parseVertexRecognizeResponseAlloc(a,
+                    \\{"results":[{"alternatives":[{"transcript":"hello"}],"languageCode":"en-US","resultEndOffset":"1s"},{"alternatives":[{"transcript":"there"}],"resultEndOffset":"2s"}]}
+                ),
+                1 => try parseVertexRecognizeResponseAlloc(a,
+                    \\{"results":[{"alternatives":[{"transcript":"hello there","words":[{"word":"hello","startOffset":"0s","endOffset":"1s","speakerLabel":"1"},{"word":"there","startOffset":"1s","endOffset":"2s","speakerLabel":"2"}]}],"languageCode":"en-US"}]}
+                ),
+                2 => try fromReadObjectAlloc(a, .{ .object = "read", .index = 0, .text = "hello there", .audio = .{ .value = .{ .duration_ms = null, .segments = .{ .value = &.{ .{ .text = "hello", .start_ms = 0, .end_ms = 100, .text_start = 0, .text_end = 5, .granularity = .{ .value = "phrase" }, .speaker = .fromNullable("speaker") }, .{ .text = "there", .start_ms = 100, .end_ms = 200, .text_start = 6, .text_end = 11, .granularity = .{ .value = "phrase" }, .speaker = .fromNullable("speaker") } } }, .speakers = .{ .value = &.{"speaker"} } } } }),
+                else => try parseOpenAiVerboseResponseAlloc(a, "{\"text\":\"hello\",\"language\":\"en\",\"duration\":1,\"segments\":[{\"text\":\"hello\",\"start\":0,\"end\":1}]}"),
+            };
+            defer deinitResponse(a, &response);
+        }
+    };
+    for (0..4) |kind| try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{kind});
+}
+
+test "provider timestamps reject nonfinite negative and overflowing values" {
+    for ([_]f64{ -1, 1e300, 1e308, std.math.inf(f64), std.math.nan(f64), 0x1p63 / 1000.0 }) |value| {
+        try std.testing.expectError(error.InvalidInferenceResponse, secondsToMs(value));
+        try std.testing.expectError(error.InvalidCloudflareResponse, cloudflareTimestamp(value));
+    }
+    try std.testing.expectEqual(@as(i64, 1235), try secondsToMs(1.2345));
+    try std.testing.expectEqual(@as(i64, 0), try secondsToMs(0));
+    try std.testing.expectEqual(@as(i64, 9223372036854773760), try secondsToMs(9223372036854774.0));
+    try std.testing.expectEqual(@as(i64, 1000), try vertexDurationToMs("0.999999999s"));
+    try std.testing.expectEqual(@as(i64, 1235), try vertexDurationToMs("1.234500000s"));
+    try std.testing.expectEqual(@as(i64, 315576000000000), try vertexDurationToMs("315576000000s"));
+    for ([_][]const u8{ "1e300s", "-1s", "NaNs", "1ss", "1.s", ".1s", "1.1234567890s", "315576000001s", "18446744073709551615s" }) |offset| try std.testing.expectError(error.InvalidInferenceResponse, vertexDurationToMs(offset));
+    try std.testing.expectError(error.InvalidInferenceResponse, parseOpenAiVerboseResponseAlloc(std.testing.allocator, "{\"text\":\"hello\",\"duration\":1e300}"));
+    try std.testing.expectError(error.InvalidInferenceResponse, parseOpenAiVerboseResponseAlloc(std.testing.allocator, "{\"text\":\"hello there\",\"segments\":[{\"text\":\"hello\",\"start\":0,\"end\":1},{\"text\":\"there\",\"start\":1,\"end\":1e300}]}"));
+    try std.testing.expectError(error.InvalidInferenceResponse, parseVertexRecognizeResponseAlloc(std.testing.allocator, "{\"results\":[{\"alternatives\":[{\"transcript\":\"hello\"}],\"resultEndOffset\":\"1e300s\"}]}"));
+}
+
+test "native transcription clones every evidence field with allocation rollback" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            var response = try cloneResponse(a, .{ .text = "hello", .status = "complete", .language = "en", .duration_ms = 100, .segments = &.{.{ .text = "hello", .speaker = "1", .start_ms = 0, .end_ms = 100, .words = &.{.{ .word = "hello", .start_ms = 0, .end_ms = 100 }} }}, .speakers = &.{.{ .id = "1", .label = "Speaker 1" }} });
+            defer deinitResponse(a, &response);
+            try std.testing.expectEqualStrings("Speaker 1", response.speakers.?[0].label.?);
+            try std.testing.expectEqualStrings("hello", response.segments.?[0].words.?[0].word.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

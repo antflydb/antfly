@@ -255,12 +255,13 @@ const HttpxTransport = struct {
         var result = try transportResponseAlloc(
             alloc,
             response.status.code,
-            response.body orelse "",
+            "",
             response.headers.get("ETag"),
             response.headers.get("Content-Type"),
             response.headers.get("Location"),
         );
         errdefer result.deinit(alloc);
+        result.body = try response.takeBodyAlloc(alloc);
         if (response.status.code == 206) {
             if (response.headers.get("Content-Range")) |value| result.content_range = try types.ContentRange.parse(value);
         }

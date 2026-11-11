@@ -65,6 +65,13 @@ pub fn main() !void {
 }
 ```
 
+Buffered responses own their body separately from headers. Use
+`response.takeBodyAlloc(allocator)` to consume a body: it transfers the original
+buffer when allocation domains match, or copies into the destination before
+releasing the original. On allocation failure the response retains ownership.
+`response.deinit()` remains required to release headers. Borrowed bodies are
+always copied by this method.
+
 ### Server
 
 ```zig

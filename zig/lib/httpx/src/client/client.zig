@@ -3362,6 +3362,46 @@ pub const Client = struct {
         return cmf & 0x0f == 8 and cmf >> 4 <= 7 and header % 31 == 0;
     }
 
+    /// Bound encoded bytes independently of decoded output without retaining
+    /// the wire body. Probing one byte at the ceiling distinguishes exact EOF
+    /// from oversized input; the probe is never exposed to the decompressor.
+    const BoundedBodyReader = struct {
+        inner: *Io.Reader,
+        remaining: usize,
+        exceeded: bool = false,
+        reader_iface: Io.Reader,
+
+        fn init(inner: *Io.Reader, limit: usize, buffer: []u8) BoundedBodyReader {
+            return .{ .inner = inner, .remaining = limit, .reader_iface = .{ .vtable = &vtable, .buffer = buffer, .seek = 0, .end = 0 } };
+        }
+        fn checkLimit(self: *const BoundedBodyReader) !void {
+            if (self.exceeded) return error.ResponseTooLarge;
+        }
+        fn readVec(reader: *Io.Reader, buffers: [][]u8) Io.Reader.Error!usize {
+            const self: *BoundedBodyReader = @fieldParentPtr("reader_iface", reader);
+            // Reader.fill passes no caller buffers: writableVector supplies
+            // our internal buffer, whose newly read bytes must advance end.
+            var vector: [8][]u8 = undefined;
+            const count, const data_size = try reader.writableVector(&vector, buffers);
+            if (count == 0 or vector[0].len == 0) return 0;
+            if (self.remaining == 0) {
+                var probe: [1]u8 = undefined;
+                if (try readSomeOnce(self.inner, &probe) == 0) return error.EndOfStream;
+                self.exceeded = true;
+                return error.ReadFailed;
+            }
+            const n = try readSomeOnce(self.inner, vector[0][0..@min(vector[0].len, self.remaining)]);
+            if (n == 0) return error.EndOfStream;
+            self.remaining -= n;
+            if (n > data_size) {
+                reader.end += n - data_size;
+                return data_size;
+            }
+            return n;
+        }
+        const vtable = IoReaderHelpers.makeVTable(readVec);
+    };
+
     fn appendBoundedBody(a: Allocator, output: *std.ArrayListUnmanaged(u8), bytes: []const u8, limit: usize) !void {
         const required = try checkedResponseSize(output.items.len, bytes.len, limit);
         if (required > output.capacity) try output.ensureTotalCapacityPrecise(a, @min(limit, std.ArrayListUnmanaged(u8).growCapacity(required)));
@@ -3509,7 +3549,36 @@ pub const Client = struct {
 
         var read_buf: [16 * 1024]u8 = undefined;
 
-        if (content_coding) |coding| {
+        if (content_coding == .gzip) {
+            var encoded_buffer: [8192]u8 = undefined;
+            var encoded = BoundedBodyReader.init(framed_reader, max_size, &encoded_buffer);
+            var window: [flate.max_window_len]u8 = undefined;
+            var decompressor = flate.Decompress.init(&encoded.reader_iface, .gzip, &window);
+            while (true) {
+                const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
+                    try encoded.checkLimit();
+                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
+                    if (err == error.EndOfStream) break;
+                    return error.DecompressionFailed;
+                };
+                if (n == 0) break;
+                try appendBoundedBody(body_allocator, &result, read_buf[0..n], max_size);
+            }
+            // Gzip EOF is not HTTP EOF. Consume trailers/framing and enforce
+            // the encoded ceiling even when the decoder has finished early.
+            while (true) {
+                const n = readSomeOnce(&encoded.reader_iface, &read_buf) catch |err| {
+                    try encoded.checkLimit();
+                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
+                    if (err == error.EndOfStream) break;
+                    if (err == error.ReadFailed and close_delimited_body) break;
+                    return error.InvalidResponse;
+                };
+                if (n == 0) break;
+            }
+        } else if (content_coding == .deflate) {
             var compressed = std.ArrayListUnmanaged(u8).empty;
             defer compressed.deinit(body_allocator);
 
@@ -3526,21 +3595,7 @@ pub const Client = struct {
                 try appendBoundedBody(body_allocator, &compressed, read_buf[0..n], max_size);
             }
 
-            switch (coding) {
-                .gzip => try appendDecompressed(
-                    body_allocator,
-                    compressed.items,
-                    .gzip,
-                    &result,
-                    max_size,
-                ),
-                .deflate => try appendDeflateDecompressed(
-                    body_allocator,
-                    compressed.items,
-                    &result,
-                    max_size,
-                ),
-            }
+            try appendDeflateDecompressed(body_allocator, compressed.items, &result, max_size);
         } else {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
@@ -3788,11 +3843,7 @@ pub const Client = struct {
         if (res.body) |body| {
             try writer.writeAll(body);
             if (progress_cb) |cb| cb(.{ .bytes_written = body.len, .total_bytes = res.contentLength() }, progress_ctx);
-            if (res.body_owned) {
-                res.allocator.free(body);
-                res.body_owned = false;
-            }
-            res.body = null;
+            res.releaseBody();
         }
     }
 
@@ -7065,4 +7116,48 @@ test "buffered response peak rejects unrepresentable admission bounds" {
     try std.testing.expectEqual(@as(usize, 0), try Client.bufferedResponseBodyPeakBytes(0));
     try std.testing.expectError(error.Overflow, Client.bufferedResponseBodyPeakBytes(std.math.maxInt(usize)));
     try std.testing.expectError(error.Overflow, Client.bufferedResponseBodyPeakBytes(std.math.maxInt(usize) / 2));
+}
+
+test "buffered gzip streams within two body buffers and enforces encoded and decoded ceilings" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const payload = try a.alloc(u8, 65500);
+    defer a.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i);
+    // A complete gzip member containing one stored (uncompressed) DEFLATE
+    // block. Near-equal wire/output sizes expose accidental wire buffering.
+    const encoded = try a.alloc(u8, payload.len + 23);
+    defer a.free(encoded);
+    @memcpy(encoded[0..10], "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff");
+    encoded[10] = 1;
+    std.mem.writeInt(u16, encoded[11..13], @intCast(payload.len), .little);
+    std.mem.writeInt(u16, encoded[13..15], ~@as(u16, @intCast(payload.len)), .little);
+    @memcpy(encoded[15..][0..payload.len], payload);
+    std.mem.writeInt(u32, encoded[encoded.len - 8 ..][0..4], std.hash.Crc32.hash(payload), .little);
+    std.mem.writeInt(u32, encoded[encoded.len - 4 ..][0..4], @intCast(payload.len), .little);
+    const compressed_zeroes = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xed\xc1\x01\x0d\x00\x00\x00\xc2\xa0\xf7\x4f\x6d\x0f\x07\x14\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xef\x06\x78\xf9\x28\xad\xdc\xff\x00\x00";
+    const cases = [_]struct { limit: usize, truncated: bool = false, wire: ?[]const u8 = null, expected: ?anyerror = null }{
+        .{ .limit = 65536 },
+        .{ .limit = 65510, .expected = error.ResponseTooLarge }, // encoded bound only
+        .{ .limit = 1024, .wire = compressed_zeroes, .expected = error.ResponseTooLarge }, // decoded bound only
+        .{ .limit = 65536, .truncated = true, .expected = error.DecompressionFailed },
+    };
+    for (cases) |case| {
+        var server = try @import("../testing.zig").TestServer.start(a, io, &.{.{ .path = "/", .respond = .{ .body = case.wire orelse if (case.truncated) encoded[0 .. encoded.len - 4] else encoded, .headers = &.{.{ .name = "Content-Encoding", .value = "gzip" }} } }});
+        defer server.deinit();
+        var serving = try io.concurrent(@import("../testing.zig").TestServer.handleOne, .{&server});
+        defer serving.cancel(io) catch {};
+        var non_remapping = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+        var body_quota = @import("../util/quota_allocator.zig").QuotaAllocator{ .backing = non_remapping.allocator(), .limit = 2 * 65536 };
+        var client = Client.initWithConfig(a, io, .{ .http1_response_body_allocator = body_quota.allocator(), .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        const result = client.get(server.baseUrl(), .{ .max_response_size = case.limit });
+        if (case.expected) |expected| try std.testing.expectError(expected, result) else {
+            var response = try result;
+            defer response.deinit();
+            try std.testing.expectEqualSlices(u8, payload, response.body.?);
+            try std.testing.expect(!body_quota.exceeded);
+        }
+        try std.testing.expectEqual(@as(usize, 0), body_quota.live);
+    }
 }
