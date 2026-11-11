@@ -147,6 +147,8 @@ pub const Config = struct {
     asset_producer: ?asset_producer_mod.Producer = null,
     chunk_provider: ?ChunkProvider = null,
     enable_without_producers: bool = false,
+    /// Query recovery borrows the source store without replay or a producer lease.
+    recovery_only: bool = false,
     relational_base_rows: bool = false,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -1930,7 +1932,11 @@ pub fn reembedDenseDocumentsSession(runtime: *EnrichmentRuntime, alloc: Allocato
                     if (actual != expected) continue;
                     require_digest = generation.revision == null;
                 }
-                const vector = try embedDensePartsTrackedImpl(runtime, &index_names, alloc, pinned_embedder, requestEmbeddingName(request), parts, dims, session.cancellation != null);
+                const vector = dispatch: {
+                    const started = try session.beginDispatch();
+                    defer session.finishDispatch(started);
+                    break :dispatch try embedDensePartsTrackedImpl(runtime, &index_names, alloc, pinned_embedder, requestEmbeddingName(request), parts, dims, session.cancellation != null);
+                };
                 defer alloc.free(vector);
                 try dense_embedder.requireTextGeneration(alloc, requestEmbeddingName(request), generation);
                 try validateRecoveredVector(vector, dims);
@@ -1956,7 +1962,11 @@ pub fn reembedDenseDocumentsSession(runtime: *EnrichmentRuntime, alloc: Allocato
         try legacy_digests.append(alloc, if (require_digest) request.expected_vector_digest else null);
     }
     if (texts.items.len == 0) return;
-    const vectors = try embedDenseBatchTracked(runtime, &index_names, alloc, pinned_embedder, requestEmbeddingName(requests[0]), texts.items, dims);
+    const vectors = dispatch: {
+        const started = try session.beginDispatch();
+        defer session.finishDispatch(started);
+        break :dispatch try embedDenseBatchTracked(runtime, &index_names, alloc, pinned_embedder, requestEmbeddingName(requests[0]), texts.items, dims);
+    };
     defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
     try dense_embedder.requireTextGeneration(alloc, requestEmbeddingName(requests[0]), generation);
     for (vectors) |vector| try validateRecoveredVector(vector, dims);
@@ -6217,6 +6227,7 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
         cancel_on_chunk: ?*std.atomic.Value(bool) = null,
         cancel_on_batch: ?*std.atomic.Value(bool) = null,
         batch_calls: usize = 0,
+        parts_calls: usize = 0,
         texts: std.ArrayListUnmanaged([]u8) = .empty,
 
         fn embedDense(_: *anyopaque, a: Allocator, _: []const u8, _: []const u8, dims: u32) ![]f32 {
@@ -6240,6 +6251,7 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
 
         fn parts(raw: *anyopaque, a: Allocator, _: []const u8, _: []const template.ContentPart, dims: u32) ![]f32 {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.parts_calls += 1;
             const out = try a.alloc(f32, dims);
             @memset(out, self.bad_value orelse 1);
             return out;
@@ -6450,6 +6462,23 @@ test "transient leann re-embeds one chunk from its re-chunked parent like the pr
         parent_signal.store(false, .release);
         runtime.config.dense_embedder.?.part_request_context.?.deadline_ns = 0;
         try std.testing.expectError(error.Timeout, reembedDenseDocumentsSession(&runtime, alloc, requests[0..1], 2, out[0..2], found[0..1], &session));
+    }
+
+    // A single recovery batch can contain multiple independent parts calls.
+    {
+        var document = document_request;
+        document.input_kind = .document;
+        document.source_template = "literal";
+        document.expected_source_hash = try densePartsSourceHash(alloc, document, &.{.{ .text = "literal" }}, @splat(probe.revision));
+        var session = @import("../../leann_recovery.zig").Session{ .budget_ns = 1 };
+        defer session.deinit();
+        const calls = probe.parts_calls;
+        try std.testing.expectError(error.ReembedBudgetExceeded, reembedDenseDocumentsSession(&runtime, alloc, &.{ document, document }, 2, &out, &found, &session));
+        try std.testing.expectEqual(calls + 1, probe.parts_calls);
+        document.expected_source_hash = document.expected_source_hash.? ^ 1;
+        try reembedDenseDocumentsSession(&runtime, alloc, &.{document}, 2, out[0..2], found[0..1], &session);
+        try std.testing.expect(!found[0]);
+        try std.testing.expectEqual(calls + 1, probe.parts_calls);
     }
 
     // Invalid output is rejected before it can be marked found or cached,
@@ -8415,6 +8444,7 @@ const PlatformEnrichmentRuntime = struct {
                 .asset_producer = config.asset_producer,
                 .chunk_provider = config.chunk_provider,
                 .enable_without_producers = config.enable_without_producers,
+                .recovery_only = config.recovery_only,
                 .relational_base_rows = config.relational_base_rows,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
@@ -8426,7 +8456,7 @@ const PlatformEnrichmentRuntime = struct {
                 .sync_wait_timeout_ms = config.sync_wait_timeout_ms,
             },
             .ownership = try ownership_mod.State.init(alloc, store, enrichment_lease.default_lease_key, .{
-                .lease_owned = true,
+                .lease_owned = !config.recovery_only,
                 .owner_id = config.owner_id,
                 .lease_ttl_ms = config.lease_ttl_ms,
             }),
@@ -8436,6 +8466,7 @@ const PlatformEnrichmentRuntime = struct {
         // Providers transfer only on successful return. Unwind local ownership
         // allocations without releasing another worker's durable lease.
         errdefer runtime.ownership.deinitPreserveLease(alloc);
+        if (config.recovery_only) return runtime;
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
         const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
         restoreThreadedRuntimeStatus(&runtime, persisted_status);
@@ -8526,6 +8557,7 @@ const PlatformEnrichmentRuntime = struct {
     }
 
     fn prepareExecution(self: *EnrichmentRuntime) !void {
+        if (self.config.recovery_only) return error.ReadOnly;
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         self.shutdown_event.reset();
         self.shutdown_requested.store(false, .release);

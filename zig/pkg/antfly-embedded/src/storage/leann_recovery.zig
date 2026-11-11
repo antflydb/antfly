@@ -19,6 +19,7 @@ const search_types = @import("antfly_vectorindex").search_types;
 pub const Session = struct {
     cancellation: ?search_types.CancellationToken = null,
     budget_ns: u64 = 0,
+    elapsed_ns: u64 = 0,
     state: ?*anyopaque = null,
     release: ?*const fn (*anyopaque) void = null,
 
@@ -30,6 +31,15 @@ pub const Session = struct {
     pub fn checkDispatch(self: *const Session, elapsed_ns: u64) !void {
         try self.check();
         if (self.budget_ns != 0 and elapsed_ns >= self.budget_ns) return error.ReembedBudgetExceeded;
+    }
+
+    pub fn beginDispatch(self: *const Session) !u64 {
+        try self.checkDispatch(self.elapsed_ns);
+        return @import("antfly_platform").time.monotonicNs();
+    }
+
+    pub fn finishDispatch(self: *Session, started: u64) void {
+        self.elapsed_ns +|= @import("antfly_platform").time.monotonicNs() -| started;
     }
 
     pub fn check(self: *const Session) !void {

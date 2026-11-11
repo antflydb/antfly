@@ -1604,14 +1604,15 @@ pub const Index = struct {
         // PQ has no admissible bounds. RaBitQ bounds describe the original
         // vectors, so they also cannot prune reranking of quantized copies.
         // Limit a graph walk to its estimated beam in either case.
-        if ((self.rabitq == null or (opts.score_quantized_source and opts.candidate_ids == null)) and pool.items.len > ef) {
+        const refill_shortlist = opts.score_quantized_source and opts.candidate_ids == null;
+        if ((self.rabitq == null or refill_shortlist) and pool.items.len > ef) {
             const ByEstimate = struct {
                 fn lessThan(_: void, a: Pooled, b: Pooled) bool {
                     return a.est < b.est or (a.est == b.est and a.id < b.id);
                 }
             };
             std.mem.sortUnstable(Pooled, pool.items, {}, ByEstimate.lessThan);
-            pool.items.len = ef;
+            if (!refill_shortlist) pool.items.len = ef;
         }
 
         const ByLower = struct {
@@ -1633,10 +1634,12 @@ pub const Index = struct {
         var i: usize = 0;
         var unrecomputed_from: ?usize = null;
         while (i < pool.items.len) {
+            if (refill_shortlist and i >= ef and top.len() >= k) break;
+            const batch_end = if (refill_shortlist and i < ef) @min(ef, pool.items.len) else pool.items.len;
             const batch_start = i;
             const tau = if (top.len() >= k) top.top().dist else std.math.inf(f32);
             ids.clearRetainingCapacity();
-            while (i < pool.items.len and ids.items.len < chunk) : (i += 1) {
+            while (i < batch_end and ids.items.len < chunk) : (i += 1) {
                 const p = pool.items[i];
                 if (!opts.score_quantized_source and p.lower >= tau) break;
                 if (self.isDeleted(p.id)) continue;
@@ -3627,6 +3630,33 @@ test "leann: retained vector validation avoids inference and rejects stale ident
     try testing.expectEqual(@as(usize, 1), quantized.results.len);
     try testing.expect(quantized.results[0].distance < threshold);
     try testing.expectEqual(validations + 1, src.validations);
+}
+
+test "leann: quantized scoring refills a stale estimated shortlist" {
+    const alloc = testing.allocator;
+    var fx = try Fixture.init(alloc, 400, 1, 16, 12, 43);
+    defer fx.deinit(alloc);
+    var index = try Index.build(alloc, .{ .dims = 16, .max_degree = 12, .quantizer = .rabitq }, fx.data);
+    defer index.deinit();
+    const Source = struct {
+        backing: SliceEmbeddingSource,
+        calls: usize = 0,
+
+        fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 1) {
+                @memset(out, std.math.nan(f32));
+                return;
+            }
+            try self.backing.source().recompute(ids, out);
+        }
+    };
+    var src = Source{ .backing = .{ .vectors = fx.data, .dims = 16 } };
+    var response = try index.search(alloc, .{ .ctx = &src, .recompute_fn = Source.recompute }, fx.query(0), .{ .k = 1, .ef = 1, .batch_size = 1, .score_quantized_source = true });
+    defer response.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), response.results.len);
+    try testing.expectEqual(@as(usize, 2), src.calls);
 }
 
 test "leann: rebuild from codes keeps codes and live nodes" {

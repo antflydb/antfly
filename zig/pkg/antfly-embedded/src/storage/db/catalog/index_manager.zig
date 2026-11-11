@@ -33846,7 +33846,6 @@ pub const IndexManager = struct {
         if (read) |*txn| txn.abort();
         read = null;
         if (elided_keys.items.len == 0) return;
-        if (session) |active| try active.checkDispatch(reembed_ns.*);
         const vectors = try alloc.alloc(f32, elided_keys.items.len * d);
         defer alloc.free(vectors);
         const ok = try alloc.alloc(bool, elided_keys.items.len);
@@ -33854,7 +33853,11 @@ pub const IndexManager = struct {
         @memset(ok, false);
         {
             const started = platform_time.monotonicNs();
-            defer reembed_ns.* +|= platform_time.monotonicNs() -| started;
+            defer if (session) |active| {
+                reembed_ns.* = active.elapsed_ns;
+            } else {
+                reembed_ns.* +|= platform_time.monotonicNs() -| started;
+            };
             try manager.reembedDenseDocumentsSession(alloc, entry, elided_keys.items, source_hashes.items, elided_digests.items, vectors, ok, session);
         }
         for (elided_slots.items, 0..) |slot, j| {
@@ -33940,7 +33943,11 @@ pub const IndexManager = struct {
         };
         if (session != null and reembedder.embed_session_fn != null) {
             try reembedder.embed_session_fn.?(reembedder.ctx, alloc, requests, entry.dims, out, found, session.?);
-        } else try reembedder.embed_fn(reembedder.ctx, alloc, requests, entry.dims, out, found);
+        } else {
+            const started = if (session) |active| try active.beginDispatch() else 0;
+            defer if (session) |active| active.finishDispatch(started);
+            try reembedder.embed_fn(reembedder.ctx, alloc, requests, entry.dims, out, found);
+        }
     }
 
     /// Restore and rebuild scans: re-embeds the document behind an elided
@@ -53612,7 +53619,7 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
         // before dispatching the embedder.
         {
             const loader = entry.vector_loader_context orelse return error.TestUnexpectedResult;
-            var session: LeannRecoverySession = .{ .budget_ns = 1 };
+            var session: LeannRecoverySession = .{ .budget_ns = 1, .elapsed_ns = 1 };
             defer session.deinit();
             var elapsed: u64 = 1;
             var loaded: [dims]f32 = undefined;

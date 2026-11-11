@@ -236,6 +236,7 @@ pub const AsyncContext = struct {
     background_closing: std.atomic.Value(bool) = .init(false),
     enrichment_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
+    query_recovery_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
     enrichment_desired_running: std.atomic.Value(bool) = .init(false),
     enrichment_restart_owner: @import("runtime_restart_owner.zig").Owner = .{},
     target_advance: @import("target_advance_tracker.zig").Tracker = .{},

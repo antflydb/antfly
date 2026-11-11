@@ -3178,6 +3178,7 @@ pub const DB = struct {
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     enrichment_owner: EnrichmentOwner = .{},
+    query_recovery_owner: DetachedEnrichmentRuntime = .{},
     /// Borrowed views for existing local consumers. The bundle owns destruction;
     /// replacement publishes these views while holding the lifecycle fence.
     enrichment_append_context: ?*EnrichmentAppendContext,
@@ -5568,6 +5569,15 @@ pub const DB = struct {
     const EnrichmentOwner = @import("enrichment_runtime_owner.zig").Owner(EnrichmentAppendContext);
     pub const DetachedEnrichmentRuntime = EnrichmentOwner.Bundle;
 
+    /// Install a query-owned provider before publishing the read handle.
+    /// The runtime cannot acquire a producer lease or publish artifacts.
+    pub fn attachQueryRecovery(self: *DB, config: *enrichment_runtime_mod.Config) !void {
+        if (self.open_mode != .query_readonly or self.query_recovery_owner.runtime != null) return error.InvalidArgument;
+        if (config.dense_embedder == null or config.sparse_embedder != null or config.asset_producer != null) return error.InvalidArgument;
+        self.query_recovery_owner = (try self.createDetachedEnrichmentRuntime(config)) orelse return error.ReembedUnavailable;
+        self.async_context.query_recovery_runtime = self.query_recovery_owner.runtime;
+    }
+
     pub fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
         if (comptime storage_engine.enabled) return storage_engine.call("createDetachedEnrichmentRuntime", .{ self, enrichment_cfg });
         // Native assets/chunks and their graph consumers still need replay
@@ -5581,7 +5591,8 @@ pub const DB = struct {
         // cannot silently fall back to default remote-content policy or an
         // unrelated executor when it supplies only a new producer set.
         var runtime_cfg = enrichment_cfg.*;
-        if (has_native_work) runtime_cfg.enable_without_producers = true;
+        runtime_cfg.recovery_only = self.open_mode == .query_readonly;
+        if (has_native_work and !runtime_cfg.recovery_only) runtime_cfg.enable_without_producers = true;
         runtime_cfg.root_incarnation = self.root_incarnation;
         if (runtime_cfg.secret_store == null) runtime_cfg.secret_store = self.secret_store;
         if (runtime_cfg.remote_content == null) runtime_cfg.remote_content = self.remote_content;
@@ -5632,7 +5643,7 @@ pub const DB = struct {
             .commit = commitArtifactUnitTurnFromEnrichment,
         });
         errdefer bundle.deinit(self.runtime_alloc);
-        try mergeEnrichmentTerminalFailureEnvelope(resources.store, bundle.runtime.?);
+        if (!runtime_cfg.recovery_only) try mergeEnrichmentTerminalFailureEnvelope(resources.store, bundle.runtime.?);
         return bundle;
     }
 
@@ -6182,6 +6193,8 @@ pub const DB = struct {
         self.ttl_owner.deinit(self.runtime_alloc);
         self.ttl_runtime = null;
         self.ttl_cleanup_context = null;
+        self.async_context.query_recovery_runtime = null;
+        self.query_recovery_owner.deinit(self.runtime_alloc);
         self.enrichment_owner.deinit(self.runtime_alloc);
         publishEnrichmentOwner(self);
         self.resolution_owner.deinitRuntime(self.runtime_alloc);
@@ -27442,13 +27455,13 @@ pub const DB = struct {
         found: []bool,
     ) anyerror!void {
         const context: *AsyncContext = @ptrCast(@alignCast(ctx));
-        const runtime = context.enrichment_runtime orelse return error.ReembedUnavailable;
+        const runtime = context.enrichment_runtime orelse context.query_recovery_runtime orelse return error.ReembedUnavailable;
         try enrichment_runtime_mod.reembedDenseDocuments(runtime, alloc, requests, dims, out, found);
     }
 
     fn reembedDenseForIndexManagerSession(ctx: *anyopaque, alloc: std.mem.Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, dims: u32, out: []f32, found: []bool, session: *@import("../leann_recovery.zig").Session) anyerror!void {
         const context: *AsyncContext = @ptrCast(@alignCast(ctx));
-        const runtime = context.enrichment_runtime orelse return error.ReembedUnavailable;
+        const runtime = context.enrichment_runtime orelse context.query_recovery_runtime orelse return error.ReembedUnavailable;
         try enrichment_runtime_mod.reembedDenseDocumentsSession(runtime, alloc, requests, dims, out, found, session);
     }
 
@@ -55908,6 +55921,7 @@ fn profileBenchTestsEnabled() bool {
 
 fn appendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch) !u64 {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+    if (ctx.read_only) return error.ReadOnly;
     var batch_ctx = ctx.batchContext();
     return appendDerivedBatchFromEnrichmentWithProducerFence(ctx, &batch_ctx, batch, true);
 }
@@ -56264,6 +56278,7 @@ fn enrichmentFailureArtifactKeyAlloc(
 
 fn recordEnrichmentRequestFailure(ctx_ptr: *anyopaque, failure: enrichment_runtime_mod.RequestFailure) !void {
     const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+    if (ctx.read_only) return error.ReadOnly;
     const async_ctx = ctx.async_context orelse return;
     const artifact_kind: types.ArtifactRepairKind = switch (failure.kind) {
         .dense_embedding, .sparse_embedding => .embedding,
@@ -56621,10 +56636,11 @@ fn appendGeneratedBatchFromEnrichment(
     source_guards: []const enrichment_runtime_mod.GeneratedSourceGuard,
     fence: ?enrichment_runtime_mod.GeneratedWriteFence,
 ) !enrichment_runtime_mod.GeneratedRecordCommit {
+    const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
+    if (ctx.read_only) return error.ReadOnly;
     if (artifact_promotions.len == 0 and artifact_delete_keys.len == 0 and source_guards.len == 0 and fence == null)
         return .{ .sequence = try appendDerivedBatchFromEnrichment(ctx_ptr, batch) };
 
-    const ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ctx_ptr));
     var batch_ctx = ctx.batchContext();
     var replication_mutation = acquireReplicationMutationSharedContext(&batch_ctx);
     defer if (replication_mutation) |*lease| lease.release();
@@ -134638,8 +134654,14 @@ fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool, transien
     defer alloc.free(snapshot_root);
     var generation = (try native_backup.validateAndMaterializeWithCancellation(alloc, io_impl.io(), snapshot_root, std.mem.span(restore_path), .none)) orelse return error.TestUnexpectedResult;
     defer generation.deinit();
-    var restored = try DB.open(alloc, std.mem.span(restore_path), .{ .open_mode = if (transient) .writer else .query_readonly, .enrichment = enrichment, .backend_runtime = runtime.ptr(), .ttl_cleanup = .{ .enabled = false } });
+    var restored = try DB.open(alloc, std.mem.span(restore_path), .{ .open_mode = .query_readonly, .backend_runtime = runtime.ptr(), .ttl_cleanup = .{ .enabled = false } });
     defer restored.close();
+    if (enrichment) |provider| {
+        var recovery = provider;
+        try restored.attachQueryRecovery(&recovery);
+        try std.testing.expect(restored.enrichment_runtime == null);
+        try std.testing.expectError(error.ReadOnly, restored.query_recovery_owner.runtime.?.start());
+    }
     const entry = restored.core.index_manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
     try std.testing.expect(!entry.index.experimentalPostingWalAuthoritative());
     const query = if (transient)
