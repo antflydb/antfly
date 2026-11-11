@@ -379,6 +379,34 @@ result; candidate qualification must measure them separately from the earlier
 roughly five-second fixture.
 
 
+Reader protocol 100 adds at most 32 direct provider selectors for publication
+roots and declaration roots. Selectors are copied into the stable reader binding,
+validated against its namespace and exact map generation, and covered by the
+retention certificate when present. Older descriptors keep their original
+serialization and fall back to generation-map navigation. Publication activation
+requires topology capability 87.
+
+Prepared text leaves share one query request gate across composed sources:
+eight requests and a 32 MiB transfer allowance, beneath a process gate of eight
+requests and 64 MiB. Reservations include request bodies and response ceilings.
+A required transfer larger than the allowance runs alone under its response
+limit; these allowances do not claim a hard bound on total query memory. Unknown
+response sizes reserve the whole allowance. Optional warming declines admission
+under pressure and reserves two request slots for demand. Queue time honors the
+original deadline and cancellation, without occupying provider transport workers.
+
+Text source opening waits for the first seed pack, then allows ranking and demand
+reads to overlap remaining packs. Query teardown cancels and joins every seed
+worker before releasing its store, arena, or reader lease. Missing or declined
+seeds fall back to authoritative reads. SQL retains the joined opening path.
+Generation-map bytes now use the existing credential-scoped, checksum-verified
+immutable cache as well as decoded RAM navigation. Its configured disk tier can
+reuse these bytes after process restart; cache hits still validate namespace and
+node depth. Table-owner routing remains the locality policy; this does not add a
+new distributed cache placement service. HN already publishes stored source and
+now projects the URL alongside its other rendering fields, avoiding Parquet
+hydration when the stored projection covers the request.
+
 Independent composed sources use waves of at most four initial page/count calls.
 Each source owns its mutable preparation scope, cancellation signal, and phase
 profile. The root scope shares the 64 MiB preparation budget, sixteen prepared

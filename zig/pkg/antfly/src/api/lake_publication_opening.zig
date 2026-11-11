@@ -457,7 +457,7 @@ const Worker = struct {
         const a = arena.allocator();
         // Clients and cloud-generation readers have independent ownership;
         // no request-arena allocator or mutable provider map crosses workers.
-        var store = try self.store.reopenReadOnly(a);
+        var store = try self.store.reopenReadOnlyWithPriority(a, true);
         defer store.deinit();
         store.implementation.cloud_io = self.cached.context.io;
         // The parent already admitted publication/reader/retention authority.
@@ -476,14 +476,96 @@ const Worker = struct {
         if (bundle.provider_generation) |generation| if (store.cloud_binding) |binding| {
             try binding.reader.bindOpeningHint(.{ .id = bundle.artifact.artifact_id, .bytes = bundle.artifact.byte_len, .generation = generation });
         };
-        packs.warmPublication(a, store.artifactStore(), .{ .artifact = .{ .artifact_id = bundle.artifact.artifact_id, .checksum = bundle.artifact.checksum, .byte_len = bundle.artifact.byte_len }, .decoded_bytes = bundle.decoded_bytes }, self.domain, self.cached, token) catch |err| switch (err) {
+        // A pack-level singleflight marker avoids decoding and readmitting the
+        // same seeds on every warm query. It retains no reader or credentials.
+        var seed: SeedLoader = .{ .a = a, .store = store.artifactStore(), .bundle = bundle, .domain = self.domain, .cached = self.cached, .token = token };
+        const seed_key = @import("lake_wal_image.zig").digest(.{ .kind = "publication-opening-seed-v1", .store = store.identity, .scope = self.cached.scope, .namespace = self.publication.namespace, .generation = self.publication.generation, .bundle = bundle });
+        const marker = self.cached.cache.decoded.acquire(seed_key, decode_budget, self.cached.context, .{ .ptr = &seed, .load = SeedLoader.load }) catch |err| switch (err) {
             // Immutable optional cache material cannot be repaired in place.
             // Remember its absence for this publication; demand remains strict.
             error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidNativeLakeTextOpeningPack => return,
             else => return err,
         };
+        marker.release();
     }
 };
+const SeedLoader = struct {
+    a: A,
+    store: stores.ArtifactStore,
+    bundle: catalog.OpeningBundle,
+    domain: [32]u8,
+    cached: artifacts.CachedRead,
+    token: Token,
+    fn load(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try packs.warmPublication(self.a, self.store, .{ .artifact = .{ .artifact_id = self.bundle.artifact.artifact_id, .checksum = self.bundle.artifact.checksum, .byte_len = self.bundle.artifact.byte_len }, .decoded_bytes = self.bundle.decoded_bytes }, self.domain, self.cached, self.token);
+        const marker = try item.arena.allocator().create(u8);
+        marker.* = 1;
+        item.payload = .{ .extension = marker };
+    }
+};
+/// Query-owned seed pipeline. Opening the first seed releases the reader to
+/// rank ready segments while later seeds continue under speculative admission.
+pub const Pending = struct {
+    arena: ?std.heap.ArenaAllocator = null,
+    store: ?*Store = null,
+    work: [max_bundles]Worker = undefined,
+    tasks: [max_bundles]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null),
+    io: ?std.Io = null,
+    started: bool = false,
+
+    pub fn deinit(self: *Pending) void {
+        if (self.io) |io| for (&self.tasks, &self.work) |*task, *worker| if (task.*) |*owned| {
+            worker.stopped.store(true, .release);
+            _ = owned.cancel(io) catch {};
+            task.* = null;
+        };
+        if (self.store) |store| store.deinit();
+        if (self.arena) |*arena| arena.deinit();
+        self.* = .{};
+    }
+    pub fn start(self: *Pending, store: *const Store, publication: catalog.Publication, cached: artifacts.CachedRead, token: Token) !void {
+        if (self.started or publication.opening_bundles.len == 0) return;
+        try publication.validate();
+        try cached.context.ensureActive();
+        self.started = true;
+        self.arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        errdefer self.deinit();
+        const a = self.arena.?.allocator();
+        const owned_store = try a.create(Store);
+        owned_store.* = try store.reopenReadOnly(a);
+        self.store = owned_store;
+        const encoded = try std.json.Stringify.valueAlloc(a, publication, .{});
+        const held = try std.json.parseFromSliceLeaky(catalog.Publication, a, encoded, .{ .allocate = .alloc_always });
+        const scope = (try stores.uploadScopeFromArtifactId(held.inventory.artifact_id)) orelse return error.InvalidLakeIndexCatalog;
+        self.io = cached.context.io;
+        for (held.opening_bundles, 0..) |bundle, i| {
+            self.work[i] = .{ .backing = std.heap.smp_allocator, .store = owned_store, .publication = held, .bundle = bundle, .domain = scope.domain, .cached = cached, .token = token };
+            if (self.io) |io| {
+                const cost = 2 * (bundle.artifact.byte_len + bundle.decoded_bytes) + 2 * 1024 * 1024;
+                self.tasks[i] = local.sql_parallel_scheduler.global().submitIo(io, @intCast(cost), Worker.run, .{&self.work[i]});
+            }
+        }
+        // The first pack carries bootstrap/navigation bytes. Declined optional
+        // work uses normal required reads. Its failure never hides source data.
+        if (self.tasks[0]) |*task| {
+            const result = task.await(self.io.?);
+            self.tasks[0] = null;
+            result catch |err| {
+                try cached.context.ensureActive();
+                try token.check();
+                if (err == error.OutOfMemory) return err;
+            };
+        } else {
+            self.work[0].run() catch |err| {
+                try cached.context.ensureActive();
+                try token.check();
+                if (err == error.OutOfMemory) return err;
+            };
+        }
+    }
+};
+
 const Loader = struct {
     store: *const Store,
     publication: catalog.Publication,
@@ -578,4 +660,63 @@ pub fn warm(store: *const Store, publication: catalog.Publication, cached: artif
         return;
     };
     held.release();
+}
+
+test "external lake opening pipeline owns seeds through cancellation and reader teardown" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("opening-pipeline-lifetime");
+    defer directory.cleanup();
+    var store = try Store.openNative(a, null, null, false, .standalone, directory.path());
+    defer store.deinit();
+    const scope = try stores.UploadScope.forPublication(@splat(81), 1, std.testing.io);
+    var output = store.artifactStore();
+    output.upload_scope = scope;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var collector: packs.Collector = .{ .a = a, .out = ca, .store = &output, .cancellation = .none, .version = 2, .max_packs = 2 };
+    defer collector.deinit();
+    var inventory = try output.putScoped(scope, "inventory", .none);
+    defer inventory.deinit(a);
+    const ref: artifacts.ChunkRef = .{ .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len };
+    try collector.add(ref, "inventory");
+    try collector.flush();
+    var later = try output.putScoped(scope, "later", .none);
+    defer later.deinit(a);
+    try collector.add(.{ .artifact_id = later.artifact_id, .checksum = later.checksum, .byte_len = later.byte_len }, "later");
+    try collector.flush();
+    var bundles: [2]catalog.OpeningBundle = undefined;
+    for (collector.refs.items, &bundles) |pack, *bundle| bundle.* = .{
+        .artifact = .{ .kind = .doc_values, .metadata_version = 1, .artifact_id = pack.artifact.artifact_id, .checksum = pack.artifact.checksum, .byte_len = pack.artifact.byte_len },
+        .decoded_bytes = @intCast(pack.decoded_bytes),
+    };
+    const publication: catalog.Publication = .{
+        .namespace = scope.domain,
+        .generation = 1,
+        .token = @splat(1),
+        .signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = store.identity },
+        .published_at_ms = 1,
+        .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://source/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = inventory.artifact_id } },
+        .inventory = .{ .kind = .external_base_source, .artifact_id = inventory.artifact_id, .checksum = inventory.checksum, .byte_len = inventory.byte_len },
+        .opening_bundles = &bundles,
+    };
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = store.cache_identity, .context = .{ .io = std.testing.io } };
+    var pending: Pending = .{};
+    defer pending.deinit();
+    try pending.start(&store, publication, cached, .none);
+    const Miss = struct {
+        fn load(_: *anyopaque, _: A) ![]u8 {
+            return error.UnexpectedOpeningCacheMiss;
+        }
+    };
+    var dummy: u8 = 0;
+    const bytes = try cache.readImmutableAlloc(a, cached.scope, inventory.artifact_id, inventory.byte_len, try stores.sha256DigestFromChecksum(inventory.checksum), cached.context, .{ .ptr = &dummy, .load = Miss.load });
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("inventory", bytes);
+    // Joins every optional worker before releasing its private store/arena.
+    pending.deinit();
+    try std.testing.expect(pending.store == null and pending.arena == null);
+    for (pending.tasks) |task| try std.testing.expect(task == null);
 }

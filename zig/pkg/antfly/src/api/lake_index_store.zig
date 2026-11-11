@@ -124,12 +124,17 @@ pub const Store = struct {
     /// Reopen independent client ownership for a query-local lazy selector.
     /// Both physical location and current credential scope must still match.
     pub fn reopenReadOnly(self: *const Store, a: A) !Store {
-        const options = self.reopen_options orelse return error.NativeArtifactStorageRequired;
+        return self.reopenReadOnlyWithPriority(a, false);
+    }
+    pub fn reopenReadOnlyWithPriority(self: *const Store, a: A, speculative: bool) !Store {
+        var options = self.reopen_options orelse return error.NativeArtifactStorageRequired;
+        if (options.transport) |*transport| transport.speculative = speculative;
         var result = if (options.config) |config|
             try openRetainedNativeWithTransport(a, config, options.secrets, self.locator, true, options.deployment, options.local_base_dir, options.transport)
         else
             try openNativeWithTransport(a, null, options.secrets, true, options.deployment, options.local_base_dir, options.transport);
         errdefer result.deinit();
+        result.implementation.cloud_cache = self.implementation.cloud_cache;
         if (!std.mem.eql(u8, &result.identity, &self.identity)) return error.ExternalLakeIndexStoreChanged;
         if (!std.mem.eql(u8, &result.cache_identity, &self.cache_identity)) return error.ExternalLakeIndexCredentialsChanged;
         return result;

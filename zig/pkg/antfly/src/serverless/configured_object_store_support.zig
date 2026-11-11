@@ -103,7 +103,7 @@ pub const BindingObjectStoreOpenOptions = struct {
         if (self.native_reader_protected) return null;
         if (source.catalog == null or self.node_config == null or self.node_config.?.storage.artifacts.connection == null or snapshot.len == 0) return null;
         const pins = @import("lake_snapshot_pins.zig");
-        var opened = try openNativeArtifactObjectStoreWithTransportAlloc(pin_alloc, self.node_config.?, self.secret_store, false, .{ .io = self.io, .requests = self.requests });
+        var opened = try openNativeArtifactObjectStoreWithTransportAlloc(pin_alloc, self.node_config.?, self.secret_store, false, .{ .io = self.io, .requests = self.requests, .query_requests = self.query_requests });
         errdefer opened.deinit();
         const prefix = try pins.namespace(pin_alloc, opened.prefix, source, uuid);
         errdefer pin_alloc.free(prefix);
@@ -159,6 +159,7 @@ pub const BindingObjectStoreOpenOptions = struct {
     /// bridge clears it and reconstructs from its checked IoBorrow.
     io: ?std.Io = null,
     requests: ?*@import("httpx").RequestLimit = null,
+    query_requests: ?*@import("httpx").RequestLimit = null,
     catalog_table_id: u64 = 0,
     catalog_generation: u64 = 0,
 };
@@ -231,7 +232,7 @@ pub fn executeLakeCatalogAlloc(a: Allocator, binding: catalog_binding.Binding, u
     defer if (journal_store) |*store| store.deinit();
     var journal: ?lake_catalog.rest.Journal = null;
     if (mutation or operation == .resolve) {
-        journal_store = try openNativeArtifactObjectStoreWithTransportAlloc(a, node, options.secret_store, !mutation, .{ .io = options.io, .requests = options.requests });
+        journal_store = try openNativeArtifactObjectStoreWithTransportAlloc(a, node, options.secret_store, !mutation, .{ .io = options.io, .requests = options.requests, .query_requests = options.query_requests });
         const authority = try std.json.Stringify.valueAlloc(scratch, .{ .source = binding.source_uri, .catalog = config }, .{});
         const prefix = try std.fmt.allocPrint(scratch, "{s}/lake-catalog/{d}/{d}/{s}", .{ journal_store.?.prefix, options.catalog_table_id, options.catalog_generation, lake_catalog.types.digestHex(authority) });
         journal = .{ .client = journal_store.?.client, .bucket = journal_store.?.bucket, .prefix = prefix };
@@ -266,7 +267,7 @@ pub fn executeExternalMaintenanceAlloc(a: Allocator, binding: catalog_binding.Bi
         if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Idempotency-Key") or std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Host") or std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Length")) return error.LakeCatalogForbidden;
         try headers.append(scratch, .{ entry.key_ptr.*, value });
     }
-    var opened = try openNativeArtifactObjectStoreWithTransportAlloc(a, node, options.secret_store, false, .{ .io = options.io, .requests = options.requests });
+    var opened = try openNativeArtifactObjectStoreWithTransportAlloc(a, node, options.secret_store, false, .{ .io = options.io, .requests = options.requests, .query_requests = options.query_requests });
     defer opened.deinit();
     const identity = try std.json.Stringify.valueAlloc(scratch, .{ .source = binding.source_uri, .catalog = config, .uuid = uuid }, .{});
     const journal_prefix = try std.fmt.allocPrint(scratch, "{s}/lake-provider-maintenance/{d}/{d}/{s}", .{ opened.prefix, options.catalog_table_id, options.catalog_generation, lake_catalog.types.digestHex(identity) });
@@ -318,7 +319,7 @@ pub fn openBindingObjectStoreAlloc(
         alloc,
         binding.source_uri,
         options.file_bucket,
-        .{ .ensure_bucket = !options.read_only, .io = options.io, .requests = options.requests },
+        .{ .ensure_bucket = !options.read_only, .io = options.io, .requests = options.requests, .query_requests = options.query_requests },
     );
     return try openCredentialedBindingObjectStoreAlloc(alloc, binding, options);
 }
@@ -352,7 +353,7 @@ fn openCredentialedBindingObjectStoreAlloc(
                 value.bucket,
                 value.prefix,
                 options.read_only,
-                .{ .io = options.io, .requests = options.requests },
+                .{ .io = options.io, .requests = options.requests, .query_requests = options.query_requests },
             );
         },
         .gcs => |value| blk: {
@@ -364,7 +365,7 @@ fn openCredentialedBindingObjectStoreAlloc(
                 value.bucket,
                 value.prefix,
                 options.read_only,
-                .{ .io = options.io, .requests = options.requests },
+                .{ .io = options.io, .requests = options.requests, .query_requests = options.query_requests },
             );
         },
         .file => |path| blk: {
@@ -379,7 +380,7 @@ fn openCredentialedBindingObjectStoreAlloc(
                 alloc,
                 file_uri,
                 options.file_bucket,
-                .{ .ensure_bucket = !options.read_only, .io = options.io, .requests = options.requests },
+                .{ .ensure_bucket = !options.read_only, .io = options.io, .requests = options.requests, .query_requests = options.query_requests },
             );
         },
     };
@@ -424,7 +425,7 @@ fn openCredentialedS3PrefixAlloc(
                 .virtual_hosted => .virtual_hosted,
             },
         },
-        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing, .io = if (transport) |value| value.io else null, .requests = if (transport) |value| value.requests else null },
+        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing, .io = if (transport) |value| value.io else null, .requests = if (transport) |value| value.requests else null, .query_requests = if (transport) |value| value.query_requests else null, .speculative = if (transport) |value| value.speculative else false },
     );
 }
 
@@ -454,7 +455,7 @@ fn openCredentialedGcsPrefixAlloc(
         bucket,
         prefix,
         bearer_token,
-        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing, .io = if (transport) |value| value.io else null, .requests = if (transport) |value| value.requests else null },
+        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing, .io = if (transport) |value| value.io else null, .requests = if (transport) |value| value.requests else null, .query_requests = if (transport) |value| value.query_requests else null, .speculative = if (transport) |value| value.speculative else false },
     );
 }
 

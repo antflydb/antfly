@@ -97,27 +97,66 @@ fn parsedResponseReusable(parser: *const Parser, req_method: types.Method) bool 
 pub const RequestLimit = extern struct {
     capacity: u32,
     active: u32 = 0,
+    max_bytes: u64 = 0,
+    active_bytes: u64 = 0,
+    demand_waiters: u32 = 0,
+    lock_word: u32 = 0,
 
+    fn lock(self: *RequestLimit) void {
+        while (@cmpxchgWeak(u32, &self.lock_word, 0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+    fn unlock(self: *RequestLimit) void {
+        @atomicStore(u32, &self.lock_word, 0, .release);
+    }
+    fn charge(self: *const RequestLimit, bytes: u64) u64 {
+        // A required oversized transfer runs alone under its caller's response
+        // limit. Ordinary transfers share the bounded in-flight allowance.
+        return if (self.max_bytes == 0) 0 else @min(bytes, self.max_bytes);
+    }
     fn acquire(self: *RequestLimit, io: Io, deadline_ms: ?i64, cancellation: ?CancellationToken) !void {
+        return self.acquireBudget(io, deadline_ms, cancellation, 0, false);
+    }
+    fn acquireBudget(self: *RequestLimit, io: Io, deadline_ms: ?i64, cancellation: ?CancellationToken, bytes: u64, speculative: bool) !void {
+        if (!speculative) _ = @atomicRmw(u32, &self.demand_waiters, .Add, 1, .acq_rel);
+        defer if (!speculative) {
+            _ = @atomicRmw(u32, &self.demand_waiters, .Sub, 1, .acq_rel);
+        };
         while (true) {
             try io.checkCancel();
             if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
             try ensureRequestDeadline(io, deadline_ms);
-            const count = @atomicLoad(u32, &self.active, .acquire);
-            if (count < self.capacity and @cmpxchgWeak(u32, &self.active, count, count + 1, .acq_rel, .acquire) == null) return;
-            if (self.capacity == 0) return error.ConcurrencyUnavailable;
+            self.lock();
+            const slots = if (speculative) self.capacity -| 2 else self.capacity;
+            const blocked = speculative and @atomicLoad(u32, &self.demand_waiters, .acquire) != 0;
+            const charged = self.charge(bytes);
+            if (!blocked and self.active < slots and (self.max_bytes == 0 or charged <= self.max_bytes -| self.active_bytes)) {
+                _ = @atomicRmw(u32, &self.active, .Add, 1, .acq_rel);
+                self.active_bytes += charged;
+                self.unlock();
+                return;
+            }
+            self.unlock();
+            if (speculative or self.capacity == 0) return error.ConcurrencyUnavailable;
             try io.sleep(.fromMilliseconds(1), .awake);
         }
     }
     fn release(self: *RequestLimit) void {
+        self.releaseBudget(0);
+    }
+    fn releaseBudget(self: *RequestLimit, bytes: u64) void {
+        self.lock();
+        defer self.unlock();
         const previous = @atomicRmw(u32, &self.active, .Sub, 1, .acq_rel);
-        std.debug.assert(previous != 0);
+        std.debug.assert(previous != 0 and self.active_bytes >= self.charge(bytes));
+        self.active_bytes -= self.charge(bytes);
     }
 };
 
 /// HTTP client configuration.
 pub const ClientConfig = struct {
     request_limit: ?*RequestLimit = null,
+    query_request_limit: ?*RequestLimit = null,
+    speculative_io: bool = false,
     attempt_observer: ?AttemptObserver = null,
     base_url: ?[]const u8 = null,
     timeouts: types.Timeouts = .{},
@@ -1179,8 +1218,11 @@ pub const Client = struct {
         var lease = try self.request_gate.tryAcquire(self.io);
         defer lease.deinit();
         var queued_cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation orelse self.config.request_cancellation };
-        if (self.config.request_limit) |limit| try limit.acquire(self.io, deadline_ms, queued_cancellation.token());
-        defer if (self.config.request_limit) |limit| limit.release();
+        const transfer_bytes = @min(reqOpts.max_response_size orelse self.config.max_response_size, self.config.max_response_size) +| (if (reqOpts.body) |body| body.len else 0);
+        if (self.config.query_request_limit) |limit| try limit.acquireBudget(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io);
+        defer if (self.config.query_request_limit) |limit| limit.releaseBudget(transfer_bytes);
+        if (self.config.request_limit) |limit| try limit.acquireBudget(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io);
+        defer if (self.config.request_limit) |limit| limit.releaseBudget(transfer_bytes);
         if (!self.config.cancel_in_flight_on_shutdown) return self.requestInternal(method, url, reqOpts, 0, deadline_ms);
 
         var cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation orelse self.config.request_cancellation };
@@ -1204,8 +1246,11 @@ pub const Client = struct {
         var lease = try self.request_gate.tryAcquire(self.io);
         defer lease.deinit();
         var queued_cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation orelse self.config.request_cancellation };
-        if (self.config.request_limit) |limit| try limit.acquire(self.io, deadline_ms, queued_cancellation.token());
-        defer if (self.config.request_limit) |limit| limit.release();
+        const transfer_bytes = @min(reqOpts.max_response_size orelse self.config.max_response_size, self.config.max_response_size) +| (if (reqOpts.body) |body| body.len else 0);
+        if (self.config.query_request_limit) |limit| try limit.acquireBudget(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io);
+        defer if (self.config.query_request_limit) |limit| limit.releaseBudget(transfer_bytes);
+        if (self.config.request_limit) |limit| try limit.acquireBudget(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io);
+        defer if (self.config.request_limit) |limit| limit.releaseBudget(transfer_bytes);
         if (!self.config.cancel_in_flight_on_shutdown) return self.requestToWriterInternal(method, url, reqOpts, writer, progress_cb, progress_ctx, 0, deadline_ms);
 
         var cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation orelse self.config.request_cancellation };
@@ -7222,5 +7267,28 @@ test "request task admission keeps transport independent of a fully occupied cal
         try result;
     }
     try serving.await(io);
+    try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &limit.active, .acquire));
+}
+
+test "request task admission shares byte quotas and reserves demand capacity ahead of speculation" {
+    const io = std.testing.io;
+    var limit: RequestLimit = .{ .capacity = 8, .max_bytes = 16 };
+    try limit.acquireBudget(io, null, null, 12, false);
+    try std.testing.expectEqual(@as(u64, 12), limit.active_bytes);
+    try std.testing.expectError(error.ConcurrencyUnavailable, limit.acquireBudget(io, null, null, 8, true));
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &limit.active, .acquire));
+    limit.releaseBudget(12);
+    try limit.acquireBudget(io, null, null, 128, false);
+    try std.testing.expectEqual(@as(u64, 16), limit.active_bytes);
+    try std.testing.expectError(error.ConcurrencyUnavailable, limit.acquireBudget(io, null, null, 1, true));
+    limit.releaseBudget(128);
+    _ = @atomicRmw(u32, &limit.demand_waiters, .Add, 1, .acq_rel);
+    try std.testing.expectError(error.ConcurrencyUnavailable, limit.acquireBudget(io, null, null, 1, true));
+    _ = @atomicRmw(u32, &limit.demand_waiters, .Sub, 1, .acq_rel);
+    for (0..6) |_| try limit.acquireBudget(io, null, null, 1, true);
+    try std.testing.expectError(error.ConcurrencyUnavailable, limit.acquireBudget(io, null, null, 1, true));
+    for (0..2) |_| try limit.acquireBudget(io, null, null, 1, false);
+    for (0..8) |_| limit.releaseBudget(1);
+    try std.testing.expectEqual(@as(u64, 0), limit.active_bytes);
     try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &limit.active, .acquire));
 }

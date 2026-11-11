@@ -23,6 +23,8 @@ const Allocator = std.mem.Allocator;
 pub const Transport = struct {
     io: ?std.Io = null,
     requests: ?*@import("httpx").RequestLimit = null,
+    query_requests: ?*@import("httpx").RequestLimit = null,
+    speculative: bool = false,
 };
 const AwsCredentialContext = @import("aws_credential_context.zig").AwsCredentialContext;
 
@@ -145,6 +147,8 @@ pub const OpenedObjectStore = struct {
         /// Borrowed runtime; it must outlive the opened provider client.
         io: ?std.Io = null,
         requests: ?*@import("httpx").RequestLimit = null,
+        query_requests: ?*@import("httpx").RequestLimit = null,
+        speculative: bool = false,
     };
 
     pub fn initRemoteUri(alloc: Allocator, uri: []const u8, file_bucket: []const u8) !OpenedObjectStore {
@@ -260,7 +264,11 @@ pub const OpenedObjectStore = struct {
         errdefer cfg.deinit(alloc);
         if (options.io) |io| cfg.io = io;
         gcs.* = try object_storage.Gcs.JsonApiClient.init(alloc, cfg);
-        if (gcs.owned_httpx) |transport| transport.client.config.request_limit = options.requests;
+        if (gcs.owned_httpx) |transport| {
+            transport.client.config.request_limit = options.requests;
+            transport.client.config.query_request_limit = options.query_requests;
+            transport.client.config.speculative_io = options.speculative;
+        }
 
         var owned_client = gcs.client();
         if (options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
@@ -380,7 +388,11 @@ pub const OpenedObjectStore = struct {
         if (open_options.io) |io| cfg.io = io;
         s3.* = try object_storage.S3.Client.init(alloc, cfg);
         cfg_owned = false;
-        if (s3.owned_httpx) |transport| transport.client.config.request_limit = open_options.requests;
+        if (s3.owned_httpx) |transport| {
+            transport.client.config.request_limit = open_options.requests;
+            transport.client.config.query_request_limit = open_options.query_requests;
+            transport.client.config.speculative_io = open_options.speculative;
+        }
         var owned_client = s3.client();
         errdefer owned_client.deinit();
         if (open_options.ensure_bucket and !(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);

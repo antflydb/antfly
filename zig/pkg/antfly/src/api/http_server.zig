@@ -5331,9 +5331,9 @@ pub const ApiHttpServer = struct {
     // occupied by synchronous query/build callers.
     const LakeProviderTransport = struct {
         io: std.Io.Threaded,
-        // HTTP/1 reserves up to six nested request/connect/socket tasks. Four
-        // admitted requests leave eight workers of completion headroom.
-        requests: @import("httpx").RequestLimit = .{ .capacity = 4 },
+        // HTTP/1 reserves up to six nested request/connect/socket tasks. Eight
+        // admitted requests leave sixteen workers of completion headroom.
+        requests: @import("httpx").RequestLimit = .{ .capacity = 8, .max_bytes = 64 * 1024 * 1024 },
     };
     pub fn lakeProviderTransport(self: *ApiHttpServer) !@import("antfly_local_sources").serverless_object_store_support.Transport {
         platform_sync.lockYielding(&self.lake_transport_mutex);
@@ -5341,7 +5341,7 @@ pub const ApiHttpServer = struct {
         if (self.index_installation_closing.load(.acquire)) return error.Canceled;
         if (self.lake_transport == null) {
             const transport = try self.owner_alloc.create(LakeProviderTransport);
-            transport.* = .{ .io = std.Io.Threaded.init(self.owner_alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(32) }) };
+            transport.* = .{ .io = std.Io.Threaded.init(self.owner_alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(64) }) };
             self.lake_transport = transport;
         }
         return .{ .io = self.lake_transport.?.io.io(), .requests = &self.lake_transport.?.requests };

@@ -112,6 +112,7 @@ pub const Scope = struct {
     parent: ?*Scope = null,
     reserved: std.atomic.Value(usize) = .init(0),
     read_ahead_budget: local.serverless_query_lake_read_context.ReadAheadBudget = .{},
+    request_limit: @import("httpx").RequestLimit = .{ .capacity = 8, .max_bytes = 32 * 1024 * 1024 },
     io: local.serverless_query_lake_read_context.IoTrace.Snapshot = .{},
     budget: local.sql_memory_budget,
     entries: [16]*Prepared = undefined,
@@ -247,6 +248,9 @@ pub const Scope = struct {
     }
 };
 const Prepared = struct {
+    opening_pending: @import("lake_publication_opening.zig").Pending = .{},
+    request_limit: @import("httpx").RequestLimit = .{ .capacity = 8, .max_bytes = 32 * 1024 * 1024 },
+    transport: local.serverless_object_store_support.Transport = .{},
     io_trace: local.serverless_query_lake_read_context.IoTrace = .{},
     backing: A,
     native_owner: ?source_owner.admission.State = null,
@@ -307,6 +311,7 @@ const Prepared = struct {
         return self.durable_token.?;
     }
     pub fn deinit(self: *Prepared) void {
+        self.opening_pending.deinit();
         self.selected.deinit();
         if (self.manifest_pin) |pin| pin.release();
         self.source.deinit();
@@ -321,15 +326,19 @@ const Prepared = struct {
         backing.destroy(self);
     }
 };
-fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext, request_profile: ?*@import("lake_query_metrics.zig").ComposedProfile, is_lake: *bool, allow_owned: bool) !?*Prepared {
+fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext, request_profile: ?*@import("lake_query_metrics.zig").ComposedProfile, is_lake: *bool, allow_owned: bool, scope: ?*Scope) !?*Prepared {
     const prepared = try backing.create(Prepared);
     prepared.* = .{ .backing = backing, .arena = .init(backing) };
     var transferred = false;
     defer if (!transferred) {
+        prepared.opening_pending.deinit();
         prepared.arena.deinit();
         backing.destroy(prepared);
     };
     defer if (request_profile) |profile| profile.io.add(prepared.io_trace.snapshot());
+    prepared.transport = try server.lakeProviderTransport();
+    prepared.transport.query_requests = if (scope) |owner| &(owner.parent orelse owner).request_limit else &prepared.request_limit;
+    if (scope) |owner| prepared.io_trace.read_ahead_shared = &(owner.parent orelse owner).read_ahead_budget;
     const a = prepared.arena.allocator();
     var schema = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, current_table.schema_json)) orelse return null;
     defer if (!transferred) schema.deinit(a);
@@ -345,6 +354,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     defer if (!transferred) if (retained_pin) |pin| pin.deinit();
     const normalized = try request.platformDeadline();
     prepared.retained_context = .{ .trace = &prepared.io_trace, .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+    try server.prepareLakeCache();
     const retained_cancellation = retainedCancellation(&prepared.retained_context);
     const now_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
     prepared.native_owner = owner: {
@@ -377,22 +387,22 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     var manifest_ahead: ManifestAhead = .{};
     defer manifest_ahead.deinit(server.embedding_provider_runtime.io);
     if (prepared.native_cut) |cut| {
-        var cut_store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
+        var cut_store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, prepared.transport);
         defer cut_store.deinit();
         cut_store.implementation.cloud_io = server.embedding_provider_runtime.io;
+        cut_store.implementation.cloud_cache = .{ .cache = &server.lake_read_cache, .scope = cut_store.cache_identity, .context = prepared.retained_context };
         var artifacts = cut_store.artifactStore();
-        try server.prepareLakeCache();
         if (cut.manifest) |ref| manifest_ahead.start(server, ref, cut_store.cache_identity, prepared.retained_context);
         retained_pin = try retained_api.loadOwned(ra, &artifacts, cut_store.identity, table, cut, now_ms, retained_cancellation, &server.lake_read_cache.decoded, &server.lake_retained_groups, prepared.retained_context, .{ .cache = &server.lake_read_cache, .scope = cut_store.cache_identity, .context = prepared.retained_context });
         retained = retained_pin.?.descriptor;
         table.lake_index_catalog_json = try local.metadata_lake_index_catalog.encode(ra, .{ .namespace = retained.?.publication.namespace, .generation = retained.?.publication.generation, .published = retained.?.publication });
     }
     if (req.remote_snapshot) |token| if (std.mem.startsWith(u8, token, retained_api.prefix)) {
-        var cut_store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
+        var cut_store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, prepared.transport);
         defer cut_store.deinit();
         cut_store.implementation.cloud_io = server.embedding_provider_runtime.io;
+        cut_store.implementation.cloud_cache = .{ .cache = &server.lake_read_cache, .scope = cut_store.cache_identity, .context = prepared.retained_context };
         var artifacts = cut_store.artifactStore();
-        try server.prepareLakeCache();
         retained_pin = try retained_api.loadWithGroups(ra, &artifacts, cut_store.identity, token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, retained_cancellation, &server.lake_read_cache.decoded, &server.lake_retained_groups, prepared.retained_context);
         retained = retained_pin.?.descriptor;
         table.lake_index_catalog_json = try local.metadata_lake_index_catalog.encode(ra, .{ .namespace = retained.?.publication.namespace, .generation = retained.?.publication.generation, .published = retained.?.publication });
@@ -413,14 +423,13 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     };
     defer if (!transferred) lease.deinit();
     context = lease.readContext();
-    try server.prepareLakeCache();
-    const transport = try server.lakeProviderTransport();
-    var options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .io = transport.io, .requests = transport.requests, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
+    const transport = prepared.transport;
+    var options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .io = transport.io, .requests = transport.requests, .query_requests = transport.query_requests, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
     options.retained_catalog_metadata = if (retained) |cut| cut.catalog_metadata else null;
     options.authoritative_metadata = prepared.native_cut != null;
     options.native_reader_protected = if (prepared.native_owner) |owner| owner.enabled else false;
     if (prepared.native_cut) |cut| if (cut.manifest) |ref| {
-        var manifest_store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
+        var manifest_store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, prepared.transport);
         defer manifest_store.deinit();
         manifest_store.implementation.cloud_io = server.embedding_provider_runtime.io;
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &server.lake_read_cache, .scope = manifest_store.cache_identity, .context = context };
@@ -432,11 +441,12 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     // at its final heap address before selecting/binding any publication.
     // Owned queries reference already durable state. Enforce their no-upload
     // contract through a read-only artifact store, including fresh requests.
-    prepared.store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null or prepared.native_cut != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
+    prepared.store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null or prepared.native_cut != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, prepared.transport);
     const store = &prepared.store;
     defer if (!transferred) store.deinit();
     if (retained == null) try server.retainLakeQueryStore(a, store, table.table_id, request);
     store.implementation.cloud_io = server.embedding_provider_runtime.io;
+    store.implementation.cloud_cache = .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context };
     var wal_cut: ?@import("lake_wal_cut_cache.zig").Pin = null;
     defer if (!transferred) if (wal_cut) |pin| pin.deinit();
     const oa = a;
@@ -501,11 +511,15 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
     }
     if (retained != null) if (req.lake_read) |read| if (read.through) |receipt| if (retained_pending.lsn < receipt.wal_lsn) return error.IndexRebuilding;
     var source = blk: {
+        errdefer prepared.opening_pending.deinit();
         const source_started = @import("antfly_platform").time.monotonicNs();
         defer if (request_profile) |profile| profile.record(&server.lake_query_metrics, .source, source_started);
-        break :blk try @import("lake_published_navigation.zig").open(a, server, table.table_id, table.lake_index_catalog_json, .{ .storage_mode = .relational, .external_base_source = source_schema }, options.lakeOptions(), context, request, lease);
+        break :blk try @import("lake_published_navigation.zig").openPipelined(a, server, table.table_id, table.lake_index_catalog_json, .{ .storage_mode = .relational, .external_base_source = source_schema }, options.lakeOptions(), context, request, lease, &prepared.opening_pending, prepared.transport);
     };
-    defer if (!transferred) source.deinit();
+    defer if (!transferred) {
+        prepared.opening_pending.deinit();
+        source.deinit();
+    };
     // A native-admitted cut already protects the exact published source and
     // immutable delete versions. Expose that retention through the existing
     // snapshot port so qualified delete proofs need no provider HEAD. Strict
@@ -698,14 +712,14 @@ fn refreshOwnedCutExclusive(backing: A, server: *server_api.ApiHttpServer, table
         if (!resident) {
             var warm_profile: @import("lake_query_metrics.zig").ComposedProfile = .{};
             var lake = false;
-            const warm = (try prepare(a, server, table, .{}, request, &warm_profile, &lake, true)) orelse return;
+            const warm = (try prepare(a, server, table, .{}, request, &warm_profile, &lake, true, null)) orelse return;
             warm.deinit();
         }
         return;
     };
     var profile: @import("lake_query_metrics.zig").ComposedProfile = .{};
     var is_lake = false;
-    const prepared = (try prepare(a, server, table, .{}, request, &profile, &is_lake, false)) orelse return;
+    const prepared = (try prepare(a, server, table, .{}, request, &profile, &is_lake, false, null)) orelse return;
     defer prepared.deinit();
     const ttl = retained_api.configuredTtl(server.cfg.node_config);
     const horizon = try source_owner.admission.retention(now, ttl);
@@ -725,7 +739,7 @@ fn refreshOwnedCutExclusive(backing: A, server: *server_api.ApiHttpServer, table
     try authority.apply(table.table_id, .{ .admit_source = .{ .scope = source_owner.scope(table, native_owner), .epoch = native_owner.epoch, .source_uuid = uuid, .cut = cut, .now_ms = now } });
     // Read once through the normal path to install immutable state/row groups
     // and the sealed manifest in process-accounted residency before serving.
-    const warm = (try prepare(a, server, table, .{}, request, &profile, &is_lake, true)) orelse return;
+    const warm = (try prepare(a, server, table, .{}, request, &profile, &is_lake, true, null)) orelse return;
     warm.deinit();
 }
 fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext, delivery: ?local.api_query_response.Delivery, build_recent: bool, scope: ?*Scope) !?local.api_query.QueryResponse {
@@ -764,7 +778,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
                 leaf.preparations +|= 1;
             };
         };
-        break :prepared try prepare(if (cache) shared.?.budget.allocator() else a, server, current_table, req, request, &request_profile, &is_lake, !build_recent) orelse return null;
+        break :prepared try prepare(if (cache) shared.?.budget.allocator() else a, server, current_table, req, request, &request_profile, &is_lake, !build_recent, scope) orelse return null;
     };
     if (scope) |owner| prepared.io_trace.read_ahead_shared = &(owner.parent orelse owner).read_ahead_budget;
     trace_owner = prepared;
@@ -6964,7 +6978,7 @@ test "external lake provider clients use one isolated server-owned transport" {
     try std.testing.expect(first.io.?.userdata == second.io.?.userdata);
     try std.testing.expect(first.io.?.userdata != server.embedding_provider_runtime.io.userdata);
     try std.testing.expect(first.requests == second.requests);
-    try std.testing.expectEqual(@as(u32, 4), first.requests.?.capacity);
+    try std.testing.expectEqual(@as(u32, 8), first.requests.?.capacity);
     server.index_installation_closing.store(true, .release);
     try std.testing.expectError(error.Canceled, server.lakeProviderTransport());
 }

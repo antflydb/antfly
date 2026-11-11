@@ -26,7 +26,7 @@ pub const Digest = [32]u8;
 pub const Token = [16]u8;
 pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
 pub const max_directory_artifacts: usize = 4096;
-pub const native_reader_protocol: u16 = 99;
+pub const native_reader_protocol: u16 = 100;
 pub const minimum_reader_protocol: u16 = 97;
 
 // Readers retain the prior contract while new writers publish opening bundles.
@@ -102,10 +102,15 @@ pub const CloudRetentionCertificate = struct {
 };
 pub const CloudVacuumProgress = struct { cutoff: u64 = 0, proof: ?Digest = null, after: ?Digest = null, done: bool = false };
 pub const CloudGenerations = struct {
+    bootstrap: []const ProviderLocator = &.{},
     root: artifacts.ProviderGenerationRef,
     complete: bool = false,
     vacuum: CloudVacuumProgress = .{},
     certificate: ?CloudRetentionCertificate = null,
+    pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
+        if (self.bootstrap.len == 0) return stream.write(.{ .root = self.root, .complete = self.complete, .vacuum = self.vacuum, .certificate = self.certificate });
+        return stream.write(.{ .root = self.root, .complete = self.complete, .vacuum = self.vacuum, .certificate = self.certificate, .bootstrap = self.bootstrap });
+    }
 };
 pub const ProviderLocator = struct {
     id: []const u8,
@@ -193,6 +198,11 @@ pub const Publication = struct {
         }
         if (self.cloud_generations) |cloud| {
             try cloud.root.validate();
+            if (cloud.bootstrap.len > 32 or (cloud.bootstrap.len != 0 and self.reader_protocol < 100)) return error.InvalidLakeIndexCatalog;
+            for (cloud.bootstrap, 0..) |locator, i| {
+                if (locator.id.len == 0 or locator.id.len > 512 or locator.bytes == 0 or locator.bytes > 32 * 1024 * 1024 or locator.generation.len == 0 or locator.generation.len > 4096 or std.mem.eql(u8, locator.generation, "null")) return error.InvalidLakeIndexCatalog;
+                for (cloud.bootstrap[0..i]) |prior| if (std.mem.eql(u8, prior.id, locator.id)) return error.InvalidLakeIndexCatalog;
+            }
             if (cloud.certificate) |certificate| {
                 if (!cloud.complete or certificate.version != 1 or certificate.until_ms == 0 or certificate.until_ms > cloud.root.retention_until_ms or certificate.roots.len == 0 or certificate.roots.len > 4096 or std.mem.allEqual(u8, &certificate.binding, 0)) return error.InvalidLakeIndexCatalog;
                 for (certificate.roots, 0..) |root, i| if (i != 0 and std.mem.order(u8, &certificate.roots[i - 1], &root) != .lt) return error.InvalidLakeIndexCatalog;

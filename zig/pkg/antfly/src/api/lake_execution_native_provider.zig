@@ -78,9 +78,9 @@ fn attempt(request: c.Request, callbacks: *Callbacks, io: std.Io, transport_io: 
     try request.cancellation.check();
     const store_started = probeNow();
     var store = if (request.store.config) |config|
-        try Store.openRetainedNativeWithTransport(a, config, request.store.secrets, request.store.locator, false, request.store.deployment, request.store.local_base_dir, .{ .io = transport_io, .requests = request.source.requests })
+        try Store.openRetainedNativeWithTransport(a, config, request.store.secrets, request.store.locator, false, request.store.deployment, request.store.local_base_dir, .{ .io = transport_io, .requests = request.source.requests, .query_requests = request.source.query_requests })
     else
-        try Store.openNativeWithTransport(a, null, request.store.secrets, false, request.store.deployment, request.store.local_base_dir, .{ .io = transport_io, .requests = request.source.requests });
+        try Store.openNativeWithTransport(a, null, request.store.secrets, false, request.store.deployment, request.store.local_base_dir, .{ .io = transport_io, .requests = request.source.requests, .query_requests = request.source.query_requests });
     defer store.deinit();
     probeStage("store_open_ns", store_started);
     if (store.locator.protocol != request.store.locator.protocol or store.locator.tls != request.store.locator.tls or

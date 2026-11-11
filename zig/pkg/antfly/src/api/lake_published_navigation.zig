@@ -119,6 +119,7 @@ const Owner = struct {
     }
 };
 const Factory = struct {
+    pending: ?*@import("lake_publication_opening.zig").Pending = null,
     store: *Store,
     publication: local.metadata_lake_index_catalog.Publication,
     lease: *Lease,
@@ -140,7 +141,9 @@ const Factory = struct {
         try context.ensureActive();
         try self.store.bindPublication(self.publication, token);
         const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = self.cache, .scope = self.store.cache_identity, .context = held_context };
-        try @import("lake_publication_opening.zig").warm(self.store, self.publication, cached, token);
+        if (self.pending) |pending| {
+            try pending.start(self.store, self.publication, cached, token);
+        } else try @import("lake_publication_opening.zig").warm(self.store, self.publication, cached, token);
         const pin = @import("lake_index_decoded_metadata.zig").acquire(nav.Root, cached, self.store.artifactStore(), ref, token, nav.load) catch |err| switch (err) {
             error.OutOfMemory, error.SqlMemoryLimitExceeded, error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidNativeLakeFileState, error.CloudGenerationMapUnavailable => return null,
             else => return err,
@@ -187,6 +190,9 @@ fn optionalAdmission(context: Context, required: bool, err: anyerror) !void {
 /// One entry point for native search and SQL. Fallback source contexts never
 /// borrow the temporary native lease; adopted navigation owns an independent pin.
 pub fn open(a: A, server: *@import("http_server.zig").ApiHttpServer, table_id: u64, catalog_json: []const u8, schema: local.storage_schema.TableSchema, options: anytype, context: Context, request: local.api_operation.RequestContext, reader: ?*Lease) !Source {
+    return openPipelined(a, server, table_id, catalog_json, schema, options, context, request, reader, null, null);
+}
+pub fn openPipelined(a: A, server: *@import("http_server.zig").ApiHttpServer, table_id: u64, catalog_json: []const u8, schema: local.storage_schema.TableSchema, options: anytype, context: Context, request: local.api_operation.RequestContext, reader: ?*Lease, pending: ?*@import("lake_publication_opening.zig").Pending, transport: ?local.serverless_object_store_support.Transport) !Source {
     const binding = (schema.external_base_source orelse return error.InvalidExternalTableBinding).binding;
     if (catalog_json.len == 0)
         return Source.openLazyCached(a, schema, options, context, &server.lake_read_cache);
@@ -200,19 +206,20 @@ pub fn open(a: A, server: *@import("http_server.zig").ApiHttpServer, table_id: u
     var source_options: @import("antfly_local_sources").serverless_lake_host.OpenOptions = options;
     source_options.row_identity_version = binding.row_identity_version;
     const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return Source.openLazyCached(a, schema, source_options, context, &server.lake_read_cache);
-    var store = Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport()) catch |err| {
+    var store = Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, transport orelse try server.lakeProviderTransport()) catch |err| {
         try optionalAdmission(context, reader != null, err);
         return Source.openLazyCached(a, schema, source_options, context, &server.lake_read_cache);
     };
     defer store.deinit();
     if (!std.mem.eql(u8, &store.identity, &publication.signature.store)) return Source.openLazyCached(a, schema, source_options, context, &server.lake_read_cache);
     store.implementation.cloud_io = context.io;
+    store.implementation.cloud_cache = .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context };
     const lease = reader orelse server.lake_reader_leases.acquireRetained(server.embedding_provider_runtime.io, authority, table_id, publication.generation, context, null) catch |err| {
         try optionalAdmission(context, false, err);
         return Source.openLazyCached(a, schema, source_options, context, &server.lake_read_cache);
     };
     defer if (reader == null) lease.deinit();
-    var factory: Factory = .{ .store = &store, .publication = publication, .lease = lease, .cache = &server.lake_read_cache, .table_id = table_id, .required = reader != null };
+    var factory: Factory = .{ .pending = pending, .store = &store, .publication = publication, .lease = lease, .cache = &server.lake_read_cache, .table_id = table_id, .required = reader != null };
     if ((binding.format != .iceberg and !local.serverless_query_lake_parquet_manifest.isManifest(binding.source_uri)) or binding.object_mutability != .immutable) {
         var source = try Source.openLazyCached(a, schema, source_options, context, &server.lake_read_cache);
         errdefer source.deinit();
