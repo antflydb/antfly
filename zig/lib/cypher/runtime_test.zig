@@ -5581,27 +5581,38 @@ test "ordered memo traces preserve reached scalar errors and empty tails" {
 
 test "ordered reduction snapshots match independent sequential execution across partitions" {
     const Compare = struct {
-        fn run(text: []const u8, parameters: []const v.Entry) !void {
-            const a = std.testing.allocator;
+        a: std.mem.Allocator,
+        fast: c.Compiled,
+        slow: c.Compiled,
+        control: []u8,
+        fn init(a: std.mem.Allocator, text: []const u8) !@This() {
             var diagnostic: c.Diagnostic = .{};
             var fast = try c.compile(a, text, .{}, &diagnostic);
-            defer fast.deinit();
+            errdefer fast.deinit();
             const returned = std.mem.lastIndexOf(u8, text, " RETURN ") orelse 0;
             var split = text.len;
             for ([_][]const u8{ " ORDER BY ", " SKIP ", " LIMIT " }) |keyword| if (std.mem.lastIndexOf(u8, text, keyword)) |position| {
                 if (position > returned) split = @min(split, position);
             };
             const control = try std.fmt.allocPrint(a, "{s},sum(0)+size(coalesce(collect(null),[])){s}", .{ text[0..split], text[split..] });
-            defer a.free(control);
-            var slow = try c.compile(a, control, .{}, &diagnostic);
-            defer slow.deinit();
+            errdefer a.free(control);
+            const slow = try c.compile(a, control, .{}, &diagnostic);
+            return .{ .a = a, .fast = fast, .slow = slow, .control = control };
+        }
+        fn deinit(self: *@This()) void {
+            self.slow.deinit();
+            self.fast.deinit();
+            self.a.free(self.control);
+        }
+        fn run(self: *const @This(), parameters: []const v.Entry) !void {
+            const a = self.a;
             var fixture: Fixture = .{};
-            var actual = runtime.execute(a, fixture.backend(), graph, &fast, parameters, .{}) catch |err| {
-                try std.testing.expectError(err, runtime.execute(a, fixture.backend(), graph, &slow, parameters, .{}));
+            var actual = runtime.execute(a, fixture.backend(), graph, &self.fast, parameters, .{}) catch |err| {
+                try std.testing.expectError(err, runtime.execute(a, fixture.backend(), graph, &self.slow, parameters, .{}));
                 return;
             };
             defer actual.deinit();
-            var expected = try runtime.execute(a, fixture.backend(), graph, &slow, parameters, .{});
+            var expected = try runtime.execute(a, fixture.backend(), graph, &self.slow, parameters, .{});
             defer expected.deinit();
             try std.testing.expectEqual(expected.rows.len, actual.rows.len);
             for (actual.rows, expected.rows) |left, right| for (left, right[0..left.len]) |x, y| {
@@ -5610,59 +5621,70 @@ test "ordered reduction snapshots match independent sequential execution across 
             };
         }
     };
-    var random = std.Random.DefaultPrng.init(0xa328d4);
+    // Preserve leak and write-after-free checks without unwinding a native
+    // allocation stack for every row in this complete seeded cross-product.
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
+    defer if (checked.deinit() != 0) @panic("ordered reduction comparison leaked allocations");
     const choices = [_]v.Value{ .null, .{ .integer = 0 }, .{ .integer = -2 }, .{ .integer = 3 }, .{ .integer = std.math.maxInt(i64) }, .{ .integer = std.math.minInt(i64) }, .{ .number = 1e16 }, .{ .number = 2.5 }, .{ .number = 3 }, .{ .number = -0.0 }, .{ .boolean = true }, .{ .string = "bad" } };
-    for (0..160) |iteration| {
-        var cells: [18]v.Value = undefined;
-        for (&cells) |*value| value.* = choices[random.random().uintLessThan(usize, if (iteration < 60) 4 else choices.len)];
-        const lists = [_]v.Value{ .{ .list = cells[0..6] }, .{ .list = cells[6..12] }, .{ .list = cells[12..] }, .{ .list = cells[0..6] } };
-        const parameters: []const v.Entry = &.{ .{ .name = "lists", .value = .{ .list = &lists } }, .{ .name = "groups", .value = .{ .list = cells[0..3] } }, .{ .name = "unused", .value = .{ .string = "primitive" } } };
-        for ([_][]const u8{
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,sum(x),avg(x),sum(DISTINCT x),avg(DISTINCT x),count(DISTINCT x)",
-            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {RETURN avg(x) AS y} RETURN i,avg(y),head(collect(y)) ORDER BY i",
-            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH i,avg(x) AS y RETURN y} RETURN i,avg(y),head(collect(y)) ORDER BY i",
-            "UNWIND $groups AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH i,avg(x) AS y RETURN y} RETURN i,avg(y),head(collect(y)) ORDER BY i",
-            "WITH $groups AS gs UNWIND gs AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH i AS j,x CALL {WITH j,avg(x) AS y RETURN y} RETURN y} RETURN i,avg(y) ORDER BY i",
-            "WITH $unused AS dead UNWIND $groups AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH * WITH i,count(x) AS y RETURN y} RETURN i,count(y) ORDER BY i LIMIT 1",
+    // Compile each immutable plan once. Restarting the PRNG for each query
+    // preserves the exact original 160 seeded parameter sets and cross-product.
+    for ([_][]const u8{
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,sum(x),avg(x),sum(DISTINCT x),avg(DISTINCT x),count(DISTINCT x)",
+        "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {RETURN avg(x) AS y} RETURN i,avg(y),head(collect(y)) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH i,avg(x) AS y RETURN y} RETURN i,avg(y),head(collect(y)) ORDER BY i",
+        "UNWIND $groups AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH i,avg(x) AS y RETURN y} RETURN i,avg(y),head(collect(y)) ORDER BY i",
+        "WITH $groups AS gs UNWIND gs AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH i AS j,x CALL {WITH j,avg(x) AS y RETURN y} RETURN y} RETURN i,avg(y) ORDER BY i",
+        "WITH $unused AS dead UNWIND $groups AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH * WITH i,count(x) AS y RETURN y} RETURN i,count(y) ORDER BY i LIMIT 1",
 
-            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {UNWIND [x,x+1] AS k WITH i,sum(k) AS y RETURN y} RETURN i,avg(y) ORDER BY i",
-            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {UNWIND CASE WHEN x IS NULL THEN [] ELSE [x] END AS k WITH i,count(k) AS n RETURN n} RETURN i,sum(n) ORDER BY i",
-            "UNWIND [3,1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {RETURN x AS y} RETURN i,count(y) ORDER BY i LIMIT 1",
-            "UNWIND [3,1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {CALL {RETURN x AS z} RETURN z AS y} RETURN i,count(y) ORDER BY i%2 SKIP 1 LIMIT 1",
+        "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {UNWIND [x,x+1] AS k WITH i,sum(k) AS y RETURN y} RETURN i,avg(y) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {UNWIND CASE WHEN x IS NULL THEN [] ELSE [x] END AS k WITH i,count(k) AS n RETURN n} RETURN i,sum(n) ORDER BY i",
+        "UNWIND [3,1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {RETURN x AS y} RETURN i,count(y) ORDER BY i LIMIT 1",
+        "UNWIND [3,1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {CALL {RETURN x AS z} RETURN z AS y} RETURN i,count(y) ORDER BY i%2 SKIP 1 LIMIT 1",
 
-            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH x WHERE x>0 RETURN count(*) AS n} RETURN i,n,count(*) ORDER BY i,n",
-            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {CALL {WITH x WHERE x>0 RETURN 7 AS y} RETURN count(*) AS n} RETURN i,n,count(*) ORDER BY i,n",
-            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {UNWIND [1,2] AS k WITH k,count(*) AS n RETURN n} RETURN i,sum(n),head(collect(n)) ORDER BY i",
-            "UNWIND [3,1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x))",
-            "UNWIND [3,1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x) AS a,head(collect(x)) ORDER BY a",
-            "UNWIND [3,1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC RETURN i,count(x) ORDER BY i LIMIT 1",
-            "UNWIND [3,1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,i*2 AS j,x ORDER BY x DESC RETURN i,j,head(collect(x)) LIMIT 2",
-            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC WITH i,x RETURN i,avg(x),head(collect(x)),last(collect(x)) ORDER BY i",
-            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x)) ORDER BY i",
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {UNWIND [x,x+1] AS y RETURN y} RETURN i,sum(y),avg(y),head(collect(y)),last(collect(y)) ORDER BY i",
-            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH * CALL {UNWIND [x,7] AS t RETURN t} RETURN t AS y} RETURN i,avg(y),head(collect(y)) ORDER BY i",
-            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {RETURN x*2 AS y LIMIT 1} RETURN i,avg(y) ORDER BY i",
-            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH DISTINCT x RETURN x*2 AS y} RETURN i,avg(y) ORDER BY i",
-            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {UNWIND [x,7] AS t WITH t ORDER BY t DESC RETURN t AS y SKIP 1 LIMIT 1} RETURN i,head(collect(y)),last(collect(y)) ORDER BY i",
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),avg(z)",
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND reverse(xs) AS x RETURN i,sum(x),avg(x),sum(DISTINCT x)",
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,CASE WHEN i=2 THEN avg(x) ELSE 7 END",
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH * WHERE x IS NOT NULL RETURN i,avg(x),count(*)",
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,avg(x),any(v IN collect(x) WHERE v>1),reduce(s=0,v IN collect(x)|s+v),head([v IN collect(x) WHERE v>1])",
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,avg(x),any(v IN collect(DISTINCT x) WHERE v>1),reduce(s=0,v IN collect(DISTINCT x)|s+v),last([v IN collect(DISTINCT x) WHERE v>1])",
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {RETURN x*2 AS y,7 AS z} RETURN i,avg(y),min(z)",
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {CALL {RETURN x AS t} WITH t WHERE t IS NOT NULL RETURN CASE WHEN t>0 THEN t ELSE 7 END AS y} RETURN i,avg(y),head(collect(y))",
-            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC RETURN i,sum(x),avg(x),head(collect(x)),last(collect(x)) ORDER BY i",
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC RETURN i,sum(x),avg(x),head(collect(x)),last(collect(x)) ORDER BY i",
-            "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x+i) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH x WHERE x>0 RETURN count(*) AS n} RETURN i,n,count(*) ORDER BY i,n",
+        "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {CALL {WITH x WHERE x>0 RETURN 7 AS y} RETURN count(*) AS n} RETURN i,n,count(*) ORDER BY i,n",
+        "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {UNWIND [1,2] AS k WITH k,count(*) AS n RETURN n} RETURN i,sum(n),head(collect(n)) ORDER BY i",
+        "UNWIND [3,1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x))",
+        "UNWIND [3,1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x) AS a,head(collect(x)) ORDER BY a",
+        "UNWIND [3,1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC RETURN i,count(x) ORDER BY i LIMIT 1",
+        "UNWIND [3,1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,i*2 AS j,x ORDER BY x DESC RETURN i,j,head(collect(x)) LIMIT 2",
+        "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC WITH i,x RETURN i,avg(x),head(collect(x)),last(collect(x)) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x WITH i,x ORDER BY x DESC RETURN i,avg(x),head(collect(x)) ORDER BY i",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {UNWIND [x,x+1] AS y RETURN y} RETURN i,sum(y),avg(y),head(collect(y)),last(collect(y)) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH * CALL {UNWIND [x,7] AS t RETURN t} RETURN t AS y} RETURN i,avg(y),head(collect(y)) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {RETURN x*2 AS y LIMIT 1} RETURN i,avg(y) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {WITH DISTINCT x RETURN x*2 AS y} RETURN i,avg(y) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {UNWIND [x,7] AS t WITH t ORDER BY t DESC RETURN t AS y SKIP 1 LIMIT 1} RETURN i,head(collect(y)),last(collect(y)) ORDER BY i",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x+1 AS y,x*2 AS z RETURN i,sum(y),avg(z)",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND reverse(xs) AS x RETURN i,sum(x),avg(x),sum(DISTINCT x)",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,CASE WHEN i=2 THEN avg(x) ELSE 7 END",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH * WHERE x IS NOT NULL RETURN i,avg(x),count(*)",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,avg(x),any(v IN collect(x) WHERE v>1),reduce(s=0,v IN collect(x)|s+v),head([v IN collect(x) WHERE v>1])",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,avg(x),any(v IN collect(DISTINCT x) WHERE v>1),reduce(s=0,v IN collect(DISTINCT x)|s+v),last([v IN collect(DISTINCT x) WHERE v>1])",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {RETURN x*2 AS y,7 AS z} RETURN i,avg(y),min(z)",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x CALL {CALL {RETURN x AS t} WITH t WHERE t IS NOT NULL RETURN CASE WHEN t>0 THEN t ELSE 7 END AS y} RETURN i,avg(y),head(collect(y))",
+        "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC RETURN i,sum(x),avg(x),head(collect(x)),last(collect(x)) ORDER BY i",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC RETURN i,sum(x),avg(x),head(collect(x)),last(collect(x)) ORDER BY i",
+        "UNWIND [1,2] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x ORDER BY x DESC RETURN i,avg(x+i) ORDER BY i",
 
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH DISTINCT i,x RETURN i,avg(x),count(*)",
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x WHERE x IS NOT NULL AND x>0 RETURN i,sum(x),avg(x),head(collect(x)),last(collect(x))",
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH DISTINCT i,x,x*2 AS y WITH i,x,y WHERE x>0 RETURN i,avg(x),head(collect(y)),last(collect(y))",
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,avg(x),collect(DISTINCT x)[0..2],collect(DISTINCT x)[-2..]",
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH DISTINCT i,x WITH DISTINCT i,x RETURN i,count(*),collect(x)[0..2],collect(x)[-2..]",
-            "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x AS y WHERE x IS NOT NULL RETURN i,avg(y),head(collect(y))",
-        }) |text| try Compare.run(text, parameters);
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH DISTINCT i,x RETURN i,avg(x),count(*)",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x WHERE x IS NOT NULL AND x>0 RETURN i,sum(x),avg(x),head(collect(x)),last(collect(x))",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH DISTINCT i,x,x*2 AS y WITH i,x,y WHERE x>0 RETURN i,avg(x),head(collect(y)),last(collect(y))",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x RETURN i,avg(x),collect(DISTINCT x)[0..2],collect(DISTINCT x)[-2..]",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH DISTINCT i,x WITH DISTINCT i,x RETURN i,count(*),collect(x)[0..2],collect(x)[-2..]",
+        "UNWIND [1,2,1] AS i UNWIND $lists AS xs UNWIND xs AS x WITH i,x AS y WHERE x IS NOT NULL RETURN i,avg(y),head(collect(y))",
+    }) |text| {
+        var compare = try Compare.init(checked.allocator(), text);
+        defer compare.deinit();
+        var random = std.Random.DefaultPrng.init(0xa328d4);
+        for (0..160) |iteration| {
+            var cells: [18]v.Value = undefined;
+            for (&cells) |*value| value.* = choices[random.random().uintLessThan(usize, if (iteration < 60) 4 else choices.len)];
+            const lists = [_]v.Value{ .{ .list = cells[0..6] }, .{ .list = cells[6..12] }, .{ .list = cells[12..] }, .{ .list = cells[0..6] } };
+            const parameters: []const v.Entry = &.{ .{ .name = "lists", .value = .{ .list = &lists } }, .{ .name = "groups", .value = .{ .list = cells[0..3] } }, .{ .name = "unused", .value = .{ .string = "primitive" } } };
+            errdefer std.debug.print("ordered reduction query={s} seed iteration={d}\n", .{ text, iteration });
+            try compare.run(parameters);
+        }
     }
 }
 

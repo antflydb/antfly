@@ -322,6 +322,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const cypher_mod = @import("../../lib/cypher/build_support.zig").addSteps(b, .{
         .root = b.path("lib/cypher"),
         .filters = selectTestFilters(b, &.{}),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
         .target = target,
         .optimize = optimize,
         .codegen = yacc_build.addCompiler(b, b.path("lib/yacc"), b.graph.host, .safe),

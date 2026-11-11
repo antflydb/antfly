@@ -17,6 +17,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -33,6 +34,21 @@ from conftest import (
     StandaloneAntflyServer,
     find_free_port,
 )
+
+
+def _psql_binary():
+    """Use the configured client or PATH on every supported platform."""
+    configured = os.environ.get("ANTFLY_TEST_PSQL_BIN") or os.environ.get("PSQL")
+    candidate = configured or "psql"
+    resolved = shutil.which(candidate)
+    if resolved is None and configured is None and sys.platform == "darwin":
+        # Homebrew's PostgreSQL is keg-only, so it need not be on PATH.
+        resolved = shutil.which("/opt/homebrew/opt/postgresql@18/bin/psql")
+    if resolved is None:
+        raise RuntimeError(
+            "pgwire coverage requires psql on PATH or ANTFLY_TEST_PSQL_BIN"
+        )
+    return resolved
 
 
 @pytest.mark.e2e_resource("antfly_process")
@@ -107,6 +123,37 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
             f"/graphs/{graph}",
             {"labels": [{"name": "D", "table": table}], "relationships": []},
         )
+        # Point cohorts are invocation-bound. Exercise parameter rebinding,
+        # keyset unions and residual predicates through both public hosts.
+        for key in ("n0", "n1999"):
+            point = call(
+                f"/graphs/{graph}/query",
+                {
+                    "query": "MATCH(n:D) WHERE antfly.documentKey(n)=$key AND n.score>=0 RETURN n.score",
+                    "parameters": {"key": key},
+                    "limits": {"scanned_anchors": 1},
+                },
+            )
+            assert point["rows"] == [[{"type": "integer", "value": key[1:]}]], point
+            sql_point = call(
+                "/sql",
+                {
+                    "statement": f"SELECT q.score FROM GRAPH_TABLE({graph} MATCH(n IS D) WHERE antfly.documentKey(n)=$1 COLUMNS(n.score AS score)) q",
+                    "parameters": [key],
+                },
+            )
+            assert sql_point["rows"] == [[key[1:]]], sql_point
+        key_union = call(
+            f"/graphs/{graph}/query",
+            {
+                "query": "MATCH(n:D) WHERE antfly.documentKey(n)=$first OR antfly.documentKey(n)=$second RETURN n.score ORDER BY n.score",
+                "parameters": {"first": "n0", "second": "n1999"},
+            },
+        )
+        assert key_union["rows"] == [
+            [{"type": "integer", "value": "0"}],
+            [{"type": "integer", "value": "1999"}],
+        ], key_union
         result = call(
             f"/graphs/{graph}/query",
             {
@@ -722,7 +769,7 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         # Exercise the same negotiated cursor behind the pgwire authority guard.
         pgwire = subprocess.run(
             [
-                "/opt/homebrew/opt/postgresql@18/bin/psql",
+                _psql_binary(),
                 f"host=127.0.0.1 port={server.pgwire_port} user=admin dbname=default sslmode=disable",
                 "-X",
                 "-At",
@@ -1322,7 +1369,7 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
         )["rows"] == [["k000999", "1"]]
         pg_groups = subprocess.run(
             [
-                "/opt/homebrew/opt/postgresql@18/bin/psql",
+                _psql_binary(),
                 f"host=127.0.0.1 port={server.pgwire_port} user=admin dbname=default sslmode=disable",
                 "-X",
                 "-At",
@@ -3403,6 +3450,244 @@ def test_authenticated_cypher_immutable_metadata_and_visited_comparison_work(
                 budget=10000,
             )
             assert dag["rows"] == [[{"type": "boolean", "value": expected}]], dag
+    finally:
+        session.close()
+        server.stop()
+
+
+def test_authenticated_cypher_certified_point_domains_across_owners(monkeypatch):
+    monkeypatch.setenv(
+        "ANTFLY_TRUSTED_PRINCIPAL_SECRET", "cypher-point-cohort-authority-secret-v1"
+    )
+    monkeypatch.setenv("ANTFLY_TRUSTED_PRINCIPAL_ISSUER", "cypher-point-cohort")
+    binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+    if not Path(binary).exists():
+        pytest.skip("native Antfly binary is unavailable")
+    server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port(), pgwire=True)
+    try:
+        script = (
+            Path(__file__).resolve().parents[2] / "scripts" / "verify_cypher_http.py"
+        )
+        result = subprocess.run(
+            [sys.executable, str(script), "--url", server.url, "--shards", "8"],
+            env={
+                **os.environ,
+                "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
+            },
+            capture_output=True,
+            text=True,
+            timeout=240,
+        )
+        assert result.returncode == 0, (
+            result.stdout + result.stderr + server.log_path.read_text()[-10000:]
+        )
+        assert "checks passed" in result.stdout, result.stdout
+    finally:
+        server.stop()
+
+
+def test_authenticated_cypher_point_cohorts_catalog_churn_and_overlays(monkeypatch):
+    import threading
+
+    monkeypatch.setenv(
+        "ANTFLY_TRUSTED_PRINCIPAL_SECRET", "cypher-cohort-churn-authority-secret-v1"
+    )
+    monkeypatch.setenv("ANTFLY_TRUSTED_PRINCIPAL_ISSUER", "cypher-cohort-churn")
+    binary = os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))
+    if not Path(binary).exists():
+        pytest.skip("native Antfly binary is unavailable")
+    server = StandaloneAntflyServer(binary, "127.0.0.1", find_free_port(), pgwire=True)
+    session = requests.Session()
+    session.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+    table = "cypher_cohort_" + uuid.uuid4().hex
+    other_table = table + "_other"
+    graph = table + "_g"
+    try:
+
+        def call(path, body, client=session):
+            response = client.post(
+                server.api_url.rstrip("/") + path, json=body, timeout=40
+            )
+            assert response.status_code in (200, 201, 202), (
+                path,
+                response.status_code,
+                response.text,
+                server.log_path.read_text()[-6000:],
+            )
+            return response.json()
+
+        call(
+            "/tables/" + table,
+            {
+                "num_shards": 8,
+                "schema": {
+                    "default_type": "D",
+                    "document_schemas": {
+                        "D": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {"x": {"type": "integer"}},
+                            }
+                        }
+                    },
+                },
+            },
+        )
+        keys = [f"a{i:04}" for i in range(1000)]
+        call(
+            "/tables/" + table + "/batch",
+            {
+                "inserts": {
+                    **{key: {"x": i} for i, key in enumerate(keys)},
+                    "β": {"x": 9999},
+                },
+                "sync_level": "full_index",
+            },
+        )
+        call("/sql", {"statement": f"CREATE TABLE {other_table} (x BIGINT)"})
+        call(
+            "/sql", {"statement": f"INSERT INTO {other_table}(_id,x) VALUES('other',5)"}
+        )
+        call(
+            "/graphs/" + graph,
+            {
+                "labels": [
+                    {"name": "D", "table": table},
+                    {"name": "O", "table": other_table},
+                ],
+                "relationships": [],
+            },
+        )
+        count_sql = f"SELECT count(*) FROM GRAPH_TABLE({graph} MATCH(n IS D) WHERE antfly.documentKey(n) IN $1 COLUMNS(n.x AS x)) q"
+        start = threading.Barrier(2)
+        errors = []
+
+        def publish_unrelated_tables():
+            writer = requests.Session()
+            writer.auth = session.auth
+            try:
+                start.wait(timeout=30)
+                for i in range(30):
+                    call(
+                        "/tables/" + table + "_unrelated_" + str(i),
+                        {"num_shards": 1},
+                        writer,
+                    )
+                    time.sleep(0.001)
+            except Exception as error:
+                errors.append(error)
+            finally:
+                writer.close()
+
+        publisher = threading.Thread(target=publish_unrelated_tables)
+        publisher.start()
+        try:
+            start.wait(timeout=30)
+            for _ in range(25):
+                result = call(
+                    "/graphs/" + graph + "/query",
+                    {
+                        "query": "MATCH(n:D) WHERE antfly.documentKey(n) IN $keys RETURN count(n)",
+                        "parameters": {"keys": keys},
+                    },
+                )
+                assert result["rows"] == [[{"type": "integer", "value": "1000"}]], (
+                    result
+                )
+                # SQL intentionally fences its logical schema/policy bindings
+                # against the global catalog revision. Concurrent DDL can
+                # serialize it with 40001; routing failures must still fail.
+                response = session.post(
+                    server.api_url.rstrip("/") + "/sql",
+                    json={"statement": count_sql, "parameters": [keys]},
+                    timeout=40,
+                )
+                result = response.json()
+                if response.status_code == 409:
+                    assert result["code"] == "40001", result
+                    assert "table or policy definition changed" in result["message"]
+                else:
+                    assert response.status_code == 200, result
+                    assert result["rows"] == [["1000"]], result
+        finally:
+            publisher.join(timeout=60)
+        assert not publisher.is_alive()
+        assert not errors, errors
+        result = call("/sql", {"statement": count_sql, "parameters": [keys]})
+        assert result["rows"] == [["1000"]], result
+        # A READ COMMITTED overlay has no range guards. Updated and newly
+        # inserted keys must remain visible while capture retains full cohorts.
+        transaction = call(
+            "/sql", {"statement": "BEGIN ISOLATION LEVEL READ COMMITTED"}
+        )["session_id"]
+        try:
+            call(
+                "/sql",
+                {
+                    "statement": f"UPDATE {other_table} SET x=55 WHERE _id='other'",
+                    "session_id": transaction,
+                },
+            )
+            point_sql = f"SELECT q.x FROM GRAPH_TABLE({graph} MATCH(n IS D) WHERE antfly.documentKey(n)=$1 COLUMNS(n.x AS x)) q"
+            other_sql = f"SELECT q.x FROM GRAPH_TABLE({graph} MATCH(n IS O) WHERE antfly.documentKey(n)=$1 COLUMNS(n.x AS x)) q"
+            # An unreferenced label's staged rows need no owner projection.
+            # Exercise both point and scan plans before staging any D writes.
+            result = call(
+                "/sql",
+                {
+                    "statement": point_sql,
+                    "parameters": ["a0000"],
+                    "session_id": transaction,
+                },
+            )
+            assert result["rows"] == [["0"]], result
+            all_d = f"SELECT count(*) FROM GRAPH_TABLE({graph} MATCH(n IS D) COLUMNS(n.x AS x)) q"
+            result = call("/sql", {"statement": all_d, "session_id": transaction})
+            assert result["rows"] == [["1001"]], result
+            result = call(
+                "/sql",
+                {
+                    "statement": other_sql,
+                    "parameters": ["other"],
+                    "session_id": transaction,
+                },
+            )
+            assert result["rows"] == [["55"]], result
+            call(
+                "/sql",
+                {
+                    "statement": f"UPDATE {table} SET x=77 WHERE _id='β'",
+                    "session_id": transaction,
+                },
+            )
+            call(
+                "/sql",
+                {
+                    "statement": f"INSERT INTO {table}(_id,x) VALUES('γ',88)",
+                    "session_id": transaction,
+                },
+            )
+            for key, expected in (("a0000", "0"), ("β", "77"), ("γ", "88")):
+                result = call(
+                    "/sql",
+                    {
+                        "statement": point_sql,
+                        "parameters": [key],
+                        "session_id": transaction,
+                    },
+                )
+                assert result["rows"] == [[expected]], result
+            result = call(
+                "/sql",
+                {
+                    "statement": other_sql,
+                    "parameters": ["other"],
+                    "session_id": transaction,
+                },
+            )
+            assert result["rows"] == [["55"]], result
+        finally:
+            call("/sql", {"statement": "ROLLBACK", "session_id": transaction})
     finally:
         session.close()
         server.stop()

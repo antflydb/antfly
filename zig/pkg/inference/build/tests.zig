@@ -295,8 +295,13 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     var batch_imports = suite.tests.root_module.import_table.iterator();
     while (batch_imports.next()) |entry| batch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
     batch_root.link_libc = true;
-    // Focused aarch64 CPU/CUDA builds peak at 1 GiB; reserve 2 GiB for cold CI.
-    const batch_tests = b.addTest(.{ .max_rss = 2 * 1024 * 1024 * 1024, .root_module = batch_root, .filters = &.{ "execution scope", "execution owner transitions", "execution resource release", "execution batch", "cooperative decode batches", "cooperative decode publication", "runtime.scheduler.native_generate", "test_0" } });
+    // Native Apple Silicon Metal Debug peaked at 3,872,571,392 bytes with a
+    // cold local cache; 4,352 MiB adds 18% measured headroom. Keep the
+    // existing 2 GiB CPU/CUDA claim and other platform profiles independent.
+    const native_debug_metal_batch = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
+        ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and ctx.optimize == .debug and
+        ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
+    const batch_tests = b.addTest(.{ .max_rss = @as(usize, if (native_debug_metal_batch) 4_352 else 2_048) * 1024 * 1024, .root_module = batch_root, .filters = &.{ "execution scope", "execution owner transitions", "execution resource release", "execution batch", "cooperative decode batches", "cooperative decode publication", "runtime.scheduler.native_generate", "test_0" } });
     const run_batch_tests = ctx.addRunArtifact(batch_tests);
     test_step.dependOn(&run_batch_tests.step);
     ctx.step("test-execution-batch", "Verify cohort budgets, scope retirement and decode arithmetic without a GPU").dependOn(&run_batch_tests.step);

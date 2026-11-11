@@ -74,6 +74,13 @@ pub const NativeSourceOwner = struct {
         self.acknowledge(self.ptr, self.table_id, self.object_generation, self.token, lsn, context) catch return error.LakeCommitOutcomeUnknown;
     }
 };
+/// A named capability keeps its reflected type identity stable when source
+/// options are compiled independently in the lake operation's caller/owner.
+/// Anonymous field structs receive compilation-local generated type names.
+pub const NativeSourceOwnerResolver = struct {
+    ptr: *anyopaque,
+    resolve: *const fn (*anyopaque, Allocator, u64, u64, lake_catalog.types.Context) anyerror!?NativeSourceOwner,
+};
 pub const BindingObjectStoreOpenOptions = struct {
     pub fn resolveOwner(self: @This(), a: Allocator, context: lake_catalog.types.Context) !@This() {
         var result = self;
@@ -133,7 +140,7 @@ pub const BindingObjectStoreOpenOptions = struct {
         return result.table;
     }
     native_owner: ?NativeSourceOwner = null,
-    native_owner_resolver: ?struct { ptr: *anyopaque, resolve: *const fn (*anyopaque, Allocator, u64, u64, lake_catalog.types.Context) anyerror!?NativeSourceOwner } = null,
+    native_owner_resolver: ?NativeSourceOwnerResolver = null,
     /// Only an authenticated, retained native serving cut may bypass mutable
     /// source discovery. Its generation reader protects source files in vacuum.
     authoritative_metadata: bool = false,

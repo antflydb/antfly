@@ -10,7 +10,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from cypher_qualification_retry import retry_allowed
+from cypher_qualification_retry import await_durable_graph_commit, retry_allowed
 
 
 def main():
@@ -26,7 +26,14 @@ def main():
     filtered = graph + "_filtered"
     created_table = created_graph = created_filtered = False
 
-    def call(path, body=None, method="POST", expected_status=None, read_only=False):
+    def call(
+        path,
+        body=None,
+        method="POST",
+        expected_status=None,
+        read_only=False,
+        accepted=(200, 201, 202, 204),
+    ):
         request = urllib.request.Request(
             args.url.rstrip("/") + "/db/v1" + path,
             data=None if body is None else json.dumps(body).encode(),
@@ -53,18 +60,27 @@ def main():
                 continue
             break
         assert (
-            status in (200, 201, 202, 204)
-            if expected_status is None
-            else status == expected_status
+            status in accepted if expected_status is None else status == expected_status
         ), (path, status, content.decode())
         return json.loads(content) if content else None
 
     def sql(statement, *, read_only=False):
         return call("/sql", {"statement": statement}, read_only=read_only)
 
-    def query(statement):
-        result = call(f"/graphs/{graph}/query", {"query": statement})
-        assert result["complete"] is True, result
+    def query(statement, *, graph_name=graph):
+        result = call(f"/graphs/{graph_name}/query", {"query": statement})
+        if result.get("commit") is not None:
+            await_durable_graph_commit(
+                result,
+                lambda transaction: call(
+                    f"/transactions/{transaction}/status",
+                    method="GET",
+                    read_only=True,
+                    accepted=(200, 409, 503),
+                ),
+            )
+        else:
+            assert result["complete"] is True, result
         return result
 
     def verify(statement, expected):
@@ -111,7 +127,7 @@ def main():
             "CREATE (n:Document) RETURN n.amount,n.total",
             "MERGE (n:Document) RETURN n.amount,n.total",
         ):
-            result = call(f"/graphs/{filtered}/query", {"query": statement})
+            result = query(statement, graph_name=filtered)
             assert [cell["value"] for cell in result["rows"][0]] == ["4", "12"], result
             assert sql(f"SELECT amount,total FROM {table}", read_only=True)["rows"] == [
                 ["4", "12"]

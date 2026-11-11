@@ -53,8 +53,11 @@ test "privacy receivers fence legacy lookups and reject superseded assertions be
         version: [64]u8,
         calls: usize = 0,
         last: types.LookupOptions = .{},
-        fn capture(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?u64) ![64]u8 {
+        captured_deadline: ?u64 = null,
+        fn capture(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, deadline: ?u64) ![64]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.captured_deadline = deadline;
+            if (deadline) |end| if (end <= @import("antfly_platform").time.monotonicNs()) return error.DeadlineExceeded;
             return self.version;
         }
         fn lookup(raw: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8, opts: types.LookupOptions, consistency: Consistency) !?source.LookupResponse {
@@ -85,6 +88,37 @@ test "privacy receivers fence legacy lookups and reject superseded assertions be
     _ = try reads.lookupGroupLocal(std.testing.allocator, 7, "docs", "doc", .{ .privacy_original = true }, .read_index);
     try std.testing.expect(fake.last.privacy_original);
     try std.testing.expect(fake.last.privacy_policy_version == null);
+
+    const Clock = struct {
+        fn now(raw: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = @as(*const u64, @ptrCast(@alignCast(raw.?))).* };
+        }
+    };
+    var request_now: u64 = 17;
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = &request_now, .vtable = &vtable };
+    const options: types.LookupOptions = .{
+        .execution_deadline_ns = request_now + std.time.ns_per_s,
+        .execution_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io),
+    };
+    for ([_]bool{ false, true }) |group_local| {
+        const before = @import("antfly_platform").time.monotonicNs();
+        if (group_local) {
+            _ = try reads.lookupGroupLocal(std.testing.allocator, 7, "docs", "doc", options, .read_index);
+        } else {
+            _ = try reads.lookup(std.testing.allocator, "docs", "doc", options, .read_index);
+        }
+        const after = @import("antfly_platform").time.monotonicNs();
+        try std.testing.expect(fake.captured_deadline.? >= before + std.time.ns_per_s);
+        try std.testing.expect(fake.captured_deadline.? <= after + std.time.ns_per_s);
+        try std.testing.expectEqual(options.execution_deadline_ns, fake.last.execution_deadline_ns);
+        try std.testing.expectEqual(options.execution_io.?.userdata, fake.last.execution_io.?.userdata);
+    }
+    const reads_before_expiry = fake.calls;
+    request_now = options.execution_deadline_ns.?;
+    try std.testing.expectError(error.DeadlineExceeded, reads.lookupGroupLocal(std.testing.allocator, 7, "docs", "doc", options, .read_index));
+    try std.testing.expectEqual(reads_before_expiry, fake.calls);
 }
 
 test "privacy routed scans accept the public range response envelope and own cursors" {
@@ -451,4 +485,92 @@ test "privacy reply transport failures distinguish unsent requests from possible
         try std.testing.expectError(if (state == .not_sent) failure else error.MetadataMutationOutcomeUnknown, client.forwardPrivacyMutation("http://metadata", "docs", "{}", null, scan, .{}));
         try std.testing.expectEqual(@as(usize, 1), fake.calls);
     };
+}
+
+test "privacy compact owner readiness transport bounds replies and preserves selected namespaces" {
+    const api = @import("../metadata/api.zig");
+    const Fake = struct {
+        status: u16 = 200,
+        malformed: bool = false,
+        legacy: bool = false,
+        disposition: @FieldType(api.OwnerReadiness, "status") = .ready,
+        calls: usize = 0,
+        fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/catalog/owner-readiness"));
+            try std.testing.expectEqual(@as(?usize, 4096), request.max_response_bytes);
+            var parsed = try std.json.parseFromSlice(api.OwnerReadinessRequest, a, request.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqual(@as(u64, 7), parsed.value.table_id);
+            try std.testing.expectEqual(@as(usize, 2), parsed.value.owners.len);
+            try std.testing.expectEqual(@as(u64, 71), parsed.value.owners[0].range_id);
+            return .{ .status = self.status, .body = if (self.legacy) try a.dupe(u8, "{\"ready\":true}") else if (self.malformed) try a.dupe(u8, "{}") else try std.json.Stringify.valueAlloc(a, api.OwnerReadiness{ .status = self.disposition, .metadata_group_id = 9, .metadata_incarnation = @splat('1') }, .{}) };
+        }
+    };
+    const a = std.testing.allocator;
+    var fake: Fake = .{};
+    var client = @import("../metadata/http_client.zig").MetadataHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    const request: api.OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{ .{ .group_id = 1, .shard_id = 7, .range_id = 71 }, .{ .group_id = 2, .shard_id = 7, .range_id = 72 } } };
+    var result = try client.fetchOwnerReadiness("http://metadata", request, null);
+    defer result.deinit();
+    try std.testing.expectEqual(.ready, result.value.status);
+    fake.disposition = .topology_changed;
+    var changed = try client.fetchOwnerReadiness("http://metadata", request, null);
+    defer changed.deinit();
+    try std.testing.expectEqual(.topology_changed, changed.value.status);
+    fake.disposition = .identity_unavailable;
+    var unhealthy = try client.fetchOwnerReadiness("http://metadata", request, null);
+    defer unhealthy.deinit();
+    try std.testing.expectEqual(.identity_unavailable, unhealthy.value.status);
+    fake.malformed = true;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchOwnerReadiness("http://metadata", request, null));
+    fake.malformed = false;
+    fake.legacy = true;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchOwnerReadiness("http://metadata", request, null));
+    fake.status = 404;
+    try std.testing.expectError(error.UnsupportedOperation, client.fetchOwnerReadiness("http://metadata", request, null));
+    const calls = fake.calls;
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchOwnerReadiness("http://metadata", request, .{ .deadline_ns = 1 }));
+    try std.testing.expectEqual(calls, fake.calls);
+}
+
+test "privacy compact owner readiness transport preserves preflight and dispatch cancellation" {
+    const api = @import("../metadata/api.zig");
+    const Fake = struct {
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, _: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.Cancelled;
+        }
+    };
+    var fake: Fake = .{};
+    var signal: http.RequestCancellation = .{};
+    signal.cancel();
+    var client = @import("../metadata/http_client.zig").MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    const request: api.OwnerReadinessRequest = .{ .table_id = 7, .owners = &.{.{ .group_id = 1, .shard_id = 1, .range_id = 1 }} };
+    try std.testing.expectError(error.Canceled, client.fetchOwnerReadiness("http://metadata", request, .{ .deadline_ns = std.math.maxInt(u64), .cancellation = &signal }));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectError(error.Canceled, client.fetchOwnerReadiness("http://metadata", request, null));
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "privacy compact owner readiness transport routing tokens fail closed on peer errors" {
+    const Fake = struct {
+        status: u16 = 503,
+        fn execute(raw: *anyopaque, a: std.mem.Allocator, request: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/routing-token"));
+            try std.testing.expectEqual(@as(?usize, 4096), request.max_response_bytes);
+            return .{ .status = self.status, .body = try a.dupe(u8, "invalid peer JSON") };
+        }
+    };
+    var fake: Fake = .{};
+    var client = @import("../metadata/http_client.zig").MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchRoutingToken("http://metadata", null));
+    fake.status = 200;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, client.fetchRoutingToken("http://metadata", null));
+    fake.status = 404;
+    try std.testing.expectError(error.UnsupportedOperation, client.fetchRoutingToken("http://metadata", null));
 }

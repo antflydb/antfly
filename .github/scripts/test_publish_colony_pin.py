@@ -97,6 +97,38 @@ class FakeAPI:
 
 
 class PublisherTests(unittest.TestCase):
+    def test_repository_credentials_stay_with_their_own_authority(self):
+        api = p.GitHub("COLONY_SENTINEL", "ANTFLY_SENTINEL")
+        paths = [
+            (f"repos/{p.COLONY}/git/ref/heads/main", "COLONY_SENTINEL"),
+            (f"repos/{p.UPSTREAM}/compare/{OLD}...{TARGET}", "ANTFLY_SENTINEL"),
+            (f"repos/{p.UPSTREAM}/compare/{TARGET}...main", "ANTFLY_SENTINEL"),
+            (f"repos/{p.COLONY}/git/commits/{BASE}", "COLONY_SENTINEL"),
+        ]
+        with patch.object(
+            api.opener, "open", side_effect=lambda *args, **kwargs: io.BytesIO(b"{}")
+        ) as opened:
+            for path, _ in paths:
+                api.request(path)
+        for call, (path, token) in zip(opened.call_args_list, paths):
+            request = call.args[0]
+            self.assertEqual(request.full_url, p.API_ROOT + path)
+            self.assertEqual(request.get_header("Authorization"), "Bearer " + token)
+
+    def test_upstream_reads_never_fall_back_to_private_writer_credentials(self):
+        api = p.GitHub("COLONY_SENTINEL")
+        with patch.object(api.opener, "open", return_value=io.BytesIO(b"{}")) as opened:
+            api.request(f"repos/{p.UPSTREAM}/compare/{OLD}...{TARGET}")
+        self.assertIsNone(opened.call_args.args[0].get_header("Authorization"))
+        with patch.object(api.opener, "open") as opened:
+            for path, method in [
+                (f"repos/{p.UPSTREAM}/git/refs/heads/main", "PATCH"),
+                ("repos/other/repository/git/ref/heads/main", "GET"),
+            ]:
+                with self.assertRaises(p.PublicationError):
+                    api.request(path, method)
+            opened.assert_not_called()
+
     def report(self, api):
         return {
             "id": 34,
@@ -170,7 +202,11 @@ class PublisherTests(unittest.TestCase):
         }
         api.checks = [
             {**report, "external_id": identity, "output": {"text": "invalid"}}
-            for identity in ("antfly-pin:99-1:12:2", "antfly-pin:10-1:99:2", "antfly-pin:10-1:12:1")
+            for identity in (
+                "antfly-pin:99-1:12:2",
+                "antfly-pin:10-1:99:2",
+                "antfly-pin:10-1:12:1",
+            )
         ] + [report]
         _, manifest = p.wait_for_validation(api, "10-1", timeout=1)
         self.assertEqual(manifest, api.manifest)
@@ -375,25 +411,25 @@ class PublisherTests(unittest.TestCase):
                 for private in ("SENTINEL_TOKEN", "PRIVATE", "https://", body):
                     self.assertNotIn(private, summary)
 
-    def test_checks_permission_failure_is_actionable_without_private_details(self):
+    def test_check_refusal_identifies_the_missing_permission_without_private_data(self):
         api = p.GitHub("SENTINEL_TOKEN")
         error = urllib.error.HTTPError(
             "https://api.github.com/PRIVATE",
             403,
-            "PRIVATE_REASON",
-            {"X-Accepted-GitHub-Permissions": "checks=read"},
-            io.BytesIO(
-                b'{"message":"Resource not accessible by personal access token PRIVATE"}'
-            ),
+            "PRIVATE",
+            {
+                "X-GitHub-Request-Id": "id",
+                "X-Accepted-GitHub-Permissions": "checks=read",
+            },
+            io.BytesIO(b"Resource not accessible by personal access token PRIVATE"),
         )
         with patch.object(api.opener, "open", side_effect=error):
             with self.assertRaises(p.PublicationError) as caught:
-                api.request("repos/example/private/commits/abc/check-runs?filter=all")
+                api.request(f"repos/{p.COLONY}/commits/{BASE}/check-runs?filter=all")
         message = str(caught.exception)
-        self.assertIn("GitHub GET Checks read failed with HTTP 403", message)
-        self.assertIn("reason=token-permissions", message)
+        self.assertIn("validation check read", message)
         self.assertIn("required=checks=read", message)
-        for private in ("SENTINEL_TOKEN", "PRIVATE", "example/private", "https://"):
+        for private in ("SENTINEL_TOKEN", "PRIVATE", p.COLONY, BASE):
             self.assertNotIn(private, message)
 
     def test_requests_identify_the_publisher_and_keep_credentials_off_redirects(self):

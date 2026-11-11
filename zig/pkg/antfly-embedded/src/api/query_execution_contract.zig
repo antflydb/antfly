@@ -111,6 +111,7 @@ pub const BackgroundTextStatsFieldRequestInput = struct {
 };
 
 pub const TextStatsRequestInput = struct {
+    _privacy_policy_version: ?std.json.Value = null,
     _native_cut: ?std.json.Value = null,
     _identity_read_generation: ?u64 = null,
     _resolved_doc_filter: ?std.json.Value = null,
@@ -163,6 +164,7 @@ pub const OwnedAlgebraicTensorExpr = query_contract.OwnedAlgebraicTensorExprEnve
 pub const OwnedAlgebraicTensorProgram = query_contract.OwnedAlgebraicTensorProgramEnvelope;
 
 pub const ParsedExplicitTextStatsRequest = struct {
+    privacy_policy_version: ?[64]u8 = null,
     identity_read_generation: ?u64 = null,
     resolved_doc_filter: ?db_mod.doc_filter_wire.ParsedResolvedDocFilter = null,
     items: []OwnedTextStatsFieldRequest = &.{},
@@ -176,6 +178,7 @@ pub const ParsedExplicitTextStatsRequest = struct {
 };
 
 pub const ParsedBackgroundTextStatsRequest = struct {
+    privacy_policy_version: ?[64]u8 = null,
     identity_read_generation: ?u64 = null,
     resolved_doc_filter: ?db_mod.doc_filter_wire.ParsedResolvedDocFilter = null,
     items: []OwnedBackgroundTextStatsFieldRequest = &.{},
@@ -230,11 +233,18 @@ pub fn parseTextStatsRequest(
 ) !ParsedTextStatsRequest {
     var parsed = try std.json.parseFromSlice(TextStatsRequestInput, alloc, body, .{});
     defer parsed.deinit();
+    const version = if (parsed.value._privacy_policy_version) |value| try query_contract.parsePrivacyPolicyVersion(value) else null;
     if (parsed.value.query_request) |query_value| {
         if (parsed.value._resolved_doc_filter != null) return error.InvalidQueryRequest;
         const encoded_query = try std.json.Stringify.valueAlloc(alloc, query_value, .{});
         defer alloc.free(encoded_query);
-        return .{ .query_request = try query_api.parseQueryRequest(alloc, null, table_name, encoded_query) };
+        var owned = try query_api.parseQueryRequest(alloc, null, table_name, encoded_query);
+        errdefer owned.deinit(alloc);
+        if (version) |expected| {
+            if (owned.req.privacy_policy_version) |nested| if (!std.mem.eql(u8, &expected, &nested)) return error.InvalidQueryRequest;
+            owned.req.privacy_policy_version = expected;
+        }
+        return .{ .query_request = owned };
     }
     if (parsed.value.fields) |fields_value| {
         var resolved_doc_filter = if (parsed.value._resolved_doc_filter) |filter_value|
@@ -268,6 +278,7 @@ pub fn parseTextStatsRequest(
             initialized += 1;
         }
         return .{ .explicit_fields = .{
+            .privacy_policy_version = version,
             .identity_read_generation = identity_read_generation,
             .resolved_doc_filter = resolved_doc_filter,
             .items = items,
@@ -307,12 +318,44 @@ pub fn parseTextStatsRequest(
             initialized += 1;
         }
         return .{ .background_fields = .{
+            .privacy_policy_version = version,
             .identity_read_generation = identity_read_generation,
             .resolved_doc_filter = resolved_doc_filter,
             .items = items,
         } };
     }
     return error.InvalidQueryRequest;
+}
+
+test "local query contract text stats wire preserves privacy controls and rejects unknown metadata" {
+    const a = std.testing.allocator;
+    const version = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for ([_][]const u8{ "none", version }) |value| {
+        const expected: [64]u8 = if (std.mem.eql(u8, value, "none")) @splat(0) else version.*;
+        const bodies = [_][]const u8{
+            "\"fields\":[{\"field\":\"body\",\"terms\":[\"alpha\"]}]",
+            "\"background_fields\":[{\"aggregation_name\":\"sig\",\"field\":\"body\",\"terms\":[\"alpha\"],\"background_query\":{\"match_all\":{}}}]",
+            "\"query_request\":{}",
+        };
+        for (bodies) |body| {
+            const wire = try std.fmt.allocPrint(a, "{{\"_privacy_policy_version\":\"{s}\",{s}}}", .{ value, body });
+            defer a.free(wire);
+            var parsed = try parseTextStatsRequest(a, "docs", wire);
+            defer parsed.deinit(a);
+            const actual = switch (parsed) {
+                .explicit_fields => |request| request.privacy_policy_version,
+                .background_fields => |request| request.privacy_policy_version,
+                .query_request => |request| request.req.privacy_policy_version,
+            };
+            try std.testing.expect(actual != null);
+            try std.testing.expectEqualSlices(u8, &expected, &actual.?);
+        }
+    }
+    try std.testing.expectError(error.InvalidQueryRequest, parseTextStatsRequest(a, "docs", "{\"_privacy_policy_version\":\"bad\",\"fields\":[]}"));
+    try std.testing.expectError(error.UnknownField, parseTextStatsRequest(a, "docs", "{\"unexpected\":true,\"fields\":[]}"));
+    const conflicting = try std.fmt.allocPrint(a, "{{\"_privacy_policy_version\":\"{s}\",\"query_request\":{{\"_privacy_policy_version\":\"none\"}}}}", .{version});
+    defer a.free(conflicting);
+    try std.testing.expectError(error.InvalidQueryRequest, parseTextStatsRequest(a, "docs", conflicting));
 }
 
 pub fn identityGenerationFromTextStatsResolvedFilter(

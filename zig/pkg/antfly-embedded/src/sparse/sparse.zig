@@ -9055,7 +9055,9 @@ test "sparse predicate decisions remain bounded and exact through collisions" {
 }
 
 test "sparse adaptive ordinal constraints seek on upfront and mid query completion" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     var pb: [256]u8 = undefined;
     const path = tmpPath(&pb, "adaptive-seeks");
     defer cleanupTmp(path);
@@ -9104,7 +9106,9 @@ test "sparse adaptive ordinal constraints seek on upfront and mid query completi
 }
 
 test "sparse broad physical masks seek through the bounded native directory" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const ordinals = @import("ordinal_lookup.zig");
     const Bitmap = @import("../encoding/roaring.zig").RoaringBitmap;
     const prefix = "lake2:" ++ "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ++ ":00000000:";
@@ -9167,7 +9171,9 @@ test "sparse broad physical masks seek through the bounded native directory" {
 }
 
 test "sparse lazy native windows intersect reached postings and preserve spill legacy and signed scores" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     const ordinals = @import("ordinal_lookup.zig");
     const Bitmap = @import("../encoding/roaring.zig").RoaringBitmap;
     var pb: [256]u8 = undefined;
@@ -9308,7 +9314,9 @@ test "sparse planning caps do not hide backing allocation failures after optiona
 }
 
 test "sparse shared parallel ranges preserve signed canonical scores filters and cap fallback" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     var threaded = std.Io.Threaded.init(a, .{});
     defer threaded.deinit();
     var pb: [256]u8 = undefined;

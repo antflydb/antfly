@@ -8588,10 +8588,6 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid create table request");
         };
-        @import("antfly_local_sources").privacy_catalog.validateUserConfiguration(ctx.allocator, body_data) catch |err| {
-            if (err == error.PrivacyManagedGraph) return jsonErrorResponse(ctx, 400, "privacy policies and managed producers must be configured through the table Privacy API");
-            return err;
-        };
         // Reject oversized requests before JSON allocation, credential
         // sealing, or remote embedding-model probes. Forwarding has a larger
         // envelope allowance, but the user definition itself is capped here.
@@ -8599,6 +8595,10 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(413);
             return ctx.text("create table request too large");
         }
+        @import("antfly_local_sources").privacy_catalog.validateUserConfiguration(ctx.allocator, body_data) catch |err| {
+            if (err == error.PrivacyManagedGraph) return jsonErrorResponse(ctx, 400, "privacy policies and managed producers must be configured through the table Privacy API");
+            return err;
+        };
         var create_req = table_contract.parseCreateTableRequest(alloc, body_data) catch |err| {
             if (table_contract.classifyCreateTableRequestError(err) == .internal_failure) {
                 std.log.err("create table request parsing failed: {} body_len={d}", .{ err, body_data.len });
@@ -10067,7 +10067,8 @@ pub const AntflyApiHandler = struct {
         if (http_server_mod.permissionsAllow(principal.permissions, .table, table, .admin)) return true;
         const reads = self.api_server.table_reads orelse return true;
         if (reads.vtable.privacy_policy_version == null) return true;
-        const version = try reads.privacyPolicyVersion(ctx.allocator, table, operationContext(ctx, identity).deadline_ns);
+        const native_context = try operationContext(ctx, identity).platformDeadline();
+        const version = try reads.privacyPolicyVersion(ctx.allocator, table, native_context.deadline_ns);
         return std.mem.allEqual(u8, &version, 0);
     }
 

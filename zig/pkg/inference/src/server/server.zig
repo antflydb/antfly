@@ -22335,11 +22335,17 @@ pub const Node = struct {
         const required_units = @max(reserved_units, estimateGenerateAdmissionUnitsFromShape((prompt orelse @as([]const u8, AudioReadInput.default_prompt)).len, 1, tokens));
         try self.growAdmissionUnits(reserved_units, required_units);
         reserved_units = required_units;
-        const output = self.generateMessagesDirectPrepared(a, model_path, &messages, tokens, preflight, reserved_units, null, false, null, false, null, null, null, control) catch |err| {
+        // Model execution has its own checked KV/workspace budget and resource
+        // admission. Keep its reclaimable allocations out of the document
+        // arena: that arena bounds source/evidence/output bytes, and retains
+        // logically freed tensor scratch until the complete document finishes.
+        const output = self.generateMessagesDirectPrepared(self.allocator, model_path, &messages, tokens, preflight, reserved_units, null, false, null, false, null, null, null, control) catch |err| {
             return if (err == error.EmbeddingSequenceTooLong) error.AudioTooLong else err;
         };
-        errdefer a.free(output.text);
-        return .{ .text = output.text, .prompt_tokens = output.prompt_tokens, .completion_tokens = output.completion_tokens, .truncated = output.truncated, .audio_json = try std.json.Stringify.valueAlloc(a, metadata, .{}), .origin = if (prompt != null and !std.mem.eql(u8, prompt.?, AudioReadInput.default_prompt)) .interpretation else .transcription };
+        defer self.allocator.free(output.text);
+        const text = try a.dupe(u8, output.text);
+        errdefer a.free(text);
+        return .{ .text = text, .prompt_tokens = output.prompt_tokens, .completion_tokens = output.completion_tokens, .truncated = output.truncated, .audio_json = try std.json.Stringify.valueAlloc(a, metadata, .{}), .origin = if (prompt != null and !std.mem.eql(u8, prompt.?, AudioReadInput.default_prompt)) .interpretation else .transcription };
     }
 
     pub fn readAudioJsonWithControl(self: *Node, a: std.mem.Allocator, raw: []const u8, supplied_control: InferenceExecutionControl) ![]u8 {

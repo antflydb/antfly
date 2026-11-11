@@ -3253,6 +3253,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const advances = try batchAdvancesManagedIndexApplyState(ctx.index_manager, batch, index_ref);
                 {
                     const async_ctx = AsyncContext{
+                        .shared_artifact_repair_issue_mutex = if (ctx.async_context) |owner| owner.artifactRepairIssueMutex() else null,
                         .apply_exclusive_held = ctx.apply_exclusive_held,
                         .alloc = ctx.alloc,
                         .io = ctx.io,
@@ -3299,6 +3300,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null, false, null);
         }
 
+        /// Borrow an operation's existing admission without reopening the
+        /// shared gate: a queued capture may already have closed that gate.
+        /// The caller keeps the supplied lease alive through this invocation.
+        fn acquireReplayAdmission(
+            ctx: *const AsyncContext,
+            admitted: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease,
+        ) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+            if (admitted) |lease| {
+                std.debug.assert(lease.active and lease.admission == ctx.snapshot_replay_admission);
+                return null;
+            }
+            return try acquireSnapshotReplayAsyncContext(ctx);
+        }
+
         pub fn applyDerivedBatchToIndexContextProfiled(
             ctx: *const AsyncContext,
             batch: derived_types.DerivedBatch,
@@ -3310,13 +3325,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Generated files and their publication metadata are one physical
             // generation. Native capture takes the exclusive side of this admission
             // while copying, so no async worker may rewrite an artifact mid-copy.
-            var snapshot_replay = if (admitted_replay) |lease| blk: {
-                std.debug.assert(lease.admission == ctx.snapshot_replay_admission);
-                std.debug.assert(lease.active);
-                // The callback keeps its retained lease alive for this entire call.
-                // Borrow it directly instead of adding another shared-count round trip.
-                break :blk @as(?snapshot_admission_mod.SnapshotAdmission.MutationLease, null);
-            } else try acquireSnapshotReplayAsyncContext(ctx);
+            var snapshot_replay = try acquireReplayAdmission(ctx, admitted_replay);
             defer if (snapshot_replay) |*lease| lease.release();
             if (index_ref.kind == .full_text) {
                 const apply_start_ns = monotonicTimeNs();
@@ -3878,6 +3887,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 },
             }
             if (!ctx.projection_only) try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);
+        }
+
+        pub fn applyAssetPublicationMetadataContext(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_name: []const u8, admitted_replay: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease) !void {
+            if (ctx.projection_only) return;
+            const has_asset_root = for (batch.changed_artifact_keys) |key| {
+                if (internal_keys.isAssetArtifactKey(key)) break true;
+            } else false;
+            if (!has_asset_root) return;
+            var replay = try acquireReplayAdmission(ctx, admitted_replay);
+            defer if (replay) |*lease| lease.release();
+            try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_name, batch.changed_artifact_keys, batch.sequence);
         }
 
         pub fn clearPublishedAssetArtifactRepairIssuesContext(ctx: *const AsyncContext, index_name: []const u8, keys: []const []const u8, sequence: u64) !void {
@@ -4737,8 +4757,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (asset_plan) |*view| view.release();
 
             const mutable_ctx = @constCast(ctx);
-            lockAtomicWithBackoff(&mutable_ctx.artifact_repair_issue_mutex);
-            defer mutable_ctx.artifact_repair_issue_mutex.unlock();
+            lockAtomicWithBackoff(mutable_ctx.artifactRepairIssueMutex());
+            defer mutable_ctx.artifactRepairIssueMutex().unlock();
 
             const loaded = (try loadArtifactRepairIssueFromStoreByKey(ctx.alloc, ctx.store, issue_key)) orelse return;
             var issue = loaded;
@@ -4757,42 +4777,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break producer.type == .document_extraction;
                 } else true; // Missing catalog authority retains conservative validation.
                 if (requires_manifest) {
-                    // Failed extraction retains older children. Their presence
-                    // alone is no proof of repair; require a healthy manifest.
-                    var manifest = std.json.parseFromSlice(std.json.Value, ctx.alloc, raw, .{}) catch |err| switch (err) {
+                    const health = @import("enrichment/document_extraction_completion.zig").publicationState(ctx.alloc, raw) catch |err| switch (err) {
                         error.OutOfMemory => return err,
                         else => return,
                     };
-                    defer manifest.deinit();
-                    if (manifest.value != .object) return;
-                    const route = manifest.value.object.get("route_type") orelse return;
-                    if (route != .string or route.string.len == 0) return;
-                    if (manifest.value.object.get("merge_plan") orelse manifest.value.object.get("merge")) |merge| {
-                        if (merge != .object) return;
-                        const state = merge.object.get("status") orelse return;
-                        if (state != .string or !std.mem.eql(u8, state.string, "converged")) {
-                            if (state == .string and std.mem.eql(u8, state.string, "failed"))
-                                try noteFailedArtifactRepairPublicationContext(ctx, issue, artifact_key_hex, published_sequence);
-                            return;
-                        }
-                    }
-                    if (try enrichment_runtime_mod.documentExtractionEmptyCoverageIsTerminalFailure(ctx.alloc, raw)) {
-                        try noteFailedArtifactRepairPublicationContext(ctx, issue, artifact_key_hex, published_sequence);
-                        return;
-                    }
-                    // Partial OCR may retain valid older units. A non-empty
-                    // artifact is not sufficient to settle a terminal repair.
-                    if (manifest.value.object.get("ocr_failed_count")) |count| {
-                        if (count != .integer or count.integer != 0) {
+                    switch (health) {
+                        .pending => return,
+                        .failed => {
                             try noteFailedArtifactRepairPublicationContext(ctx, issue, artifact_key_hex, published_sequence);
                             return;
-                        }
-                    }
-                    if (manifest.value.object.get("ocr_failed_page_numbers")) |pages| {
-                        if (pages != .array or pages.array.items.len != 0) {
-                            try noteFailedArtifactRepairPublicationContext(ctx, issue, artifact_key_hex, published_sequence);
-                            return;
-                        }
+                        },
+                        .complete => {},
                     }
                 }
             }
@@ -5089,16 +5084,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer alloc.free(retired_prefix);
             try collectDeleteKeysForPrefix(alloc, store, retired_prefix, delete_keys, owned_delete_keys, null);
 
-            // Standalone privacy witnesses live in the control namespace, but
-            // preserve the exact document prefix after their own prefix. Retire
-            // every policy generation beside the document, even if an older
-            // producer's artifact has already been garbage-collected.
+            // Standalone witnesses retain a per-document prefix, using a digest
+            // for oversized IDs. Retire every policy generation beside the
+            // document, even after an older artifact was garbage-collected.
             const privacy_prefix = try @import("../../privacy/local_publication.zig").key(alloc, document_prefix);
             defer alloc.free(privacy_prefix);
             try collectDeleteKeysForPrefix(alloc, store, privacy_prefix, delete_keys, owned_delete_keys, null);
             const local_asset_prefix = try @import("artifact_local_publication.zig").key(alloc, document_prefix);
             defer alloc.free(local_asset_prefix);
             try collectDeleteKeysForPrefix(alloc, store, local_asset_prefix, delete_keys, owned_delete_keys, null);
+            if (internal_keys.documentMetadataDigestPrefixLen(document_prefix) != null) {
+                // Rolling upgrades may retain v1 witnesses. Retire both
+                // namespaces together, without visiting neighboring documents.
+                inline for (.{ @import("../../privacy/local_publication.zig"), @import("artifact_local_publication.zig") }) |publication| {
+                    const old = try publication.legacyKey(alloc, document_prefix);
+                    defer alloc.free(old);
+                    try collectDeleteKeysForPrefix(alloc, store, old, delete_keys, owned_delete_keys, null);
+                }
+            }
             const retry_prefix = try @import("../../privacy/retry.zig").key(alloc, document_prefix);
             defer alloc.free(retry_prefix);
             try collectDeleteKeysForPrefix(alloc, store, retry_prefix, delete_keys, owned_delete_keys, null);
@@ -5595,9 +5598,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 target_identities.deinit(alloc);
             }
 
+            // Publication metadata needs the same durable target as projection
+            // rows. Otherwise the executor may consider this lane caught up
+            // before the manifest's repair-ledger effect has been applied.
+            const has_asset_publication = for (batch.changed_artifact_keys) |key| {
+                if (internal_keys.isAssetArtifactKey(key)) break true;
+            } else false;
             var target_scope_known = true;
             for (managed_indexes) |candidate| {
-                const applicability = managedIndexBatchApplicabilityWithEmbeddingNames(index_manager, batch, candidate.ref, &changed_embedding_names);
+                const applicability = if (has_asset_publication)
+                    ManagedIndexBatchApplicability.relevant
+                else
+                    managedIndexBatchApplicabilityWithEmbeddingNames(index_manager, batch, candidate.ref, &changed_embedding_names);
                 switch (applicability) {
                     .irrelevant, .missing_dependency => {},
                     .relevant => {
@@ -6492,7 +6504,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             const byte_source_fingerprint = if (metadata_fingerprint == null)
-                try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, source_url, config_json, config, downloaded_mut.content_type) orelse try documentExtractionFingerprintAlloc(alloc, source_url, config_json, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
+                try document_extraction_mod.downloadedMetadataFingerprintAlloc(alloc, source_url, config_json, config, downloaded_mut.content_type) orelse try document_extraction_mod.contentFingerprintAlloc(alloc, source_url, config_json, config, config.content_type, config.filename, downloaded_mut.content_type, downloaded_mut.data)
             else
                 null;
             defer if (byte_source_fingerprint) |fingerprint| alloc.free(fingerprint);
@@ -7618,27 +7630,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try out.append(alloc, '}');
             try out.append(alloc, '}');
             return try out.toOwnedSlice(alloc);
-        }
-
-        pub fn documentExtractionFingerprintAlloc(
-            alloc: Allocator,
-            source_url: []const u8,
-            config_json: []const u8,
-            configured_content_type: []const u8,
-            configured_filename: []const u8,
-            downloaded_content_type: []const u8,
-            data: []const u8,
-        ) ![]u8 {
-            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-            hasher.update(source_url);
-            hasher.update(config_json);
-            hasher.update(configured_content_type);
-            hasher.update(configured_filename);
-            hasher.update(downloaded_content_type);
-            hasher.update(data);
-            var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-            hasher.final(&digest);
-            return try hexBytesAlloc(alloc, &digest);
         }
 
         pub fn documentExtractionKeyIndex(keys: []const []const u8, key: []const u8) ?usize {
@@ -9596,7 +9587,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 index_manager.alloc.free(parsed.artifact_name);
                             }
                             for (index_manager.graphArtifactSources(index_ref.name)) |source| {
-                                if (source.mention_edge_type.len == 0) continue;
+                                // Resolution also changes canonical relation endpoints when
+                                // document-to-mention edges are disabled.
                                 if (resolverConfigForResolution(index_manager, index_ref.name, source.artifact_name, parsed.artifact_name) != null) return .relevant;
                             }
                             if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
@@ -9707,6 +9699,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             record: change_journal_mod.Record,
             index_ref: index_manager_mod.ManagedIndexRef,
         ) ManagedIndexBatchApplicability {
+            // A final asset manifest can carry no projection rows at all,
+            // while proving that a formerly failed producer has published.
+            // Target fast-forward must not skip that repair-ledger effect.
+            // Batch applicability remains projection-only: the replay callback
+            // settles metadata through batched issue probes without rebuilding
+            // postings, vectors, or graph edges for these records.
+            for (record.changed_artifact_keys) |key| {
+                if (internal_keys.isAssetArtifactKey(key)) return .relevant;
+            }
             switch (index_ref.kind) {
                 .full_text, .algebraic => {
                     if (record.changed_doc_keys.len > 0 or
@@ -9755,7 +9756,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 index_manager.alloc.free(parsed.artifact_name);
                             }
                             for (index_manager.graphArtifactSources(index_ref.name)) |source| {
-                                if (source.mention_edge_type.len == 0) continue;
+                                // Resolution also changes canonical relation endpoints when
+                                // document-to-mention edges are disabled.
                                 if (resolverConfigForResolution(index_manager, index_ref.name, source.artifact_name, parsed.artifact_name) != null) return .relevant;
                             }
                             if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
@@ -11162,8 +11164,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer ctx.alloc.free(issue_key);
 
             const mutable_ctx = @constCast(ctx);
-            lockAtomicWithBackoff(&mutable_ctx.artifact_repair_issue_mutex);
-            defer mutable_ctx.artifact_repair_issue_mutex.unlock();
+            lockAtomicWithBackoff(mutable_ctx.artifactRepairIssueMutex());
+            defer mutable_ctx.artifactRepairIssueMutex().unlock();
 
             const now_ns = currentTimeNs();
             const existing = try loadArtifactRepairIssueFromStoreByKey(ctx.alloc, ctx.store, issue_key);
@@ -11376,8 +11378,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             reason: types.ArtifactRepairReason,
         ) !void {
             const mutable_ctx = @constCast(ctx);
-            lockAtomicWithBackoff(&mutable_ctx.artifact_repair_issue_mutex);
-            defer mutable_ctx.artifact_repair_issue_mutex.unlock();
+            lockAtomicWithBackoff(mutable_ctx.artifactRepairIssueMutex());
+            defer mutable_ctx.artifactRepairIssueMutex().unlock();
             var identity = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(ctx.alloc, artifact_key)) orelse return;
             defer identity.deinit(ctx.alloc);
 

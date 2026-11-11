@@ -32,6 +32,7 @@ import (
 
 func serve(args []string) error {
 	flags := flag.NewFlagSet("antfly-source serve", flag.ContinueOnError)
+	knowledgeAudience := flags.String("knowledge-audience", "", "operator assertion: native instance and every input/output/API share this single audience; empty disables knowledge")
 	profile := flags.String("config", "", "initial source profile JSON (persisted runtime changes take precedence)")
 	state := flags.String("state-dir", "", "private durable state directory")
 	listen := flags.String("listen", "127.0.0.1:8082", "HTTP listen address (put non-loopback listeners behind TLS)")
@@ -48,7 +49,7 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	service, err := sources.NewService(sources.ServiceOptions{Profile: configuration, StateDir: *state, PublicURL: *publicURL, AdminToken: os.Getenv(*adminEnv), MediaKey: []byte(os.Getenv(*mediaEnv))})
+	service, err := sources.NewService(sources.ServiceOptions{KnowledgeAudience: *knowledgeAudience, Profile: configuration, StateDir: *state, PublicURL: *publicURL, AdminToken: os.Getenv(*adminEnv), MediaKey: []byte(os.Getenv(*mediaEnv))})
 	if err != nil {
 		return err
 	}

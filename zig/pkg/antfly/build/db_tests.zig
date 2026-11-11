@@ -33,6 +33,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const native_query_maintenance_filters = [_][]const u8{
         "db native checkpoint warming",
+        "db native checkpoint discovery",
         "db idle dense query captures",
         "external lake native warming",
         "source vector payloads debt policy bounds background deferral",
@@ -189,6 +190,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = selectTestFilters(b, &.{
         "#1210",
+        "relational prepared writes validate orphan vector receipts",
         "db public artifact reprocess accepts durable work despite unrelated provider retries",
         "db public extraction budget rejection publishes a failure manifest",
         "db document extraction manifest inspection and reprocess API",
@@ -419,6 +421,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db enrichment repair never clears a newer failure revision",
         "storage.db.db.test.db enrichment restart supervisor recovers transient start failures",
         "storage.db.db.test.db enrichment status changes notify query visibility hook",
+        "storage.db.db.test.db enrichment status changes notify only after atomic publication",
+        "storage.db.db.test.db enrichment status changes notify after discarding corrupt optional cursors",
         "storage.db.db.test.db enrichment status does not wait for lifecycle mutation",
         "storage.db.db.test.db enrichments precomputed watermark advances across replay entries without enrichment debt",
         "storage.db.db.test.db enrichments precomputes generated enrichments into the committed batch",
@@ -505,6 +509,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.enrichment.enrichment_state.test.enrichment apply state works with memory backend store",
         "storage.db.enrichment.enrichment_state.test.enrichment projection checkpoint persists status and identity fields",
         "storage.db.enrichment.enrichment_state.test.enrichment projection checkpoint rejects malformed structured state",
+        "storage.db.enrichment.enrichment_state.test.enrichment status publication keeps progress advanced before write admission",
         "storage.db.enrichment.enrichment_state.test.enrichment replay cursor rejects corruption",
         "storage.db.enrichment.enrichment_state.test.enrichment replay cursor round trips and clears independently",
         "storage.db.enrichment.enrichment_state.test.enrichment state lsm point loads do not clone mutable snapshot",

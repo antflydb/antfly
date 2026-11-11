@@ -786,6 +786,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     antfly_imports.configureStorageBenchmark(b, storage_bench_root_mod);
     @import("../../../build_support/embedded/storage.zig").configureLmdb(b, storage_bench_root_mod, lmdb_engine_mod, false);
     storage_bench_mod.addImport("antfly-zig", storage_bench_root_mod);
+    options.antfly_imports.build_info.link(storage_bench_mod);
     storage_bench_mod.addImport("antfly_platform", platform_mod);
 
     const storage_bench = b.addExecutable(.{
@@ -814,6 +815,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
             .optimize = optimize,
         });
         module.addImport("antfly-zig", storage_bench_root_mod);
+        options.antfly_imports.build_info.link(module);
         const artifact = b.addExecutable(.{
             .name = workload[0],
             .root_module = module,

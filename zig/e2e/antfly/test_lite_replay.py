@@ -30,10 +30,11 @@ from conftest import (
     DEFAULT_ANTFLY_BIN,
     InferenceEmbeddingServer,
     StandaloneAntflyServer,
+    lookup_key_path,
     ready_index_status,
     resolve_binary_path,
 )
-from helpers import wait_until
+from helpers import PhaseTimings, wait_until
 
 # These tests construct their servers directly, outside the process-owning
 # fixtures that the scheduler can infer. Reserve their actual process capacity.
@@ -61,6 +62,7 @@ class DenseEmbeddingServer(InferenceEmbeddingServer):
 @pytest.mark.parametrize("batch_size", [50, 608])
 @pytest.mark.parametrize("storage_engine", [None, "lite"], ids=["default", "lite"])
 def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
+    timings = PhaseTimings(f"dense-replay-{storage_engine}-{batch_size}")
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     identity = "0123456789abcdef" * 4
     embedder = DenseEmbeddingServer(model_identity=identity, response_delay_s=None)
@@ -335,17 +337,26 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
                 assert {
                     node.get("document", {}).get("canonical_name")
                     for node in graph["nodes"]
-                    if node.get("table") == "concepts"
                 } == {f"Orchard {ordinal}", "Harvest"}, {
                     "graph": graph,
                     "index": call("GET", "/tables/docs/indexes/knowledge"),
                     "resolver": call("GET", "/tables/docs/resolvers/concepts"),
                     "logs": server.debug_logs(),
                 }
+                # Returned qualifiers are canonical storage identities. Prove
+                # hydration against the public target rather than filtering
+                # valid nodes out by the mutable logical name.
+                assert len({node["table"] for node in graph["nodes"]}) == 1
+                for node in graph["nodes"]:
+                    assert node["table"]
+                    assert node["document"] == call(
+                        "GET", lookup_key_path("concepts", node["key"])
+                    )
 
         for offset in range(0, 608, batch_size):
             write(offset, min(offset + batch_size, 608))
         assert_complete(608)
+        timings.mark("initial-replay-and-visibility")
         # Hold the producer so reopening necessarily encounters durable debt.
         embedder.arm_delay()
         try:
@@ -354,11 +365,16 @@ def test_bulk_dense_replay_and_reopen(batch_size, storage_engine):
                 call("GET", "/tables/docs/indexes/vectors")["status"]["total_indexed"]
                 < 658
             )
-            server.pause()
+            # This is crash recovery with durable producer debt. A graceful
+            # SIGTERM cannot drain the deliberately held provider and only
+            # spends the fixture's shutdown timeout before killing it anyway.
+            server.pause(crash=True)
+            timings.mark("crash-with-durable-debt")
         finally:
             embedder.release_delay()
         server.resume()
         assert_complete(658)
+        timings.mark("recovered-replay-and-visibility")
         assert embedder.received_model_identities
         assert set(embedder.received_model_identities) == {identity}
         # Neither a changed nor a missing remote identity may yield vectors in

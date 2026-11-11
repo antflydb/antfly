@@ -728,7 +728,7 @@ test "capi path gate hands a writer lease to the next queued thread and drops it
 const PathGate = struct {
     path: []u8,
     mutex: QueuedMutex = .{},
-    sql_preparation: @import("sql.zig").PreparationAdmission = .{},
+    sql_preparation: @import("../sql/preparation_admission.zig").PreparationAdmission = .{},
     references: usize = 1,
     owners: std.ArrayList(*Owner) = .empty,
 };

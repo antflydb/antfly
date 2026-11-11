@@ -656,6 +656,7 @@ pub const storage_resource_manager = @import("storage/resource_manager.zig");
 pub const storage_restore_decoder_cache = @import("storage/restore_decoder_cache.zig");
 pub const storage_retained_effects = @import("storage/retained_effects.zig");
 pub const storage_retained_frame = @import("storage/retained_frame.zig");
+pub const storage_verified_retained_frame = @import("storage/verified_retained_frame.zig");
 pub const storage_rewrite_program_cache = @import("storage/rewrite_program_cache.zig");
 pub const storage_rewrite_tail_spool = @import("storage/rewrite_tail_spool.zig");
 pub const storage_row_identity = @import("storage/row_identity.zig");
@@ -893,3 +894,17 @@ pub const storage_db_enrichment_media_output_counts = @import("storage/db/enrich
 
 pub const storage_db_field_projection_source = @import("storage/db/field_projection_source.zig");
 pub const storage_source_value_identity = @import("storage/source_value_identity.zig");
+
+pub const storage_db_mutation_commit_disposition_test = @import("storage/db/mutation_commit_disposition_test.zig");
+
+pub const storage_db_mutation_plan = @import("storage/db/mutation_plan.zig");
+
+pub const storage_db_query_cypher_projection = @import("storage/db/query/cypher_projection.zig");
+
+pub const storage_db_transform_read_plan = @import("storage/db/transform_read_plan.zig");
+
+pub const storage_embedded_graph_catalog = @import("storage/embedded_graph_catalog.zig");
+
+pub const storage_read_session_contract = @import("storage/read_session_contract.zig");
+
+pub const storage_read_session_values = @import("storage/read_session_values.zig");

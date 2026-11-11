@@ -113,6 +113,7 @@ func searchCommand(args []string) error {
 }
 func processingCommand(args []string) error {
 	flags := flag.NewFlagSet("antfly-source processing", flag.ContinueOnError)
+	audience := flags.String("knowledge-audience", "", "operator assertion of one native instance audience")
 	path := flags.String("config", "", "source profile JSON")
 	state := flags.String("state", "", "optional existing runner state directory for discovery publication")
 	sourceID := flags.String("source", "", "source identity")
@@ -135,11 +136,11 @@ func processingCommand(args []string) error {
 			if err = publisher.EnsureTable(ctx, source.Table); err != nil {
 				return err
 			}
-			if err = sources.ReconcileSourceSearch(ctx, publisher, source); err != nil {
+			if err = sources.ReconcileSourceSearch(ctx, publisher, source, *audience); err != nil {
 				return err
 			}
 			if *state != "" {
-				runner := sources.Runner{Profile: profile, StateDir: *state, Publisher: publisher}
+				runner := sources.Runner{KnowledgeAudience: *audience, Profile: profile, StateDir: *state, Publisher: publisher}
 				if err := runner.RefreshSearchDiscovery(ctx, source.ID); err != nil {
 					return err
 				}

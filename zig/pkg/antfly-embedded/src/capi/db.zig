@@ -10791,7 +10791,7 @@ test "capi native memory decision explanation provenance survives reopen and scr
 }
 
 fn nativeMemoryTestCall(handle: ?*anyopaque, alloc: Allocator, principal: []const u8, action: @import("../memory/service.zig").Action, body: anytype, token: []const u8, name: []const u8) ![]const u8 {
-    const request = try std.json.Stringify.valueAlloc(alloc, .{ .action = action, .principal = principal, .id = name, .body = body, .idempotency_key = token }, .{});
+    const request = try std.json.Stringify.valueAlloc(alloc, .{ .action = action, .principal = principal, .id = name, .body = if (@TypeOf(body) == @TypeOf(.{})) @as(struct {}, .{}) else body, .idempotency_key = token }, .{});
     var output: capi.Buffer = .{};
     const code = antfly_db_memory_json(handle, .fromSlice("personal"), .fromSlice(request), &output);
     if (code != .ok) std.debug.print("memory C ABI: {s}\n", .{std.mem.span(capi.lastErrorDetail())});

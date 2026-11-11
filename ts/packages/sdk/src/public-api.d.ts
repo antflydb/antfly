@@ -2537,9 +2537,12 @@ export interface paths {
          *     reader, transcriber, extractor, and document-extraction producers are
          *     all supported, as are dense and sparse embedding producers. Embedding
          *     reprocessing regenerates vectors even when the source chunks are unchanged.
-         *     Embedding requests are committed durably and queued for supervised
-         *     inference. Acceptance does not wait for inference; inspect index coverage
-         *     and repair issues for the eventual outcome.
+         *     Embedding requests and document-extraction requests on servers with an
+         *     enrichment runtime are committed durably and queued for supervised
+         *     inference. Acceptance does not wait for inference. For extraction, inspect
+         *     the artifact generation, merge status and per-page failures; for embeddings,
+         *     inspect index coverage and repair issues. Embedded databases without an
+         *     enrichment runtime execute document extraction inline.
          */
         post: operations["reprocessDocumentArtifact"];
         delete?: never;
@@ -9352,7 +9355,7 @@ export interface components {
             unresolved: number;
             /**
              * Format: uint64
-             * @description Number of selected repair records or indexes skipped because another repair pass already owns them.
+             * @description Number of selected repair records or indexes still in progress after this pass, including queued native producer work and work owned by another repair pass.
              */
             in_progress: number;
             /**
@@ -9472,7 +9475,12 @@ export interface components {
              */
             advance?: boolean;
         };
-        /** @description Durable table repair job state. */
+        /**
+         * @description Durable table repair job state. In result, work counters accumulate across
+         *     passes, while unresolved and in_progress describe only the latest bounded
+         *     pass. Earlier failures remain represented by cumulative failure counters,
+         *     debt_remaining, and the current remaining_failures summary.
+         */
         TableRepairJob: {
             /**
              * Format: uint64
@@ -18953,6 +18961,8 @@ export interface components {
             scorer_json?: string;
             /** @enum {string} */
             candidate_search?: "" | "exact_key" | "prefix" | "ann";
+            /** @description Optional canonical key namespace ending in /. Prefix and ANN blocking apply it before candidate limits. Redirects and final decisions must remain in this prefix and the configured target table. Empty preserves unrestricted native matching. */
+            candidate_key_prefix?: string;
             candidate_ann_index?: string;
             /** Format: uint */
             candidate_limit?: number;

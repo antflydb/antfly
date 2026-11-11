@@ -201,8 +201,13 @@ func TestNativeSourceSearchStreams(t *testing.T) {
 	plain["source"].(map[string]any)["revision"] = "r2"
 	_, err = p.call(ctx, "POST", tablePath(table)+"/batch", map[string]any{"inserts": map[string]any{"text": plain}, "sync_level": "full_index"})
 	require.NoError(t, err)
-	raw, err = p.Search(ctx, binding, SearchRequest{Stream: text.Name, Mode: "full_text", Text: "launch"})
-	require.NoError(t, err)
+	// Acknowledged parent writes can still advance dependent artifact coverage.
+	// Wait on the actual query admission boundary rather than assuming every
+	// derived source remains complete immediately after the write receipt.
+	require.Eventually(t, func() bool {
+		raw, err = p.Search(ctx, binding, SearchRequest{Stream: text.Name, Mode: "full_text", Text: "launch"})
+		return err == nil
+	}, 30*time.Second, 100*time.Millisecond)
 	require.NoError(t, json.Unmarshal(raw, &wire))
 	require.Len(t, wire.Responses[0].Hits.Hits, 1)
 	require.Equal(t, `{"text":"launch"}`, wire.Responses[0].Hits.Hits[0].Hierarchy.Matches[0].Source["$"])

@@ -41,7 +41,9 @@ pub const Input = struct {
     /// Null retains every managed projection; empty retains primary data only.
     indexes: ?[]const []const u8 = null,
 };
-pub const Table = struct { privacy_policy_version: ?[64]u8 = null, indexes: ?[]const []const u8 = null, name: []const u8, table_id: u64, schema_version: u32, principal_proof: []const u8 = "", database: []const u8 = "default", filter_query_json: []const u8 = "" };
+/// Null is an unrestricted table cohort. Nonempty keys are certified physical
+/// document identities; unknown and empty domains retain the full cohort.
+pub const Table = struct { keys: ?[]const []const u8 = null, privacy_policy_version: ?[64]u8 = null, indexes: ?[]const []const u8 = null, name: []const u8, table_id: u64, schema_version: u32, principal_proof: []const u8 = "", database: []const u8 = "default", filter_query_json: []const u8 = "" };
 pub const Statement = struct {
     partial_graph: bool = false,
     catalog_json: []const u8,

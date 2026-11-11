@@ -78,6 +78,20 @@ func ProcessingJobPath(source management.Source, input management.ProcessingJobR
 		return "", "", nil, fmt.Errorf("invalid artifact")
 	}
 	declared := false
+	if source.Knowledge != nil {
+		for _, g := range source.Knowledge.Graphs {
+			for _, a := range g.Artifacts {
+				if a == input.Artifact {
+					declared = true
+				}
+			}
+		}
+		for _, e := range source.Knowledge.Entities {
+			if e.SourceArtifact == input.Artifact {
+				declared = true
+			}
+		}
+	}
 	for _, artifact := range source.Artifacts {
 		if artifact.Artifact == input.Artifact {
 			declared = true
