@@ -237,6 +237,10 @@ pub fn assignFixedCenters(
 ) !RunStats {
     if (config.dims == 0 or centers.len == 0 or centers.len % config.dims != 0) return error.InvalidDimensions;
     if (assignments.len != points.len or distances.len != points.len or entries.len != points.len) return error.InvalidDimensions;
+    try validateClusteringPoints(points, config.dims);
+    for (centers) |value| {
+        if (!std.math.isFinite(value)) return error.InvalidEmeansVector;
+    }
     const started = monotonicNs();
     assign(config, points, centers, assignments, distances);
     var stats: RunStats = .{};
@@ -647,6 +651,19 @@ test "kmeans forced metal backend requires dense vectors" {
     }, &points, 0, &centroids, &next_centroids, &assignments, &distances, &counts, &entries));
 }
 
+fn validateClusteringPoints(points: []const Point, dims: usize) !void {
+    for (points) |point| {
+        try validateClusteringVector(point.vector, dims);
+    }
+}
+
+pub fn validateClusteringVector(vector: []const f32, dims: usize) !void {
+    if (vector.len != dims) return error.InvalidDimensions;
+    for (vector) |value| {
+        if (!std.math.isFinite(value)) return error.InvalidEmeansVector;
+    }
+}
+
 // Bessa et al. (2026), https://arxiv.org/abs/2611.09501.
 // CPU e-means: fitted laws, shuffled batches, cosine decay, revival, closing
 // means. One extra exact assignment supplies HBC's final packing labels.
@@ -655,10 +672,7 @@ fn runEmeans(config: RunConfig, points: []const Point, seed: usize, centroids: [
     if (config.backend == .metal) return error.EmeansRequiresCpu;
     if (!allUnitWeights(points)) return error.EmeansRequiresUnitWeights;
     if (config.emeans_epochs == 0) return error.InvalidEmeansEpochs;
-    for (points) |point| {
-        if (point.vector.len != config.dims) return error.InvalidDimensions;
-        for (point.vector) |v| if (!std.math.isFinite(v)) return error.InvalidEmeansVector;
-    }
+    try validateClusteringPoints(points, config.dims);
     const alloc = config.allocator orelse return error.EmeansRequiresAllocator;
     const k = counts.len;
     if (k > points.len) return error.TooFewVectors;
@@ -862,4 +876,26 @@ test "kmeans e-means fitted recipe follows reference laws" {
     try std.testing.expectEqual(@as(usize, 1024), recipe.batch);
     try std.testing.expect(recipe.alpha >= 0.0001 and recipe.alpha <= 1);
     try std.testing.expectEqual(@as(usize, 128), emeansRecipe(10000, 100, 2, 5).batch);
+}
+
+test "fixed-center routing validates every input row before assignment" {
+    const config: RunConfig = .{
+        .dims = 2,
+        .metric = .l2_squared,
+        .backend = .cpu,
+        .update_strategy = .scatter,
+        .max_iter = 1,
+    };
+    var points = [_]Point{
+        .{ .stable_id = 1, .vector = &.{ 0, 0 }, .weight = 1 },
+        .{ .stable_id = 2, .vector = &.{1}, .weight = 1 },
+    };
+    var assignments = [_]usize{ 99, 99 };
+    var distances: [2]f32 = undefined;
+    var entries: [2]Entry = undefined;
+    const centers = [_]f32{ 0, 0 };
+    try std.testing.expectError(error.InvalidDimensions, assignFixedCenters(config, &points, &centers, &assignments, &distances, &entries));
+    points[1].vector = &.{ 1, std.math.nan(f32) };
+    try std.testing.expectError(error.InvalidEmeansVector, assignFixedCenters(config, &points, &centers, &assignments, &distances, &entries));
+    try std.testing.expectEqualSlices(usize, &.{ 99, 99 }, &assignments);
 }

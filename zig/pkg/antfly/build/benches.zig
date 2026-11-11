@@ -749,6 +749,14 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const build_quality_step = b.step("bench-build-quality", "Build bounded-bootstrap held-out recall benchmark");
     build_quality_step.dependOn(&b.addInstallArtifact(build_quality, .{}).step);
 
+    const spool_tests = b.addTest(.{
+        .root_module = options.antfly_test_mod,
+        .filters = &.{ "spooled bulk", "offline lake build configuration", "stable generation finalization", "authoritative external-vector HBC", "experimental posting checkpoint reopens", "native posting initial acceleration", "prepared posting activation" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("bulk-spool-test", "Verify bounded offline HBC construction, publication and failure cleanup")
+        .dependOn(&b.addRunArtifact(spool_tests).step);
+
     const dense_stack_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/dense_stack_bench.zig"),
         .target = target,

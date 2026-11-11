@@ -57,14 +57,29 @@ test "external lake execution operation owns clients checkpoints cancellation an
     defer fs.deinit();
     var client = fs.client();
     try client.makeBucket("antfly");
-    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{
-        .{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = &.{ "first value", "second value" } },
-        .{ .column_id = "dense", .field_id = 2, .converted_type = 0, .values = &.{ "[1,0]", "[0,1]" } },
-        .{ .column_id = "sparse", .field_id = 3, .converted_type = 0, .values = &.{ "{\"1\":2}", "{\"2\":3}" } },
-    });
-    defer a.free(data);
-    var put = try client.putObject("antfly", "part.parquet", data, .{});
-    put.deinit(a);
+    var input_arena = std.heap.ArenaAllocator.init(a);
+    defer input_arena.deinit();
+    const input_alloc = input_arena.allocator();
+    var bodies: [231][]const u8 = undefined;
+    var dense: [bodies.len][]const u8 = undefined;
+    var sparse: [bodies.len][]const u8 = undefined;
+    for (&bodies, &dense, &sparse, 0..) |*body, *vector, *terms, i| {
+        body.* = try std.fmt.allocPrint(input_alloc, "value {d}", .{i});
+        vector.* = try std.fmt.allocPrint(input_alloc, "[{d},1]", .{i});
+        terms.* = "{\"1\":2}";
+    }
+    for (0..2) |file| {
+        for (&bodies, 0..) |*body, i| body.* = try std.fmt.allocPrint(input_alloc, "file-{d}-value-{d}", .{ file, i });
+        const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{
+            .{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = &bodies },
+            .{ .column_id = "dense", .field_id = 2, .converted_type = 0, .values = &dense },
+            .{ .column_id = "sparse", .field_id = 3, .converted_type = 0, .values = &sparse },
+        });
+        defer a.free(data);
+        var name: [32]u8 = undefined;
+        var put = try client.putObject("antfly", try std.fmt.bufPrint(&name, "part-{d}.parquet", .{file}), data, .{});
+        put.deinit(a);
+    }
     const schema = try std.fmt.allocPrint(a, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"lake\",\"format\":\"parquet\",\"uri\":\"file://{s}\",\"schema_fingerprint\":\"schema\",\"row_identity\":{{\"key_columns\":[\"body\"]}}}},\"relational_indexes\":[{{\"name\":\"body_idx\",\"keys\":[{{\"column\":\"body\"}}],\"include_columns\":[\"dense\"]}}],\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"body\":{{\"type\":\"string\"}},\"dense\":{{\"type\":\"string\"}},\"sparse\":{{\"type\":\"string\"}}}},\"additionalProperties\":false}}}}}}}}", .{directory.path()});
     defer a.free(schema);
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
@@ -73,7 +88,7 @@ test "external lake execution operation owns clients checkpoints cancellation an
     defer source.deinit();
     var store = try @import("lake_index_store.zig").Store.openNative(a, null, null, false, .standalone, directory.path());
     defer store.deinit();
-    const table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = schema, .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":true},\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"rows\",\"op\":\"count\"}]},\"dense\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2},\"sparse\":{\"type\":\"embeddings\",\"external\":true,\"sparse\":true}}" };
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = schema, .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":true},\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"rows\",\"op\":\"count\"}]},\"dense\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"lake_bulk_build\":\"lloyd\"},\"sparse\":{\"type\":\"embeddings\",\"external\":true,\"sparse\":true}}" };
     const pending_bytes = try publication.beginWithLocator(a, std.testing.io, table, &source, store.identity, .{}, 100, 1000, store.locator);
     defer a.free(pending_bytes);
     var pending = table;
@@ -166,6 +181,27 @@ test "external lake execution operation owns clients checkpoints cancellation an
         try std.testing.expect(found);
     }
 
+    for (inventory.declarations) |declaration| if (declaration.artifact.kind == .vector_segment) {
+        const native = @import("lake_index_native_dense.zig");
+        const native_files = @import("lake_index_native_files.zig");
+        const root = try native.loadRoot(inventory_arena.allocator(), store.artifactStore(), declaration.artifact, .none, null);
+        var reader: native_files.Reader = .{ .root = root.generation, .prefix = "/published-bulk", .store = store.artifactStore(), .context = .{}, .scratch = a };
+        defer reader.deinit();
+        var vectors = try local.storage_lsm_backend.Backend.open(a, "/published-bulk/vectors", .{ .storage = reader.storage(), .backend = .{ .read_only = true, .create_if_missing = false } });
+        defer vectors.close();
+        var loader: native.VectorLoader = .{ .backend = &vectors, .dims = 2 };
+        var index = try local.storage_hbc_adapter.HBCIndex.openWithLsmOptions(a, "/published-bulk", .{ .dims = 2 }, .{ .storage = reader.storage(), .backend_options = .{ .backend = .{ .read_only = true, .create_if_missing = false } } });
+        defer index.close();
+        index.setIo(std.testing.io);
+        index.setExternalVectorLoader(&loader, native.VectorLoader.load);
+        try index.activateExperimentalPostingReads(0);
+        try std.testing.expectEqual(@as(u64, bodies.len * 2), index.stats().active_count);
+        try std.testing.expect((try index.verifyTreeLinks()).consistent());
+        var hits = try index.search(&.{ 100, 1 }, 2);
+        defer hits.deinit();
+        try std.testing.expectEqual(@as(usize, 2), hits.items.items.len);
+    };
+
     try std.testing.expect(authority.checkpoints != 0);
     var control = try catalog.parse(a, authority.table.lake_index_catalog_json);
     defer control.deinit();
@@ -225,7 +261,13 @@ test "external lake execution operation owns clients checkpoints cancellation an
     var changed_store = try store.executionDescriptor();
     changed_store.identity[0] ^= 1;
     try std.testing.expectError(error.ExternalLakeIndexStoreChanged, native_client.build(a, std.testing.io, pending, .{}, changed_store, .{}, .none, clock, lease, null, .{}, .{}, &cause));
-    var added = try client.putObject("antfly", "part2.parquet", data, .{});
+    const added_data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{
+        .{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = &bodies },
+        .{ .column_id = "dense", .field_id = 2, .converted_type = 0, .values = &dense },
+        .{ .column_id = "sparse", .field_id = 3, .converted_type = 0, .values = &sparse },
+    });
+    defer a.free(added_data);
+    var added = try client.putObject("antfly", "part2.parquet", added_data, .{});
     added.deinit(a);
     // A fresh owner must validate the source against the admitted signature,
     // including changes hidden from the API's already-open reader inventory.

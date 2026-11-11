@@ -57,6 +57,27 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: local.serverless_manifes
     if (!std.mem.eql(u8, &scope.domain, &root.generation.domain)) return error.InvalidNativeLakeDenseRoot;
     return root;
 }
+const BuildCancellation = struct {
+    token: Cancellation,
+    provider: *@import("lake_index_row_source.zig").Provider,
+
+    fn check(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.token.check();
+        try self.provider.context.ensureActive();
+    }
+};
+
+fn vectorStoreOptions(storage: ?local.storage_lsm_backend.Storage, offline: bool) local.storage_lsm_backend.Options {
+    return .{
+        .storage = storage,
+        .flush_threshold = if (offline) 64 * 1024 else 8 * 1024 * 1024,
+        .flush_threshold_bytes = if (offline) 8 * 1024 * 1024 else 0,
+        .bulk_ingest_flush_threshold_multiplier = if (offline) 1 else 8,
+        .bulk_ingest_flush_threshold_bytes_multiplier = if (offline) 1 else 8,
+    };
+}
+
 pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared) ![]const Declared {
     return buildIncremental(a, out, table, source, base, store, provider, cancellation, reusable, &.{});
 }
@@ -137,8 +158,30 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const hbc = local.storage_hbc_adapter;
         var options: hbc.HBCConfig = .{ .dims = dims };
         options.metric = std.meta.stringToEnum(@TypeOf(options.metric), metric) orelse return error.InvalidIndexConfig;
+        var build_cancellation: BuildCancellation = .{ .token = cancellation, .provider = provider };
+        var build_options: ?hbc.HBCIndex.SpoolBuildOptions = null;
+        if (@import("lake_enrichment_units.zig").configured(configuration, "lake_bulk_build")) |algorithm| {
+            if (algorithm != .string) return error.InvalidIndexConfig;
+            const selected = std.meta.stringToEnum(@TypeOf((hbc.HBCIndex.SpoolBuildOptions{}).algorithm), algorithm.string) orelse return error.InvalidIndexConfig;
+            if (selected == .emeans and options.metric != .l2_squared) return error.EmeansRequiresL2;
+            if (seed == null) build_options = .{ .algorithm = selected, .check = BuildCancellation.check, .context = &build_cancellation };
+        }
+        var bulk_input_limit: u64 = 512 * 1024 * 1024;
+        if (@import("lake_enrichment_units.zig").configured(configuration, "lake_bulk_build_max_input_bytes")) |limit| {
+            if (limit != .integer or limit.integer <= 0) return error.InvalidIndexConfig;
+            bulk_input_limit = @intCast(limit.integer);
+        }
+        if (build_options != null) {
+            // Construction consumes each source vector once per partition.
+            // Keep retained HBC caches within the shared builder allocator.
+            const per_leaf = @as(usize, dims) * (@as(usize, options.leaf_size) + 8);
+            options.max_cached_nodes = std.math.clamp((16 * 1024 * 1024) / per_leaf, 1, 256);
+            options.max_cached_vectors = 0;
+            options.max_cached_metadata = 0;
+            options.pinned_tree_depth = 0;
+        }
         const vector_path = try std.fmt.allocPrint(ca, "{s}/vectors", .{path});
-        var vectors = try local.storage_lsm_backend.Backend.open(budget.allocator(), vector_path, .{ .storage = candidate_storage, .flush_threshold = 8 * 1024 * 1024 });
+        var vectors = try local.storage_lsm_backend.Backend.open(budget.allocator(), vector_path, vectorStoreOptions(candidate_storage, build_options != null));
         defer vectors.close();
         var index = try hbc.HBCIndex.openWithLsmOptions(budget.allocator(), path, options, .{ .storage = candidate_storage });
         defer index.close();
@@ -158,9 +201,22 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer if (baseline_vectors) |*cut| cut.deinit();
         var baseline_postings = if (seed != null) (try index.nativeBackupGeneration(a, 0)) orelse return error.InvalidNativeLakeDenseRoot else null;
         defer if (baseline_postings) |*cut| cut.deinit();
-        if (seed == null) try index.beginBulkIngestSession();
+        const spool_path = try std.fmt.allocPrint(ca, "{s}/bulk-spool", .{path});
+        const spool_dir = if (build_options != null) dir: {
+            try std.Io.Dir.cwd().createDir(io, spool_path, .fromMode(0o700));
+            break :dir try std.Io.Dir.cwd().openDir(io, spool_path, .{});
+        } else null;
+        defer if (spool_dir) |dir| dir.close(io);
+        var spool: hbc.HBCIndex.BulkSpool = .{ .dir = spool_dir orelse undefined, .io = io, .dims = dims };
+        var spool_buffer: [64 * 1024]u8 = undefined;
+        var spool_output = if (build_options != null) try spool.create(&spool_buffer) else null;
+        defer if (spool_output) |*output| output.abort(spool);
+        const transformed: []f32 = if (build_options != null) try budget.allocator().alloc(f32, dims) else &.{};
+        defer if (build_options != null) budget.allocator().free(transformed);
+        const incremental_session = seed == null and build_options == null;
+        if (incremental_session) try index.beginBulkIngestSession();
         var finished = false;
-        defer if (!finished and seed == null) index.abortBulkIngestSession();
+        defer if (!finished and incremental_session) index.abortBulkIngestSession();
         var identities: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer identities.deinit(budget.allocator());
         if (seed) |root| {
@@ -205,7 +261,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         input_provider.enrichment_columns = @import("lake_enrichment_units.zig").configured(producer.config, "template") != null;
         const rows = try input_provider.provider().open_with_cancellation_fn.?(input_provider.provider().ptr, a, binding, cancellation);
         defer rows.deinit(a);
-        var input_remaining: u64 = 512 * 1024 * 1024;
+        var input_remaining: u64 = if (build_options != null) bulk_input_limit else 512 * 1024 * 1024;
         const input = if (provider.resume_work) |work| &work.native_input_left else &input_remaining;
         while (try rows.next(a)) |batch| {
             var page_arena = std.heap.ArenaAllocator.init(a);
@@ -229,7 +285,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         try unit_records.put(pa, try @import("lake_enrichment_units.zig").sourceKey(pa, parent_key, unit.source_ordinal), try @import("lake_enrichment_units.zig").sourceJson(pa, unit));
                     }
                     const id = vectorId(key);
-                    if ((try identities.getOrPut(budget.allocator(), id)).found_existing) return error.NativeLakeVectorIdentityCollision;
+                    if (build_options == null and (try identities.getOrPut(budget.allocator(), id)).found_existing) return error.NativeLakeVectorIdentityCollision;
                     if (seed != null) if (try index.getMetadata(id)) |existing| {
                         defer index.alloc.free(existing);
                         return error.NativeLakeVectorIdentityCollision;
@@ -247,12 +303,30 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             var records = unit_records.iterator();
             while (records.next()) |record| try transaction.put(.{ .name = "lake_units" }, record.key_ptr.*, record.value_ptr.*);
             try transaction.commit();
-            if (seed != null) try index.beginExperimentalPostingMutationCapture();
-            errdefer if (seed != null) index.cancelExperimentalPostingMutationCapture();
-            try index.batchInsertWithMetadataOptions(writes.items, .{ .assume_absent_ids = true, .bulk_ingest = seed == null, .skip_vector_store = true });
-            if (seed != null) try index.persistExperimentalPostingSidecarAtAppliedSequence(0, .{});
+            if (spool_output) |*output| {
+                for (writes.items) |write| {
+                    const vector = index.transformVector(write.vector, transformed);
+                    try output.append(write.vector_id, write.metadata, vector);
+                }
+            } else {
+                if (seed != null) try index.beginExperimentalPostingMutationCapture();
+                errdefer if (seed != null) index.cancelExperimentalPostingMutationCapture();
+                try index.batchInsertWithMetadataOptions(writes.items, .{ .assume_absent_ids = true, .bulk_ingest = seed == null, .skip_vector_store = true });
+                if (seed != null) try index.persistExperimentalPostingSidecarAtAppliedSequence(0, .{});
+            }
         }
-        if (seed == null) try index.finishBulkIngestSessionWithOptions(.{});
+        if (spool_output) |*output| {
+            const root = try output.finish(io);
+            spool_output = null;
+            // Release the source mutable table before admitting routing and
+            // leaf-construction work under the same allocator.
+            try vectors.flushBufferedWritesWithOptions(.{ .compact = false });
+            index.bulkBuildSpool(&spool, root, build_options.?) catch |err| switch (err) {
+                error.DuplicateVectorId => return error.NativeLakeVectorIdentityCollision,
+                else => return err,
+            };
+        }
+        if (incremental_session) try index.finishBulkIngestSessionWithOptions(.{});
         try tracker.finish();
         finished = true;
         // Keep small committed deltas; compact at a bounded WAL/depth boundary.
@@ -264,10 +338,10 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (tip.sealed_wals[0..tip.sealed_wal_count]) |wal| wal_bytes +|= wal.committed_bytes;
             flatten = wal_bytes >= 32 * 1024 * 1024 or tip.segment_generations.len >= 8 or tip.sealed_wal_count >= 4;
         };
-        try index.finalizeExperimentalPostingGenerationAtAppliedSequence(0, .{ .flatten = flatten, .make_authoritative = true });
+        try index.finalizeExperimentalPostingGenerationAtAppliedSequence(0, .{ .flatten = flatten, .make_authoritative = true, .check = BuildCancellation.check, .context = &build_cancellation });
         var checkpoint = (try index.nativeBackupGeneration(a, 0)) orelse return error.InvalidNativeLakeDenseRoot;
         defer checkpoint.deinit();
-        var output_remaining: u64 = 1024 * 1024 * 1024;
+        var output_remaining: u64 = if (build_options != null) try std.math.mul(u64, bulk_input_limit, 2) else 1024 * 1024 * 1024;
         const output_bytes: files.OutputBudget = .{ .generation = &output_remaining, .work = if (provider.resume_work) |work| &work.native_output_left else null };
         var navigation: @import("lake_index_native_directory.zig").Navigation = .{ .allocator = a };
         defer navigation.deinit();
@@ -444,4 +518,45 @@ test "external lake dense roots reject obsolete metadata versions" {
     defer fs.deinit();
     // Missing objects must not be read for unsupported root formats.
     for ([_]u16{ 2, 3 }) |version| try std.testing.expectError(error.InvalidNativeLakeDenseRoot, loadRoot(a, fs.artifactStore(), .{ .kind = .vector_segment, .metadata_version = @intCast(version), .artifact_id = "missing", .byte_len = 1, .checksum = "missing" }, .none, null));
+}
+
+test "external lake execution offline dense source flushes by bytes within its allocation quota" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("offline-dense-source");
+    defer directory.cleanup();
+    var budget: local.sql_memory_budget = .{ .backing = a, .limit = 64 * 1024 * 1024 };
+    const path = try std.fmt.allocPrint(a, "{s}/vectors", .{directory.path()});
+    defer a.free(path);
+    const dims = 768;
+    const count = 32768;
+    const vector: [dims]f32 = @splat(1.25);
+    const encoded = try @import("antfly_vector").codec.encodePackedF32BytesAlloc(a, &vector);
+    defer a.free(encoded);
+    {
+        var backend = try local.storage_lsm_backend.Backend.open(budget.allocator(), path, vectorStoreOptions(null, true));
+        defer backend.close();
+        var offset: usize = 0;
+        while (offset < count) : (offset += 128) {
+            var batch = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            errdefer batch.abort();
+            for (offset..@min(offset + 128, count)) |row| {
+                var key: [32]u8 = undefined;
+                try batch.put(.{ .name = "exact_vectors" }, try std.fmt.bufPrint(&key, "row-{d:0>8}", .{row}), encoded);
+            }
+            try batch.commit();
+        }
+        try backend.flushBufferedWritesWithOptions(.{ .compact = false });
+        var checkpoint = try backend.pinNativeCheckpoint();
+        defer checkpoint.deinit();
+        try std.testing.expect(@as(u64, count) * dims * 4 > budget.limit);
+        try std.testing.expect(budget.peak <= budget.limit);
+    }
+    var reopened = try local.storage_lsm_backend.Backend.open(budget.allocator(), path, vectorStoreOptions(null, true));
+    defer reopened.close();
+    var read = try reopened.beginRead();
+    defer read.abort();
+    for ([_]usize{ 0, count / 2, count - 1 }) |row| {
+        var key: [32]u8 = undefined;
+        try std.testing.expectEqualSlices(u8, encoded, try read.get(.{ .name = "exact_vectors" }, try std.fmt.bufPrint(&key, "row-{d:0>8}", .{row})));
+    }
 }

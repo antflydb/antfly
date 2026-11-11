@@ -1263,6 +1263,7 @@ from .join_type import JoinType
 from .kernel_jit_config import KernelJitConfig
 from .kernel_jit_mode import KernelJitMode
 from .key_range import KeyRange
+from .lake_bulk_build_algorithm import LakeBulkBuildAlgorithm
 from .lake_catalog_commit_request import LakeCatalogCommitRequest
 from .lake_catalog_commit_request_requirements_item import LakeCatalogCommitRequestRequirementsItem
 from .lake_catalog_commit_request_updates_item import LakeCatalogCommitRequestUpdatesItem
@@ -3950,6 +3951,7 @@ __all__ = (
     "KernelJitConfig",
     "KernelJitMode",
     "KeyRange",
+    "LakeBulkBuildAlgorithm",
     "LakeCatalogCommitRequest",
     "LakeCatalogCommitRequestRequirementsItem",
     "LakeCatalogCommitRequestUpdatesItem",

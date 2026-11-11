@@ -46,6 +46,7 @@ pub const weighted_subgroup_selection = @import("weighted_subgroup_selection.zig
 comptime {
     if (@import("builtin").is_test) {
         _ = @import("quantized_directory.zig");
+        _ = @import("centroid_directory.zig");
         _ = @import("vector_block.zig");
         _ = @import("antfly_hash");
         _ = @import("posting_wal.zig");
