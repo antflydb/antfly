@@ -608,10 +608,12 @@ Three modes:
 
 Done since the first version: filter-aware traversal (`SearchOptions.filter`),
 a per-query re-embedding budget and cancellation (`leann.reembed_budget_ms`,
-`SearchOptions.gate`), a 32 MiB re-embed cache keyed by index incarnation,
-key and stub digest, `vector_storage: auto`, int8 copies for media vectors
+`SearchOptions.gate`), a resource-governed re-embed cache capped at 32 MiB
+including its metadata and keyed by index incarnation, key and stub digest, `vector_storage: auto`, int8 copies for media vectors
 (`leann.media_vectors: int8`), and a Python e2e test
-(`test_leann_index_returns_exact_nearest_first`).
+(`test_leann_index_returns_exact_nearest_first`). The re-embed cache respects
+the retained-vector opt-out, shares the node cache budget, and releases LRU
+entries and empty hash-table capacity under query memory pressure.
 
 ## Leader replication
 

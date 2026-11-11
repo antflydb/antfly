@@ -1406,7 +1406,7 @@ pub const IndexManager = struct {
     /// vectors fail with `error.ReembedUnavailable`.
     dense_reembedder: ?DenseReembedder = null,
     /// Recently re-embedded vectors of transient LEANN indexes (32 MiB).
-    leann_reembed_cache: leann_store_mod.ReembedCache = .{ .limit_bytes = 32 << 20 },
+    leann_reembed_cache: leann_store_mod.ManagedReembedCache = .{ .limit_bytes = 32 << 20 },
     leann_range_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     text_main_backend: persistent_mod.MainBackend,
     text_lsm_storage: ?lsm_backend_mod.Storage,
@@ -33810,6 +33810,7 @@ pub const IndexManager = struct {
         var source_hashes = std.ArrayListUnmanaged(?u64).empty;
         defer source_hashes.deinit(alloc);
         const incarnation = leannIncarnation(entry.config);
+        const cache_enabled = manager.retainedVectorCacheEnabled();
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
@@ -33869,7 +33870,7 @@ pub const IndexManager = struct {
                             const header = try enrichment_artifact_codec.decodeHeader(raw_artifact);
                             const identity = .{ .digest = stub.vector_digest, .source_hash = if (header.flags.has_source_hash) @as(?u64, header.source_hash) else null };
                             const digest = identity.digest;
-                            if (manager.leann_reembed_cache.get(incarnation, meta, digest, out[i * d ..][0..d])) {
+                            if (cache_enabled and manager.leann_reembed_cache.get(incarnation, meta, digest, out[i * d ..][0..d])) {
                                 found[i] = true;
                                 continue;
                             }
@@ -33917,7 +33918,9 @@ pub const IndexManager = struct {
             if (!ok[j]) continue;
             const vector = vectors[j * d ..][0..d];
             if (elided_digests.items[j]) |dg| {
-                manager.leann_reembed_cache.put(manager.alloc, incarnation, elided_keys.items[j], dg, vector) catch {};
+                if (cache_enabled) if (manager.resource_manager) |resources| {
+                    manager.leann_reembed_cache.put(manager.alloc, resources, incarnation, elided_keys.items[j], dg, vector) catch {};
+                };
             }
             @memcpy(out[slot * d ..][0..d], vector);
             found[slot] = true;
@@ -53701,6 +53704,32 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
             try expectTop(&manager, &store, entry, &vectors[177], keys[177]);
             try std.testing.expectEqual(before, embedder.documents);
             try std.testing.expect(manager.leann_reembed_cache.hits > 0);
+        }
+
+        // A hard opt-out bypasses an existing hot entry and creates no
+        // replacement owner after the old cache is torn down.
+        {
+            var loader = IndexManager.DenseVectorLoadContext{ .manager = &manager, .index_name = @constCast("leann_idx") };
+            var out: [dims]f32 = undefined;
+            var found = [_]bool{false};
+            var elapsed: u64 = 0;
+            try IndexManager.loadDenseVectorsForLeann(&loader, alloc, &.{177}, &.{keys[177]}, &out, &found, &elapsed);
+            try std.testing.expect(manager.leann_reembed_cache.owner != null);
+            const previous = manager.retained_vector_cache_enabled;
+            manager.retained_vector_cache_enabled = false;
+            defer manager.retained_vector_cache_enabled = previous;
+            const before = embedder.documents;
+            const hits = manager.leann_reembed_cache.hits;
+            try IndexManager.loadDenseVectorsForLeann(&loader, alloc, &.{177}, &.{keys[177]}, &out, &found, &elapsed);
+            try std.testing.expect(found[0]);
+            try std.testing.expectEqual(before + 1, embedder.documents);
+            try std.testing.expectEqual(hits, manager.leann_reembed_cache.hits);
+            manager.leann_reembed_cache.deinit(alloc);
+            try IndexManager.loadDenseVectorsForLeann(&loader, alloc, &.{177}, &.{keys[177]}, &out, &found, &elapsed);
+            try std.testing.expect(found[0]);
+            try std.testing.expectEqualSlices(f32, &vectors[177], &out);
+            try std.testing.expectEqual(before + 2, embedder.documents);
+            try std.testing.expect(manager.leann_reembed_cache.owner == null);
         }
 
         // Cross the tiny exact limit with a sparse allowlist of elided rows.

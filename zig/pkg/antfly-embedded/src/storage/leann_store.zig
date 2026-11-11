@@ -1417,6 +1417,123 @@ const NodeFilter = struct {
     }
 };
 
+/// Resource-governed optional retention. The heap owner keeps allocator and
+/// reclaimer addresses stable when an IndexManager is moved during publication.
+pub const ManagedReembedCache = struct {
+    const resources = @import("resource_manager.zig");
+    const Quota = @import("antfly_platform").allocator.reclamation.Quota;
+    limit_bytes: usize = 32 << 20,
+    mutex: std.atomic.Mutex = .unlocked,
+    owner: ?*Owner = null,
+    hits: u64 = 0,
+
+    const Owner = struct {
+        backing: Allocator,
+        metadata: resources.Reservation,
+        budget: resources.BudgetedAllocator,
+        quota: Quota = undefined,
+        cache: ReembedCache,
+        reclaimer: u64 = 0,
+
+        fn create(backing: Allocator, manager: *resources.ResourceManager, limit: usize) !*Owner {
+            if (limit <= @sizeOf(Owner)) return error.OutOfMemory;
+            var metadata = try manager.reserveWithoutReclaim(.hbc_node_metadata_cache, @sizeOf(Owner));
+            errdefer metadata.release();
+            const self = try backing.create(Owner);
+            errdefer backing.destroy(self);
+            self.* = .{ .backing = backing, .metadata = metadata, .budget = resources.BudgetedAllocator.init(manager, .hbc_node_metadata_cache, backing, 1), .cache = .{ .limit_bytes = limit } };
+            // Cache credit is exact; returning one entry immediately releases
+            // admission for other queries rather than retaining spare credit.
+            self.budget.credit_quantum = 1;
+            errdefer self.budget.deinit();
+            self.quota = Quota.init(self.budget.allocator(), limit - @sizeOf(Owner));
+            errdefer self.quota.deinit();
+            self.reclaimer = try manager.registerReclaimer(.hbc_node_metadata_cache, self, reclaim);
+            return self;
+        }
+
+        fn trimLocked(self: *Owner, target: u64) u64 {
+            const before = self.budget.reservation.bytes;
+            const alloc = self.quota.allocator();
+            while (self.cache.oldest != null and before - self.budget.reservation.bytes < target) self.cache.evictOldest(alloc);
+            if (self.cache.oldest == null) {
+                self.cache.map.deinit(alloc);
+                self.cache.map = .empty;
+            }
+            _ = self.budget.releaseUnusedCredit();
+            return before - self.budget.reservation.bytes;
+        }
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *Owner = @ptrCast(@alignCast(raw));
+            const Guard = @import("antfly_platform").allocator.reclamation.Guard;
+            if (target == 0 or !Guard.allowed() or !self.cache.mutex.tryLock()) return 0;
+            defer self.cache.mutex.unlock();
+            // Backing allocators may be layered under the requester. Honor
+            // their existing same-thread reclamation protocol when freeing.
+            Guard.beginReclaim();
+            defer Guard.endReclaim();
+            return self.trimLocked(target);
+        }
+
+        fn destroy(self: *Owner) void {
+            self.metadata.manager.unregisterReclaimer(self.reclaimer);
+            self.cache.deinit(self.quota.allocator());
+            self.quota.deinit();
+            self.budget.deinit();
+            self.metadata.release();
+            self.backing.destroy(self);
+        }
+    };
+
+    fn lock(self: *@This()) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    pub fn deinit(self: *@This(), _: Allocator) void {
+        // The owning IndexManager has quiesced its readers before teardown.
+        if (self.owner) |owner| owner.destroy();
+        self.* = .{ .limit_bytes = self.limit_bytes };
+    }
+
+    pub fn get(self: *@This(), incarnation: u64, key: []const u8, digest: u64, out: []f32) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        const owner = self.owner orelse return false;
+        // Hits use already-admitted residency. Do not take the node-wide
+        // accounting lock for each candidate; the caller checks retention
+        // policy once per batch and pressure can reclaim this owner directly.
+        const hit = owner.cache.get(incarnation, key, digest, out);
+        self.hits += @intFromBool(hit);
+        return hit;
+    }
+
+    pub fn put(self: *@This(), backing: Allocator, manager: *resources.ResourceManager, incarnation: u64, key: []const u8, digest: u64, vector: []const f32) !void {
+        const target = @min(self.limit_bytes, std.math.cast(usize, manager.hbcCachePolicy().target_bytes) orelse self.limit_bytes);
+        if (target == 0) return;
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.owner == null) self.owner = try Owner.create(backing, manager, target);
+        const owner = self.owner.?;
+        // Reuse the linked LRU under pressure. Each retry removes at least one
+        // old entry; failures never repeat source reads or embedding work.
+        while (true) {
+            owner.cache.put(owner.quota.allocator(), incarnation, key, digest, vector) catch |err| {
+                if (err != error.OutOfMemory) return err;
+                owner.cache.lock();
+                defer owner.cache.mutex.unlock();
+                if (owner.cache.oldest == null) {
+                    _ = owner.trimLocked(std.math.maxInt(u64));
+                    return err;
+                }
+                _ = owner.trimLocked(1);
+                continue;
+            };
+            return;
+        }
+    }
+};
+
 /// Bounded cache of vectors re-embedded for transient LEANN indexes, so hot
 /// candidates are not re-embedded on every query. Keyed by the index
 /// incarnation, the document key and the digest of the dropped vector: an
@@ -1491,11 +1608,11 @@ pub const ReembedCache = struct {
     pub fn put(self: *ReembedCache, alloc: Allocator, incarnation: u64, doc_key: []const u8, digest: u64, vector: []const f32) !void {
         const size = doc_key.len + 16 + vector.len * @sizeOf(f32);
         if (size > self.limit_bytes) return;
+        self.lock();
+        defer self.mutex.unlock();
         const owned_key = try alloc.alloc(u8, doc_key.len + 16);
         errdefer alloc.free(owned_key);
         _ = keyInto(owned_key, incarnation, doc_key, digest);
-        self.lock();
-        defer self.mutex.unlock();
         if (self.map.contains(owned_key)) {
             alloc.free(owned_key);
             return;
@@ -2183,4 +2300,97 @@ test "leann store: a failed persistent rebuild keeps every vector owned once" {
         res.deinit();
         if (!failing.has_induced_failure) break;
     }
+}
+
+test "leann managed reembed cache charges all storage shares pressure and releases ownership" {
+    const resources = @import("resource_manager.zig");
+    var budgets = resources.Options.defaultBudgets();
+    budgets[@backingInt(resources.Slice.hbc_node_metadata_cache)] = .{ .soft_limit_bytes = 32 * 1024, .hard_limit_bytes = 64 * 1024 };
+    var manager = resources.ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 64 * 1024 } });
+    defer manager.deinit(testing.allocator);
+    var backing = @import("test_allocator.zig").BoundedAllocator.init(testing.allocator, 64 * 1024);
+    defer std.debug.assert(backing.deinit() == 0);
+    const alloc = backing.allocator();
+    var caches = [_]ManagedReembedCache{ .{ .limit_bytes = 8 * 1024 }, .{ .limit_bytes = 8 * 1024 } };
+    defer for (&caches) |*cache| cache.deinit(alloc);
+    const vector: [128]f32 = @splat(1);
+    var out: [128]f32 = undefined;
+    for (&caches) |*cache| {
+        for (0..30) |i| {
+            var key_buf: [24]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "parent-{d}", .{i});
+            try cache.put(alloc, &manager, 1, key, 9, &vector);
+            const owner = cache.owner.?;
+            try testing.expect(owner.quota.live_bytes + @sizeOf(ManagedReembedCache.Owner) <= cache.limit_bytes);
+        }
+        try testing.expect(!cache.get(1, "parent-0", 9, &out));
+        try testing.expect(cache.get(1, "parent-29", 9, &out));
+        const owner = cache.owner.?;
+        // Pressure skips a busy owner rather than blocking a cache reader.
+        try testing.expect(owner.cache.mutex.tryLock());
+        try testing.expectEqual(@as(u64, 0), ManagedReembedCache.Owner.reclaim(owner, 1));
+        owner.cache.mutex.unlock();
+    }
+    var charged: u64 = 0;
+    var actual: usize = 0;
+    var metadata: u64 = 0;
+    for (&caches) |*cache| {
+        const owner = cache.owner.?;
+        charged += owner.metadata.bytes + owner.budget.reservation.bytes;
+        actual += @sizeOf(ManagedReembedCache.Owner) + owner.quota.live_bytes;
+        metadata += owner.metadata.bytes;
+    }
+    try testing.expectEqual(actual, backing.live);
+    try testing.expectEqual(charged, manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+    try testing.expect(charged >= actual);
+    // A required query can reclaim both optional caches, including empty map
+    // capacity, while their fixed owner shells remain correctly charged.
+    try testing.expect(manager.reclaimForAllocation(.dense_search_working_set, 64 * 1024) > 0);
+    for (&caches) |*cache| {
+        try testing.expectEqual(@as(u64, 0), cache.owner.?.budget.reservation.bytes);
+        try testing.expectEqual(@as(usize, 0), cache.owner.?.quota.live_bytes);
+        try testing.expect(!cache.get(1, "parent-29", 9, &out));
+    }
+    try testing.expectEqual(metadata, manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+    var required = try manager.reserveWithoutReclaim(.dense_search_working_set, 64 * 1024 - metadata);
+    required.release();
+    for (&caches) |*cache| cache.deinit(alloc);
+    try testing.expectEqual(@as(u64, 0), manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+    try testing.expectEqual(@as(usize, 0), backing.live);
+    try testing.expectEqual(@as(u64, 0), manager.reclaimForAllocation(.dense_search_working_set, 64 * 1024));
+    // Failed owner construction must return its metadata reservation too.
+    try testing.expectError(error.OutOfMemory, caches[0].put(testing.failing_allocator, &manager, 1, "fail", 9, &vector));
+    try testing.expectEqual(@as(u64, 0), manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+    // Failure after owner construction must not leave a partial vector or key.
+    backing.limit = @sizeOf(ManagedReembedCache.Owner) + 128;
+    try testing.expectError(error.OutOfMemory, caches[0].put(alloc, &manager, 1, "partial", 9, &vector));
+    try testing.expectEqual(@as(usize, @sizeOf(ManagedReembedCache.Owner)), backing.live);
+    try testing.expectEqual(@as(u64, @sizeOf(ManagedReembedCache.Owner)), manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+    caches[0].deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), backing.live);
+    try testing.expectEqual(@as(u64, 0), manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+    // No policy capacity means no allocation, even with an unusable backing.
+    budgets[@backingInt(resources.Slice.hbc_node_metadata_cache)] = .{};
+    var disabled = resources.ResourceManager.init(.{ .budgets = budgets });
+    defer disabled.deinit(testing.allocator);
+    try caches[0].put(testing.failing_allocator, &disabled, 1, "disabled", 9, &vector);
+    try testing.expect(caches[0].owner == null);
+    // A layered request allocator may already hold its quota lock when node
+    // pressure invokes the cache. Reclaim must reuse that same-thread lock.
+    const reclamation = @import("antfly_platform").allocator.reclamation;
+    var parent = reclamation.Quota.init(testing.allocator, 64 * 1024);
+    defer parent.deinit();
+    var layered = ManagedReembedCache{ .limit_bytes = 8 * 1024 };
+    defer layered.deinit(parent.allocator());
+    try layered.put(parent.allocator(), &manager, 1, "layered", 9, &vector);
+    {
+        try testing.expect(parent.mutex.tryLock());
+        defer parent.mutex.unlock();
+        reclamation.Guard.enter(&parent.mutex);
+        defer reclamation.Guard.leave();
+        try testing.expect(ManagedReembedCache.Owner.reclaim(layered.owner.?, std.math.maxInt(u64)) > 0);
+    }
+    layered.deinit(parent.allocator());
+    try testing.expectEqual(@as(usize, 0), parent.live_bytes);
+    try testing.expectEqual(@as(u64, 0), manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
 }
