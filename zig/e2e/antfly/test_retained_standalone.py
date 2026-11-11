@@ -475,6 +475,11 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             )
             == caught_up
         )
+        api(
+            "POST",
+            atomic_path + "/subscriptions/cancel",
+            {"cursor": caught_up["cursor"]},
+        )
         # Exact finite contributions may overflow only when projected to SUM.
         # Serving must expose the same permanent numeric error across surfaces.
         sql(
@@ -520,15 +525,27 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             45,
             server,
         )
-        atomic = api("GET", atomic_path)
+        # Create the retry immediately before discard so this regression does
+        # not depend on a session surviving the unrelated overflow checks.
+        revoked = api(
+            "POST",
+            atomic_path + "/subscriptions",
+            {"start_ns": str(first_bucket), "end_ns": str(first_bucket + interval)},
+        )
+        revoked_frame = api(
+            "POST",
+            atomic_path + "/subscriptions/poll",
+            {"cursor": revoked["cursor"]},
+        )
         assert (
             api(
                 "POST",
                 atomic_path + "/subscriptions/poll",
-                {"cursor": subscription["cursor"]},
+                {"cursor": revoked["cursor"]},
             )
-            == caught_up
+            == revoked_frame
         )
+        atomic = api("GET", atomic_path)
         api(
             "POST",
             atomic_path + "/close",
@@ -540,12 +557,12 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             api(
                 "POST",
                 atomic_path + "/subscriptions/poll",
-                {"cursor": subscription["cursor"]},
+                {"cursor": revoked["cursor"]},
             )
         api(
             "POST",
             atomic_path + "/subscriptions/cancel",
-            {"cursor": caught_up["cursor"]},
+            {"cursor": revoked_frame["cursor"]},
         )
         wait_for(
             lambda: api("GET", atomic_path),
