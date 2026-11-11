@@ -43,6 +43,7 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 	if binary == "" {
 		t.Skip("set ANTFLY_GREPSTEIN_E2E_BINARY to the native Antfly binary")
 	}
+	t.Setenv("ANTFLY_API_KEY", "")
 	binary, err := filepath.Abs(binary)
 	if err != nil {
 		t.Fatal(err)
@@ -202,7 +203,10 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 				args = append(args, "--artifact", stream)
 			}
 			args = append(args, "Native GCS extraction evidence")
-			output, err := exec.CommandContext(ctx, grepBinary, args...).CombinedOutput()
+			command := exec.CommandContext(ctx, grepBinary, args...)
+			command.Dir = root
+			command.Env = append(os.Environ(), "XDG_CACHE_HOME="+filepath.Join(root, "grep-cache"))
+			output, err := command.CombinedOutput()
 			if err != nil || !bytes.Contains(output, []byte("Native GCS extraction evidence")) {
 				t.Fatalf("native grep %s failed: %v\n%s", stream, err, output)
 			}
