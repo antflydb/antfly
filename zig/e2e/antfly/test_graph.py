@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -118,38 +119,59 @@ def _create_stateful_table(api, table_name: str, **kwargs) -> dict:
     return created
 
 
-def test_stateful_graph_diagnostic_identifies_later_incoming_operation(stateful_api):
+def test_stateful_incoming_traversals_preserve_path_enumeration(stateful_api):
     api = stateful_api
     table = f"graph_capability_{time.time_ns()}"
     _create_stateful_table(
-        api, table, num_shards=2, indexes={"knowledge": {"type": "graph"}}
+        api,
+        table,
+        num_shards=2,
+        indexes={
+            "knowledge": {
+                "type": "graph",
+                "edge_types": [{"name": "link", "field": "links"}],
+            }
+        },
     )
-    start = {"identities": [{"table": table, "key": "seed"}]}
+    _batch_write_stateful(
+        api,
+        table,
+        inserts={
+            "root": {"links": ["a", "b"]},
+            "a": {"links": ["target"]},
+            "b": {"links": ["target"]},
+            "target": {},
+        },
+        sync_level="full_index",
+    )
+    start = {"identities": [{"table": table, "key": "target"}]}
     response = api._request(
         "POST",
         f"/tables/{table}/query",
         {
             "graph_queries": {
-                "supported_incoming": {
-                    "index": "knowledge",
-                    "traverse": {"start": start, "direction": "in", "max_depth": 1},
-                },
-                "seed_paths": {
+                name: {
                     "index": "knowledge",
                     "traverse": {
                         "start": start,
                         "direction": "in",
-                        "max_depth": 1,
-                        "deduplicate_nodes": False,
+                        "max_depth": 2,
+                        "include_paths": True,
+                        "deduplicate_nodes": deduplicate,
                     },
-                },
+                }
+                for name, deduplicate in (("incoming", True), ("incoming_paths", False))
             }
         },
     )
-    assert response.status_code == 422, response.text
-    error = response.json()
-    assert error["operation"] == "seed_paths", error
-    assert error["reason"] == "deduplicate_nodes_must_be_true", error
+    assert response.status_code == 200, response.text
+    results = response.json()["responses"][0]["graph_results"]
+    assert [node["key"] for node in results["incoming"]["nodes"]].count("root") == 1
+    roots = [
+        node for node in results["incoming_paths"]["nodes"] if node["key"] == "root"
+    ]
+    assert len(roots) == 2, results
+    assert len({json.dumps(node["path"], sort_keys=True) for node in roots}) == 2, roots
 
 
 def _batch_write_stateful(api, table_name: str, **kwargs) -> dict:
@@ -2148,9 +2170,9 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
             "return": {"aggregates": {"count": {"count": "*"}}},
         }
 
-    neq = lambda left, right: {
-        "not_equal": {"left": {"alias": left}, "right": {"alias": right}}
-    }
+    def neq(left, right):
+        return {"not_equal": {"left": {"alias": left}, "right": {"alias": right}}}
+
     queries = {
         "q1": count_query(
             {

@@ -83,11 +83,93 @@ def _wait_for_constraints_enforced(
                 if response.json().get("state") == "enforced":
                     return time.monotonic() <= deadline
             else:
-                assert response.status_code in (404, 409, 503), response.text
+                assert response.status_code in (404, 409, 503, 504), response.text
         remaining = deadline - time.monotonic()
         if remaining > 0:
             time.sleep(min(1.0, remaining))
     return False
+
+
+def test_routed_document_reads_preserve_budget_on_every_gateway(
+    three_by_three_backup_cluster,
+):
+    cluster = three_by_three_backup_cluster
+    table = "routed_read_clock"
+    expected = {"value": 42}
+    with requests.Session() as session:
+        session.auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+        _create_cluster_table_when_admitted(cluster, session, table, {"num_shards": 3})
+        assert wait_until(
+            lambda: cluster.fully_replicated_topology(table), timeout_s=90
+        ), cluster.debug_logs()
+        _seed_cluster_docs_when_writable(cluster, session, table, {"0:clock": expected})
+        # Include the coordinator's own route and both forwarded routes.
+        # Internal route fencing establishes a finite executor-clock deadline,
+        # even when the public caller did not supply an explicit timeout.
+        for api_url in cluster.data_api_urls:
+            actual = wait_until(
+                lambda api_url=api_url: _lookup_doc_from_url(
+                    session, api_url, table, "0:clock"
+                ),
+                timeout_s=15,
+                interval_s=0.1,
+            )
+            assert actual == expected, cluster.debug_logs()
+
+
+def _enroll_store_root_once(client, api_url, proof, *, timeout_s=30.0):
+    """Resolve uncertain enrollment by exact identity; never replay the write."""
+    identity = proof["identity"]
+    deadline = time.monotonic() + timeout_s
+    auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+    try:
+        response = client.post(
+            f"{api_url}/store-roots/enroll",
+            json=proof,
+            auth=auth,
+            timeout=min(5.0, timeout_s),
+        )
+    except (requests.Timeout, requests.ConnectionError):
+        response = None
+    if response is not None:
+        if response.ok:
+            assert response.json() == identity, response.text
+            return
+        try:
+            failure = response.json()
+        except ValueError:
+            failure = response.text.strip()
+        uncertain = (
+            failure in ("MetadataMutationOutcomeUnknown",)
+            if isinstance(failure, str)
+            else isinstance(failure, dict)
+            and any(
+                failure.get(key) == "MetadataMutationOutcomeUnknown"
+                for key in ("code", "error")
+            )
+        )
+        if response.status_code != 503 or not uncertain:
+            _check_response(response)
+    last = None
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            status = client.post(
+                f"{api_url}/store-roots/enrollment-status",
+                json=identity,
+                auth=auth,
+                timeout=min(5.0, remaining),
+            )
+        except (requests.Timeout, requests.ConnectionError) as error:
+            last = repr(error)
+        else:
+            last = (status.status_code, status.text)
+            if status.ok:
+                assert status.json() == identity, status.text
+                return
+            # A conflicting identity or authorization error is permanent.
+            assert status.status_code in (404, 503, 504), last
+        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+    raise AssertionError(f"store-root enrollment was not confirmed: {last}")
 
 
 def _wait_for_terminal_restore_job(
@@ -1357,13 +1439,9 @@ class ThreeByThreeBackupCluster:
                 text=True,
                 cwd=REPO_ROOT,
             )
-            response = requests.post(
-                f"{self.metadata_public_urls[0]}/store-roots/enroll",
-                json=json.loads(proof.stdout),
-                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
-                timeout=30,
+            _enroll_store_root_once(
+                requests, self.metadata_public_urls[0], json.loads(proof.stdout)
             )
-            _check_response(response)
 
     def metadata_snapshot(self, index: int, *, request_timeout_s: float = 1.0) -> dict:
         response = requests.get(

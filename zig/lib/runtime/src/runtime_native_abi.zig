@@ -38,7 +38,7 @@ pub const TypeContract = extern struct {
     compiler_id: u64 = zig_compiler_id,
 
     pub fn of(comptime T: type) TypeContract {
-        return .{
+        return comptime .{
             .alignment = @alignOf(T),
             .size = @sizeOf(T),
             .bit_size = @sizeOf(T) * 8,
@@ -79,7 +79,7 @@ pub const CallContract = extern struct {
         comptime Arguments: type,
         comptime Output: type,
     ) CallContract {
-        return .{
+        return comptime .{
             .method_id = stableId(method_name),
             .function = .of(Function),
             .arguments = .of(Arguments),
@@ -99,6 +99,13 @@ pub const CallContract = extern struct {
 };
 
 pub fn stableId(comptime name: []const u8) u64 {
+    return comptime blk: {
+        @setEvalBranchQuota(1_000_000);
+        break :blk hashName(name);
+    };
+}
+
+fn hashName(comptime name: []const u8) u64 {
     // FNV-1a is deliberately simple and reproducible in every compilation
     // unit. Type size/alignment/bit-size are checked independently.
     var hash: u64 = 0xcbf29ce484222325;
@@ -117,6 +124,15 @@ pub fn stableId(comptime name: []const u8) u64 {
 /// recursive reflection over the large query/storage type graph materially
 /// increases analysis and code-generation time in every runtime unit.
 pub fn shallowLayoutId(comptime T: type) u64 {
+    // Descriptors depend exclusively on reflected compile-time inputs. Debug
+    // callers must not repeatedly hash long type names or entire vtables.
+    return comptime blk: {
+        @setEvalBranchQuota(1_000_000);
+        break :blk computeShallowLayoutId(T);
+    };
+}
+
+fn computeShallowLayoutId(comptime T: type) u64 {
     var hash: u64 = stableId(@tagName(@typeInfo(T)));
     hashInteger(&hash, @sizeOf(T));
     hashInteger(&hash, @alignOf(T));
