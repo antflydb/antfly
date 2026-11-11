@@ -13573,6 +13573,13 @@ pub const RetainedDatasetProgress = struct {
     }
 };
 
+pub const RetainedDatasetReadError = struct {
+    /// Stable machine-readable domain failure
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
 pub const RetainedSubscriptionFrame = struct {
     kind: []const u8,
     cursor: []const u8,

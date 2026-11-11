@@ -212,6 +212,56 @@ pub const Metric = struct {
         };
     }
 };
+/// Mutable query reduction. Exact units are allocated once per numeric metric;
+/// intermediate partition merges never allocate or serialize numeric state.
+pub const MetricReducer = struct {
+    metric: Metric,
+    exact: ?*ExactSum = null,
+
+    pub fn init(a: A, input: Metric) !MetricReducer {
+        var result: MetricReducer = .{ .metric = input };
+        result.metric.exact_sum = null;
+        if (input.exact_sum) |bytes| {
+            const exact = try ExactSum.parse(bytes);
+            result.exact = try a.create(ExactSum);
+            result.exact.?.* = exact;
+        }
+        return result;
+    }
+    pub fn add(self: *MetricReducer, a: A, right: Metric) !void {
+        const left = self.metric;
+        if (left.count < 0 or right.count < 0) return error.RetainedSeriesCorrupt;
+        const count = std.math.add(i64, left.count, right.count) catch return error.RetainedSeriesNumericOverflow;
+        if ((self.exact != null or left.count == 0) and (right.exact_sum != null or right.count == 0) and (self.exact != null or right.exact_sum != null)) {
+            const r = if (right.exact_sum) |bytes| try ExactSum.parse(bytes) else ExactSum{};
+            if (self.exact == null) {
+                self.exact = try a.create(ExactSum);
+                self.exact.?.* = .{};
+            }
+            self.exact.?.* = try self.exact.?.add(r);
+            self.metric.sum = 0;
+        } else {
+            const sum = (if (self.exact) |exact| exact.legacyWide() else left.sum) + (if (right.exact_sum) |bytes| (try ExactSum.parse(bytes)).legacyWide() else right.sum);
+            if (!std.math.isFinite(sum)) return error.RetainedSeriesNumericOverflow;
+            if (self.exact) |exact| a.destroy(exact);
+            self.exact = null;
+            self.metric.sum = sum;
+        }
+        self.metric.count = count;
+        self.metric.minimum = if (left.minimum) |l| if (right.minimum) |r| @min(l, r) else l else right.minimum;
+        self.metric.maximum = if (left.maximum) |l| if (right.maximum) |r| @max(l, r) else l else right.maximum;
+    }
+    pub fn deinit(self: *MetricReducer, a: A) void {
+        if (self.exact) |exact| a.destroy(exact);
+        self.exact = null;
+    }
+    pub fn finish(self: MetricReducer, a: A) !Metric {
+        var result = self.metric;
+        result.exact_sum = if (self.exact) |exact| try exact.encode(a) else null;
+        return result;
+    }
+};
+
 pub fn ownMetrics(a: A, input: []const Metric) ![]Metric {
     const output = try a.alloc(Metric, input.len);
     for (input, output) |metric, *out| out.* = try metric.owned(a);

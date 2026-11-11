@@ -1238,3 +1238,41 @@ test "retained dataset terminal empty proof seals and serves a partial bucket su
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
 }
+
+test "retained dataset abandoned uploads collect independently by location" {
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    try setup(&memory);
+    var clock: FakeClock = .{};
+    const store = catalog(&memory, &clock);
+    const hot = location(&memory, false);
+    const cold = location(&memory, true);
+    try store.create(definition(.records));
+    var first_fault = objects.scripted_fault.Client.init(a, memory.client());
+    defer first_fault.deinit();
+    var failed_hot = hot;
+    failed_hot.client = first_fault.client();
+    first_fault.commitNextPutThenFail(error.DatasetCopyFault);
+    try std.testing.expectError(error.DatasetCopyFault, store.publish(segment(), failed_hot, "states"));
+    var second_fault = objects.scripted_fault.Client.init(a, memory.client());
+    defer second_fault.deinit();
+    var failed_cold = cold;
+    failed_cold.client = second_fault.client();
+    var second = segment();
+    second.id = @splat(24);
+    second.location = cold.id;
+    second.access = cold.access;
+    clock.now += 1;
+    second_fault.commitNextPutThenFail(error.DatasetCopyFault);
+    try std.testing.expectError(error.DatasetCopyFault, store.publish(second, failed_cold, "states"));
+    clock.now += 6 * std.time.ns_per_min;
+    first_fault.failNextPutBefore(error.DatasetCopyFault);
+    try std.testing.expectError(error.DatasetCopyFault, store.reclaimUpload(failed_hot));
+    try std.testing.expect(try store.reclaimUpload(cold));
+    try std.testing.expect(!try store.reclaimUpload(cold));
+    try store.beginDiscard(definition(.records));
+    try std.testing.expectError(error.DatasetDependencyPending, store.nextDiscard(null));
+    try std.testing.expect(try store.reclaimUpload(hot));
+    try std.testing.expectEqual(@as(?t.Id, null), try store.nextDiscard(null));
+    try std.testing.expect(try store.discardReceipt() != null);
+}

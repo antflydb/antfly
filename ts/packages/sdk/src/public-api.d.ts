@@ -3101,7 +3101,7 @@ export interface paths {
         put?: never;
         /**
          * Replay retained summary changes
-         * @description Poll with the last cursor. Repeating a poll after a lost response returns the last committed frame. Use a new snapshot when replay is unavailable or the serving session expires.
+         * @description Poll with the last cursor through any cluster API node; its authenticated issuer routes to the serving session. Repeating a poll after a lost response returns the last committed frame. Replay gaps can coalesce through a fresh snapshot; reset is required when the serving session is lost.
          */
         post: operations["pollRetainedSubscription"];
         delete?: never;
@@ -7438,6 +7438,16 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        RetainedDatasetReadError: {
+            /**
+             * @description Stable machine-readable domain failure
+             * @example retained_series_numeric_overflow
+             */
+            code: string;
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
         RetainedSubscriptionFrame: {
             /** @enum {string} */
             kind: "snapshot" | "changes";
@@ -39012,6 +39022,15 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description A retained aggregate is outside its supported numeric range. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedDatasetReadError"];
+                };
+            };
             /** @description Subscription owner is temporarily unavailable. */
             503: {
                 headers: {
@@ -39076,6 +39095,15 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description A retained aggregate is outside its supported numeric range. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedDatasetReadError"];
+                };
             };
             /** @description Subscription owner is temporarily unavailable. */
             503: {
@@ -39244,6 +39272,15 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description A retained aggregate is outside its supported numeric range. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedDatasetReadError"];
+                };
             };
             /** @description Dataset authority is temporarily unavailable. */
             503: {

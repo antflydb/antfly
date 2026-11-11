@@ -7,6 +7,7 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.create_retained_subscription_body import CreateRetainedSubscriptionBody
+from ...models.retained_dataset_read_error import RetainedDatasetReadError
 from ...models.retained_subscription_frame import RetainedSubscriptionFrame
 from ...types import Response
 
@@ -39,7 +40,7 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | RetainedSubscriptionFrame | None:
+) -> Any | RetainedDatasetReadError | RetainedSubscriptionFrame | None:
     if response.status_code == 201:
         response_201 = RetainedSubscriptionFrame.from_dict(response.json())
 
@@ -61,6 +62,11 @@ def _parse_response(
         response_413 = cast(Any, None)
         return response_413
 
+    if response.status_code == 422:
+        response_422 = RetainedDatasetReadError.from_dict(response.json())
+
+        return response_422
+
     if response.status_code == 503:
         response_503 = cast(Any, None)
         return response_503
@@ -73,7 +79,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | RetainedSubscriptionFrame]:
+) -> Response[Any | RetainedDatasetReadError | RetainedSubscriptionFrame]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -89,7 +95,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: CreateRetainedSubscriptionBody,
-) -> Response[Any | RetainedSubscriptionFrame]:
+) -> Response[Any | RetainedDatasetReadError | RetainedSubscriptionFrame]:
     """Open a retained summary subscription
 
      Captures a bounded initial snapshot. Supply an aligned half-open range or a moving window. Requires
@@ -106,7 +112,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | RetainedSubscriptionFrame]
+        Response[Any | RetainedDatasetReadError | RetainedSubscriptionFrame]
     """
 
     kwargs = _get_kwargs(
@@ -130,7 +136,7 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: CreateRetainedSubscriptionBody,
-) -> Any | RetainedSubscriptionFrame | None:
+) -> Any | RetainedDatasetReadError | RetainedSubscriptionFrame | None:
     """Open a retained summary subscription
 
      Captures a bounded initial snapshot. Supply an aligned half-open range or a moving window. Requires
@@ -147,7 +153,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | RetainedSubscriptionFrame
+        Any | RetainedDatasetReadError | RetainedSubscriptionFrame
     """
 
     return sync_detailed(
@@ -166,7 +172,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: CreateRetainedSubscriptionBody,
-) -> Response[Any | RetainedSubscriptionFrame]:
+) -> Response[Any | RetainedDatasetReadError | RetainedSubscriptionFrame]:
     """Open a retained summary subscription
 
      Captures a bounded initial snapshot. Supply an aligned half-open range or a moving window. Requires
@@ -183,7 +189,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | RetainedSubscriptionFrame]
+        Response[Any | RetainedDatasetReadError | RetainedSubscriptionFrame]
     """
 
     kwargs = _get_kwargs(
@@ -205,7 +211,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: CreateRetainedSubscriptionBody,
-) -> Any | RetainedSubscriptionFrame | None:
+) -> Any | RetainedDatasetReadError | RetainedSubscriptionFrame | None:
     """Open a retained summary subscription
 
      Captures a bounded initial snapshot. Supply an aligned half-open range or a moving window. Requires
@@ -222,7 +228,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | RetainedSubscriptionFrame
+        Any | RetainedDatasetReadError | RetainedSubscriptionFrame
     """
 
     return (

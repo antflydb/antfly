@@ -197,7 +197,7 @@ pub const Catalog = struct {
         defer self.context.alloc.free(raw);
         const generation_key = try std.fmt.allocPrint(self.context.alloc, "definitions/{d}", .{value.generation});
         defer self.context.alloc.free(generation_key);
-        try self.commit(session.value, &.{ .{ .kind = .put, .key = "definition", .value = raw }, .{ .kind = .put, .key = generation_key, .value = raw } });
+        try self.commit(session.value, &.{ .{ .kind = .put, .key = "definition", .value = raw }, .{ .kind = .put, .key = generation_key, .value = raw }, .{ .kind = .put, .key = "upload_index_version", .value = "2" } });
     }
 
     /// Definition versions remain readable after schema/recipe evolution. The
@@ -378,7 +378,7 @@ pub const Catalog = struct {
             try self.writeVerified(staged, location, bytes);
             return self.publishImpl(staged, location, bytes, closed_page, staged.location_object.?, &fenced);
         }
-        var extra: [4]coordinator.Command = undefined;
+        var extra: [6]coordinator.Command = undefined;
         var extra_len: usize = 0;
         var expiry: ?ExpiryCursor = null;
         if (progress_key) |progress| {
@@ -399,6 +399,13 @@ pub const Catalog = struct {
         defer self.context.alloc.free(expiry_key);
         extra[extra_len] = .{ .kind = .delete, .key = attempt_key };
         extra[extra_len + 1] = .{ .kind = .delete, .key = expiry_key };
+        extra_len += 2;
+        const local_key = try uploadLocationKey(self.context.alloc, pending.value.location, attempt, null);
+        defer self.context.alloc.free(local_key);
+        const local_due = try uploadLocationKey(self.context.alloc, pending.value.location, attempt, pending.value.expires_ns);
+        defer self.context.alloc.free(local_due);
+        extra[extra_len] = .{ .kind = .delete, .key = local_key };
+        extra[extra_len + 1] = .{ .kind = .delete, .key = local_due };
         extra_len += 2;
         try self.putSegmentWithLocation(session.value, value, location, extra[0..extra_len]);
     }
@@ -1124,8 +1131,8 @@ pub const Catalog = struct {
         defer self.context.alloc.free(coverage_key);
         const coverage = try std.json.Stringify.valueAlloc(self.context.alloc, Coverage{ .segment = value.id, .start_ns = value.coverage.start_ns, .end_ns = value.coverage.end_ns, .key_span = value.key_span }, .{});
         defer self.context.alloc.free(coverage);
-        if (extra.len > 4) return error.DatasetPageBudgetExceeded;
-        var commands: [7]coordinator.Command = undefined;
+        if (extra.len > 6) return error.DatasetPageBudgetExceeded;
+        var commands: [9]coordinator.Command = undefined;
         commands[0] = .{ .kind = .put, .key = binding_key, .value = binding };
         commands[1] = .{ .kind = .put, .key = key, .value = raw };
         commands[2] = .{ .kind = .put, .key = coverage_key, .value = coverage };
@@ -1197,7 +1204,11 @@ pub const Catalog = struct {
         defer pending.deinit();
         const due = try uploadExpiryKey(self.context.alloc, id, pending.value.expires_ns);
         defer self.context.alloc.free(due);
-        try self.putSegmentWithLocation(session, value, location, &.{ .{ .kind = .delete, .key = key }, .{ .kind = .delete, .key = due } });
+        const local_key = try uploadLocationKey(self.context.alloc, location.id, id, null);
+        defer self.context.alloc.free(local_key);
+        const local_due = try uploadLocationKey(self.context.alloc, location.id, id, pending.value.expires_ns);
+        defer self.context.alloc.free(local_due);
+        try self.putSegmentWithLocation(session, value, location, &.{ .{ .kind = .delete, .key = key }, .{ .kind = .delete, .key = due }, .{ .kind = .delete, .key = local_key }, .{ .kind = .delete, .key = local_due } });
     }
 
     const Upload = struct { segment: t.Segment, location: t.Id, storage_identity: t.Id, expires_ns: u64, retiring: bool = false };
@@ -1208,6 +1219,47 @@ pub const Catalog = struct {
     fn uploadExpiryKey(a: A, id: t.Id, deadline: u64) ![]u8 {
         return std.fmt.allocPrint(a, "upload_expiry/{d:0>20}/{s}", .{ deadline, std.fmt.bytesToHex(id, .lower) });
     }
+    fn uploadLocationPrefix(a: A, location: t.Id, expiry: bool) ![]u8 {
+        return std.fmt.allocPrint(a, "{s}/{s}/", .{ if (expiry) "upload_expiry_by_location" else "uploads_by_location", std.fmt.bytesToHex(location, .lower) });
+    }
+    fn uploadLocationKey(a: A, location: t.Id, id: t.Id, expires: ?u64) ![]u8 {
+        if (expires) |deadline| return std.fmt.allocPrint(a, "upload_expiry_by_location/{s}/{d:0>20}/{s}", .{ std.fmt.bytesToHex(location, .lower), deadline, std.fmt.bytesToHex(id, .lower) });
+        return std.fmt.allocPrint(a, "uploads_by_location/{s}/{s}", .{ std.fmt.bytesToHex(location, .lower), std.fmt.bytesToHex(id, .lower) });
+    }
+    /// Upgrade pre-index journals without object I/O. New publishers maintain
+    /// both indexes atomically, so insertions behind this cursor are safe.
+    fn repairUploadIndex(self: Catalog, session: Header) !bool {
+        if (try self.get(session, u8, "upload_index_version")) |version| {
+            defer version.deinit();
+            if (version.value != 2) return error.InvalidDatasetBinding;
+            return false;
+        }
+        const position = try self.get(session, []const u8, "upload_index_cursor");
+        defer if (position) |value| value.deinit();
+        const page = try self.list(session, "uploads/", if (position) |value| value.value else "", 32);
+        defer page.deinit();
+        var arena = std.heap.ArenaAllocator.init(self.context.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var commands = std.ArrayList(coordinator.Command).empty;
+        for (page.value.results[0]) |item| {
+            const upload = try std.json.parseFromSliceLeaky(Upload, a, item.value, .{});
+            const id = upload.segment.location_object orelse return error.InvalidDatasetCoverage;
+            try commands.appendSlice(a, &.{
+                .{ .kind = .put, .key = try uploadLocationKey(a, upload.location, id, null), .value = item.key },
+                .{ .kind = .put, .key = try uploadLocationKey(a, upload.location, id, upload.expires_ns), .value = item.key },
+            });
+        }
+        if (page.value.results[0].len < 32) {
+            try commands.appendSlice(a, &.{ .{ .kind = .put, .key = "upload_index_version", .value = "2" }, .{ .kind = .delete, .key = "upload_index_cursor" } });
+        } else {
+            const last = page.value.results[0][31].key;
+            try commands.append(a, .{ .kind = .put, .key = "upload_index_cursor", .value = try std.json.Stringify.valueAlloc(a, last, .{}) });
+        }
+        try self.commit(session, commands.items);
+        return true;
+    }
+
     fn prepareUpload(self: Catalog, value: t.Segment, location: Location) !t.Segment {
         var next = value;
         var id: t.Id = undefined;
@@ -1220,6 +1272,10 @@ pub const Catalog = struct {
         defer self.context.alloc.free(key);
         const due = try uploadExpiryKey(self.context.alloc, id, expires);
         defer self.context.alloc.free(due);
+        const local_key = try uploadLocationKey(self.context.alloc, location.id, id, null);
+        defer self.context.alloc.free(local_key);
+        const local_due = try uploadLocationKey(self.context.alloc, location.id, id, expires);
+        defer self.context.alloc.free(local_due);
         const binding_key = try locationKey(self.context.alloc, location.id);
         defer self.context.alloc.free(binding_key);
         const binding = try std.json.Stringify.valueAlloc(self.context.alloc, .{ .storage_identity = location.storage_identity, .access = location.access }, .{});
@@ -1236,7 +1292,7 @@ pub const Catalog = struct {
                 existing.deinit();
                 return error.DatasetPlacementConflict;
             }
-            self.commit(session.value, &.{ .{ .kind = .put, .key = binding_key, .value = binding }, .{ .kind = .put, .key = key, .value = raw }, .{ .kind = .put, .key = due, .value = key } }) catch |err| switch (err) {
+            self.commit(session.value, &.{ .{ .kind = .put, .key = binding_key, .value = binding }, .{ .kind = .put, .key = key, .value = raw }, .{ .kind = .put, .key = due, .value = key }, .{ .kind = .put, .key = local_key, .value = key }, .{ .kind = .put, .key = local_due, .value = key } }) catch |err| switch (err) {
                 error.PreconditionFailed => {
                     try self.retryConflict(attempt);
                     continue;
@@ -1262,13 +1318,16 @@ pub const Catalog = struct {
     pub fn reclaimUpload(self: Catalog, location: Location) !bool {
         const session = try self.open(true);
         defer session.deinit();
+        if (try self.repairUploadIndex(session.value)) return true;
         const discarding = try self.get(session.value, Discard, "discard");
         defer if (discarding) |value| value.deinit();
-        const work = try self.list(session.value, if (discarding != null) "uploads/" else "upload_expiry/", "", 1);
+        const prefix = try uploadLocationPrefix(self.context.alloc, location.id, discarding == null);
+        defer self.context.alloc.free(prefix);
+        const work = try self.list(session.value, prefix, "", 1);
         defer work.deinit();
         if (work.value.results[0].len == 0) return false;
         const item = work.value.results[0][0];
-        const key = if (discarding != null) item.key else item.value;
+        const key = item.value;
         const parsed = (try self.get(session.value, Upload, key)) orelse return error.InvalidDatasetCoverage;
         defer parsed.deinit();
         var pending = parsed.value;
@@ -1291,7 +1350,11 @@ pub const Catalog = struct {
         defer current.deinit();
         const due = try uploadExpiryKey(self.context.alloc, id, pending.expires_ns);
         defer self.context.alloc.free(due);
-        try self.commit(current.value, &.{ .{ .kind = .delete, .key = key }, .{ .kind = .delete, .key = due } });
+        const local_key = try uploadLocationKey(self.context.alloc, location.id, id, null);
+        defer self.context.alloc.free(local_key);
+        const local_due = try uploadLocationKey(self.context.alloc, location.id, id, pending.expires_ns);
+        defer self.context.alloc.free(local_due);
+        try self.commit(current.value, &.{ .{ .kind = .delete, .key = key }, .{ .kind = .delete, .key = due }, .{ .kind = .delete, .key = local_key }, .{ .kind = .delete, .key = local_due } });
         return true;
     }
 
@@ -1386,4 +1449,49 @@ fn nextPlacementRevision(value: u64) !u64 {
 
 fn retirementKey(a: A, value: t.Segment) ![]u8 {
     return std.fmt.allocPrint(a, "retired/{d}/{s}/{d}", .{ value.definition_generation, std.fmt.bytesToHex(value.source.partition, .lower), value.source.incarnation });
+}
+
+test "retained dataset legacy upload inventory upgrades in bounded metadata-only steps" {
+    const a = std.testing.allocator;
+    var memory = objects.memory.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("meta");
+    try client.makeBucket("hot");
+    const id: t.Id = @splat(1);
+    const namespace = std.fmt.bytesToHex(id, .lower);
+    const store: Catalog = .{ .context = .{ .alloc = a, .client = memory.client(), .bucket = "meta", .prefix = "catalog", .namespace = &namespace, .io = std.testing.io }, .dataset = id, .owner = @splat(1) };
+    var schema: t.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash("{}", &schema, .{});
+    const definition_value: t.Definition = .{ .id = id, .generation = 1, .kind = .records, .schema = schema, .schema_json = "{}", .authorization = @splat(2), .retention_ns = std.time.ns_per_day, .local_residence_ns = 0 };
+    try store.create(definition_value);
+    const hot: Location = .{ .id = @splat(6), .storage_identity = @splat(16), .client = memory.client(), .bucket = "hot", .prefix = "segments", .access = .local };
+    var checksum: t.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash("states", &checksum, .{});
+    const segment_value: t.Segment = .{ .id = @splat(4), .dataset = id, .definition_generation = 1, .schema = schema, .state_encoding = 1, .coverage = .{ .start_ns = "0", .end_ns = "60" }, .source = .{ .partition = @splat(5), .incarnation = 1, .sequence = 1 }, .finalized = true, .checksum = checksum, .byte_len = 6, .location = hot.id };
+    var fault = objects.scripted_fault.Client.init(a, memory.client());
+    defer fault.deinit();
+    var failed = hot;
+    failed.client = fault.client();
+    fault.commitNextPutThenFail(error.DatasetCopyFault);
+    try std.testing.expectError(error.DatasetCopyFault, store.publish(segment_value, failed, "states"));
+    // Simulate a pre-index journal while preserving its durable upload fence.
+    const session = try store.open(true);
+    defer session.deinit();
+    const uploads = try store.list(session.value, "uploads/", "", 1);
+    defer uploads.deinit();
+    var pending = try std.json.parseFromSlice(Catalog.Upload, a, uploads.value.results[0][0].value, .{});
+    defer pending.deinit();
+    const attempt = pending.value.segment.location_object.?;
+    const local_key = try Catalog.uploadLocationKey(a, hot.id, attempt, null);
+    defer a.free(local_key);
+    const local_due = try Catalog.uploadLocationKey(a, hot.id, attempt, pending.value.expires_ns);
+    defer a.free(local_due);
+    try store.commit(session.value, &.{ .{ .kind = .delete, .key = "upload_index_version" }, .{ .kind = .delete, .key = local_key }, .{ .kind = .delete, .key = local_due } });
+    try store.beginDiscard(definition_value);
+    try std.testing.expect(try store.reclaimUpload(hot)); // rebuild only
+    try std.testing.expectError(error.DatasetDependencyPending, store.nextDiscard(null));
+    try std.testing.expect(try store.reclaimUpload(hot)); // payload fence
+    try std.testing.expect(!try store.reclaimUpload(hot));
+    try std.testing.expectEqual(@as(?t.Id, null), try store.nextDiscard(null));
 }

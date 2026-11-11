@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+pub const BoundedAllocator = @import("bounded_allocator.zig").BoundedAllocator;
 pub const reclamation = @import("allocator_reclamation.zig");
 
 /// Checked backing for measured allocation-heavy test fixtures. Keep safety,

@@ -235,7 +235,7 @@ pub fn open(server: anytype, alloc: A, sessions: *registry.Registry, secret: []c
     var binding = std.crypto.hash.sha2.Sha256.init(.{});
     binding.update(&principal);
     binding.update(payload);
-    var position: registry.Position = .{ .id = undefined, .sequence = 0, .binding = binding.finalResult() };
+    var position: registry.Position = .{ .owner_node_id = server.localSessionNodeId(), .id = undefined, .sequence = 0, .binding = binding.finalResult() };
     const io = server.sharedApiIo() orelse return error.BackendRuntimeUnavailable;
     io.random(&position.id);
     const cursor = registry.token(secret, position);

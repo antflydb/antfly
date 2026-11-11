@@ -921,3 +921,24 @@ test "retained series diagnostics never advance retention or source authority" {
     try e.recordDiagnostic(&store, null, 110);
     try std.testing.expectEqual(@as(?[]const u8, null), (try e.status(arena.allocator(), &store)).last_error);
 }
+
+test "retained series exact query reduction allocates once across partition cancellation" {
+    const big = try (try series.ExactSum.input(0x1p1023)).encode(a);
+    defer a.free(big);
+    const tiny = try (try series.ExactSum.input(0x1p-1074)).encode(a);
+    defer a.free(tiny);
+    const negative = try (try series.ExactSum.input(-0x1p1023)).encode(a);
+    defer a.free(negative);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    var reducer = try series.MetricReducer.init(failing.allocator(), .{});
+    defer reducer.deinit(failing.allocator());
+    for (0..256) |_| {
+        try reducer.add(failing.allocator(), .{ .count = 1, .exact_sum = big });
+        try reducer.add(failing.allocator(), .{ .count = 1, .exact_sum = tiny });
+        try reducer.add(failing.allocator(), .{ .count = 1, .exact_sum = negative });
+    }
+    const metric = try reducer.finish(a);
+    defer a.free(metric.exact_sum.?);
+    try std.testing.expectEqual(@as(i64, 768), metric.count);
+    try std.testing.expectEqual(@as(f64, 0x1p-1066), (try metric.finalize(.sum)).number);
+}

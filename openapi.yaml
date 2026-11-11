@@ -9385,6 +9385,12 @@ paths:
           description: Replay or serving state was lost. Open a fresh snapshot.
         '413':
           description: Subscription exceeds its result or state budget.
+        '422':
+          description: A retained aggregate is outside its supported numeric range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetainedDatasetReadError'
         '503':
           description: Subscription owner is temporarily unavailable.
       security:
@@ -9416,8 +9422,10 @@ paths:
       tags:
         - query_operations
       operationId: pollRetainedSubscription
-      description: Poll with the last cursor. Repeating a poll after a lost response returns the last
-        committed frame. Use a new snapshot when replay is unavailable or the serving session expires.
+      description: Poll with the last cursor through any cluster API node; its authenticated issuer routes
+        to the serving session. Repeating a poll after a lost response returns the last committed frame.
+        Replay gaps can coalesce through a fresh snapshot; reset is required when the serving session
+        is lost.
       requestBody:
         required: true
         content:
@@ -9430,7 +9438,7 @@ paths:
               properties:
                 cursor:
                   type: string
-                  maxLength: 128
+                  maxLength: 160
       responses:
         '200':
           description: Snapshot or committed delta frame and its next cursor.
@@ -9446,6 +9454,12 @@ paths:
           description: Replay or serving state was lost. Open a fresh snapshot.
         '413':
           description: Subscription exceeds its result or state budget.
+        '422':
+          description: A retained aggregate is outside its supported numeric range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetainedDatasetReadError'
         '503':
           description: Subscription owner is temporarily unavailable.
       security:
@@ -9490,7 +9504,7 @@ paths:
               properties:
                 cursor:
                   type: string
-                  maxLength: 128
+                  maxLength: 160
       responses:
         '204':
           description: Subscription canceled.
@@ -9649,6 +9663,12 @@ paths:
           description: Requested history has expired.
         '413':
           description: Request or result exceeds the range budget.
+        '422':
+          description: A retained aggregate is outside its supported numeric range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetainedDatasetReadError'
         '503':
           description: Dataset authority is temporarily unavailable.
       security:
@@ -24975,6 +24995,24 @@ components:
         type: string
         example: role:tenant_reader
   schemas:
+    RetainedDatasetReadError:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable domain failure
+          example: retained_series_numeric_overflow
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - false
     RetainedSubscriptionFrame:
       type: object
       required:
@@ -24989,7 +25027,7 @@ components:
             - changes
         cursor:
           type: string
-          maxLength: 128
+          maxLength: 160
         resynchronized:
           type: boolean
           description: True when the server caught up through a fresh bounded snapshot instead of replaying

@@ -2927,20 +2927,42 @@ pub const AntflyApiHandler = struct {
             .open => subscription.open(server, a, &server.retained_subscriptions, &secret, principal, target, std.json.parseFromSliceLeaky(subscription.Create, a, body, .{}) catch return textResponse(ctx, 400, "invalid subscription range"), context),
             .poll, .cancel => response: {
                 const request = std.json.parseFromSliceLeaky(subscription.Poll, a, body, .{}) catch return textResponse(ctx, 400, "invalid subscription cursor");
-                if (action == .poll) break :response subscription.poll(server, a, &server.retained_subscriptions, &secret, principal, target, request, context);
                 const position = registry.verify(&secret, request.cursor) catch return textResponse(ctx, 400, "invalid subscription cursor");
+                var headers: std.ArrayList(http_common.RequestHeader) = .empty;
+                defer headers.deinit(a);
+                for ([_][]const u8{ http_server_mod.trusted_principal_header, "X-Antfly-Subscription-Hop", @import("antfly_public_limits").Execution.timeout_header }) |header| {
+                    if (ctx.header(header)) |value| try headers.append(a, .{ .name = header, .value = value });
+                }
+                var cancellation = requestCancellation(ctx);
+                const timeout_ms: u32 = @intCast(@max(1, @min(30_000, (context.deadline_ns.? -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms)));
+                var forwarded = server.forwardRetainedSubscription(position.owner_node_id, .{ .method = .POST, .uri = ctx.request.uri.raw, .headers = headers.items, .authorization = ctx.header("authorization"), .content_type = ctx.header("content-type"), .body = body, .timeout_ms = timeout_ms, .cancellation = &cancellation, .max_response_bytes = registry.max_reply_bytes }) catch |err| break :response @as(anyerror![]u8, err);
+                if (forwarded) |*response| {
+                    const allowed = http_server_mod.resourcePermissionCurrentlyAllowed(identity, .dataset, logical, .read) catch |err| {
+                        response.deinit(server.alloc);
+                        return err;
+                    };
+                    if (!allowed) {
+                        response.deinit(server.alloc);
+                        return textResponse(ctx, 403, "forbidden");
+                    }
+                    return try respondOwnedContextualResponse(ctx, response, server.alloc);
+                }
+                if (action == .poll) break :response subscription.poll(server, a, &server.retained_subscriptions, &secret, principal, target, request, context);
                 server.retained_subscriptions.cancel(server.alloc, position, principal) catch return textResponse(ctx, 403, "forbidden");
                 return ctx.status(204).text("");
             },
         };
-        const bytes = result catch |err| return switch (err) {
-            error.RetainedSeriesResetRequired, error.RetainedOwnerPlanChanged => ctx.status(409).json(.{ .code = "reset_required", .reset_required = true }),
-            error.InvalidRetainedSubscriptionToken, error.InvalidDatasetCoverage, error.RetainedSeriesResolutionMismatch => textResponse(ctx, 400, @errorName(err)),
-            error.DatasetPageBudgetExceeded, error.DatasetReaderBudgetExceeded => textResponse(ctx, 413, @errorName(err)),
-            error.RetainedSeriesHistoryExpired => textResponse(ctx, 410, @errorName(err)),
-            error.Forbidden => textResponse(ctx, 403, "forbidden"),
-            error.CatalogNotFound => textResponse(ctx, 404, "dataset not found"),
-            else => textResponse(ctx, 503, "subscription replay unavailable"),
+        const bytes = result catch |err| {
+            if (@import("retained_series_errors.zig").readFailure(err)) |failure| return ctx.status(failure.status).json(.{ .code = failure.code, .message = failure.message, .retryable = failure.retryable });
+            return switch (err) {
+                error.RetainedSeriesResetRequired, error.RetainedOwnerPlanChanged => ctx.status(409).json(.{ .code = "reset_required", .reset_required = true }),
+                error.InvalidRetainedSubscriptionToken, error.InvalidDatasetCoverage, error.RetainedSeriesResolutionMismatch => textResponse(ctx, 400, @errorName(err)),
+                error.DatasetPageBudgetExceeded, error.DatasetReaderBudgetExceeded => textResponse(ctx, 413, @errorName(err)),
+                error.RetainedSeriesHistoryExpired => textResponse(ctx, 410, @errorName(err)),
+                error.Forbidden => textResponse(ctx, 403, "forbidden"),
+                error.CatalogNotFound => textResponse(ctx, 404, "dataset not found"),
+                else => textResponse(ctx, 503, "subscription replay unavailable"),
+            };
         };
         defer a.free(bytes);
         if (!try http_server_mod.resourcePermissionCurrentlyAllowed(identity, .dataset, logical, .read)) return textResponse(ctx, 403, "forbidden");
@@ -3059,13 +3081,16 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "dataset range required");
         if (body.len > 32768) return textResponse(ctx, 413, "dataset request too large");
         const request = std.json.parseFromSliceLeaky(@import("retained_dataset_read.zig").QueryRequest, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid dataset range");
-        const result = @import("retained_dataset_read.zig").queryJson(self.api_server, ctx.allocator, .{ .database = route.database, .namespace = route.namespace, .table = name }, request, operationContext(ctx, identity)) catch |err| return switch (err) {
-            error.DatasetPageBudgetExceeded => textResponse(ctx, 413, @errorName(err)),
-            error.RetainedSeriesHistoryExpired => textResponse(ctx, 410, @errorName(err)),
-            error.RetainedSeriesResolutionMismatch, error.InvalidDatasetCoverage => textResponse(ctx, 400, @errorName(err)),
-            error.RetainedSeriesCoverageMissing, error.RetainedOwnerPlanChanged => textResponse(ctx, 409, @errorName(err)),
-            error.CatalogNotFound, error.NamespaceNotFound, error.DatabaseNotFound => textResponse(ctx, 404, @errorName(err)),
-            else => textResponse(ctx, 503, "dataset range unavailable"),
+        const result = @import("retained_dataset_read.zig").queryJson(self.api_server, ctx.allocator, .{ .database = route.database, .namespace = route.namespace, .table = name }, request, operationContext(ctx, identity)) catch |err| {
+            if (@import("retained_series_errors.zig").readFailure(err)) |failure| return ctx.status(failure.status).json(.{ .code = failure.code, .message = failure.message, .retryable = failure.retryable });
+            return switch (err) {
+                error.DatasetPageBudgetExceeded => textResponse(ctx, 413, @errorName(err)),
+                error.RetainedSeriesHistoryExpired => textResponse(ctx, 410, @errorName(err)),
+                error.RetainedSeriesResolutionMismatch, error.InvalidDatasetCoverage => textResponse(ctx, 400, @errorName(err)),
+                error.RetainedSeriesCoverageMissing, error.RetainedOwnerPlanChanged => textResponse(ctx, 409, @errorName(err)),
+                error.CatalogNotFound, error.NamespaceNotFound, error.DatabaseNotFound => textResponse(ctx, 404, @errorName(err)),
+                else => textResponse(ctx, 503, "dataset range unavailable"),
+            };
         };
         defer ctx.allocator.free(result);
         if (!try http_server_mod.resourcePermissionCurrentlyAllowed(identity, .dataset, logical, .read)) return textResponse(ctx, 403, "forbidden");

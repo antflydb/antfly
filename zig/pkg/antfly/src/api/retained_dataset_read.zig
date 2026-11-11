@@ -25,6 +25,7 @@ const topology = @import("../metadata/topology_protocol.zig");
 const operation = local.api_operation;
 const callback_abi = local.runtime_callback_abi;
 const A = std.mem.Allocator;
+const MemoryBudget = @import("antfly_platform").allocator.BoundedAllocator;
 
 pub const QueryRequest = struct {
     start_ns: []const u8,
@@ -167,13 +168,21 @@ pub const max_result_bytes = 32 * 1024 * 1024;
 pub const max_input_rows = 128 * 1024;
 
 pub const Result = struct {
+    budget: ?*MemoryBudget = null,
     arena: std.heap.ArenaAllocator,
     rows: []const series.Bucket,
     history: dataset.InitialHistory,
     captures: []const Capture = &.{},
     next: ?dataset.RowKey = null,
+    fn allocationFailure(self: Result, err: anyerror) anyerror {
+        return if (err == error.OutOfMemory and self.budget != null and self.budget.?.denied) error.DatasetPageBudgetExceeded else err;
+    }
     pub fn deinit(self: *Result) void {
         self.arena.deinit();
+        if (self.budget) |budget| {
+            std.debug.assert(budget.live == 0);
+            budget.backing.destroy(budget);
+        }
         self.* = undefined;
     }
 };
@@ -182,6 +191,20 @@ pub const Result = struct {
 /// A read failure aborts the complete query. The selected archive authority
 /// cannot fall back to an older native copy after metadata has handed it off.
 pub fn read(a: A, snapshot: Snapshot, input: Request, context: operation.RequestContext, reader: anytype) !Result {
+    return readLimited(a, snapshot, input, context, reader, max_result_bytes);
+}
+fn readLimited(a: A, snapshot: Snapshot, input: Request, context: operation.RequestContext, reader: anytype, memory_limit: usize) !Result {
+    const budget = try a.create(MemoryBudget);
+    errdefer a.destroy(budget);
+    budget.* = .{ .backing = a, .limit = memory_limit, .total_limit = memory_limit };
+    var result = readBudgeted(budget.allocator(), snapshot, input, context, reader) catch |err| {
+        std.debug.assert(budget.live == 0);
+        return if (err == error.OutOfMemory and budget.denied) error.DatasetPageBudgetExceeded else err;
+    };
+    result.budget = budget;
+    return result;
+}
+fn readBudgeted(a: A, snapshot: Snapshot, input: Request, context: operation.RequestContext, reader: anytype) !Result {
     const range: dataset.Range = .{ .start_ns = input.start_ns, .end_ns = input.end_ns };
     try range.validate();
     if (input.max_rows == 0 or input.max_rows > max_input_rows) return error.DatasetPageBudgetExceeded;
@@ -213,6 +236,7 @@ pub fn read(a: A, snapshot: Snapshot, input: Request, context: operation.Request
     defer positions.deinit(a);
     var rows: std.ArrayList(series.Bucket) = .empty;
     var row_bytes: usize = 0;
+    var reducers = std.ArrayList([]series.MetricReducer).empty;
     var visited_rows: usize = 0;
     var more = false;
     var safe_through: ?dataset.RowKey = null;
@@ -252,16 +276,27 @@ pub fn read(a: A, snapshot: Snapshot, input: Request, context: operation.Request
                 const merged = &rows.items[index];
                 if (!std.mem.eql(u8, merged.dimensions, row.dimensions)) return error.RetainedSeriesCorrupt;
                 merged.rows = std.math.add(i64, merged.rows, row.rows) catch return error.RetainedSeriesNumericOverflow;
-                for (merged.metrics, row.metrics) |*target, metric| target.* = try target.merge(scratch, metric);
+                for (reducers.items[index], row.metrics) |*target, metric| try target.add(scratch, metric);
             } else {
                 if (rows.items.len >= (if (input.page) @as(usize, max_input_rows) else input.max_rows)) return error.DatasetPageBudgetExceeded;
                 const cost = @sizeOf(series.Bucket) + row.dimensions.len + series.metricBytes(row.metrics);
                 if (cost > max_result_bytes - row_bytes) return error.DatasetPageBudgetExceeded;
                 row_bytes += cost;
                 try positions.put(a, key, rows.items.len);
-                try rows.append(scratch, .{ .start_ns = row.start_ns, .dimensions = try scratch.dupe(u8, row.dimensions), .rows = row.rows, .metrics = try series.ownMetrics(scratch, row.metrics) });
+                const metrics = try scratch.alloc(series.MetricReducer, row.metrics.len);
+                for (metrics, row.metrics) |*target, metric| target.* = try series.MetricReducer.init(scratch, metric);
+                try reducers.append(scratch, metrics);
+                try rows.append(scratch, .{ .start_ns = row.start_ns, .dimensions = try scratch.dupe(u8, row.dimensions), .rows = row.rows, .metrics = &.{} });
             }
         }
+    }
+    row_bytes = 0;
+    for (rows.items, reducers.items) |*row, metrics| {
+        row.metrics = try scratch.alloc(series.Metric, metrics.len);
+        for (row.metrics, metrics) |*target, metric| target.* = try metric.finish(scratch);
+        const cost = @sizeOf(series.Bucket) + row.dimensions.len + series.metricBytes(row.metrics);
+        if (cost > max_result_bytes - row_bytes) return error.DatasetPageBudgetExceeded;
+        row_bytes += cost;
     }
     std.mem.sort(series.Bucket, rows.items, {}, struct {
         fn before(_: void, left: series.Bucket, right: series.Bucket) bool {
@@ -359,8 +394,8 @@ pub fn readResolved(server: anytype, a: A, snapshot: Snapshot, definition: datas
     var result = try read(a, snapshot, input, context, Reader{ .server = server, .snapshot = snapshot, .definition = definition, .archive = if (archive) |*opened| opened else null, .limit = if (input.page) @intCast(@min(input.max_rows + 1, @max(@as(usize, 1), max_input_rows / @max(@as(usize, 1), snapshot.owners.len)))) else input.max_rows, .input = input, .captures = &captures, .capture_alloc = scratch });
     errdefer result.deinit();
     const owned = result.arena.allocator();
-    const output = try owned.dupe(Capture, captures.items);
-    for (output) |*capture| capture.table = try owned.dupe(u8, capture.table);
+    const output = owned.dupe(Capture, captures.items) catch |err| return result.allocationFailure(err);
+    for (output) |*capture| capture.table = owned.dupe(u8, capture.table) catch |err| return result.allocationFailure(err);
     result.captures = output;
     return result;
 }
@@ -472,6 +507,11 @@ test "retained owner native controls merge archived and native average states wi
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqual(@as(?f64, 3.25), result.rows[0].metrics[0].value(.avg));
+    try std.testing.expect(result.budget.?.peak <= max_result_bytes);
+    var bounded_reader: Reader = .{};
+    try std.testing.expectError(error.DatasetPageBudgetExceeded, readLimited(a, snapshot, range, .{}, &bounded_reader, 128));
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, read(failing.allocator(), snapshot, range, .{}, &bounded_reader));
     reader.archive_available = false;
     try std.testing.expectError(error.DatasetLocationUnavailable, read(a, snapshot, range, .{}, &reader));
     try std.testing.expectEqual(@as(usize, 2), reader.native_calls);
@@ -568,4 +608,40 @@ test "retained owner native controls read certification ignores clock changes wi
     progress.admitted_ns = 1000;
     progress.source_sequence += 1;
     try std.testing.expect(!std.meta.eql(first, try Observation.from(7, progress, spec)));
+}
+
+test "retained owner native controls exact fanin stays inside one working allocation ceiling" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const lineage = try local.system_catalog_retained_datasets.Source.fromTable(temp, .{ .table_id = 7, .name = "raw", .schema_json = "" }, "11111111111111111111111111111111".*);
+    var schema: dataset.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash("{}", &schema, .{});
+    const definition: dataset.Definition = .{ .id = @splat(1), .generation = 1, .kind = .summary, .schema = schema, .schema_json = "{}", .authorization = @splat(2), .retention_ns = 1000, .local_residence_ns = 100, .summary = .{ .source = lineage.identity(), .timestamp = "ts", .interval_ns = 10, .mutable_for_ns = 100, .measures = &.{.{ .name = "sum_v", .law = .sum, .field = "v" }} } };
+    const descriptor: local.system_catalog_retained_datasets.Descriptor = .{ .definition = definition, .source = lineage, .phase = .active, .catalog_location = @splat(3), .catalog_storage_identity = @splat(4) };
+    const json = try std.json.Stringify.valueAlloc(temp, descriptor, .{});
+    var membership: topology.RangeMembershipAccumulator = .{};
+    for (1..97) |group| try membership.add(group);
+    var plan: owner_model.Plan = .{ .id = @splat(0), .resource = 8, .dataset = definition.id, .generation = 1, .definition = try definition.fingerprint(temp), .source = lineage.identity(), .source_table = 7, .topology_generation = 1, .membership = membership.finish(7).digest, .phase = .active, .registration_after = 96, .registration_complete = true, .registered = 96, .registration_membership = membership, .ready = 96 };
+    plan.id = plan.identity();
+    const owners = try temp.alloc(owner_model.Owner, 96);
+    for (owners, 1..) |*owner, group| owner.* = .{ .plan = plan.id, .group = group, .partition = @splat(5), .incarnation = 1, .mode = .ready, .native_receipt = @splat(6) };
+    const snapshot: Snapshot = .{ .resource = .{ .id = 8, .kind = .dataset, .name = "stats", .source_json = json, .retained = descriptor.identity() }, .plan = plan, .owners = owners };
+    const Reader = struct {
+        rows: [3]series.Bucket,
+        pub fn readPartition(self: *@This(), alloc: A, owner: owner_model.Owner, _: Authority, _: dataset.Range, _: operation.RequestContext) !@import("../serverless/datasets/summary_read.zig").Result {
+            const index = (owner.group - 1) % 3;
+            return .{ .arena = std.heap.ArenaAllocator.init(alloc), .rows = self.rows[index..][0..1] };
+        }
+    };
+    const metrics = try temp.alloc(series.Metric, 3);
+    for (metrics, [_]f64{ 0x1p1023, 0x1p-1074, -0x1p1023 }) |*metric, value| metric.* = .{ .count = 1, .exact_sum = try (try series.ExactSum.input(value)).encode(temp) };
+    var reader: Reader = .{ .rows = undefined };
+    for (&reader.rows, 0..) |*row, index| row.* = .{ .start_ns = 0, .dimensions = "[]", .rows = 1, .metrics = metrics[index..][0..1] };
+    var result = try readLimited(a, snapshot, .{ .start_ns = "0", .end_ns = "10" }, .{}, &reader, 64 * 1024);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(@as(f64, 0x1p-1069), (try result.rows[0].metrics[0].finalize(.sum)).number);
+    try std.testing.expect(result.budget.?.total <= 64 * 1024);
 }

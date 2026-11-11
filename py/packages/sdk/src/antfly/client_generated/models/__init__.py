@@ -2418,6 +2418,7 @@ from .retained_dataset_owner_progress import RetainedDatasetOwnerProgress
 from .retained_dataset_owner_progress_mode import RetainedDatasetOwnerProgressMode
 from .retained_dataset_progress import RetainedDatasetProgress
 from .retained_dataset_progress_phase import RetainedDatasetProgressPhase
+from .retained_dataset_read_error import RetainedDatasetReadError
 from .retained_subscription_frame import RetainedSubscriptionFrame
 from .retained_subscription_frame_events_item import RetainedSubscriptionFrameEventsItem
 from .retained_subscription_frame_events_item_type import RetainedSubscriptionFrameEventsItemType
@@ -4918,6 +4919,7 @@ __all__ = (
     "RetainedDatasetOwnerProgressMode",
     "RetainedDatasetProgress",
     "RetainedDatasetProgressPhase",
+    "RetainedDatasetReadError",
     "RetainedSubscriptionFrame",
     "RetainedSubscriptionFrameEventsItem",
     "RetainedSubscriptionFrameEventsItemType",

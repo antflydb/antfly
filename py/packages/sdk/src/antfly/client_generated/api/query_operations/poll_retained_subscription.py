@@ -7,6 +7,7 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.poll_retained_subscription_body import PollRetainedSubscriptionBody
+from ...models.retained_dataset_read_error import RetainedDatasetReadError
 from ...models.retained_subscription_frame import RetainedSubscriptionFrame
 from ...types import Response
 
@@ -39,7 +40,7 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | RetainedSubscriptionFrame | None:
+) -> Any | RetainedDatasetReadError | RetainedSubscriptionFrame | None:
     if response.status_code == 200:
         response_200 = RetainedSubscriptionFrame.from_dict(response.json())
 
@@ -61,6 +62,11 @@ def _parse_response(
         response_413 = cast(Any, None)
         return response_413
 
+    if response.status_code == 422:
+        response_422 = RetainedDatasetReadError.from_dict(response.json())
+
+        return response_422
+
     if response.status_code == 503:
         response_503 = cast(Any, None)
         return response_503
@@ -73,7 +79,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | RetainedSubscriptionFrame]:
+) -> Response[Any | RetainedDatasetReadError | RetainedSubscriptionFrame]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -89,11 +95,12 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: PollRetainedSubscriptionBody,
-) -> Response[Any | RetainedSubscriptionFrame]:
+) -> Response[Any | RetainedDatasetReadError | RetainedSubscriptionFrame]:
     """Replay retained summary changes
 
-     Poll with the last cursor. Repeating a poll after a lost response returns the last committed frame.
-    Use a new snapshot when replay is unavailable or the serving session expires.
+     Poll with the last cursor through any cluster API node; its authenticated issuer routes to the
+    serving session. Repeating a poll after a lost response returns the last committed frame. Replay
+    gaps can coalesce through a fresh snapshot; reset is required when the serving session is lost.
 
     Args:
         database_name (str):
@@ -106,7 +113,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | RetainedSubscriptionFrame]
+        Response[Any | RetainedDatasetReadError | RetainedSubscriptionFrame]
     """
 
     kwargs = _get_kwargs(
@@ -130,11 +137,12 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: PollRetainedSubscriptionBody,
-) -> Any | RetainedSubscriptionFrame | None:
+) -> Any | RetainedDatasetReadError | RetainedSubscriptionFrame | None:
     """Replay retained summary changes
 
-     Poll with the last cursor. Repeating a poll after a lost response returns the last committed frame.
-    Use a new snapshot when replay is unavailable or the serving session expires.
+     Poll with the last cursor through any cluster API node; its authenticated issuer routes to the
+    serving session. Repeating a poll after a lost response returns the last committed frame. Replay
+    gaps can coalesce through a fresh snapshot; reset is required when the serving session is lost.
 
     Args:
         database_name (str):
@@ -147,7 +155,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | RetainedSubscriptionFrame
+        Any | RetainedDatasetReadError | RetainedSubscriptionFrame
     """
 
     return sync_detailed(
@@ -166,11 +174,12 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: PollRetainedSubscriptionBody,
-) -> Response[Any | RetainedSubscriptionFrame]:
+) -> Response[Any | RetainedDatasetReadError | RetainedSubscriptionFrame]:
     """Replay retained summary changes
 
-     Poll with the last cursor. Repeating a poll after a lost response returns the last committed frame.
-    Use a new snapshot when replay is unavailable or the serving session expires.
+     Poll with the last cursor through any cluster API node; its authenticated issuer routes to the
+    serving session. Repeating a poll after a lost response returns the last committed frame. Replay
+    gaps can coalesce through a fresh snapshot; reset is required when the serving session is lost.
 
     Args:
         database_name (str):
@@ -183,7 +192,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | RetainedSubscriptionFrame]
+        Response[Any | RetainedDatasetReadError | RetainedSubscriptionFrame]
     """
 
     kwargs = _get_kwargs(
@@ -205,11 +214,12 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: PollRetainedSubscriptionBody,
-) -> Any | RetainedSubscriptionFrame | None:
+) -> Any | RetainedDatasetReadError | RetainedSubscriptionFrame | None:
     """Replay retained summary changes
 
-     Poll with the last cursor. Repeating a poll after a lost response returns the last committed frame.
-    Use a new snapshot when replay is unavailable or the serving session expires.
+     Poll with the last cursor through any cluster API node; its authenticated issuer routes to the
+    serving session. Repeating a poll after a lost response returns the last committed frame. Replay
+    gaps can coalesce through a fresh snapshot; reset is required when the serving session is lost.
 
     Args:
         database_name (str):
@@ -222,7 +232,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | RetainedSubscriptionFrame
+        Any | RetainedDatasetReadError | RetainedSubscriptionFrame
     """
 
     return (

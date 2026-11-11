@@ -480,6 +480,51 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             atomic_path + "/subscriptions/cancel",
             {"cursor": caught_up["cursor"]},
         )
+        # Exact finite contributions may overflow only when projected to SUM.
+        # Serving must expose the same permanent numeric error across surfaces.
+        sql(
+            f"INSERT INTO atomic_probe (id, recorded_at) VALUES (1.7976931348623157e308, '{timestamp}'), (1.7976931348623157e308, '{timestamp}')"
+        )
+        overflow_path = "/databases/default/namespaces/public/datasets/overflow_sum"
+        api(
+            "POST",
+            overflow_path,
+            {
+                "source": {"table": "atomic_probe"},
+                "timestamp": "recorded_at",
+                "interval_ns": str(interval),
+                "mutable_for_ns": str(mutable_for),
+                "retention_ns": str(retention),
+                "measures": [{"name": "sum_id", "law": "sum", "field": "id"}],
+            },
+        )
+        overflow = wait_for(
+            lambda: api("GET", overflow_path),
+            lambda row: row["phase"] == "active",
+            process=server,
+        )
+        overflow_query = {
+            "start_ns": str(first_bucket),
+            "end_ns": str(first_bucket + interval),
+        }
+        for suffix in ("/query", "/subscriptions"):
+            with pytest.raises(OSError, match="422.*retained_series_numeric_overflow"):
+                api("POST", overflow_path + suffix, overflow_query)
+        with pytest.raises(OSError, match="400.*22003"):
+            sql(
+                f"SELECT sum_id FROM retained_summary(public.overflow_sum, '{first_bucket}', '{first_bucket + interval}')"
+            )
+        api(
+            "POST",
+            overflow_path + "/close",
+            {"expected_revision": overflow["revision"], "discard": True},
+        )
+        wait_for(
+            lambda: api("GET", overflow_path),
+            lambda row: row["source_released"],
+            45,
+            server,
+        )
         atomic = api("GET", atomic_path)
         api(
             "POST",

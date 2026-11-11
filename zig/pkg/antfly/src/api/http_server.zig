@@ -13988,6 +13988,30 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    /// A verified subscription cursor binds its issuer. Keep the bounded
+    /// registry on that node while allowing ordinary load-balanced ingress.
+    pub fn forwardRetainedSubscription(self: *ApiHttpServer, owner: u64, request: http_common.HttpRequest) !?contextual_operations.OwnedResponse {
+        if (owner == 0 or owner == self.localSessionNodeId()) return null;
+        const router = self.cfg.session_router orelse return error.RetainedSeriesResetRequired;
+        const base = (try router.nodeBaseUri(self.alloc, owner)) orelse return error.RetainedSeriesResetRequired;
+        defer self.alloc.free(base);
+        for (request.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Subscription-Hop")) return error.RetainedSeriesResetRequired;
+        const executor = self.cfg.session_executor orelse return error.HttpExecutorUnavailable;
+        var headers: std.ArrayList(http_common.RequestHeader) = .empty;
+        defer headers.deinit(self.alloc);
+        try headers.appendSlice(self.alloc, request.headers);
+        try headers.append(self.alloc, .{ .name = "X-Antfly-Subscription-Hop", .value = "forwarded" });
+        const uri = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{ base, request.uri });
+        defer self.alloc.free(uri);
+        var outgoing = request;
+        outgoing.uri = uri;
+        outgoing.headers = headers.items;
+        outgoing.timeout_ms = @min(request.timeout_ms orelse 30_000, 30_000);
+        var response = try executor.execute(self.alloc, outgoing);
+        defer response.deinit(self.alloc);
+        return try self.cloneForwardedResponse(response);
+    }
+
     pub fn forwardSQLResourceOperation(self: *ApiHttpServer, id: []const u8, kind: @import("sql_resource_routing.zig").Kind, request: http_common.HttpRequest, forwarded: *bool) !?contextual_operations.OwnedResponse {
         const routing = @import("sql_resource_routing.zig");
         const owner = try routing.owner(id);
@@ -62981,4 +63005,82 @@ test "system catalog graph physical endpoints recheck logical grants and binding
     try std.testing.expectEqual(@as(usize, 1), fake.forward_reads);
     fake.revision += 1;
     try std.testing.expectError(error.CatalogGenerationChanged, ApiHttpServer.CatalogGraphReadContext.authorize(&context, a, "table:another"));
+}
+
+test "retained owner native controls subscription issuer routes poll retry and cancel between nodes" {
+    const a = std.testing.allocator;
+    const subscriptions = @import("retained_subscription_registry.zig");
+    const Fixture = struct {
+        sessions: *subscriptions.Registry = undefined,
+        secret: [32]u8 = undefined,
+        calls: usize = 0,
+        initial: subscriptions.Position,
+        principal: subscriptions.Digest = @splat(3),
+        fn local(_: *anyopaque) u64 {
+            return 2;
+        }
+        fn issuer(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn uri(_: *anyopaque, alloc: std.mem.Allocator, node: u64) !?[]u8 {
+            return if (node == 1) try alloc.dupe(u8, "http://issuer") else null;
+        }
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const principal = if (std.mem.eql(u8, request.authorization orelse "", "Basic reader")) self.principal else @as(subscriptions.Digest, @splat(9));
+            try std.testing.expectEqualStrings("forwarded", request.header("X-Antfly-Subscription-Hop").?);
+            try std.testing.expectEqual(@as(?u32, 1500), request.timeout_ms);
+            try std.testing.expect(std.mem.startsWith(u8, request.uri, "http://issuer/"));
+            const input = try std.json.parseFromSlice(struct { cursor: []const u8 }, alloc, request.body, .{});
+            defer input.deinit();
+            const position = try subscriptions.verify(&self.secret, input.value.cursor);
+            try std.testing.expectEqual(@as(u64, 1), position.owner_node_id);
+            if (std.mem.endsWith(u8, request.uri, "/cancel")) {
+                try self.sessions.cancel(alloc, position, principal);
+                return .{ .status = 204 };
+            }
+            const loaded = try self.sessions.load(alloc, alloc, position, principal, 2);
+            switch (loaded) {
+                .retry_reply => |reply| return .{ .status = 200, .body = reply },
+                .state => |state| {
+                    defer alloc.free(state);
+                    return .{ .status = 200, .body = try self.sessions.commit(alloc, alloc, position, principal, 3, "next-state", "committed-frame") };
+                },
+            }
+        }
+    };
+    var fixture: Fixture = .{ .initial = .{ .owner_node_id = 1, .id = @splat(4), .binding = @splat(5), .sequence = 0 } };
+    var issuer = ApiHttpServer.init(a, .{ .internal_service_secret = "cluster-secret", .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.issuer, .local_status = undefined, .node_base_uri = Fixture.uri } } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer issuer.deinit();
+    fixture.sessions = &issuer.retained_subscriptions;
+    fixture.secret = try issuer.researchStateKey(std.testing.io);
+    try fixture.sessions.create(a, fixture.initial, fixture.principal, 1, "initial-state");
+    var server = ApiHttpServer.init(a, .{ .internal_service_secret = "cluster-secret", .session_router = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.local, .local_status = undefined, .node_base_uri = Fixture.uri } }, .session_executor = .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    try std.testing.expectEqualDeep(fixture.secret, try server.researchStateKey(std.testing.io));
+    const cursor = subscriptions.token(&fixture.secret, fixture.initial);
+    const body = try std.json.Stringify.valueAlloc(a, .{ .cursor = cursor[0..] }, .{});
+    defer a.free(body);
+    const request: http_common.HttpRequest = .{ .method = .POST, .uri = "/db/v1/databases/default/namespaces/public/datasets/stats/subscriptions/poll", .authorization = "Basic reader", .body = body, .timeout_ms = 1500 };
+    var first = (try server.forwardRetainedSubscription(1, request)).?;
+    defer first.deinit(a);
+    var retry = (try server.forwardRetainedSubscription(1, request)).?;
+    defer retry.deinit(a);
+    try std.testing.expectEqualStrings("committed-frame", first.body);
+    try std.testing.expectEqualStrings(first.body, retry.body);
+    var loop = request;
+    loop.headers = &.{.{ .name = "X-Antfly-Subscription-Hop", .value = "forwarded" }};
+    try std.testing.expectError(error.RetainedSeriesResetRequired, server.forwardRetainedSubscription(1, loop));
+    try std.testing.expectError(error.RetainedSeriesResetRequired, server.forwardRetainedSubscription(99, request));
+    try std.testing.expect((try server.forwardRetainedSubscription(2, request)) == null);
+    var denied = request;
+    denied.authorization = "Basic other-reader";
+    try std.testing.expectError(error.Forbidden, server.forwardRetainedSubscription(1, denied));
+    var cancel = request;
+    cancel.uri = "/db/v1/databases/default/namespaces/public/datasets/stats/subscriptions/cancel";
+    var canceled = (try server.forwardRetainedSubscription(1, cancel)).?;
+    defer canceled.deinit(a);
+    try std.testing.expectEqual(@as(u16, 204), canceled.status);
+    try std.testing.expectError(error.RetainedSeriesResetRequired, server.forwardRetainedSubscription(1, request));
 }

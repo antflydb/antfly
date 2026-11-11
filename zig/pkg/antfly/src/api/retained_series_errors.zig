@@ -31,6 +31,13 @@ pub fn classify(err: anyerror) ?Error {
     inline for (@typeInfo(Error).error_set.error_names.?) |name| if (err == @field(Error, name)) return @field(Error, name);
     return null;
 }
+/// Permanent serving failures use the same domain contract as SQL 22003.
+pub fn readFailure(err: anyerror) ?Spec {
+    return switch (err) {
+        error.RetainedSeriesNumericOverflow => describe(error.RetainedSeriesNumericOverflow),
+        else => null,
+    };
+}
 pub fn decode(name: []const u8) ?Error {
     inline for (@typeInfo(Error).error_set.error_names.?) |field| if (std.mem.eql(u8, field, name)) return @field(Error, field);
     return null;
@@ -58,4 +65,12 @@ test "retained source write diagnostics preserve exact reasons and bounded retry
     try std.testing.expect(classify(error.OutcomeUnknown) == null);
     try std.testing.expect(classify(error.OutOfMemory) == null);
     try std.testing.expect(decode("unknown") == null);
+}
+
+test "retained owner native controls numeric serving failures are permanent domain errors" {
+    const failure = readFailure(error.RetainedSeriesNumericOverflow).?;
+    try std.testing.expectEqual(@as(u16, 422), failure.status);
+    try std.testing.expectEqualStrings("retained_series_numeric_overflow", failure.code);
+    try std.testing.expect(!failure.retryable);
+    try std.testing.expect(readFailure(error.Timeout) == null);
 }

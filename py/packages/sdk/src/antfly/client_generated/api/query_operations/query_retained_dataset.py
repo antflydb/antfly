@@ -8,6 +8,7 @@ from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.query_retained_dataset_body import QueryRetainedDatasetBody
 from ...models.query_retained_dataset_response_200 import QueryRetainedDatasetResponse200
+from ...models.retained_dataset_read_error import RetainedDatasetReadError
 from ...types import Response
 
 
@@ -39,7 +40,7 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | QueryRetainedDatasetResponse200 | None:
+) -> Any | QueryRetainedDatasetResponse200 | RetainedDatasetReadError | None:
     if response.status_code == 200:
         response_200 = QueryRetainedDatasetResponse200.from_dict(response.json())
 
@@ -69,6 +70,11 @@ def _parse_response(
         response_413 = cast(Any, None)
         return response_413
 
+    if response.status_code == 422:
+        response_422 = RetainedDatasetReadError.from_dict(response.json())
+
+        return response_422
+
     if response.status_code == 503:
         response_503 = cast(Any, None)
         return response_503
@@ -81,7 +87,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | QueryRetainedDatasetResponse200]:
+) -> Response[Any | QueryRetainedDatasetResponse200 | RetainedDatasetReadError]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -97,7 +103,7 @@ def sync_detailed(
     *,
     client: AuthenticatedClient,
     body: QueryRetainedDatasetBody,
-) -> Response[Any | QueryRetainedDatasetResponse200]:
+) -> Response[Any | QueryRetainedDatasetResponse200 | RetainedDatasetReadError]:
     """Query retained summary buckets
 
      Reads a half-open range aligned to the summary's bucket width and origin. Follow next using the same
@@ -116,7 +122,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | QueryRetainedDatasetResponse200]
+        Response[Any | QueryRetainedDatasetResponse200 | RetainedDatasetReadError]
     """
 
     kwargs = _get_kwargs(
@@ -140,7 +146,7 @@ def sync(
     *,
     client: AuthenticatedClient,
     body: QueryRetainedDatasetBody,
-) -> Any | QueryRetainedDatasetResponse200 | None:
+) -> Any | QueryRetainedDatasetResponse200 | RetainedDatasetReadError | None:
     """Query retained summary buckets
 
      Reads a half-open range aligned to the summary's bucket width and origin. Follow next using the same
@@ -159,7 +165,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | QueryRetainedDatasetResponse200
+        Any | QueryRetainedDatasetResponse200 | RetainedDatasetReadError
     """
 
     return sync_detailed(
@@ -178,7 +184,7 @@ async def asyncio_detailed(
     *,
     client: AuthenticatedClient,
     body: QueryRetainedDatasetBody,
-) -> Response[Any | QueryRetainedDatasetResponse200]:
+) -> Response[Any | QueryRetainedDatasetResponse200 | RetainedDatasetReadError]:
     """Query retained summary buckets
 
      Reads a half-open range aligned to the summary's bucket width and origin. Follow next using the same
@@ -197,7 +203,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | QueryRetainedDatasetResponse200]
+        Response[Any | QueryRetainedDatasetResponse200 | RetainedDatasetReadError]
     """
 
     kwargs = _get_kwargs(
@@ -219,7 +225,7 @@ async def asyncio(
     *,
     client: AuthenticatedClient,
     body: QueryRetainedDatasetBody,
-) -> Any | QueryRetainedDatasetResponse200 | None:
+) -> Any | QueryRetainedDatasetResponse200 | RetainedDatasetReadError | None:
     """Query retained summary buckets
 
      Reads a half-open range aligned to the summary's bucket width and origin. Follow next using the same
@@ -238,7 +244,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | QueryRetainedDatasetResponse200
+        Any | QueryRetainedDatasetResponse200 | RetainedDatasetReadError
     """
 
     return (

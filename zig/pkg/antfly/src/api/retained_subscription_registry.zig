@@ -27,11 +27,13 @@ pub const max_reply_bytes = 4 * 1024 * 1024;
 const max_total_bytes = 64 * 1024 * 1024;
 const max_sessions = 64;
 const idle_ns = 2 * std.time.ns_per_min;
-const payload_len = 1 + 16 + 8 + 32;
+const legacy_payload_len = 1 + 16 + 8 + 32;
+const payload_len = legacy_payload_len + 8;
 const token_bytes = payload_len + Hmac.mac_length;
 pub const token_length = encoding.Encoder.calcSize(token_bytes);
 
 pub const Position = struct {
+    owner_node_id: u64 = 0,
     id: Id,
     sequence: u64,
     binding: Digest,
@@ -39,10 +41,11 @@ pub const Position = struct {
 
 pub fn token(secret: []const u8, position: Position) [token_length]u8 {
     var bytes: [token_bytes]u8 = undefined;
-    bytes[0] = 1;
-    bytes[1..17].* = position.id;
-    std.mem.writeInt(u64, bytes[17..25], position.sequence, .big);
-    bytes[25..payload_len].* = position.binding;
+    bytes[0] = 2;
+    std.mem.writeInt(u64, bytes[1..9], position.owner_node_id, .big);
+    bytes[9..25].* = position.id;
+    std.mem.writeInt(u64, bytes[25..33], position.sequence, .big);
+    bytes[33..payload_len].* = position.binding;
     const key = signingKey(secret);
     Hmac.create(bytes[payload_len..], bytes[0..payload_len], &key);
     var encoded: [token_length]u8 = undefined;
@@ -50,15 +53,25 @@ pub fn token(secret: []const u8, position: Position) [token_length]u8 {
     return encoded;
 }
 pub fn verify(secret: []const u8, raw: []const u8) !Position {
+    if (raw.len == encoding.Encoder.calcSize(legacy_payload_len + Hmac.mac_length)) {
+        var bytes: [legacy_payload_len + Hmac.mac_length]u8 = undefined;
+        encoding.Decoder.decode(&bytes, raw) catch return error.InvalidRetainedSubscriptionToken;
+        if (bytes[0] != 1) return error.InvalidRetainedSubscriptionToken;
+        try verifyMac(secret, &bytes, legacy_payload_len);
+        return .{ .id = bytes[1..17].*, .sequence = std.mem.readInt(u64, bytes[17..25], .big), .binding = bytes[25..legacy_payload_len].* };
+    }
     if (raw.len != token_length) return error.InvalidRetainedSubscriptionToken;
     var bytes: [token_bytes]u8 = undefined;
     encoding.Decoder.decode(&bytes, raw) catch return error.InvalidRetainedSubscriptionToken;
-    if (bytes[0] != 1) return error.InvalidRetainedSubscriptionToken;
+    if (bytes[0] != 2) return error.InvalidRetainedSubscriptionToken;
+    try verifyMac(secret, &bytes, payload_len);
+    return .{ .owner_node_id = std.mem.readInt(u64, bytes[1..9], .big), .id = bytes[9..25].*, .sequence = std.mem.readInt(u64, bytes[25..33], .big), .binding = bytes[33..payload_len].* };
+}
+fn verifyMac(secret: []const u8, bytes: []const u8, payload: usize) !void {
     const key = signingKey(secret);
     var actual: [Hmac.mac_length]u8 = undefined;
-    Hmac.create(&actual, bytes[0..payload_len], &key);
-    if (!std.crypto.timing_safe.eql([Hmac.mac_length]u8, actual, bytes[payload_len..].*)) return error.InvalidRetainedSubscriptionToken;
-    return .{ .id = bytes[1..17].*, .sequence = std.mem.readInt(u64, bytes[17..25], .big), .binding = bytes[25..payload_len].* };
+    Hmac.create(&actual, bytes[0..payload], &key);
+    if (!std.crypto.timing_safe.eql([Hmac.mac_length]u8, actual, bytes[payload..][0..Hmac.mac_length].*)) return error.InvalidRetainedSubscriptionToken;
 }
 fn signingKey(secret: []const u8) Digest {
     var key: Digest = undefined;
@@ -112,7 +125,7 @@ pub const Registry = struct {
         self.entries.deinit(alloc);
     }
     fn requireBinding(entry: *const Entry, position: Position, principal: Digest) !void {
-        if (!std.mem.eql(u8, &entry.position.binding, &position.binding) or !std.mem.eql(u8, &entry.principal, &principal)) return error.Forbidden;
+        if (entry.position.owner_node_id != position.owner_node_id or !std.mem.eql(u8, &entry.position.binding, &position.binding) or !std.mem.eql(u8, &entry.principal, &principal)) return error.Forbidden;
     }
     pub fn create(self: *Registry, alloc: A, position: Position, principal: Digest, now: u64, state: []const u8) !void {
         if (position.sequence != 0 or std.mem.allEqual(u8, &position.id, 0) or state.len > max_state_bytes) return error.DatasetPageBudgetExceeded;
@@ -194,4 +207,24 @@ test "retained subscription retries return the exact committed response and reje
     defer a.free(after.retry_reply);
     try std.testing.expectEqualStrings(committed, after.retry_reply);
     try std.testing.expectError(error.RetainedSeriesResetRequired, registry.load(a, a, initial, principal, idle_ns + 4));
+}
+
+test "retained subscription issuer is authenticated and legacy cursors remain decodable" {
+    const initial: Position = .{ .owner_node_id = 42, .id = @splat(1), .sequence = 7, .binding = @splat(3) };
+    var encoded = token("secret", initial);
+    try std.testing.expectEqualDeep(initial, try verify("secret", &encoded));
+    encoded[8] = if (encoded[8] == 'A') 'B' else 'A';
+    try std.testing.expectError(error.InvalidRetainedSubscriptionToken, verify("secret", &encoded));
+    var legacy: [legacy_payload_len + Hmac.mac_length]u8 = undefined;
+    legacy[0] = 1;
+    legacy[1..17].* = initial.id;
+    std.mem.writeInt(u64, legacy[17..25], initial.sequence, .big);
+    legacy[25..legacy_payload_len].* = initial.binding;
+    const key = signingKey("secret");
+    Hmac.create(legacy[legacy_payload_len..], legacy[0..legacy_payload_len], &key);
+    var text: [encoding.Encoder.calcSize(legacy.len)]u8 = undefined;
+    _ = encoding.Encoder.encode(&text, &legacy);
+    const decoded = try verify("secret", &text);
+    try std.testing.expectEqual(@as(u64, 0), decoded.owner_node_id);
+    try std.testing.expectEqualDeep(initial.id, decoded.id);
 }

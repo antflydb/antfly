@@ -291,6 +291,7 @@ pub const RetainedDatasetMeasure = types.RetainedDatasetMeasure;
 pub const RetainedDatasetNativeProgress = types.RetainedDatasetNativeProgress;
 pub const RetainedDatasetOwnerProgress = types.RetainedDatasetOwnerProgress;
 pub const RetainedDatasetProgress = types.RetainedDatasetProgress;
+pub const RetainedDatasetReadError = types.RetainedDatasetReadError;
 pub const RetainedSubscriptionFrame = types.RetainedSubscriptionFrame;
 pub const RetrievalAgentRequest = types.RetrievalAgentRequest;
 pub const RetrievalAgentResult = types.RetrievalAgentResult;

@@ -1254,12 +1254,20 @@ components:
       schema:
         type: string
   schemas:
+    RetainedDatasetReadError:
+      type: object
+      additionalProperties: false
+      required: [code, message, retryable]
+      properties:
+        code: {type: string, description: Stable machine-readable domain failure, example: retained_series_numeric_overflow}
+        message: {type: string}
+        retryable: {type: boolean, enum: [false]}
     RetainedSubscriptionFrame:
       type: object
       required: [kind, cursor, events]
       properties:
         kind: {type: string, enum: [snapshot, changes]}
-        cursor: {type: string, maxLength: 128}
+        cursor: {type: string, maxLength: 160}
         resynchronized: {type: boolean, description: True when the server caught up through a fresh bounded snapshot instead of replaying every intermediate state.}
         initial_history: {type: string, enum: [certified, retained_source_rows]}
         dimensions:
@@ -18988,6 +18996,11 @@ paths:
         '403': {description: Dataset read permission or cursor authority is missing.}
         '409': {description: Replay or serving state was lost. Open a fresh snapshot.}
         '413': {description: Subscription exceeds its result or state budget.}
+        '422':
+          description: A retained aggregate is outside its supported numeric range.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RetainedDatasetReadError'}
         '503': {description: Subscription owner is temporarily unavailable.}
 
   /databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/poll:
@@ -19008,7 +19021,7 @@ paths:
       summary: Replay retained summary changes
       tags: [query_operations]
       operationId: pollRetainedSubscription
-      description: Poll with the last cursor. Repeating a poll after a lost response returns the last committed frame. Use a new snapshot when replay is unavailable or the serving session expires.
+      description: Poll with the last cursor through any cluster API node; its authenticated issuer routes to the serving session. Repeating a poll after a lost response returns the last committed frame. Replay gaps can coalesce through a fresh snapshot; reset is required when the serving session is lost.
       requestBody:
         required: true
         content:
@@ -19018,7 +19031,7 @@ paths:
               required: [cursor]
               additionalProperties: false
               properties:
-                cursor: {type: string, maxLength: 128}
+                cursor: {type: string, maxLength: 160}
       responses:
         '200':
           description: Snapshot or committed delta frame and its next cursor.
@@ -19029,6 +19042,11 @@ paths:
         '403': {description: Dataset read permission or cursor authority is missing.}
         '409': {description: Replay or serving state was lost. Open a fresh snapshot.}
         '413': {description: Subscription exceeds its result or state budget.}
+        '422':
+          description: A retained aggregate is outside its supported numeric range.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RetainedDatasetReadError'}
         '503': {description: Subscription owner is temporarily unavailable.}
 
   /databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/cancel:
@@ -19059,7 +19077,7 @@ paths:
               required: [cursor]
               additionalProperties: false
               properties:
-                cursor: {type: string, maxLength: 128}
+                cursor: {type: string, maxLength: 160}
       responses:
         '204':
           description: Subscription canceled.
@@ -19147,6 +19165,11 @@ paths:
         '409': {description: Dataset coverage or owner authority changed.}
         '410': {description: Requested history has expired.}
         '413': {description: Request or result exceeds the range budget.}
+        '422':
+          description: A retained aggregate is outside its supported numeric range.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RetainedDatasetReadError'}
         '503': {description: Dataset authority is temporarily unavailable.}
 
   /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query:
