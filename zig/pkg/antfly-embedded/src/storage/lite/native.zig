@@ -5142,12 +5142,12 @@ const PageWriteBatch = struct {
                 _ = file.test_page_write_calls.fetchAdd(1, .monotonic);
                 _ = file.test_page_writes.fetchAdd(@intCast(end - start), .monotonic);
             }
-            // Reserve room for this batch's entries before the write below,
-            // so `note` itself never allocates and a genuine allocation
-            // failure can never be mistaken for this window simply
-            // overflowing -- see `ManifestBuilder.reserveCapacity`.
+            // Reserve room for this window's entries before the write below,
+            // so `note` itself never allocates -- see
+            // `ManifestBuilder.reserveCapacity`'s doc comment: a no-op for
+            // every window after the file's first.
             if (NativeFile.manifest_commits_enabled) {
-                file.manifest_builder.reserveCapacity(file.allocator, @intCast(end - start));
+                try file.manifest_builder.reserveCapacity(file.allocator);
             }
             (file.file.writePositionalAll(file.runtimeIo(), self.buffer[start * size .. end * size], self.page_ids[start] * @as(u64, size)) catch |zig017_err| {
                 zig017_return_error = zig017_err;
@@ -5775,6 +5775,8 @@ pub const NativeFile = struct {
         }
         errdefer if (result.reader_fence_lock) |handle| handle.release(io);
         if (opts.resource_manager) |manager| result.page_cache.attachResourceManager(manager);
+        // See the matching comment in `createWithIo`.
+        if (manifest_commits_enabled) try result.manifest_builder.reserveCapacity(allocator);
         return result;
     }
 
@@ -5825,6 +5827,19 @@ pub const NativeFile = struct {
     ) !NativeFile {
         var owned_io_impl = io_impl;
         const io = borrowed_io orelse owned_io_impl.io();
+
+        // Reserved up front, before anything below -- including a
+        // replacement create's own rename-into-place -- commits anything
+        // irreversible: an allocation failure here must still be a clean,
+        // pre-replacement failure ("lite allocator v4 failed replacement
+        // create preserves original"), not an error returned after the
+        // original file has already been replaced on disk. Moved into
+        // `result.manifest_builder` at the final `return` below, once
+        // construction can no longer fail; `errdefer` only needs to cover
+        // the window before that move.
+        var manifest_builder_reservation: ManifestBuilder = .{};
+        if (manifest_commits_enabled) try manifest_builder_reservation.reserveCapacity(allocator);
+        errdefer if (manifest_commits_enabled) manifest_builder_reservation.deinit(allocator);
 
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
@@ -5945,6 +5960,15 @@ pub const NativeFile = struct {
                 null,
         };
         if (resource_manager) |manager| result.page_cache.attachResourceManager(manager);
+        // Already reserved (see this function's own top, before any of
+        // the replacement/rename dance above could commit) -- moved in
+        // now that construction can no longer fail. Pre-paying for this
+        // one allocation at open, rather than lazily on the first commit,
+        // is what lets a caller tracking "no allocation during ordinary
+        // writes" (see "lite native page batches coalesce runs without
+        // heap allocation and preserve gaps") start measuring right after
+        // this call returns, before issuing any writes.
+        result.manifest_builder = manifest_builder_reservation;
         return result;
     }
 
@@ -13150,7 +13174,14 @@ pub const NativeFile = struct {
             self.manifest_builder.reserved_page = try writes.pages.allocateFresh();
         }
         try self.persistAllocator(&writes.pages, &next);
-        if (manifest_commits_enabled) try self.manifest_builder.noteReused(self.allocator, &writes.pages.reused);
+        if (manifest_commits_enabled) {
+            // Guaranteed capacity even for a flush that wrote no fresh
+            // pages (so `PageWriteBatch.flushCount`'s own reservation
+            // never ran this window) -- a no-op once the file's first
+            // window has already reserved it.
+            try self.manifest_builder.reserveCapacity(self.allocator);
+            self.manifest_builder.noteReused(&writes.pages.reused);
+        }
         // Every page this flush allocated and should have written
         // (excluding the reserved manifest page itself, not yet written at
         // this point) must already be in manifest_builder -- unless
@@ -13430,10 +13461,7 @@ pub const NativeFile = struct {
         // during one of its flushes) must not survive to be mistaken for a
         // later commit's own fresh reservation. Safe to drop unconditionally
         // -- the next durable commit just falls back to presynced.
-        if (manifest_commits_enabled) {
-            self.manifest_builder.deinit(self.allocator);
-            self.manifest_builder = .{};
-        }
+        if (manifest_commits_enabled) self.manifest_builder.resetForNextWindow();
         self.namespace_directory_cache_root = std.math.maxInt(u64);
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
         self.namespace_directory_cache = .empty;
@@ -13477,10 +13505,7 @@ pub const NativeFile = struct {
     /// `reserved_page` left set) silently steering that unrelated commit
     /// away from building a manifest of its own.
     fn resetBareCommitManifestWindow(self: *NativeFile) void {
-        if (manifest_commits_enabled) {
-            self.manifest_builder.deinit(self.allocator);
-            self.manifest_builder = .{};
-        }
+        if (manifest_commits_enabled) self.manifest_builder.resetForNextWindow();
     }
 
     /// Reserve a manifest page for a bare (no caller-owned transaction)
@@ -13511,7 +13536,11 @@ pub const NativeFile = struct {
     /// `flushTransactionWrites` for transactional commits, so this is the
     /// one place manifest/presynced publication logic lives either way.
     fn publishBareCommit(self: *NativeFile, pages: *PageAllocator, next: *CheckpointSlot) !void {
-        if (manifest_commits_enabled) try self.manifest_builder.noteReused(self.allocator, &pages.reused);
+        if (manifest_commits_enabled) {
+            // See the matching comment in `flushTransactionWrites`.
+            try self.manifest_builder.reserveCapacity(self.allocator);
+            self.manifest_builder.noteReused(&pages.reused);
+        }
         const manifest_prepared = if (manifest_commits_enabled) try self.tryBuildCommitManifest(next) else false;
         // Never the group-commit path: a bare commit has no outer Store
         // lock to release around its sync.
@@ -13563,10 +13592,7 @@ pub const NativeFile = struct {
                 // just falls back to the presynced two-sync path instead of
                 // risking an under- or over-complete manifest, exactly like
                 // an ordinary `overflowed` latch.
-                if (manifest_commits_enabled) {
-                    self.manifest_builder.deinit(self.allocator);
-                    self.manifest_builder = .{};
-                }
+                if (manifest_commits_enabled) self.manifest_builder.resetForNextWindow();
             }
             self.namespace_directory_cache_root = std.math.maxInt(u64);
             deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
@@ -13840,10 +13866,7 @@ pub const NativeFile = struct {
         // way, whatever manifest_builder accumulated describes writes that
         // are now covered by *this* durable publish, not the next one.
         // Tracking restarts clean from here.
-        if (manifest_commits_enabled) {
-            self.manifest_builder.deinit(self.allocator);
-            self.manifest_builder = .{};
-        }
+        if (manifest_commits_enabled) self.manifest_builder.resetForNextWindow();
         self.last_synced_header = self.header;
         if (self.ledger) |state| {
             self.retirement_activity_bytes +|= state.released_data_pages *| self.header.page_size;
@@ -14052,7 +14075,7 @@ fn appendPageToFile(
     // Reserve before the write, same as `PageWriteBatch.flushCount`: see
     // `ManifestBuilder.reserveCapacity`'s doc comment for why `note` itself
     // must never allocate.
-    if (manifest) |builder| builder.reserveCapacity(allocator, 1);
+    if (manifest) |builder| try builder.reserveCapacity(allocator);
     try file.writePositionalAll(io, page, page_id * @as(u64, @intCast(page_size)));
     if (builtin.is_test) PageWriteMetrics.record(kind, page.len);
     if (manifest) |builder| builder.note(page_id, std.mem.readInt(u32, page[page_crc_offset..][0..4], .little));
@@ -14842,50 +14865,70 @@ const ManifestBuilder = struct {
     /// against it.
     reserved_page: ?u64 = null,
 
-    /// `entries`/`reused_pages` always use `std.heap.page_allocator`,
-    /// never a caller-supplied allocator (see `reserveCapacity`'s doc
-    /// comment for why: this struct's own, intentional "ran out of
-    /// reserved room, fall back to the presynced two-sync path" shape is
-    /// indistinguishable from a real allocation failure to
-    /// `std.testing.checkAllAllocationFailures`' exhaustive sweep, the same
-    /// reason `inode_lock.zig`'s process-wide registry fixes on
-    /// `page_allocator` instead of a caller's). Both call sites still take
-    /// an `allocator` parameter for API continuity (and because dropping it
-    /// everywhere would be a larger, riskier mechanical change); it is
-    /// otherwise unused.
-    fn deinit(self: *ManifestBuilder, _: Allocator) void {
-        self.entries.deinit(std.heap.page_allocator);
-        self.reused_pages.deinit(std.heap.page_allocator);
+    /// Frees `entries`/`reused_pages` for good -- only at a true end of
+    /// this struct's lifetime (`NativeFile.close`, or a short-lived helper
+    /// file's own one-shot cleanup), never between commits. See
+    /// `resetForNextWindow` for the between-commits case: this struct is a
+    /// long-lived field of `NativeFile`, and the whole point of
+    /// `reserveCapacity`'s pre-size (below) is that steady-state commits
+    /// never reach this allocator at all.
+    fn deinit(self: *ManifestBuilder, allocator: Allocator) void {
+        self.entries.deinit(allocator);
+        self.reused_pages.deinit(allocator);
     }
 
-    /// Reserve room for `additional` more `note` calls before the page
-    /// writes they describe, so `note` itself never allocates and never has
-    /// to tell "this window overflowed" (an ordinary, expected fallback to
-    /// the presynced two-sync path) apart from a genuine, unrelated
-    /// allocation failure -- `checkAllAllocationFailures` flagged the old
-    /// `put(...) catch { overflowed = true; }` shape in `note`/`noteReused`
-    /// as exactly that: a real `error.OutOfMemory` silently relabeled as a
-    /// benign size-limit overflow instead of surfacing (`SwallowedOutOfMemoryError`).
-    /// A reservation failure here is still the same safe fallback, just made
-    /// explicitly, at the one place capacity is actually grown, rather than
-    /// implicitly inside every subsequent `put`.
+    /// Between-commits reset: drop every entry but keep the underlying
+    /// capacity `reserveCapacity` already paid for, so the *next* window's
+    /// `note`/`noteReused` calls allocate nothing either -- exactly the
+    /// same guarantee `deinit` followed by reconstruction used to defeat
+    /// every single commit. Called instead of `deinit` at every window
+    /// boundary (commit or abort) for `NativeFile`'s own long-lived
+    /// `manifest_builder`; `deinit` remains for the struct's true end of
+    /// life.
+    fn resetForNextWindow(self: *ManifestBuilder) void {
+        self.entries.clearRetainingCapacity();
+        self.reused_pages.clearRetainingCapacity();
+        self.overflowed = false;
+        self.reserved_page = null;
+    }
+
+    /// Pre-size `entries`/`reused_pages` to cover the largest window this
+    /// struct ever needs to track (`max_single_sync_pages` noted pages,
+    /// +1 so `note`'s own overflow check below always has room to make
+    /// its one over-budget `putAssumeCapacity` before it fires) -- once,
+    /// ever, idempotently, through `allocator` (`NativeFile`'s own
+    /// long-lived allocator, not a fresh one scoped to this call). Called
+    /// before every window's first `note`/`noteReused`, same as the
+    /// incremental reservation this replaced, but `ensureTotalCapacity`
+    /// against a fixed ceiling is a guaranteed no-op once that ceiling is
+    /// reached -- unlike the old `ensureUnusedCapacity(allocator,
+    /// additional)` against the *current, shrunk-by-reset* count, which
+    /// re-allocated on every single commit even though the previous
+    /// commit had already paid for the exact same capacity and
+    /// `resetForNextWindow` only dropped entries, not that capacity's
+    /// backing memory.
     ///
-    /// That fix alone turned out not to be enough: moving *which* call
-    /// catches the failure doesn't change *what* it catches it from --
-    /// `entries`/`reused_pages` still grew through the caller's (test-
-    /// wrapped, in `checkAllAllocationFailures`' sweep) allocator, so a
-    /// deliberately benign overflow and a real induced `OutOfMemory` were
-    /// still the same event as far as the sweep could tell. See `deinit`'s
-    /// doc comment: both hashmaps now always grow through
-    /// `std.heap.page_allocator` instead, so nothing on this path is ever
-    /// subject to that sweep at all, and `self.overflowed = true` here is
-    /// unambiguously "this window's own bounded capacity, not memory,
-    /// ran out."
-    fn reserveCapacity(self: *ManifestBuilder, _: Allocator, additional: u32) void {
-        if (self.overflowed) return;
-        self.entries.ensureUnusedCapacity(std.heap.page_allocator, additional) catch {
-            self.overflowed = true;
-        };
+    /// This used to also be the one place an ordinary "this window simply
+    /// overflowed its size budget" (handled by `note`'s own count check)
+    /// could be confused with a genuine allocation failure -- `catch {
+    /// self.overflowed = true; }` relabeled a real `error.OutOfMemory` as
+    /// that benign case, which `std.testing.checkAllAllocationFailures`
+    /// flagged as `SwallowedOutOfMemoryError`. Fixed by construction, not
+    /// by catching: once capacity is reached once, this is a no-op for
+    /// every later window, so by the time any file sees enough commits for
+    /// `checkAllAllocationFailures`-style exhaustive fault injection to
+    /// matter, the single real allocation this ever does has already
+    /// either succeeded or (this file's very first window) legitimately
+    /// propagated `error.OutOfMemory` -- there is no longer a *repeated*
+    /// event for the sweep to ever catch mid-steady-state.
+    fn reserveCapacity(self: *ManifestBuilder, allocator: Allocator) !void {
+        try self.entries.ensureTotalCapacity(allocator, max_single_sync_pages + 1);
+        // If `reused_pages` fails to grow, `entries`' just-grown buffer
+        // above must not leak: nothing else owns it yet (a caller whose
+        // own construction fails partway, e.g. `createWithRuntime`, never
+        // reaches a `deinit`/`resetForNextWindow` call for this value).
+        errdefer self.entries.clearAndFree(allocator);
+        try self.reused_pages.ensureTotalCapacity(allocator, max_single_sync_pages + 1);
     }
 
     fn note(self: *ManifestBuilder, page_id: u64, crc: u32) void {
@@ -14902,17 +14945,14 @@ const ManifestBuilder = struct {
     /// intermediate flush in the window uses its own fresh `PageAllocator`,
     /// each with its own `reused` set) so the final `reused_pages` covers
     /// the whole since-last-durable-checkpoint window, not just the last
-    /// flush. Reserves capacity for the whole merge up front (see
-    /// `reserveCapacity`'s doc comment) instead of risking an ordinary
-    /// `put` failure reading as this window simply overflowing.
-    fn noteReused(self: *ManifestBuilder, _: Allocator, reused: *const std.AutoHashMapUnmanaged(u64, void)) !void {
+    /// flush. Capacity for the whole merge was already reserved up front
+    /// by `reserveCapacity`, so this never allocates either.
+    fn noteReused(self: *ManifestBuilder, reused: *const std.AutoHashMapUnmanaged(u64, void)) void {
         if (self.overflowed) return;
-        // See `deinit`'s doc comment: always page_allocator, never the
-        // passed-in (possibly test-wrapped) allocator.
-        self.reused_pages.ensureUnusedCapacity(std.heap.page_allocator, reused.count()) catch {
+        if (self.reused_pages.count() + reused.count() > max_single_sync_pages) {
             self.overflowed = true;
             return;
-        };
+        }
         var it = reused.keyIterator();
         while (it.next()) |page| self.reused_pages.putAssumeCapacity(page.*, {});
     }
@@ -22104,16 +22144,18 @@ test "lite sorted editor releases ownership on every allocation failure" {
             // on every one of `checkAllAllocationFailures`'s repeated calls
             // to this same closure (same `f`, never durably published
             // between them), making a supposedly side-effect-free retry
-            // visibly heavier each time -- and because each call's growth
-            // happens under that call's own temporary `allocator`, letting
-            // it survive past `defer f.allocator = saved` above would also
-            // leave it holding memory from an allocator instance this
-            // function no longer owns. Reset it before the swap unwinds,
-            // with the same allocator that grew it this call.
-            defer if (NativeFile.manifest_commits_enabled) {
-                f.manifest_builder.deinit(allocator);
-                f.manifest_builder = .{};
-            };
+            // visibly heavier each time. `resetForNextWindow` (not
+            // `deinit`): `f` was constructed through `createWithIo`, whose
+            // own `reserveCapacity` call already paid for this capacity
+            // under `f`'s *original* allocator (`a` above, before this
+            // call's `f.allocator = allocator` swap) -- freeing it here
+            // through this call's temporary `allocator` instead would free
+            // memory a different allocator instance owns. Clearing
+            // retained capacity touches no allocator at all, so it is safe
+            // regardless of which one is currently installed, and -- since
+            // 64 mutations is far below `max_single_sync_pages` -- nothing
+            // this editor does will ever need to grow it further anyway.
+            defer if (NativeFile.manifest_commits_enabled) f.manifest_builder.resetForNextWindow();
             var pages = try f.pageAllocatorFromFreeMap(f.activeCheckpoint());
             defer pages.deinit();
             var editor = IndexEditor.init(f, f.activeCheckpoint(), f.activeCheckpoint().document_index_root_page);
