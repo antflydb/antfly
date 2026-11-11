@@ -45525,7 +45525,8 @@ test "model aware media terminal scalar output acknowledges failure without mode
     }
     var catalog = try db.artifactInventoryCommand(a);
     defer catalog.catalogs.deinit(a);
-    catalog.binding.effect_protocol = 15;
+    // Execution-bound model outputs require the v18 publication fence.
+    catalog.binding.effect_protocol = 18;
     try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
     var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     activation.publication_digest = activation.digest();
@@ -45751,13 +45752,25 @@ test "model aware media vocabulary cache retains 32 admitted vocabularies withou
     try storePutBatchWithRetry(&runtime, &.{ .{ .key = vector_key, .value = encoded }, .{ .key = member, .value = "{}" }, .{ .key = manifest_key, .value = &manifest } }, &.{});
     const output_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "labels");
     defer alloc.free(output_key);
-    var window = GeneratedReplayWindow{ .alloc = alloc };
-    defer window.deinit();
+    const primary = try documentSourceStoreKeyAlloc(&runtime, "doc");
+    defer alloc.free(primary);
+    try storePutWithRetry(&runtime, primary, "{}");
     const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
     for (0..2) |_| for (0..32) |i| {
         const config = try std.fmt.allocPrint(alloc, "{{\"labels\":[{{\"label\":\"word-{d}\"}}],\"top_k\":1}}", .{i});
         defer alloc.free(config);
-        try processVectorLabels(&runtime, request, config, null, "{}", output_key, &window);
+        const producer = try std.fmt.allocPrint(alloc, "{{\"type\":\"vector_labels\",\"config\":{s}}}", .{config});
+        defer alloc.free(producer);
+        // Each vocabulary is a real admitted producer recipe, not a stale
+        // request bypassing the current catalog publication fence.
+        _ = try index_manager.upsertEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = producer });
+        var admitted_request = request;
+        admitted_request.producer_json = producer;
+        // A catalog mutation starts a fresh replay cut; the vocabulary cache
+        // belongs to the runtime and must survive all 64 independent windows.
+        var window = GeneratedReplayWindow{ .alloc = alloc };
+        defer window.deinit();
+        try processVectorLabels(&runtime, admitted_request, config, null, "{}", output_key, &window);
     };
     try std.testing.expectEqual(@as(usize, 32), fake.calls);
     std.debug.print("vocabulary prompts={d} retained={d} slots={d} budget={d}\n", .{ fake.calls, runtime.vector_label_cache.bytes, @import("vector_label_cache.zig").Cache.max_entries, @import("vector_label_cache.zig").Cache.max_bytes });
@@ -45796,7 +45809,7 @@ test "model aware media labels authenticate independently refreshed retained tex
     };
     try index_manager.addEnrichment(&store, .{ .name = "clips", .kind = .chunk, .field = "body", .chunk_size = 8 });
     try index_manager.addEnrichment(&store, .{ .name = "vectors", .kind = .embedding, .field = "body", .source_artifact_name = "clips", .expected_dims = 2, .producer_json = "{\"provider\":\"antfly\",\"model\":\"vectors\"}" });
-    try index_manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"},{\"label\":\"music\"}],\"top_k\":1}}" });
+    try index_manager.addEnrichment(&store, .{ .name = "labels", .kind = .asset, .source_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"}]}}" });
     const Fake = struct {
         calls: usize = 0,
         generation: u8 = 2,
@@ -45856,7 +45869,10 @@ test "model aware media labels authenticate independently refreshed retained tex
     defer alloc.free(output_key);
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
-    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\"}" };
+    const primary = try documentSourceStoreKeyAlloc(&runtime, "doc");
+    defer alloc.free(primary);
+    try storePutWithRetry(&runtime, primary, "{}");
+    const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .asset, .index_name = "labels", .artifact_name = "labels", .doc_key = "doc", .source_field = "", .upstream_artifact_name = "vectors", .producer_json = "{\"type\":\"vector_labels\",\"config\":{\"labels\":[{\"label\":\"speech\"}]}}" };
     try processVectorLabels(&runtime, request, "{\"labels\":[{\"label\":\"speech\"}]}", null, "{}", output_key, &window);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     const output = try storeGetAlloc(&runtime, output_key);
