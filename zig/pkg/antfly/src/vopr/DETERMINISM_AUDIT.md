@@ -363,3 +363,70 @@ dump shows every `production-*` feature still at 0), and is out of scope for
 this document's determinism focus: it is a liveness bug, not a nondeterminism
 one. Left for separate investigation; full `full-cluster-vopr-test` 25/25
 twice is not yet reached pending that.
+
+## `PrefixedFairSeeded` could starve `time_advance` for an entire transition budget
+
+Continuing the metadata-partition investigation above: fixing the
+transaction-begin classification gap (see `internal_group_operations.zig`'s
+commit) got `full-cluster.metadata-partition`'s production read/write/tenant
+round trip to succeed, but `history-completes` still failed. Isolated
+diagnostics narrowed it to one HTTP GET (`fetchLookup` for a cross-table
+isolation probe) that never resolved — logging showed the request was still
+pending 4+ *virtual* seconds in, with no sign of progress, yet nothing else
+in the scenario ever reported a hang either; the whole 50,000-transition
+budget just ran out first.
+
+The actual bug: `vopr.choice.PrefixedFairSeeded` — the "fair" scheduling
+policy `full-cluster.zig` uses for every non-`production_*` mode (`clean`,
+`metadata-partition`, etc., via `choice.PrefixedFairSeeded.init` in
+`Scenario.run`'s `choice_source` selection) — picks a `vopr-io.time_advance`
+transition only when *no other* transition is enabled that round. Its
+sibling, `PrefixedCooperativeSeeded` (used for `production_*` modes), has
+the same postponement but bounds it: after `max_non_time_choices` (256)
+consecutive non-time picks it forces a `time_advance` pick anyway.
+`PrefixedFairSeeded` had no such bound — unconditional, indefinite
+postponement. A full-cluster scenario with a few dozen concurrently-live
+service fibers (confirmed via `full-cluster.active-tasks` in the failure
+dump: ~40) *always* has some non-time transition enabled, so `time_advance`
+was starved for the scenario's entire transition budget. This is a pure
+scheduler-fairness bug, not a leak of the host's real clock — VOPR's
+simulated `.awake`/`.real` clocks were already correctly deterministic and
+controlled; they simply never got told to advance.
+
+The consequence: any deadline whose only path to firing is a `time_advance`
+transition is indistinguishable from a true hang under `PrefixedFairSeeded`
+scenarios that stay busy. This almost certainly includes server-side
+catalog/read-index readiness retries with a deadline (`lookupWithReadinessRetry`
+in `http_server.zig` retries every 50ms for up to 5 seconds on
+`StorageReadTemporarilyUnavailable`-class errors) and any client-side
+request timeout — confirmed concretely: adding a non-`null` `timeout_ms` to
+an otherwise-untimed-out `fetchLookup` call (attempting to fix the hang
+above) made the *previously-passing* `full-cluster.clean` mode hang too,
+on the exact same symptom, with no fault injected at all. That dead end is
+what led here: the timeout itself wasn't broken, `time_advance` just never
+got picked while anything else was runnable, so the watchdog timer behind
+`httpx`'s own request-timeout `Io.Select` race never fired either.
+
+Fix: gave `PrefixedFairSeeded` the same `non_time_choices`/
+`max_non_time_choices` bound `PrefixedCooperativeSeeded` already has,
+sharing its `default_max_non_time_choices` constant and its `isTimeAdvance`
+helper. "Postpones time while application work is runnable" (the existing,
+still-true doc comment and still-passing test) is now bounded rather than
+unconditional.
+
+Regression: `"prefixed fair seeded source eventually forces time_advance
+when work never stops being runnable"` in `lib/vopr/src/choice.zig` keeps a
+non-time transition continuously enabled alongside `time_advance` and
+asserts the latter wins within `max_non_time_choices + 1` choices — it
+previously would never win. Fast, fully isolated (`lib/vopr`'s own `zig
+build test`, no antfly binary needed); confirmed passing.
+
+Verified: full-cluster.metadata-partition's transaction-begin failures stay
+fixed and the production round trip keeps succeeding with this change
+(unaffected, as expected — it's a scheduler-fairness fix, not a correctness
+one for that path). `history-completes` for metadata-partition is **not**
+yet green: the isolation-probe lookup still doesn't resolve, now confirmed
+*not* to be this starvation bug (this fix alone doesn't change the outcome),
+and its true root is a separate, still-open investigation — see the
+coordinator report for where that stands. `full-cluster-vopr-test` 25/25
+twice is not yet reached.
