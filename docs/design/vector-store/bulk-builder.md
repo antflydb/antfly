@@ -49,8 +49,11 @@ separately to process RSS.
 
 ## Construction
 
-1. Decode authored Parquet `LIST<FLOAT>` and `LIST<DOUBLE>` columns into borrowed
-   float32 vectors. Repetition and definition levels preserve rows across page
+1. Decode authored Parquet `LIST<FLOAT>` columns into borrowed float32 vectors.
+   `LIST<DOUBLE>` preserves its original precision in bounded numeric JSON arrays;
+   embedding consumers perform their float32 conversion at the vector boundary.
+   SQL and stored-source reads preserve doubles, including finite values outside
+   the float32 range. Repetition and definition levels preserve rows across page
    boundaries and distinguish null lists from empty lists. The reader retains
    one physical page and a bounded output cohort. Zstandard pages use the shared
    native decoder's bounded Huffman prefix table: at most 2,048 two-byte entries
@@ -219,3 +222,32 @@ Each trial decodes 49,152,000 bytes through each implementation using equal
 window allocations and checks every output. Trial order alternates. Kernel
 measurements isolate compressed-source decoding; complete Parquet operation
 measurements remain separate.
+
+
+## Recorded complete-operation observations
+
+On the authored Cohere 1M Parquet corpus (768 dimensions, 3.13 GB source), the
+local filesystem operation took 788.9 seconds with standard Zstandard literal
+search, then 220.4 seconds with the native prefix decoder and Lloyd, and 218.1
+seconds with the prefix decoder and e-means. The optimized runs published
+logical identity evidence and reopened all one million members, returning ten
+query hits. These are shared-workstation observations with concurrent builds,
+not a controlled speedup estimate. The raw corpus was not normalized by the
+builder, and this probe checks serving rather than recall.
+
+Five alternating decoder trials each validated 49.15 MB byte-for-byte. Median
+native decoding was 0.697 seconds versus 5.446 seconds for standard decoding,
+with equal window allocations. The [recorded data](../../../zig/bench/vectors/cohere_bulk_pipeline_1m.json)
+includes trial order, raw timings, executable hashes, source identity, and timer
+boundaries. Optimizer-only timings in the earlier quality comparison describe a
+smaller portion of the import pipeline.
+
+
+A separate synthetic admission regression builds three million 4d vectors from
+a raw Parquet file with a 512 MiB input allowance. Its 288 MB of fixed-width
+private keys exceed the former 256 MiB tracker cap. Construction, publication,
+logical identity evidence, and reopen passed in 102.3 seconds. This checks scale
+and configured admission; it is not a high-dimensional recall comparison.
+Generate the input with `zig/bench/vectors/prepare_identity_stress.py` (requires
+PyArrow), then run the operation probe with `ANTFLY_LAKE_BULK_DIMS=4` and
+`ANTFLY_LAKE_BULK_INPUT_BYTES=536870912`.
