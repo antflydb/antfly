@@ -7990,6 +7990,8 @@ fn consumerTests() type {
                 \\{"boundary_model":"embedding","targets":[{"name":"embedding","kind":"embedding","model":"encoder","dimensions":2,"execute":false,"required":true,"task_type":"RETRIEVAL_DOCUMENT"},{"name":"transcript","kind":"transcribe","model":"asr","language":"en","diarize":true},{"name":"labels","kind":"classify","model":"classifier","top_k":3,"skip_windows":[{"ordinal":18446744073709551615,"sub_index":4294967295}]},{"name":"speakers","kind":"diarize","model":"speaker","diarization":{"model":"speaker","model_identity":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","similarity_threshold":0.45,"ambiguity_margin":0.03,"min_rms":0.01,"max_speakers":4}}]}
             , actual);
             try std.testing.expect(std.mem.indexOf(u8, encoded, "private-") == null);
+            // The optional nested model has no minLength in the public schema.
+            try std.testing.expect(public_index_contract.createdFieldValueMatches(.chunker_diarization, "model", .{ .string = "" }));
             try std.testing.expect(!public_index_contract.createdFieldValueMatches(.chunker_diarization, "max_speakers", .{ .integer = 0 }));
             try std.testing.expect(!public_index_contract.createdFieldValueMatches(.chunker_diarization, "similarity_threshold", .{ .float = 1.1 }));
 

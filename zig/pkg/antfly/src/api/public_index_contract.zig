@@ -727,7 +727,8 @@ fn chunkOutputTargetFieldValueMatches(field: []const u8, value: std.json.Value) 
 }
 
 fn chunkDiarizationFieldValueMatches(field: []const u8, value: std.json.Value) bool {
-    if (std.mem.eql(u8, field, "model") or std.mem.eql(u8, field, "model_identity")) return isNonEmptyString(value);
+    if (std.mem.eql(u8, field, "model")) return isString(value);
+    if (std.mem.eql(u8, field, "model_identity")) return isNonEmptyString(value);
     if (std.mem.eql(u8, field, "max_speakers")) return isInteger(value) and value.integer >= 1 and value.integer <= 64;
     const number: f64 = switch (value) {
         .integer => |v| @floatFromInt(v),
