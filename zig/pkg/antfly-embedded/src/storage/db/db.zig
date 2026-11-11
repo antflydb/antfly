@@ -66902,7 +66902,17 @@ test "db implicit batch timestamps use the borrowed runtime clock" {
     vopr_io.realtime_ns += 3 * std.time.ns_per_s;
     try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{}" }}, .sync_level = .write });
     try std.testing.expectEqual(@as(u64, 10 * std.time.ns_per_s), try db.getTimestamp(alloc, "doc:b"));
-    try db.batch(.{ .writes = &.{.{ .key = "doc:c", .value = "{}" }}, .timestamp_ns = 99, .sync_level = .write });
+    // `admit_current` (the default `document_version_scheme`) resolves local
+    // writes to `.revision_v1`, which allocates each write's stored version
+    // from a DB-wide monotonic watermark independent of its admitted
+    // wall-clock timestamp (see `ttl.nextDocumentVersion`'s doc comment and
+    // `mutation_commit.zig`'s resolution of `admit_current`) -- by design,
+    // not a bug: it exists so local revisions never regress even when an
+    // explicit timestamp is chronologically earlier than one already
+    // committed (doc:b's write above already raised that watermark past 99).
+    // Request `.legacy` explicitly to exercise what this test actually
+    // means to verify: an explicit timestamp is honored verbatim.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:c", .value = "{}" }}, .timestamp_ns = 99, .sync_level = .write, .document_version_scheme = .legacy });
     try std.testing.expectEqual(@as(u64, 99), try db.getTimestamp(alloc, "doc:c"));
     // Persisted advisory status affects compression and disk-usage reports too;
     // its timestamp must remain in the same runtime as the owning DB.
