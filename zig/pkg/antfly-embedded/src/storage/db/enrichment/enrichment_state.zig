@@ -287,6 +287,13 @@ pub fn loadProjectionCheckpoint(alloc: Allocator, store: anytype, scope: []const
     return loadProjectionCheckpointTxn(alloc, &txn, scope);
 }
 
+pub fn loadAuthoritativeCheckpoint(alloc: Allocator, store: backend_erased.Store, scope: []const u8) !ProjectionCheckpoint {
+    var borrowed = store;
+    var txn = try borrowed.beginAuthorityProbe();
+    defer txn.abort();
+    return loadProjectionCheckpointTxn(alloc, &txn, scope);
+}
+
 fn loadProjectionCheckpointTxn(alloc: Allocator, txn: anytype, scope: []const u8) !ProjectionCheckpoint {
     const key = try appliedSequenceKey(alloc, scope);
     defer alloc.free(key);
@@ -519,12 +526,23 @@ pub fn loadRuntimeObservation(alloc: Allocator, store: anytype, scope: []const u
     defer runtime.deinit();
     var txn = try runtime.store.beginProbe();
     defer txn.abort();
-    const checkpoint = try loadProjectionCheckpointTxn(alloc, &txn, scope);
+    return loadRuntimeObservationTxn(alloc, &txn, scope);
+}
+
+pub fn loadAuthoritativeRuntimeObservation(alloc: Allocator, store: backend_erased.Store, scope: []const u8) !RuntimeObservation {
+    var borrowed = store;
+    var txn = try borrowed.beginAuthorityProbe();
+    defer txn.abort();
+    return loadRuntimeObservationTxn(alloc, &txn, scope);
+}
+
+fn loadRuntimeObservationTxn(alloc: Allocator, txn: anytype, scope: []const u8) !RuntimeObservation {
+    const checkpoint = try loadProjectionCheckpointTxn(alloc, txn, scope);
     return .{
         .applied = checkpoint.applied_sequence,
         .generation = checkpoint.generation,
-        .status = try loadRuntimeStatusTxn(alloc, &txn, scope),
-        .revision = try loadStatusRevisionTxn(alloc, &txn, scope),
+        .status = try loadRuntimeStatusTxn(alloc, txn, scope),
+        .revision = try loadStatusRevisionTxn(alloc, txn, scope),
     };
 }
 
