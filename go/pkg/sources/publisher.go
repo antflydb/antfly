@@ -30,6 +30,15 @@ import (
 
 // Publisher writes the ordinary Antfly table API. It installs no new database
 // routes and never treats a local catalog as server-side authorization.
+// ResponseBudgetError identifies a bounded response without conflating it with
+// provider outages or malformed successful responses. Callers may split reads.
+type ResponseBudgetError struct{ LimitBytes int64 }
+
+func (e *ResponseBudgetError) Error() string {
+	return fmt.Sprintf("Antfly response exceeds budget (%d bytes)", e.LimitBytes)
+}
+func (*ResponseBudgetError) AntflyResponseBudgetExceeded() bool { return true }
+
 type responseLimitKey struct{}
 
 type Publisher struct {
@@ -93,6 +102,9 @@ func (p *Publisher) callContentType(ctx context.Context, method, path string, bo
 		return nil, err
 	}
 	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, &PublishHTTPError{Status: response.StatusCode, RetryAt: providerRetryAt(response.Header.Get("Retry-After"), time.Now())}
+	}
 	limit := 8 << 20
 	if requested, ok := ctx.Value(responseLimitKey{}).(int); ok && requested > 0 && requested < limit {
 		limit = requested
@@ -102,10 +114,7 @@ func (p *Publisher) callContentType(ctx context.Context, method, path string, bo
 		return nil, err
 	}
 	if len(data) > limit {
-		return nil, fmt.Errorf("Antfly response exceeds budget")
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil, &PublishHTTPError{Status: response.StatusCode, RetryAt: providerRetryAt(response.Header.Get("Retry-After"), time.Now())}
+		return nil, &ResponseBudgetError{LimitBytes: int64(limit)}
 	}
 	if scope, ok := ctx.Value(searchScopeKey{}).(*searchScope); ok {
 		if err := scope.observe(response.Header); err != nil {
