@@ -516,8 +516,10 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
     const receiver_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vector-receiver", .{tmp.sub_path});
     defer alloc.free(receiver_path);
     const OpenOptions = @import("antfly_source_root").antfly_sources.physical_db.OpenOptions;
-    const donor_options: OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false };
-    const receiver_options: OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false };
+    // This harness delivers committed entries directly and advances replay at
+    // explicit checkpoints; unrelated worker lock contention is not a Raft owner.
+    const donor_options: OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    const receiver_options: OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
     var donor = try DB.open(alloc, donor_path, donor_options);
     defer donor.close();
     var receiver = try DB.open(alloc, receiver_path, receiver_options);

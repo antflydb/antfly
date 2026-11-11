@@ -6876,6 +6876,24 @@ test "storage owner quiesce drains leases and promotion callbacks before context
     try std.testing.expectError(error.Canceled, source.acquireDescriptor(7001, "docs", path, descriptor));
 }
 
+// Direct owner fixtures stand in for the Raft progress driver. Retry only an
+// exact committed term/index after definitive admission refusal; uncertain
+// mutation outcomes are never replayed here.
+fn applyCommittedForTest(source: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, descriptor: descriptor_contract.Descriptor, req: db_types.BatchRequest, term: u64, index: u64) !void {
+    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, group_id, table_name, descriptor, req, term, index) catch |err| switch (err) {
+            error.StorageBusy, error.RaftApplyWriterUnavailable => {
+                if (platform_time.monotonicNs() >= deadline) return err;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+}
+
 test "committed owner apply yields admission conflicts and retries the exact entry once" {
     const alloc = std.testing.allocator;
     const Source = ProvisionedKernelOwnerSource;
@@ -6892,7 +6910,7 @@ test "committed owner apply yields admission conflicts and retries the exact ent
             .lsm_root_generation = table_reads.backend_current_root_generation,
             .identity = .{ .table_id = 1, .shard_id = 1, .range_id = 1 },
         };
-        try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, .{
+        try applyCommittedForTest(&source, alloc, 1, "docs", descriptor, .{
             .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }},
         }, 1, 1);
         const increment: db_types.BatchRequest = .{ .transforms = &.{.{
@@ -6924,13 +6942,13 @@ test "committed owner apply yields admission conflicts and retries the exact ent
         // Publication may first retire the old owner. Bounded progress retries
         // reopen it without abandoning the original term/index identity.
         for (0..4) |_| {
-            source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, increment, 1, 2) catch |err| switch (err) {
+            applyCommittedForTest(&source, alloc, 1, "docs", descriptor, increment, 1, 2) catch |err| switch (err) {
                 error.StorageBusy => continue,
                 else => return err,
             };
             break;
         } else return error.TestOwnerAdmissionDidNotRecover;
-        try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, increment, 1, 2);
+        try applyCommittedForTest(&source, alloc, 1, "docs", descriptor, increment, 1, 2);
         var reader = try source.acquireDescriptor(1, "docs", path, descriptor);
         defer reader.deinit();
         var value = try reader.owner().lookupJson("docs", "{\"key\":\"doc:counter\",\"include_all_fields\":true}");
@@ -7315,14 +7333,14 @@ test "committed relational catch-up applies an older pinned schema version" {
     };
     var current = old;
     current.schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"relational_indexes\":[{\"name\":\"id_idx\",\"keys\":[{\"column\":\"id\"}]}],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"extra\":{\"type\":\"string\"}},\"additionalProperties\":false}}}}";
-    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+    try applyCommittedForTest(&source, alloc, 1, "docs", old, .{
         .writes = &.{.{ .key = "doc:first", .value = "{\"id\":1}" }},
         .relational_schema_version = 1,
     }, 1, 1);
     var lease = try source.acquireDescriptor(1, "docs", path, current);
     lease.deinit();
     for (0..4) |_| {
-        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+        applyCommittedForTest(&source, alloc, 1, "docs", old, .{
             .writes = &.{.{ .key = "doc:second", .value = "{\"id\":2}" }},
             .relational_schema_version = 1,
         }, 1, 2) catch |err| switch (err) {
@@ -7396,7 +7414,7 @@ test "committed catch-up does not reconcile an older index-only descriptor" {
         .schema_json = old.schema_json,
         .indexes_json = "{\"new_idx\":{\"type\":\"full_text\"}}",
     };
-    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+    try applyCommittedForTest(&source, alloc, 1, "docs", old, .{
         .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"first\"}" }},
     }, 1, 1);
     {
@@ -7404,7 +7422,7 @@ test "committed catch-up does not reconcile an older index-only descriptor" {
         lease.deinit();
     }
     for (0..4) |_| {
-        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+        applyCommittedForTest(&source, alloc, 1, "docs", old, .{
             .writes = &.{.{ .key = "doc:second", .value = "{\"title\":\"second\"}" }},
         }, 1, 2) catch |err| switch (err) {
             error.StorageBusy => continue,
@@ -7439,7 +7457,7 @@ test "source owner graph replay prepares its pinned index catalog" {
     {
         var initial = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
         defer initial.deinit();
-        try initial.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", old, .{
+        try applyCommittedForTest(&initial, alloc, 1, "docs", old, .{
             .writes = &.{ .{ .key = "a", .value = "{}" }, .{ .key = "b", .value = "{}" } },
         }, 1, 1);
     }
@@ -7449,7 +7467,7 @@ test "source owner graph replay prepares its pinned index catalog" {
     graph.schema_json = "{\"version\":1}";
     graph.indexes_json = "{\"links\":{\"type\":\"graph\",\"edge_types\":[{\"name\":\"link\",\"field\":\"ref\"}]}}";
     for (0..8) |_| {
-        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", graph, .{
+        applyCommittedForTest(&source, alloc, 1, "docs", graph, .{
             .writes = &.{.{ .key = "a", .value = "{\"ref\":\"b\"}" }},
         }, 1, 2) catch |err| switch (err) {
             error.StorageBusy => continue,
@@ -7458,7 +7476,7 @@ test "source owner graph replay prepares its pinned index catalog" {
         break;
     } else return error.TestOwnerAdmissionDidNotRecover;
     // An exact redelivery must remain safe after the required catalog is ready.
-    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", graph, .{
+    try applyCommittedForTest(&source, alloc, 1, "docs", graph, .{
         .graph_writes = &.{.{ .index_name = "links", .source = "a", .target = "b", .edge_type = "link" }},
     }, 1, 2);
     const path = try std.fmt.allocPrint(alloc, "{s}/group-1/table-db", .{root});
@@ -7489,13 +7507,13 @@ test "current catalog acquisition replaces a replay-only owner with the same des
     {
         var initial = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
         defer initial.deinit();
-        try initial.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, .{
+        try applyCommittedForTest(&initial, alloc, 1, "docs", descriptor, .{
             .writes = &.{.{ .key = "doc:first", .value = "{\"title\":\"first\"}" }},
         }, 1, 1);
     }
     var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
     defer source.deinit();
-    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", descriptor, .{
+    try applyCommittedForTest(&source, alloc, 1, "docs", descriptor, .{
         .writes = &.{.{ .key = "doc:second", .value = "{\"title\":\"second\"}" }},
     }, 1, 2);
     try std.testing.expectEqual(@as(u64, 1), source.cacheStats().miss_count);

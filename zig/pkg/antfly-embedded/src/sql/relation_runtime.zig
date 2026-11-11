@@ -217,6 +217,10 @@ const SetTestBackend = struct {
 };
 
 test "SQL weighted relational operators retain bags and unwind failed negotiation" {
+    // Retain leak/safety checks and every fault position without collecting
+    // allocation/free stack traces on the successful allocation path.
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
     const Fixture = struct {
         const This = @This();
         fn checkpoint(_: *anyopaque) !void {}
@@ -381,13 +385,13 @@ test "SQL weighted relational operators retain bags and unwind failed negotiatio
             try std.testing.expectEqual(self.opened, self.closed);
         }
     };
-    try Fixture.run(std.testing.allocator, null);
-    try Fixture.spillRun(std.testing.allocator, false);
-    try Fixture.spillRun(std.testing.allocator, true);
+    try Fixture.run(checked.allocator(), null);
+    try Fixture.spillRun(checked.allocator(), false);
+    try Fixture.spillRun(checked.allocator(), true);
     // Each query owns a separate statement and cursor cohort. Enumerate every
     // allocation failure per query, avoiding quadratic replay of earlier cases.
     for (0..Fixture.cases.len + 3) |index|
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{@as(?usize, index)});
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(checked.allocator(), Fixture.run, .{@as(?usize, index)});
 }
 
 test "SQL row membership executes captured typed relations with NULL-aware truth and query boundaries" {

@@ -561,6 +561,7 @@ pub const storage_dense_work_admission = @import("storage/dense_work_admission.z
 pub const storage_docstore = @import("storage/docstore.zig");
 pub const storage_generation_publication = @import("storage/generation_publication.zig");
 pub const storage_hbc_adapter = @import("storage/hbc_adapter.zig");
+pub const storage_leann_filter = @import("storage/leann_filter.zig");
 pub const storage_leann_store = @import("storage/leann_store.zig");
 pub const storage_leann_replica = @import("storage/leann_replica.zig");
 pub const storage_leann_replicated = @import("storage/leann_replicated.zig");

@@ -37,6 +37,13 @@ info:
     offline upstreams do not remove configured aliases. Request IDs and
     per-attempt telemetry contain target identities and actual usage only.
 
+    ## Media source security
+
+    Omitted or empty policies deny HTTP(S), file, and S3 while allowing data
+    URIs; omitted allowed_hosts and allowed_paths remain explicit deny-all lists
+    even when another field is configured. Remote URL byte potential is reserved
+    before fetch. Configure explicit host/path allowlists to enable remote media.
+
     ## Invocation budgets
 
     Public database inference endpoints accept one optional

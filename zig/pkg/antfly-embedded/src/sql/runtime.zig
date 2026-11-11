@@ -5873,7 +5873,9 @@ test "external lake SQL finalized join state preserves empty globals HAVING and 
 }
 
 test "external lake SQL plain count consumes resident and spilled typed join partials" {
-    const a = std.testing.allocator;
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const a = checked.allocator();
     for ([_][]const u8{
         "SELECT COUNT(*) FROM (VALUES (1),(1)) l(k) JOIN (VALUES (1),(1)) r(k) ON l.k=r.k",
         "SELECT COUNT(*) FROM (VALUES (NULL),(NULL)) l(k) JOIN (VALUES (NULL),(NULL)) r(k) ON l.k=r.k",

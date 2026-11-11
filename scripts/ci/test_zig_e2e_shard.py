@@ -354,6 +354,7 @@ class ShardTests(unittest.TestCase):
                 "e2e-base-tests",
                 "e2e-base-low-fd",
                 "embedded-sdk-native",
+                "source-sdk-native",
                 "pgwire-driver-conformance",
                 "better-auth",
             }
@@ -362,6 +363,7 @@ class ShardTests(unittest.TestCase):
         self.assertIn('test "$LOW_FD_RESULT" = "success"', gate)
         self.assertIn('test "$PLAN_RESULT" = "success"', gate)
         self.assertIn('test "$BETTER_AUTH_RESULT" = "success"', gate)
+        self.assertIn('test "$SOURCE_SDK_RESULT" = "success"', gate)
         for block in workflow.split('if ! "$helper"')[1:3]:
             paths = shlex.split(
                 block.split("\n          then", 1)[0]

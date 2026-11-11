@@ -3630,10 +3630,21 @@ test "initial child root receipt requires enrollment current reporter and exact 
         defer txn.abort();
         try std.testing.expectError(error.InitialChildRootReceiptChanged, store.requireInitialChildRootReceiptTxn(&txn, group_id, receipt));
     }
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, store.storeRootControlJson(alloc, group_id, .{ .enrollment_status = identity }));
     const enrollment = try store_root_enrollment.Request.sign(identity, seed);
     const encoded = try std.json.Stringify.valueAlloc(alloc, enrollment, .{});
     defer alloc.free(encoded);
     try store.applyStandaloneCommand(group_id, .{ .apply_store_root_enrollment = encoded });
+    {
+        const status = try store.storeRootControlJson(alloc, group_id, .{ .enrollment_status = identity });
+        defer alloc.free(status);
+        var enrolled = try std.json.parseFromSlice(store_root_enrollment.Identity, alloc, status, .{});
+        defer enrolled.deinit();
+        try std.testing.expectEqual(identity, enrolled.value);
+        var conflicting = identity;
+        conflicting.node_id += 1;
+        try std.testing.expectError(error.StoreRootEnrollmentChanged, store.storeRootControlJson(alloc, group_id, .{ .enrollment_status = conflicting }));
+    }
     {
         var txn = try store.store.beginWriteTxn();
         defer txn.abort();
@@ -13802,8 +13813,13 @@ pub const RaftApplyStore = struct {
                 const identity = if (control == .enrollment_status) control.enrollment_status else control.authorized_page.identity;
                 var txn = try self.store.beginReadTxn();
                 defer txn.abort();
+                if (control == .enrollment_status) {
+                    // An unresolved proposal may not be visible yet. Absence
+                    // is not proof of a conflicting immutable enrollment.
+                    if (!try self.storeRootEnrollmentPresentTxn(&txn, group_id, identity)) return error.MetadataMutationOutcomeUnknown;
+                    return std.json.Stringify.valueAlloc(alloc, identity, .{});
+                }
                 try self.requireStoreRootEnrollmentTxn(&txn, group_id, identity);
-                if (control == .enrollment_status) return std.json.Stringify.valueAlloc(alloc, identity, .{});
                 const request = control.authorized_page;
                 try request.verify();
                 try request.page.validate(group_id);
@@ -13818,12 +13834,17 @@ pub const RaftApplyStore = struct {
     }
 
     fn requireStoreRootEnrollmentTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, identity: store_root_enrollment.Identity) !void {
+        if (!try self.storeRootEnrollmentPresentTxn(txn, group_id, identity)) return error.StoreRootEnrollmentChanged;
+    }
+
+    fn storeRootEnrollmentPresentTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, identity: store_root_enrollment.Identity) !bool {
         try identity.validate();
         var key_buf: [256]u8 = undefined;
-        const bytes = (try stagingGet(txn, try store_root_enrollment.key(&key_buf, group_id, identity.store_id, identity.root_incarnation))) orelse return error.StoreRootEnrollmentChanged;
+        const bytes = (try stagingGet(txn, try store_root_enrollment.key(&key_buf, group_id, identity.store_id, identity.root_incarnation))) orelse return false;
         var parsed = try std.json.parseFromSlice(store_root_enrollment.Identity, self.alloc, bytes, .{});
         defer parsed.deinit();
         if (!std.meta.eql(parsed.value, identity)) return error.StoreRootEnrollmentChanged;
+        return true;
     }
 
     fn applyStoreRootEnrollmentTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {

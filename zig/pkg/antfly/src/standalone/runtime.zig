@@ -7171,8 +7171,8 @@ fn publicHttpServerConfig(bind_host: []const u8, bind_port: u16) httpx.ServerCon
         .max_route_body_size = @import("antfly_public_limits").max_route_body_bytes,
         .max_streamed_body_size = native_checkpoint_upload_limit,
         // Bound aggregate request-body buffering across HTTP/1 and HTTP/2.
-        // Four maximum-sized public requests may complete while excess uploads
-        // are shed before allocator pressure becomes systemic.
+        // Reserve four ordinary public bodies, or one larger explicitly
+        // registered route body after normalization; shed excess uploads.
         .request_body_buffer_budget_bytes = 256 * 1024 * 1024,
         // This is a transport safeguard for every H1 request body. Keep it
         // independent from admission.query.max_concurrent_requests.
@@ -12320,7 +12320,7 @@ test "standalone public HTTP server is restart-safe and uses public API request 
     try std.testing.expect(cfg.reuse_address);
     try std.testing.expect(!cfg.reuse_port);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_body_size);
-    try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), cfg.request_body_buffer_budget_bytes);
+    try std.testing.expectEqual(@max(@as(usize, 256 * 1024 * 1024), @import("antfly_public_limits").max_route_body_bytes), cfg.request_body_buffer_budget_bytes);
     try std.testing.expectEqual(@as(?usize, native_checkpoint_upload_limit), cfg.max_streamed_body_size);
     try std.testing.expect(cfg.max_connections >= 1);
     try std.testing.expect(cfg.max_connections <= public_http_connection_ceiling);
