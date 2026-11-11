@@ -24,9 +24,17 @@ SCRIPT = Path(__file__).with_name("install_ubuntu_packages.sh")
 
 
 class InstallUbuntuPackagesTests(unittest.TestCase):
-    def run_install(self, failures, install_status=0):
+    def run_install(self, failures, install_status=0, sources=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            source_env = {}
+            if sources is not None:
+                source = root / "ubuntu.sources"
+                if sources == "present":
+                    source.write_text(
+                        "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu\nSuites: noble\nComponents: main universe\n"
+                    )
+                source_env["ANTFLY_UBUNTU_APT_SOURCES"] = str(source)
             commands = {
                 "sudo": '#!/bin/sh\nexec "$@"\n',
                 "sleep": "#!/bin/sh\nexit 0\n",
@@ -57,12 +65,15 @@ else:
                     "APT_TEST_ROOT": directory,
                     "APT_TEST_FAILURES": str(failures),
                     "APT_TEST_INSTALL_STATUS": str(install_status),
+                    **source_env,
                 },
                 check=False,
             )
-            calls = [
-                json.loads(line) for line in (root / "calls").read_text().splitlines()
-            ]
+            calls = (
+                [json.loads(line) for line in (root / "calls").read_text().splitlines()]
+                if (root / "calls").exists()
+                else []
+            )
             return result.returncode, calls
 
     def test_success_installs_once_after_verified_refresh(self):
@@ -73,6 +84,22 @@ else:
         self.assertEqual(
             calls[1][-4:], ["install", "-y", "pkg-config", "build-essential"]
         )
+
+    def test_official_sources_isolate_refresh_and_resolution_from_unrelated_ppas(self):
+        status, calls = self.run_install(1, sources="present")
+        self.assertEqual(status, 0)
+        source = next(
+            arg for arg in calls[0] if arg.startswith("Dir::Etc::sourcelist=")
+        )
+        self.assertTrue(source.endswith("/ubuntu.sources"))
+        for call in calls:
+            self.assertIn(source, call)
+            self.assertIn("Dir::Etc::sourceparts=-", call)
+
+    def test_missing_explicit_sources_never_falls_back_to_unrelated_repositories(self):
+        status, calls = self.run_install(0, sources="missing")
+        self.assertNotEqual(status, 0)
+        self.assertEqual(calls, [])
 
     def test_transient_index_failure_retries_before_installing(self):
         status, calls = self.run_install(1)
