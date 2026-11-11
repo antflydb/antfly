@@ -7123,7 +7123,20 @@ pub const HostedProvisionedTableReadSource = struct {
         return .{
             .ptr = self,
             .supports_sql_range_guards = true,
-            .strict_read_index_absence = if (self.local_read_source) |local| local.strict_read_index_absence else false,
+            // Match ProvisionedTableReadSource.source()'s fallback below: a
+            // full storage configuration (not control-only) can assert
+            // read-index-strength absence once a route fence is held, same
+            // as the non-hosted sibling. Defaulting to `false` here instead
+            // of `!control_only_storage_sources` meant a remote group's own
+            // confirmed, route-fenced "not found" never got the
+            // AuthoritativeLookupMissing/read_index_absence_header treatment
+            // (internal_group_operations.zig's `reads.strict_read_index_absence`
+            // check), so a hosted lookup against a key with no route in the
+            // table could never trust *any* replica's answer as definitive
+            // under read_index -- not even the group's confirmed current
+            // leader's -- falling through lookupAcrossActivePlacements to
+            // StorageReadTemporarilyUnavailable forever.
+            .strict_read_index_absence = if (self.local_read_source) |local| local.strict_read_index_absence else !control_only_storage_sources,
             // Both alternatives have static lifetime. A runtime conditional
             // inside an address-of literal would leave a stack-backed vtable.
             .vtable = if (self.catalog.vtable.privacy_policy_binding != null or self.catalog.vtable.linearizable_table_routing_snapshot != null)
@@ -7244,7 +7257,7 @@ pub const HostedProvisionedTableReadSource = struct {
         // sources may downgrade NotLeader to stale; remote HTTP misses remain
         // ambiguous, so neither takes this shortcut.
         if (route == .local and consistency == .read_index and
-            (if (self.local_read_source) |local| local.strict_read_index_absence else false)) return null;
+            (if (self.local_read_source) |local| local.strict_read_index_absence else !control_only_storage_sources)) return null;
         return try lookupAcrossActivePlacements(self, alloc, group_id, table_name, key, scoped_opts, consistency, route);
     }
 
@@ -18579,6 +18592,20 @@ fn consumerTests() type {
             const catalog: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.adminSnapshot, .free_admin_snapshot = Fixture.freeAdminSnapshot, .resolve_route = Fixture.resolve, .restore_scope_for_group = Fixture.restoreScope } };
             const router: table_router.HostedGroupRouter = .{ .ptr = &fixture, .vtable = &.{ .local_node_id = Fixture.localNodeId, .local_status = Fixture.localStatus, .group_leader_node_id = Fixture.leader, .node_base_uri = Fixture.nodeBaseUri } };
             var hosted = HostedProvisionedTableReadSource.init("unused", catalog, raft_mod.read_gate.alreadyReadSafeBarrier(), router, .{ .ptr = &fixture, .vtable = &.{ .execute = Fixture.execute } });
+            // Regression: with no local_read_source attached (the ordinary
+            // full-storage VOPR/production shape), strict_read_index_absence
+            // must match ProvisionedTableReadSource.source()'s own fallback
+            // (!control_only_storage_sources), not unconditionally false.
+            // The hosted source previously defaulted to false regardless,
+            // so internal_group_operations.zig's `reads.strict_read_index_absence`
+            // check never returned AuthoritativeLookupMissing for a group's
+            // own confirmed, route-fenced "not found" -- not even from its
+            // current leader -- so a hosted lookup for a key with no route
+            // could never trust any replica's answer as definitive under
+            // read_index, falling through lookupAcrossActivePlacements to
+            // StorageReadTemporarilyUnavailable forever (full-cluster.metadata-
+            // partition's history-completes hang).
+            if (comptime !control_only_storage_sources) try std.testing.expect(hosted.source().strict_read_index_absence);
             _ = hosted.withLocalReadSource(.{ .ptr = &fixture, .strict_read_index_absence = true, .vtable = &.{ .lookup = unsupportedPhysicalTopLevelLookup, .scan = unsupportedPhysicalTopLevelScan, .query = unsupportedPhysicalTopLevelQuery, .lookup_group_local_routed = Fixture.lookup } });
             for (0..36) |_| try std.testing.expect((try hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index)) == null);
             try std.testing.expectEqual(@as(usize, 36), fixture.reads);
