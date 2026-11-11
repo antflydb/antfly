@@ -112,6 +112,8 @@ pub const SearchRequest = struct {
     /// Borrowed request-lifecycle signal. Search loops poll this at bounded
     /// intervals so a disconnected caller does not retain query capacity.
     cancellation: ?CancellationToken = null,
+    /// Absolute monotonic deadline for storage and provider work.
+    deadline_ns: ?u64 = null,
 };
 
 pub fn normalizedSearchEffort(req: SearchRequest) ?f32 {

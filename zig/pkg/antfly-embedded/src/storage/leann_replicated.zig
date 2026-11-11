@@ -720,10 +720,11 @@ pub const ReplicatedState = struct {
         errdefer out.deinit();
         if (req.k == 0) return out;
         if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        if (req.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
         const loader = self.loader orelse return error.MissingVectorLoader;
         const budget_ms = if (self.opts.transient) self.opts.reembed_budget_ms else 0;
         var gate = SearchGate.init(req, if (loader.load_batch_session != null) 0 else budget_ms);
-        var recovery = @import("leann_recovery.zig").Session{ .cancellation = req.cancellation, .budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms };
+        var recovery = @import("leann_recovery.zig").Session{ .cancellation = req.cancellation, .deadline_ns = req.deadline_ns, .budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms };
         defer recovery.deinit();
         var ctx = KeyLoader{ .state = @constCast(self), .loader = loader, .reembed_ns = &gate.reembed_ns, .recovery = &recovery };
         var want: u32 = @intCast(@max(req.k, 1));

@@ -18,6 +18,7 @@ const search_types = @import("antfly_vectorindex").search_types;
 /// Borrowed by each loader call; owned by one search, never shared across queries.
 pub const Session = struct {
     cancellation: ?search_types.CancellationToken = null,
+    deadline_ns: ?u64 = null,
     budget_ns: u64 = 0,
     elapsed_ns: u64 = 0,
     state: ?*anyopaque = null,
@@ -44,5 +45,6 @@ pub const Session = struct {
 
     pub fn check(self: *const Session) !void {
         if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
     }
 };

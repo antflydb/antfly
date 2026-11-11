@@ -667,6 +667,7 @@ pub const LeannStore = struct {
         errdefer out.deinit();
         if (req.k == 0) return out;
         if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        if (req.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
 
         var filter = try Filter.init(alloc, req);
         defer filter.deinit(alloc);
@@ -699,7 +700,7 @@ pub const LeannStore = struct {
         const budget_ms = if (self.opts.transient) self.opts.reembed_budget_ms else 0;
         const session_loader = if (self.loader) |loader| loader.load_batch_session != null else false;
         var gate = SearchGate.init(req, if (session_loader) 0 else budget_ms);
-        var recovery = RecoverySession{ .cancellation = req.cancellation, .budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms };
+        var recovery = RecoverySession{ .cancellation = req.cancellation, .deadline_ns = req.deadline_ns, .budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms };
         defer recovery.deinit();
         var ctx = SourceCtx{ .recovery = &recovery, .store = self, .far_from = req.query, .reembed_ns = &gate.reembed_ns, .strict = search_types.requiresExhaustiveCoverage(req) };
         const node_filter = NodeFilter{ .store = self, .filter = &filter };
@@ -1206,24 +1207,27 @@ test "LEANN allowlist routing bounds direct scoring on large indexes" {
 /// scoring rather than returning unverified candidates.
 pub const SearchGate = struct {
     cancellation: ?search_types.CancellationToken,
+    deadline_ns: ?u64,
     budget_ns: u64,
     reembed_ns: u64 = 0,
 
     pub fn init(req: search_types.SearchRequest, budget_ms: u32) SearchGate {
         return .{
             .cancellation = req.cancellation,
+            .deadline_ns = req.deadline_ns,
             .budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms,
         };
     }
 
     pub fn recomputeGate(self: *const SearchGate) ?leann.RecomputeGate {
-        if (self.cancellation == null and self.budget_ns == 0) return null;
+        if (self.cancellation == null and self.deadline_ns == null and self.budget_ns == 0) return null;
         return .{ .ctx = self, .check_fn = check, .cancel_fn = checkCancellation };
     }
 
     fn checkCancellation(raw: *const anyopaque) anyerror!void {
         const self: *const SearchGate = @ptrCast(@alignCast(raw));
         if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
     }
 
     fn check(raw: *const anyopaque) anyerror!bool {

@@ -27465,18 +27465,38 @@ pub const DB = struct {
         if (context.enrichment_runtime) |runtime| return runtime;
         const runtime = context.query_recovery_runtime orelse return error.ReembedUnavailable;
         if (context.query_recovery_ready.load(.acquire)) return runtime;
-        // Provider construction is local and bounded. A concurrent miss can
-        // wait for that attempt without holding the lock during inference.
-        while (!context.query_recovery_mutex.tryLock()) {
+        const io = context.io orelse return error.ReembedUnavailable;
+        const mutex = &context.query_recovery_mutex;
+        mutex.lockUncancelable(io);
+        defer mutex.unlock(io);
+        while (context.query_recovery_in_progress) {
             if (session) |active| try active.check();
-            platform_time.yieldNow();
+            // Callback cancellation has no futex to wait on. Sleep until the
+            // owner broadcasts, or briefly wake to observe a request limit.
+            const timeout: std.Io.Timeout = if (session) |active| limit: {
+                if (active.cancellation == null and active.deadline_ns == null) break :limit .none;
+                const remaining = if (active.deadline_ns) |deadline| deadline -| monotonicTimeNs() else std.math.maxInt(u64);
+                const wait_ns = if (active.cancellation != null) @min(remaining, 10 * std.time.ns_per_ms) else remaining;
+                break :limit .{ .duration = .{ .raw = .fromNanoseconds(wait_ns), .clock = .awake } };
+            } else .none;
+            context.query_recovery_condition.waitTimeout(io, mutex, timeout) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => return error.Cancelled,
+            };
         }
-        defer context.query_recovery_mutex.unlock();
-        if (context.query_recovery_ready.load(.acquire)) return runtime;
         if (session) |active| try active.check();
+        if (context.query_recovery_ready.load(.acquire)) return runtime;
         const factory = context.query_recovery_factory orelse return error.ReembedUnavailable;
         if (monotonicTimeNs() < context.query_recovery_retry_at) return error.ReembedUnavailable;
-        var config = factory.create(factory.ptr) catch |err| {
+        context.query_recovery_in_progress = true;
+        mutex.unlock(io);
+        const created = factory.create(factory.ptr);
+        mutex.lockUncancelable(io);
+        defer {
+            context.query_recovery_in_progress = false;
+            context.query_recovery_condition.broadcast(io);
+        }
+        var config = created catch |err| {
             if (err == error.OutOfMemory) {
                 context.query_recovery_retry_at = monotonicTimeNs() +| 100 * std.time.ns_per_ms;
             } else {
@@ -134954,11 +134974,15 @@ fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool, transien
         config: enrichment_runtime_mod.Config,
         attempts: usize = 0,
         released: bool = false,
+        entered: std.Io.Event = .unset,
+        proceed: std.Io.Event = .unset,
 
         fn create(raw: *anyopaque) !enrichment_runtime_mod.Config {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.attempts += 1;
             if (self.attempts == 1) return error.OutOfMemory;
+            self.entered.set(std.testing.io);
+            self.proceed.waitUncancelable(std.testing.io);
             return self.config;
         }
 
@@ -134992,6 +135016,26 @@ fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool, transien
         try std.testing.expect(!factory.released);
         // Advance past the retry deadline without sleeping in the test.
         restored.async_context.query_recovery_retry_at = 0;
+        const Setup = struct {
+            fn run(context: *AsyncContext, failure: *?anyerror) void {
+                _ = DB.queryRecoveryRuntime(context, null) catch |err| {
+                    failure.* = err;
+                    return;
+                };
+            }
+        };
+        var owner_error: ?anyerror = null;
+        {
+            const owner = try std.Thread.spawn(.{}, Setup.run, .{ restored.async_context, &owner_error });
+            defer {
+                factory.proceed.set(std.testing.io);
+                owner.join();
+            }
+            try factory.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            const session = @import("../leann_recovery.zig").Session{ .deadline_ns = monotonicTimeNs() + 20 * std.time.ns_per_ms };
+            try std.testing.expectError(error.Timeout, DB.queryRecoveryRuntime(restored.async_context, &session));
+        }
+        try std.testing.expectEqual(@as(?anyerror, null), owner_error);
     }
     var results = try entry.index.searchWithRequest(.{ .query = query, .k = 1, .search_effort = if (transient) 1 else null });
     defer results.deinit();
