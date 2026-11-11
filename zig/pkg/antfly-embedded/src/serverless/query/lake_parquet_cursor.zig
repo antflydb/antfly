@@ -691,7 +691,7 @@ pub const Cursor = struct {
         var count: usize = 0;
         var planned: usize = 0;
         for (self.columns) |*column| {
-            if (std.mem.startsWith(u8, column.chunk.logical_type, "vector_f32:")) continue;
+            if (VectorReader.supports(column.chunk.logical_type)) continue;
             if (self.filter != null and !column.required) continue;
             if (planned == 4) break;
             if (column.consumed != column.count) continue;
@@ -834,7 +834,7 @@ pub const Cursor = struct {
         // Speculative discovery runs in the admitted I/O phase, using the
         // heap-owned admission's locked backing allocator for retained state.
         for (self.columns) |*column| {
-            if (std.mem.startsWith(u8, column.chunk.logical_type, "vector_f32:")) {
+            if (VectorReader.supports(column.chunk.logical_type)) {
                 if ((!required_only or column.required) and column.first + column.count <= self.position) try self.advanceVector(column);
                 continue;
             }
@@ -1065,18 +1065,28 @@ pub const Cursor = struct {
             _ = vector.output.reset(.free_all);
             const a = vector.output.allocator();
             var values: std.ArrayList([]const f32) = .empty;
+            var json: std.ArrayList([]const u8) = .empty;
             var nulls: std.ArrayList(u8) = .empty;
             var retained_bytes: usize = 0;
             const cohort_bytes = @min(8 * 1024 * 1024, self.limits.max_decoded_bytes / @max(1, self.columns.len));
-            while (values.items.len < 4096 and column.first + values.items.len < self.group.row_count) {
+            while (nulls.items.len < 4096 and column.first + nulls.items.len < self.group.row_count) {
                 const row = (try vector.nextRow(input, a)) orelse return error.ParquetRowGroupRowCountMismatch;
-                try values.append(a, row.values);
+                if (vector.is_double) {
+                    // Keep authored doubles exact for SQL/stored-source reads.
+                    // Embedding consumers perform their existing float32 cast.
+                    const encoded = try std.json.Stringify.valueAlloc(a, row.doubles, .{});
+                    try json.append(a, encoded);
+                    retained_bytes += row.doubles.len * @sizeOf(f64) + encoded.len + @sizeOf([]const u8) + 1;
+                } else {
+                    try values.append(a, row.values);
+                    retained_bytes += row.values.len * @sizeOf(f32) + @sizeOf([]const f32) + 1;
+                }
                 try nulls.append(a, @intFromBool(row.is_null));
-                retained_bytes += row.values.len * @sizeOf(f32) + @sizeOf([]const f32) + 1;
                 if (retained_bytes >= cohort_bytes) break;
             }
-            column.count = values.items.len;
+            column.count = nulls.items.len;
             vector.vectors = values.items;
+            vector.json = json.items;
             vector.nulls = nulls.items;
             if (column.first + column.count == self.group.row_count and try vector.available(input)) return error.ParquetRowGroupRowCountMismatch;
             if (column.first + column.count > self.position) break;
@@ -1108,7 +1118,7 @@ pub const Cursor = struct {
             }
             if (column.vector) |vector| {
                 const begin: usize = @intCast(self.position - column.first);
-                try vectors.append(a, .{ .name = column.chunk.column_id, .values = .{ .vector_f32 = vector.vectors[begin..][0..count] }, .nulls = .{ .bytes = vector.nulls[begin..][0..count] } });
+                try vectors.append(a, .{ .name = column.chunk.column_id, .values = if (vector.is_double) .{ .json = vector.json[begin..][0..count] } else .{ .vector_f32 = vector.vectors[begin..][0..count] }, .nulls = .{ .bytes = vector.nulls[begin..][0..count] } });
                 continue;
             }
             const decoded = if (column.cached) |lease| lease.item.payload.columns[0] else column.decoded.?.value.columns[0];

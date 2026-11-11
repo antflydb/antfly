@@ -1,6 +1,6 @@
 # Native Parquet vector fixtures
 
-Generated with PyArrow 25.0.0. Each file contains 231 rows with columns `body`
+Generated with PyArrow 25.0.1. Each file contains 231 rows with columns `body`
 (UTF-8), `dense` (`list<float32>`), and `sparse` (UTF-8). Row `i` in file `f`
 contains `file-{f}-value-{i}`, `[float(i), 1.0]`, and `{"1":2}`.
 
@@ -25,3 +25,9 @@ The native execution integration test builds all index families, publishes the
 artifacts, and reopens the dense index. The typed case also exercises four-bit
 quantization. Reader unit tests separately force vectors across page boundaries,
 null/empty lists, null coordinates, and invalid continuations.
+
+
+The two `lake_double_vectors_*.parquet` fixtures use the same generation options
+with `pa.list_(pa.float64())` and values `[float(i) + 1e-8,
+1.0000000000000002]`. The integration test checks the original double values at
+the SQL/JSON boundary before building and reopening the native index families.

@@ -53,14 +53,18 @@ fn expectCandidate(a: A, expected: catalog.Publication, expected_declarations: [
 }
 
 test "external lake execution operation owns clients checkpoints cancellation and fenced results" {
-    try testNativeExecution(false);
+    try testNativeExecution(false, false);
 }
 
 test "external lake execution builds native typed Parquet vector lists across pages" {
-    try testNativeExecution(true);
+    try testNativeExecution(true, false);
 }
 
-fn testNativeExecution(typed_vectors: bool) !void {
+test "external lake execution preserves DOUBLE array precision through native index builds" {
+    try testNativeExecution(true, true);
+}
+
+fn testNativeExecution(typed_vectors: bool, double_vectors: bool) !void {
     const a = std.testing.allocator;
     var directory = try local.common_test_directory.TestDirectory.init("lake-execution-native");
     defer directory.cleanup();
@@ -88,7 +92,9 @@ fn testNativeExecution(typed_vectors: bool) !void {
         });
         defer a.free(data);
         var name: [32]u8 = undefined;
-        const typed_data = if (file == 0) @embedFile("testdata/lake_vectors_0.parquet") else @embedFile("testdata/lake_vectors_1.parquet");
+        const typed_data = if (double_vectors)
+            (if (file == 0) @embedFile("testdata/lake_double_vectors_0.parquet") else @embedFile("testdata/lake_double_vectors_1.parquet"))
+        else if (file == 0) @embedFile("testdata/lake_vectors_0.parquet") else @embedFile("testdata/lake_vectors_1.parquet");
         var put = try client.putObject("antfly", try std.fmt.bufPrint(&name, "part-{d}.parquet", .{file}), if (typed_vectors) typed_data else data, .{});
         put.deinit(a);
     }
@@ -98,6 +104,18 @@ fn testNativeExecution(typed_vectors: bool) !void {
     defer binding.deinit(a);
     var source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
     defer source.deinit();
+    if (double_vectors) {
+        var stream = try local.serverless_query_lake_stream.Stream.init(a, &source, &.{"dense"}, &.{}, .{ .io = std.testing.io }, .{});
+        defer stream.deinit();
+        const batch = (try stream.next()).?;
+        const column = batch.findColumn("dense").?;
+        try std.testing.expect(column.values == .json);
+        var check_arena = std.heap.ArenaAllocator.init(a);
+        defer check_arena.deinit();
+        const value = try column.values.jsonAt(check_arena.allocator(), 0);
+        try std.testing.expectEqual(@as(f64, 1e-8), try std.fmt.parseFloat(f64, value.array.items[0].number_string));
+        try std.testing.expectEqual(@as(f64, 1.0000000000000002), try std.fmt.parseFloat(f64, value.array.items[1].number_string));
+    }
     var store = try @import("lake_index_store.zig").Store.openNative(a, null, null, false, .standalone, directory.path());
     defer store.deinit();
     const table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = schema, .indexes_json = if (typed_vectors) "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":true},\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"rows\",\"op\":\"count\"}]},\"dense\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"lake_bulk_build\":\"lloyd\",\"quantization_bits\":4,\"quantization_refine\":\"all\"},\"sparse\":{\"type\":\"embeddings\",\"external\":true,\"sparse\":true}}" else "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":true},\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"rows\",\"op\":\"count\"}]},\"dense\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"lake_bulk_build\":\"lloyd\"},\"sparse\":{\"type\":\"embeddings\",\"external\":true,\"sparse\":true}}" };

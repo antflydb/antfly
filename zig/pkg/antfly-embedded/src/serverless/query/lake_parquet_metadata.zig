@@ -812,7 +812,7 @@ fn collectSchemaColumnsAlloc(
                 errdefer alloc.free(name);
                 const physical = try std.fmt.allocPrint(alloc, "{s}.{s}.{s}", .{ element.name, repeated.name, leaf.name });
                 errdefer alloc.free(physical);
-                const logical = try std.fmt.allocPrint(alloc, "vector_f32:{d}:{d}", .{ definition, optional });
+                const logical = try std.fmt.allocPrint(alloc, "{s}:{d}:{d}", .{ if (leaf.physical_type == 5) "vector_f64_json" else "vector_f32", definition, optional });
                 errdefer alloc.free(logical);
                 try columns.append(alloc, .{ .column_id = name, .physical_column_id = physical, .physical_type = leaf.physical_type, .nullable = element_nullable, .logical_type = logical, .field_id = element.field_id });
                 cursor.* += 2;
