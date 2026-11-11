@@ -29,7 +29,7 @@ pub fn For(comptime DB: type) type {
         metadata: std.heap.ArenaAllocator,
         // Heap-owned to keep parser allocator pointers stable if this reader
         // moves into a SQL cursor. The query lease fences this catalog cut.
-        privacy_arena: *std.heap.ArenaAllocator,
+        privacy_arena: ?*std.heap.ArenaAllocator,
         privacy_policy: ?Physical.privacy_read.PolicySnapshot,
         keys: [64][]const u8 = undefined,
         ids: [64][]const u8 = undefined,
@@ -295,9 +295,11 @@ pub fn For(comptime DB: type) type {
             self.retireDirectories();
             self.directory_arena.deinit();
             self.metadata.deinit();
-            const privacy_backing = self.privacy_arena.child_allocator;
-            self.privacy_arena.deinit();
-            privacy_backing.destroy(self.privacy_arena);
+            if (self.privacy_arena) |arena| {
+                const privacy_backing = arena.child_allocator;
+                arena.deinit();
+                privacy_backing.destroy(arena);
+            }
             self.read.abort();
             self.schema.release();
             self.policy.release();

@@ -218,24 +218,37 @@ export function persistentMigrationLock(
       // Kysely calls release even when acquire fails. Never remove an
       // unconfirmed claim, including one whose INSERT might still commit.
       if (!claim) return;
-      try {
-        if (!(await storage.remove(db, claim.ownerToken))) {
+      const deadline = performance.now() + wait;
+      for (;;) {
+        try {
+          if (!(await storage.remove(db, claim.ownerToken))) {
+            held.delete(db);
+            throw new AntflyMigrationLockError(
+              "ANTFLY_MIGRATION_LOCK_LOST",
+              "Migration claim ownership changed before release",
+              claim
+            );
+          }
           held.delete(db);
+          return;
+        } catch (error) {
+          if (error instanceof AntflyMigrationLockError) throw error;
+          // These SQLSTATEs guarantee the conditional DELETE did not commit.
+          // Retain the same owner token and retry only this internal release;
+          // uncertain writes and application migrations are never replayed.
+          if (["40001", "53300"].includes(String(state(error))) && performance.now() < deadline) {
+            await new Promise((resolve) =>
+              setTimeout(resolve, Math.min(100, Math.max(1, deadline - performance.now())))
+            );
+            continue;
+          }
           throw new AntflyMigrationLockError(
-            "ANTFLY_MIGRATION_LOCK_LOST",
-            "Migration claim ownership changed before release",
-            claim
+            "ANTFLY_MIGRATION_LOCK_UNKNOWN",
+            "Migration claim release was not confirmed; do not replay migrations",
+            claim,
+            error
           );
         }
-        held.delete(db);
-      } catch (error) {
-        if (error instanceof AntflyMigrationLockError) throw error;
-        throw new AntflyMigrationLockError(
-          "ANTFLY_MIGRATION_LOCK_UNKNOWN",
-          "Migration claim release was not confirmed; do not replay migrations",
-          claim,
-          error
-        );
       }
     },
   };

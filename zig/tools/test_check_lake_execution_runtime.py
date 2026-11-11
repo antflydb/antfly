@@ -17,8 +17,95 @@
 """Reject skipped, partial and duplicate performance evidence."""
 
 import json
+import os
+import signal
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
 import unittest
-from check_lake_execution_runtime import observations, PHASES, FAMILIES
+from check_lake_execution_runtime import observations, run_logged, PHASES, FAMILIES
+
+
+class ProbeProcessBudgets(unittest.TestCase):
+    def test_separate_phase_budgets_retain_phase_logs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build_log, run_log = root / "build.log", root / "run.log"
+            # A slow build must not spend the executable's execution budget.
+            run_logged(
+                [sys.executable, "-c", "import time; time.sleep(.1); print('built')"],
+                None,
+                build_log,
+                2,
+            )
+            run_logged([sys.executable, "-c", "print('ran')"], None, run_log, 2)
+            self.assertEqual(build_log.read_text().strip(), "built")
+            self.assertEqual(run_log.read_text().strip(), "ran")
+
+    def test_execution_timeout_stops_the_process(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "run.log"
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_logged(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import time; print('started', flush=True); time.sleep(30)",
+                    ],
+                    None,
+                    log,
+                    0.2,
+                )
+            self.assertIn("started", log.read_text())
+
+    def test_timeout_stops_children_after_wrapper_exits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ready = root / "child.pid"
+            child = (
+                "import os,signal,sys,time; from pathlib import Path; "
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+                "Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)"
+            )
+            wrapper = (
+                "import os,signal,subprocess,sys,time; "
+                "signal.signal(signal.SIGTERM,lambda *_:os._exit(0)); "
+                "subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]]); "
+                "time.sleep(30)"
+            )
+            child_terminated = False
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    run_logged(
+                        [sys.executable, "-c", wrapper, child, str(ready)],
+                        None,
+                        root / "run.log",
+                        2,
+                    )
+                pid = int(ready.read_text())
+                for _ in range(40):
+                    # An orphan may briefly remain a zombie until the host's
+                    # reaper runs; it is already dead and cannot retain work.
+                    status = subprocess.run(
+                        ["ps", "-p", str(pid), "-o", "stat="],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    ).stdout.strip()
+                    if not status or status.startswith("Z"):
+                        child_terminated = True
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail("timed-out wrapper left a live child")
+            finally:
+                if not child_terminated and ready.exists():
+                    try:
+                        os.kill(int(ready.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
 
 class Evidence(unittest.TestCase):

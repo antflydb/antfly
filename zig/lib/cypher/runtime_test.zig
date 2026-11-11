@@ -73,17 +73,21 @@ const Fixture = struct {
     }
 };
 fn check(text: []const u8, expected: []const u8) !void {
+    try checkAlloc(std.testing.allocator, text, expected);
+}
+
+fn checkAlloc(a: std.mem.Allocator, text: []const u8, expected: []const u8) !void {
     var diagnostic: c.Diagnostic = .{};
-    var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+    var compiled = try c.compile(a, text, .{}, &diagnostic);
     defer compiled.deinit();
     var fixture: Fixture = .{};
-    var result = runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}) catch |err| {
+    var result = runtime.execute(a, fixture.backend(), graph, &compiled, &.{}, .{}) catch |err| {
         std.debug.print("query failed ({s}): {s}\n", .{ @errorName(err), text });
         return err;
     };
     defer result.deinit();
-    const json = try std.json.Stringify.valueAlloc(std.testing.allocator, result.rows, .{});
-    defer std.testing.allocator.free(json);
+    const json = try std.json.Stringify.valueAlloc(a, result.rows, .{});
+    defer a.free(json);
     try std.testing.expectEqualStrings(expected, json);
 }
 test "Cypher regex predicates use whole strings and preserve dynamic NULL arguments" {
@@ -2118,6 +2122,9 @@ test "optional compressed bags preserve per-input null extension and dead bindin
 }
 
 test "compressed admission and ordered bags agree with exact trails and preserve eager errors" {
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
+    defer if (checked.deinit() != 0) @panic("Cypher semantic campaign leaked allocations");
+    const checked_allocator = checked.allocator();
     const Dag = struct {
         fn expand(ptr: *anyopaque, a: std.mem.Allocator, mapping: catalog.Relationship, identity: v.Identity, direction: c.ast.Direction, after: ?[]const u8, limit: usize) !b.Page(*const v.Relationship) {
             const page = try Fixture.expand(ptr, a, mapping, identity, direction, after, limit);
@@ -2164,7 +2171,7 @@ test "compressed admission and ordered bags agree with exact trails and preserve
         "WITH b ORDER BY b.rank LIMIT 3 UNWIND [(b)-[:CITES]->(d:Document) | d.rank] AS x RETURN count(*),sum(x)",
         "WITH b ORDER BY b.rank LIMIT 3 RETURN EXISTS { MATCH (b)-[:CITES]->(d:Document) }",
     }) |tail| {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        var arena = std.heap.ArenaAllocator.init(checked_allocator);
         defer arena.deinit();
         const a = arena.allocator();
         const prefix = try std.fmt.allocPrint(a, "{s} (a:Document)-[:CITES*0..3]->(b:Document){s}", .{ verb, predicate });
@@ -2185,7 +2192,7 @@ test "compressed admission and ordered bags agree with exact trails and preserve
         defer expected.deinit();
         try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(a, expected.rows, .{}), try std.json.Stringify.valueAlloc(a, result.rows, .{}));
     };
-    try check("OPTIONAL MATCH (a:Document)-[:CITES*1..2]->(b:Document) WHERE EXISTS { MATCH (b)-[:CITES]->(d:Document) WHERE false } RETURN count(*),count(b)", "[[1,0]]");
+    try checkAlloc(checked_allocator, "OPTIONAL MATCH (a:Document)-[:CITES*1..2]->(b:Document) WHERE EXISTS { MATCH (b)-[:CITES]->(d:Document) WHERE false } RETURN count(*),count(b)", "[[1,0]]");
     for ([_][]const u8{
         "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WHERE a.rank<0 AND 1/0=1 RETURN count(*)",
         "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WHERE EXISTS { MATCH (b)-[:CITES]->(d:Document) WHERE false } AND 1/0=1 RETURN count(*)",
@@ -2197,10 +2204,10 @@ test "compressed admission and ordered bags agree with exact trails and preserve
         "MATCH (a:Document)-[:CITES*0..2]->(b:Document) WITH b ORDER BY b.rank LIMIT 3 MATCH (b)-[:CITES*0..2]->(d:Document) WHERE b.rank<0 AND 1/0=1 RETURN count(*)",
     }) |text| {
         var diagnostic: c.Diagnostic = .{};
-        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        var compiled = try c.compile(checked_allocator, text, .{}, &diagnostic);
         defer compiled.deinit();
         var fixture: Fixture = .{};
-        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
+        try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(checked_allocator, fixture.backend(), graph, &compiled, &.{}, .{}));
     }
 }
 
@@ -2715,6 +2722,11 @@ test "completed streaming child memo releases retained rows on every allocation 
 }
 
 test "continuation presence memo and intermediate DISTINCT release allocation failures" {
+    // Keep every injected allocation failure and memory check; collecting a
+    // stack trace for each backing allocation dominates these matrix tests.
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
+    defer if (checked.deinit() != 0) @panic("Cypher semantic campaign leaked allocations");
+    const checked_allocator = checked.allocator();
     const Campaign = struct {
         fn run(backing: std.mem.Allocator, kind: u2) !void {
             var fixed: FixedAllocation = .{ .backing = backing };
@@ -2735,7 +2747,7 @@ test "continuation presence memo and intermediate DISTINCT release allocation fa
             try std.testing.expectEqual(@as(usize, if (kind == 1 or kind == 2) 0 else 2), result.rows.len);
         }
     };
-    inline for (0..4) |kind| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as(u2, kind)});
+    inline for (0..4) |kind| try std.testing.checkAllAllocationFailures(checked_allocator, Campaign.run, .{@as(u2, kind)});
 }
 
 test "path summaries preserve zero hop null scope and observable identities" {
@@ -6300,12 +6312,17 @@ test "observed axes compose independent CALL bags without multiplying set suppor
 }
 
 test "bounded DISTINCT group windows own only selected memberships across eviction" {
+    // Keep every injected allocation failure and memory check; collecting a
+    // stack trace for each backing allocation dominates these matrix tests.
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
+    defer if (checked.deinit() != 0) @panic("Cypher semantic campaign leaked allocations");
+    const checked_allocator = checked.allocator();
     for ([_][]const u8{
         "UNWIND range(1,10000) AS i UNWIND [0,1,0] AS x RETURN i,count(DISTINCT x) ORDER BY i LIMIT 5",
         "UNWIND range(10000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,count(DISTINCT [x]) ORDER BY i LIMIT 5",
         "UNWIND range(10000,1,-1) AS i CALL {UNWIND [0,1,0] AS x RETURN x} RETURN i,count(DISTINCT {v:x}) ORDER BY i LIMIT 5",
     }) |text| {
-        const a = std.testing.allocator;
+        const a = checked_allocator;
         var diagnostic: c.Diagnostic = .{};
         var compiled = try c.compile(a, text, .{}, &diagnostic);
         defer compiled.deinit();
@@ -6398,7 +6415,10 @@ test "observed immutable parameter lists separate bag counts and shared DISTINCT
 }
 
 fn compareReductionPlans(text: []const u8, control: []const u8) !void {
-    const a = std.testing.allocator;
+    try compareReductionPlansAlloc(std.testing.allocator, text, control);
+}
+
+fn compareReductionPlansAlloc(a: std.mem.Allocator, text: []const u8, control: []const u8) !void {
     var diagnostic: c.Diagnostic = .{};
     var fast = try c.compile(a, text, .{}, &diagnostic);
     defer fast.deinit();
@@ -7466,6 +7486,11 @@ test "ordered lineage records logical DISTINCT CALL filter and singleton prefix 
 }
 
 test "ordered lineage programs release allocations after proof and packet failures" {
+    // Keep every injected allocation failure and memory check; collecting a
+    // stack trace for each backing allocation dominates these matrix tests.
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
+    defer if (checked.deinit() != 0) @panic("Cypher semantic campaign leaked allocations");
+    const checked_allocator = checked.allocator();
     const Campaign = struct {
         fn run(backing: std.mem.Allocator, text: []const u8) !void {
             var callbacks = backing.vtable.*;
@@ -7520,7 +7545,7 @@ test "ordered lineage programs release allocations after proof and packet failur
         "UNWIND range(-20,0)+range(1,20) AS x WITH x WHERE x<3 OR x>17 RETURN count(*),sum(x),avg(x)",
         "UNWIND range(1,20) AS x WITH x+1 AS y RETURN y,count(*) ORDER BY y LIMIT 2",
         "UNWIND [7] AS z UNWIND range(20,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 2",
-    }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
+    }) |text| try std.testing.checkAllAllocationFailures(checked_allocator, Campaign.run, .{text});
 }
 
 test "ordered lineage singleton probes preserve nested CALL recursion limits" {
@@ -7579,7 +7604,10 @@ test "symbolic set reducers and weighted cohort windows stay bounded" {
 }
 
 test "set summaries and weighted ranks preserve encounters scopes and failures" {
-    const a = std.testing.allocator;
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
+    defer if (checked.deinit() != 0) @panic("Cypher semantic campaign leaked allocations");
+    const checked_allocator = checked.allocator();
+    const a = checked_allocator;
     for ([_]struct { source: []const u8, first: i64, step: i64 }{
         .{ .source = "range(1,450)", .first = 1, .step = 1 },
         .{ .source = "range(450,1,-1)", .first = 450, .step = -1 },
@@ -7610,7 +7638,7 @@ test "set summaries and weighted ranks preserve encounters scopes and failures" 
             defer a.free(query);
             const control = try std.fmt.allocPrint(a, "UNWIND {s}+{s} AS x {s}", .{ literal, literal, tail });
             defer a.free(control);
-            try compareReductionPlans(query, control);
+            try compareReductionPlansAlloc(checked_allocator, query, control);
         }
         for ([_][]const u8{
             "WITH DISTINCT x AS y RETURN count(*),sum(y),min(y),max(y),sum(7),sum(DISTINCT 7)",
@@ -7629,7 +7657,7 @@ test "set summaries and weighted ranks preserve encounters scopes and failures" 
             defer a.free(sparse_literal);
             const control = try std.fmt.allocPrint(a, "UNWIND {s}+{s} AS x {s}", .{ sparse_literal, literal, tail });
             defer a.free(control);
-            try compareReductionPlans(query, control);
+            try compareReductionPlansAlloc(checked_allocator, query, control);
         }
     }
     for ([_][]const u8{
@@ -7640,7 +7668,7 @@ test "set summaries and weighted ranks preserve encounters scopes and failures" 
         defer a.free(query);
         const control = try std.fmt.allocPrint(a, "{s} UNWIND zs AS z UNWIND [5,4,3,2,1] AS i UNWIND [z,1,z] AS x RETURN i,avg(x) ORDER BY avg(x),i LIMIT 2", .{prefix});
         defer a.free(control);
-        try compareReductionPlans(query, control);
+        try compareReductionPlansAlloc(checked_allocator, query, control);
     }
     for ([_][]const u8{ "WITH z+1 AS k", "WITH z AS k,z+1 AS j WITH k+1 AS k,j+2 AS j", "WITH z/0 AS k" }) |scope| {
         for ([_][]const u8{ "RETURN i,sum(k),avg(k) ORDER BY i LIMIT 3", "WITH k AS h,i RETURN h,count(*) ORDER BY h LIMIT 3" }) |tail| {
@@ -7648,10 +7676,10 @@ test "set summaries and weighted ranks preserve encounters scopes and failures" 
             defer a.free(query);
             const control = try std.fmt.allocPrint(a, "UNWIND [7,8] AS z {s} UNWIND [5,4,3,2,1] AS i {s}", .{ scope, tail });
             defer a.free(control);
-            try compareReductionPlans(query, control);
+            try compareReductionPlansAlloc(checked_allocator, query, control);
         }
     }
-    try compareReductionPlans("UNWIND range(9223372036854775807,9223372036854775807)+range(1,1)+range(-1,-1) AS x WITH DISTINCT x AS y RETURN sum(y)", "UNWIND [9223372036854775807,1,-1] AS x WITH DISTINCT x AS y RETURN sum(y)");
+    try compareReductionPlansAlloc(checked_allocator, "UNWIND range(9223372036854775807,9223372036854775807)+range(1,1)+range(-1,-1) AS x WITH DISTINCT x AS y RETURN sum(y)", "UNWIND [9223372036854775807,1,-1] AS x WITH DISTINCT x AS y RETURN sum(y)");
 }
 
 test "retained ordered domains stay compressed through reducers and ranking" {
@@ -7691,7 +7719,10 @@ test "retained ordered domains stay compressed through reducers and ranking" {
 }
 
 test "terminal rank packets preserve lexicographic ties multiplicity endpoints and failures" {
-    const a = std.testing.allocator;
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
+    defer if (checked.deinit() != 0) @panic("Cypher semantic campaign leaked allocations");
+    const checked_allocator = checked.allocator();
+    const a = checked_allocator;
     for ([_]i64{ 1, -1 }) |step| {
         var values: [180]i64 = undefined;
         for (&values, 0..) |*value, index| value.* = if (step > 0) @as(i64, @intCast(index)) - 90 else 90 - @as(i64, @intCast(index));
@@ -7710,7 +7741,7 @@ test "terminal rank packets preserve lexicographic ties multiplicity endpoints a
                     defer a.free(query);
                     const control = try std.fmt.allocPrint(a, "UNWIND {s}+{s} AS x WITH x,x%3 AS g ORDER BY {s} {s} {s}", .{ literal, literal, order, page, tail });
                     defer a.free(control);
-                    try compareReductionPlans(query, control);
+                    try compareReductionPlansAlloc(checked_allocator, query, control);
                 }
             }
         }
@@ -7728,7 +7759,7 @@ test "terminal rank packets preserve lexicographic ties multiplicity endpoints a
         defer a.free(query);
         const control = try std.fmt.allocPrint(a, "UNWIND {s} AS x {s}", .{ literal, tail });
         defer a.free(control);
-        try compareReductionPlans(query, control);
+        try compareReductionPlansAlloc(checked_allocator, query, control);
     }
     for ([_][]const u8{
         "WITH x ORDER BY x LIMIT 5 RETURN sum(x)",
@@ -7741,7 +7772,7 @@ test "terminal rank packets preserve lexicographic ties multiplicity endpoints a
         defer a.free(query);
         const control = try std.fmt.allocPrint(a, "UNWIND [9223372036854775805,9223372036854775806,9223372036854775807,-1,0,1] AS x {s}", .{tail});
         defer a.free(control);
-        try compareReductionPlans(query, control);
+        try compareReductionPlansAlloc(checked_allocator, query, control);
     }
 }
 
@@ -8269,6 +8300,9 @@ test "group observers preserve shared values when retiring invocation arenas" {
 }
 
 test "ordered groups retire reducers across a broad exact-budget prefix" {
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
+    defer if (checked.deinit() != 0) @panic("Cypher semantic campaign leaked allocations");
+    const checked_allocator = checked.allocator();
     const F = struct {
         nodes: []const v.Node,
         reads: usize = 0,
@@ -8312,7 +8346,7 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
             return try scan(ptr, a, table, after, limit);
         }
     };
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(checked_allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const nodes = try a.alloc(v.Node, 5000);
@@ -8325,15 +8359,15 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
     {
         fixture.reads = 0;
         var diagnostic: c.Diagnostic = .{};
-        var compiled = try c.compile(std.testing.allocator, "MATCH(n:Document) RETURN n.id AS id", .{}, &diagnostic);
+        var compiled = try c.compile(checked_allocator, "MATCH(n:Document) RETURN n.id AS id", .{}, &diagnostic);
         defer compiled.deinit();
-        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 512 << 10 })).?;
+        const cursor = (try runtime.NodeCursor.open(checked_allocator, backend, graph, compiled.query, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 512 << 10 })).?;
         defer cursor.close();
         const plan = (try cursor.planScalarObserver("id", .distinct)).?;
         try cursor.startWeightPlan(plan);
         var count: usize = 0;
         while (!cursor.done) {
-            var page = std.heap.ArenaAllocator.init(std.testing.allocator);
+            var page = std.heap.ArenaAllocator.init(checked_allocator);
             defer page.deinit();
             const rows = try cursor.next(page.allocator(), 64);
             for (rows, cursor.last_weights.items) |row, weight| {
@@ -8357,9 +8391,9 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
         fixture.reads = 0;
         fixture.ordered_requests = 0;
         var diagnostic: c.Diagnostic = .{};
-        var compiled = try c.compile(std.testing.allocator, "MATCH(n:Document) RETURN n.id,max(n.rank) ORDER BY n.id LIMIT 1", .{}, &diagnostic);
+        var compiled = try c.compile(checked_allocator, "MATCH(n:Document) RETURN n.id,max(n.rank) ORDER BY n.id LIMIT 1", .{}, &diagnostic);
         defer compiled.deinit();
-        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 6000 });
+        var result = try runtime.execute(checked_allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 6000 });
         defer result.deinit();
         try std.testing.expectEqual(@as(i64, 63), result.rows[0][1].integer);
         try std.testing.expectEqual(@as(usize, 1), fixture.ordered_requests);
@@ -8371,9 +8405,9 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
     }) |query| {
         fixture.reads = 0;
         var diagnostic: c.Diagnostic = .{};
-        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        var compiled = try c.compile(checked_allocator, query, .{}, &diagnostic);
         defer compiled.deinit();
-        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{.{ .name = "zero", .value = .{ .integer = 0 } }}, .{ .scanned_anchors = 256 });
+        var result = try runtime.execute(checked_allocator, backend, graph, &compiled, &.{.{ .name = "zero", .value = .{ .integer = 0 } }}, .{ .scanned_anchors = 256 });
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 0), result.rows.len);
         try std.testing.expectEqual(@as(usize, 0), fixture.reads);
@@ -8382,9 +8416,9 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
         fixture.reads = 0;
         var diagnostic: c.Diagnostic = .{};
         const query = try std.fmt.allocPrint(a, "MATCH(n:Document) RETURN n.id,{s} AS c ORDER BY n.id SKIP 2 LIMIT 5", .{observer});
-        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        var compiled = try c.compile(checked_allocator, query, .{}, &diagnostic);
         defer compiled.deinit();
-        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 256, .memory_bytes = 2 << 20 });
+        var result = try runtime.execute(checked_allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 256, .memory_bytes = 2 << 20 });
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 5), result.rows.len);
         try std.testing.expectEqualStrings("000002", result.rows[0][0].string);
@@ -8395,9 +8429,9 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
         fixture.reads = 0;
         const query = try std.fmt.allocPrint(a, "MATCH(n:Document) WITH n.id AS g,count(DISTINCT n.rank) AS c ORDER BY g SKIP 2 LIMIT 5 WHERE {s} RETURN g,c", .{predicate});
         var diagnostic: c.Diagnostic = .{};
-        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        var compiled = try c.compile(checked_allocator, query, .{}, &diagnostic);
         defer compiled.deinit();
-        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 256, .memory_bytes = 2 << 20 });
+        var result = try runtime.execute(checked_allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 256, .memory_bytes = 2 << 20 });
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 5), result.rows.len);
         try std.testing.expectEqualStrings("000002", result.rows[0][0].string);
@@ -8412,15 +8446,15 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
         };
         fixture.reads = 0;
         var diagnostic: c.Diagnostic = .{};
-        var compiled = try c.compile(std.testing.allocator, "MATCH(n:Document) RETURN n.id AS id,n.rank AS rank", .{}, &diagnostic);
+        var compiled = try c.compile(checked_allocator, "MATCH(n:Document) RETURN n.id AS id,n.rank AS rank", .{}, &diagnostic);
         defer compiled.deinit();
-        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 512 << 10 })).?;
+        const cursor = (try runtime.NodeCursor.open(checked_allocator, backend, graph, compiled.query, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 512 << 10 })).?;
         defer cursor.close();
         const plan = (try cursor.planScalarDomain("rank", &.{"id"}, .min, null)).?;
         try cursor.startWeightPlan(plan);
         var count: usize = 0;
         while (!cursor.done) {
-            var page = std.heap.ArenaAllocator.init(std.testing.allocator);
+            var page = std.heap.ArenaAllocator.init(checked_allocator);
             defer page.deinit();
             const rows = try cursor.next(page.allocator(), 64);
             for (rows) |row| {
@@ -8440,14 +8474,14 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
         defer fixture.allow_boundaries = false;
         fixture.reads = 0;
         var diagnostic: c.Diagnostic = .{};
-        var compiled = try c.compile(std.testing.allocator, "MATCH(n:Document) RETURN n.id AS id,n.rank AS rank", .{}, &diagnostic);
+        var compiled = try c.compile(checked_allocator, "MATCH(n:Document) RETURN n.id AS id,n.rank AS rank", .{}, &diagnostic);
         defer compiled.deinit();
-        const cursor = (try runtime.NodeCursor.open(std.testing.allocator, backend, graph, compiled.query, &.{}, .{ .scanned_anchors = 5010, .memory_bytes = 512 << 10 })).?;
+        const cursor = (try runtime.NodeCursor.open(checked_allocator, backend, graph, compiled.query, &.{}, .{ .scanned_anchors = 5010, .memory_bytes = 512 << 10 })).?;
         defer cursor.close();
         try cursor.startWeightPlan((try cursor.planScalarDomain("rank", &.{"id"}, kind, null)).?);
         var count: usize = 0;
         while (!cursor.done) {
-            var page = std.heap.ArenaAllocator.init(std.testing.allocator);
+            var page = std.heap.ArenaAllocator.init(checked_allocator);
             defer page.deinit();
             for (try cursor.next(page.allocator(), 1)) |row| {
                 try std.testing.expectEqual(@as(i64, @intCast(count * 1000 + (if (kind == .max) @as(usize, 999) else 0))), row[1].value.integer);
@@ -8462,9 +8496,9 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
         fixture.requests = 0;
         var diagnostic: c.Diagnostic = .{};
         const text = try std.fmt.allocPrint(a, "MATCH (n:Document) RETURN DISTINCT n.id ORDER BY n.id{s}", .{suffix});
-        var compiled = try c.compile(std.testing.allocator, text, .{}, &diagnostic);
+        var compiled = try c.compile(checked_allocator, text, .{}, &diagnostic);
         defer compiled.deinit();
-        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 16 << 20 });
+        var result = try runtime.execute(checked_allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 16 << 20 });
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 5000), result.rows.len);
         try std.testing.expectEqual(@as(usize, 5000), fixture.reads);
@@ -8475,9 +8509,9 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
         fixture.requests = 0;
         fixture.ordered_requests = 0;
         var diagnostic: c.Diagnostic = .{};
-        var compiled = try c.compile(std.testing.allocator, "MATCH (n:Document) WHERE n.rank<0 OR n.rank>10000 RETURN DISTINCT n.id ORDER BY n.id", .{}, &diagnostic);
+        var compiled = try c.compile(checked_allocator, "MATCH (n:Document) WHERE n.rank<0 OR n.rank>10000 RETURN DISTINCT n.id ORDER BY n.id", .{}, &diagnostic);
         defer compiled.deinit();
-        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 16 << 20 });
+        var result = try runtime.execute(checked_allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 16 << 20 });
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 0), result.rows.len);
         try std.testing.expectEqual(@as(usize, 5000), fixture.reads);
@@ -8488,9 +8522,9 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
         fixture.reads = 0;
         const query = try std.fmt.allocPrint(a, "MATCH (n:Document) RETURN n.id,{s} ORDER BY n.id{s}", .{ observer, suffix });
         var diagnostic: c.Diagnostic = .{};
-        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        var compiled = try c.compile(checked_allocator, query, .{}, &diagnostic);
         defer compiled.deinit();
-        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 16 << 20 });
+        var result = try runtime.execute(checked_allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 16 << 20 });
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 5000), fixture.reads);
         try std.testing.expectEqual(@as(usize, 5000), result.stats.scanned_anchors);
@@ -8511,9 +8545,9 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
         fixture.reads = 0;
         const query = try std.fmt.allocPrint(a, "MATCH (n:Document) RETURN n.id,count(*),min(n.rank),max(n.rank) ORDER BY n.id{s}", .{suffix});
         var diagnostic: c.Diagnostic = .{};
-        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        var compiled = try c.compile(checked_allocator, query, .{}, &diagnostic);
         defer compiled.deinit();
-        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 256 << 10 });
+        var result = try runtime.execute(checked_allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 5000, .memory_bytes = 256 << 10 });
         defer result.deinit();
         const expected: usize = if (std.mem.indexOf(u8, suffix, "4900") != null) 5 else if (std.mem.indexOf(u8, suffix, "4999") != null) 1 else 0;
         try std.testing.expectEqual(expected, result.rows.len);
@@ -8528,9 +8562,9 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
     }
     fixture.nodes = large;
     var diagnostic: c.Diagnostic = .{};
-    var compiled = try c.compile(std.testing.allocator, "MATCH (n:Document) RETURN n.id,count(*),min(n.rank),max(n.rank) ORDER BY n.id SKIP 49900 LIMIT 5", .{}, &diagnostic);
+    var compiled = try c.compile(checked_allocator, "MATCH (n:Document) RETURN n.id,count(*),min(n.rank),max(n.rank) ORDER BY n.id SKIP 49900 LIMIT 5", .{}, &diagnostic);
     defer compiled.deinit();
-    var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 50000, .intermediate_states = 4000000, .memory_bytes = 256 << 10 });
+    var result = try runtime.execute(checked_allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 50000, .intermediate_states = 4000000, .memory_bytes = 256 << 10 });
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 5), result.rows.len);
     try std.testing.expectEqualStrings("049900", result.rows[0][0].string);

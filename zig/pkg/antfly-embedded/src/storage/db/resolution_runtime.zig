@@ -3106,7 +3106,7 @@ pub const ResolutionRuntime = struct {
             return .{};
         }
 
-        const resolvers = try self.index_manager.listResolvers(self.alloc);
+        const resolvers = try self.index_manager.listResolverBackfillDescriptors(self.alloc);
         defer {
             for (resolvers) |*cfg| cfg.deinit(self.alloc);
             self.alloc.free(resolvers);
