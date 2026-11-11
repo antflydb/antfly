@@ -220,6 +220,17 @@ pub fn fcntlUnlock(fd: std.posix.fd_t, offset: i64) void {
 /// is exactly what this function exists to avoid) so both the deadline
 /// and `io`'s cancellation are checked between attempts rather than
 /// blocking the whole span uninterrupted.
+///
+/// Unlike `futexWaitSharedBounded`, each step here is a genuine
+/// `io.sleep`, not a kernel wait with a timeout tied to the lock
+/// itself: POSIX gives `futex`/`__ulock_wait` a timeout parameter, but
+/// `fcntl`'s only blocking mode (`F_SETLKW`) has none, nor any way to
+/// wake early the instant the range frees up. Sleep-polling a
+/// nonblocking trylock is the correct shape for a bounded `fcntl`
+/// acquire, not a stand-in for a kernel wait this primitive doesn't
+/// offer. The only caller in this codebase (`shared_lock_region.zig`'s
+/// one-time create/validate section) is rare enough that the short
+/// step's own latency is immaterial.
 pub fn fcntlLockBounded(io: std.Io, fd: std.posix.fd_t, offset: i64, lock_type: i16, deadline: std.Io.Timestamp) (std.Io.Cancelable || error{Timeout})!void {
     const poll_step_ms: u32 = 5;
     while (true) {
