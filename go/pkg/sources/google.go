@@ -487,7 +487,7 @@ func (c *GoogleConnector) ValidateCachedSnapshot(ctx context.Context, r Request,
 		if config.Key != "" {
 			prefix = config.Key
 		}
-		return c.get(ctx, client, "/b/"+url.PathEscape(config.Bucket)+"/o?maxResults=1&prefix="+url.QueryEscape(prefix), &response)
+		return c.get(ctx, client, "/b/"+url.PathEscape(config.Bucket)+"/o?maxResults=1&fields=items(name)&prefix="+url.QueryEscape(prefix), &response)
 	}
 	pinned, _, err := driveContentClient(client)
 	if err != nil {
@@ -537,7 +537,7 @@ func (c *GoogleConnector) ValidateStagedSource(ctx context.Context, r Request, o
 	var object struct {
 		Generation string `json:"generation"`
 	}
-	path := "/b/" + url.PathEscape(config.Bucket) + "/o/" + url.PathEscape(o.Path) + "?generation=" + url.QueryEscape(o.Revision) + "&ifGenerationMatch=" + url.QueryEscape(o.Revision)
+	path := "/b/" + url.PathEscape(config.Bucket) + "/o/" + url.PathEscape(o.Path) + "?generation=" + url.QueryEscape(o.Revision) + "&ifGenerationMatch=" + url.QueryEscape(o.Revision) + "&fields=generation"
 	path, err = gcsMetadataFence(path, config, o)
 	if err != nil {
 		return err

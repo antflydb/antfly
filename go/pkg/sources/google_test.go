@@ -321,6 +321,10 @@ func TestGCSProjectedPageProvenance(t *testing.T) {
 			if r.URL.Query().Get("generation") != "1" || r.URL.Query().Get("ifGenerationMatch") != "1" || r.URL.Query().Get("ifMetagenerationMatch") != "7" {
 				t.Error("read did not pin the projection generation and metadata")
 			}
+			if r.URL.Query().Get("alt") != "media" {
+				_, _ = w.Write([]byte(`{"generation":"1"}`))
+				return
+			}
 			w.Header().Set("X-Goog-Generation", "1")
 			_, _ = w.Write(text)
 		default:
@@ -335,6 +339,9 @@ func TestGCSProjectedPageProvenance(t *testing.T) {
 		t.Fatalf("page listing: %d objects, error = %v", len(inventory.Objects), err)
 	}
 	item := inventory.Objects[0]
+	if err := connector.CheckAccess(t.Context(), request, item); err != nil {
+		t.Fatal(err)
+	}
 	data, err := connector.Read(t.Context(), request, item)
 	if err != nil {
 		t.Fatal(err)
@@ -346,5 +353,23 @@ func TestGCSProjectedPageProvenance(t *testing.T) {
 	}
 	if _, err := Normalize("test-source", item, []byte("different text"), Permissions{}, time.Time{}); err == nil {
 		t.Fatal("mismatched page text was accepted")
+	}
+}
+
+func TestGCSPreviewBoundsFilteredListing(t *testing.T) {
+	pages := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pages++
+		if r.URL.Query().Get("maxResults") != "100" {
+			t.Error("preview requested a full listing page")
+		}
+		fmt.Fprintf(w, `{"items":[{"name":"pages/skipped.pdf","size":"1","generation":"1"}],"nextPageToken":"%d"}`, pages)
+	}))
+	defer server.Close()
+	connector := GoogleConnector{ProviderName: ProviderGCS, HTTPClient: server.Client(), APIBase: server.URL}
+	request := Request{Mode: ImportModeSource, SourceNamespace: "test", Preview: true, Config: SourceConfig(`{"bucket":"docs","prefix":"pages/","suffixes":[".txt"]}`)}
+	_, err := connector.Enumerate(t.Context(), request)
+	if pages != 4 || err == nil || !strings.Contains(err.Error(), "preview sample exhausted") {
+		t.Fatalf("expected bounded preview, got %d pages and %v", pages, err)
 	}
 }
