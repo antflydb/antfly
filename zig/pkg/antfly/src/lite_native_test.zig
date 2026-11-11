@@ -33,6 +33,13 @@ test {
     // target to actually exercise the full-text crash sweep.
     _ = @import("antfly_local_sources").storage_lite_crash_consistency_test;
     _ = @import("antfly_local_sources").storage_lite_crash_sim_io;
+    // redo_log.zig (docs/design/lite-performance/lite-single-commit-write-path.md
+    // §9.2) is standalone and not yet imported by any production code --
+    // build step (b) of §9.9, before the native.zig/docstore.zig
+    // integration in step (c). Force it in the same way crash_sim_io.zig
+    // already is, so its unit/torn-tail/corruption tests run under
+    // lite-storage-test.
+    _ = @import("antfly_local_sources").storage_lite_redo_log;
 }
 
 /// Implementation source choices for this compilation root.
