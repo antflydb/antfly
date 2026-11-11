@@ -298,6 +298,32 @@ pub fn ensureRegion(entry: *Entry, io: Io) !*shared_lock_region.Region {
     return &entry.region.?;
 }
 
+/// True when `err` (from `shared_lock_region.Region.open`/`openSized`)
+/// means the region itself can't be used at this path at all -- a
+/// read-only or otherwise uncooperative filesystem (the same conditions
+/// that already send `native.zig`'s pre-region flock paths to their own
+/// plain fallback), a sidecar name too long for the platform, proven
+/// corruption, or exhausted liveness slots -- rather than a transient or
+/// resource failure. Every migrated caller, writer or reader side, shares
+/// this one check so "region unusable, fall back to flock" means the same
+/// thing everywhere: callers should fall back to the plain-flock path on
+/// `true`, and propagate the error unchanged on `false` (notably
+/// `OutOfMemory`, which a fallback attempt would likely fail the same way,
+/// so swallowing it here would only hide the real failure).
+pub fn isRegionUnusable(err: anyerror) bool {
+    return switch (err) {
+        error.AccessDenied,
+        error.ReadOnlyFileSystem,
+        error.PermissionDenied,
+        error.NameTooLong,
+        error.RegionUnavailable,
+        error.RegionCorrupt,
+        error.LivenessSlotsExhausted,
+        => true,
+        else => false,
+    };
+}
+
 var registry_mutex: Io.Mutex = .init;
 var registry: std.AutoHashMapUnmanaged(Io.File.INode, *Entry) = .empty;
 
