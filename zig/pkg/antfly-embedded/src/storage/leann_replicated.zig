@@ -685,6 +685,11 @@ pub const ReplicatedState = struct {
                 return context.filter.allows(id, key);
             }
 
+            fn order(raw: *const anyopaque, key: []const u8) u64 {
+                const context: *const @This() = @ptrCast(@alignCast(raw));
+                return context.state.bindings.get(key).?;
+            }
+
             fn cancelled(raw: *const anyopaque) bool {
                 const context: *const @This() = @ptrCast(@alignCast(raw));
                 return context.filter.cancelled();
@@ -705,14 +710,17 @@ pub const ReplicatedState = struct {
             }
         }
 
+        var local_stats: leann.SearchStats = .{};
+        const profile = search_stats orelse &local_stats;
         const hits = try self.replica.search(alloc, req.query, std.math.cast(u32, req.k) orelse std.math.maxInt(u32), .{
             .ef = self.opts.search_ef,
             .bound_scale = self.opts.bound_scale,
             .batch_size = self.opts.batch_size,
-            .stats = search_stats,
+            .stats = profile,
             .filter = if (filter.active()) .{
                 .ctx = &filter_ctx,
                 .allows = FilterContext.allows,
+                .result_order = FilterContext.order,
                 .cancelled = FilterContext.cancelled,
                 .eligible_count = filter.eligibleCount(),
                 .direct_verify_bounds = direct_mode == .bounds,
@@ -726,6 +734,7 @@ pub const ReplicatedState = struct {
             const vector_id = self.bindings.get(hit.key) orelse continue;
             out.addResultWithOwnedMetadata(vector_id, hit.distance, 0, if (req.load_metadata) try alloc.dupe(u8, hit.key) else null);
         }
+        if (profile.exact_match_count) |count| out.candidate_coverage = if (count > out.getHits().len) .more else .exhausted;
         out.sort();
         return out;
     }
@@ -1304,6 +1313,42 @@ test "leann replicated state: search honors the index's tuning settings" {
     var counting = Counting{ .primary = .{ .alloc = alloc } };
     defer counting.primary.deinit();
     state.loader = counting.loader();
+    {
+        var buffered = try ReplicatedState.init(alloc, opts);
+        defer buffered.deinit();
+        buffered.loader = counting.loader();
+        const old: [dims]f32 = @splat(1);
+        const current: [dims]f32 = @splat(0);
+        const ids = [_]u64{ 601, 602 };
+        const keys = [_][]const u8{ "a", "z" };
+        for (ids, keys) |id, key| {
+            try counting.primary.put(id, &old);
+            try buffered.noteWrites(&[_]TestItem{.{ .vector_id = id, .vector = &old, .metadata = key }}, &.{});
+        }
+        var planned = (try buffered.plan(alloc)).?;
+        defer planned.deinit(alloc);
+        _ = try buffered.applyRecord(planned.record, 1);
+        try testing.expect(buffered.replica.index == null);
+        for (ids, keys) |id, key| {
+            // Swap key order relative to the public result order.
+            const public_id = if (id == 601) @as(u64, 604) else 603;
+            try counting.primary.put(public_id, &current);
+            try buffered.noteWrites(&[_]TestItem{.{ .vector_id = public_id, .vector = &current, .metadata = key }}, &.{});
+        }
+        counting.loads = 0;
+        counting.batches = 0;
+        var result = try buffered.search(alloc, .{
+            .query = &current,
+            .k = 1,
+            .filter_ids = &.{ 603, 604 },
+        });
+        defer result.deinit();
+        try testing.expectEqual(@as(u64, 603), result.getHits()[0].vector_id);
+        try testing.expectEqual(@as(f32, 0), result.getHits()[0].distance);
+        try testing.expectEqual(.more, result.candidate_coverage);
+        try testing.expectEqual(@as(usize, 2), counting.loads);
+        try testing.expectEqual(@as(usize, 1), counting.batches);
+    }
     var keys: [600][8]u8 = undefined;
     var vecs: [600][dims]f32 = undefined;
     var prng = std.Random.DefaultPrng.init(13);
@@ -1342,6 +1387,7 @@ test "leann replicated state: search honors the index's tuning settings" {
         .exclude_ids = &.{11},
     }, &stats);
     defer direct.deinit();
+    try testing.expectEqual(.exhausted, direct.candidate_coverage);
     const direct_hits = direct.getHits();
     try testing.expectEqual(@as(usize, 2), direct_hits.len);
     try testing.expectEqual(@as(u64, 7), direct_hits[0].vector_id);
@@ -1379,6 +1425,7 @@ test "leann replicated state: search honors the index's tuning settings" {
         .distance_under = 0.001,
     }, &stats);
     defer bounded.deinit();
+    try testing.expectEqual(.exhausted, bounded.candidate_coverage);
     try testing.expectEqual(@as(usize, 1), bounded.getHits().len);
     try testing.expectEqual(@as(u64, 7), bounded.getHits()[0].vector_id);
     try testing.expectEqual(@as(u32, 0), stats.expanded);

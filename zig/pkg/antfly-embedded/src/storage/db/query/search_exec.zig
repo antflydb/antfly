@@ -15382,7 +15382,9 @@ fn searchDenseInternal(
         };
 
         const hbc_search_start = platform_time.monotonicNs();
-        const route_costs = entry.index.denseRouteCostSnapshot();
+        var route_costs = entry.index.denseRouteCostSnapshot();
+        const exact_has_residual = hbc_req.key_predicate != null or hbc_req.filter_prefix.len != 0;
+        if (!exact_has_residual) route_costs.exact_residual_read_permille = null;
         const hbc_cache_pressured = if (entry.index.resource_manager) |manager|
             manager.sliceStats(.hbc_node_metadata_cache).pressure != .normal
         else
@@ -15448,6 +15450,9 @@ fn searchDenseInternal(
                 .candidates = exact.profile.candidate_count,
                 .metadata_ns = exact.profile.metadata_lookup_ns,
                 .native_lookup_ns = exact.profile.native_lookup_ns,
+                .native_reads = exact.profile.raw_scalar_reads,
+                .has_residual_filter = exact_has_residual and !entry.index.hasExternalVectorLoader(),
+                .vectors_scored = exact.vectors_scored,
                 .artifact_read_decode_ns = exact.profile.artifact_read_ns +| exact.profile.artifact_decode_ns,
                 .distance_ns = exact.profile.distance_ns,
                 .artifact_cache_hits = exact.profile.artifact_cache_hits,
@@ -15619,7 +15624,7 @@ fn searchDenseInternal(
             hbc_effective_k,
             bounded_full_candidate_count,
             raw_hits.len,
-            route.exact_native_filter,
+            route.exact_native_filter or entry.index.leann != null,
         );
         const candidate_ceiling_reached = candidate_window >= candidate_ceiling;
         if (!candidate_window_incomplete and exhaustive_broad_live_window) {
@@ -15923,7 +15928,11 @@ fn denseSearchRouteWithCosts(
     // overhead. The built-in scorer reads the HBC-resident f32 payload.
     const exact_lookup_overhead: u64 = if (external_vector_storage) 64 else 8;
     const exact_bytes_per_candidate = dimensions *| @sizeOf(f32) +| exact_lookup_overhead;
-    const exact_storage_bytes = candidate_count *| exact_bytes_per_candidate;
+    const exact_read_count = if (!external_vector_storage and measured != null)
+        (candidate_count *| (measured.?.exact_residual_read_permille orelse 1000) +| 999) / 1000
+    else
+        candidate_count;
+    const exact_storage_bytes = exact_read_count *| exact_bytes_per_candidate;
 
     // Estimate how many approximate candidates HBC must inspect to obtain k
     // eligible hits. This expresses filter selectivity as storage work rather
@@ -15957,9 +15966,9 @@ fn denseSearchRouteWithCosts(
         const exact_lookup_ns = if (external_vector_storage)
             artifact_ns
         else
-            denseRouteCostOrPrior(cost.exact_native_lookup_ns_per_candidate, artifact_ns);
-        const exact_work_ns = candidate_count *|
-            (filter_ns +| exact_lookup_ns +| resolved_cost.exact_distance_ns_per_vector);
+            denseRouteCostOrPrior(cost.exact_native_lookup_ns_per_read, artifact_ns);
+        const exact_work_ns = candidate_count *| filter_ns +|
+            exact_read_count *| (exact_lookup_ns +| resolved_cost.exact_distance_ns_per_vector);
         var hbc_work_ns = hbc_candidates *|
             (filter_ns +| resolved_cost.quantized_score_ns_per_candidate) +|
             rerank_candidates *| (artifact_ns +| resolved_cost.exact_distance_ns_per_vector);
@@ -16081,7 +16090,7 @@ test "dense search route reports exact native filter budget decisions" {
 test "native exact lookup costs affect the exact route without pricing HBC rerank" {
     var costs: hbc_mod.HBCIndex.DenseRouteCostSnapshot = .{};
     const prior = denseSearchRouteWithCosts(true, 100, 10_000, 768, 10, 128, 128, false, false, costs, false, 1000);
-    costs.exact_native_lookup_ns_per_candidate = 100_000;
+    costs.exact_native_lookup_ns_per_read = 100_000;
     const measured = denseSearchRouteWithCosts(true, 100, 10_000, 768, 10, 128, 128, false, false, costs, false, 1000);
     try std.testing.expect(prior.exact_native_filter);
     try std.testing.expect(!measured.exact_native_filter);
@@ -16195,10 +16204,10 @@ fn denseCandidateWindowIncomplete(
     candidate_window: u32,
     bounded_full_candidate_count: u32,
     raw_hit_count: usize,
-    exact_native_filter: bool,
+    coverage_counts_all_matches: bool,
 ) bool {
     return switch (coverage) {
-        .exhausted => !exact_native_filter and scoreOrderWindowTotalHitsRelation(candidate_window, bounded_full_candidate_count, raw_hit_count) == .gte,
+        .exhausted => !coverage_counts_all_matches and scoreOrderWindowTotalHitsRelation(candidate_window, bounded_full_candidate_count, raw_hit_count) == .gte,
         .more => true,
         .unknown => candidateWindowIncomplete(candidate_window, bounded_full_candidate_count),
     };

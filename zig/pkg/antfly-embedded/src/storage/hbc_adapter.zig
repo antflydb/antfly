@@ -5632,7 +5632,8 @@ pub const HBCIndex = struct {
         quantized_score_ns_per_candidate: u64 = 0,
         artifact_read_decode_ns_per_vector: u64 = 0,
         exact_distance_ns_per_vector: u64 = 0,
-        exact_native_lookup_ns_per_candidate: u64 = 0,
+        exact_native_lookup_ns_per_read: u64 = 0,
+        exact_residual_read_permille: ?u64 = null,
         rerank_cache_hit_permille: u64 = 0,
         rerank_cache_observations: u64 = 0,
         exact_observations: u64 = 0,
@@ -5652,6 +5653,9 @@ pub const HBCIndex = struct {
         candidates: u64,
         metadata_ns: u64,
         native_lookup_ns: u64 = 0,
+        native_reads: u64 = 0,
+        has_residual_filter: bool = false,
+        vectors_scored: ?u64 = null,
         artifact_read_decode_ns: u64,
         distance_ns: u64,
         artifact_cache_hits: u64,
@@ -18930,10 +18934,17 @@ pub const HBCIndex = struct {
             state.filter_scan_ns_per_candidate,
             perUnit(observation.metadata_ns, observation.candidates),
         );
-        state.exact_native_lookup_ns_per_candidate = routeRateEwma(
-            state.exact_native_lookup_ns_per_candidate,
-            perUnit(observation.native_lookup_ns, observation.candidates),
+        state.exact_native_lookup_ns_per_read = routeRateEwma(
+            state.exact_native_lookup_ns_per_read,
+            perUnit(observation.native_lookup_ns, observation.native_reads),
         );
+        if (observation.has_residual_filter and observation.candidates != 0) {
+            const sample = @min(1000, observation.native_reads *| 1000 / observation.candidates);
+            state.exact_residual_read_permille = if (state.exact_residual_read_permille) |previous|
+                routeRateEwmaObserved(previous, sample, 1)
+            else
+                sample;
+        }
         state.artifact_read_decode_ns_per_vector = routeRateEwma(
             state.artifact_read_decode_ns_per_vector,
             perUnit(
@@ -18943,7 +18954,7 @@ pub const HBCIndex = struct {
         );
         state.exact_distance_ns_per_vector = routeRateEwma(
             state.exact_distance_ns_per_vector,
-            perUnit(observation.distance_ns, observation.candidates),
+            perUnit(observation.distance_ns, observation.vectors_scored orelse observation.candidates),
         );
         const cache_total = observation.artifact_cache_hits +| observation.artifact_vectors_loaded;
         if (cache_total > 0) {
@@ -22333,6 +22344,21 @@ test "hbc route observation counts external distance timing once" {
     defer tp.cleanup();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 4 });
     defer idx.close();
+
+    idx.observeExactDenseRouteCost(.{
+        .candidates = 100,
+        .metadata_ns = 0,
+        .native_lookup_ns = 1000,
+        .native_reads = 10,
+        .has_residual_filter = true,
+        .artifact_read_decode_ns = 0,
+        .distance_ns = 0,
+        .artifact_cache_hits = 0,
+        .artifact_vectors_loaded = 0,
+    });
+    const exact = idx.denseRouteCostSnapshot();
+    try std.testing.expectEqual(@as(u64, 100), exact.exact_native_lookup_ns_per_read);
+    try std.testing.expectEqual(@as(?u64, 100), exact.exact_residual_read_permille);
 
     var profile: SearchProfile = .{
         .reranked_vectors = 2,

@@ -210,6 +210,7 @@ pub const ResultFilter = struct {
     /// the verification target while the walk learns the local match rate.
     eligible_count: ?u32 = null,
     direct_verify_bounds: bool = false,
+    result_order: ?*const fn (*const anyopaque, u32) u64 = null,
     distance_over: ?f32 = null,
     distance_under: ?f32 = null,
     cancelled: ?*const fn (*const anyopaque) bool = null,
@@ -262,6 +263,8 @@ pub const SearchStats = struct {
     expanded: u32 = 0,
     /// Largest retained traversal frontier in a filtered search.
     peak_frontier: u32 = 0,
+    /// Qualifying matches when direct verification completed without ranking prunes.
+    exact_match_count: ?usize = null,
 };
 
 pub const Result = struct { id: u32, distance: f32 };
@@ -781,16 +784,20 @@ pub const Index = struct {
         if (query.len != self.dimension()) return error.DimensionMismatch;
         try filter.checkCancelled();
         var stats = SearchStats{};
-        if (self.node_count == 0 or opts.k == 0 or filter.eligible_count == 0) return .{ .results = try alloc.alloc(Result, 0), .stats = stats };
+        if (self.node_count == 0 or opts.k == 0 or filter.eligible_count == 0) {
+            if (opts.k != 0) stats.exact_match_count = 0;
+            return .{ .results = try alloc.alloc(Result, 0), .stats = stats };
+        }
         const q = try alloc.dupe(f32, query);
         defer alloc.free(q);
         if (self.config.metric == .cosine) normalize(q);
 
-        var top: HeapOrdered(true, true) = .{};
+        var top: FilteredHeap = .{};
         defer top.deinit(alloc);
         var work: FilteredVerification = .{};
         defer work.deinit(alloc);
         if (direct_ids) |ids| {
+            stats.exact_match_count = 0;
             if (filter.direct_verify_bounds and self.rabitq != null) {
                 var approx = try Approx.initWithRadius(alloc, self, q, filter.distance_under != null);
                 defer approx.deinit();
@@ -849,7 +856,7 @@ pub const Index = struct {
                 opts.k *| 12;
             stats.peak_frontier = 1;
             var eligible_seen: usize = 0;
-            var previous_cutoff: ?Cand = null;
+            var previous_cutoff: ?FilteredCandidate = null;
             while (true) {
                 while (frontier.len() > 0 and stats.expanded < budget) {
                     try filter.checkCancelled();
@@ -870,8 +877,8 @@ pub const Index = struct {
                     stats.peak_frontier = @max(stats.peak_frontier, @as(u32, @intCast(frontier.len())));
                 }
                 const discovered = eligible_seen + work.pending.items.len;
-                const unknown_yield = filter.eligible_count == null and discovered >= opts.k;
-                if (discovered >= target or unknown_yield or frontier.len() == 0) {
+                const enough_to_verify = (filter.eligible_count == null or filter.distance_under != null or filter.distance_over != null) and discovered >= opts.k;
+                if (discovered >= target or enough_to_verify or frontier.len() == 0) {
                     eligible_seen += work.pending.items.len;
                     try self.verifyFiltered(alloc, source, q, null, opts, filter, &work, &top, &stats);
                     if (frontier.len() == 0) break;
@@ -895,7 +902,7 @@ pub const Index = struct {
                 budget = @intCast(@min(next_budget, self.node_count));
             }
         }
-        std.mem.sortUnstable(Cand, top.items.items, {}, candLessThan);
+        std.mem.sortUnstable(FilteredCandidate, top.items.items, {}, FilteredCandidate.lessThan);
         const results = try alloc.alloc(Result, top.len());
         for (results, top.items.items) |*out, item| out.* = .{ .id = item.id, .distance = item.dist };
         return .{ .results = results, .stats = stats };
@@ -948,7 +955,7 @@ pub const Index = struct {
         try work.pending.append(alloc, .{ .id = id, .dist = lower });
     }
 
-    fn verifyFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, query: []const f32, upper_query: ?[]const f32, opts: SearchOptions, filter: ResultFilter, work: *FilteredVerification, top: *HeapOrdered(true, true), stats: *SearchStats) !void {
+    fn verifyFiltered(self: *const Index, alloc: Allocator, source: EmbeddingSource, query: []const f32, upper_query: ?[]const f32, opts: SearchOptions, filter: ResultFilter, work: *FilteredVerification, top: *FilteredHeap, stats: *SearchStats) !void {
         std.mem.sortUnstable(Cand, work.pending.items, {}, candLessThan);
         defer work.pending.clearRetainingCapacity();
         const batch_size = if (opts.batch_size > 0) opts.batch_size else @max(opts.k, 1);
@@ -958,10 +965,13 @@ pub const Index = struct {
             work.ids.clearRetainingCapacity();
             while (next < work.pending.items.len and work.ids.items.len < batch_size) : (next += 1) {
                 const item = work.pending.items[next];
-                if (top.len() >= opts.k and item.dist > top.top().dist) break;
+                if (top.len() >= opts.k and item.dist > top.top().dist) {
+                    stats.exact_match_count = null;
+                    break;
+                }
                 const upper_vector = self.upper_vectors.get(item.id);
                 if (upper_vector != null and source.boundsCurrent(item.id)) {
-                    try addFilteredResult(alloc, filter, top, opts.k, .{ .id = item.id, .dist = if (upper_query) |rotated| distance(self.config.metric, rotated, upper_vector.?) else item.dist });
+                    try addFilteredResult(alloc, filter, top, opts.k, stats, .{ .id = item.id, .dist = if (upper_query) |rotated| distance(self.config.metric, rotated, upper_vector.?) else item.dist });
                 } else {
                     try work.ids.append(alloc, item.id);
                 }
@@ -970,16 +980,22 @@ pub const Index = struct {
             try work.distances.resize(alloc, work.ids.items.len);
             try self.recomputeDistances(alloc, source, query, work.ids.items, &work.vectors, work.distances.items, stats);
             for (work.ids.items, work.distances.items) |id, dist| {
-                try addFilteredResult(alloc, filter, top, opts.k, .{ .id = id, .dist = dist });
+                try addFilteredResult(alloc, filter, top, opts.k, stats, .{ .id = id, .dist = dist });
             }
         }
     }
 
-    fn addFilteredResult(alloc: Allocator, filter: ResultFilter, top: *HeapOrdered(true, true), k: usize, item: Cand) !void {
-        if (!std.math.isFinite(item.dist) or !filter.distanceAllowed(item.dist)) return;
+    fn addFilteredResult(alloc: Allocator, filter: ResultFilter, top: *FilteredHeap, k: usize, stats: *SearchStats, candidate: Cand) !void {
+        if (!std.math.isFinite(candidate.dist) or !filter.distanceAllowed(candidate.dist)) return;
+        if (stats.exact_match_count) |*count| count.* += 1;
+        const item: FilteredCandidate = .{
+            .id = candidate.id,
+            .dist = candidate.dist,
+            .order = if (filter.result_order) |order| order(filter.ctx, candidate.id) else candidate.id,
+        };
         if (top.len() < k) {
             try top.push(alloc, item);
-        } else if (candLessThan({}, item, top.top())) {
+        } else if (FilteredCandidate.lessThan({}, item, top.top())) {
             top.replaceTop(item);
         }
     }
@@ -2936,6 +2952,24 @@ pub const ProductQuantizer = struct {
 
 const Cand = struct { dist: f32, id: u32 };
 
+const FilteredCandidate = struct {
+    dist: f32,
+    id: u32,
+    order: u64,
+
+    fn lessThan(_: void, a: FilteredCandidate, b: FilteredCandidate) bool {
+        if (a.dist != b.dist) return a.dist < b.dist;
+        if (a.order != b.order) return a.order < b.order;
+        return a.id < b.id;
+    }
+
+    fn worse(a: FilteredCandidate, b: FilteredCandidate) bool {
+        return lessThan({}, b, a);
+    }
+};
+
+const FilteredHeap = CandidateHeap(FilteredCandidate, FilteredCandidate.worse);
+
 fn candLessThan(_: void, a: Cand, b: Cand) bool {
     if (a.dist != b.dist) return a.dist < b.dist;
     return a.id < b.id;
@@ -2943,18 +2977,17 @@ fn candLessThan(_: void, a: Cand, b: Cand) bool {
 
 /// Binary heap over candidates: a min-heap, or a max-heap when `is_max`.
 fn Heap(comptime is_max: bool) type {
-    return HeapOrdered(is_max, false);
-}
-
-fn HeapOrdered(comptime is_max: bool, comptime tie_by_id: bool) type {
-    return struct {
-        items: std.ArrayListUnmanaged(Cand) = .empty,
-        const Self = @This();
-
+    return CandidateHeap(Cand, struct {
         fn before(a: Cand, b: Cand) bool {
-            if (tie_by_id) return if (is_max) candLessThan({}, b, a) else candLessThan({}, a, b);
             return if (is_max) a.dist > b.dist else a.dist < b.dist;
         }
+    }.before);
+}
+
+fn CandidateHeap(comptime Item: type, comptime before: fn (Item, Item) bool) type {
+    return struct {
+        items: std.ArrayListUnmanaged(Item) = .empty,
+        const Self = @This();
 
         fn deinit(self: *Self, alloc: Allocator) void {
             self.items.deinit(alloc);
@@ -2968,23 +3001,23 @@ fn HeapOrdered(comptime is_max: bool, comptime tie_by_id: bool) type {
             return self.items.items.len;
         }
 
-        fn top(self: *const Self) Cand {
+        fn top(self: *const Self) Item {
             return self.items.items[0];
         }
 
-        fn push(self: *Self, alloc: Allocator, c: Cand) !void {
+        fn push(self: *Self, alloc: Allocator, c: Item) !void {
             try self.items.append(alloc, c);
             var i = self.items.items.len - 1;
             const xs = self.items.items;
             while (i > 0) {
                 const p = (i - 1) / 2;
                 if (!before(xs[i], xs[p])) break;
-                std.mem.swap(Cand, &xs[i], &xs[p]);
+                std.mem.swap(Item, &xs[i], &xs[p]);
                 i = p;
             }
         }
 
-        fn pop(self: *Self) Cand {
+        fn pop(self: *Self) Item {
             const xs = self.items.items;
             const out = xs[0];
             const last = self.items.pop().?;
@@ -2995,7 +3028,7 @@ fn HeapOrdered(comptime is_max: bool, comptime tie_by_id: bool) type {
             return out;
         }
 
-        fn replaceTop(self: *Self, c: Cand) void {
+        fn replaceTop(self: *Self, c: Item) void {
             self.items.items[0] = c;
             self.siftDown(0);
         }
@@ -3009,7 +3042,7 @@ fn HeapOrdered(comptime is_max: bool, comptime tie_by_id: bool) type {
                 var best = l;
                 if (l + 1 < xs.len and before(xs[l + 1], xs[l])) best = l + 1;
                 if (!before(xs[best], xs[i])) break;
-                std.mem.swap(Cand, &xs[i], &xs[best]);
+                std.mem.swap(Item, &xs[i], &xs[best]);
                 i = best;
             }
         }
@@ -3328,10 +3361,11 @@ test "leann: filtered verification avoids loads beyond the upper threshold" {
     try testing.expectEqual(@as(u32, 0), response.stats.recomputed);
 }
 
-test "leann: filtered heap evicts the largest ID on equal distances" {
+test "leann: filtered heap uses the caller's order on equal distances" {
     const alloc = testing.allocator;
-    var top: HeapOrdered(true, true) = .{};
+    var top: FilteredHeap = .{};
     defer top.deinit(alloc);
+    var stats: SearchStats = .{ .exact_match_count = 0 };
     const filter = ResultFilter{
         .ctx = &top,
         .allows = struct {
@@ -3339,11 +3373,47 @@ test "leann: filtered heap evicts the largest ID on equal distances" {
                 return true;
             }
         }.allows,
+        .result_order = struct {
+            fn order(_: *const anyopaque, id: u32) u64 {
+                return std.math.maxInt(u64) - @as(u64, id);
+            }
+        }.order,
     };
-    try Index.addFilteredResult(alloc, filter, &top, 2, .{ .id = 1, .dist = 10 });
-    try Index.addFilteredResult(alloc, filter, &top, 2, .{ .id = 2, .dist = 10 });
-    try Index.addFilteredResult(alloc, filter, &top, 2, .{ .id = 3, .dist = 0 });
-    try testing.expectEqual(@as(u32, 1), top.top().id);
+    try Index.addFilteredResult(alloc, filter, &top, 1, &stats, .{ .id = 1, .dist = 10 });
+    try Index.addFilteredResult(alloc, filter, &top, 1, &stats, .{ .id = 2, .dist = 10 });
+    try testing.expectEqual(@as(u32, 2), top.top().id);
+    try testing.expectEqual(@as(?usize, 2), stats.exact_match_count);
+}
+
+test "leann: a distance-selective allowlist verifies before the graph is exhausted" {
+    const alloc = testing.allocator;
+    const dims = 8;
+    const count = 128;
+    const query: [dims]f32 = @splat(0);
+    var vectors: [count * dims]f32 = @splat(100);
+    @memset(vectors[0 .. 10 * dims], 0);
+    var index = try Index.build(alloc, .{ .dims = dims, .metric = .l2_squared, .quantizer = .rabitq }, &vectors);
+    defer index.deinit();
+    index.entry = 0;
+    index.max_level = 0;
+    for (index.adjacency.items, 0..) |*neighbors, id| {
+        neighbors.clearRetainingCapacity();
+        if (id + 1 < count) try neighbors.append(alloc, @intCast(id + 1));
+    }
+    var source = SliceEmbeddingSource{ .vectors = &vectors, .dims = dims };
+    var result = try index.searchFiltered(alloc, source.source(), &query, .{ .k = 10, .ef = 16 }, .{
+        .ctx = &index,
+        .eligible_count = 100,
+        .distance_under = 1,
+        .allows = struct {
+            fn allows(_: *const anyopaque, id: u32) !bool {
+                return id < 100;
+            }
+        }.allows,
+    }, null);
+    defer result.deinit(alloc);
+    try testing.expectEqual(@as(usize, 10), result.results.len);
+    try testing.expect(result.stats.expanded <= 32);
 }
 
 test "leann: clustered eligibility stops a widened walk before exhausting the graph" {

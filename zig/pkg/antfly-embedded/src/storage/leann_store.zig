@@ -636,6 +636,8 @@ pub const LeannStore = struct {
         const graph_ids: []u32 = if (direct) try alloc.alloc(u32, filter.ids.include.count()) else &.{};
         defer if (direct) alloc.free(graph_ids);
         var graph_count: usize = 0;
+        var pending_matches: usize = 0;
+        var graph_matches: ?usize = if (direct) 0 else null;
         if (direct) {
             var ids = filter.ids.include.keyIterator();
             while (ids.next()) |id| {
@@ -644,13 +646,13 @@ pub const LeannStore = struct {
                     graph_count += 1;
                 }
                 if (self.pending_of.get(id.*)) |slot| {
-                    try self.scorePending(alloc, &filter, q, scratch, slot, &out);
+                    pending_matches += @intFromBool(try self.scorePending(alloc, &filter, q, scratch, slot, &out));
                 }
             }
             std.mem.sortUnstable(u32, graph_ids[0..graph_count], {}, std.sort.asc(u32));
         } else {
             for (0..self.pending.items.len) |slot| {
-                try self.scorePending(alloc, &filter, q, scratch, slot, &out);
+                _ = try self.scorePending(alloc, &filter, q, scratch, slot, &out);
             }
         }
 
@@ -672,6 +674,11 @@ pub const LeannStore = struct {
                     return context.filter.allows(node.vector_id, node.metadata);
                 }
 
+                fn order(raw: *const anyopaque, id: u32) u64 {
+                    const context: *const @This() = @ptrCast(@alignCast(raw));
+                    return context.store.nodes.items[id].vector_id;
+                }
+
                 fn cancelled(raw: *const anyopaque) bool {
                     const context: *const @This() = @ptrCast(@alignCast(raw));
                     return context.filter.cancelled();
@@ -682,6 +689,7 @@ pub const LeannStore = struct {
                 try index.searchFiltered(alloc, ctx.source(), req.query, opts, .{
                     .ctx = &filter_ctx,
                     .allows = FilterContext.allows,
+                    .result_order = FilterContext.order,
                     .cancelled = FilterContext.cancelled,
                     .eligible_count = filter.eligibleCount(),
                     .direct_verify_bounds = direct_mode == .bounds,
@@ -691,25 +699,28 @@ pub const LeannStore = struct {
             else
                 try index.search(alloc, ctx.source(), req.query, opts);
             defer resp.deinit(alloc);
+            graph_matches = resp.stats.exact_match_count;
             if (search_stats) |profile| profile.* = resp.stats;
             for (resp.results) |result| {
                 const node = self.nodes.items[result.id];
                 out.addResultWithOwnedMetadata(node.vector_id, result.distance, 0, if (req.load_metadata) try alloc.dupe(u8, node.metadata) else null);
             }
         }
+        if (graph_matches) |count| out.candidate_coverage = if (count + pending_matches > out.getHits().len) .more else .exhausted;
         out.sort();
         return out;
     }
 
-    fn scorePending(self: *const LeannStore, alloc: Allocator, filter: *const Filter, q: []const f32, scratch: []f32, slot: usize, out: *search_results.SearchResults) !void {
+    fn scorePending(self: *const LeannStore, alloc: Allocator, filter: *const Filter, q: []const f32, scratch: []f32, slot: usize, out: *search_results.SearchResults) !bool {
         if (filter.cancelled()) return error.Cancelled;
         const item = self.pending.items[slot];
-        if (!try filter.allows(item.vector_id, item.metadata)) return;
+        if (!try filter.allows(item.vector_id, item.metadata)) return false;
         @memcpy(scratch, item.vector);
         if (self.opts.metric == .cosine) normalize(scratch);
         const dist = leann.distance(@fromBackingInt(@intCast(@as(u8, @intCast(@backingInt(self.opts.metric))))), q, scratch);
-        if (!std.math.isFinite(dist) or !filter.distanceAllowed(dist)) return;
+        if (!std.math.isFinite(dist) or !filter.distanceAllowed(dist)) return false;
         out.addResultWithOwnedMetadata(item.vector_id, dist, 0, if (filter.request.load_metadata) try alloc.dupe(u8, item.metadata) else null);
+        return true;
     }
 
     /// Metadata for a live vector id, owned by `alloc`.

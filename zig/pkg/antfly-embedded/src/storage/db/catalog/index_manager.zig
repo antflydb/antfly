@@ -52579,6 +52579,7 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
             .distance_under = 0.001,
         });
         defer filtered.results.deinit();
+        try std.testing.expectEqual(.exhausted, filtered.results.candidate_coverage);
         try std.testing.expectEqual(@as(usize, 1), filtered.results.getHits().len);
         try std.testing.expectEqual(allowlist[5], filtered.results.getHits()[0].vector_id);
         try std.testing.expectEqual(@as(u64, 0), filtered.profile.nodes_visited);

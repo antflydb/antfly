@@ -660,6 +660,7 @@ pub const Replica = struct {
         cancelled: *const fn (*const anyopaque) bool,
         eligible_count: ?u32 = null,
         direct_verify_bounds: bool = false,
+        result_order: ?*const fn (*const anyopaque, []const u8) u64 = null,
         distance_over: ?f32 = null,
         distance_under: ?f32 = null,
         direct_keys: ?[]const []const u8 = null,
@@ -693,16 +694,65 @@ pub const Replica = struct {
         const tmp = try alloc.alloc(f32, query.len);
         defer alloc.free(tmp);
         const direct_keys = if (tuning.filter) |filter| filter.direct_keys else null;
+        var direct_key_set: std.StringHashMapUnmanaged(void) = .empty;
+        defer direct_key_set.deinit(alloc);
         if (direct_keys) |keys| {
-            for (keys) |key| {
-                const slot = self.bufferIndex(key) orelse continue;
-                try self.scoreBufferHit(alloc, q, tmp, slot, tuning.filter, loader, &hits);
-            }
-        } else {
-            for (0..self.buffer_keys.items.len) |slot| {
-                try self.scoreBufferHit(alloc, q, tmp, slot, tuning.filter, loader, &hits);
+            if (self.buffer_keys.items.len > 0) {
+                for (keys) |key| try direct_key_set.put(alloc, key, {});
             }
         }
+        var dirty_slots: std.ArrayListUnmanaged(usize) = .empty;
+        defer dirty_slots.deinit(alloc);
+        for (self.buffer_keys.items, 0..) |key, slot| {
+            if (direct_keys != null and !direct_key_set.contains(key)) continue;
+            if (tuning.filter) |filter| {
+                if (filter.cancelled(filter.ctx)) return error.Cancelled;
+                if (!try filter.allows(filter.ctx, key)) continue;
+            }
+            if (loader.bounds_current) |check| {
+                if (!check(loader.ctx, key)) {
+                    try dirty_slots.append(alloc, slot);
+                    continue;
+                }
+            }
+            try self.scoreBufferHit(alloc, q, tmp, key, self.buffer_vectors.items[slot], tuning.filter, &hits);
+        }
+        if (loader.load_batch) |load_batch| {
+            if (dirty_slots.items.len > 0) {
+                const batch_size = @min(dirty_slots.items.len, if (tuning.batch_size == 0) 64 else tuning.batch_size);
+                const keys = try alloc.alloc([]const u8, batch_size);
+                defer alloc.free(keys);
+                const vectors = try alloc.alloc(f32, batch_size * query.len);
+                defer alloc.free(vectors);
+                const found = try alloc.alloc(bool, batch_size);
+                defer alloc.free(found);
+                var start: usize = 0;
+                while (start < dirty_slots.items.len) {
+                    if (tuning.filter) |filter| if (filter.cancelled(filter.ctx)) return error.Cancelled;
+                    const slots = dirty_slots.items[start..][0..@min(batch_size, dirty_slots.items.len - start)];
+                    for (slots, keys[0..slots.len]) |slot, *key| key.* = self.buffer_keys.items[slot];
+                    @memset(found[0..slots.len], false);
+                    try load_batch(loader.ctx, alloc, keys[0..slots.len], vectors[0 .. slots.len * query.len], found[0..slots.len]);
+                    for (keys[0..slots.len], found[0..slots.len], 0..) |key, ok, i| {
+                        if (ok) try self.scoreBufferHit(alloc, q, tmp, key, vectors[i * query.len ..][0..query.len], tuning.filter, &hits);
+                    }
+                    start += slots.len;
+                }
+            }
+        } else {
+            for (dirty_slots.items) |slot| {
+                if (tuning.filter) |filter| if (filter.cancelled(filter.ctx)) return error.Cancelled;
+                const key = self.buffer_keys.items[slot];
+                const vector = loader.load(loader.ctx, alloc, key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                defer alloc.free(vector);
+                try self.scoreBufferHit(alloc, q, tmp, key, vector, tuning.filter, &hits);
+            }
+        }
+        const buffer_matches = hits.items.len;
+        var exact_matches: ?usize = if (direct_keys != null) buffer_matches else null;
         if (self.index) |*index| {
             var ctx = SearchSource{ .replica = self, .loader = loader, .far_from = if (tuning.filter != null) null else query };
             const opts: leann.SearchOptions = .{
@@ -719,6 +769,11 @@ pub const Replica = struct {
                     fn allows(raw: *const anyopaque, id: u32) !bool {
                         const context: *const @This() = @ptrCast(@alignCast(raw));
                         return context.filter.allows(context.filter.ctx, context.replica.keys.items[id]);
+                    }
+
+                    fn order(raw: *const anyopaque, id: u32) u64 {
+                        const context: *const @This() = @ptrCast(@alignCast(raw));
+                        return context.filter.result_order.?(context.filter.ctx, context.replica.keys.items[id]);
                     }
 
                     fn cancelled(raw: *const anyopaque) bool {
@@ -739,6 +794,7 @@ pub const Replica = struct {
                 break :blk try index.searchFiltered(alloc, ctx.source(), query, opts, .{
                     .ctx = &filter_context,
                     .allows = FilterContext.allows,
+                    .result_order = if (filter.result_order != null) FilterContext.order else null,
                     .cancelled = FilterContext.cancelled,
                     .eligible_count = filter.eligible_count,
                     .direct_verify_bounds = filter.direct_verify_bounds,
@@ -747,12 +803,17 @@ pub const Replica = struct {
                 }, if (direct_keys != null) direct_ids.items else null);
             } else try index.search(alloc, ctx.source(), query, opts);
             defer resp.deinit(alloc);
+            exact_matches = if (resp.stats.exact_match_count) |count| count + buffer_matches else null;
             if (tuning.stats) |profile| profile.* = resp.stats;
             for (resp.results) |r| try hits.append(alloc, .{ .key = self.keys.items[r.id], .distance = r.distance });
         }
-        std.mem.sortUnstable(Hit, hits.items, {}, struct {
-            fn lt(_: void, a: Hit, b: Hit) bool {
-                if (a.distance == b.distance) return std.mem.lessThan(u8, a.key, b.key);
+        if (tuning.stats) |profile| profile.exact_match_count = exact_matches;
+        std.mem.sortUnstable(Hit, hits.items, tuning.filter, struct {
+            fn lt(filter: ?KeyFilter, a: Hit, b: Hit) bool {
+                if (a.distance == b.distance) {
+                    if (filter) |f| if (f.result_order) |order| return order(f.ctx, a.key) < order(f.ctx, b.key);
+                    return std.mem.lessThan(u8, a.key, b.key);
+                }
                 return a.distance < b.distance;
             }
         }.lt);
@@ -760,22 +821,8 @@ pub const Replica = struct {
         return hits.toOwnedSlice(alloc);
     }
 
-    fn scoreBufferHit(self: *const Replica, alloc: Allocator, query: []const f32, scratch: []f32, slot: usize, filter: ?KeyFilter, loader: VectorLoader, hits: *std.ArrayListUnmanaged(Hit)) !void {
-        const key = self.buffer_keys.items[slot];
-        if (filter) |f| {
-            if (f.cancelled(f.ctx)) return error.Cancelled;
-            if (!try f.allows(f.ctx, key)) return;
-        }
+    fn scoreBufferHit(self: *const Replica, alloc: Allocator, query: []const f32, scratch: []f32, key: []const u8, vector: []const f32, filter: ?KeyFilter, hits: *std.ArrayListUnmanaged(Hit)) !void {
         const metric = self.opts.config.metric;
-        const current = if (loader.bounds_current) |check| blk: {
-            if (check(loader.ctx, key)) break :blk null;
-            break :blk loader.load(loader.ctx, alloc, key) catch |err| switch (err) {
-                error.NotFound => return,
-                else => return err,
-            };
-        } else null;
-        defer if (current) |vector| alloc.free(vector);
-        const vector = current orelse self.buffer_vectors.items[slot];
         if (vector.len != scratch.len) return error.DimensionMismatch;
         @memcpy(scratch, vector);
         if (metric == .cosine) normalize(scratch);
