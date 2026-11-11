@@ -871,6 +871,77 @@ endpoint independently of credentials and source policy. Hosting runtimes can
 cache verified byte digests under that namespace, immutable object version and
 length; a digest receipt never replaces live access checks or grants delivery.
 
+### Declaration revisions and preconditions
+
+Every source returned by the shared handler carries a read-only `revision` (also
+sent as an `ETag`). It is derived from declared fields only, so run state, search
+status and knowledge status never change it. Runtimes that advertise
+`revision_preconditions` accept `PUT /sources/{id}` with `If-Match: "<revision>"`
+and return `412 source_revision_mismatch` when another edit landed first; a
+conditional PUT never creates a source. Runtimes implement this by providing
+`management.PreconditionBackend` and comparing under the same lock as the write;
+the shared handler answers `501` for runtimes that do not. Use
+`Client.PutSourceIfMatch` with the revision from a prior read; the server's
+revision is authoritative (do not recompute it client-side).
+
+Optional empty stream/artifact arrays have the same revision as omitted arrays,
+matching their HTTP representation. Clearing either collection converges after
+one write. Public policies with an omitted or empty `readers` list also compare
+as equivalent during manifest planning; the server's opaque revision remains
+authoritative for conditional writes.
+
+Runtimes may expose read-only `reconciliation_status` (`pending`, `failed` or
+`ready`) when desired state is committed before configuration side effects.
+These observations do not change the declaration revision. Matching declarations
+with unfinished recovery plan as `reconcile`; apply retries a conditional PUT and
+reports `reconciled` when ready. A non-ready write response is a failed apply
+result, so partial configuration is never reported as converged.
+
+### Reusable CLI handlers
+
+`sources/management/commands` packages management operations as framework-neutral
+handlers that any CLI can mount against Colony or a standalone server:
+capabilities, paginated listing, status, runs (start with an idempotency key,
+bounded waiting that never cancels hosted work, history, inspection,
+capability-gated cancellation), processing and artifact readiness, archive and
+confirmation-gated purge, and versioned manifests with `PlanManifest` and
+`ApplyManifest`. Handlers take an `Env` (any `API` implementation such as
+`*management.Client`, an output writer, JSON mode, and test clock hooks) and return
+typed `*commands.Error` values whose `ExitCode()` gives stable process statuses.
+Hosting-specific behaviour (identity of manifest entries, connection references,
+default permissions, extensions) is injected through `PlanOptions`.
+
+Build the client with `NewClientWithOptions` to supply your own `http.Client`
+(timeouts; redirects stay disabled) and a per-request token source.
+
+A manifest is strict, versioned JSON (callers may convert YAML first) that reuses
+the shared declaration types:
+
+```json
+{"version": 1, "sources": [{
+  "key": "engineering-docs", "name": "Engineering docs",
+  "connection": "<connection-id>", "table": "knowledge",
+  "config": {"resource": "drive", "folder_id": "..."}
+}]}
+```
+
+Fields an entry omits are left as the server has them. Plan never writes; apply
+writes changed sources and retries unfinished configuration reconciliation. It
+never deletes a source that is absent from the file —
+retire sources explicitly with archive or purge.
+
+Omitted names preserve existing display names; a new source defaults to its key.
+Planning validates every effective search, processing and knowledge declaration
+before any write, using the same pure validators as the runtime adapters.
+Provider access, authorization and native index admission are checked by the
+server. These shared validators live in `internal/declarations`, keeping command
+handlers independent of connector dependencies.
+
+Apply reports `error_code`, `http_status` and `server_code` on failed source
+results when available. If every failure has the same category, the command
+retains that category's exit status. Mixed categories exit 1; each result retains
+its own error details. Successful sources are kept and can converge on rerun.
+
 ## Native source records and searchable artifacts
 
 Source runs now publish the consumer-independent [v3 envelope](../../../zig/pkg/antfly-grep/schema/document-v3.json):
@@ -1024,3 +1095,14 @@ and explicit exact-key selections are retained.
 Projected-page syncs checkpoint each verified publication batch. On resume,
 the sync rechecks the indexed rows and the pinned GCS generations and
 metagenerations before reusing them.
+
+
+Manifest comparison treats equivalent JSON numeric spellings exactly (including
+large integers and decimal exponents); it never converts them to float64 or
+changes the server's opaque revision. Plan and apply prefer
+`Client.GetSourceDeclaration`, using `GET /sources/{id}?view=declaration` to read
+configuration and reconciliation state without native readiness inspection.
+Runtimes implement the optional `management.DeclarationBackend`; older runtimes
+may return the full source view. Status commands continue to request readiness.
+Opaque connector config rejects `management.ReservedSourceConfigFields()` in both
+manifest preflight and the shared HTTP handler.

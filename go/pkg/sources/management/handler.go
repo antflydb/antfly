@@ -21,6 +21,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -107,6 +108,56 @@ func page(r *http.Request) (int, string, error) {
 	return limit, cursor, nil
 }
 
+// sourcePrecondition accepts one strong entity tag or a bare revision.
+func sourcePrecondition(values []string) (string, error) {
+	if len(values) != 1 {
+		return "", Failure(400, "invalid_precondition")
+	}
+	revision := strings.TrimSpace(values[0])
+	if strings.HasPrefix(revision, "W/") || revision == "*" {
+		return "", Failure(400, "invalid_precondition")
+	}
+	if len(revision) >= 2 && revision[0] == '"' && revision[len(revision)-1] == '"' {
+		revision = revision[1 : len(revision)-1]
+	}
+	if revision == "" || strings.ContainsAny(revision, "\", \t\r\n") {
+		return "", Failure(400, "invalid_precondition")
+	}
+	return revision, nil
+}
+
+// putSourceConditionally applies at most one of If-Match (revision) or
+// If-None-Match: * (create-only). Malformed preconditions are rejected before
+// the backend's precondition support is checked.
+func putSourceConditionally(ctx context.Context, b Backend, source Source, h http.Header) (Source, error) {
+	ifMatch, ifNoneMatch := h.Values("If-Match"), h.Values("If-None-Match")
+	switch {
+	case ifMatch != nil && ifNoneMatch != nil:
+		return Source{}, Failure(400, "invalid_precondition")
+	case ifMatch == nil && ifNoneMatch == nil:
+		return b.PutSource(ctx, source)
+	}
+	var revision string
+	if ifNoneMatch != nil {
+		if len(ifNoneMatch) != 1 || strings.TrimSpace(ifNoneMatch[0]) != "*" {
+			return Source{}, Failure(400, "invalid_precondition")
+		}
+	} else {
+		var err error
+		if revision, err = sourcePrecondition(ifMatch); err != nil {
+			return Source{}, err
+		}
+	}
+	backend, ok := b.(PreconditionBackend)
+	if !ok {
+		return Source{}, Failure(501, "revision_preconditions_unsupported")
+	}
+	if ifNoneMatch != nil {
+		return backend.PutSourceIfAbsent(ctx, source)
+	}
+	return backend.PutSourceIfMatch(ctx, source, revision)
+}
+
 // Handler expects a base-relative path. The caller mounts and authenticates it.
 // Route validation and JSON/error semantics are shared by both hosting runtimes.
 func Handler(b Backend) http.Handler {
@@ -141,7 +192,18 @@ func Handler(b Backend) http.Handler {
 			case len(parts) == 2:
 				switch r.Method {
 				case http.MethodGet:
-					result, err = b.GetSource(r.Context(), id)
+					switch view := r.URL.Query().Get("view"); view {
+					case "", "full":
+						result, err = b.GetSource(r.Context(), id)
+					case "declaration":
+						if declarations, ok := b.(DeclarationBackend); ok {
+							result, err = declarations.GetSourceDeclaration(r.Context(), id)
+						} else {
+							result, err = b.GetSource(r.Context(), id)
+						}
+					default:
+						err = Failure(400, "invalid_source_view")
+					}
 				case http.MethodPut:
 					var source Source
 					if err = Decode(w, r, &source); err != nil {
@@ -151,7 +213,18 @@ func Handler(b Backend) http.Handler {
 						err = Failure(400, "invalid_source")
 						break
 					}
-					result, err = b.PutSource(r.Context(), source)
+					for _, key := range ReservedSourceConfigFields() {
+						if _, exists := source.Config[key]; exists {
+							err = Failure(400, "reserved_source_config_field")
+							break
+						}
+					}
+					if err != nil {
+						break
+					}
+					source.Revision = ""
+					source.ReconciliationStatus = nil
+					result, err = putSourceConditionally(r.Context(), b, source, r.Header)
 				case http.MethodDelete:
 					purge := r.URL.Query().Get("purge")
 					if purge != "" && purge != "true" && purge != "false" {
@@ -225,6 +298,19 @@ func Handler(b Backend) http.Handler {
 			WriteError(w, err)
 			return
 		}
+		switch value := result.(type) {
+		case Source:
+			value.Revision = SourceRevision(value)
+			w.Header().Set("ETag", `"`+value.Revision+`"`)
+			result = value
+		case SourcePage:
+			// The backend may retain its page; only mutate handler-owned sources.
+			value.Data = slices.Clone(value.Data)
+			for i := range value.Data {
+				value.Data[i].Revision = SourceRevision(value.Data[i])
+			}
+			result = value
+		}
 		WriteJSON(w, status, result)
 	})
 }
@@ -237,6 +323,8 @@ const SourcePageBudget = MaxResponseBytes - 1024
 // SourceBytes measures the actual wire representation, including JSON escaping.
 // Runtime adapters enforce the same budget before materializing a large page.
 func SourceBytes(source Source) (int, error) {
+	// Include the handler-owned fields before enforcing the transport budget.
+	source.Revision = SourceRevision(source)
 	raw, err := json.Marshal(source)
 	if err != nil {
 		return 0, err
