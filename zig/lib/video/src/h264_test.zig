@@ -774,7 +774,7 @@ test "video H264 field chroma high depth and explicit group allocation failures 
         }
     };
     inline for (.{ @embedFile("../testdata/h264-groups-6-0.mp4"), @embedFile("../testdata/h264-paff-pcm-14-3.mp4"), @embedFile("../testdata/h264-high10-444-cabac.mp4"), @embedFile("../testdata/h264-high10-mbaff-cabac.mp4") }) |bytes| {
-        try std.testing.checkAllAllocationFailures(a, Harness.run, .{bytes});
+        try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{bytes});
     }
 }
 
@@ -1004,7 +1004,7 @@ test "video H264 PAFF standalone allocation failures release partial field refer
             defer frame.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{});
 }
 
 test "video H264 PAFF field marking preserves complementary identities and long PicNum 31" {
@@ -1130,8 +1130,11 @@ const paff_assembly_cases = .{
 };
 
 test "video H264 PAFF assembly interleaved and fragmented fields preserve samples and timestamps" {
+    var checked = try @import("allocation_test_support.zig").CheckedAllocator.init();
+    defer checked.deinit();
+    const alloc = checked.allocator();
     const Receipt = struct { cases: []const struct { name: []const u8, members: []const []const usize, mp4_sha256: []const u8, nv12_sha256: []const u8 } };
-    const receipt = try std.json.parseFromSlice(Receipt, a, @embedFile("../testdata/h264-paff-assembly-oracle.json"), .{ .ignore_unknown_fields = true });
+    const receipt = try std.json.parseFromSlice(Receipt, alloc, @embedFile("../testdata/h264-paff-assembly-oracle.json"), .{ .ignore_unknown_fields = true });
     defer receipt.deinit();
     try std.testing.expectEqual(paff_assembly_cases.len, receipt.value.cases.len);
     inline for (paff_assembly_cases, 0..) |pair, case_index| {
@@ -1143,14 +1146,14 @@ test "video H264 PAFF assembly interleaved and fragmented fields preserve sample
             try std.testing.expectEqualStrings(if (file_index == 0) entry.mp4_sha256 else entry.nv12_sha256, &std.fmt.bytesToHex(hash, .lower));
         }
         var pool = media.admission.Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
-        var src = media.source.Source{ .allocator = a, .admission_pool = &pool, .identity = pair[0], .storage = .{ .borrowed = pair[1] } };
-        var reader = try media.mp4.Reader.init(a, &src, .{ .max_index_bytes = 65536 });
+        var src = media.source.Source{ .allocator = alloc, .admission_pool = &pool, .identity = pair[0], .storage = .{ .borrowed = pair[1] } };
+        var reader = try media.mp4.Reader.init(alloc, &src, .{ .max_index_bytes = 65536 });
         defer reader.deinit();
         const retained = pool.snapshot();
         const size = pair[2].len / entry.members.len;
         for (entry.members, 0..) |members, ordinal| {
             for (members) |index| {
-                var frame = video.h264.decodeFrame(a, &reader, index, .{}) catch |err| {
+                var frame = video.h264.decodeFrame(alloc, &reader, index, .{}) catch |err| {
                     std.debug.print("PAFF assembly {s} packet {d}: {s}\n", .{ pair[0], index, @errorName(err) });
                     return err;
                 };
@@ -1218,8 +1221,8 @@ test "video H264 PAFF assembly allocation failures unwind snapshots and pending 
             defer frame.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Harness.run, .{ @as([]const u8, @embedFile("../testdata/h264-paff-interleaved-fragments-14-3.mp4")), @as(usize, 0) });
-    try std.testing.checkAllAllocationFailures(a, Harness.run, .{ @as([]const u8, @embedFile("../testdata/h264-paff-frozen-prediction-14-3.mp4")), @as(usize, 1) });
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{ @as([]const u8, @embedFile("../testdata/h264-paff-interleaved-fragments-14-3.mp4")), @as(usize, 0) });
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{ @as([]const u8, @embedFile("../testdata/h264-paff-frozen-prediction-14-3.mp4")), @as(usize, 1) });
 }
 
 test "video H264 PAFF assembly snapshots survive complementary completion and eviction" {
@@ -1252,7 +1255,7 @@ test "video H264 PAFF assembly snapshots survive complementary completion and ev
         }
     };
     try Harness.run(a);
-    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{});
 }
 
 test "video H264 PAFF assembly ignores auxiliary timing and rejects duplicate fragments" {
@@ -1363,7 +1366,7 @@ test "video dynamic H264 registry and geometry reconstruction unwind allocation 
             defer frame.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{});
 }
 
 test "video monochrome native depth CAVLC and CABAC PAFF samples match FFmpeg" {
@@ -1489,8 +1492,8 @@ test "video H264 JM advanced reconstruction allocation failures and admission un
             frame.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Harness.run, .{@as([]const u8, @embedFile("../testdata/h264-jm-partitions.mp4"))});
-    try std.testing.checkAllAllocationFailures(a, Harness.run, .{@as([]const u8, @embedFile("../testdata/h264-jm-separate-14.mp4"))});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{@as([]const u8, @embedFile("../testdata/h264-jm-partitions.mp4"))});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{@as([]const u8, @embedFile("../testdata/h264-jm-separate-14.mp4"))});
 }
 
 test "video non-IDR SPS changes preserve predicted references and reset intra geometry" {
@@ -1608,7 +1611,7 @@ test "video data partitions across transport packets route every member and rele
         }
     };
     try Harness.run(a, bytes, receipt.value.frames);
-    try std.testing.checkAllAllocationFailures(a, Harness.run, .{ bytes, receipt.value.frames });
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{ bytes, receipt.value.frames });
 }
 
 test "video SPS transition allocation failures retain source and admission ownership" {
@@ -1630,7 +1633,7 @@ test "video SPS transition allocation failures retain source and admission owner
         }
     };
     try Harness.run(a);
-    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Harness.run, .{});
 }
 
 test "video split partitions enforce aggregate packet and shared gathering budgets" {
@@ -1716,7 +1719,7 @@ fn sharedWorkspaceFailure(allocator: std.mem.Allocator) !void {
 }
 
 test "video H264 shared reconstruction allocation failures preserve old owners" {
-    try std.testing.checkAllAllocationFailures(a, sharedWorkspaceFailure, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(sharedWorkspaceFailure, .{});
 }
 
 test "video H264 shared and copying reference paths preserve progressive output" {

@@ -1202,7 +1202,11 @@ test "leann store: rejects graph settings the first build would refuse" {
 }
 
 test "leann store: a failed persistent rebuild keeps every vector owned once" {
-    const alloc = testing.allocator;
+    // Preserve all vectors and every injected rebuild allocation failure,
+    // including checked ownership, without tracing every setup allocation.
+    var checked = try @import("antfly_platform").allocator.CheckedTestAllocator.init();
+    defer checked.deinit();
+    const alloc = checked.allocator();
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

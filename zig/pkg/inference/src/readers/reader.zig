@@ -1227,18 +1227,20 @@ test "reader capability probe distinguishes unsupported metadata and preserves a
 test "Moondream readers route natively only with native checkpoint artifacts" {
     const allocator = std.testing.allocator;
     const man = manifest_mod.ModelManifest{ .allocator = allocator };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const missing_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "missing-moondream2" });
+    defer allocator.free(missing_dir);
     // Missing or ONNX-only Moondream directories stay unsupported and fail
     // closed without loading anything.
-    const support = try probeManifest(allocator, "models/readers/vikhyatk/moondream2", man);
+    const support = try probeManifest(allocator, missing_dir, man);
     try std.testing.expectEqual(UnsupportedReason.unsupported_moondream_artifacts, support.unsupported);
     var session_manager = backends.SessionManager.init(allocator);
     try std.testing.expectError(
         error.UnsupportedMoondreamArtifacts,
-        LoadedReader.loadFromDirWithControl(allocator, "models/readers/vikhyatk/moondream2", &session_manager, undefined, null),
+        LoadedReader.loadFromDirWithControl(allocator, missing_dir, &session_manager, undefined, null),
     );
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "moondream2");
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "moondream2" });
     defer allocator.free(model_dir);

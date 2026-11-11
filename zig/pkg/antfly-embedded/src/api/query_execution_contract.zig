@@ -721,9 +721,58 @@ pub fn appendJsonFieldU32(
 }
 
 pub fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(escaped);
-    try out.appendSlice(alloc, escaped);
+    // Large legal scan boundaries must not require a second full-size escaped
+    // allocation before copying into the request body. Preserve the caller's
+    // prefix on failure, while retaining ownership of any grown buffer.
+    const aliases_output = value.len != 0 and out.capacity != 0 and
+        @intFromPtr(value.ptr) < @intFromPtr(out.items.ptr) + out.capacity and
+        @intFromPtr(out.items.ptr) < @intFromPtr(value.ptr) + value.len;
+    const retained = if (aliases_output) try alloc.dupe(u8, value) else null;
+    defer if (retained) |copy| alloc.free(copy);
+    const prefix_len = out.items.len;
+    var writer = std.Io.Writer.Allocating.fromArrayList(alloc, out);
+    defer out.* = writer.toArrayList();
+    errdefer writer.writer.end = prefix_len;
+    writer.writer.print("{f}", .{std.json.fmt(retained orelse value, .{})}) catch return error.OutOfMemory;
+}
+
+test "local query contract JSON string append reuses wire capacity and preserves failed prefixes" {
+    var bytes: [32 * 1024 + 2]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&bytes);
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    defer output.deinit(bounded.allocator());
+    try output.ensureTotalCapacityPrecise(bounded.allocator(), bytes.len);
+    const input: [32 * 1024]u8 = @splat('x');
+    try appendJsonString(bounded.allocator(), &output, &input);
+    try std.testing.expectEqual(bytes.len, output.items.len);
+    try std.testing.expectEqualStrings(&input, output.items[1 .. output.items.len - 1]);
+    try std.testing.expectEqual(@as(u8, '"'), output.items[0]);
+    try std.testing.expectEqual(@as(u8, '"'), output.items[output.items.len - 1]);
+    const original = output.items;
+    // The final quote fits, but no additional string can fit. Failed appends
+    // must restore the original logical bytes without discarding their owner.
+    try std.testing.expectError(error.OutOfMemory, appendJsonString(bounded.allocator(), &output, "more"));
+    try std.testing.expectEqual(original.ptr, output.items.ptr);
+    try std.testing.expectEqualStrings(original, output.items);
+    const a = std.testing.allocator;
+    var aliased: std.ArrayListUnmanaged(u8) = .empty;
+    defer aliased.deinit(a);
+    try aliased.ensureTotalCapacityPrecise(a, 4);
+    try aliased.appendSlice(a, "seed");
+    try appendJsonString(a, &aliased, aliased.items);
+    try std.testing.expectEqualStrings("seed\"seed\"", aliased.items);
+    var escaped: std.ArrayListUnmanaged(u8) = .empty;
+    defer escaped.deinit(a);
+    for ([_][]const u8{ "", "a\"b\\c\n\r\t\x00\x1f", "β🙂" }) |text| {
+        escaped.clearRetainingCapacity();
+        try escaped.appendSlice(a, "[1,");
+        try appendJsonString(a, &escaped, text);
+        try escaped.append(a, ']');
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, escaped.items, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 1), parsed.value.array.items[0].integer);
+        try std.testing.expectEqualStrings(text, parsed.value.array.items[1].string);
+    }
 }
 
 pub const indexes_openapi = @import("antfly_indexes_openapi");

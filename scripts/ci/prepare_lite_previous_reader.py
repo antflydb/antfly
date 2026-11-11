@@ -50,6 +50,29 @@ def prepare_previous_reader_build(previous: Path) -> None:
     build.write_bytes(fixed)
 
 
+def prepare_previous_reader_dependencies(root: Path, previous: Path, env: dict) -> None:
+    # Keep compiler output isolated, but seed the same hash-verified source
+    # archives prepared by CI. The historical checkout predates this helper.
+    source_cache = Path(
+        os.environ.get("ZIG_GLOBAL_CACHE_DIR", str(root / "zig/.zig-cache/global"))
+    ).resolve()
+    command = [
+        sys.executable,
+        str(root / "scripts/ci/prepare_zig_dependencies.py"),
+        "--root",
+        str(previous / "zig"),
+        "--cache",
+        env["ZIG_GLOBAL_CACHE_DIR"],
+        "--seed",
+        str(source_cache / "p"),
+    ]
+    if os.environ.get("CI") == "true":
+        # Missing inventory entries must fail here, not silently reintroduce
+        # an upstream fetch during a supposedly prepared compatibility build.
+        command.append("--offline")
+    subprocess.run(command, cwd=root, env=env, check=True)
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[2]
     previous = root / ".worktrees" / "reader-baseline-e8666a5b75"
@@ -80,8 +103,10 @@ def main() -> None:
     env = dict(
         os.environ,
         TZ="UTC0",
-        ZIG_GLOBAL_CACHE_DIR=str(previous / "zig" / ".zig-global-cache"),
+        ZIG_LOCAL_CACHE_DIR=str(previous / "zig/.zig-cache"),
+        ZIG_GLOBAL_CACHE_DIR=str(previous / "zig/.zig-cache/global"),
     )
+    prepare_previous_reader_dependencies(root, previous, env)
     subprocess.run(
         [
             sys.executable,

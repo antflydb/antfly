@@ -205,7 +205,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "raft batch protocol activation is reusable only in its accepted leader term",
         "raft batch protocol activation cleanup preserves in flight references",
         "time series document revision protocol dominates older envelope features",
-        "time series optional revision upgrade preserves a mixed group's mandatory protocol floor",
+        // Zig 0.17 response files treat apostrophes as quote delimiters even
+        // inside double-quoted arguments. Keep the test name intact and select
+        // it with its unique quote-free prefix on both compiler and run paths.
+        "time series optional revision upgrade preserves a mixed group",
         "data raft forwarding admission waits within the borrowed deadline and cancellation",
         "data raft apply completion notifications fence reuse deadlines and bounded ownership",
         "data raft retry clock and sleep borrow VoprIo",

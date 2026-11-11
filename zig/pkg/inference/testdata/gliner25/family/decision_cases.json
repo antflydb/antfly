@@ -1,11 +1,7 @@
 {
-  "format_version": 1,
   "cases": [
     {
       "id": "support_intent",
-      "texts": [
-        "My subscription renewed on April 15 for ¥5,400 after the service was already down. Can I get that charge refunded?"
-      ],
       "tasks": {
         "intent": [
           "order_status",
@@ -18,13 +14,13 @@
           "speak_to_human",
           "other"
         ]
-      }
+      },
+      "texts": [
+        "My subscription renewed on April 15 for ¥5,400 after the service was already down. Can I get that charge refunded?"
+      ]
     },
     {
       "id": "travel",
-      "texts": [
-        "I need to move my Friday flight to Paris to Saturday morning, same cabin, and keep the aisle seat if you can."
-      ],
       "tasks": {
         "request": [
           "book",
@@ -35,13 +31,13 @@
           "refund",
           "baggage"
         ]
-      }
+      },
+      "texts": [
+        "I need to move my Friday flight to Paris to Saturday morning, same cabin, and keep the aisle seat if you can."
+      ]
     },
     {
       "id": "hotel_multi_task",
-      "texts": [
-        "Guest in room 1408 says the AC has been out since yesterday and they want to move tonight or leave. They also asked for the incidentals hold to be released."
-      ],
       "tasks": {
         "intent": [
           "maintenance",
@@ -51,17 +47,18 @@
           "complaint",
           "amenity_request"
         ],
+        "needs_human": [
+          "yes",
+          "no"
+        ],
         "priority": [
           "low",
           "normal",
           "high",
           "urgent"
         ],
-        "needs_human": [
-          "yes",
-          "no"
-        ],
         "topics": {
+          "cls_threshold": 0.4,
           "labels": [
             "hvac",
             "billing",
@@ -69,16 +66,15 @@
             "noise",
             "safety"
           ],
-          "multi_label": true,
-          "cls_threshold": 0.4
+          "multi_label": true
         }
-      }
+      },
+      "texts": [
+        "Guest in room 1408 says the AC has been out since yesterday and they want to move tonight or leave. They also asked for the incidentals hold to be released."
+      ]
     },
     {
       "id": "passage_question",
-      "texts": [
-        "The treaty was signed in Paris in 1992. It entered into force the following year, after the last signatory ratified it."
-      ],
       "tasks": {
         "answer": {
           "labels": [
@@ -87,28 +83,28 @@
           ],
           "prompt": "Did the treaty enter into force in 1992?"
         }
-      }
+      },
+      "texts": [
+        "The treaty was signed in Paris in 1992. It entered into force the following year, after the last signatory ratified it."
+      ]
     },
     {
       "id": "described_labels",
-      "texts": [
-        "Please reset the card PIN. The new one never arrived and the old one is locked after three tries."
-      ],
       "tasks": {
         "intent": {
           "labels": {
-            "card_pin_change": "The customer wants a new PIN or the current PIN replaced",
+            "balance_inquiry": "The customer wants the current balance",
             "card_lost": "The physical card is missing",
-            "balance_inquiry": "The customer wants the current balance"
+            "card_pin_change": "The customer wants a new PIN or the current PIN replaced"
           }
         }
-      }
+      },
+      "texts": [
+        "Please reset the card PIN. The new one never arrived and the old one is locked after three tries."
+      ]
     },
     {
       "id": "ordinal",
-      "texts": [
-        "I finished it in two nights. The ending is earned, the middle drags, and I would still hand it to a friend."
-      ],
       "tasks": {
         "rating": [
           "0",
@@ -123,13 +119,13 @@
           "9",
           "10"
         ]
-      }
+      },
+      "texts": [
+        "I finished it in two nights. The ending is earned, the middle drags, and I would still hand it to a friend."
+      ]
     },
     {
       "id": "book_genre",
-      "texts": [
-        "She closed the ledger, blew out the lamp, and listened for the stair. The house had been empty since the winter the river took the bridge"
-      ],
       "tasks": {
         "genre": [
           "mystery",
@@ -139,20 +135,14 @@
           "literary_fiction",
           "cookbook"
         ]
-      }
+      },
+      "texts": [
+        "She closed the ledger, blew out the lamp, and listened for the stair. The house had been empty since the winter the river took the bridge"
+      ]
     },
     {
       "id": "sentiment_multi",
-      "texts": [
-        "Great food but the service was painfully slow and our waiter was rude!"
-      ],
       "tasks": {
-        "sentiment": [
-          "positive",
-          "negative",
-          "mixed",
-          "neutral"
-        ],
         "aspects": {
           "labels": [
             "food",
@@ -161,11 +151,28 @@
             "ambience"
           ],
           "multi_label": true
-        }
-      }
+        },
+        "sentiment": [
+          "positive",
+          "negative",
+          "mixed",
+          "neutral"
+        ]
+      },
+      "texts": [
+        "Great food but the service was painfully slow and our waiter was rude!"
+      ]
     },
     {
       "id": "distinct_multilingual",
+      "tasks": {
+        "intent": [
+          "refund",
+          "cancel_subscription",
+          "login_problem",
+          "other"
+        ]
+      },
       "texts": [
         "Please refund the duplicate charge.",
         "Je souhaite annuler mon abonnement.",
@@ -175,31 +182,24 @@
         "Quiero cancelar mi suscripción.",
         "로그인할 수 없습니다.",
         ""
-      ],
-      "tasks": {
-        "intent": [
-          "refund",
-          "cancel_subscription",
-          "login_problem",
-          "other"
-        ]
-      }
+      ]
     },
     {
       "id": "ragged_descriptions",
-      "texts": [
-        "Refund.",
-        "The application has been unavailable since yesterday. I have already contacted support twice and need someone to help me log in."
-      ],
       "tasks": {
         "intent": {
           "labels": {
             "refund": "Return a payment",
-            "technical_support": "Help fix a technical problem",
-            "sales": "Buy a product"
+            "sales": "Buy a product",
+            "technical_support": "Help fix a technical problem"
           }
         }
-      }
+      },
+      "texts": [
+        "Refund.",
+        "The application has been unavailable since yesterday. I have already contacted support twice and need someone to help me log in."
+      ]
     }
-  ]
+  ],
+  "format_version": 1
 }
