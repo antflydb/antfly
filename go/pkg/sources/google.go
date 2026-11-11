@@ -242,7 +242,7 @@ func (c *GoogleConnector) enumerateGCS(ctx context.Context, client *http.Client,
 				return fmt.Errorf("invalid GCS generation")
 			}
 			// Console-created directory markers are not source documents.
-			if config.PageProvenance && config.Key == "" && size == 0 && strings.HasSuffix(item.Name, "/") {
+			if config.Key == "" && size == 0 && strings.HasSuffix(item.Name, "/") {
 				continue
 			}
 			canonical := "gs://" + config.Bucket + "/" + escapeSourcePath(item.Name)

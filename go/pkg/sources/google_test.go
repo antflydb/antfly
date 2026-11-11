@@ -478,8 +478,8 @@ func TestGCSProjectedListingSkipsMarkersAndPreservesLiteralObjectKeys(t *testing
 	inventory, err = c.Enumerate(t.Context(), ordinary)
 	require.NoError(t, err)
 	require.True(t, inventory.Authoritative)
-	require.Len(t, inventory.Objects, 2)
-	require.Equal(t, "pages/", inventory.Objects[0].Path)
+	require.Len(t, inventory.Objects, 1)
+	require.Equal(t, "pages/a//b.txt", inventory.Objects[0].Path)
 }
 
 func TestGCSBatchRejectsShortMemberBody(t *testing.T) {
@@ -640,8 +640,20 @@ func TestGCSProjectedPublicationResumesThroughServiceADC(t *testing.T) {
 	require.EqualValues(t, 2+pageCount, reads.Load())
 	metadataChanged.Store(false)
 
+	// A resumed acquisition may be older than its permission lease. Final
+	// metadata validation, rather than enumeration, starts the published lease.
+	statePath := filepath.Join(runner.StateDir, testSourceID+".json")
+	var pending runState
+	require.NoError(t, loadJSON(statePath, &pending, 256<<20))
+	pending.StartedAt = time.Now().Add(-24 * time.Hour).Unix()
+	require.NoError(t, writeJSON(statePath, pending, 256<<20))
+	before := time.Now().Unix()
 	require.NoError(t, runner.Sync(t.Context()))
-	require.EqualValues(t, 3, batches.Load())
+	var published Catalog
+	require.NoError(t, loadJSON(runner.CatalogPath, &published, 32<<20))
+	require.NotNil(t, published.Sources[0].ValidUntil)
+	require.Greater(t, *published.Sources[0].ValidUntil, before)
+	require.EqualValues(t, 4, batches.Load())
 	require.EqualValues(t, 2+pageCount, reads.Load())
 	backend.mu.Lock()
 	defer backend.mu.Unlock()

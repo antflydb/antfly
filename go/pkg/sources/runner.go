@@ -766,7 +766,9 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	}
 	_, isCollaboration := connector.(*CollaborationConnector)
 	_, isDriveMedia := connector.(*driveMediaConnector)
-	if isCollaboration || isDriveMedia {
+	google, isGoogle := connector.(*GoogleConnector)
+	isGCS := isGoogle && google.ProviderName == ProviderGCS
+	if isCollaboration || isDriveMedia || isGCS {
 		phase = "audit_permissions"
 		ttl := s.PermissionTTLSeconds
 		if ttl == 0 {
@@ -774,10 +776,15 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		}
 		checkedAt := time.Now()
 		auditCtx, cancel := context.WithTimeout(ctx, time.Duration(ttl)*time.Second)
-		err := connector.ValidateInventory(auditCtx, request, *state.Pending)
+		var auditErr error
+		if isGCS {
+			auditErr = google.validateGCSObjectAccess(auditCtx, request, state.Pending.Objects)
+		} else {
+			auditErr = connector.ValidateInventory(auditCtx, request, *state.Pending)
+		}
 		cancel()
-		if err != nil {
-			return 0, "", err
+		if auditErr != nil {
+			return 0, "", auditErr
 		}
 		if time.Since(checkedAt) >= time.Duration(ttl)*time.Second {
 			return 0, "", fmt.Errorf("%w: source permission audit exceeded lease duration", context.DeadlineExceeded)
