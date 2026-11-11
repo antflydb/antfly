@@ -474,7 +474,9 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
         )
         expiring_definition = dict(
             abandoned_definition,
-            interval_ns="1000000000",
+            # A one-nanosecond interval forces the public read through durable
+            # clock admission, even immediately after backfill, on both engines.
+            interval_ns="1",
             mutable_for_ns="0",
             retention_ns="1000000000",
         )
