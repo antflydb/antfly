@@ -47,3 +47,13 @@ Run `make license-check` to validate first-party headers and preserved notices.
 The independent embedded native/WASM build verifies that library consumers do
 not require server sources. Release archives and language packages carry the
 Apache license and applicable third-party notices.
+
+## Container images
+
+The Antfly runtime images declare `Apache-2.0` in the OCI
+`org.opencontainers.image.licenses` label. The Antfly license and third-party
+notices are bundled under `/usr/share/licenses/antfly/`, including `LICENSE`,
+`THIRD_PARTY_NOTICES.md`, and `LICENSES/third-party/`.
+Bundled third-party components retain their own licenses; the GNU runtime
+image also carries NVIDIA redistribution licenses under
+`/usr/share/doc/antfly/`.
