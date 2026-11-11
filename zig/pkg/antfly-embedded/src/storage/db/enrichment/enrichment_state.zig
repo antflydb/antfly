@@ -688,7 +688,7 @@ pub fn saveRuntimeStatusAndProjection(alloc: Allocator, store: anytype, scope: [
     const conflict = observed_revision != null and observed_revision.? != revision;
     if ((generation != null and checkpoint.generation != generation.?) or
         (conflict and (failed_through == null or failed_through.? <= checkpoint.applied_sequence)) or
-        (checkpoint.applied_sequence > observed_applied and status.target_sequence <= checkpoint.applied_sequence))
+        (checkpoint.applied_sequence > observed_applied and (failed_through orelse status.target_sequence) <= checkpoint.applied_sequence))
     {
         txn.abort();
         return null;
@@ -1045,6 +1045,10 @@ test "enrichment status publication keeps progress advanced before write admissi
     const failure_revision = (try saveRuntimeStatusAndProjection(alloc, store, "generated", 3, rewound.revision, failure, .degraded, 22, rewound.generation, 12)).?;
     try std.testing.expect(failure_revision > new_revision);
     try std.testing.expectEqual(failure, (try loadRuntimeObservation(alloc, store, "generated")).status);
+    const advanced = try publishAppliedProgressObserved(alloc, store, "generated", 10, 22, .{}, rewound.revision, false, rewound.generation);
+    try std.testing.expectEqual(@as(?u64, null), advanced.status_revision);
+    try std.testing.expect((try saveRuntimeStatusAndProjection(alloc, store, "generated", 3, failure_revision, failure, .degraded, 22, rewound.generation, 8)) == null);
+    try std.testing.expectEqual(failure_revision, (try loadRuntimeObservation(alloc, store, "generated")).revision);
 }
 
 test "enrichment projection checkpoint rejects malformed structured state" {

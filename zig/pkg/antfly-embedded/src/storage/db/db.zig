@@ -33500,7 +33500,7 @@ pub const DB = struct {
     fn markEnrichmentAppliedIfNoPendingThrough(self: *DB, sequence: u64) !void {
         if (sequence == 0) return;
         const runtime = self.enrichment_runtime orelse return;
-        const cut = runtime.replayCut();
+        const cut = try runtime.replayCutForVisibility(sequence);
         if (cut.applied >= sequence) return;
         if (try self.noPendingEnrichmentReplayThrough(cut.applied, sequence)) {
             try runtime.markAppliedThroughAtCut(sequence, cut);
@@ -54826,7 +54826,7 @@ fn runEnrichmentUntilContext(ctx: *const BatchExecutionContext, sequence: u64) !
 fn markPrecomputedEnrichmentAppliedForSyncContext(ctx: *const BatchExecutionContext, sync_level: types.SyncLevel, sequence: u64) !void {
     if (sync_level != .enrichments or sequence == 0) return;
     const runtime = ctx.enrichment_runtime orelse return;
-    const cut = runtime.replayCut();
+    const cut = try runtime.replayCutForVisibility(sequence);
     if (cut.applied >= sequence) return;
     if (try noPendingEnrichmentReplayThroughContext(ctx, cut.applied, sequence)) {
         try runtime.markAppliedThroughAtCut(sequence, cut);
@@ -56725,6 +56725,7 @@ fn appendGeneratedBatchFromEnrichment(
 
         fn validateLease(self: *@This(), alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
             if (self.fence) |active_fence| {
+                if (active_fence.lease_key.len == 0) return;
                 const raw = txn.get(active_fence.lease_key) catch |err| switch (err) {
                     error.NotFound => return error.EnrichmentLeaseFenceLost,
                     else => return err,
@@ -56743,6 +56744,8 @@ fn appendGeneratedBatchFromEnrichment(
 
         pub fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fence) |fence| if (fence.replay_generation) |generation|
+                try enrichment_state.validateReplayGenerationTxn(alloc, txn, enrichment_runtime_mod.scope_name, generation);
             try self.validateLease(alloc, txn);
             for (self.source_guards) |guard| {
                 if (guard.document_key) |doc_key| {
@@ -78079,6 +78082,28 @@ test "db enrichment status changes notify query visibility hook" {
     const durable = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, "generated");
     try std.testing.expect(durable.retrying);
     try std.testing.expectEqual(@as(u64, 4), durable.target_sequence);
+
+    const previous_cut = runtime.replayCut();
+    _ = try enrichment_state.rewindAppliedProgress(alloc, runtime.store, enrichment_runtime_mod.scope_name, 0, 3, 0);
+    const refreshed = try runtime.replayCutForVisibility(3);
+    try std.testing.expectEqual(@as(u64, 0), refreshed.applied);
+    try std.testing.expect(refreshed.generation != previous_cut.generation);
+
+    const stage = "private:test-stale-enrichment-stage";
+    const final = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "stale-source", "stale-index");
+    defer alloc.free(final);
+    try db.core.store.putBatch(&.{.{ .key = stage, .value = "staged" }}, &.{});
+    try std.testing.expectError(error.EnrichmentSourceChanged, db.publishPreparedGeneratedBatch(
+        .{},
+        &.{.{ .staged_key = stage, .final_key = final }},
+        &.{},
+        &.{},
+        .{ .replay_generation = previous_cut.generation },
+    ));
+    const staged = try db.core.store.get(alloc, stage);
+    defer alloc.free(staged);
+    try std.testing.expectEqualStrings("staged", staged);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, final));
 }
 
 test "db enrichment status changes notify only after atomic publication" {
@@ -78237,6 +78262,7 @@ test "db enrichment status changes notify after discarding corrupt optional curs
             try std.testing.expectEqual(@as(u64, 1), future.base_applied_sequence);
             try std.testing.expectEqual(@as(u64, 2), future.sequence);
             try std.testing.expectEqualStrings("future", future.doc_key);
+
             const status = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, "generated");
             try std.testing.expect(status.retrying);
             try std.testing.expectEqual(@as(u64, 2), status.target_sequence);
