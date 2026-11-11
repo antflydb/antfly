@@ -446,3 +446,18 @@ func TestGCSListSkipsDirectoryMarkersAndPreservesLiteralObjectKeys(t *testing.T)
 		require.NoError(t, c.CheckAccess(t.Context(), request, item))
 	}
 }
+
+func TestGCSBatchRejectsShortMemberBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "multipart/mixed; boundary=fixture")
+		fmt.Fprint(w, "--fixture\r\nContent-Type: application/http\r\nContent-ID: <response-0>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n")
+		fmt.Fprint(w, `{"generation":"1"}`+"\r\n--fixture--\r\n")
+	}))
+	defer server.Close()
+	c := GoogleConnector{ProviderName: ProviderGCS, APIBase: server.URL, HTTPClient: server.Client()}
+	results, err := c.CheckGCSAccessBatch(t.Context(), Request{Config: SourceConfig(`{"bucket":"docs"}`)},
+		[]Item{{Path: "p.txt", Revision: "1", Metadata: map[string]any{"bucket": "docs"}}})
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.ErrorIs(t, results[0], io.ErrUnexpectedEOF)
+}
