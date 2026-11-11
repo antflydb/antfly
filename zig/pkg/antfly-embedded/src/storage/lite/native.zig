@@ -29,6 +29,23 @@ const resource_manager_mod = @import("../resource_manager.zig");
 const maintenance = @import("../maintenance.zig");
 const writer_queue = @import("writer_queue.zig");
 const inode_lock = @import("inode_lock.zig");
+// Step 1 of docs/design/lite-performance/lite-single-commit-write-path.md
+// §8 (the shared mmap lock region replacing inode_lock.zig's flock
+// registry). Not yet called from anywhere below -- this import exists
+// only so its own tests are reachable from this root module, the same
+// convention `inode_lock`/`writer_queue` above already follow. Later
+// steps wire real callers in as §8.3/§8.4 land and §8.7's migration
+// begins.
+const shared_lock_region = @import("shared_lock_region.zig");
+// Zig's lazy container analysis never looks inside an `@import` whose
+// result is never referenced, so an unused top-level `const` alone (unlike
+// `inode_lock`/`writer_queue` above, both used extensively below) does not
+// reach its test blocks at all. This forces that analysis so the step-1
+// region/writer-lock tests are discoverable from this module; delete once
+// a later step gives this module a real, referencing caller.
+comptime {
+    _ = shared_lock_region;
+}
 const wal_trace = @import("../write_amplification_trace.zig");
 pub const allocator_v4 = @import("allocator_v4.zig");
 
