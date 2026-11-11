@@ -42360,7 +42360,12 @@ test "generic contextual asset publication keeps raw upstream identity" {
     defer alloc.free(upstream_key);
     const receipt_key = try local.key(alloc, upstream_key);
     defer alloc.free(receipt_key);
-    const parent = "{\"name\":\"Black Mountain College\"}";
+    // "upstream" is a `.copy` producer with `field: "name"`: its own
+    // receipt is encoded against the extracted field value ("Black
+    // Mountain College"), not the whole raw primary document -- see
+    // declaredSourceTextAlloc's doc comment and the .copy branch in
+    // processAsset it mirrors.
+    const parent = "Black Mountain College";
     const raw_upstream = "upstream input";
     const receipt = local.encode(local.recipe(upstream), parent, raw_upstream);
     try storePutBatchWithRetry(&runtime, &.{ .{ .key = upstream_key, .value = raw_upstream }, .{ .key = receipt_key, .value = &receipt } }, &.{});
@@ -47755,7 +47760,12 @@ test "generic scalar chunks reject stale upstream and fence publication" {
     try storePutWithRetry(&runtime, upstream_key, bytes);
     const request: enrichment_types.GeneratedEnrichmentRequest = .{ .kind = .chunk_text, .index_name = "chunks", .artifact_name = "chunks", .doc_key = "doc", .upstream_artifact_name = "units", .source_field = "text", .chunk_size = 512 };
     try std.testing.expectError(error.ArtifactPublicationPending, getOrCreateRequestChunksWithProbe(&runtime, request, &cache, null, null));
-    const receipt = local.encode(local.recipe(entry), old_parent, bytes);
+    // "units" is a `.copy` producer with `field: "body"`: its receipt is
+    // encoded against the extracted field value, not the whole raw parent
+    // document -- `bytes` ("old revision content") is exactly that
+    // extraction from `old_parent`. See declaredSourceTextAlloc's doc
+    // comment.
+    const receipt = local.encode(local.recipe(entry), bytes, bytes);
     try storePutWithRetry(&runtime, receipt_key, &receipt);
     try std.testing.expectError(error.EnrichmentSourceChanged, getOrCreateRequestChunksWithProbe(&runtime, request, &cache, null, null));
     try storePutWithRetry(&runtime, parent_key, old_parent);
