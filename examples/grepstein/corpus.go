@@ -51,6 +51,7 @@ type corpusProgress struct {
 	Pages        int     `json:"pages"`
 	Audio        int     `json:"audio"`
 	Records      int     `json:"records"`
+	Reused       int     `json:"reused,omitempty"`
 	SourceBytes  int64   `json:"source_bytes"`
 	Seconds      float64 `json:"seconds"`
 	Complete     bool    `json:"complete"`
@@ -641,6 +642,10 @@ func corpusLoadCmd(args []string) error {
 	table := flags.String("table", "grepstein_corpus", "Corpus table name")
 	create := flags.Bool("create-table", false, "Create artifact-backed OCR/transcription/search indexes")
 	createOnly := flags.Bool("create-only", false, "Create the table without loading, for a storage baseline (requires --create-table)")
+	appendOnly := flags.Bool("append-only", false, "Insert only absent IDs; reuse matching rows and reject changed identities")
+	planOnly := flags.Bool("plan-only", false, "Preflight the complete append inventory without writing to Antfly (requires --append-only)")
+	var acceptedStates StringSliceFlag
+	flags.Var(&acceptedStates, "accepted-state", "Repeatable completed corpus state; reject aliases that would duplicate existing extraction")
 	batchSize := flags.Int("batch-size", 100, "Records per durable upsert (native workers manage OCR/transcription admission)")
 	semantic := flags.Bool("semantic", false, "Create semantic index (requires embedding inference)")
 	graph := flags.Bool("graph", false, "Create relation graph; run corpus graph after extraction (requires extractor inference)")
@@ -654,6 +659,12 @@ func corpusLoadCmd(args []string) error {
 	numShards := flags.Int("num-shards", 1, "Number of shards when creating the table")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if *planOnly && (!*appendOnly || *create) {
+		return fmt.Errorf("--plan-only requires --append-only and an existing table")
+	}
+	if len(acceptedStates) > 0 && !*appendOnly {
+		return fmt.Errorf("--accepted-state requires --append-only")
 	}
 	if *createOnly && !*create {
 		return fmt.Errorf("--create-only requires --create-table")
@@ -725,7 +736,11 @@ func corpusLoadCmd(args []string) error {
 	if _, err = io.Copy(digest, input); err != nil {
 		return err
 	}
-	bindingJSON, _ := json.Marshal([]any{*endpoint, *table, identity.TableID, description, hex.EncodeToString(digest.Sum(nil))})
+	bindingParts := []any{*endpoint, *table, identity.TableID, description, hex.EncodeToString(digest.Sum(nil))}
+	if *appendOnly {
+		bindingParts = append(bindingParts, "append-only-v1")
+	}
+	bindingJSON, _ := json.Marshal(bindingParts)
 	binding := sha256.Sum256(bindingJSON)
 	checkpoint := filepath.Join(*state, "load.json")
 	var progress corpusProgress
@@ -737,8 +752,27 @@ func corpusLoadCmd(args []string) error {
 		return fmt.Errorf("load checkpoint belongs to another manifest, table, server or configuration; use a separate state")
 	}
 	progress.Binding = expected
-	if progress.Complete {
+	if progress.Complete && !*planOnly {
 		return printCorpusJSON(progress)
+	}
+	var appendAbsent map[string]bool
+	if *appendOnly {
+		plan, err := planCorpusAppend(client, tableURL, input, acceptedStates, *endpoint, *table, identity.TableID, description)
+		plan.Binding = expected
+		if err != nil {
+			plan.Error = err.Error()
+			plan.Complete = false
+		}
+		if writeErr := atomicCorpusJSON(filepath.Join(*state, "append-plan.json"), plan); writeErr != nil {
+			return errors.Join(err, writeErr)
+		}
+		if err != nil {
+			return err
+		}
+		appendAbsent = plan.absent
+		if *planOnly {
+			return printCorpusJSON(plan)
+		}
 	}
 	if _, err = input.Seek(progress.InputOffset, io.SeekStart); err != nil {
 		return err
@@ -772,7 +806,14 @@ func corpusLoadCmd(args []string) error {
 			count++
 		}
 		if count > 0 {
-			response, e := corpusRequest(client, http.MethodPost, tableURL+"/batch", map[string]any{"inserts": inserts, "sync_level": "write"})
+			var response json.RawMessage
+			var e error
+			var reused int
+			if *appendOnly {
+				response, reused, e = appendCorpusBatch(client, *endpoint, *table, tableURL, inserts, appendAbsent)
+			} else {
+				response, e = corpusRequest(client, http.MethodPost, tableURL+"/batch", map[string]any{"inserts": inserts, "sync_level": "write"})
+			}
 			if e != nil {
 				return e
 			}
@@ -785,6 +826,7 @@ func corpusLoadCmd(args []string) error {
 			}
 			progress.InputOffset += offset
 			progress.Records += count
+			progress.Reused += reused
 		}
 		progress.Complete = done
 		progress.Seconds = priorSeconds + time.Since(started).Seconds()
