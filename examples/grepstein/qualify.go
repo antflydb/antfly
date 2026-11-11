@@ -38,6 +38,7 @@ import (
 
 type extractionQualification struct {
 	PublicationSHA256  string  `json:"publication_sha256"`
+	Profile            string  `json:"profile"`
 	At                 string  `json:"at"`
 	Complete           bool    `json:"complete"`
 	Records            int     `json:"records"`
@@ -103,6 +104,15 @@ func qualifyCorpusWithConcurrency(ctx context.Context, client *http.Client, tabl
 	if err := validatePublication(state); err != nil {
 		return q, err
 	}
+	var cfg corpusConfig
+	if err := readCorpusJSON(filepath.Join(state, "sources.json"), &cfg); err != nil {
+		return q, fmt.Errorf("read saved processing profile: %w", err)
+	}
+	profile, err := processingProfile(cfg.Profile)
+	if err != nil {
+		return q, err
+	}
+	q.Profile = profile.Name
 	var publication struct {
 		SHA256 string `json:"sha256"`
 	}
@@ -154,7 +164,7 @@ func qualifyCorpusWithConcurrency(ctx context.Context, client *http.Client, tabl
 			if err := workerCtx.Err(); err != nil {
 				return err
 			}
-			result, err := qualifyCorpusRecord(workerCtx, client, tableURL, record)
+			result, err := qualifyCorpusRecord(workerCtx, client, tableURL, record, profile)
 			counts.Lock()
 			q.Records += result.Records
 			q.Pages += result.Pages
@@ -188,7 +198,7 @@ func qualifyCorpusWithConcurrency(ctx context.Context, client *http.Client, tabl
 }
 
 // Each worker proves both the current source and its native extraction evidence.
-func qualifyCorpusRecord(ctx context.Context, client *http.Client, tableURL string, record corpusRecord) (q extractionQualification, resultErr error) {
+func qualifyCorpusRecord(ctx context.Context, client *http.Client, tableURL string, record corpusRecord, profile corpusProfile) (q extractionQualification, resultErr error) {
 	source, _ := record.Document["url"].(string)
 	version, _ := record.Document["version"].(string)
 	uri, parseErr := url.Parse(source)
@@ -196,16 +206,11 @@ func qualifyCorpusRecord(ctx context.Context, client *http.Client, tableURL stri
 		return q, fmt.Errorf("%s: qualification requires a generation-pinned native GCS source", record.ID)
 	}
 	mime, _ := record.Document["mime_type"].(string)
-	profileName := "pdf"
-	if strings.HasPrefix(mime, "audio/") {
-		profileName = "transcription"
+	if mime == "" && profile.Evidence == pdfPageEvidence {
+		mime = "application/pdf"
 	}
-	if strings.HasPrefix(mime, "image/") {
-		profileName = "images"
-	}
-	profile, _ := processingProfile(profileName)
-	if mime != "" && !profile.accepts(mime) {
-		return q, fmt.Errorf("%s: unsupported qualification MIME %s", record.ID, mime)
+	if !profile.accepts(mime) {
+		return q, fmt.Errorf("%s: MIME %q is unsupported by saved profile %s", record.ID, mime, profile.Name)
 	}
 	hash := strings.TrimSuffix(path.Base(uri.Path), path.Ext(uri.Path))
 	if version != hash+":"+uri.Query().Get("generation") {
@@ -217,7 +222,7 @@ func qualifyCorpusRecord(ctx context.Context, client *http.Client, tableURL stri
 	}
 	first, okFirst := corpusMetadataNumber(meta["page_start"])
 	last, okLast := corpusMetadataNumber(meta["page_end"])
-	if profile.Name == "pdf" && (!okFirst || !okLast || first < 1 || last < first || first != float64(int(first)) || last != float64(int(last))) {
+	if profile.Evidence == pdfPageEvidence && (!okFirst || !okLast || first < 1 || last < first || first != float64(int(first)) || last != float64(int(last))) {
 		return q, fmt.Errorf("%s: invalid PDF page inventory", record.ID)
 	}
 	current, err := corpusRequestWithContext(ctx, client, "GET", tableURL+"/documents/"+url.PathEscape(record.ID)+"?fields=url,version", nil)
@@ -250,7 +255,7 @@ func qualifyCorpusRecord(ctx context.Context, client *http.Client, tableURL stri
 	if err = json.Unmarshal(raw, &artifact); err != nil {
 		return q, err
 	}
-	if artifact.Source != source || artifact.Generation == 0 || artifact.Units == nil || *artifact.Units < 1 || (profile.Name == "pdf" && *artifact.Units != int(last-first+1)) {
+	if artifact.Source != source || artifact.Generation == 0 || artifact.Units == nil || *artifact.Units < 1 || (profile.Evidence == pdfPageEvidence && *artifact.Units != int(last-first+1)) {
 		return q, fmt.Errorf("%s: artifact source/generation/unit inventory is incomplete or changed", record.ID)
 	}
 	// The summary API defaults absent OCR counters to zero. Only the raw
@@ -282,11 +287,11 @@ func qualifyCorpusRecord(ctx context.Context, client *http.Client, tableURL stri
 	if *coverage.Failed != 0 {
 		return q, fmt.Errorf("%s: %d OCR pages failed; index readiness does not establish extraction coverage", record.ID, *coverage.Failed)
 	}
-	if profile.Name != "pdf" {
-		if profile.Name == "images" && (*artifact.Units != 1 || *coverage.Attempted != 1) {
+	if profile.Evidence != pdfPageEvidence {
+		if profile.Evidence == groundedImageEvidence && (*artifact.Units != 1 || *coverage.Attempted != 1) {
 			return q, fmt.Errorf("%s: image requires exactly one completed native reader unit", record.ID)
 		}
-		segments, err := qualifyMediaUnits(ctx, client, tableURL, record.ID, source, *artifact.Units, profile.Name == "images")
+		segments, err := qualifyMediaUnits(ctx, client, tableURL, record.ID, source, *artifact.Units, profile)
 		if err != nil {
 			return q, err
 		}
@@ -322,7 +327,7 @@ func qualifyCorpusRecord(ctx context.Context, client *http.Client, tableURL stri
 		if finalDoc["url"] != source || finalDoc["version"] != version {
 			return q, fmt.Errorf("%s: source changed during native unit qualification", record.ID)
 		}
-		if profile.Name == "images" {
+		if profile.Evidence == groundedImageEvidence {
 			q.ImageRecords = 1
 			q.GroundedBlocks = segments
 		} else {

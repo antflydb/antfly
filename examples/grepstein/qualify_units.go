@@ -25,7 +25,7 @@ import (
 
 // Verify every native unit, including units without searchable chunks. Work is
 // bounded by the manifest count and 100-row pages, never a corpus-sized list.
-func qualifyMediaUnits(ctx context.Context, client *http.Client, tableURL, id, source string, expected int, grounded bool) (int, error) {
+func qualifyMediaUnits(ctx context.Context, client *http.Client, tableURL, id, source string, expected int, profile corpusProfile) (int, error) {
 	const pageSize = 100
 	units, evidence := 0, 0
 	var cursor []string
@@ -89,7 +89,7 @@ func qualifyMediaUnits(ctx context.Context, client *http.Client, tableURL, id, s
 			if units >= expected || hit.ID == "" || strings.TrimSpace(unit.Text) == "" || unit.Provenance.Source != source {
 				return 0, fmt.Errorf("%s: missing native unit text/source evidence", id)
 			}
-			if grounded {
+			if profile.Evidence == groundedImageEvidence {
 				blocks, err := validateGroundedImage(unit.Text)
 				if err != nil || !unit.Provenance.OCRUsed {
 					return 0, fmt.Errorf("%s: missing grounded image evidence: %v", id, err)
@@ -97,6 +97,9 @@ func qualifyMediaUnits(ctx context.Context, client *http.Client, tableURL, id, s
 				evidence += blocks
 				units++
 				continue
+			}
+			if profile.Evidence != transcriptEvidence {
+				return 0, fmt.Errorf("%s: no media evidence handler for profile %s", id, profile.Name)
 			}
 			if !unit.Provenance.Used || len(unit.Provenance.TranscriptSpans) == 0 {
 				return 0, fmt.Errorf("%s: missing transcript timing", id)

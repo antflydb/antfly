@@ -155,7 +155,7 @@ func TestTranscriptQualificationChecksEveryUnitAndTimeSpan(t *testing.T) {
 				json.NewEncoder(w).Encode(map[string]any{"responses": []any{page}})
 			}))
 			defer server.Close()
-			segments, err := qualifyMediaUnits(context.Background(), server.Client(), server.URL, "recording", source, 129, false)
+			segments, err := qualifyMediaUnits(context.Background(), server.Client(), server.URL, "recording", source, 129, testProcessingProfile(t, "transcription"))
 			if problem == "" {
 				if err != nil || segments != 129 || requests != 2 {
 					t.Fatalf("qualification segments=%d requests=%d err=%v", segments, requests, err)
@@ -292,9 +292,72 @@ func TestImageQualificationRequiresNativeGroundingEvidence(t *testing.T) {
 				json.NewEncoder(w).Encode(map[string]any{"responses": []any{map[string]any{"status": 200, "hits": map[string]any{"hits": []any{map[string]any{"_id": "image-unit", "_source": map[string]any{"text": text, "provenance": map[string]any{"source_url": source, "ocr_used": used}}}}}}}})
 			}))
 			defer server.Close()
-			blocks, err := qualifyMediaUnits(context.Background(), server.Client(), server.URL, "picture", "gs://originals/picture.png?generation=1", 1, true)
+			blocks, err := qualifyMediaUnits(context.Background(), server.Client(), server.URL, "picture", "gs://originals/picture.png?generation=1", 1, testProcessingProfile(t, "images"))
 			if (err == nil) != (problem == "") || (err == nil && blocks != 2) {
 				t.Fatalf("blocks=%d err=%v", blocks, err)
+			}
+		})
+	}
+}
+
+func testProcessingProfile(t *testing.T, name string) corpusProfile {
+	t.Helper()
+	profile, err := processingProfile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return profile
+}
+func TestTranscriberSecretFlagOverridesBothAuthSpellings(t *testing.T) {
+	for _, key := range []string{"api_key", "bearer_token"} {
+		t.Run(key, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "stt.json")
+			if err := atomicCorpusJSON(path, map[string]any{"provider": "antfly", "model": defaultTranscriberModel, key: "${secret:old}"}); err != nil {
+				t.Fatal(err)
+			}
+			recipe, err := nativeTranscriptionConfig(path, "https://shared.example/ai/v1", "${secret:new}")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := recipe["transcription"].(map[string]any)["transcriber"].(map[string]any)
+			if cfg["api_key"] != "${secret:new}" || cfg["bearer_token"] != nil {
+				t.Fatalf("conflicting authentication: %v", cfg)
+			}
+		})
+	}
+}
+func TestAMRIsPreservedButNotSelectedForNativeTranscription(t *testing.T) {
+	source, state := t.TempDir(), t.TempDir()
+	writeCorpusFixture(t, filepath.Join(source, "recording.amr"), []byte("#!AMR\n"))
+	writeCorpusFixture(t, filepath.Join(source, "recording.wav"), nativeTranscriptFixtureAudio())
+	if err := corpusPrepareCmd([]string{"--profile", "transcription", "--state", state, "--source", "test=" + source}); err != nil {
+		t.Fatal(err)
+	}
+	rows := testCorpusRecords(t, state)
+	if len(rows) != 1 || rows[0].Document["mime_type"] != "audio/wav" {
+		t.Fatalf("unsupported recording selected: %v", rows)
+	}
+	if originalMIME("recording.amr") == "" {
+		t.Fatal("AMR raw preservation was removed")
+	}
+}
+
+func TestQualificationDispatchUsesSavedProfile(t *testing.T) {
+	for _, name := range []string{"transcription", "pdf", "not-registered"} {
+		t.Run(name, func(t *testing.T) {
+			state := t.TempDir()
+			row := corpusRecord{ID: "picture", Document: map[string]any{"mime_type": "image/png", "url": "gs://originals/objects/sha256/" + strings.Repeat("a", 64) + ".png?generation=1", "version": strings.Repeat("a", 64) + ":1", "metadata": map[string]any{}}}
+			writeAppendState(t, state, []corpusRecord{row}, corpusConfig{Profile: name})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.Contains(r.URL.Path, "/indexes/") {
+					t.Errorf("mismatched profile reached extraction: %s", r.URL.Path)
+				}
+				fmt.Fprint(w, `{"status":{"readiness":{"complete":true,"queryable":true}},"shard_status":{"one":{"readiness":{"complete":true,"queryable":true}}}}`)
+			}))
+			defer server.Close()
+			q, err := qualifyCorpus(server.Client(), server.URL+"/tables/pictures", state)
+			if err == nil || !strings.Contains(err.Error(), "profile") || q.Complete {
+				t.Fatalf("profile %s: q=%+v err=%v", name, q, err)
 			}
 		})
 	}
