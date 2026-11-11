@@ -1397,6 +1397,8 @@ def test_authenticated_cypher_property_plans_and_sql_overlays(monkeypatch):
                 server.url,
                 "--pgport",
                 str(server.pgwire_port),
+                "--psql",
+                _psql_binary(),
             ]
             if policy:
                 command.append("--policy")
