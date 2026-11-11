@@ -387,7 +387,18 @@ fn Adapter(comptime Service: type) type {
             var cancellation: http.RequestCancellation = .{ .borrowed_context = owned.request.cancellation.ptr, .borrowed_is_cancelled = owned.request.cancellation.is_cancelled_fn };
             var response = transport.fetchGroupOnlineMergeIo(try owned.uri(request.ownerGroup()), request.ownerGroup(), owned.context.record.table_contract.table_name, request, try timeout(owned.request), &cancellation) catch |err| {
                 if (err == error.OnlineSourcePinMissing and op == .snapshot) {
-                    try self.rehydrate(owned, state);
+                    // Publication is replicated; its export receipt is local.
+                    // Prefer the new leader's own verified immutable seal.
+                    // Its supervised exporter survives these short RPC polls.
+                    // Only a genuinely absent seal needs replica transfer.
+                    const certificate = self.fetch(?@import("antfly_local_sources").storage_source_snapshot.Certificate, owned, state, .publication) catch |recovery_error| {
+                        if (recovery_error != error.OnlineSourcePinMissing) return recovery_error;
+                        try self.rehydrate(owned, state);
+                        return error.OnlineMergeArtifactPending;
+                    };
+                    if (certificate) |value| {
+                        if (state.certificate == null or !value.eql(state.certificate.?)) return error.OnlineMergeReceiptMismatch;
+                    }
                     return error.OnlineMergeArtifactPending;
                 }
                 return err;
