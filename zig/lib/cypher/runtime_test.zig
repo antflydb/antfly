@@ -2722,6 +2722,11 @@ test "completed streaming child memo releases retained rows on every allocation 
 }
 
 test "continuation presence memo and intermediate DISTINCT release allocation failures" {
+    // Keep every injected allocation failure and memory check; collecting a
+    // stack trace for each backing allocation dominates these matrix tests.
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
+    defer if (checked.deinit() != 0) @panic("Cypher semantic campaign leaked allocations");
+    const checked_allocator = checked.allocator();
     const Campaign = struct {
         fn run(backing: std.mem.Allocator, kind: u2) !void {
             var fixed: FixedAllocation = .{ .backing = backing };
@@ -2742,7 +2747,7 @@ test "continuation presence memo and intermediate DISTINCT release allocation fa
             try std.testing.expectEqual(@as(usize, if (kind == 1 or kind == 2) 0 else 2), result.rows.len);
         }
     };
-    inline for (0..4) |kind| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{@as(u2, kind)});
+    inline for (0..4) |kind| try std.testing.checkAllAllocationFailures(checked_allocator, Campaign.run, .{@as(u2, kind)});
 }
 
 test "path summaries preserve zero hop null scope and observable identities" {
@@ -6307,12 +6312,17 @@ test "observed axes compose independent CALL bags without multiplying set suppor
 }
 
 test "bounded DISTINCT group windows own only selected memberships across eviction" {
+    // Keep every injected allocation failure and memory check; collecting a
+    // stack trace for each backing allocation dominates these matrix tests.
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
+    defer if (checked.deinit() != 0) @panic("Cypher semantic campaign leaked allocations");
+    const checked_allocator = checked.allocator();
     for ([_][]const u8{
         "UNWIND range(1,10000) AS i UNWIND [0,1,0] AS x RETURN i,count(DISTINCT x) ORDER BY i LIMIT 5",
         "UNWIND range(10000,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,count(DISTINCT [x]) ORDER BY i LIMIT 5",
         "UNWIND range(10000,1,-1) AS i CALL {UNWIND [0,1,0] AS x RETURN x} RETURN i,count(DISTINCT {v:x}) ORDER BY i LIMIT 5",
     }) |text| {
-        const a = std.testing.allocator;
+        const a = checked_allocator;
         var diagnostic: c.Diagnostic = .{};
         var compiled = try c.compile(a, text, .{}, &diagnostic);
         defer compiled.deinit();
@@ -7476,6 +7486,11 @@ test "ordered lineage records logical DISTINCT CALL filter and singleton prefix 
 }
 
 test "ordered lineage programs release allocations after proof and packet failures" {
+    // Keep every injected allocation failure and memory check; collecting a
+    // stack trace for each backing allocation dominates these matrix tests.
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0, .check_write_after_free = true });
+    defer if (checked.deinit() != 0) @panic("Cypher semantic campaign leaked allocations");
+    const checked_allocator = checked.allocator();
     const Campaign = struct {
         fn run(backing: std.mem.Allocator, text: []const u8) !void {
             var callbacks = backing.vtable.*;
@@ -7530,7 +7545,7 @@ test "ordered lineage programs release allocations after proof and packet failur
         "UNWIND range(-20,0)+range(1,20) AS x WITH x WHERE x<3 OR x>17 RETURN count(*),sum(x),avg(x)",
         "UNWIND range(1,20) AS x WITH x+1 AS y RETURN y,count(*) ORDER BY y LIMIT 2",
         "UNWIND [7] AS z UNWIND range(20,1,-1) AS i UNWIND [0,1,0] AS x RETURN i,avg(x) ORDER BY i LIMIT 2",
-    }) |text| try std.testing.checkAllAllocationFailures(std.testing.allocator, Campaign.run, .{text});
+    }) |text| try std.testing.checkAllAllocationFailures(checked_allocator, Campaign.run, .{text});
 }
 
 test "ordered lineage singleton probes preserve nested CALL recursion limits" {
