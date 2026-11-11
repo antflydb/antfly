@@ -15384,7 +15384,7 @@ fn searchDenseInternal(
         const hbc_search_start = platform_time.monotonicNs();
         var route_costs = entry.index.denseRouteCostSnapshot();
         const exact_has_residual = hbc_req.key_predicate != null or hbc_req.filter_prefix.len != 0;
-        if (!exact_has_residual) route_costs.exact_residual_read_permille = null;
+        if (!exact_has_residual) route_costs.exact_residual_ns_per_candidate = 0;
         const hbc_cache_pressured = if (entry.index.resource_manager) |manager|
             manager.sliceStats(.hbc_node_metadata_cache).pressure != .normal
         else
@@ -15451,7 +15451,7 @@ fn searchDenseInternal(
                 .metadata_ns = exact.profile.metadata_lookup_ns,
                 .native_lookup_ns = exact.profile.native_lookup_ns,
                 .native_reads = exact.profile.raw_scalar_reads,
-                .has_residual_filter = exact_has_residual and !entry.index.hasExternalVectorLoader(),
+                .residual_filter_ns = exact.profile.residual_filter_ns,
                 .vectors_scored = exact.vectors_scored,
                 .artifact_read_decode_ns = exact.profile.artifact_read_ns +| exact.profile.artifact_decode_ns,
                 .distance_ns = exact.profile.distance_ns,
@@ -15928,11 +15928,9 @@ fn denseSearchRouteWithCosts(
     // overhead. The built-in scorer reads the HBC-resident f32 payload.
     const exact_lookup_overhead: u64 = if (external_vector_storage) 64 else 8;
     const exact_bytes_per_candidate = dimensions *| @sizeOf(f32) +| exact_lookup_overhead;
-    const exact_read_count = if (!external_vector_storage and measured != null)
-        (candidate_count *| (measured.?.exact_residual_read_permille orelse 1000) +| 999) / 1000
-    else
-        candidate_count;
-    const exact_storage_bytes = exact_read_count *| exact_bytes_per_candidate;
+    // Residual predicates can vary between requests. Budget every candidate
+    // until this request supplies an exact native selection.
+    const exact_storage_bytes = candidate_count *| exact_bytes_per_candidate;
 
     // Estimate how many approximate candidates HBC must inspect to obtain k
     // eligible hits. This expresses filter selectivity as storage work rather
@@ -15967,8 +15965,8 @@ fn denseSearchRouteWithCosts(
             artifact_ns
         else
             denseRouteCostOrPrior(cost.exact_native_lookup_ns_per_read, artifact_ns);
-        const exact_work_ns = candidate_count *| filter_ns +|
-            exact_read_count *| (exact_lookup_ns +| resolved_cost.exact_distance_ns_per_vector);
+        const exact_work_ns = candidate_count *|
+            (filter_ns +| cost.exact_residual_ns_per_candidate +| exact_lookup_ns +| resolved_cost.exact_distance_ns_per_vector);
         var hbc_work_ns = hbc_candidates *|
             (filter_ns +| resolved_cost.quantized_score_ns_per_candidate) +|
             rerank_candidates *| (artifact_ns +| resolved_cost.exact_distance_ns_per_vector);
@@ -16095,6 +16093,11 @@ test "native exact lookup costs affect the exact route without pricing HBC reran
     try std.testing.expect(prior.exact_native_filter);
     try std.testing.expect(!measured.exact_native_filter);
     try std.testing.expectEqual(prior.estimated_hbc_work_ns, measured.estimated_hbc_work_ns);
+    costs.exact_residual_ns_per_candidate = 800;
+    const residual = denseSearchRouteWithCosts(true, 100, 10_000, 768, 10, 128, 128, false, false, costs, false, 1000);
+    try std.testing.expectEqual(measured.estimated_exact_storage_bytes, residual.estimated_exact_storage_bytes);
+    try std.testing.expectEqual(measured.estimated_exact_work_ns + 80_000, residual.estimated_exact_work_ns);
+    try std.testing.expectEqual(measured.estimated_hbc_work_ns, residual.estimated_hbc_work_ns);
 }
 
 test "dense search route uses measured per-index costs pressure and hysteresis" {
@@ -16594,6 +16597,15 @@ fn exactScoreNativeDenseFilter(
         exact_profile.metadata_lookup_ns = platform_time.monotonicNs() - metadata_start_ns;
     }
 
+    if (candidate_metadata.len > 0) {
+        const residual_start = platform_time.monotonicNs();
+        for (candidate_metadata, 0..) |*slot, i| {
+            if (i % exact_native_filter_cancellation_stride == 0) try checkVectorSearchCancelled(req);
+            slot.* = try dense_exact.filterMetadata(req, slot.*);
+        }
+        exact_profile.residual_filter_ns = platform_time.monotonicNs() - residual_start;
+    }
+
     const vector_scratch = try alloc.alloc(f32, entry.dims);
     defer alloc.free(vector_scratch);
     const query_measure = vector_mod.norm(req.query);
@@ -16602,11 +16614,7 @@ fn exactScoreNativeDenseFilter(
 
     for (unique_candidate_ids, 0..) |vector_id, i| {
         if (i % exact_native_filter_cancellation_stride == 0) try checkVectorSearchCancelled(req);
-        if (candidate_metadata.len > 0) {
-            const metadata = candidate_metadata[i] orelse continue;
-            if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) continue;
-            if (req.key_predicate) |predicate| if (!try predicate.allows(predicate.ptr, metadata)) continue;
-        }
+        if (candidate_metadata.len > 0 and candidate_metadata[i] == null) continue;
         const lookup_start = platform_time.monotonicNs();
         exact_profile.raw_scalar_reads += 1;
         const loaded_vector = if (vector_cursor) |*cursor|
@@ -17038,6 +17046,40 @@ test "one percent native filter routes through integrated dense search exactly" 
     try std.testing.expectEqual(@as(usize, 1), harness.exact_calls);
     try std.testing.expectEqual(@as(usize, 1), page.result.hits.len);
     try std.testing.expectEqual(.exact, page.result.total_hits_relation);
+
+    const Residual = struct {
+        fn allows(raw: *anyopaque, _: []const u8) !bool {
+            const broad: *const bool = @ptrCast(@alignCast(raw));
+            return broad.*;
+        }
+    };
+    var broad = false;
+    const residual: types.NativeKeyPredicate = .{ .ptr = &broad, .allows = Residual.allows };
+    const rounds: usize = if (getenv("ANTFLY_BENCH_MIXED_RESIDUAL") != null) 1_000 else 1;
+    var elapsed: [2]u64 = @splat(0);
+    for (0..rounds) |_| {
+        for ([_]bool{ false, true }, &elapsed) |accept, *time| {
+            broad = accept;
+            const start = platform_time.monotonicNs();
+            var mixed = try searchDenseProfiled(alloc, .{
+                .index_name = "dense",
+                .limit = result_count,
+                .include_stored = false,
+                .profile = true,
+                .filter_ids = filter_ids,
+                .native_key_predicate = residual.receiver(),
+            }, .{ .vector = &query, .k = result_count }, executor);
+            time.* += platform_time.monotonicNs() - start;
+            defer mixed.result.deinit();
+            try std.testing.expectEqualStrings("exact_native_filter", mixed.profile.search_route);
+            try std.testing.expectEqual(@as(u64, if (accept) candidate_count else 0), mixed.profile.hbc_exact_vectors_scored);
+            try std.testing.expectEqual(profiled.profile.route_estimated_exact_storage_bytes, mixed.profile.route_estimated_exact_storage_bytes);
+            try std.testing.expectEqual(if (accept) result_count else 0, mixed.result.hits.len);
+        }
+    }
+    if (rounds > 1) std.debug.print("mixed residual native exact: {d} queries per arm, reject-all {d} ns/query, accept-all {d} ns/query\n", .{
+        rounds, elapsed[0] / rounds, elapsed[1] / rounds,
+    });
 }
 
 fn countActiveDenseVectorIdsAlloc(

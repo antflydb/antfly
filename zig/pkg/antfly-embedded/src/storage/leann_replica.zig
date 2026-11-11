@@ -752,7 +752,7 @@ pub const Replica = struct {
             }
         }
         const buffer_matches = hits.items.len;
-        var exact_matches: ?usize = if (direct_keys != null) buffer_matches else null;
+        var matches: leann.MatchCoverage = .{ .verified = buffer_matches, .complete = true };
         if (self.index) |*index| {
             var ctx = SearchSource{ .replica = self, .loader = loader, .far_from = if (tuning.filter != null) null else query };
             const opts: leann.SearchOptions = .{
@@ -803,11 +803,12 @@ pub const Replica = struct {
                 }, if (direct_keys != null) direct_ids.items else null);
             } else try index.search(alloc, ctx.source(), query, opts);
             defer resp.deinit(alloc);
-            exact_matches = if (resp.stats.exact_match_count) |count| count + buffer_matches else null;
+            matches = resp.stats.matches;
+            matches.verified += buffer_matches;
             if (tuning.stats) |profile| profile.* = resp.stats;
             for (resp.results) |r| try hits.append(alloc, .{ .key = self.keys.items[r.id], .distance = r.distance });
         }
-        if (tuning.stats) |profile| profile.exact_match_count = exact_matches;
+        if (tuning.stats) |profile| profile.matches = matches;
         std.mem.sortUnstable(Hit, hits.items, tuning.filter, struct {
             fn lt(filter: ?KeyFilter, a: Hit, b: Hit) bool {
                 if (a.distance == b.distance) {

@@ -17,6 +17,14 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vectorindex = @import("antfly_vectorindex");
 
+/// Resolve the residual on an already-loaded candidate key.
+pub fn filterMetadata(req: vectorindex.SearchRequest, metadata: ?[]const u8) !?[]const u8 {
+    const key = metadata orelse return null;
+    if (!std.mem.startsWith(u8, key, req.filter_prefix)) return null;
+    if (req.key_predicate) |predicate| if (!try predicate.allows(predicate.ptr, key)) return null;
+    return key;
+}
+
 /// The result of exact dense scoring together with work measured at the point
 /// where it happened. `vectors_scored` counts distance evaluations, not input
 /// IDs: duplicates, exclusions, and missing vectors are not counted.
@@ -37,6 +45,7 @@ pub const SearchOutcome = struct {
         missing_vectors: u64 = 0,
         candidate_prepare_ns: u64 = 0,
         metadata_lookup_ns: u64 = 0,
+        residual_filter_ns: u64 = 0,
         artifact_key_ns: u64 = 0,
         artifact_read_ns: u64 = 0,
         artifact_decode_ns: u64 = 0,

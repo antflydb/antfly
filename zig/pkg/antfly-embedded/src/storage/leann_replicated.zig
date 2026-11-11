@@ -734,7 +734,7 @@ pub const ReplicatedState = struct {
             const vector_id = self.bindings.get(hit.key) orelse continue;
             out.addResultWithOwnedMetadata(vector_id, hit.distance, 0, if (req.load_metadata) try alloc.dupe(u8, hit.key) else null);
         }
-        if (profile.exact_match_count) |count| out.candidate_coverage = if (count > out.getHits().len) .more else .exhausted;
+        if (filter.active()) out.candidate_coverage = profile.matches.candidateCoverage(out.getHits().len);
         out.sort();
         return out;
     }

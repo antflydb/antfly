@@ -5633,7 +5633,7 @@ pub const HBCIndex = struct {
         artifact_read_decode_ns_per_vector: u64 = 0,
         exact_distance_ns_per_vector: u64 = 0,
         exact_native_lookup_ns_per_read: u64 = 0,
-        exact_residual_read_permille: ?u64 = null,
+        exact_residual_ns_per_candidate: u64 = 0,
         rerank_cache_hit_permille: u64 = 0,
         rerank_cache_observations: u64 = 0,
         exact_observations: u64 = 0,
@@ -5654,7 +5654,7 @@ pub const HBCIndex = struct {
         metadata_ns: u64,
         native_lookup_ns: u64 = 0,
         native_reads: u64 = 0,
-        has_residual_filter: bool = false,
+        residual_filter_ns: u64 = 0,
         vectors_scored: ?u64 = null,
         artifact_read_decode_ns: u64,
         distance_ns: u64,
@@ -18938,13 +18938,10 @@ pub const HBCIndex = struct {
             state.exact_native_lookup_ns_per_read,
             perUnit(observation.native_lookup_ns, observation.native_reads),
         );
-        if (observation.has_residual_filter and observation.candidates != 0) {
-            const sample = @min(1000, observation.native_reads *| 1000 / observation.candidates);
-            state.exact_residual_read_permille = if (state.exact_residual_read_permille) |previous|
-                routeRateEwmaObserved(previous, sample, 1)
-            else
-                sample;
-        }
+        state.exact_residual_ns_per_candidate = routeRateEwma(
+            state.exact_residual_ns_per_candidate,
+            perUnit(observation.residual_filter_ns, observation.candidates),
+        );
         state.artifact_read_decode_ns_per_vector = routeRateEwma(
             state.artifact_read_decode_ns_per_vector,
             perUnit(
@@ -22350,7 +22347,7 @@ test "hbc route observation counts external distance timing once" {
         .metadata_ns = 0,
         .native_lookup_ns = 1000,
         .native_reads = 10,
-        .has_residual_filter = true,
+        .residual_filter_ns = 500,
         .artifact_read_decode_ns = 0,
         .distance_ns = 0,
         .artifact_cache_hits = 0,
@@ -22358,7 +22355,7 @@ test "hbc route observation counts external distance timing once" {
     });
     const exact = idx.denseRouteCostSnapshot();
     try std.testing.expectEqual(@as(u64, 100), exact.exact_native_lookup_ns_per_read);
-    try std.testing.expectEqual(@as(?u64, 100), exact.exact_residual_read_permille);
+    try std.testing.expectEqual(@as(u64, 5), exact.exact_residual_ns_per_candidate);
 
     var profile: SearchProfile = .{
         .reranked_vectors = 2,

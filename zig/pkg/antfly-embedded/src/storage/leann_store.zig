@@ -637,7 +637,7 @@ pub const LeannStore = struct {
         defer if (direct) alloc.free(graph_ids);
         var graph_count: usize = 0;
         var pending_matches: usize = 0;
-        var graph_matches: ?usize = if (direct) 0 else null;
+        var matches: leann.MatchCoverage = .{ .complete = true };
         if (direct) {
             var ids = filter.ids.include.keyIterator();
             while (ids.next()) |id| {
@@ -652,7 +652,7 @@ pub const LeannStore = struct {
             std.mem.sortUnstable(u32, graph_ids[0..graph_count], {}, std.sort.asc(u32));
         } else {
             for (0..self.pending.items.len) |slot| {
-                _ = try self.scorePending(alloc, &filter, q, scratch, slot, &out);
+                pending_matches += @intFromBool(try self.scorePending(alloc, &filter, q, scratch, slot, &out));
             }
         }
 
@@ -699,14 +699,15 @@ pub const LeannStore = struct {
             else
                 try index.search(alloc, ctx.source(), req.query, opts);
             defer resp.deinit(alloc);
-            graph_matches = resp.stats.exact_match_count;
+            matches = resp.stats.matches;
             if (search_stats) |profile| profile.* = resp.stats;
             for (resp.results) |result| {
                 const node = self.nodes.items[result.id];
                 out.addResultWithOwnedMetadata(node.vector_id, result.distance, 0, if (req.load_metadata) try alloc.dupe(u8, node.metadata) else null);
             }
         }
-        if (graph_matches) |count| out.candidate_coverage = if (count + pending_matches > out.getHits().len) .more else .exhausted;
+        matches.verified += pending_matches;
+        if (filter.active()) out.candidate_coverage = matches.candidateCoverage(out.getHits().len);
         out.sort();
         return out;
     }

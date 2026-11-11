@@ -263,8 +263,17 @@ pub const SearchStats = struct {
     expanded: u32 = 0,
     /// Largest retained traversal frontier in a filtered search.
     peak_frontier: u32 = 0,
-    /// Qualifying matches when direct verification completed without ranking prunes.
-    exact_match_count: ?usize = null,
+    matches: MatchCoverage = .{},
+};
+
+pub const MatchCoverage = struct {
+    verified: usize = 0,
+    complete: bool = false,
+
+    pub fn candidateCoverage(self: MatchCoverage, returned: usize) @import("search_results.zig").CandidateCoverage {
+        if (self.verified > returned) return .more;
+        return if (self.complete) .exhausted else .unknown;
+    }
 };
 
 pub const Result = struct { id: u32, distance: f32 };
@@ -785,7 +794,7 @@ pub const Index = struct {
         try filter.checkCancelled();
         var stats = SearchStats{};
         if (self.node_count == 0 or opts.k == 0 or filter.eligible_count == 0) {
-            if (opts.k != 0) stats.exact_match_count = 0;
+            if (opts.k != 0) stats.matches.complete = true;
             return .{ .results = try alloc.alloc(Result, 0), .stats = stats };
         }
         const q = try alloc.dupe(f32, query);
@@ -797,7 +806,7 @@ pub const Index = struct {
         var work: FilteredVerification = .{};
         defer work.deinit(alloc);
         if (direct_ids) |ids| {
-            stats.exact_match_count = 0;
+            stats.matches.complete = true;
             if (filter.direct_verify_bounds and self.rabitq != null) {
                 var approx = try Approx.initWithRadius(alloc, self, q, filter.distance_under != null);
                 defer approx.deinit();
@@ -880,6 +889,7 @@ pub const Index = struct {
                 const enough_to_verify = (filter.eligible_count == null or filter.distance_under != null or filter.distance_over != null) and discovered >= opts.k;
                 if (discovered >= target or enough_to_verify or frontier.len() == 0) {
                     eligible_seen += work.pending.items.len;
+                    const prior_matches = stats.matches.verified;
                     try self.verifyFiltered(alloc, source, q, null, opts, filter, &work, &top, &stats);
                     if (frontier.len() == 0) break;
                     if (top.len() >= opts.k) {
@@ -887,8 +897,10 @@ pub const Index = struct {
                         // Residual filters may have fewer matches than the
                         // target. Confirm the kth result on a wider wave.
                         const cutoff = top.top();
-                        if (previous_cutoff) |previous| {
-                            if (previous.id == cutoff.id and previous.dist == cutoff.dist) break;
+                        if (stats.matches.verified > prior_matches) {
+                            if (previous_cutoff) |previous| {
+                                if (previous.id == cutoff.id and previous.dist == cutoff.dist) break;
+                            }
                         }
                         previous_cutoff = cutoff;
                     }
@@ -966,7 +978,7 @@ pub const Index = struct {
             while (next < work.pending.items.len and work.ids.items.len < batch_size) : (next += 1) {
                 const item = work.pending.items[next];
                 if (top.len() >= opts.k and item.dist > top.top().dist) {
-                    stats.exact_match_count = null;
+                    stats.matches.complete = false;
                     break;
                 }
                 const upper_vector = self.upper_vectors.get(item.id);
@@ -987,7 +999,7 @@ pub const Index = struct {
 
     fn addFilteredResult(alloc: Allocator, filter: ResultFilter, top: *FilteredHeap, k: usize, stats: *SearchStats, candidate: Cand) !void {
         if (!std.math.isFinite(candidate.dist) or !filter.distanceAllowed(candidate.dist)) return;
-        if (stats.exact_match_count) |*count| count.* += 1;
+        stats.matches.verified += 1;
         const item: FilteredCandidate = .{
             .id = candidate.id,
             .dist = candidate.dist,
@@ -3361,11 +3373,36 @@ test "leann: filtered verification avoids loads beyond the upper threshold" {
     try testing.expectEqual(@as(u32, 0), response.stats.recomputed);
 }
 
+test "leann: bounded direct verification retains a proven surplus" {
+    const alloc = testing.allocator;
+    const dims = 8;
+    const count = 128;
+    const query: [dims]f32 = @splat(0);
+    var vectors: [count * dims]f32 = @splat(100);
+    @memset(vectors[0 .. 4 * dims], 0);
+    var index = try Index.build(alloc, .{ .dims = dims, .metric = .l2_squared, .quantizer = .rabitq }, &vectors);
+    defer index.deinit();
+    var source = SliceEmbeddingSource{ .vectors = &vectors, .dims = dims };
+    var result = try index.searchFiltered(alloc, source.source(), &query, .{ .k = 1, .batch_size = 4, .bound_scale = 0 }, .{
+        .ctx = &index,
+        .direct_verify_bounds = true,
+        .allows = struct {
+            fn allows(_: *const anyopaque, _: u32) !bool {
+                return true;
+            }
+        }.allows,
+    }, &.{ 0, 1, 2, 3, 4, 5, 6, 7 });
+    defer result.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), result.results.len);
+    try testing.expect(!result.stats.matches.complete);
+    try testing.expectEqual(.more, result.stats.matches.candidateCoverage(result.results.len));
+}
+
 test "leann: filtered heap uses the caller's order on equal distances" {
     const alloc = testing.allocator;
     var top: FilteredHeap = .{};
     defer top.deinit(alloc);
-    var stats: SearchStats = .{ .exact_match_count = 0 };
+    var stats: SearchStats = .{ .matches = .{ .complete = true } };
     const filter = ResultFilter{
         .ctx = &top,
         .allows = struct {
@@ -3382,7 +3419,9 @@ test "leann: filtered heap uses the caller's order on equal distances" {
     try Index.addFilteredResult(alloc, filter, &top, 1, &stats, .{ .id = 1, .dist = 10 });
     try Index.addFilteredResult(alloc, filter, &top, 1, &stats, .{ .id = 2, .dist = 10 });
     try testing.expectEqual(@as(u32, 2), top.top().id);
-    try testing.expectEqual(@as(?usize, 2), stats.exact_match_count);
+    try testing.expectEqual(@as(usize, 2), stats.matches.verified);
+    stats.matches.complete = false;
+    try testing.expectEqual(.more, stats.matches.candidateCoverage(1));
 }
 
 test "leann: a distance-selective allowlist verifies before the graph is exhausted" {
@@ -3392,6 +3431,7 @@ test "leann: a distance-selective allowlist verifies before the graph is exhaust
     const query: [dims]f32 = @splat(0);
     var vectors: [count * dims]f32 = @splat(100);
     @memset(vectors[0 .. 10 * dims], 0);
+    @memset(vectors[20 * dims ..][0..dims], 0);
     var index = try Index.build(alloc, .{ .dims = dims, .metric = .l2_squared, .quantizer = .rabitq }, &vectors);
     defer index.deinit();
     index.entry = 0;
@@ -3414,6 +3454,29 @@ test "leann: a distance-selective allowlist verifies before the graph is exhaust
     defer result.deinit(alloc);
     try testing.expectEqual(@as(usize, 10), result.results.len);
     try testing.expect(result.stats.expanded <= 32);
+    @memset(vectors[0 .. 10 * dims], 0.1);
+    @memset(vectors[20 * dims ..][0..dims], 100);
+    @memset(vectors[40 * dims ..][0..dims], 0);
+    var gap_index = try Index.build(alloc, .{ .dims = dims, .metric = .l2_squared, .quantizer = .rabitq }, &vectors);
+    defer gap_index.deinit();
+    gap_index.entry = 0;
+    gap_index.max_level = 0;
+    for (gap_index.adjacency.items, 0..) |*neighbors, id| {
+        neighbors.clearRetainingCapacity();
+        if (id + 1 < count) try neighbors.append(alloc, @intCast(id + 1));
+    }
+    var after_gap = try gap_index.searchFiltered(alloc, source.source(), &query, .{ .k = 10, .ef = 16 }, .{
+        .ctx = &gap_index,
+        .eligible_count = 100,
+        .distance_under = 1,
+        .allows = struct {
+            fn allows(_: *const anyopaque, id: u32) !bool {
+                return id < 100;
+            }
+        }.allows,
+    }, null);
+    defer after_gap.deinit(alloc);
+    try testing.expectEqual(@as(u32, 40), after_gap.results[0].id);
 }
 
 test "leann: clustered eligibility stops a widened walk before exhausting the graph" {
@@ -3446,7 +3509,11 @@ test "leann: clustered eligibility stops a widened walk before exhausting the gr
         }, null);
         defer result.deinit(alloc);
         try testing.expectEqual(@as(usize, 10), result.results.len);
-        try testing.expect(result.stats.expanded > 16 and result.stats.expanded < count);
+        if (known != null) {
+            try testing.expect(result.stats.expanded > 16 and result.stats.expanded < count);
+        } else {
+            try testing.expectEqual(@as(u32, count), result.stats.expanded);
+        }
         try testing.expectEqual(@as(u32, 1), result.stats.peak_frontier);
     }
 }

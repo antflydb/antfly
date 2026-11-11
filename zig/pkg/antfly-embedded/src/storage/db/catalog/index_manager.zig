@@ -19454,6 +19454,16 @@ pub const IndexManager = struct {
             }
         }
 
+        const has_residual = req.filter_prefix.len > 0 or req.key_predicate != null;
+        if (has_residual) {
+            const residual_start = platform_time.monotonicNs();
+            for (candidate_metadata, fallback_doc_keys, 0..) |*metadata, fallback, i| {
+                if (i % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
+                metadata.* = try dense_exact.filterMetadata(req, metadata.* orelse fallback);
+            }
+            exact_profile.residual_filter_ns = platform_time.monotonicNs() - residual_start;
+        }
+
         const query_measure = vector_mod.norm(req.query);
         var vectors_scored: u64 = 0;
         var matching_vectors: usize = 0;
@@ -19472,7 +19482,7 @@ pub const IndexManager = struct {
                 const key_scan_end = @min(key_scan_start + exact_dense_score_batch_size, unique_candidate_ids.len);
                 var batch_key_bytes: u64 = 0;
                 for (candidate_metadata[key_scan_start..key_scan_end], fallback_doc_keys[key_scan_start..key_scan_end]) |maybe_metadata, fallback_doc_key| {
-                    const doc_key = maybe_metadata orelse fallback_doc_key orelse continue;
+                    const doc_key = (if (has_residual) maybe_metadata else maybe_metadata orelse fallback_doc_key) orelse continue;
                     if (req.filter_prefix.len > 0 and !std.mem.startsWith(u8, doc_key, req.filter_prefix)) continue;
                     // Internal tuple encoding can escape every byte. Include
                     // fixed namespace/components plus arena alignment slack.
@@ -19522,9 +19532,7 @@ pub const IndexManager = struct {
                 const candidate_end = @min(candidate_start + exact_dense_score_batch_size, unique_candidate_ids.len);
                 var batch_len: usize = 0;
                 for (unique_candidate_ids[candidate_start..candidate_end], candidate_metadata[candidate_start..candidate_end], fallback_doc_keys[candidate_start..candidate_end]) |vector_id, maybe_metadata, fallback_doc_key| {
-                    const doc_key = maybe_metadata orelse fallback_doc_key orelse continue;
-                    if (req.filter_prefix.len > 0 and !std.mem.startsWith(u8, doc_key, req.filter_prefix)) continue;
-                    if (req.key_predicate) |predicate| if (!try predicate.allows(predicate.ptr, doc_key)) continue;
+                    const doc_key = (if (has_residual) maybe_metadata else maybe_metadata orelse fallback_doc_key) orelse continue;
                     batch_ids[batch_len] = vector_id;
                     batch_metadata[batch_len] = doc_key;
                     batch_distances[batch_len] = std.math.inf(f32);
@@ -19579,15 +19587,8 @@ pub const IndexManager = struct {
             defer self.alloc.free(vector_scratch);
             for (unique_candidate_ids, candidate_metadata, fallback_doc_keys, 0..) |vector_id, maybe_metadata, fallback_doc_key, i| {
                 if (i % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
-                const doc_key = maybe_metadata orelse fallback_doc_key;
-                if (req.filter_prefix.len > 0) {
-                    const resolved_doc_key = doc_key orelse continue;
-                    if (!std.mem.startsWith(u8, resolved_doc_key, req.filter_prefix)) continue;
-                }
-                if (req.key_predicate) |predicate| {
-                    const resolved_doc_key = doc_key orelse continue;
-                    if (!try predicate.allows(predicate.ptr, resolved_doc_key)) continue;
-                }
+                const doc_key = if (has_residual) maybe_metadata else maybe_metadata orelse fallback_doc_key;
+                if (has_residual and doc_key == null) continue;
                 const lookup_start = platform_time.monotonicNs();
                 exact_profile.raw_scalar_reads += 1;
                 const loaded_vector = if (vector_cursor) |*cursor|
@@ -52586,6 +52587,72 @@ test "transient leann vectors become stubs and are re-embedded on demand" {
         try std.testing.expectEqual(@as(u64, allowlist.len), filtered.profile.approx_vectors_scored);
         try std.testing.expect(embedder.documents > before_filtered);
         try std.testing.expect(embedder.documents - before_filtered <= allowlist.len);
+
+        const query_exec = @import("../query/search_exec.zig");
+        const Paging = struct {
+            entry: *IndexManager.DenseIndex,
+            calls: usize = 0,
+
+            fn dense(raw: ?*anyopaque, _: ?[]const u8) !?*IndexManager.DenseIndex {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                return self.entry;
+            }
+            fn text(_: ?*anyopaque, _: ?[]const u8) !?*IndexManager.TextIndex {
+                return null;
+            }
+            fn docKey(_: ?*anyopaque, _: []const u8, _: u64) !?[]u8 {
+                return error.UnexpectedDocKeyLookup;
+            }
+            fn vectorId(_: ?*anyopaque, _: []const u8, _: []const u8) !?u64 {
+                return error.UnexpectedVectorIdLookup;
+            }
+            fn stored(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) ![]u8 {
+                return error.UnexpectedStoredLoad;
+            }
+            fn search(raw: ?*anyopaque, index: *IndexManager.DenseIndex, req: hbc_mod.SearchRequest) !hbc_mod.SearchResults {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                self.calls += 1;
+                return index.index.searchWithRequest(req);
+            }
+            fn profiled(raw: ?*anyopaque, index: *IndexManager.DenseIndex, req: hbc_mod.SearchRequest) !hbc_mod.ProfiledSearchResults {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                self.calls += 1;
+                return index.index.searchProfiledRequest(req);
+            }
+            fn postprocess(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, result: types.SearchResult, _: bool) !types.SearchResult {
+                return result;
+            }
+        };
+        var paging = Paging{ .entry = entry };
+        const expected_documents = embedder.documents - before_filtered;
+        const before_page_documents = embedder.documents;
+        const before_page_batches = embedder.calls;
+        var page = try query_exec.searchDenseProfiled(alloc, .{
+            .index_name = "leann_idx",
+            .limit = 3,
+            .include_stored = false,
+            .filter_ids = &allowlist,
+            .distance_under = 0.001,
+        }, .{ .vector = &vectors[5], .k = 3 }, .{
+            .ctx = &paging,
+            .filter_candidate_presence = true,
+            .text_index_entry = Paging.text,
+            .dense_index = Paging.dense,
+            .lookup_doc_key = Paging.docKey,
+            .lookup_vector_id = Paging.vectorId,
+            .load_projected_document = Paging.stored,
+            .hbc_search = Paging.search,
+            .hbc_search_profiled = Paging.profiled,
+            .postprocess = Paging.postprocess,
+        });
+        defer page.result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), paging.calls);
+        try std.testing.expectEqual(@as(usize, 1), page.result.hits.len);
+        try std.testing.expectEqualStrings(keys[5], page.result.hits[0].id);
+        try std.testing.expectEqual(.exact, page.result.total_hits_relation);
+        try std.testing.expectEqual(@as(u64, 1), page.result.total_hits);
+        try std.testing.expectEqual(expected_documents, embedder.documents - before_page_documents);
+        try std.testing.expectEqual(filtered.profile.rerank_batches, embedder.calls - before_page_batches);
 
         // Deleting a quarter rebuilds from codes on sync: nothing re-embedded.
         var deleted: [n / 4][]const u8 = undefined;
