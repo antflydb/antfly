@@ -1603,31 +1603,22 @@ pub const Index = struct {
 
         // PQ has no admissible bounds. RaBitQ bounds describe the original
         // vectors, so they also cannot prune reranking of quantized copies.
-        // Limit a graph walk to its estimated beam in either case.
-        const refill_shortlist = opts.score_quantized_source and opts.candidate_ids == null;
+        // Score the estimated shortlist first, then refill if vectors are missing.
+        const use_bounds = self.rabitq != null and !opts.score_quantized_source;
+        const refill_shortlist = !use_bounds;
         const ByEstimate = struct {
             fn compare(_: void, a: Pooled, b: Pooled) std.math.Order {
                 if (a.est < b.est) return .lt;
                 if (a.est > b.est) return .gt;
                 return std.math.order(a.id, b.id);
             }
-
-            fn lessThan(_: void, a: Pooled, b: Pooled) bool {
-                return compare({}, a, b) == .lt;
-            }
         };
         const EstimateQueue = std.PriorityQueue(Pooled, void, ByEstimate.compare);
         var estimates: ?EstimateQueue = null;
         defer if (estimates) |*queue| queue.deinit(alloc);
-        if (pool.items.len > ef) {
-            if (refill_shortlist) {
-                // Heapify once, then order only the candidates actually
-                // scored. A readable shortlist never sorts the remainder.
-                estimates = EstimateQueue.fromOwnedSlice(try pool.toOwnedSlice(alloc), {});
-            } else if (self.rabitq == null) {
-                std.mem.sortUnstable(Pooled, pool.items, {}, ByEstimate.lessThan);
-                pool.items.len = ef;
-            }
+        if (refill_shortlist and pool.items.len > ef) {
+            // Heapify once, then order only the candidates actually scored.
+            estimates = EstimateQueue.fromOwnedSlice(try pool.toOwnedSlice(alloc), {});
         }
 
         const ByLower = struct {
@@ -1635,7 +1626,7 @@ pub const Index = struct {
                 return a.lower < b.lower;
             }
         };
-        if (!opts.score_quantized_source) std.mem.sortUnstable(Pooled, pool.items, {}, ByLower.lessThan);
+        if (use_bounds) std.mem.sortUnstable(Pooled, pool.items, {}, ByLower.lessThan);
         const candidates_view = if (estimates) |queue| queue.items else pool.items;
 
         var top = Heap(true){};
@@ -1651,18 +1642,21 @@ pub const Index = struct {
         var unrecomputed_from: ?usize = null;
         while (i < candidates_view.len) {
             if (refill_shortlist and i >= ef and top.len() >= k) break;
-            const batch_end = if (refill_shortlist and i < ef) @min(ef, candidates_view.len) else candidates_view.len;
+            const refilling = refill_shortlist and i >= ef;
+            const batch_end = if (refill_shortlist and !refilling) @min(ef, candidates_view.len) else candidates_view.len;
+            const batch_size = if (refilling) @min(chunk, k - top.len()) else chunk;
             const batch_start = i;
             const tau = if (top.len() >= k) top.top().dist else std.math.inf(f32);
             ids.clearRetainingCapacity();
-            while (i < batch_end and ids.items.len < chunk) : (i += 1) {
+            while (i < batch_end and ids.items.len < batch_size) : (i += 1) {
                 const p = if (estimates) |*queue| next: {
                     const candidate = queue.pop().?;
                     // Keep the popped item for the estimate-only fallback.
                     candidates_view[candidates_view.len - 1 - i] = candidate;
                     break :next candidate;
                 } else candidates_view[i];
-                if (!opts.score_quantized_source and p.lower >= tau) break;
+                if (i % 256 == 0) try RecomputeGate.checkCancellation(opts.gate);
+                if (use_bounds and p.lower >= tau) break;
                 if (self.isDeleted(p.id)) continue;
                 if (self.upper_vectors.contains(p.id) and
                     (if (opts.verify_source) (if (source.validate_retained_fn) |validate| try validate(source.ctx, p.id) else false) else !opts.score_quantized_source))
@@ -1674,7 +1668,7 @@ pub const Index = struct {
                 try ids.append(alloc, p.id);
             }
             if (ids.items.len == 0) {
-                if (!opts.score_quantized_source and i < candidates_view.len and candidates_view[i].lower >= tau) break;
+                if (use_bounds and i < candidates_view.len and candidates_view[i].lower >= tau) break;
                 continue;
             }
             if (!try RecomputeGate.open(opts.gate)) {
@@ -3659,8 +3653,6 @@ test "leann: quantized scoring refills a stale estimated shortlist" {
     const alloc = testing.allocator;
     var fx = try Fixture.init(alloc, 400, 1, 16, 12, 43);
     defer fx.deinit(alloc);
-    var index = try Index.build(alloc, .{ .dims = 16, .max_degree = 12, .quantizer = .rabitq }, fx.data);
-    defer index.deinit();
     const Source = struct {
         backing: SliceEmbeddingSource,
         calls: usize = 0,
@@ -3675,11 +3667,48 @@ test "leann: quantized scoring refills a stale estimated shortlist" {
             try self.backing.source().recompute(ids, out);
         }
     };
+    const All = struct {
+        fn allows(_: *const anyopaque, _: u32) !bool {
+            return true;
+        }
+    };
+    var dummy: u8 = 0;
+    const filter: Filter = .{ .ctx = &dummy, .allows_fn = All.allows };
+    for ([_]Quantizer{ .rabitq, .pq }) |quantizer| {
+        var index = try Index.build(alloc, .{ .dims = 16, .max_degree = 12, .quantizer = quantizer }, fx.data);
+        defer index.deinit();
+        var src = Source{ .backing = .{ .vectors = fx.data, .dims = 16 } };
+        var response = try index.search(alloc, .{ .ctx = &src, .recompute_fn = Source.recompute }, fx.query(0), .{
+            .k = 1,
+            .ef = 1,
+            .batch_size = 1,
+            .filter = filter,
+            .verify_source = true,
+            .score_quantized_source = quantizer == .rabitq,
+        });
+        defer response.deinit(alloc);
+        try testing.expectEqual(@as(usize, 1), response.results.len);
+        try testing.expectEqual(@as(usize, 2), src.calls);
+    }
+
+    // An allowlist much larger than the shortlist scores only the shortlist
+    // and one replacement, even when the first vector is stale.
+    var index = try Index.build(alloc, .{ .dims = 16, .max_degree = 12, .quantizer = .rabitq }, fx.data);
+    defer index.deinit();
+    var candidates: [400]u32 = undefined;
+    for (&candidates, 0..) |*id, offset| id.* = @intCast(offset);
     var src = Source{ .backing = .{ .vectors = fx.data, .dims = 16 } };
-    var response = try index.search(alloc, .{ .ctx = &src, .recompute_fn = Source.recompute }, fx.query(0), .{ .k = 1, .ef = 1, .batch_size = 1, .score_quantized_source = true });
+    var response = try index.search(alloc, .{ .ctx = &src, .recompute_fn = Source.recompute }, fx.query(0), .{
+        .k = 4,
+        .ef = 4,
+        .batch_size = 1,
+        .candidate_ids = &candidates,
+        .verify_source = true,
+        .score_quantized_source = true,
+    });
     defer response.deinit(alloc);
-    try testing.expectEqual(@as(usize, 1), response.results.len);
-    try testing.expectEqual(@as(usize, 2), src.calls);
+    try testing.expectEqual(@as(usize, 4), response.results.len);
+    try testing.expectEqual(@as(usize, 5), src.calls);
 }
 
 test "leann: rebuild from codes keeps codes and live nodes" {

@@ -53285,7 +53285,7 @@ fn testLeannMediaRetention(full_consumer: bool) !void {
     const dims = 8;
     const n = 400;
     const config_json =
-        \\{"field":"body","dims":8,"metric":"l2_squared","embedding_name":"leann_idx","generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"leann_idx_chunks","embedding_name":"leann_idx"},"algorithm":"leann","leann":{"max_degree":16,"quantizer":"rabitq","quantization_bits":4,"vector_storage":"auto","media_vectors":"int8","search_ef":0,"bound_scale":1,"batch_size":0}}
+        \\{"field":"body","dims":8,"metric":"l2_squared","embedding_name":"leann_idx","generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"leann_idx_chunks","embedding_name":"leann_idx"},"algorithm":"leann","leann":{"max_degree":16,"quantizer":"rabitq","quantization_bits":4,"vector_storage":"auto","media_vectors":"int8","search_ef":32,"bound_scale":1,"batch_size":0}}
     ;
     var prng = std.Random.DefaultPrng.init(29);
     const rand = prng.random();
@@ -53312,12 +53312,13 @@ fn testLeannMediaRetention(full_consumer: bool) !void {
         keys: []const []const u8,
         vectors: []const [dims]f32,
         media_requests: usize = 0,
+        text_requests: usize = 0,
 
         fn embed(ctx: *anyopaque, _: Allocator, requests: []const enrichment_types.GeneratedEnrichmentRequest, d: u32, out: []f32, found: []bool) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             for (requests, 0..) |request, i| {
                 for (self.keys, 0..) |k, j| if (std.mem.eql(u8, k, request.doc_key)) {
-                    if (j % 2 == 1) self.media_requests += 1;
+                    if (j % 2 == 1) self.media_requests += 1 else self.text_requests += 1;
                     @memcpy(out[i * d ..][0..d], &self.vectors[j]);
                     found[i] = true;
                 };
@@ -53373,6 +53374,19 @@ fn testLeannMediaRetention(full_consumer: bool) !void {
             const digest = leann_store_mod.vectorDigest(&vectors[i]);
             try std.testing.expectEqual(copy == null, try IndexManager.validateLeannRetainedDigest(loader, alloc, keys[i], digest));
         }
+    }
+
+    // A cold allowlist query scores a bounded shortlist across both kinds
+    // of artifacts and never submits a media copy to the provider.
+    var allowed: [n]u64 = undefined;
+    for (&allowed, keys) |*id, key| id.* = (try manager.lookupDenseVectorId(&store, "leann_idx", key)) orelse return error.TestUnexpectedResult;
+    {
+        var results = try entry.index.searchWithRequest(.{ .query = &vectors[10], .k = 5, .filter_ids = &allowed });
+        defer results.deinit();
+        try std.testing.expectEqual(@as(usize, 5), results.items.items.len);
+        try std.testing.expectEqual(allowed[10], results.items.items[0].vector_id);
+        try std.testing.expect(embedder.text_requests > 0 and embedder.text_requests <= 32);
+        try std.testing.expectEqual(@as(usize, 0), embedder.media_requests);
     }
 
     // Searches re-embed text documents only; media vectors come from their int8 copies.

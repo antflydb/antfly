@@ -248,6 +248,7 @@ pub const AsyncContext = struct {
     query_recovery_ready: std.atomic.Value(bool) = .init(false),
     query_recovery_mutex: std.Io.Mutex = .init,
     query_recovery_condition: std.Io.Condition = .init,
+    query_recovery_setup: std.Io.Group = .init,
     query_recovery_in_progress: bool = false,
     query_recovery_retry_at: u64 = 0,
     enrichment_desired_running: std.atomic.Value(bool) = .init(false),
