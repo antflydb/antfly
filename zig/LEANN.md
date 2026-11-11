@@ -149,18 +149,22 @@ version needs no such special case and does better on real data (below).
 
 ```sh
 cd zig
-zig build-exe -OReleaseFast -lc -femit-bin=zig-out/bin/leann-bench \
-  --dep antfly_vector -Mroot=lib/vectorindex/src/leann_bench.zig \
-  --dep protobuf -Mantfly_vector=lib/vector/src/mod.zig \
-  -Mprotobuf=lib/protobuf/src/root.zig
-zig-out/bin/leann-bench --data PREFIX --n 100000 --queries 200 \
-  --metric cosine [--quantizer pq|rabitq] [--unpruned 1] [--cost FILE]
+zig build leann-bench -Doptimize=ReleaseFast
+zig-out/bin/leann_bench --data PREFIX --n 100000 --queries 200 \
+  --metric cosine [--quantizer pq|rabitq] [--unpruned 1] [--cost FILE] [--filtered 1]
 ```
 
 `PREFIX.train.f32` / `PREFIX.test.f32` hold a u32 row count, u32 dimension,
 then row-major f32s. Without `--data` it uses Gaussian clusters. `--cost`
 takes an embedder cost curve from `scripts/leann_embed_cost.py` and adds
 modeled embedding time per query.
+
+With `--filtered 1`, the benchmark compares widening an unfiltered result
+window, admitting only eligible nodes for exact verification, and directly
+scoring the allowlist. It reports recall against filtered exact ground truth,
+p50 and p99, and the number of embeddings loaded per query. A stored-vector
+run measures CPU and vector access. Supply `--cost FILE` to model the
+additional transient re-embedding cost.
 
 GloVe-25 (ann-benchmarks `glove-25-angular`), first 100k vectors, 200
 queries, cosine, M=30, efC=128, single thread, recall@10 against brute force.

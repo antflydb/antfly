@@ -653,15 +653,35 @@ pub const Replica = struct {
     /// k nearest live keys. Keys borrow from the replica until the next
     /// state change. `source` recomputes exact vectors by graph node id;
     /// see `nodeKey`.
+    pub const KeyFilter = struct {
+        ctx: *const anyopaque,
+        allows: *const fn (*const anyopaque, []const u8) anyerror!bool,
+        cancelled: *const fn (*const anyopaque) bool,
+        eligible_count: ?u32 = null,
+        distance_over: ?f32 = null,
+        distance_under: ?f32 = null,
+        direct_keys: ?[]const []const u8 = null,
+
+        fn distanceAllowed(self: KeyFilter, dist: f32) bool {
+            if (self.distance_over) |threshold| if (!(dist > threshold)) return false;
+            if (self.distance_under) |threshold| if (!(dist < threshold)) return false;
+            return true;
+        }
+    };
+
     /// Graph search tuning (see `leann.SearchOptions`).
     pub const SearchTuning = struct {
         /// Beam width; 0 picks the quantizer's default. Raised to `k`.
         ef: u32 = 0,
         bound_scale: f32 = 1.0,
         batch_size: u32 = 0,
+        filter: ?KeyFilter = null,
+        stats: ?*leann.SearchStats = null,
     };
 
     pub fn search(self: *const Replica, alloc: Allocator, query: []const f32, k: u32, tuning: SearchTuning, loader: VectorLoader) ![]Hit {
+        if (query.len != self.opts.config.dims) return error.DimensionMismatch;
+        if (tuning.stats) |profile| profile.* = .{};
         var hits = std.ArrayListUnmanaged(Hit).empty;
         errdefer hits.deinit(alloc);
         const metric = self.opts.config.metric;
@@ -670,20 +690,61 @@ pub const Replica = struct {
         if (metric == .cosine) normalize(q);
         const tmp = try alloc.alloc(f32, query.len);
         defer alloc.free(tmp);
-        for (self.buffer_keys.items, self.buffer_vectors.items) |key, v| {
-            @memcpy(tmp, v);
-            if (metric == .cosine) normalize(tmp);
-            try hits.append(alloc, .{ .key = key, .distance = leann.distance(metric, q, tmp) });
+        const direct_keys = if (tuning.filter) |filter| filter.direct_keys else null;
+        if (direct_keys) |keys| {
+            for (keys) |key| {
+                const slot = self.bufferIndex(key) orelse continue;
+                try self.scoreBufferHit(alloc, q, tmp, slot, tuning.filter, &hits);
+            }
+        } else {
+            for (0..self.buffer_keys.items.len) |slot| {
+                try self.scoreBufferHit(alloc, q, tmp, slot, tuning.filter, &hits);
+            }
         }
         if (self.index) |*index| {
-            var ctx = SearchSource{ .replica = self, .loader = loader, .far_from = query };
-            var resp = try index.search(alloc, ctx.source(), query, .{
+            var ctx = SearchSource{ .replica = self, .loader = loader, .far_from = if (tuning.filter != null) null else query };
+            const opts: leann.SearchOptions = .{
                 .k = k,
-                .ef = if (tuning.ef > 0) @max(tuning.ef, k) else 0,
+                .ef = tuning.ef,
                 .bound_scale = tuning.bound_scale,
                 .batch_size = tuning.batch_size,
-            });
+            };
+            var resp = if (tuning.filter) |filter| blk: {
+                const FilterContext = struct {
+                    replica: *const Replica,
+                    filter: KeyFilter,
+
+                    fn allows(raw: *const anyopaque, id: u32) !bool {
+                        const context: *const @This() = @ptrCast(@alignCast(raw));
+                        return context.filter.allows(context.filter.ctx, context.replica.keys.items[id]);
+                    }
+
+                    fn cancelled(raw: *const anyopaque) bool {
+                        const context: *const @This() = @ptrCast(@alignCast(raw));
+                        return context.filter.cancelled(context.filter.ctx);
+                    }
+                };
+                const filter_context = FilterContext{ .replica = self, .filter = filter };
+                var direct_ids: std.ArrayListUnmanaged(u32) = .empty;
+                defer direct_ids.deinit(alloc);
+                if (direct_keys) |keys| {
+                    try direct_ids.ensureTotalCapacity(alloc, keys.len);
+                    for (keys) |key| {
+                        if (self.node_of.get(key)) |id| direct_ids.appendAssumeCapacity(id);
+                    }
+                    std.mem.sortUnstable(u32, direct_ids.items, {}, std.sort.asc(u32));
+                }
+                break :blk try index.searchFiltered(alloc, ctx.source(), query, opts, .{
+                    .ctx = &filter_context,
+                    .allows = FilterContext.allows,
+                    .cancelled = FilterContext.cancelled,
+                    .eligible_count = filter.eligible_count,
+                    .distance_over = filter.distance_over,
+                    .distance_under = filter.distance_under,
+                }, if (direct_keys != null) direct_ids.items else null);
+            } else try index.search(alloc, ctx.source(), query, opts);
             defer resp.deinit(alloc);
+            if (tuning.stats) |profile| profile.* = resp.stats;
             for (resp.results) |r| try hits.append(alloc, .{ .key = self.keys.items[r.id], .distance = r.distance });
         }
         std.mem.sortUnstable(Hit, hits.items, {}, struct {
@@ -693,6 +754,20 @@ pub const Replica = struct {
         }.lt);
         if (hits.items.len > k) hits.shrinkRetainingCapacity(k);
         return hits.toOwnedSlice(alloc);
+    }
+
+    fn scoreBufferHit(self: *const Replica, alloc: Allocator, query: []const f32, scratch: []f32, slot: usize, filter: ?KeyFilter, hits: *std.ArrayListUnmanaged(Hit)) !void {
+        const key = self.buffer_keys.items[slot];
+        if (filter) |f| {
+            if (f.cancelled(f.ctx)) return error.Cancelled;
+            if (!try f.allows(f.ctx, key)) return;
+        }
+        const metric = self.opts.config.metric;
+        @memcpy(scratch, self.buffer_vectors.items[slot]);
+        if (metric == .cosine) normalize(scratch);
+        const dist = leann.distance(metric, query, scratch);
+        if (filter) |f| if (!f.distanceAllowed(dist)) return;
+        try hits.append(alloc, .{ .key = key, .distance = dist });
     }
 
     // ---------------------------------------------------------------------
@@ -790,7 +865,7 @@ pub const Replica = struct {
     const PlanSource = struct {
         replica: *const Replica,
         loader: VectorLoader,
-        far_from: []const f32,
+        far_from: ?[]const f32,
 
         fn source(self: *PlanSource) leann.EmbeddingSource {
             return .{ .ctx = self, .recompute_fn = recompute };
@@ -805,7 +880,7 @@ pub const Replica = struct {
     const SearchSource = PlanSource;
 };
 
-fn recomputeByKey(replica: *const Replica, loader: VectorLoader, far_from: []const f32, ids: []const u32, out: []f32) !void {
+fn recomputeByKey(replica: *const Replica, loader: VectorLoader, far_from: ?[]const f32, ids: []const u32, out: []f32) !void {
     const d: usize = replica.opts.config.dims;
     if (loader.load_batch) |load_batch| {
         const keys = try replica.alloc.alloc([]const u8, ids.len);
@@ -816,9 +891,9 @@ fn recomputeByKey(replica: *const Replica, loader: VectorLoader, far_from: []con
         for (ids, keys) |id, *k| k.* = if (replica.index.?.isDeleted(id)) "" else replica.keys.items[id];
         @memset(found, false);
         try load_batch(loader.ctx, replica.alloc, keys, out[0 .. ids.len * d], found);
-        for (found, 0..) |ok, i| if (!ok) for (out[i * d ..][0..d], far_from) |*o, x| {
-            o.* = -1000 * x;
-        };
+        for (found, 0..) |ok, i| {
+            if (!ok) leann.fillMissingEmbedding(out[i * d ..][0..d], far_from);
+        }
         return;
     }
     for (ids, 0..) |id, i| {
@@ -835,7 +910,7 @@ fn recomputeByKey(replica: *const Replica, loader: VectorLoader, far_from: []con
             if (v.len != d) return error.DimensionMismatch;
             @memcpy(row, v);
         } else {
-            for (row, far_from) |*o, x| o.* = -1000 * x;
+            leann.fillMissingEmbedding(row, far_from);
         }
     }
 }

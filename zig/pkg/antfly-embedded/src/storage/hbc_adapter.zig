@@ -18872,12 +18872,23 @@ pub const HBCIndex = struct {
     }
 
     pub fn searchProfiled(self: *HBCIndex, query: []const f32, k: usize) !ProfiledSearchResults {
-        if (self.leann) |store| return .{ .results = try store.search(self.alloc, .{ .query = query, .k = k }), .profile = .{} };
+        if (self.leann != null) return self.searchProfiledRequest(.{ .query = query, .k = k });
         return try vectorindex_hbc_index.searchProfiled(self, query, k, nowNs, elapsedSince);
     }
 
     pub fn searchProfiledRequest(self: *HBCIndex, req: SearchRequest) !ProfiledSearchResults {
-        if (self.leann) |store| return .{ .results = try store.search(self.alloc, req), .profile = .{} };
+        if (self.leann) |store| {
+            const start = nowNs();
+            var search_stats: @import("antfly_vectorindex").leann.SearchStats = .{};
+            const results = try store.searchWithStats(self.alloc, req, &search_stats);
+            return .{ .results = results, .profile = .{
+                .total_ns = elapsedSince(start),
+                .nodes_visited = search_stats.expanded,
+                .approx_vectors_scored = search_stats.approx_evaluated,
+                .reranked_vectors = search_stats.recomputed,
+                .rerank_batches = search_stats.batches,
+            } };
+        }
         return try vectorindex_hbc_index.searchProfiledRequest(self, req, nowNs, elapsedSince);
     }
 

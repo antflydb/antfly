@@ -4315,6 +4315,96 @@ fn scoreNativeLeafScan(
     return scoreLeafMemberIds(self, txn, leaf_id, false, true, scan.member_ids, &scan.quantized, scan.projections, scan.subgroup_plan, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, use_search_cache, now, elapsed);
 }
 
+const FilteredRaBitOutput = struct {
+    distances: []f32,
+    bounds: []f32,
+    remaining: []const usize,
+
+    pub fn accepts(self: *FilteredRaBitOutput, row: usize) bool {
+        if (self.remaining.len == 0 or self.remaining[0] != row) return false;
+        self.remaining = self.remaining[1..];
+        return true;
+    }
+
+    pub fn write(self: *FilteredRaBitOutput, row: usize, distance: f32, bound: f32) void {
+        self.distances[row] = distance;
+        self.bounds[row] = bound;
+    }
+};
+
+fn scoreFilteredRaBitRows(
+    quantizer: *const quantizer_mod.RaBitQuantizer,
+    set: *const proto.RaBitQuantizedVectorSet,
+    query: []const f32,
+    scratch: *quantizer_mod.RaBitQuantizer.EstimateScratch,
+    positions: []const usize,
+    distances: []f32,
+    bounds: []f32,
+) !void {
+    var ranges: [64]quantizer_mod.ScoreRange = undefined;
+    var count: usize = 0;
+    for (positions) |row| {
+        if (count > 0 and ranges[count - 1].end == row) {
+            ranges[count - 1].end += 1;
+        } else {
+            if (count == ranges.len) {
+                // A sorted cursor masks fragmented matches without allocating
+                // a row bitmap or reading rejected codes.
+                var masked = FilteredRaBitOutput{ .distances = distances, .bounds = bounds, .remaining = positions };
+                return quantizer.estimateDistancesTo(set, query, scratch, null, &masked);
+            }
+            ranges[count] = .{ .start = row, .end = row + 1 };
+            count += 1;
+        }
+    }
+    const Output = struct {
+        distances: []f32,
+        bounds: []f32,
+
+        pub fn write(out: @This(), row: usize, distance: f32, bound: f32) void {
+            out.distances[row] = distance;
+            out.bounds[row] = bound;
+        }
+    };
+    return quantizer.estimateDistancesInRangesTo(set, query, scratch, null, ranges[0..count], Output{
+        .distances = distances,
+        .bounds = bounds,
+    });
+}
+
+test "filtered RaBitQ scoring skips fragmented rows past the range limit" {
+    const alloc = std.testing.allocator;
+    const dims = 8;
+    const count = 512;
+    var quantizer = try quantizer_mod.RaBitQuantizer.init(alloc, dims, 42, .l2_squared);
+    defer quantizer.deinit();
+    var scratch = try quantizer_mod.RaBitQuantizer.EstimateScratch.init(alloc, dims);
+    defer scratch.deinit(alloc);
+    const centroid: [dims]f32 = @splat(0);
+    var vectors: [count * dims]f32 = undefined;
+    var random_state = std.Random.DefaultPrng.init(71);
+    const random = random_state.random();
+    for (&vectors) |*value| value.* = random.float(f32);
+    var set = try quantizer.quantize(&centroid, &vectors, count);
+    defer set.deinit(alloc);
+
+    var positions: [count / 4]usize = undefined;
+    for (&positions, 0..) |*row, i| row.* = i * 4;
+    const query: [dims]f32 = @splat(0.25);
+    for ([_][]const f32{ &query, &centroid }) |q| {
+        var expected_distances: [count]f32 = undefined;
+        var expected_bounds: [count]f32 = undefined;
+        try quantizer.estimateDistancesWithScratch(&set, q, &expected_distances, &expected_bounds, &scratch);
+        var distances: [count]f32 = @splat(-1);
+        var bounds: [count]f32 = @splat(-1);
+        try scoreFilteredRaBitRows(&quantizer, &set, q, &scratch, &positions, &distances, &bounds);
+        for (0..count) |row| {
+            try std.testing.expectEqual(if (row % 4 == 0) expected_distances[row] else -1, distances[row]);
+            try std.testing.expectEqual(if (row % 4 == 0) expected_bounds[row] else -1, bounds[row]);
+        }
+    }
+}
+
 fn scoreLeafMemberIds(
     self: anytype,
     txn: anytype,
@@ -4613,7 +4703,25 @@ fn scoreLeafMemberIds(
             const count = member_ids.len;
             const distances = scratch.distances[0..count];
             const error_bounds = scratch.error_bounds[0..count];
-            try self.estimateQuantizedDistances(quantized_set, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
+            const scored_count = blk: {
+                // Positions are in physical row order. Keep the dense kernel
+                // for broad predicates and bound the cost of planning ranges.
+                if (filtered_count <= count / 4 and quantized_set.* == .rabit) {
+                    try validateQuantizedSet(self, quantized_set, count);
+                    try scoreFilteredRaBitRows(
+                        &self.quantizer,
+                        &quantized_set.rabit,
+                        approx_query,
+                        &scratch.estimate,
+                        original_positions,
+                        distances,
+                        error_bounds,
+                    );
+                    break :blk filtered_count;
+                }
+                try self.estimateQuantizedDistances(quantized_set, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
+                break :blk count;
+            };
             if (std.meta.activeTag(quantized_set.*) == .rabit) {
                 var ex_stack: ExRefine.Stack = .{};
                 if (try ExRefine.init(self, ex_stack.get(self.alloc, self.config.dims), &quantized_set.rabit, approx_query)) |refine_init| {
@@ -4654,10 +4762,10 @@ fn scoreLeafMemberIds(
                     results.addApproxResult(member_id, distances[i], error_bounds[i]);
                 }
             }
-            profile.approx_vectors_scored += count;
+            profile.approx_vectors_scored += scored_count;
             noteLeafScanBytes(
                 profile,
-                count,
+                scored_count,
                 @as(u64, @intCast(rabitq.codeWidth(self.config.dims))) *| @sizeOf(u64),
             );
             return;

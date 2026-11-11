@@ -15393,7 +15393,11 @@ fn searchDenseInternal(
             if (target == 0) break :blk 1000;
             break :blk @min(@as(u64, 1000), cache_slice.used_bytes *| 1000 / target);
         } else 1000;
-        const route = denseSearchRouteWithCosts(
+        const route = if (entry.leann_transient) DenseSearchRoute{
+            .exact_native_filter = false,
+            .name = "leann",
+            .reason = "leann_owns_transient_verification",
+        } else denseSearchRouteWithCosts(
             native_constraints.positive_filter,
             effective_native_filter_candidate_count,
             index_stats.active_count,
@@ -15407,8 +15411,8 @@ fn searchDenseInternal(
             hbc_cache_pressured,
             hbc_cache_residency_permille,
         );
-        entry.index.noteDenseRouteChoice(if (route.exact_native_filter) .exact else .hbc);
-        profile.search_route = route.name;
+        if (entry.index.leann == null) entry.index.noteDenseRouteChoice(if (route.exact_native_filter) .exact else .hbc);
+        profile.search_route = if (entry.index.leann != null and !route.exact_native_filter) "leann" else route.name;
         profile.route_reason = route.reason;
         profile.route_estimated_exact_storage_bytes = route.estimated_exact_storage_bytes;
         profile.route_estimated_hbc_storage_bytes = route.estimated_hbc_storage_bytes;
