@@ -92,6 +92,10 @@ pub const State = struct {
         self.* = undefined;
     }
 
+    pub fn needsLeaseRefresh(self: *const State, now_ms: u64) bool {
+        return self.lease_owned and (!self.has_lease or now_ms >= self.lease_renew_after_ms);
+    }
+
     pub fn ensureLease(self: *State, now_ms: u64) !bool {
         if (!self.lease_owned) {
             self.has_lease = true;
@@ -102,7 +106,7 @@ pub const State = struct {
         // A lease cannot be taken by a conforming peer before its durable
         // expiry. Keep the overwhelmingly common runtime tick on this
         // in-memory path and renew early enough to tolerate scheduler stalls.
-        if (had_lease and now_ms < self.lease_renew_after_ms) return true;
+        if (!self.needsLeaseRefresh(now_ms)) return true;
         const acquired = try self.lease.tryAcquireFenced(self.owner_id, now_ms, self.lease_ttl_ms);
         if (acquired.acquired) {
             self.has_lease = true;
