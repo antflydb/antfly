@@ -24,11 +24,11 @@ pub const Provider = enum {
     apple,
 
     /// These adapters consume an already acquired recording through
-    /// RemoteOptions.resolved_audio. Antfly's local callback remains URL-based.
+    /// RemoteOptions.resolved_audio. The asset runtime adapts local Antfly
+    /// callbacks to inline data URIs at their URL-based compatibility boundary.
     pub fn supportsResolvedAudio(self: @This()) bool {
         return switch (self) {
-            .openai, .vertex, .cloudflare, .apple => true,
-            .antfly => false,
+            .antfly, .openai, .vertex, .cloudflare, .apple => true,
         };
     }
 

@@ -78,19 +78,7 @@ fn audioMediaTypeMatches(mime: []const u8, detected: audio.EncodedFormat) !bool 
 }
 
 pub fn audioMime(bytes: []const u8) ![]const u8 {
-    return switch (audio.detectFormat(bytes) orelse return error.UnsupportedDocumentFormat) {
-        .wav => "audio/wav",
-        .mp3 => "audio/mpeg",
-        .aac => "audio/aac",
-        .mp4 => "audio/mp4",
-        .ogg => "audio/ogg",
-        .opus => "audio/opus",
-        .flac => "audio/flac",
-        .aiff => "audio/aiff",
-        .caf => "audio/x-caf",
-        .au => "audio/basic",
-        .webm => "audio/webm",
-    };
+    return audio.mimeForBytes(bytes) catch return error.UnsupportedDocumentFormat;
 }
 // Semantic replacements are logical regions, independent of how many source
 // glyphs painted them. Borrow text until ordering/limits are resolved, then

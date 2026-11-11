@@ -25,7 +25,8 @@ pub const Provider = enum {
 
     /// Mirrors `antfly_transcribing.Provider.supportsResolvedAudio`.
     pub fn supportsResolvedAudio(self: @This()) bool {
-        return self != .antfly;
+        _ = self;
+        return true;
     }
 };
 

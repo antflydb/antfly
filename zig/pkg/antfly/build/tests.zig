@@ -859,6 +859,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const index_document_producer_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/asset_producer_runtime.zig"), .target = target, .optimize = optimize });
     test_imports.configure(b, index_document_producer_mod, true, true);
     index_document_producer_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const transcriber_credential_tests = b.addTest(.{ .root_module = index_document_producer_mod, .filters = &.{"transcriber"}, .max_rss = 4 * 1024 * 1024 * 1024 });
+    b.step("antfly-transcriber-credentials-test", "Verify native STT credentials, source ownership and batching").dependOn(&b.addRunArtifact(transcriber_credential_tests).step);
     const index_document_producer_tests = b.addTest(.{ .root_module = index_document_producer_mod, .filters = &.{"index document checkpoint producer"} });
     b.step("antfly-index-document-producer-test", "Verify native indexed document checkpoint propagation and final replay").dependOn(&b.addRunArtifact(index_document_producer_tests).step);
     const index_document_checkpoint_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/storage/db/enrichment/document_checkpoints.zig"), .target = target, .optimize = optimize });

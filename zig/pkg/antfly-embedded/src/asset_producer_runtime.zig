@@ -1151,10 +1151,21 @@ pub const Runtime = struct {
                     if (inference_work.hasDataUriScheme(request.source_text) != inline_source)
                         return error.InferenceInvocationMemoryUnavailable;
                 }
-                break :blk if (inline_source)
-                    .data_uri
-                else
-                    .borrowed_binary;
+                const has_media = requests[0].media.len != 0;
+                for (requests[1..]) |request| if ((request.media.len != 0) != has_media)
+                    return error.InferenceInvocationMemoryUnavailable;
+                if (cfg.provider == .antfly) {
+                    if (!remote) break :blk if (has_media or inline_source) .data_uri else .borrowed_binary;
+                    const selected_transport = remoteAttachmentTransport(try self.transcriberCapabilities(alloc, cfg), .base64_payload);
+                    // An opaque URL has no caller-owned recording to charge.
+                    // Bound its downloaded source plus transport workspace here.
+                    if (!has_media and !inline_source) {
+                        const source_peak = try selected_transport.peakResidentSize(transcribing.effectiveMaxDownloadBytes(cfg.max_download_bytes), 0);
+                        caller_workspace_bytes = try std.math.mul(usize, source_peak, requests.len);
+                    }
+                    break :blk selected_transport;
+                }
+                break :blk if (inline_source) .data_uri else .borrowed_binary;
             },
         };
 
@@ -1530,6 +1541,11 @@ pub const Runtime = struct {
                 defer cfg.deinit();
                 break :blk try self.readerCapabilities(alloc, cfg.value);
             },
+            .transcriber => blk: {
+                var cfg = try std.json.parseFromSlice(transcribing.Config, alloc, requests[0].config_json, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+                defer cfg.deinit();
+                break :blk try self.transcriberCapabilities(alloc, cfg.value);
+            },
             .decision => blk: {
                 const raw = requests[0].config_json;
                 if (std.mem.indexOf(u8, raw, "decision_revision_probe") != null or std.mem.indexOfScalar(u8, raw, '\\') != null) {
@@ -1757,6 +1773,33 @@ pub const Runtime = struct {
         return .{ .config = cfg, .credential = credential };
     }
 
+    const ResolvedTranscriberConfig = struct {
+        config: transcribing.Config,
+        credential: ?[]u8 = null,
+        fn deinit(self: *ResolvedTranscriberConfig, alloc: Allocator) void {
+            if (self.credential) |value| alloc.free(value);
+        }
+    };
+
+    // Durable recipes retain references. Resolve once per invocation before
+    // discovery and execution, without lending a node credential to other URLs.
+    fn resolveTranscriberConfig(self: *Runtime, alloc: Allocator, raw: transcribing.Config) !ResolvedTranscriberConfig {
+        var cfg = self.routedTranscriberConfig(raw);
+        if (isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl())) return .{ .config = cfg };
+        const reference = cfg.bearer_token orelse cfg.api_key orelse
+            (if (cfg.provider == .antfly) self.defaultInferenceCredentialReference(cfg.resolvedUrl()) else null);
+        var secret = if (cfg.provider == .cloudflare)
+            try common_secrets.SecretValue.initConfigOrEnv(alloc, reference, "CLOUDFLARE_API_TOKEN")
+        else
+            (try common_secrets.SecretValue.initConfig(alloc, reference)) orelse return .{ .config = cfg };
+        defer secret.deinit(alloc);
+        const credential = try secret.resolveOwned(alloc, self.secret_store);
+        if (cfg.provider == .cloudflare and credential == null) return error.CloudflareCredentialMissing;
+        cfg.api_key = credential;
+        cfg.bearer_token = null;
+        return .{ .config = cfg, .credential = credential };
+    }
+
     fn readerCapabilities(
         self: *Runtime,
         alloc: Allocator,
@@ -1798,6 +1841,36 @@ pub const Runtime = struct {
         try capabilities.validate();
         if (capabilities.task != .read) return error.InvalidInferenceCapabilities;
         return capabilities;
+    }
+
+    fn transcriberCapabilities(self: *Runtime, alloc: Allocator, raw_cfg: transcribing.Config) !?inference_work.InferenceCapabilities {
+        var resolved = try self.resolveTranscriberConfig(alloc, raw_cfg);
+        defer resolved.deinit(alloc);
+        const cfg = resolved.config;
+        try cfg.validate();
+        if (cfg.provider != .antfly) return null;
+        const model = try requiredAntflyTranscriberModel(cfg);
+        if (isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl())) {
+            const local = self.antfly_provider orelse return null;
+            const capabilities = (try self.linkedModelCapabilities(alloc, local, model, .transcribe)) orelse return null;
+            try capabilities.validate();
+            if (capabilities.task != .transcribe) return error.InvalidInferenceCapabilities;
+            return capabilities;
+        }
+        var auth: ?[]u8 = null;
+        defer if (auth) |value| alloc.free(value);
+        var storage: [2][2][]const u8 = undefined;
+        var count: usize = 0;
+        if (cfg.bearer_token orelse cfg.api_key) |token| {
+            auth = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
+            storage[count] = .{ "Authorization", auth.? };
+            count += 1;
+        }
+        count = try self.execution.routing.appendHeaders(&storage, count);
+        return self.capabilityCache().getOrDiscoverWithContext(self.http, cfg.resolvedUrl().?, model, .transcribe, storage[0..count], self.execution.waitContext()) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => null,
+        };
     }
 
     fn canGenerateBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !bool {
@@ -3064,8 +3137,10 @@ pub const Runtime = struct {
         }
         for (out) |*item| item.* = "";
         for (requests, 0..) |request, i| {
+            const inline_audio = try localTranscriberSourceAlloc(alloc, request, cfg_parsed.value.max_download_bytes);
+            defer if (inline_audio) |uri| alloc.free(uri);
             const transcribe_request = transcribing.Request{
-                .url = request.source_text,
+                .url = inline_audio orelse request.source_text,
                 .language = cfg_parsed.value.language_code,
                 .timestamps = cfg_parsed.value.timestamps orelse true,
                 .diarization = cfg_parsed.value.diarization orelse false,
@@ -4115,18 +4190,13 @@ pub const Runtime = struct {
         cfg_parsed.value.framed_attachments = false;
         cfg_parsed.value = self.routedTranscriberConfig(cfg_parsed.value);
         cfg_parsed.value.max_response_bytes = self.responseLimitForTask(.transcriber, 1);
-        // `transcribing` sends `api_key` verbatim: resolve the node default
-        // credential for this request only when it routed to the default endpoint.
-        const default_transcriber_credential = if (cfg_parsed.value.provider == .antfly and
-            cfg_parsed.value.api_key == null and cfg_parsed.value.bearer_token == null)
-            try self.resolveDefaultInferenceCredential(alloc, cfg_parsed.value.resolvedUrl())
-        else
-            null;
-        defer if (default_transcriber_credential) |token| alloc.free(token);
-        if (default_transcriber_credential) |token| cfg_parsed.value.api_key = token;
+        var resolved_transcriber = try self.resolveTranscriberConfig(alloc, cfg_parsed.value);
+        defer resolved_transcriber.deinit(alloc);
+        cfg_parsed.value = resolved_transcriber.config;
         if (request.media.len > 0) {
             if (!request.inline_media_trusted) return error.UntrustedInlineMedia;
             if (!cfg_parsed.value.provider.supportsResolvedAudio() or request.media.len != 1) return error.UnsupportedTranscriptionMedia;
+            if (request.media[0].bytes.len > transcribing.effectiveMaxDownloadBytes(cfg_parsed.value.max_download_bytes)) return error.ResponseTooLarge;
         }
         const antfly_model = if (cfg_parsed.value.provider == .antfly)
             try requiredAntflyTranscriberModel(cfg_parsed.value)
@@ -4135,8 +4205,10 @@ pub const Runtime = struct {
 
         if (isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) {
             const local = self.antfly_provider orelse return error.UnsupportedTranscriberProvider;
+            const inline_audio = try localTranscriberSourceAlloc(alloc, request, cfg_parsed.value.max_download_bytes);
+            defer if (inline_audio) |uri| alloc.free(uri);
             const transcribe_request = transcribing.Request{
-                .url = request.source_text,
+                .url = inline_audio orelse request.source_text,
                 .language = cfg_parsed.value.language_code,
                 .timestamps = cfg_parsed.value.timestamps orelse true,
                 .diarization = cfg_parsed.value.diarization orelse false,
@@ -4206,16 +4278,7 @@ pub const Runtime = struct {
             capability_lease_fields.apply(&cfg_parsed.value);
         }
 
-        var cloudflare_token: ?[]u8 = null;
-        defer if (cloudflare_token) |token| alloc.free(token);
-        var execution_cfg = cfg_parsed.value;
-        if (execution_cfg.provider == .cloudflare) {
-            var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, execution_cfg.bearer_token orelse execution_cfg.api_key, "CLOUDFLARE_API_TOKEN");
-            defer secret.deinit(alloc);
-            cloudflare_token = (try secret.resolveOwned(alloc, self.secret_store)) orelse return error.CloudflareCredentialMissing;
-            execution_cfg.api_key = cloudflare_token;
-            execution_cfg.bearer_token = null;
-        }
+        const execution_cfg = cfg_parsed.value;
         var result = transcribing.transcribeWithConfig(
             alloc,
             self.http,
@@ -4227,6 +4290,7 @@ pub const Runtime = struct {
             },
             .{
                 .resolved_audio = if (request.media.len == 1) request.media[0].bytes else null,
+                .resolved_audio_content_type = if (request.media.len == 1) request.media[0].mime_type else null,
                 .source_table = self.execution.routing.source_table,
                 .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
                 .cancellation = httpx.CancellationToken.fromCallback(
@@ -4515,6 +4579,17 @@ fn isLocalReaderProvider(provider: readers.Provider, url: ?[]const u8) bool {
 
 fn isLocalTranscriberProvider(provider: transcribing.Provider, url: ?[]const u8) bool {
     return provider == .antfly and url == null;
+}
+
+// Local callbacks retain their URL contract. Adapt caller-owned recordings at
+// this one boundary for single and batched calls; never fetch a private source
+// again or accept untrusted media through a batch shortcut.
+fn localTranscriberSourceAlloc(alloc: Allocator, request: asset_producer.Request, max_download_bytes: ?usize) !?[]u8 {
+    if (request.media.len == 0) return null;
+    if (!request.inline_media_trusted) return error.UntrustedInlineMedia;
+    if (request.media.len != 1) return error.UnsupportedTranscriptionMedia;
+    const media = request.media[0];
+    return try transcribing.inlineAudioSourceAlloc(alloc, media.bytes, media.mime_type, max_download_bytes);
 }
 
 fn requiredAntflyTranscriberModel(cfg: transcribing.Config) ![]const u8 {
@@ -8499,6 +8574,8 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
             _ = self.transcribe_calls.fetchAdd(1, .monotonic);
             try std.testing.expectEqualStrings("local-transcriber", model);
             try std.testing.expectEqualStrings("en-US", request.language.?);
+            if (std.mem.startsWith(u8, request.url, "gs://")) return error.TestUnexpectedResult;
+            if (std.mem.startsWith(u8, request.url, "data:")) try std.testing.expectEqualStrings("data:audio/wav;base64,ZmFrZQ==", request.url);
             const text = if (std.mem.endsWith(u8, request.url, "a.wav")) "first transcript" else "second transcript";
             return .{
                 .text = try a.dupe(u8, text),
@@ -8559,6 +8636,26 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
     try std.testing.expectEqualStrings("first transcript", results[0]);
     try std.testing.expectEqualStrings("second transcript", results[1]);
     try std.testing.expectEqual(@as(usize, 2), local.transcribe_calls.load(.monotonic));
+    const borrowed_request = asset_producer.Request{
+        .producer_type = .transcriber,
+        .config_json = requests[0].config_json,
+        .source_text = "gs://private/must-not-fetch.wav",
+        .content_type = "text/plain",
+        .inline_media_trusted = true,
+        .media = &.{.{ .bytes = "fake", .mime_type = "audio/wav" }},
+    };
+    const borrowed_plan = try producer.invocationMemoryForRequests(alloc, &.{borrowed_request});
+    try std.testing.expectEqual(inference_work.AttachmentTransport.data_uri, borrowed_plan.attachment_transport);
+    const borrowed = try runtime.transcribe(alloc, borrowed_request);
+    defer alloc.free(borrowed);
+    try std.testing.expectEqualStrings("second transcript", borrowed);
+    try std.testing.expectError(error.ResponseTooLarge, runtime.transcribe(alloc, .{
+        .producer_type = .transcriber,
+        .config_json = "{\"provider\":\"antfly\",\"model\":\"local-transcriber\",\"max_download_bytes\":1}",
+        .source_text = "gs://private/must-not-fetch.wav",
+        .inline_media_trusted = true,
+        .media = &.{.{ .bytes = "fake", .mime_type = "audio/wav" }},
+    }));
 }
 
 test "asset producer runtime routes antfly transcriber without url to local provider" {
@@ -9916,4 +10013,125 @@ test "index document checkpoint producer execution identity rejects missing fenc
     try std.testing.expect(!immutableAntflyModel("/tmp/model@1111111111111111111111111111111111111111"));
     try std.testing.expect(!immutableAntflyModel("../model@1111111111111111111111111111111111111111"));
     try std.testing.expect(immutableAntflyModel("owner/model@1111111111111111111111111111111111111111"));
+}
+
+test "asset producer runtime transcriber credentials resolve references and retain endpoint authority" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fs.path.join(alloc, &.{ root, "speech-secrets.json" });
+    defer alloc.free(path);
+    var secrets = try common_secrets.FileStore.initWithIo(alloc, io, path);
+    defer secrets.deinit();
+    var stored = try secrets.put(alloc, "speech.test", "first-token");
+    stored.deinit(alloc);
+    var client = httpx.Client.initWithConfig(alloc, io, .{});
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .secret_store = &secrets, .inference_api_url = "https://shared.example/ai/v1", .inference_api_key = "${secret:speech.test}" });
+    defer runtime.deinit();
+    for ([_]transcribing.Provider{ .antfly, .openai, .cloudflare }) |provider| {
+        const raw = transcribing.Config{ .provider = provider, .model = "whisper", .api_key = "${secret:speech.test}", .api_url = "https://shared.example/ai/v1", .base_url = "https://third.example/v1" };
+        var resolved = try runtime.resolveTranscriberConfig(alloc, raw);
+        defer resolved.deinit(alloc);
+        try std.testing.expectEqualStrings("first-token", resolved.config.api_key.?);
+        try std.testing.expectEqualStrings("${secret:speech.test}", raw.api_key.?);
+    }
+    var default = try runtime.resolveTranscriberConfig(alloc, .{ .provider = .antfly, .model = "whisper" });
+    defer default.deinit(alloc);
+    try std.testing.expectEqualStrings("first-token", default.config.api_key.?);
+    var other = try runtime.resolveTranscriberConfig(alloc, .{ .provider = .antfly, .model = "whisper", .api_url = "https://third.example/ai/v1" });
+    defer other.deinit(alloc);
+    try std.testing.expect(other.config.api_key == null);
+    stored = try secrets.put(alloc, "speech.test", "rotated-token");
+    stored.deinit(alloc);
+    var rotated = try runtime.resolveTranscriberConfig(alloc, .{ .provider = .antfly, .model = "whisper", .bearer_token = "${secret:speech.test}" });
+    defer rotated.deinit(alloc);
+    try std.testing.expectEqualStrings("rotated-token", rotated.config.api_key.?);
+    try std.testing.expect(rotated.config.bearer_token == null);
+}
+
+test "transcriber negotiated source transport fits the planned allocator independently of response size" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    for ([_]bool{ false, true }) |framed| {
+        const descriptor = try std.json.Stringify.valueAlloc(a, .{
+            .inputs = [_][]const u8{"audio"},
+            .inference_capabilities = .{
+                .version = 4,
+                .task = "transcribe",
+                .input_modalities = [_][]const u8{"audio"},
+                .accepted_mime_types = [_][]const u8{"audio/wav"},
+                .input_granularity = "item",
+                .output = "transcription",
+                .result_cardinality = "one_per_request",
+                .prompt_policy = "explicit",
+                .borrowed_attachments = false,
+                .framed_attachments = framed,
+                .task_limits = .{ .max_text_bytes_per_item = null, .max_input_tokens_per_item = null, .max_output_tokens_per_item = null, .max_candidates_per_request = null, .max_schema_bytes = null },
+                .batch = .{ .mode = "serial_compatibility", .preferred_items = 1, .max_items = 1, .max_encoded_media_bytes = 1048576, .max_decoded_pixels = 0, .max_media_parts_per_item = 1, .per_item_failures = false },
+            },
+        }, .{});
+        defer a.free(descriptor);
+        const catalog = try std.fmt.allocPrint(a, "{{\"transcribers\":{{\"speech\":{s}}}}}", .{descriptor});
+        defer a.free(catalog);
+        const Check = struct {
+            fn request(r: httpx.testing_mod.RequestInfo) !void {
+                if (r.header("Content-Type")) |mime| if (std.mem.eql(u8, mime, httpx.attachment_envelope.content_type)) {
+                    var envelope = try httpx.attachment_envelope.parseAlloc(std.testing.allocator, r.body, .{});
+                    defer envelope.deinit();
+                    try std.testing.expectEqual(@as(usize, 65536), envelope.attachments[0].data.len);
+                    try std.testing.expectEqualStrings("audio/wav", envelope.attachments[0].mime_type);
+                    return;
+                };
+                var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, r.body, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqual(@as(usize, 87384), parsed.value.object.get("audio").?.string.len);
+            }
+        };
+        var server = try httpx.TestServer.start(a, io, &.{
+            .{ .method = .GET, .path = "/ai/v1/models", .respond = .{ .body = catalog } },
+            .{ .method = .POST, .path = "/ai/v1/read", .assert_request = Check.request, .respond = .{ .body = "{\"object\":\"list\",\"model\":\"speech\",\"usage\":null,\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"hello\",\"status\":\"complete\",\"audio\":{\"duration_ms\":1}}]}" } },
+        });
+        defer server.deinit();
+        server.max_request_bytes = 128 * 1024;
+        var serving = std.Io.Group.init;
+        var server_error: ?anyerror = null;
+        const Serve = struct {
+            fn run(s: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
+                while (true) s.handleOne() catch |err| {
+                    if (err != error.Canceled) failure.* = err;
+                    return;
+                };
+            }
+        };
+        try serving.concurrent(io, Serve.run, .{ &server, &server_error });
+        defer serving.cancel(io);
+        var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var runtime = Runtime.initWithOptions(a, &client, .{ .max_provider_response_bytes = 4096, .provider_response_envelope_bytes = 64, .result_limits = .{ .transcriber_bytes_per_item = 256 } });
+        defer runtime.deinit();
+        const config = try std.fmt.allocPrint(a, "{{\"provider\":\"antfly\",\"model\":\"speech\",\"api_url\":\"{s}/ai/v1\"}}", .{server.baseUrl()});
+        defer a.free(config);
+        const recording = try a.alloc(u8, 65536);
+        defer a.free(recording);
+        @memset(recording, 0);
+        const request = asset_producer.Request{ .producer_type = .transcriber, .config_json = config, .source_text = "gs://private/must-not-fetch.wav", .content_type = "text/plain", .inline_media_trusted = true, .media = &.{.{ .bytes = recording, .mime_type = "audio/wav" }} };
+        const plan = try runtime.producer().invocationMemoryForRequests(a, &.{request});
+        try std.testing.expectEqual(if (framed) inference_work.AttachmentTransport.segmented_framed_binary else .base64_payload, plan.attachment_transport);
+        try std.testing.expect(plan.allocator_limit_bytes < recording.len);
+        const transport = try plan.attachment_transport.peakResidentSize(recording.len, "audio/wav".len);
+        var budget = inference_work.BoundedInvocationAllocator.init(a, plan.allocator_limit_bytes + transport - recording.len);
+        const output = try runtime.transcribe(budget.allocator(), request);
+        defer budget.allocator().free(output);
+        try std.testing.expectEqualStrings("hello", output);
+        serving.cancel(io);
+        if (server_error) |err| return err;
+    }
 }
