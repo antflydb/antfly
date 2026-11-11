@@ -526,9 +526,10 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
     )
     count = 100_001
     for first in range(0, count, 1000):
-        # Only the final prefix is queried. Fence it once after admitting all
-        # source batches so this scale fixture also exercises coalesced replay.
-        # The final full-index write covers every preceding sequence.
+        # Coalesce setup writes, but bound replay debt so a visibility fence
+        # fits the ordinary request budget even in a Debug build. Each fence
+        # covers all earlier sequences; the scale and final query are unchanged.
+        fence = (first + 1000) % 5000 == 0 or first + 1000 >= count
         api.batch_write_with_timeout(
             name,
             timeout_s=120,
@@ -541,7 +542,7 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
                 }
                 for i in range(first, min(first + 1000, count))
             },
-            sync_level="full_index" if first + 1000 >= count else "write",
+            sync_level="full_index" if fence else "write",
         )
     payload = api.post("/query", dict(fixture["query"], table=name))
     result = payload.get("responses", [payload])[0]
