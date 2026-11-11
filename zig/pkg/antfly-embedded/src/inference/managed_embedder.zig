@@ -1168,6 +1168,8 @@ fn attachManagedBedrockCredentialCaches(
 }
 
 pub const ManagedEmbedder = struct {
+    retained_options: InitOptions = .{},
+    retained_options_arena: ?std.heap.ArenaAllocator = null,
     alloc: std.mem.Allocator,
     entries: []ManagedEmbeddingEntry,
     /// Standalone owners without an injected runtime executor share one
@@ -1309,7 +1311,21 @@ pub const ManagedEmbedder = struct {
             entry.deadline_ns = supplied_options.deadline_ns;
             entry.cancellation = supplied_options.cancellation;
         }
+        var options_arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer options_arena.deinit();
+        var retained_options = supplied_options;
+        retained_options.io = options.io;
+        retained_options.bounded_http_request = options.bounded_http_request;
+        retained_options.setup_context = null;
+        retained_options.deadline_ns = null;
+        retained_options.cancellation = null;
+        retained_options.progress = null;
+        retained_options.source_table = try options_arena.allocator().dupe(u8, supplied_options.source_table);
+        if (supplied_options.inference_api_url) |value| retained_options.inference_api_url = try options_arena.allocator().dupe(u8, value);
+        if (supplied_options.inference_api_key) |value| retained_options.inference_api_key = try options_arena.allocator().dupe(u8, value);
         return .{
+            .retained_options = retained_options,
+            .retained_options_arena = options_arena,
             .alloc = alloc,
             .entries = owned_entries,
             .owned_http_io = owned_http_io,
@@ -1319,6 +1335,7 @@ pub const ManagedEmbedder = struct {
     }
 
     pub fn deinit(self: *ManagedEmbedder) void {
+        if (self.retained_options_arena) |*arena| arena.deinit();
         for (self.entries) |*entry| entry.deinit(self.alloc);
         self.alloc.free(self.entries);
         deinitManagedEmbeddingHttpClient(self.alloc, self.owned_http_client);
@@ -1370,9 +1387,17 @@ pub const ManagedEmbedder = struct {
         return false;
     }
 
+    fn cloneDenseForIndexes(raw: *anyopaque, alloc: std.mem.Allocator, indexes: []const u8, control: RequestContext) !db_embedder.DenseEmbedder {
+        const self: *ManagedEmbedder = @ptrCast(@alignCast(raw));
+        var options = self.retained_options;
+        options.setup_context = control;
+        return (try createDenseEmbedderWithOptions(alloc, indexes, options)) orelse error.ReembedUnavailable;
+    }
+
     pub fn denseInterface(self: *ManagedEmbedder) db_embedder.DenseEmbedder {
         return .{
             .ptr = self,
+            .clone_for_indexes_fn = cloneDenseForIndexes,
             .dense_embed_fn = embedDense,
             .computation_key_fn = documentComputationKey,
             .dense_embed_batch_fn = embedDenseBatch,

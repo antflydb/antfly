@@ -136,6 +136,7 @@ pub const NeighborContextGraphSource = struct {
 
 /// Provider lifetime is independent of the source DB and its worker runtime.
 pub const SharedProviders = struct {
+    parent: ?*SharedProviders = null,
     references: std.atomic.Value(usize) = .init(1),
     alloc: Allocator,
     dense: ?embedder_mod.DenseEmbedder,
@@ -154,6 +155,7 @@ pub const SharedProviders = struct {
         if (self.sparse) |sparse| sparse.deinit(self.alloc);
         if (self.asset) |asset| asset.deinit(self.alloc);
         if (self.chunk) |*chunk| chunk.deinit();
+        if (self.parent) |parent| parent.release();
         self.alloc.destroy(self);
     }
 };
@@ -500,6 +502,9 @@ const transient_worker_retry_base_sleep_ms: u64 = 500;
 const transient_worker_retry_max_sleep_ms: u64 = 30_000;
 const lease_denied_retry_sleep_ns: u64 = 100 * std.time.ns_per_ms;
 const default_sync_wait_timeout_ms: u64 = 5 * std.time.ms_per_min;
+const authority_retry_initial_ms: u64 = 2;
+const authority_retry_max_ms: u64 = 32;
+const parked_authority_check_ms: u64 = 30_000;
 const borrowed_cancellation_poll_min_ns: i64 = 25 * std.time.ns_per_ms;
 const borrowed_cancellation_poll_max_ns: i64 = 250 * std.time.ns_per_ms;
 
@@ -539,6 +544,35 @@ const ForegroundCatchUpGuard = struct {
         }
     }
 };
+
+const AuthorityRetry = struct {
+    delay_ms: u64 = authority_retry_initial_ms,
+
+    fn wait(self: *@This(), runtime: *EnrichmentRuntime, guard: ForegroundCatchUpGuard) !void {
+        try guard.check();
+        const deadline = guard.deadline_ns orelse return RuntimeError.EnrichmentRetryInProgress;
+        const remaining_ns = deadline -| guard.clock.nowRealtimeNs();
+        const delay_ns = @min(self.delay_ms * std.time.ns_per_ms, remaining_ns);
+        if (authorityRetryExecutor(runtime, guard.clock)) |io| {
+            io.sleep(.fromNanoseconds(@intCast(delay_ns)), .awake) catch
+                return RuntimeError.EnrichmentWaitCanceled;
+        } else {
+            if (delay_ns < std.time.ns_per_ms) return RuntimeError.EnrichmentWaitTimeout;
+            guard.clock.sleepMs(delay_ns / std.time.ns_per_ms);
+        }
+        try guard.check();
+        self.delay_ms = @min(self.delay_ms * 2, authority_retry_max_ms);
+    }
+};
+
+fn authorityRetryExecutor(runtime: *EnrichmentRuntime, clock: platform_clock.Clock) ?Io {
+    if (comptime builtin.os.tag == .freestanding) return null;
+    const executor = runtime.io_impl orelse return null;
+    if (clock.isReal()) return executor.io();
+    const backend = runtime.backend_runtime orelse return null;
+    if (std.meta.eql(clock, backend.monotonicClock()) or std.meta.eql(clock, backend.clock())) return executor.io();
+    return null;
+}
 
 const CoverageOutcome = enum { produced, skipped, terminal_failed };
 const coverage_outcome_count = @typeInfo(CoverageOutcome).@"enum".field_names.len;
@@ -8189,23 +8223,25 @@ const UnsupportedEnrichmentRuntime = struct {
         const before = self.replayCut();
         const visibility_guard = ForegroundCatchUpGuard.boundedBy(self.deadline_clock, self.config, cancellation, deadline_ns);
         const validated = if (before.applied >= sequence) try refreshVisibilityCut(self, before, visibility_guard) else before;
-        const wait_after_sequence = if (validated.generation == before.generation) before.applied else 0;
         // A completed or terminal prefix wins a racing transport
         // cancellation. This mirrors the threaded runtime and prevents a
         // disconnect from obscuring an already-durable visibility outcome.
         if (validated.applied >= sequence) {
+            const wait_after_sequence = if (self.replay_generation == before.generation) before.applied else 0;
             const failure_envelope = terminalFailureEnvelopeSnapshot(self);
             if (terminalFailurePendingInRange(self, failure_envelope, wait_after_sequence, sequence))
                 return RuntimeError.EnrichmentWorkerFailed;
             return;
         }
         self.catchUpUntilGuarded(sequence, visibility_guard) catch |err| {
+            const wait_after_sequence = if (self.replay_generation == before.generation) before.applied else 0;
             const failure_envelope = terminalFailureEnvelopeSnapshot(self);
             if ((err == RuntimeError.EnrichmentWaitCanceled or err == RuntimeError.EnrichmentWaitTimeout) and
                 terminalFailurePendingInRange(self, failure_envelope, wait_after_sequence, sequence))
                 return RuntimeError.EnrichmentWorkerFailed;
             return err;
         };
+        const wait_after_sequence = if (self.replay_generation == before.generation) before.applied else 0;
         const failure_envelope = terminalFailureEnvelopeSnapshot(self);
         if (terminalFailurePendingInRange(self, failure_envelope, wait_after_sequence, sequence))
             return RuntimeError.EnrichmentWorkerFailed;
@@ -8215,8 +8251,9 @@ const UnsupportedEnrichmentRuntime = struct {
     /// terminal request failures rather than treating parked repair debt as success.
     pub fn catchUpUntilForDrain(self: *@This(), sequence: u64) !void {
         if (sequence == 0) return;
-        const after = self.applied_sequence;
+        const before = self.replayCut();
         try self.catchUpUntil(sequence);
+        const after = if (before.generation == self.replay_generation) before.applied else 0;
         if (terminalFailurePendingInRange(self, terminalFailureEnvelopeSnapshot(self), after, sequence))
             return RuntimeError.EnrichmentWorkerFailed;
     }
@@ -8233,6 +8270,11 @@ const UnsupportedEnrichmentRuntime = struct {
         self.active_provider_guard = guard;
         defer self.active_provider_guard = previous_provider_guard;
 
+        const generation = self.replay_generation;
+        validateReplayPassGeneration(self, generation) catch |err| switch (err) {
+            error.EnrichmentReplayAuthorityBusy => return RuntimeError.EnrichmentRetryInProgress,
+            else => return err,
+        };
         self.active_failure_fingerprint = 0;
         self.retry_error_has_request_identity = false;
         self.notifySequence(sequence);
@@ -8240,8 +8282,6 @@ const UnsupportedEnrichmentRuntime = struct {
         const pending = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.replay_source, self.applied_sequence);
         defer enrichment_worker.freePendingDocumentGroups(self.alloc, pending);
         const config_hash = try enrichmentCatalogConfigHash(self.alloc, self.index_manager);
-        const generation = self.replay_generation;
-        try validateReplayPassGeneration(self, generation);
         const previous_generation = swapReplayWriteGeneration(self, generation);
         defer _ = swapReplayWriteGeneration(self, previous_generation);
         var replay_cursor_assets = try loadReplayCursorForPass(self, self.applied_sequence, .assets, config_hash, generation);
@@ -8878,17 +8918,20 @@ const PlatformEnrichmentRuntime = struct {
             .raw = .fromNanoseconds(@intCast(@min(remaining_ns, @as(u64, std.math.maxInt(i64))))),
         });
         var cancellation_poll_ns = borrowed_cancellation_poll_min_ns;
+        const guard: ForegroundCatchUpGuard = .{ .cancellation = cancellation, .deadline_ns = effective_deadline_ns, .clock = self.deadline_clock };
 
         while (true) {
             self.mutex.lockUncancelable(io);
             if (self.applied_sequence >= sequence) {
                 const cut: ReplayCut = .{ .applied = self.applied_sequence, .generation = self.replay_generation };
                 self.mutex.unlock(io);
-                const validated = try refreshVisibilityCut(self, cut, .{ .cancellation = cancellation, .deadline_ns = effective_deadline_ns, .clock = self.deadline_clock });
+                const validated = try refreshVisibilityCut(self, cut, guard);
                 if (validated.applied < sequence) continue;
                 self.mutex.lockUncancelable(io);
+                const same_generation = self.replay_generation == validated.generation;
                 const failure_envelope = terminalFailureEnvelopeSnapshot(self);
                 self.mutex.unlock(io);
+                if (!same_generation) continue;
                 // The durable lookup can touch storage, so never perform it
                 // while holding the runtime mutex. The envelope keeps this
                 // lookup entirely off the healthy visibility path.
@@ -8896,13 +8939,18 @@ const PlatformEnrichmentRuntime = struct {
                     return RuntimeError.EnrichmentWorkerFailed;
                 return;
             }
-            if (self.worker_failed or self.last_error_name != null) {
+            if (self.visibilityBlockerAssumeLocked() != null) {
+                const cut: ReplayCut = .{ .applied = self.applied_sequence, .generation = self.replay_generation };
                 self.mutex.unlock(io);
-                return RuntimeError.EnrichmentWorkerFailed;
-            }
-            if (self.retrying) {
+                const refreshed = try refreshReplayAuthority(self, cut, guard, .status);
+                self.mutex.lockUncancelable(io);
+                const blocker = if (self.replay_generation == refreshed.cut.generation and self.applied_sequence < sequence)
+                    self.visibilityBlockerAssumeLocked()
+                else
+                    null;
                 self.mutex.unlock(io);
-                return RuntimeError.EnrichmentRetryInProgress;
+                if (blocker) |err| return err;
+                continue;
             }
             if (self.shutdown) {
                 self.mutex.unlock(io);
@@ -8951,34 +8999,7 @@ const PlatformEnrichmentRuntime = struct {
             const previous_waiters = self.sync_waiter_count.fetchSub(1, .release);
             std.debug.assert(previous_waiters > 0);
             wait_result catch |err| switch (err) {
-                error.Canceled => {
-                    // Resolve a terminal transition racing cancellation before
-                    // reporting an ambiguous post-commit wait outcome.
-                    // Timed futex expiry is a successful (possibly spurious)
-                    // wake and is distinguished by the deadline check above.
-                    self.mutex.lockUncancelable(io);
-                    const cut: ReplayCut = .{ .applied = self.applied_sequence, .generation = self.replay_generation };
-                    const failed = self.worker_failed or self.last_error_name != null;
-                    const retrying = self.retrying;
-                    self.mutex.unlock(io);
-                    if (cut.applied >= sequence) {
-                        const validated = refreshVisibilityCut(self, cut, null) catch |probe_err| switch (probe_err) {
-                            error.EnrichmentRetryInProgress => return RuntimeError.EnrichmentWaitCanceled,
-                            else => return probe_err,
-                        };
-                        if (validated.applied >= sequence) {
-                            self.mutex.lockUncancelable(io);
-                            const envelope = terminalFailureEnvelopeSnapshot(self);
-                            self.mutex.unlock(io);
-                            if (terminalFailurePendingInRange(self, envelope, if (wait_cut.generation == validated.generation) wait_cut.applied else 0, sequence))
-                                return RuntimeError.EnrichmentWorkerFailed;
-                            return;
-                        }
-                    }
-                    if (failed) return RuntimeError.EnrichmentWorkerFailed;
-                    if (retrying) return RuntimeError.EnrichmentRetryInProgress;
-                    return RuntimeError.EnrichmentWaitCanceled;
-                },
+                error.Canceled => return self.resolveCanceledVisibilityWait(io, sequence, wait_cut),
             };
             if (cancellation.ptr != null) {
                 // Preserve fast disconnect response for ordinary waits, then
@@ -8993,15 +9014,50 @@ const PlatformEnrichmentRuntime = struct {
         }
     }
 
+    fn visibilityBlockerAssumeLocked(self: *const EnrichmentRuntime) ?RuntimeError {
+        if (self.worker_failed or self.last_error_name != null) return RuntimeError.EnrichmentWorkerFailed;
+        if (self.retrying) return RuntimeError.EnrichmentRetryInProgress;
+        return null;
+    }
+
+    fn resolveCanceledVisibilityWait(self: *EnrichmentRuntime, io: Io, sequence: u64, wait_cut: ReplayCut) !void {
+        // A completed transition racing cancellation can still satisfy the wait.
+        // Re-read runtime status if the probe reconciles a newer generation.
+        self.mutex.lockUncancelable(io);
+        const cut: ReplayCut = .{ .applied = self.applied_sequence, .generation = self.replay_generation };
+        const blocked = self.visibilityBlockerAssumeLocked() != null;
+        self.mutex.unlock(io);
+        if (cut.applied < sequence and !blocked) return RuntimeError.EnrichmentWaitCanceled;
+        const validated = (refreshReplayAuthority(self, cut, null, if (blocked) .status else .checkpoint) catch |err| switch (err) {
+            error.EnrichmentRetryInProgress => return RuntimeError.EnrichmentWaitCanceled,
+            else => return err,
+        }).cut;
+
+        self.mutex.lockUncancelable(io);
+        const same_generation = self.replay_generation == validated.generation;
+        const blocker = self.visibilityBlockerAssumeLocked();
+        const envelope = terminalFailureEnvelopeSnapshot(self);
+        self.mutex.unlock(io);
+
+        if (same_generation and validated.applied >= sequence) {
+            if (terminalFailurePendingInRange(self, envelope, if (wait_cut.generation == validated.generation) wait_cut.applied else 0, sequence))
+                return RuntimeError.EnrichmentWorkerFailed;
+            return;
+        }
+        if (same_generation) if (blocker) |err| return err;
+        return RuntimeError.EnrichmentWaitCanceled;
+    }
+
     /// Run without a visibility deadline while preserving the wait API's
     /// durable terminal-failure check, including already-applied prefixes.
     pub fn catchUpUntilForDrain(self: *EnrichmentRuntime, sequence: u64) !void {
         const io = (self.io_impl orelse return error.MissingBackendRuntimeIo).io();
         self.mutex.lockUncancelable(io);
-        const after = self.applied_sequence;
+        const before: ReplayCut = .{ .applied = self.applied_sequence, .generation = self.replay_generation };
         self.mutex.unlock(io);
         try self.catchUpUntil(sequence);
         self.mutex.lockUncancelable(io);
+        const after = if (before.generation == self.replay_generation) before.applied else 0;
         const envelope = terminalFailureEnvelopeSnapshot(self);
         self.mutex.unlock(io);
         if (terminalFailurePendingInRange(self, envelope, after, sequence))
@@ -9048,35 +9104,48 @@ const PlatformEnrichmentRuntime = struct {
             return RuntimeError.EnrichmentWorkerFailed;
     }
 
+    fn catchUpDecisionAssumeLocked(self: *EnrichmentRuntime, sequence: u64) ForegroundCatchUpDecision {
+        const new_work = self.scoped_retry_wait and (self.graph_stage_recovery_pending or sequence > self.scoped_retry_observed_target or
+            (!self.scoped_retry_full and (sequence > self.scoped_retry_scan_sequence or self.scoped_retry_has_tail)));
+        const retry_due = self.retrying and (new_work or self.clock.nowRealtimeMs() >= self.next_retry_at_ms);
+        const failed = self.worker_failed or self.last_error_name != null;
+        const decision = foregroundCatchUpDecision(self.applied_sequence, sequence, self.target_sequence, failed, self.retrying, retry_due);
+        return if (self.graph_stage_recovery_pending and (decision == .complete or decision == .worker_failed)) .run_pass else decision;
+    }
+
     fn catchUpUntilGuarded(self: *EnrichmentRuntime, sequence: u64, guard: ForegroundCatchUpGuard) !void {
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
 
         self.notifySequence(sequence);
+        var authority_retry: AuthorityRetry = .{};
         while (true) {
             self.mutex.lockUncancelable(io);
-            const applied = self.applied_sequence;
-            const recovery_pending = self.graph_stage_recovery_pending;
-            const runtime_target = self.target_sequence;
-            const failed = self.worker_failed or self.last_error_name != null;
-            const retrying = self.retrying;
-            const next_retry_at_ms = self.next_retry_at_ms;
-            const new_work = self.scoped_retry_wait and (self.graph_stage_recovery_pending or sequence > self.scoped_retry_observed_target or
-                (!self.scoped_retry_full and (sequence > self.scoped_retry_scan_sequence or self.scoped_retry_has_tail)));
+            const cut: ReplayCut = .{ .applied = self.applied_sequence, .generation = self.replay_generation };
+            const decision = self.catchUpDecisionAssumeLocked(sequence);
             self.mutex.unlock(io);
 
-            const retry_due = retrying and (new_work or self.clock.nowRealtimeMs() >= next_retry_at_ms);
-            switch (foregroundCatchUpDecision(applied, sequence, runtime_target, failed, retrying, retry_due)) {
-                .complete => if (!recovery_pending) {
-                    if ((try refreshVisibilityCut(self, self.replayCut(), guard)).applied >= sequence) return;
+            switch (decision) {
+                .complete => {
+                    if ((try refreshVisibilityCut(self, cut, guard)).applied >= sequence) return;
                     continue;
                 },
-                .worker_failed => if (!recovery_pending) return RuntimeError.EnrichmentWorkerFailed,
-                .retry_in_progress => return RuntimeError.EnrichmentRetryInProgress,
+                .worker_failed, .retry_in_progress => {
+                    const refreshed = try refreshReplayAuthority(self, cut, guard, .status);
+                    self.mutex.lockUncancelable(io);
+                    const still_blocked = self.replay_generation == refreshed.cut.generation and self.catchUpDecisionAssumeLocked(sequence) == decision;
+                    self.mutex.unlock(io);
+                    if (still_blocked) return if (decision == .worker_failed) RuntimeError.EnrichmentWorkerFailed else RuntimeError.EnrichmentRetryInProgress;
+                    continue;
+                },
                 .run_pass => {},
             }
             try guard.check();
             runForegroundCatchUpPassGuarded(self, io, sequence, guard) catch |err| {
+                if (err == error.EnrichmentReplayAuthorityBusy) {
+                    try authority_retry.wait(self, guard);
+                    continue;
+                }
                 if (isGraphRecoveryPending(err)) continue;
                 return switch (err) {
                     RuntimeError.EnrichmentWaitCanceled => RuntimeError.EnrichmentWaitCanceled,
@@ -10642,6 +10711,13 @@ test "rejected chunk embedding publication records its request for stale cleanup
     try std.testing.expectEqual(@as(usize, 0), window.dense_embeddings.items.len);
 }
 
+fn workerRetryDelayAssumeLocked(runtime: *EnrichmentRuntime) u64 {
+    if (!runtime.retrying) return 0;
+    const new_work = runtime.scoped_retry_wait and (runtime.graph_stage_recovery_pending or runtime.target_sequence > runtime.scoped_retry_observed_target or
+        (!runtime.scoped_retry_full and (runtime.target_sequence > runtime.scoped_retry_scan_sequence or runtime.scoped_retry_has_tail)));
+    return if (new_work) 0 else runtime.next_retry_at_ms -| runtime.clock.nowRealtimeMs();
+}
+
 fn workerStep(runtime: *EnrichmentRuntime) ?u64 {
     if (runtime.shutdown_requested.load(.acquire)) return null;
     maintainIndexDocumentCheckpoints(runtime) catch |err| {
@@ -10649,25 +10725,42 @@ fn workerStep(runtime: *EnrichmentRuntime) ?u64 {
     };
     const io = runtime.io_impl.?.io();
     runtime.mutex.lockUncancelable(io);
-    if (runtime.shutdown or ((runtime.worker_failed or runtime.last_error_name != null) and !runtime.graph_stage_recovery_pending) or
+    const parked_failed = (runtime.worker_failed or runtime.last_error_name != null) and !runtime.graph_stage_recovery_pending;
+    const parked_retry = workerRetryDelayAssumeLocked(runtime) > 0;
+    const verify_parked = !runtime.shutdown and !runtime.replay_pass_active and
+        runtime.store.vtable.begin_authority_probe != null and
+        (parked_retry or (parked_failed and runtime.target_sequence > runtime.applied_sequence));
+    if (verify_parked) {
+        const cut: ReplayCut = .{ .applied = runtime.applied_sequence, .generation = runtime.replay_generation };
+        const retry_at_ms = if (parked_retry) runtime.next_retry_at_ms else null;
+        runtime.mutex.unlock(io);
+        const refreshed = refreshReplayAuthority(runtime, cut, null, .status) catch |err| {
+            const backoff_ms: u64 = if (err == RuntimeError.EnrichmentRetryInProgress) 1_000 else parked_authority_check_ms;
+            return if (retry_at_ms) |at| @min(backoff_ms, at -| runtime.clock.nowRealtimeMs()) else backoff_ms;
+        };
+        if (refreshed.reconciled) return 0;
+        runtime.mutex.lockUncancelable(io);
+    }
+    const shutting_down = runtime.shutdown;
+    if (shutting_down or ((runtime.worker_failed or runtime.last_error_name != null) and !runtime.graph_stage_recovery_pending) or
         (runtime.target_sequence <= runtime.applied_sequence and !runtime.retrying and !runtime.graph_stage_recovery_pending))
     {
         runtime.mutex.unlock(io);
-        return if (runtime.shutdown) null else if (runtime.document_checkpoint_gc_pending.load(.acquire)) 1000 else if (runtime.document_checkpoints_present.load(.acquire)) 30_000 else null;
+        return if (shutting_down) null else if (runtime.document_checkpoint_gc_pending.load(.acquire)) 1000 else if (verify_parked or runtime.document_checkpoints_present.load(.acquire)) parked_authority_check_ms else null;
     }
     if (runtime.replay_pass_active) {
         runtime.mutex.unlock(io);
         return 25;
     }
-    const new_work = runtime.scoped_retry_wait and (runtime.graph_stage_recovery_pending or runtime.target_sequence > runtime.scoped_retry_observed_target or
-        (!runtime.scoped_retry_full and (runtime.target_sequence > runtime.scoped_retry_scan_sequence or runtime.scoped_retry_has_tail)));
-    const delay = if (runtime.retrying and !new_work) runtime.next_retry_at_ms -| runtime.clock.nowRealtimeMs() else 0;
+    const delay = workerRetryDelayAssumeLocked(runtime);
     const target = runtime.target_sequence;
     runtime.mutex.unlock(io);
     // Bound scheduler wakeups, never the persisted request deadline. This
     // also keeps overflow-sized Retry-After values out of duration casts.
     if (delay > 0) return @min(delay, transient_worker_retry_max_sleep_ms);
-    runForegroundCatchUpPass(runtime, io, target) catch {};
+    runForegroundCatchUpPass(runtime, io, target) catch |err| {
+        if (err == error.EnrichmentReplayAuthorityBusy) return authority_retry_max_ms;
+    };
     return 0;
 }
 
@@ -10816,6 +10909,7 @@ fn runForegroundCatchUpPassGuarded(
         // the durable worker retry budget.
         if (err == RuntimeError.EnrichmentWaitCanceled or
             err == RuntimeError.EnrichmentWaitTimeout or
+            err == error.EnrichmentReplayAuthorityBusy or
             isGraphRecoveryPending(err)) return err;
         handleWorkerLoopError(runtime, io, err, .{ .generation = generation, .through = target_sequence });
         return err;
@@ -10830,9 +10924,11 @@ fn runForegroundCatchUpPassOwned(
     generation: u64,
 ) !void {
     try guard.check();
+    try validateReplayPassGeneration(runtime, generation);
     setActiveFailureFingerprint(runtime, 0);
     const now_ms = runtime.clock.nowRealtimeMs();
     runtime.mutex.lockUncancelable(io);
+    const refreshed_lease = runtime.ownership.needsLeaseRefresh(now_ms);
     const acquired = runtime.ownership.ensureLease(now_ms) catch |err| {
         runtime.ownership.noteAcquireFailure();
         runtime.mutex.unlock(io);
@@ -10852,7 +10948,9 @@ fn runForegroundCatchUpPassOwned(
         return;
     }
 
-    try validateReplayPassGeneration(runtime, generation);
+    // A durable lease acquisition can race a rewind after preflight. The
+    // in-memory renewal fast path needs no second storage read.
+    if (refreshed_lease) try validateReplayPassGeneration(runtime, generation);
 
     // A replay pass can exceed the lease TTL even when each provider call is
     // short: text embeddings, rate-limit waits and publication across many
@@ -37387,32 +37485,43 @@ fn publishAppliedProgressWithRetry(runtime: *EnrichmentRuntime, sequence: u64, s
     }
 }
 
+fn isReplayAuthorityBusy(err: anyerror) bool {
+    return err == error.WouldBlock or err == error.WriterLocked or err == error.FileBusy;
+}
+
+const AuthorityProbeKind = enum { checkpoint, status };
+
+const ReplayAuthority = struct {
+    cut: ReplayCut,
+    reconciled: bool = false,
+};
+
 fn refreshVisibilityCut(runtime: *EnrichmentRuntime, cut: ReplayCut, guard: ?ForegroundCatchUpGuard) !ReplayCut {
-    // Unbound runtime fixtures can exercise wait state without a store.
-    if (runtime.backend_runtime == null) return cut;
+    return (try refreshReplayAuthority(runtime, cut, guard, .checkpoint)).cut;
+}
+
+fn refreshReplayAuthority(runtime: *EnrichmentRuntime, cut: ReplayCut, guard: ?ForegroundCatchUpGuard, kind: AuthorityProbeKind) !ReplayAuthority {
+    var retry: AuthorityRetry = .{};
     while (true) {
-        return probeVisibilityCut(runtime, cut) catch |err| switch (err) {
-            error.WouldBlock, error.WriterLocked, error.FileBusy => {
-                const budget = guard orelse return RuntimeError.EnrichmentRetryInProgress;
-                try budget.check();
-                // Unbounded maintenance turns yield admission to the next
-                // turn. Only a request with a deadline waits here.
-                const deadline = budget.deadline_ns orelse return RuntimeError.EnrichmentRetryInProgress;
-                if (deadline -| budget.clock.nowRealtimeNs() < std.time.ns_per_ms) return RuntimeError.EnrichmentWaitTimeout;
-                budget.clock.sleepMs(1);
-                try budget.check();
-                continue;
-            },
-            else => return err,
+        return probeReplayAuthority(runtime, cut, kind) catch |err| {
+            if (err == error.Canceled) return RuntimeError.EnrichmentWaitCanceled;
+            if (!isReplayAuthorityBusy(err)) return err;
+            const budget = guard orelse return RuntimeError.EnrichmentRetryInProgress;
+            try retry.wait(runtime, budget);
+            continue;
         };
     }
 }
 
-fn probeVisibilityCut(runtime: *EnrichmentRuntime, cut: ReplayCut) !ReplayCut {
-    const checkpoint = try enrichment_state.loadAuthoritativeCheckpoint(runtime.alloc, runtime.store, scope_name);
-    if (checkpoint.generation == cut.generation) {
-        if (checkpoint.applied_sequence < cut.applied) return error.EnrichmentSourceChanged;
-        return cut;
+fn probeReplayAuthority(runtime: *EnrichmentRuntime, cut: ReplayCut, kind: AuthorityProbeKind) !ReplayAuthority {
+    // Unbound runtime fixtures can exercise wait state without a store.
+    if (runtime.backend_runtime == null) return .{ .cut = cut };
+    if (kind == .checkpoint) {
+        const checkpoint = try enrichment_state.loadAuthoritativeCheckpoint(runtime.alloc, runtime.store, scope_name);
+        if (checkpoint.generation == cut.generation) {
+            if (checkpoint.applied_sequence < cut.applied) return error.EnrichmentSourceChanged;
+            return .{ .cut = cut };
+        }
     }
     const publication_io = if (comptime builtin.os.tag == .freestanding) null else blk: {
         const io = (runtime.io_impl orelse break :blk null).io();
@@ -37421,21 +37530,33 @@ fn probeVisibilityCut(runtime: *EnrichmentRuntime, cut: ReplayCut) !ReplayCut {
     };
     defer unlockAppliedPublication(runtime, publication_io);
     const observed = try enrichment_state.loadAuthoritativeRuntimeObservation(runtime.alloc, runtime.store, scope_name);
+    if (observed.generation == cut.generation and observed.applied < cut.applied)
+        return error.EnrichmentSourceChanged;
     const io = lockRuntime(runtime);
     defer unlockRuntime(runtime, io);
-    if (runtime.replay_generation != observed.generation) {
+    const newer_status = observed.revision > (runtime.status_revision orelse 0) and
+        observed.applied >= runtime.applied_sequence;
+    // Leave an active pass's same-generation status to its publication CAS.
+    // A generation change still invalidates the pass immediately.
+    const can_adopt_status = if (comptime builtin.os.tag == .freestanding) true else !runtime.replay_pass_active;
+    const reconcile = runtime.replay_generation != observed.generation or (kind == .status and newer_status and can_adopt_status);
+    if (reconcile) {
         reconcileRuntimeObservation(runtime, observed);
         if (comptime builtin.os.tag != .freestanding) if (io) |value| broadcastRuntimeStateChanged(runtime, value);
     }
-    return .{ .applied = observed.applied, .generation = observed.generation };
+    return .{
+        .cut = .{ .applied = observed.applied, .generation = observed.generation },
+        .reconciled = reconcile or runtime.replay_generation != cut.generation,
+    };
 }
 
 fn validateReplayPassGeneration(runtime: *EnrichmentRuntime, generation: u64) !void {
-    const refreshed = refreshVisibilityCut(runtime, .{ .applied = 0, .generation = generation }, null) catch |err| switch (err) {
-        error.EnrichmentRetryInProgress => return error.EnrichmentSourceChanged,
-        else => return err,
+    const refreshed = probeReplayAuthority(runtime, .{ .applied = 0, .generation = generation }, .checkpoint) catch |err| {
+        if (err == error.Canceled) return RuntimeError.EnrichmentWaitCanceled;
+        if (isReplayAuthorityBusy(err)) return error.EnrichmentReplayAuthorityBusy;
+        return err;
     };
-    if (refreshed.generation != generation) return error.EnrichmentSourceChanged;
+    if (refreshed.cut.generation != generation) return error.EnrichmentSourceChanged;
 }
 
 fn reconcileRuntimeObservation(runtime: *EnrichmentRuntime, observed: enrichment_state.RuntimeObservation) void {
@@ -38413,6 +38534,196 @@ test "enrichment applied checkpoint stays degraded until runtime status clears" 
         try std.testing.expectEqual(@as(u64, 5), try enrichment_state.loadAppliedSequence(alloc, reader_store, scope_name));
         try std.testing.expectEqual(rewound, try enrichment_state.loadAuthoritativeRuntimeObservation(alloc, reader_store, scope_name));
 
+        var backend_handle = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+        defer backend_handle.deinit();
+        var lite_runtime = runtime;
+        lite_runtime.store = reader_store;
+        lite_runtime.backend_runtime = backend_handle.ptr();
+        lite_runtime.io_impl = .{ .borrowed = std.testing.io };
+        lite_runtime.active_replay_generation = null;
+        const old_cut: ReplayCut = .{ .applied = 5, .generation = rewound.generation - 1 };
+        lite_runtime.replay_generation = old_cut.generation;
+        lite_runtime.applied_sequence = old_cut.applied;
+        {
+            lite_runtime.applied_publication_mutex.lockUncancelable(std.testing.io);
+            defer lite_runtime.applied_publication_mutex.unlock(std.testing.io);
+            try std.testing.expectError(error.EnrichmentReplayAuthorityBusy, runForegroundCatchUpPassGuarded(&lite_runtime, std.testing.io, 6, .{}));
+            try std.testing.expect(!lite_runtime.retrying);
+            try std.testing.expectEqual(rewound, try enrichment_state.loadAuthoritativeRuntimeObservation(alloc, writer_store, scope_name));
+
+            const CanceledProbe = struct {
+                fn run(r: *EnrichmentRuntime, cut: ReplayCut, entered: *Io.Event) anyerror!ReplayCut {
+                    const io = r.io_impl.?.io();
+                    const clock = r.backend_runtime.?.monotonicClock();
+                    const guard = ForegroundCatchUpGuard.bounded(clock, r.config, .none);
+                    entered.set(io);
+                    return refreshVisibilityCut(r, cut, guard);
+                }
+            };
+            var entered: Io.Event = .unset;
+            var cancel_probe = try std.testing.io.concurrent(CanceledProbe.run, .{ &lite_runtime, old_cut, &entered });
+            entered.waitUncancelable(std.testing.io);
+            try std.testing.expectError(error.EnrichmentWaitCanceled, cancel_probe.cancel(std.testing.io));
+
+            const ProbeClock = struct {
+                elapsed_ms: u64 = 0,
+                sleeps: usize = 0,
+
+                fn now(ctx: ?*anyopaque) u64 {
+                    const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                    return self.elapsed_ms * std.time.ns_per_ms;
+                }
+
+                fn sleep(ctx: ?*anyopaque, ms: u64) void {
+                    const self: *@This() = @ptrCast(@alignCast(ctx.?));
+                    const expected = [_]u64{ 2, 4, 8, 16, 32, 13 };
+                    std.debug.assert(self.sleeps < expected.len and ms == expected[self.sleeps]);
+                    self.sleeps += 1;
+                    self.elapsed_ms += ms;
+                }
+            };
+            var clock: ProbeClock = .{};
+            const guard: ForegroundCatchUpGuard = .{
+                .clock = .{ .ctx = &clock, .now_realtime_ns_fn = ProbeClock.now, .sleep_ms_fn = ProbeClock.sleep },
+                .deadline_ns = 75 * std.time.ns_per_ms,
+            };
+            try std.testing.expectError(error.EnrichmentWaitTimeout, refreshVisibilityCut(&lite_runtime, old_cut, guard));
+            try std.testing.expectEqual(@as(usize, 6), clock.sleeps);
+            try std.testing.expectEqual(@as(u64, 75), clock.elapsed_ms);
+        }
+
+        // Cancellation and ordinary waits both reconcile a stale blocker,
+        // including when the requested sequence exceeds the cached cut.
+        for ([_]u64{ 5, 6 }) |sequence| {
+            lite_runtime.replay_generation = old_cut.generation;
+            lite_runtime.applied_sequence = old_cut.applied;
+            lite_runtime.worker_failed = true;
+            try std.testing.expectError(error.EnrichmentWaitCanceled, lite_runtime.resolveCanceledVisibilityWait(std.testing.io, sequence, old_cut));
+            try std.testing.expectEqual(rewound.generation, lite_runtime.replay_generation);
+            try std.testing.expect(!lite_runtime.worker_failed);
+        }
+        lite_runtime.replay_generation = old_cut.generation;
+        lite_runtime.applied_sequence = old_cut.applied;
+        lite_runtime.retrying = true;
+        var canceled = std.atomic.Value(bool).init(true);
+        try std.testing.expectError(error.EnrichmentWaitCanceled, lite_runtime.waitForAppliedWithCancellation(6, CancellationToken.fromAtomic(&canceled)));
+        try std.testing.expectEqual(rewound.generation, lite_runtime.replay_generation);
+        try std.testing.expect(!lite_runtime.retrying);
+
+        lite_runtime.replay_generation = old_cut.generation;
+        lite_runtime.applied_sequence = old_cut.applied;
+        lite_runtime.worker_failed = true;
+        try std.testing.expectError(error.EnrichmentWaitCanceled, lite_runtime.catchUpUntilWithCancellation(6, CancellationToken.fromAtomic(&canceled)));
+        try std.testing.expectEqual(rewound.generation, lite_runtime.replay_generation);
+        try std.testing.expect(!lite_runtime.worker_failed);
+
+        lite_runtime.replay_generation = old_cut.generation;
+        lite_runtime.applied_sequence = old_cut.applied;
+        lite_runtime.worker_failed = true;
+        try std.testing.expectEqual(@as(?u64, 0), workerStep(&lite_runtime));
+        try std.testing.expectEqual(rewound.generation, lite_runtime.replay_generation);
+        try std.testing.expect(!lite_runtime.worker_failed);
+
+        const RewindOnLeaseAcquire = struct {
+            writer: backend_erased.Store,
+            observed: ?enrichment_state.RuntimeObservation = null,
+
+            fn beginWrite(a: Allocator, ptr: *anyopaque) anyerror!backend_erased.WriteTxn {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.observed == null)
+                    self.observed = try enrichment_state.rewindAppliedProgress(a, self.writer, scope_name, 0, 6, 0);
+                return self.writer.beginWrite();
+            }
+        };
+        var rewind_on_lease = RewindOnLeaseAcquire{ .writer = writer_store };
+        var lease_store_vtable = writer_store.vtable.*;
+        lease_store_vtable.begin_write = RewindOnLeaseAcquire.beginWrite;
+        const lease_store: backend_erased.Store = .{ .allocator = alloc, .ptr = &rewind_on_lease, .vtable = &lease_store_vtable };
+        lite_runtime.ownership = try ownership_mod.State.init(alloc, lease_store, enrichment_lease.default_lease_key, .{ .lease_owned = true });
+        defer lite_runtime.ownership.deinitPreserveLease(alloc);
+        try std.testing.expectError(error.EnrichmentSourceChanged, runForegroundCatchUpPassGuarded(&lite_runtime, std.testing.io, 6, .{}));
+        const lease_rewind = rewind_on_lease.observed.?;
+        try std.testing.expectEqual(lease_rewind.generation, lite_runtime.replay_generation);
+        try std.testing.expectEqual(lease_rewind.applied, lite_runtime.applied_sequence);
+        try std.testing.expect(!lite_runtime.retrying);
+
+        const failed_revision = (try enrichment_state.saveRuntimeStatusAndProjection(
+            alloc,
+            writer_store,
+            scope_name,
+            lease_rewind.applied,
+            lease_rewind.revision,
+            .{ .worker_failed = true, .target_sequence = 6 },
+            .repair_required,
+            0,
+            lease_rewind.generation,
+            null,
+        )).?;
+        const stale_status = try enrichment_state.loadAuthoritativeRuntimeObservation(alloc, reader_store, scope_name);
+        const clean_revision = (try enrichment_state.saveRuntimeStatusAndProjection(
+            alloc,
+            writer_store,
+            scope_name,
+            lease_rewind.applied,
+            failed_revision,
+            .{ .target_sequence = 6 },
+            .clean,
+            0,
+            lease_rewind.generation,
+            null,
+        )).?;
+        for ([_]bool{ false, true }) |retrying| {
+            for ([_]enum { waiter, canceled_waiter, foreground, worker }{ .waiter, .canceled_waiter, .foreground, .worker }) |path| {
+                var stale = stale_status;
+                stale.status.worker_failed = !retrying;
+                stale.status.retrying = retrying;
+                stale.status.next_retry_at_ms = if (retrying) std.math.maxInt(u64) else 0;
+                reconcileRuntimeObservation(&lite_runtime, stale);
+                const token = CancellationToken.fromAtomic(&canceled);
+                switch (path) {
+                    .waiter => try std.testing.expectError(error.EnrichmentWaitCanceled, lite_runtime.waitForAppliedWithCancellation(6, token)),
+                    .canceled_waiter => try std.testing.expectError(error.EnrichmentWaitCanceled, lite_runtime.resolveCanceledVisibilityWait(std.testing.io, 6, lite_runtime.replayCut())),
+                    .foreground => try std.testing.expectError(error.EnrichmentWaitCanceled, lite_runtime.catchUpUntilWithCancellation(6, token)),
+                    .worker => try std.testing.expectEqual(@as(?u64, 0), workerStep(&lite_runtime)),
+                }
+                try std.testing.expectEqual(clean_revision, lite_runtime.status_revision.?);
+                try std.testing.expectEqual(lease_rewind.generation, lite_runtime.replay_generation);
+                try std.testing.expect(!lite_runtime.worker_failed);
+                try std.testing.expect(!lite_runtime.retrying);
+            }
+        }
+
+        {
+            var retry_clock: platform_clock.ManualClock = .{};
+            retry_clock.setRealtimeNs(100 * std.time.ns_per_ms);
+            const previous_clock = lite_runtime.clock;
+            lite_runtime.clock = retry_clock.clock();
+            defer lite_runtime.clock = previous_clock;
+            lite_runtime.retrying = true;
+            lite_runtime.next_retry_at_ms = 110;
+            defer lite_runtime.retrying = false;
+            lite_runtime.applied_publication_mutex.lockUncancelable(std.testing.io);
+            defer lite_runtime.applied_publication_mutex.unlock(std.testing.io);
+            try std.testing.expectEqual(@as(?u64, 10), workerStep(&lite_runtime));
+        }
+
+        try enrichment_state.saveProjectionCheckpoint(writer_store, scope_name, .{ .generation = lease_rewind.generation, .applied_sequence = 12 });
+        _ = try enrichment_state.saveRuntimeStatusAndProjection(
+            alloc,
+            writer_store,
+            scope_name,
+            12,
+            clean_revision,
+            .{ .target_sequence = 12, .terminal_failure_min_sequence = 9, .terminal_failure_max_sequence = 9 },
+            .clean,
+            0,
+            lease_rewind.generation,
+            null,
+        );
+        lite_runtime.replay_generation = old_cut.generation;
+        lite_runtime.applied_sequence = 12;
+        try std.testing.expectError(error.EnrichmentWorkerFailed, lite_runtime.catchUpUntilForDrain(12));
+
         const replacement_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/authority-replacement.aflite", .{tmp.sub_path});
         defer alloc.free(replacement_path);
         {
@@ -38420,7 +38731,7 @@ test "enrichment applied checkpoint stays degraded until runtime status clears" 
             defer replacement.close();
             var replacement_store = try replacement.runtimeStore(alloc);
             defer replacement_store.deinit();
-            try enrichment_state.saveProjectionCheckpoint(replacement_store, scope_name, .{ .generation = rewound.generation });
+            try enrichment_state.saveProjectionCheckpoint(replacement_store, scope_name, .{ .generation = lease_rewind.generation });
         }
         try std.Io.Dir.rename(std.Io.Dir.cwd(), replacement_path, std.Io.Dir.cwd(), lite_path, std.testing.io);
         {

@@ -3179,6 +3179,9 @@ pub const DB = struct {
     remote_content: ?*const scraping.RemoteContentConfig,
     enrichment_owner: EnrichmentOwner = .{},
     query_recovery_owner: DetachedEnrichmentRuntime = .{},
+    // Keep one reconstruction service owner when live producers are removed.
+    // Its immutable options can still open historical native query cuts.
+    retained_recovery_config: ?enrichment_runtime_mod.Config = null,
     /// Borrowed views for existing local consumers. The bundle owns destruction;
     /// replacement publishes these views while holding the lifecycle fence.
     enrichment_append_context: ?*EnrichmentAppendContext,
@@ -5606,31 +5609,125 @@ pub const DB = struct {
         return self.enrichment_owner.bundle.retain();
     }
 
-    fn attachRetainedQueryRecovery(self: *DB, retained: *DB, cancellation: types.CancellationToken, deadline_ns: u64) !void {
+    fn retainedRecoveryIndexesJson(retained: *DB, alloc: Allocator) ![]u8 {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var root: std.json.Value = .{ .object = .{} };
+        for (retained.core.index_manager.dense_indexes.items) |entry| {
+            if (!entry.leann_transient) continue;
+            var value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, entry.config.config_json, .{});
+            if (value != .object) return error.InvalidIndexConfig;
+            try value.object.put(scratch, "type", .{ .string = "embeddings" });
+            if (value.object.get("dims")) |dims| try value.object.put(scratch, "dimension", dims);
+            if (value.object.get("generator")) |generator| {
+                if (generator != .object) return error.InvalidIndexConfig;
+                if (generator.object.get("source_template")) |template| try value.object.put(scratch, "template", template);
+                if (generator.object.get("chunker")) |chunker| try value.object.put(scratch, "chunker", chunker);
+            }
+            try root.object.put(scratch, entry.config.name, value);
+        }
+        return std.json.Stringify.valueAlloc(alloc, root, .{});
+    }
+
+    const RetainedProviderFactory = struct {
+        alloc: Allocator,
+        indexes: []u8,
+        providers: *enrichment_runtime_mod.SharedProviders,
+        config: enrichment_runtime_mod.Config,
+
+        fn create(raw: *anyopaque, control: @import("antfly_inference_execution_context").RequestContext) !enrichment_runtime_mod.Config {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try control.check();
+            const original = self.config.dense_embedder orelse return error.ReembedUnavailable;
+            const clone = original.clone_for_indexes_fn orelse return error.ReembedUnavailable;
+            const dense = try clone(original.ptr, self.alloc, self.indexes, control);
+            errdefer dense.deinit(self.alloc);
+            const shared = try self.alloc.create(enrichment_runtime_mod.SharedProviders);
+            shared.* = .{ .alloc = self.alloc, .dense = dense, .sparse = null, .asset = null, .chunk = null, .parent = self.providers.retain() };
+            var config = self.config;
+            config.dense_embedder = dense;
+            config.shared_providers = shared;
+            return config;
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.providers.release();
+            self.alloc.free(self.indexes);
+            self.alloc.destroy(self);
+        }
+    };
+
+    fn attachRetainedQueryRecovery(self: *DB, retained: *DB) !void {
         const needs_recovery = for (retained.core.index_manager.dense_indexes.items) |entry| {
             if (entry.leann_transient) break true;
         } else false;
         if (!needs_recovery) return;
+        const alloc = retained.runtime_alloc;
+        const indexes = try retainedRecoveryIndexesJson(retained, alloc);
+        defer alloc.free(indexes);
+        // Fork cold provisioning directly; opening a cut must never initialize
+        // the live catalog's providers or depend on their availability.
+        if (self.async_context.io) |io| {
+            self.async_context.query_recovery_mutex.lockUncancelable(io);
+            defer self.async_context.query_recovery_mutex.unlock(io);
+            if (self.async_context.query_recovery_factory) |factory| if (factory.fork) |fork| {
+                const forked = try fork(factory.ptr, alloc, indexes);
+                errdefer forked.release(forked.ptr);
+                try retained.attachLazyQueryRecovery(forked);
+                return;
+            };
+        }
         var providers = self.retainQueryProviders();
         defer providers.deinit(self.runtime_alloc);
-        const runtime = providers.runtime orelse return;
-        if (runtime == self.async_context.query_recovery_runtime and !self.async_context.query_recovery_ready.load(.acquire)) {
-            const session = @import("../leann_recovery.zig").Session{
-                .deadline_ns = deadline_ns,
-                .cancellation = vectorindex_mod.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
-            };
-            _ = try queryRecoveryRuntime(self.async_context, &session);
+        const runtime = providers.runtime;
+        if (runtime != null and runtime == self.async_context.query_recovery_runtime and !self.async_context.query_recovery_ready.load(.acquire)) return error.ReembedUnavailable;
+        var retained_services: ?enrichment_runtime_mod.Config = null;
+        {
+            const mutex = &self.async_context.enrichment_lifecycle_mutex;
+            while (!mutex.tryLock()) spinOrYield();
+            defer mutex.unlock();
+            if (self.retained_recovery_config) |value| {
+                var owned = value;
+                owned.shared_providers = value.shared_providers.?.retain();
+                retained_services = owned;
+            }
         }
-        if (runtime.config.dense_embedder == null) return;
+        defer if (retained_services) |*value| deinitOwnedEnrichmentConfig(self.runtime_alloc, value);
+        const source_config = if (runtime) |value| current: {
+            if (value.config.dense_embedder) |active_dense| if (active_dense.clone_for_indexes_fn != null) break :current value.config;
+            break :current retained_services orelse value.config;
+        } else retained_services orelse return;
+        const dense = source_config.dense_embedder orelse return;
         var config: enrichment_runtime_mod.Config = .{
-            .dense_embedder = runtime.config.dense_embedder,
-            .chunk_provider = runtime.config.chunk_provider,
-            .shared_providers = runtime.config.shared_providers.?.retain(),
-            .io = runtime.config.io,
-            .secret_store = runtime.config.secret_store,
-            .remote_content = runtime.config.remote_content,
+            .dense_embedder = dense,
+            .chunk_provider = source_config.chunk_provider,
+            .io = source_config.io,
+            .secret_store = source_config.secret_store,
+            .remote_content = source_config.remote_content,
         };
-        defer deinitOwnedEnrichmentConfig(retained.runtime_alloc, &config);
+        if (dense.clone_for_indexes_fn != null) {
+            const factory = try alloc.create(RetainedProviderFactory);
+            errdefer alloc.destroy(factory);
+            const owned_indexes = try alloc.dupe(u8, indexes);
+            factory.* = .{ .alloc = alloc, .indexes = owned_indexes, .providers = source_config.shared_providers.?.retain(), .config = config };
+            errdefer {
+                factory.providers.release();
+                alloc.free(owned_indexes);
+            }
+            try retained.attachLazyQueryRecovery(.{ .ptr = factory, .create = RetainedProviderFactory.create, .release = RetainedProviderFactory.release });
+            return;
+        }
+        // Legacy custom callbacks cannot be reconstructed. Reuse one only
+        // when its named index configuration is still the retained version.
+        for (retained.core.index_manager.dense_indexes.items) |entry| {
+            if (!entry.leann_transient) continue;
+            const current = self.core.index_manager.denseIndex(entry.config.name) orelse return error.ReembedRevisionMismatch;
+            if (!std.mem.eql(u8, current.config.config_json, entry.config.config_json)) return error.ReembedRevisionMismatch;
+        }
+        config.shared_providers = source_config.shared_providers.?.retain();
+        defer deinitOwnedEnrichmentConfig(alloc, &config);
         try retained.attachQueryRecovery(&config);
     }
 
@@ -5722,6 +5819,20 @@ pub const DB = struct {
         self.enrichment_append_context = self.enrichment_owner.bundle.append_ctx;
         self.enrichment_runtime = self.enrichment_owner.bundle.runtime;
         self.async_context.enrichment_runtime = self.enrichment_owner.bundle.runtime;
+        if (self.enrichment_runtime) |runtime| if (runtime.config.dense_embedder) |dense| {
+            if (dense.clone_for_indexes_fn != null) {
+                const shared = runtime.config.shared_providers.?.retain();
+                if (self.retained_recovery_config) |*previous| deinitOwnedEnrichmentConfig(self.runtime_alloc, previous);
+                self.retained_recovery_config = .{
+                    .dense_embedder = dense,
+                    .chunk_provider = runtime.config.chunk_provider,
+                    .shared_providers = shared,
+                    .io = runtime.config.io,
+                    .secret_store = runtime.config.secret_store,
+                    .remote_content = runtime.config.remote_content,
+                };
+            }
+        };
     }
     fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !void {
         self.enrichment_owner.bundle = (try self.createDetachedEnrichmentRuntime(enrichment_cfg)) orelse return;
@@ -6255,6 +6366,8 @@ pub const DB = struct {
         self.query_recovery_owner.deinit(self.runtime_alloc);
         self.enrichment_owner.deinit(self.runtime_alloc);
         publishEnrichmentOwner(self);
+        if (self.retained_recovery_config) |*config| deinitOwnedEnrichmentConfig(self.runtime_alloc, config);
+        self.retained_recovery_config = null;
         self.resolution_owner.deinitRuntime(self.runtime_alloc);
         self.resolution_runtime = null;
         self.async_context.resolution_runtime = null;
@@ -21679,7 +21792,7 @@ pub const DB = struct {
                 if (self.owned_backend_runtime) |owned| readonly.owned_backend_runtime = owned.retain();
                 errdefer readonly.close();
                 try self.copyQueryCutRowPolicyAuthority(&readonly);
-                try self.attachRetainedQueryRecovery(&readonly, control.token(), control.deadline_ns);
+                try self.attachRetainedQueryRecovery(&readonly);
                 try control.token().check();
                 readonly.retained_value_scope = @import("../../search/value_membership.zig").Scope.init(self.core.path, request.id, origin, request.expires_ms);
                 readonly.retained_remote_query_lease = lease;
@@ -21713,7 +21826,7 @@ pub const DB = struct {
         if (self.owned_backend_runtime) |owned| readonly.owned_backend_runtime = owned.retain();
         errdefer readonly.close();
         try self.copyQueryCutRowPolicyAuthority(&readonly);
-        try self.attachRetainedQueryRecovery(&readonly, control.token(), control.deadline_ns);
+        try self.attachRetainedQueryRecovery(&readonly);
         try control.token().check();
         readonly.retained_value_scope = @import("../../search/value_membership.zig").Scope.init(self.core.path, request.id, origin, request.expires_ms).withSourceProof(source_proof);
         readonly.retained_query_lease = reader;
@@ -27585,11 +27698,18 @@ pub const DB = struct {
             context.query_recovery_factory = null;
             return error.ReembedUnavailable;
         };
-        runtime.config.dense_embedder = dense;
-        if (runtime.config.shared_providers) |shared| {
+        if (config.shared_providers) |shared| {
+            if (runtime.config.shared_providers) |previous| previous.release();
+            runtime.config.shared_providers = shared;
+            config.shared_providers = null;
+        } else if (runtime.config.shared_providers) |shared| {
             shared.dense = dense;
             shared.chunk = config.chunk_provider;
         }
+        runtime.config.dense_embedder = dense;
+        if (config.io) |io_value| runtime.config.io = io_value;
+        if (config.secret_store) |secrets| runtime.config.secret_store = secrets;
+        if (config.remote_content) |remote| runtime.config.remote_content = remote;
         config.dense_embedder = null;
         runtime.config.chunk_provider = config.chunk_provider;
         config.chunk_provider = null;
@@ -43355,7 +43475,10 @@ pub const DB = struct {
             if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
             if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
             return self.searchWithDenseProfileAttempt(alloc, req, &accounting) catch |err| switch (err) {
-                error.QueryReadRetry => continue,
+                error.QueryReadRetry => {
+                    try accounting.retry();
+                    continue;
+                },
                 else => return err,
             };
         }
@@ -43428,8 +43551,25 @@ pub const DB = struct {
     pub fn queryLeaseClockNowNs() u64 {
         return currentTimeNs();
     }
-    pub fn queryLeaseSearchOwned(self: *DB, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
+    pub fn queryLeaseSearchOwned(self: *DB, alloc: Allocator, req: types.SearchRequest, allow_handoff: bool) !SearchWithDenseProfileResult {
         if (comptime storage_engine.enabled) @compileError("query lease search execution belongs to the storage owner");
+        var accounting = QueryRecoveryAccounting{};
+        defer accounting.elapsed.deinit(self.alloc);
+        while (true) {
+            return self.queryLeaseSearchAttempt(alloc, req, allow_handoff, &accounting) catch |err| switch (err) {
+                error.QueryReadRetry => {
+                    try accounting.retry();
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
+    fn queryLeaseSearchAttempt(self: *DB, alloc: Allocator, req: types.SearchRequest, allow_handoff: bool, accounting: *QueryRecoveryAccounting) !SearchWithDenseProfileResult {
+        var external_work = DenseExternalWork.init(self, .apply_shared, accounting);
+        if (allow_handoff) external_work.activate();
+        defer if (allow_handoff) external_work.deinit();
         const db = self;
         const snapshot_req = try db.searchRequestAtCurrentIdentityGeneration(req);
         if (!types.canonicalHierarchyExecutionWithinBudget(snapshot_req)) return error.InvalidQueryRequest;
@@ -43514,7 +43654,10 @@ pub const DB = struct {
             if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
             if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
             return self.searchWithCapturedRequestAndExecutionContextAttempt(alloc, req, exec_ctx, &accounting) catch |err| switch (err) {
-                error.QueryReadRetry => continue,
+                error.QueryReadRetry => {
+                    try accounting.retry();
+                    continue;
+                },
                 else => return err,
             };
         }
@@ -46523,7 +46666,10 @@ pub const DB = struct {
             if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
             if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
             return self.searchDenseProfiledWithCapturedRequestAttempt(alloc, req, dense, &accounting) catch |err| switch (err) {
-                error.QueryReadRetry => continue,
+                error.QueryReadRetry => {
+                    try accounting.retry();
+                    continue;
+                },
                 else => return err,
             };
         }
@@ -47597,7 +47743,14 @@ pub const DB = struct {
     threadlocal var active_dense_external_work: ?*DenseExternalWork = null;
 
     const QueryRecoveryAccounting = struct {
+        retries: u8 = 0,
         elapsed: std.AutoHashMapUnmanaged(*hbc_mod.HBCIndex, u64) = .empty,
+        // Requests without a deadline also finish under sustained writes or
+        // cache churn. Completed batches remain useful to the next caller.
+        fn retry(self: *@This()) !void {
+            if (self.retries >= 3) return error.StorageBusy;
+            self.retries += 1;
+        }
     };
 
     const DenseExternalWork = struct {
@@ -47610,6 +47763,7 @@ pub const DB = struct {
         catalog: bool = false,
         source: ?docstore_mod.DocStore.Txn = null,
         sequence: u64 = 0,
+        catalog_generation: u64 = 0,
         changed: bool = false,
 
         fn init(db: *DB, access: DenseSearchAccess, accounting: *QueryRecoveryAccounting) @This() {
@@ -47645,6 +47799,7 @@ pub const DB = struct {
             if (self.source == null) {
                 self.source = try self.db.core.store.beginReadTxn();
                 self.sequence = self.db.core.nextDerivedSequence();
+                self.catalog_generation = self.db.core.index_manager.write_plan_generation.load(.acquire);
             }
             self.previous = active_query_recovery;
             active_query_recovery = .{ .context = self.db.async_context, .runtime = self.providers.runtime };
@@ -47666,7 +47821,8 @@ pub const DB = struct {
                 self.db.endPublishedDenseSearch();
                 self.catalog = false;
             }
-            self.changed = self.changed or self.db.core.nextDerivedSequence() != self.sequence;
+            self.changed = self.changed or self.db.core.nextDerivedSequence() != self.sequence or
+                self.db.core.index_manager.write_plan_generation.load(.acquire) != self.catalog_generation;
         }
 
         fn leave(raw: *anyopaque) void {
@@ -135132,9 +135288,24 @@ test "db native snapshot restores and re-embeds transient leann stubs" {
     try testLeannNativeSnapshot(false, false, true);
 }
 
-fn verifyLeannInferenceAllowsWrites(db: *DB, query: []const f32) !void {
+test "leann query retry accounting bounds conflicts without resetting inference time" {
+    var accounting = DB.QueryRecoveryAccounting{};
+    defer accounting.elapsed.deinit(std.testing.allocator);
+    var placeholder: hbc_mod.HBCIndex = undefined;
+    try accounting.elapsed.put(std.testing.allocator, &placeholder, 123);
+    for (0..3) |_| try accounting.retry();
+    try std.testing.expectError(error.StorageBusy, accounting.retry());
+    try std.testing.expectEqual(@as(u64, 123), accounting.elapsed.get(&placeholder).?);
+}
+
+const LeannConcurrentRead = enum { query, aggregation_lease, catalog, churn };
+
+fn verifyLeannInferenceAllowsWrites(db: *DB, query: []const f32, mode: LeannConcurrentRead) !void {
     const Gate = struct {
         original: embedder_mod.DenseEmbedder,
+        mode: LeannConcurrentRead,
+        db: *DB,
+        dispatches: usize = 0,
         entered: std.Io.Event = .unset,
         proceed: std.Io.Event = .unset,
 
@@ -135144,24 +135315,37 @@ fn verifyLeannInferenceAllowsWrites(db: *DB, query: []const f32) !void {
         }
         fn capabilities(raw: *anyopaque, alloc: Allocator, name: []const u8) !@import("antfly_inference_work").InferenceCapabilities {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.mode == .catalog) {
+                self.entered.set(std.testing.io);
+                try self.proceed.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+            }
             return self.original.capabilities(alloc, name);
         }
         fn batch(raw: *anyopaque, alloc: Allocator, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.entered.set(std.testing.io);
             try self.proceed.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } });
+            if (self.mode == .churn) {
+                self.dispatches += 1;
+                const value = try std.fmt.allocPrint(alloc, "{{\"_embeddings\":{{\"leann_idx\":[1,2,3,4]}},\"revision\":{d}}}", .{self.dispatches});
+                defer alloc.free(value);
+                try self.db.batch(.{ .writes = &.{.{ .key = "concurrent:churn", .value = value }}, .sync_level = .write });
+            }
             return self.original.embedDenseBatch(alloc, name, texts, dims);
         }
     };
     const runtime = db.enrichment_runtime.?;
     const original = runtime.config.dense_embedder.?;
-    var gate = Gate{ .original = original };
+    var gate = Gate{ .original = original, .mode = mode, .db = db };
+    const cache_limit = db.core.index_manager.leann_reembed_cache.limit_bytes;
+    if (mode == .churn) db.core.index_manager.leann_reembed_cache.limit_bytes = 0;
+    defer db.core.index_manager.leann_reembed_cache.limit_bytes = cache_limit;
     runtime.config.dense_embedder = .{ .ptr = &gate, .dense_embed_fn = Gate.single, .dense_embed_batch_fn = Gate.batch, .capabilities_fn = Gate.capabilities };
     defer runtime.config.dense_embedder = original;
     db.core.index_manager.leann_reembed_cache.deinit(db.alloc);
     const Search = struct {
-        fn run(owner: *DB, vector: []const f32, failure: *?anyerror) void {
-            var result = owner.search(std.testing.allocator, .{
+        fn run(owner: *DB, vector: []const f32, failure: *?anyerror, route: LeannConcurrentRead) void {
+            const req: types.SearchRequest = .{
                 .index_name = "leann_idx",
                 .dense = .{ .vector = vector, .k = 1 },
                 .limit = 1,
@@ -135169,25 +135353,57 @@ fn verifyLeannInferenceAllowsWrites(db: *DB, query: []const f32) !void {
                 .include_stored = false,
                 .filter_doc_ids_positive = true,
                 .filter_doc_ids = &.{ "doc:0123", "doc:0299" },
-            }) catch |err| {
+            };
+            var lease: ?DB.QueryReadLease = if (route == .aggregation_lease) owner.beginQueryReadLease() catch |err| {
                 failure.* = err;
                 return;
-            };
+            } else null;
+            defer if (lease) |*held| held.release();
+            var result = (if (lease) |*held| (held.search(std.testing.allocator, req) catch |err| {
+                failure.* = err;
+                return;
+            }).result else owner.search(std.testing.allocator, req) catch |err| {
+                if (route == .churn and err == error.StorageBusy) return;
+                failure.* = err;
+                return;
+            });
             defer result.deinit();
-            if (result.hits.len != 1) failure.* = error.TestUnexpectedResult;
+            if (route == .churn or result.hits.len != 1) failure.* = error.TestUnexpectedResult;
         }
     };
     var search_failure: ?anyerror = null;
     var joined = false;
-    const reader = try std.Thread.spawn(.{}, Search.run, .{ db, query, &search_failure });
+    const reader = try std.Thread.spawn(.{}, Search.run, .{ db, query, &search_failure, mode });
     defer {
         gate.proceed.set(std.testing.io);
         if (!joined) reader.join();
     }
     try gate.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
     const Write = struct {
-        fn run(owner: *DB, done: *std.Io.Event, failure: *?anyerror) void {
+        fn run(owner: *DB, done: *std.Io.Event, failure: *?anyerror, route: LeannConcurrentRead) void {
             defer done.set(std.testing.io);
+            if (route == .catalog) {
+                const configs = owner.listEnrichments(std.testing.allocator) catch |err| {
+                    failure.* = err;
+                    return;
+                };
+                defer types.freeEnrichmentConfigs(std.testing.allocator, configs);
+                for (configs) |*cfg| {
+                    if (cfg.kind != .embedding or !std.mem.eql(u8, cfg.name, "leann_idx")) continue;
+                    std.testing.allocator.free(cfg.field);
+                    cfg.field = std.testing.allocator.dupe(u8, "other") catch |err| {
+                        failure.* = err;
+                        return;
+                    };
+                    _ = owner.upsertEnrichment(cfg.*) catch |err| {
+                        failure.* = err;
+                        return;
+                    };
+                    return;
+                }
+                failure.* = error.TestUnexpectedResult;
+                return;
+            }
             owner.batch(.{ .deletes = &.{"doc:0299"}, .sync_level = .write }) catch |err| {
                 failure.* = err;
             };
@@ -135195,7 +135411,7 @@ fn verifyLeannInferenceAllowsWrites(db: *DB, query: []const f32) !void {
     };
     var done: std.Io.Event = .unset;
     var write_failure: ?anyerror = null;
-    const writer = try std.Thread.spawn(.{}, Write.run, .{ db, &done, &write_failure });
+    const writer = try std.Thread.spawn(.{}, Write.run, .{ db, &done, &write_failure, mode });
     defer {
         gate.proceed.set(std.testing.io);
         writer.join();
@@ -135206,6 +135422,7 @@ fn verifyLeannInferenceAllowsWrites(db: *DB, query: []const f32) !void {
     reader.join();
     joined = true;
     try std.testing.expect(search_failure == null);
+    if (mode == .churn) try std.testing.expectEqual(@as(usize, 4), gate.dispatches);
 }
 
 fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool, transient: bool) !void {
@@ -135222,7 +135439,20 @@ fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool, transien
     defer runtime.deinit();
     var native = try lsm_backend_mod.NativeStorage.init(alloc, .threaded);
     defer native.deinit();
+    const HistoricalProvider = struct {
+        var deterministic: embedder_mod.DeterministicDenseEmbedder = .{};
+        var clones: usize = 0;
+        fn clone(_: *anyopaque, _: Allocator, indexes: []const u8, control: @import("antfly_inference_execution_context").RequestContext) !embedder_mod.DenseEmbedder {
+            try control.check();
+            try std.testing.expect(std.mem.indexOf(u8, indexes, "\"dimension\":4") != null);
+            try std.testing.expect(std.mem.indexOf(u8, indexes, "leann_idx") != null);
+            clones += 1;
+            return deterministic.interface();
+        }
+    };
+    HistoricalProvider.clones = 0;
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var live_replacement = embedder_mod.DeterministicDenseEmbedder{ .seed = 1234567 };
     const enrichment: ?enrichment_runtime_mod.Config = if (transient) .{ .owner_id = "leann-snapshot", .dense_embedder = deterministic.interface() } else null;
     var db = try DB.open(alloc, std.mem.span(path), .{ .backend_runtime = runtime.ptr(), .enrichment = enrichment, .identity_namespace = if (transient) .{ .table_id = 7, .shard_id = 1, .range_id = 1 } else null, .index_backends = .{ .dense_lsm_storage = if (explicit_storage) native.storage() else null }, .ttl_cleanup = .{ .enabled = false } });
     var db_open = true;
@@ -135289,17 +135519,22 @@ fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool, transien
         try std.testing.expect(try enrichment_artifact_codec.elidedDenseEmbedding(raw) != null);
     }
     var retained_query: ?DB = null;
+    var retained_request: ?@import("native_query_cut_contract.zig").Request = null;
     defer if (retained_query) |*retained| retained.close();
     if (transient) {
         const vector = try deterministic.interface().embedDense(alloc, "leann_idx", "passage number 123", 4);
         defer alloc.free(vector);
-        try verifyLeannInferenceAllowsWrites(&db, vector);
+        try verifyLeannInferenceAllowsWrites(&db, vector, .aggregation_lease);
+        try verifyLeannInferenceAllowsWrites(&db, vector, .catalog);
+        try verifyLeannInferenceAllowsWrites(&db, vector, .query);
+        try verifyLeannInferenceAllowsWrites(&db, vector, .churn);
         const request: @import("native_query_cut_contract.zig").Request = .{
             .id = &@as([64]u8, @splat('e')),
             .table_id = 7,
             .expires_ms = @import("native_query_cut.zig").nowMs() + 300_000,
             .create = true,
         };
+        retained_request = request;
         retained_query = try db.openQueryCut(request, .none);
     }
     // A table with a LEANN index used to fail native snapshots outright.
@@ -135324,6 +135559,17 @@ fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool, transien
     try db.batch(.{ .deletes = &.{keys[123]}, .sync_level = .full_index });
     try db.syncIndexes(true);
     if (retained_query) |*retained| {
+        retained.close();
+        var different = live_replacement.interface();
+        different.clone_for_indexes_fn = HistoricalProvider.clone;
+        try db.reconfigureEnrichmentRuntimePaused(.{ .owner_id = "changed-live-provider", .dense_embedder = different });
+        // Removing the final live producer must preserve its reconstruction
+        // service recipe while the historical catalog still contains it.
+        try db.reconfigureEnrichmentRuntimePaused(.{});
+        var reopen = retained_request.?;
+        reopen.create = false;
+        retained.* = try db.openQueryCut(reopen, .none);
+        try std.testing.expectEqual(@as(usize, 0), HistoricalProvider.clones);
         db.close();
         db_open = false;
         const vector = try deterministic.interface().embedDense(alloc, "leann_idx", "passage number 123", 4);
@@ -135332,6 +135578,7 @@ fn testLeannNativeSnapshot(legacy_native: bool, explicit_storage: bool, transien
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 1), result.hits.len);
         try std.testing.expectEqualStrings(keys[123], result.hits[0].id);
+        try std.testing.expectEqual(@as(usize, 1), HistoricalProvider.clones);
     }
     var restore_tmp = try TestDirectory.init("db-leann-restore");
     defer restore_tmp.cleanup();

@@ -84,7 +84,8 @@ pub const ElideEntry = replicated_mod.ElideEntry;
 pub const vectorDigest = replica_mod.vectorDigest;
 pub const GenerationFetcher = replica_mod.GenerationFetcher;
 
-pub const RecoverySession = @import("leann_recovery.zig").Session;
+pub const Filter = @import("leann_filter.zig").Filter;
+const RecoverySession = @import("leann_recovery.zig").Session;
 
 /// Exact-vector loading, with an optional per-search recovery context.
 pub const VectorLoader = struct {
@@ -654,15 +655,26 @@ pub const LeannStore = struct {
     /// nearest first, as HBC returns them: `SearchResults` is a heap that
     /// keeps the worst result first until sorted.
     pub fn search(self: *LeannStore, alloc: Allocator, req: search_types.SearchRequest) !search_results.SearchResults {
-        return self.searchWithWorkingAllocator(alloc, alloc, req);
+        return self.searchWithStats(alloc, req, null);
+    }
+
+    pub fn searchWithStats(self: *LeannStore, alloc: Allocator, req: search_types.SearchRequest, profile_out: ?*leann.SearchStats) !search_results.SearchResults {
+        return self.searchWithWorkingAllocatorAndStats(alloc, alloc, req, profile_out);
     }
 
     pub fn searchWithWorkingAllocator(self: *LeannStore, result_alloc: Allocator, alloc: Allocator, req: search_types.SearchRequest) !search_results.SearchResults {
+        return self.searchWithWorkingAllocatorAndStats(result_alloc, alloc, req, null);
+    }
+
+    pub fn searchWithWorkingAllocatorAndStats(self: *LeannStore, result_alloc: Allocator, alloc: Allocator, req: search_types.SearchRequest, search_stats: ?*leann.SearchStats) !search_results.SearchResults {
+        if (search_stats) |profile| profile.* = .{};
         if (req.query.len != self.opts.dims) return error.DimensionMismatch;
+        if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        if (req.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
         if (!self.opts.transient) {
             try self.acquireSearchRead(req);
             defer self.lock.unlockShared(self.io);
-            var result = if (self.replicated) |state| try state.search(result_alloc, req) else try self.searchLocalLocked(result_alloc, req);
+            var result = if (self.replicated) |state| try state.searchWithStats(result_alloc, req, search_stats) else try self.searchLocalLocked(result_alloc, req, search_stats);
             result.sort();
             return result;
         }
@@ -703,17 +715,22 @@ pub const LeannStore = struct {
                 const response = score: {
                     if (req.external_work) |work| try work.enter(work.ptr);
                     defer if (req.external_work) |work| work.leave(work.ptr);
-                    break :score try plan.score(alloc, .{ .ctx = &source, .recompute_fn = CapturedSource.recompute }, req.query, captured.options);
+                    break :score try plan.score(alloc, .{ .ctx = &source, .recompute_fn = CapturedSource.recompute, .result_order = CapturedSource.order }, req.query, captured.options);
                 };
                 var scored = response;
                 defer scored.deinit(alloc);
                 if (req.external_work) |work| try work.validate(work.ptr);
+                var profile = scored.stats;
+                profile.matches.verified += captured.pending_matches;
+                profile.matches.complete = profile.matches.complete and captured.direct;
+                if (search_stats) |output| output.* = profile;
                 if (scored.stats.budget_exhausted) return error.ReembedBudgetExceeded;
                 for (scored.results) |result| {
                     const row = source.row(result.id) orelse return error.InvalidLeannStore;
                     if (!filter.distanceAllowed(result.distance)) continue;
                     captured.results.addResultWithOwnedMetadata(row.vector_id, result.distance, 0, if (req.load_metadata) try result_alloc.dupe(u8, row.metadata) else null);
                 }
+                captured.results.candidate_coverage = profile.matches.candidateCoverage(captured.results.getHits().len);
             }
             if (search_types.requiresExhaustiveCoverage(req) or captured.results.items.items.len >= req.k or
                 want >= captured.live or !filter.distanceActive() or captured.truncated)
@@ -743,6 +760,8 @@ pub const LeannStore = struct {
         results: search_results.SearchResults,
         live: usize = 0,
         truncated: bool = false,
+        direct: bool = false,
+        pending_matches: usize = 0,
         loader: ?VectorLoader = null,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
@@ -773,6 +792,11 @@ pub const LeannStore = struct {
         if (metric == .cosine) normalize(query);
         const scratch = try alloc.alloc(f32, self.opts.dims);
         defer alloc.free(scratch);
+        var buffered: std.ArrayListUnmanaged(CapturedRow) = .empty;
+        defer {
+            for (buffered.items) |row| alloc.free(row.metadata);
+            buffered.deinit(alloc);
+        }
         const graph: ?*const leann.Index = if (self.replicated) |state|
             if (state.replica.index) |*index| index else null
         else if (self.index) |*index| index else null;
@@ -780,10 +804,19 @@ pub const LeannStore = struct {
             for (state.replica.buffer_keys.items, state.replica.buffer_vectors.items) |key, vector| {
                 const id = state.bindings.get(key) orelse continue;
                 if (!try filter.allows(id, key)) continue;
+                if (state.dirty.contains(key)) {
+                    const owned = try alloc.dupe(u8, key);
+                    errdefer alloc.free(owned);
+                    try buffered.append(alloc, .{ .node_id = 0, .vector_id = id, .metadata = owned });
+                    continue;
+                }
                 @memcpy(scratch, vector);
                 if (metric == .cosine) normalize(scratch);
                 const dist = leann.distance(metric, query, scratch);
-                if (filter.distanceAllowed(dist)) captured.results.addResultWithOwnedMetadata(id, dist, 0, if (req.load_metadata) try result_alloc.dupe(u8, key) else null);
+                if (filter.distanceAllowed(dist)) {
+                    captured.pending_matches += 1;
+                    captured.results.addResultWithOwnedMetadata(id, dist, 0, if (req.load_metadata) try result_alloc.dupe(u8, key) else null);
+                }
             }
         } else {
             for (self.pending.items) |pending| {
@@ -791,10 +824,15 @@ pub const LeannStore = struct {
                 @memcpy(scratch, pending.vector);
                 if (metric == .cosine) normalize(scratch);
                 const dist = leann.distance(metric, query, scratch);
-                if (filter.distanceAllowed(dist)) captured.results.addResultWithOwnedMetadata(pending.vector_id, dist, 0, if (req.load_metadata) try result_alloc.dupe(u8, pending.metadata) else null);
+                if (filter.distanceAllowed(dist)) {
+                    captured.pending_matches += 1;
+                    captured.results.addResultWithOwnedMetadata(pending.vector_id, dist, 0, if (req.load_metadata) try result_alloc.dupe(u8, pending.metadata) else null);
+                }
             }
         }
-        const index = graph orelse return captured;
+        if (graph == null and buffered.items.len == 0) return captured;
+        const index = graph;
+
         const NodePredicate = struct {
             store: *LeannStore,
             filter: *Filter,
@@ -814,9 +852,10 @@ pub const LeannStore = struct {
         captured.live = if (self.replicated) |state| state.replica.liveCount() else self.node_of.count();
         var candidates: std.ArrayListUnmanaged(u32) = .empty;
         defer candidates.deinit(alloc);
-        const direct = filter.has_allowed and useDirectCandidates(req, filter.allowed.count(), captured.live, self.opts.search_ef);
+        const direct = (filter.included_count != null) and (search_types.requiresExhaustiveCoverage(req) or filter.directMode(self.opts.dims, captured.live, true, if (index) |value| value.rabitq != null else false) != .graph);
+        captured.direct = direct or search_types.requiresExhaustiveCoverage(req);
         if (direct) {
-            var ids = filter.allowed.keyIterator();
+            var ids = filter.ids.include.keyIterator();
             while (ids.next()) |id| {
                 if (self.replicated) |state| {
                     const key = state.key_of.get(id.*) orelse continue;
@@ -839,11 +878,20 @@ pub const LeannStore = struct {
             .verify_source = true,
             .gate = gate.recomputeGate(),
         };
-        captured.plan = try index.prepareSearch(alloc, req.query, captured.options);
+        captured.plan = if (index) |value| try value.prepareSearch(alloc, req.query, captured.options) else .{
+            .candidates = try alloc.alloc(leann.PreparedCandidate, 0),
+            .metric = metric,
+            .dims = self.opts.dims,
+            .has_bounds = false,
+        };
         captured.truncated = captured.plan.?.stats.filter_truncated;
-        for (captured.plan.?.candidates) |candidate| {
+        for (captured.plan.?.candidates) |*candidate| {
             const vector_id, const metadata = if (self.replicated) |state| row: {
                 const key = state.replica.keys.items[candidate.id];
+                if (state.dirty.contains(key)) {
+                    candidate.lower = -std.math.inf(f32);
+                    candidate.retained = false;
+                }
                 break :row .{ state.bindings.get(key) orelse return error.InvalidLeannStore, key };
             } else row: {
                 const node = self.nodes.items[candidate.id];
@@ -853,6 +901,20 @@ pub const LeannStore = struct {
             errdefer alloc.free(owned);
             try captured.rows.append(alloc, .{ .node_id = candidate.id, .vector_id = vector_id, .metadata = owned });
         }
+        // Dirty exact-buffer rows also use the pinned current source. Their
+        // synthetic IDs live only inside this plan, beyond every graph node.
+        const graph_count = if (index) |value| value.node_count else 0;
+        const original_count = captured.plan.?.candidates.len;
+        captured.plan.?.candidates = try alloc.realloc(captured.plan.?.candidates, original_count + buffered.items.len);
+        try captured.rows.ensureUnusedCapacity(alloc, buffered.items.len);
+        if (@as(usize, graph_count) + buffered.items.len > std.math.maxInt(u32)) return error.InvalidLeannStore;
+        for (buffered.items, 0..) |*row, offset| {
+            row.node_id = @intCast(@as(usize, graph_count) + offset);
+            captured.plan.?.candidates[original_count + offset] = .{ .id = row.node_id, .lower = -std.math.inf(f32), .est = 0 };
+            captured.rows.appendAssumeCapacity(row.*);
+        }
+        buffered.clearRetainingCapacity();
+        captured.direct = captured.direct or captured.plan.?.candidates.len == captured.live;
         std.mem.sortUnstable(CapturedRow, captured.rows.items, {}, CapturedRow.less);
         // All pointers into the graph and stack predicates end at preparation.
         captured.options.filter = null;
@@ -877,6 +939,11 @@ pub const LeannStore = struct {
                 if (self.rows[mid].node_id < id) lo = mid + 1 else hi = mid;
             }
             return if (lo < self.rows.len and self.rows[lo].node_id == id) self.rows[lo] else null;
+        }
+
+        fn order(raw: *anyopaque, id: u32) u64 {
+            const self_: *@This() = @ptrCast(@alignCast(raw));
+            return self_.row(id).?.vector_id;
         }
 
         fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) !void {
@@ -922,12 +989,11 @@ pub const LeannStore = struct {
         }
     };
 
-    fn searchLocalLocked(self: *LeannStore, alloc: Allocator, req: search_types.SearchRequest) !search_results.SearchResults {
+    fn searchLocalLocked(self: *LeannStore, alloc: Allocator, req: search_types.SearchRequest, search_stats: ?*leann.SearchStats) !search_results.SearchResults {
         var out = search_results.SearchResults.init(alloc, req.k);
         errdefer out.deinit();
         if (req.k == 0) return out;
         if (req.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
-        if (req.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
 
         var filter = try Filter.init(alloc, req);
         defer filter.deinit(alloc);
@@ -939,82 +1005,113 @@ pub const LeannStore = struct {
         // Exact buffer.
         const scratch = try alloc.alloc(f32, self.opts.dims);
         defer alloc.free(scratch);
-        for (self.pending.items) |p| {
-            if (!try filter.allows(p.vector_id, p.metadata)) continue;
-            @memcpy(scratch, p.vector);
-            if (self.opts.metric == .cosine) normalize(scratch);
-            const dist = leann.distance(@fromBackingInt(@intCast(@as(u8, @intCast(@backingInt(self.opts.metric))))), q, scratch);
-            if (!filter.distanceAllowed(dist)) continue;
-            out.addResultWithOwnedMetadata(p.vector_id, dist, 0, if (req.load_metadata) try alloc.dupe(u8, p.metadata) else null);
+        const direct_mode = filter.directMode(self.opts.dims, self.node_of.count() + self.pending.items.len, self.opts.transient, self.opts.quantizer == .rabitq);
+        const direct = direct_mode != .graph;
+        const graph_ids: []u32 = if (direct) try alloc.alloc(u32, filter.included_count.?) else &.{};
+        defer if (direct) alloc.free(graph_ids);
+        var graph_count: usize = 0;
+        var pending_matches: usize = 0;
+        var matches: leann.MatchCoverage = .{ .complete = true };
+        if (direct) {
+            var ids = filter.ids.include.keyIterator();
+            while (ids.next()) |id| {
+                if (filter.ids.exclude.contains(id.*)) continue;
+                if (self.node_of.get(id.*)) |node_id| {
+                    graph_ids[graph_count] = node_id;
+                    graph_count += 1;
+                }
+                if (self.pending_of.get(id.*)) |slot| {
+                    pending_matches += @intFromBool(try self.scorePending(alloc, &filter, q, scratch, slot, &out));
+                }
+            }
+            std.mem.sortUnstable(u32, graph_ids[0..graph_count], {}, std.sort.asc(u32));
+        } else {
+            for (0..self.pending.items.len) |slot| {
+                pending_matches += @intFromBool(try self.scorePending(alloc, &filter, q, scratch, slot, &out));
+            }
         }
 
-        if (self.index == null) return out;
-        const index = &self.index.?;
-        const live: usize = self.node_of.count();
-        if (live == 0) return out;
-
-        // Full effort streams live vectors once and applies distance bounds
-        // before top-k admission. Bounded graph search widens its candidate
-        // pool until enough results pass the bounds or coverage is exhausted.
-        var want: usize = if (search_types.requiresExhaustiveCoverage(req)) req.k else if (filter.distanceActive()) @max(req.k * 4, req.k + 64) else req.k;
-        const budget_ms = if (self.opts.transient) self.opts.reembed_budget_ms else 0;
-        const session_loader = if (self.loader) |loader| loader.load_batch_session != null else false;
-        var gate = SearchGate.init(req, if (session_loader) 0 else budget_ms);
-        var recovery = RecoverySession{ .cancellation = req.cancellation, .deadline_ns = req.deadline_ns, .budget_ns = @as(u64, budget_ms) * std.time.ns_per_ms };
-        defer recovery.deinit();
-        var ctx = SourceCtx{ .recovery = &recovery, .store = self, .far_from = req.query, .reembed_ns = &gate.reembed_ns, .strict = search_types.requiresExhaustiveCoverage(req) };
-        const node_filter = NodeFilter{ .store = self, .filter = &filter };
-        const direct_candidates = filter.has_allowed and useDirectCandidates(req, filter.allowed.count(), live, self.opts.search_ef);
-        var candidate_ids = std.ArrayListUnmanaged(u32).empty;
-        defer candidate_ids.deinit(alloc);
-        if (direct_candidates) {
-            var ids = filter.allowed.keyIterator();
-            while (ids.next()) |id| if (self.node_of.get(id.*)) |node| try candidate_ids.append(alloc, node);
-        }
-        while (true) {
-            want = @min(want, live);
-            var resp = try index.search(alloc, ctx.source(), req.query, .{
-                .k = @intCast(want),
-                .ef = if (search_types.requiresExhaustiveCoverage(req)) @intCast(live) else if (self.opts.search_ef > 0) @max(self.opts.search_ef, @as(u32, @intCast(want))) else 0,
+        if (self.index) |*index| {
+            var ctx = SourceCtx{ .store = self, .far_from = if (filter.active()) null else req.query };
+            var gate = SearchGate.init(req, 0);
+            const opts: leann.SearchOptions = .{
+                .k = std.math.cast(u32, req.k) orelse std.math.maxInt(u32),
+                .ef = self.opts.search_ef,
                 .bound_scale = self.opts.bound_scale,
                 .batch_size = self.opts.batch_size,
-                .filter = if (filter.nodeActive() or search_types.requiresExhaustiveCoverage(req)) .{ .ctx = &node_filter, .allows_fn = NodeFilter.allows } else null,
-                .candidate_ids = if (direct_candidates) candidate_ids.items else null,
+                .gate = gate.recomputeGate(),
                 .exhaustive = search_types.requiresExhaustiveCoverage(req),
                 .distance_over = req.distance_over,
                 .distance_under = req.distance_under,
                 .verify_source = true,
-                .score_quantized_source = self.opts.media_int8,
-                .filter_visit_limit = if (filter.nodeActive() and !search_types.requiresExhaustiveCoverage(req)) @max(65536, @as(u32, @intCast(@min(req.k *| 16, std.math.maxInt(u32))))) else 0,
-                .gate = gate.recomputeGate(),
-            });
-            defer resp.deinit(alloc);
-            if (resp.stats.budget_exhausted) return error.ReembedBudgetExceeded;
-            var passed: usize = 0;
-            for (resp.results) |r| {
-                const node = self.nodes.items[r.id];
-                if (!try filter.allows(node.vector_id, node.metadata)) continue;
-                if (!filter.distanceAllowed(r.distance)) continue;
-                passed += 1;
-            }
-            if (search_types.requiresExhaustiveCoverage(req) or passed >= req.k or want >= live or !filter.distanceActive() or resp.stats.filter_truncated or
-                (filter.has_allowed and want >= filter.allowed.count()))
-            {
-                for (resp.results) |r| {
-                    const node = self.nodes.items[r.id];
-                    if (!try filter.allows(node.vector_id, node.metadata)) continue;
-                    if (!filter.distanceAllowed(r.distance)) continue;
-                    out.addResultWithOwnedMetadata(node.vector_id, r.distance, 0, if (req.load_metadata) try alloc.dupe(u8, node.metadata) else null);
+            };
+            const FilterContext = struct {
+                store: *const LeannStore,
+                filter: *const Filter,
+
+                fn allows(raw: *const anyopaque, id: u32) !bool {
+                    const context: *const @This() = @ptrCast(@alignCast(raw));
+                    const node = context.store.nodes.items[id];
+                    return context.filter.allows(node.vector_id, node.metadata);
                 }
-                return out;
+
+                fn order(raw: *const anyopaque, id: u32) u64 {
+                    const context: *const @This() = @ptrCast(@alignCast(raw));
+                    return context.store.nodes.items[id].vector_id;
+                }
+
+                fn cancelled(raw: *const anyopaque) bool {
+                    const context: *const @This() = @ptrCast(@alignCast(raw));
+                    return context.filter.cancelled();
+                }
+            };
+            const filter_ctx = FilterContext{ .store = self, .filter = &filter };
+            var node_filter = NodeFilter{ .store = self, .filter = &filter };
+            var resp = if (search_types.requiresExhaustiveCoverage(req)) full: {
+                var full_opts = opts;
+                full_opts.filter = .{ .ctx = &node_filter, .allows_fn = NodeFilter.allows };
+                ctx.strict = true;
+                break :full try index.search(alloc, ctx.source(), req.query, full_opts);
+            } else if (filter.active())
+                try index.searchFiltered(alloc, ctx.source(), req.query, opts, .{
+                    .ctx = &filter_ctx,
+                    .allows = FilterContext.allows,
+                    .result_order = FilterContext.order,
+                    .cancelled = FilterContext.cancelled,
+                    .eligible_count = filter.eligibleCount(),
+                    .direct_verify_bounds = direct_mode == .bounds,
+                    .distance_over = req.distance_over,
+                    .distance_under = req.distance_under,
+                }, if (direct) graph_ids[0..graph_count] else null)
+            else
+                try index.search(alloc, ctx.source(), req.query, opts);
+            defer resp.deinit(alloc);
+            matches = resp.stats.matches;
+            if (search_stats) |profile| profile.* = resp.stats;
+            for (resp.results) |result| {
+                const node = self.nodes.items[result.id];
+                out.addResultWithOwnedMetadata(node.vector_id, result.distance, 0, if (req.load_metadata) try alloc.dupe(u8, node.metadata) else null);
             }
-            want *= 4;
         }
+        matches.verified += pending_matches;
+        if (filter.active()) out.candidate_coverage = matches.candidateCoverage(out.getHits().len);
+        out.sort();
+        return out;
     }
 
-    /// Drops every key `keep` rejects (after a shard split or range change).
-    /// Local mode deletes them now; replicated mode marks them for the
-    /// leader to delete through the log. Returns how many keys it dropped.
+    fn scorePending(self: *const LeannStore, alloc: Allocator, filter: *const Filter, q: []const f32, scratch: []f32, slot: usize, out: *search_results.SearchResults) !bool {
+        if (filter.cancelled()) return error.Cancelled;
+        const item = self.pending.items[slot];
+        if (!try filter.allows(item.vector_id, item.metadata)) return false;
+        @memcpy(scratch, item.vector);
+        if (self.opts.metric == .cosine) normalize(scratch);
+        const dist = leann.distance(@fromBackingInt(@intCast(@as(u8, @intCast(@backingInt(self.opts.metric))))), q, scratch);
+        if (!std.math.isFinite(dist) or !filter.distanceAllowed(dist)) return false;
+        out.addResultWithOwnedMetadata(item.vector_id, dist, 0, if (filter.request.load_metadata) try alloc.dupe(u8, item.metadata) else null);
+        return true;
+    }
+
+    /// Metadata for a live vector id, owned by `alloc`.
     pub fn dropKeysWhere(self: *LeannStore, ctx: anytype, comptime keep: fn (@TypeOf(ctx), []const u8) bool) !usize {
         if (self.replicated) |state| {
             self.lock.lockUncancelable(self.io);
@@ -1058,7 +1155,7 @@ pub const LeannStore = struct {
     /// of every metric instead of failing the search.
     const SourceCtx = struct {
         store: *LeannStore,
-        far_from: []const f32,
+        far_from: ?[]const f32,
         reembed_ns: ?*u64 = null,
         strict: bool = false,
         recovery: ?*RecoverySession = null,
@@ -1494,59 +1591,6 @@ pub const SearchGate = struct {
         const self: *const SearchGate = @ptrCast(@alignCast(raw));
         try checkCancellation(raw);
         if (self.budget_ns != 0 and self.reembed_ns >= self.budget_ns) return false;
-        return true;
-    }
-};
-
-pub const Filter = struct {
-    allowed: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    excluded: std.AutoHashMapUnmanaged(u64, void) = .empty,
-    has_allowed: bool,
-    key_predicate: ?search_types.KeyPredicate,
-    prefix: []const u8,
-    over: ?f32,
-    under: ?f32,
-
-    pub fn init(alloc: Allocator, req: search_types.SearchRequest) !Filter {
-        var self = Filter{
-            .has_allowed = req.filter_ids.len > 0,
-            .key_predicate = req.key_predicate,
-            .prefix = req.filter_prefix,
-            .over = req.distance_over,
-            .under = req.distance_under,
-        };
-        errdefer self.deinit(alloc);
-        for (req.filter_ids) |id| try self.allowed.put(alloc, id, {});
-        for (req.exclude_ids) |id| try self.excluded.put(alloc, id, {});
-        return self;
-    }
-
-    pub fn deinit(self: *Filter, alloc: Allocator) void {
-        self.allowed.deinit(alloc);
-        self.excluded.deinit(alloc);
-    }
-
-    /// Filters on the node itself (id, key, prefix), applied in the walk.
-    pub fn nodeActive(self: *const Filter) bool {
-        return self.has_allowed or self.excluded.count() > 0 or self.key_predicate != null or
-            self.prefix.len > 0;
-    }
-
-    pub fn distanceActive(self: *const Filter) bool {
-        return self.over != null or self.under != null;
-    }
-
-    pub fn allows(self: *const Filter, vector_id: u64, metadata: []const u8) !bool {
-        if (self.has_allowed and !self.allowed.contains(vector_id)) return false;
-        if (self.excluded.contains(vector_id)) return false;
-        if (self.prefix.len > 0 and !std.mem.startsWith(u8, metadata, self.prefix)) return false;
-        if (self.key_predicate) |p| if (!try p.allows(p.ptr, metadata)) return false;
-        return true;
-    }
-
-    pub fn distanceAllowed(self: *const Filter, dist: f32) bool {
-        if (self.over) |t| if (!(dist > t)) return false;
-        if (self.under) |t| if (!(dist < t)) return false;
         return true;
     }
 };

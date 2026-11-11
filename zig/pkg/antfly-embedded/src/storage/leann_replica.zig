@@ -57,13 +57,14 @@ pub const Options = struct {
 /// Loads the exact vector for a key (the stored embedding). Used only by
 /// the planner and by generation builds.
 pub const VectorLoader = struct {
+    validate_digest: ?*const fn (*anyopaque, Allocator, []const u8, u64) anyerror!bool = null,
+    bounds_current: ?*const fn (*anyopaque, []const u8) bool = null,
     ctx: *anyopaque,
     load: *const fn (ctx: *anyopaque, alloc: Allocator, key: []const u8) anyerror![]f32,
     /// Optional batch form: fills `out[i * dims ..]` for each key and sets
     /// `found[i]`. Search recomputes go through it when present, so a source
     /// that re-embeds documents makes one embedder call per batch.
     load_batch: ?*const fn (ctx: *anyopaque, alloc: Allocator, keys: []const []const u8, out: []f32, found: []bool) anyerror!void = null,
-    validate_digest: ?*const fn (ctx: *anyopaque, alloc: Allocator, key: []const u8, digest: u64) anyerror!bool = null,
 };
 
 /// Fetches the bytes of a generation whose install record did not inline
@@ -654,42 +655,40 @@ pub const Replica = struct {
     /// k nearest live keys. Keys borrow from the replica until the next
     /// state change. `source` recomputes exact vectors by graph node id;
     /// see `nodeKey`.
-    /// Graph search tuning (see `leann.SearchOptions`).
-    /// Restricts hits to keys it allows; passed into the graph walk.
     pub const KeyFilter = struct {
         ctx: *const anyopaque,
-        allows_fn: *const fn (ctx: *const anyopaque, key: []const u8) anyerror!bool,
+        allows: *const fn (*const anyopaque, []const u8) anyerror!bool,
+        cancelled: *const fn (*const anyopaque) bool,
+        eligible_count: ?u32 = null,
+        direct_verify_bounds: bool = false,
+        result_order: ?*const fn (*const anyopaque, []const u8) u64 = null,
+        distance_over: ?f32 = null,
+        distance_under: ?f32 = null,
+        direct_keys: ?[]const []const u8 = null,
+
+        fn distanceAllowed(self: KeyFilter, dist: f32) bool {
+            if (self.distance_over) |threshold| if (!(dist > threshold)) return false;
+            if (self.distance_under) |threshold| if (!(dist < threshold)) return false;
+            return true;
+        }
     };
 
+    /// Graph search tuning (see `leann.SearchOptions`).
     pub const SearchTuning = struct {
         /// Beam width; 0 picks the quantizer's default. Raised to `k`.
         ef: u32 = 0,
         bound_scale: f32 = 1.0,
         batch_size: u32 = 0,
         filter: ?KeyFilter = null,
-        candidate_ids: ?[]const u32 = null,
-        score_quantized_source: bool = false,
-        filter_visit_limit: u32 = 0,
-        filter_truncated: ?*bool = null,
-        budget_exhausted: ?*bool = null,
+        stats: ?*leann.SearchStats = null,
         exhaustive: bool = false,
-        distance_over: ?f32 = null,
-        distance_under: ?f32 = null,
-        /// Cancellation and re-embedding budget (see `leann.RecomputeGate`).
         gate: ?leann.RecomputeGate = null,
-    };
-
-    const NodeKeyFilter = struct {
-        replica: *const Replica,
-        filter: KeyFilter,
-
-        fn allows(raw: *const anyopaque, id: u32) anyerror!bool {
-            const self: *const NodeKeyFilter = @ptrCast(@alignCast(raw));
-            return self.filter.allows_fn(self.filter.ctx, self.replica.keys.items[id]);
-        }
+        score_quantized_source: bool = false,
     };
 
     pub fn search(self: *const Replica, alloc: Allocator, query: []const f32, k: u32, tuning: SearchTuning, loader: VectorLoader) ![]Hit {
+        if (query.len != self.opts.config.dims) return error.DimensionMismatch;
+        if (tuning.stats) |profile| profile.* = .{};
         var hits = std.ArrayListUnmanaged(Hit).empty;
         errdefer hits.deinit(alloc);
         const metric = self.opts.config.metric;
@@ -698,45 +697,165 @@ pub const Replica = struct {
         if (metric == .cosine) normalize(q);
         const tmp = try alloc.alloc(f32, query.len);
         defer alloc.free(tmp);
-        for (self.buffer_keys.items, self.buffer_vectors.items) |key, v| {
-            if (tuning.filter) |f| if (!try f.allows_fn(f.ctx, key)) continue;
-            @memcpy(tmp, v);
-            if (metric == .cosine) normalize(tmp);
-            const dist = leann.distance(metric, q, tmp);
-            if (tuning.distance_over) |over| if (!(dist > over)) continue;
-            if (tuning.distance_under) |under| if (!(dist < under)) continue;
-            try hits.append(alloc, .{ .key = key, .distance = dist });
+        const direct_keys = if (tuning.filter) |filter| filter.direct_keys else null;
+        var direct_key_set: std.StringHashMapUnmanaged(void) = .empty;
+        defer direct_key_set.deinit(alloc);
+        if (direct_keys) |keys| {
+            if (self.buffer_keys.items.len > 0) {
+                for (keys) |key| try direct_key_set.put(alloc, key, {});
+            }
         }
+        var buffer_loads: u32 = 0;
+        var buffer_batches: u32 = 0;
+        var dirty_slots: std.ArrayListUnmanaged(usize) = .empty;
+        defer dirty_slots.deinit(alloc);
+        for (self.buffer_keys.items, 0..) |key, slot| {
+            if (direct_keys != null and !direct_key_set.contains(key)) continue;
+            if (tuning.filter) |filter| {
+                if (filter.cancelled(filter.ctx)) return error.Cancelled;
+                if (!try filter.allows(filter.ctx, key)) continue;
+            }
+            if (loader.bounds_current) |check| {
+                if (!check(loader.ctx, key)) {
+                    try dirty_slots.append(alloc, slot);
+                    continue;
+                }
+            }
+            try self.scoreBufferHit(alloc, q, tmp, key, self.buffer_vectors.items[slot], tuning.filter, &hits);
+        }
+        if (loader.load_batch) |load_batch| {
+            if (dirty_slots.items.len > 0) {
+                const batch_size = @min(dirty_slots.items.len, if (tuning.batch_size == 0) 64 else tuning.batch_size);
+                const keys = try alloc.alloc([]const u8, batch_size);
+                defer alloc.free(keys);
+                const vectors = try alloc.alloc(f32, batch_size * query.len);
+                defer alloc.free(vectors);
+                const found = try alloc.alloc(bool, batch_size);
+                defer alloc.free(found);
+                var start: usize = 0;
+                while (start < dirty_slots.items.len) {
+                    if (tuning.filter) |filter| if (filter.cancelled(filter.ctx)) return error.Cancelled;
+                    const slots = dirty_slots.items[start..][0..@min(batch_size, dirty_slots.items.len - start)];
+                    for (slots, keys[0..slots.len]) |slot, *key| key.* = self.buffer_keys.items[slot];
+                    @memset(found[0..slots.len], false);
+                    buffer_loads += @intCast(slots.len);
+                    buffer_batches += 1;
+                    try load_batch(loader.ctx, alloc, keys[0..slots.len], vectors[0 .. slots.len * query.len], found[0..slots.len]);
+                    for (keys[0..slots.len], found[0..slots.len], 0..) |key, ok, i| {
+                        if (ok) try self.scoreBufferHit(alloc, q, tmp, key, vectors[i * query.len ..][0..query.len], tuning.filter, &hits);
+                    }
+                    start += slots.len;
+                }
+            }
+        } else {
+            for (dirty_slots.items) |slot| {
+                if (tuning.filter) |filter| if (filter.cancelled(filter.ctx)) return error.Cancelled;
+                const key = self.buffer_keys.items[slot];
+                buffer_loads += 1;
+                buffer_batches += 1;
+                const vector = loader.load(loader.ctx, alloc, key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                defer alloc.free(vector);
+                try self.scoreBufferHit(alloc, q, tmp, key, vector, tuning.filter, &hits);
+            }
+        }
+        const buffer_matches = hits.items.len;
+        var matches: leann.MatchCoverage = .{ .verified = buffer_matches, .complete = true };
         if (self.index) |*index| {
-            var ctx = SearchSource{ .replica = self, .loader = loader, .far_from = query, .strict = tuning.exhaustive };
-            const node_filter: ?NodeKeyFilter = if (tuning.filter) |f| .{ .replica = self, .filter = f } else null;
-            var resp = try index.search(alloc, ctx.source(), query, .{
+            var ctx = SearchSource{ .replica = self, .loader = loader, .far_from = if (tuning.filter != null) null else query, .strict = tuning.exhaustive };
+            const opts: leann.SearchOptions = .{
                 .k = k,
-                .ef = if (tuning.ef > 0) @max(tuning.ef, k) else 0,
+                .ef = tuning.ef,
                 .bound_scale = tuning.bound_scale,
                 .batch_size = tuning.batch_size,
-                .filter = if (node_filter) |*nf| leann.Filter{ .ctx = nf, .allows_fn = NodeKeyFilter.allows } else null,
-                .candidate_ids = tuning.candidate_ids,
-                .filter_visit_limit = tuning.filter_visit_limit,
+                .gate = tuning.gate,
                 .exhaustive = tuning.exhaustive,
-                .distance_over = tuning.distance_over,
-                .distance_under = tuning.distance_under,
                 .verify_source = true,
                 .score_quantized_source = tuning.score_quantized_source,
-                .gate = tuning.gate,
-            });
+                .distance_over = if (tuning.filter) |filter| filter.distance_over else null,
+                .distance_under = if (tuning.filter) |filter| filter.distance_under else null,
+            };
+            var resp = if (tuning.filter) |filter| blk: {
+                const FilterContext = struct {
+                    replica: *const Replica,
+                    filter: KeyFilter,
+
+                    fn allows(raw: *const anyopaque, id: u32) !bool {
+                        const context: *const @This() = @ptrCast(@alignCast(raw));
+                        return context.filter.allows(context.filter.ctx, context.replica.keys.items[id]);
+                    }
+
+                    fn order(raw: *const anyopaque, id: u32) u64 {
+                        const context: *const @This() = @ptrCast(@alignCast(raw));
+                        return context.filter.result_order.?(context.filter.ctx, context.replica.keys.items[id]);
+                    }
+
+                    fn cancelled(raw: *const anyopaque) bool {
+                        const context: *const @This() = @ptrCast(@alignCast(raw));
+                        return context.filter.cancelled(context.filter.ctx);
+                    }
+                };
+                const filter_context = FilterContext{ .replica = self, .filter = filter };
+                var direct_ids: std.ArrayListUnmanaged(u32) = .empty;
+                defer direct_ids.deinit(alloc);
+                if (direct_keys) |keys| {
+                    try direct_ids.ensureTotalCapacity(alloc, keys.len);
+                    for (keys) |key| {
+                        if (self.node_of.get(key)) |id| direct_ids.appendAssumeCapacity(id);
+                    }
+                    std.mem.sortUnstable(u32, direct_ids.items, {}, std.sort.asc(u32));
+                }
+                if (tuning.exhaustive) {
+                    var full_opts = opts;
+                    full_opts.filter = .{ .ctx = &filter_context, .allows_fn = FilterContext.allows };
+                    break :blk try index.search(alloc, ctx.source(), query, full_opts);
+                }
+                break :blk try index.searchFiltered(alloc, ctx.source(), query, opts, .{
+                    .ctx = &filter_context,
+                    .allows = FilterContext.allows,
+                    .result_order = if (filter.result_order != null) FilterContext.order else null,
+                    .cancelled = FilterContext.cancelled,
+                    .eligible_count = filter.eligible_count,
+                    .direct_verify_bounds = filter.direct_verify_bounds,
+                    .distance_over = filter.distance_over,
+                    .distance_under = filter.distance_under,
+                }, if (direct_keys != null) direct_ids.items else null);
+            } else try index.search(alloc, ctx.source(), query, opts);
             defer resp.deinit(alloc);
-            if (tuning.filter_truncated) |truncated| truncated.* = resp.stats.filter_truncated;
-            if (tuning.budget_exhausted) |exhausted| exhausted.* = resp.stats.budget_exhausted;
+            matches = resp.stats.matches;
+            matches.verified += buffer_matches;
+            if (tuning.stats) |profile| profile.* = resp.stats;
             for (resp.results) |r| try hits.append(alloc, .{ .key = self.keys.items[r.id], .distance = r.distance });
         }
-        std.mem.sortUnstable(Hit, hits.items, {}, struct {
-            fn lt(_: void, a: Hit, b: Hit) bool {
+        if (tuning.stats) |profile| {
+            profile.matches = matches;
+            profile.recomputed +|= buffer_loads;
+            profile.batches +|= buffer_batches;
+        }
+        std.mem.sortUnstable(Hit, hits.items, tuning.filter, struct {
+            fn lt(filter: ?KeyFilter, a: Hit, b: Hit) bool {
+                if (a.distance == b.distance) {
+                    if (filter) |f| if (f.result_order) |order| return order(f.ctx, a.key) < order(f.ctx, b.key);
+                    return std.mem.lessThan(u8, a.key, b.key);
+                }
                 return a.distance < b.distance;
             }
         }.lt);
         if (hits.items.len > k) hits.shrinkRetainingCapacity(k);
         return hits.toOwnedSlice(alloc);
+    }
+
+    fn scoreBufferHit(self: *const Replica, alloc: Allocator, query: []const f32, scratch: []f32, key: []const u8, vector: []const f32, filter: ?KeyFilter, hits: *std.ArrayListUnmanaged(Hit)) !void {
+        const metric = self.opts.config.metric;
+        if (vector.len != scratch.len) return error.DimensionMismatch;
+        @memcpy(scratch, vector);
+        if (metric == .cosine) normalize(scratch);
+        const dist = leann.distance(metric, query, scratch);
+        if (!std.math.isFinite(dist)) return;
+        if (filter) |f| if (!f.distanceAllowed(dist)) return;
+        try hits.append(alloc, .{ .key = key, .distance = dist });
     }
 
     // ---------------------------------------------------------------------
@@ -834,18 +953,20 @@ pub const Replica = struct {
     const PlanSource = struct {
         replica: *const Replica,
         loader: VectorLoader,
-        far_from: []const f32,
+        far_from: ?[]const f32,
         strict: bool = false,
 
         fn source(self: *PlanSource) leann.EmbeddingSource {
-            return .{ .ctx = self, .recompute_fn = recompute, .validate_retained_fn = if (self.loader.validate_digest != null) validateRetained else null };
+            return .{
+                .ctx = self,
+                .recompute_fn = recompute,
+                .bounds_current = if (self.loader.bounds_current != null) boundsCurrent else null,
+            };
         }
 
-        fn validateRetained(raw: *anyopaque, id: u32) anyerror!bool {
+        fn boundsCurrent(raw: *anyopaque, id: u32) bool {
             const self: *PlanSource = @ptrCast(@alignCast(raw));
-            const key = self.replica.keys.items[id];
-            const digest = self.replica.liveDigest(key) orelse return false;
-            return self.loader.validate_digest.?(self.loader.ctx, self.replica.alloc, key, digest);
+            return self.loader.bounds_current.?(self.loader.ctx, self.replica.keys.items[id]);
         }
 
         fn recompute(raw: *anyopaque, ids: []const u32, out: []f32) anyerror!void {
@@ -857,8 +978,7 @@ pub const Replica = struct {
     const SearchSource = PlanSource;
 };
 
-fn recomputeByKey(replica: *const Replica, loader: VectorLoader, far_from: []const f32, ids: []const u32, out: []f32, strict: bool) !void {
-    _ = far_from;
+fn recomputeByKey(replica: *const Replica, loader: VectorLoader, far_from: ?[]const f32, ids: []const u32, out: []f32, strict: bool) !void {
     const d: usize = replica.opts.config.dims;
     if (loader.load_batch) |load_batch| {
         const keys = try replica.alloc.alloc([]const u8, ids.len);
@@ -869,10 +989,10 @@ fn recomputeByKey(replica: *const Replica, loader: VectorLoader, far_from: []con
         for (ids, keys) |id, *k| k.* = if (replica.index.?.isDeleted(id)) "" else replica.keys.items[id];
         @memset(found, false);
         try load_batch(loader.ctx, replica.alloc, keys, out[0 .. ids.len * d], found);
-        for (found, 0..) |ok, i| if (!ok) {
-            if (strict and keys[i].len != 0) return error.IncompletePublishedSnapshot;
-            @memset(out[i * d ..][0..d], std.math.nan(f32));
-        };
+        for (found, 0..) |ok, i| {
+            if (!ok and strict and keys[i].len != 0) return error.IncompletePublishedSnapshot;
+            if (!ok) leann.fillMissingEmbedding(out[i * d ..][0..d], far_from);
+        }
         return;
     }
     for (ids, 0..) |id, i| {
@@ -890,7 +1010,7 @@ fn recomputeByKey(replica: *const Replica, loader: VectorLoader, far_from: []con
             @memcpy(row, v);
         } else {
             if (strict and !replica.index.?.isDeleted(id)) return error.IncompletePublishedSnapshot;
-            @memset(row, std.math.nan(f32));
+            leann.fillMissingEmbedding(row, far_from);
         }
     }
 }

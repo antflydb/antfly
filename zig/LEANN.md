@@ -167,18 +167,24 @@ version needs no such special case and does better on real data (below).
 
 ```sh
 cd zig
-zig build-exe -OReleaseFast -lc -femit-bin=zig-out/bin/leann-bench \
-  --dep antfly_vector -Mroot=lib/vectorindex/src/leann_bench.zig \
-  --dep protobuf -Mantfly_vector=lib/vector/src/mod.zig \
-  -Mprotobuf=lib/protobuf/src/root.zig
-zig-out/bin/leann-bench --data PREFIX --n 100000 --queries 200 \
-  --metric cosine [--quantizer pq|rabitq] [--unpruned 1] [--cost FILE]
+zig build leann-bench -Doptimize=ReleaseFast
+zig-out/bin/leann_bench --data PREFIX --n 100000 --queries 200 \
+  --metric cosine [--quantizer pq|rabitq] [--unpruned 1] [--cost FILE] [--filtered 1]
 ```
 
 `PREFIX.train.f32` / `PREFIX.test.f32` hold a u32 row count, u32 dimension,
 then row-major f32s. Without `--data` it uses Gaussian clusters. `--cost`
 takes an embedder cost curve from `scripts/leann_embed_cost.py` and adds
 modeled embedding time per query.
+
+With `--filtered 1`, the benchmark compares widening an unfiltered result
+window, admitting only eligible nodes for exact verification, and directly
+scoring the allowlist with exact distances or RaBitQ bounds. It reports
+filtered recall, p50 and p99, embedding loads per query, and peak graph
+frontier size. Use `--filter-layout clustered` and `--filter-k N` to
+vary match locality and the result window. A stored-vector
+run measures CPU and vector access. Supply `--cost FILE` to model the
+additional transient re-embedding cost.
 
 GloVe-25 (ann-benchmarks `glove-25-angular`), first 100k vectors, 200
 queries, cosine, M=30, efC=128, single thread, recall@10 against brute force.
@@ -463,15 +469,15 @@ and rescores leaf members near the admission cutoff with extended codes
   deletes are idempotent, so replay after a crash is safe. Searches answer
   HBC's `SearchRequest` with HBC's `SearchResults`, applying `filter_ids`,
   `exclude_ids`, the key predicate, the metadata prefix and distance limits
-  to an over-fetched candidate list. Exact distances come from HBC's
-  external vector loader (the stored embedding artifact, or the document
-  field for direct-field indexes). Explicit ID filters map directly to graph
-  nodes. Best-effort searches bound work for arbitrary predicates, so a very
-  selective filter can return fewer than `k`; search effort `1.0` instead
-  streams every live candidate once for complete coverage. Missing candidates are omitted
-  from best-effort results; complete-coverage requests fail if a live vector
-  cannot be loaded. Source identity mismatches are treated as unavailable
-  candidates rather than scoring a different revision.
+  before exact verification. Selective ID allowlists can score directly.
+  Persistent graph searches keep nonmatching nodes available for navigation
+  and widen their frontier as needed. Dirty replicated candidates load their
+  current vector before ranking. Transient searches capture owned candidates
+  before calling a provider, including dirty exact-buffer entries. Complete
+  effort scores every surviving candidate once in bounded batches. Missing
+  candidates are omitted from best-effort results; complete effort fails if
+  a live vector cannot be loaded. Searches report proven exhaustion or a
+  proven surplus when their verification establishes it.
 - **Persistence.** `sync` (called from `IndexManager.syncAll`, before the
   applied sequence is recorded) writes `leann.store` atomically with a CRC:
   the key map, the exact buffer, and the serialized graph. When at least
@@ -719,14 +725,22 @@ read lock. Scoring uses that owned plan and a pinned primary read generation,
 so writes and replicated graph updates can proceed during provider calls.
 A primary commit during inference restarts the complete query attempt, including
 composed ranking, using the completed recovery cache entries. Re-embedding time
-remains cumulative across these attempts. Cache hits and stored-vector reads
+remains cumulative across these attempts. At most three generation retries
+are admitted; continued churn returns retryable `StorageBusy`. The first
+search on an aggregation lease uses the same handoff. Once a lease exposes
+results or readers, its generation stays fenced for subsequent operations.
+Recovery requests own producer and chunker configuration across the handoff.
+Cache hits and stored-vector reads
 keep their short query fence. Candidate metadata and scoring scratch count against the dense-search working
 set budget. Full-effort plans retain the live candidate list and score vectors
 in bounded batches.
 
-Retained query cuts read their own sources and share reference-counted provider
-ownership. Provisioned readers reconstruct provider configuration from the
-retained index catalog. Lazy setup observes the initiating request's deadline
+Retained query cuts read their own sources and lazily reconstruct managed
+providers from their retained index catalog. Cold provisioning recipes fork
+without initializing the live catalog. One reconstruction service owner survives removal of the last live producer.
+Provider service lifetimes use reference counting; legacy custom callbacks can be shared when their named configuration
+still matches. Custom providers that support changing catalogs can implement
+`clone_for_indexes_fn`. Lazy setup observes the initiating request's deadline
 and cancellation before returning, including during uncached-handle cleanup.
 
 Int8 media quantization is irreversible. A full-vector consumer added after

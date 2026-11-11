@@ -176,6 +176,8 @@ pub const ReplayPublication = struct {
 
 /// Read-handle-owned provider construction. Called only on a cold stub miss.
 pub const QueryRecoveryFactory = struct {
+    /// Fork a lazy owner for an immutable retained catalog, without discovery.
+    fork: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!QueryRecoveryFactory = null,
     ptr: *anyopaque,
     create: *const fn (*anyopaque, @import("antfly_inference_execution_context").RequestContext) anyerror!enrichment_runtime_mod.Config,
     release: *const fn (*anyopaque) void,

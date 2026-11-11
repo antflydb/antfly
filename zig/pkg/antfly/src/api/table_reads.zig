@@ -12772,12 +12772,16 @@ fn queryDbDetailed(
         const retained = retained: {
             var opened = try db.openQueryCut(cut, req.cancellation orelse .none);
             errdefer opened.close();
-            for (opened.core.index_manager.dense_indexes.items) |entry| {
-                if (!entry.leann_transient) continue;
-                const indexes_json = try retainedRecoveryIndexesJson(alloc, &opened);
-                defer alloc.free(indexes_json);
-                try attachProvisionedQueryRecovery(&opened, indexes_json, runtime_cfg.forTable(table_name));
-                break;
+            // DB cuts already fork an attached recipe. A source with no
+            // current transient index still needs the historical recipe here.
+            if (opened.async_context.query_recovery_runtime == null) {
+                for (opened.core.index_manager.dense_indexes.items) |entry| {
+                    if (!entry.leann_transient) continue;
+                    const indexes_json = try retainedRecoveryIndexesJson(alloc, &opened);
+                    defer alloc.free(indexes_json);
+                    try attachProvisionedQueryRecovery(&opened, indexes_json, runtime_cfg.forTable(table_name));
+                    break;
+                }
             }
             break :retained opened;
         };
@@ -13164,6 +13168,11 @@ const ProvisionedQueryRecovery = struct {
         return recovery;
     }
 
+    fn fork(raw: *anyopaque, alloc: std.mem.Allocator, indexes_json: []const u8) !db_mod.DB.QueryRecoveryFactory {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return try provisionedQueryRecoveryFactory(alloc, indexes_json, self.cfg, self.io);
+    }
+
     fn release(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         var arena = self.arena;
@@ -13173,7 +13182,13 @@ const ProvisionedQueryRecovery = struct {
 
 fn attachProvisionedQueryRecovery(db: *db_mod.DB, indexes_json: []const u8, cfg: ManagedReadRuntimeConfig) !void {
     const io = db.backend_runtime.io() orelse return;
-    var arena = std.heap.ArenaAllocator.init(db.runtime_alloc);
+    const factory = try provisionedQueryRecoveryFactory(db.runtime_alloc, indexes_json, cfg, io);
+    errdefer factory.release(factory.ptr);
+    try db.attachLazyQueryRecovery(factory);
+}
+
+fn provisionedQueryRecoveryFactory(backing: std.mem.Allocator, indexes_json: []const u8, cfg: ManagedReadRuntimeConfig, io: std.Io) !db_mod.DB.QueryRecoveryFactory {
+    var arena = std.heap.ArenaAllocator.init(backing);
     errdefer arena.deinit();
     const alloc = arena.allocator();
     const owner = try alloc.create(ProvisionedQueryRecovery);
@@ -13187,7 +13202,7 @@ fn attachProvisionedQueryRecovery(db: *db_mod.DB, indexes_json: []const u8, cfg:
         .io = io,
         .arena = arena,
     };
-    try db.attachLazyQueryRecovery(.{ .ptr = owner, .create = ProvisionedQueryRecovery.create, .release = ProvisionedQueryRecovery.release });
+    return .{ .fork = ProvisionedQueryRecovery.fork, .ptr = owner, .create = ProvisionedQueryRecovery.create, .release = ProvisionedQueryRecovery.release };
 }
 
 fn loadTableIndexesJson(
@@ -33815,12 +33830,27 @@ fn implementationTests() type {
             const retained_config = try retainedRecoveryIndexesJson(alloc, &db);
             defer alloc.free(retained_config);
             try attachProvisionedQueryRecovery(&db, retained_config, .{ .backend_runtime = runtime.ptr(), .antfly_provider = provider });
+            // Fork from the retained catalog without initializing the live
+            // catalog. A broken live definition cannot block a historical read.
+            const live_factory = db.async_context.query_recovery_factory.?;
+            const live_recipe: *ProvisionedQueryRecovery = @ptrCast(@alignCast(live_factory.ptr));
+            live_recipe.indexes_json = "{\"unavailable-live-model\":{}}";
+            const forked = try live_factory.fork.?(live_factory.ptr, alloc, retained_config);
+            const before_fork_attach = mock.calls.load(.monotonic);
+            try db.attachLazyQueryRecovery(forked);
+            try std.testing.expectEqual(before_fork_attach, mock.calls.load(.monotonic));
             db.core.index_manager.leann_reembed_cache.deinit(alloc);
             const cold_calls = mock.calls.load(.monotonic);
             var retained_result = try entry.index.searchWithRequest(.{ .query = &.{ 1, 17, 289, 0 }, .k = 1, .search_effort = 1 });
             defer retained_result.deinit();
             try std.testing.expectEqual(@as(usize, 1), retained_result.items.items.len);
             try std.testing.expect(mock.calls.load(.monotonic) > cold_calls);
+            const retained_dense = db.async_context.query_recovery_runtime.?.config.dense_embedder.?;
+            const cloned_dense = try retained_dense.clone_for_indexes_fn.?(retained_dense.ptr, alloc, retained_config, .{ .io = runtime.ptr().io().?, .deadline_ns = null });
+            defer cloned_dense.deinit(alloc);
+            const cloned_vector = try cloned_dense.embedDense(alloc, "semantic", "17", 4);
+            defer alloc.free(cloned_vector);
+            try std.testing.expectEqual(@as(usize, 4), cloned_vector.len);
 
             // A filesystem-only runtime cannot initialize query inference.
             var filesystem_runtime = try db_mod.background_runtime.BackendRuntimeHandle.initManualWithOwnedFilesystemIo(alloc);

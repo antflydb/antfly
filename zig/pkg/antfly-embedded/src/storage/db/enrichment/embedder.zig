@@ -101,6 +101,8 @@ pub const TextDispatchAccounting = struct {
 };
 
 pub const DenseEmbedder = struct {
+    /// Reconstruct from a retained catalog while sharing external services.
+    clone_for_indexes_fn: ?*const fn (*anyopaque, Allocator, []const u8, RequestContext) anyerror!DenseEmbedder = null,
     ptr: *anyopaque,
     dense_embed_fn: DenseEmbedFn,
     /// Stable effective provider/model/credential identity plus exact text and
