@@ -373,3 +373,14 @@ func TestGCSPreviewBoundsFilteredListing(t *testing.T) {
 		t.Fatalf("expected bounded preview, got %d pages and %v", pages, err)
 	}
 }
+
+func TestGCSPageProvenanceRequiresTextPublication(t *testing.T) {
+	connector := &GoogleConnector{ProviderName: ProviderGCS}
+	config := SourceConfig(`{"bucket":"projection","prefix":"pages/","page_provenance":true}`)
+	for _, publication := range []string{"", "native", "media", "text"} {
+		_, err := PublicationConnector(connector, Source{Config: config, Publication: publication})
+		if (err == nil) != (publication == "text") {
+			t.Errorf("publication %q returned %v", publication, err)
+		}
+	}
+}
