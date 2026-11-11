@@ -384,6 +384,12 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
             }
         };
     }
+    // Graph and search aggregation execution require their own native ports;
+    // reject them before selecting a publication rather than dropping clauses.
+    if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.aggregations_json.len != 0) return error.UnsupportedQueryRequest;
+    if (req.full_text != null and req.query != .match_all) return error.UnsupportedQueryRequest;
+    // Reject unavailable serving authority before resolving storage or credentials.
+    const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return error.ExternalLakeIndexUnavailable;
     // One stable artifact client serves descriptor admission, the retained
     // manifest and index reads. Dropping temporary clients between these steps
     // discards their live connection pools on every cold/current preparation.
@@ -407,12 +413,7 @@ fn prepare(backing: A, server: *server_api.ApiHttpServer, current_table: local.c
         retained = retained_pin.?.descriptor;
         table.lake_index_catalog_json = try local.metadata_lake_index_catalog.encode(ra, .{ .namespace = retained.?.publication.namespace, .generation = retained.?.publication.generation, .published = retained.?.publication });
     };
-    // Graph and search aggregation execution require their own native ports;
-    // reject them before selecting a publication rather than dropping clauses.
-    if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.aggregations_json.len != 0) return error.UnsupportedQueryRequest;
-    if (req.full_text != null and req.query != .match_all) return error.UnsupportedQueryRequest;
     var context: Context = .{ .trace = &prepared.io_trace, .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
-    const authority = server.source.lakeIndexLifecycleAuthority(request) orelse return error.ExternalLakeIndexUnavailable;
     var state = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
     defer if (!transferred) state.deinit();
     const publication = state.value.published orelse return error.ExternalLakeIndexNotPublished;
