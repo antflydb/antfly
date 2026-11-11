@@ -129,6 +129,9 @@ class SourcesClient(_SourceTransport):
     def preview_processing(self, source_id: str, preset: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", f"/sources/{quote(source_id, safe='')}/processing-preview", preset)
 
+    def query_knowledge(self, source_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        return self._request("POST", f"/sources/{quote(source_id, safe='')}/knowledge-query", request)
+
     def processing_job(self, source_id: str, request: dict[str, Any]) -> dict[str, Any]:
         return self._request("POST", f"/sources/{quote(source_id, safe='')}/processing-jobs", request)
 
@@ -136,7 +139,7 @@ class SourcesClient(_SourceTransport):
         return self._request(
             "PUT",
             f"/sources/{quote(source['id'], safe='')}",
-            {key: value for key, value in source.items() if key != "search_status"},
+            {key: value for key, value in source.items() if key not in ("search_status", "knowledge_status")},
         )
 
     def remove_source(self, source_id: str, *, purge: bool = False) -> dict[str, Any]:

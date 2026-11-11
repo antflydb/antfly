@@ -947,7 +947,8 @@ pub const Adapter = struct {
     fn requireUnprotectedMutation(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !void {
         const source = self.server.table_reads orelse return;
         if (source.vtable.privacy_policy_version == null) return;
-        const version = try source.privacyPolicyVersion(alloc, table.physical_name, self.context.deadline_ns);
+        const native_context = try self.context.platformDeadline();
+        const version = try source.privacyPolicyVersion(alloc, table.physical_name, native_context.deadline_ns);
         if (!std.mem.allEqual(u8, &version, 0)) return error.UnsupportedSqlExecution;
     }
 

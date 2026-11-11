@@ -142,6 +142,9 @@ def main():
                     **os.environ,
                     "GOWORK": "off",
                     "ANTFLY_SOURCES_E2E_URL": f"http://127.0.0.1:{api_port}/db/v1",
+                    "ANTFLY_SOURCES_KNOWLEDGE_RESTART_STATE": str(
+                        state / "knowledge-restart.json"
+                    ),
                 }
                 subprocess.run(
                     [
@@ -152,7 +155,7 @@ def main():
                         "-count=1",
                         "-v",
                         "-run",
-                        "^TestNative(SourceSearchStreams|TranscriptSearchEvidence|PDFInputAdmission)$",
+                        "^TestNative(SourceSearchStreams|TranscriptSearchEvidence|PDFInputAdmission|SourceKnowledge|SourceKnowledgePrefixResolution|SourceKnowledgeRecipeMigration)$",
                         "-timeout",
                         "4m",
                     ],
@@ -160,6 +163,62 @@ def main():
                     env=env,
                     check=True,
                     timeout=270,
+                )
+                subprocess.run(
+                    [
+                        "go",
+                        "-C",
+                        "go/pkg/sources",
+                        "run",
+                        "./examples/source-knowledge",
+                        "--endpoint",
+                        env["ANTFLY_SOURCES_E2E_URL"],
+                        "--catalog",
+                        str(state / "knowledge-catalog.json"),
+                    ],
+                    cwd=root,
+                    env=env,
+                    check=True,
+                    timeout=150,
+                )
+                # Reopen the same durable owner and qualify migrated recipes,
+                # shared curation and owner retraction without rebuilding inputs.
+                command = server.args
+                server.terminate()
+                server.wait(timeout=15)
+                server = subprocess.Popen(
+                    command, cwd=root, stdout=log, stderr=subprocess.STDOUT
+                )
+                deadline = time.monotonic() + 45
+                while True:
+                    if server.poll() is not None:
+                        raise RuntimeError("native owner exited during restart")
+                    try:
+                        with socket.create_connection(
+                            ("127.0.0.1", api_port), timeout=0.2
+                        ):
+                            break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("restarted native owner did not listen")
+                        time.sleep(0.1)
+                subprocess.run(
+                    [
+                        "go",
+                        "-C",
+                        "go/pkg/sources",
+                        "test",
+                        "-count=1",
+                        "-v",
+                        "-run",
+                        "^TestNativeSourceKnowledgeAfterRestart$",
+                        "-timeout",
+                        "3m",
+                    ],
+                    cwd=root,
+                    env=env,
+                    check=True,
+                    timeout=210,
                 )
             except BaseException:
                 log.flush()

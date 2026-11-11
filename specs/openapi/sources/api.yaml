@@ -338,6 +338,7 @@ components:
           type: array
           maxItems: 64
           items: {$ref: './management.yaml#/components/schemas/ArtifactBinding'}
+        knowledge: {$ref: './management.yaml#/components/schemas/KnowledgeDeclaration'}
         processing: {$ref: './management.yaml#/components/schemas/ProcessingDeclaration'}
         identity: {$ref: '#/components/schemas/SourceIdentity'}
     Profile:

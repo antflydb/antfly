@@ -19,6 +19,8 @@ const std = @import("std");
 const A = std.mem.Allocator;
 const indexed = @import("indexed.zig");
 pub const Source = struct {
+    acquisition_id: ?[]const u8 = null,
+    knowledge: ?std.json.Value = null,
     search_version: u32 = 1,
     artifacts: []const std.json.Value = &.{},
     fields: ?@import("record_view.zig").Fields = null,
@@ -50,7 +52,7 @@ pub fn table(source: Source) !indexed.Table {
         for (id) |char| if (!std.ascii.isAlphanumeric(char) and char != '_' and char != '-') return error.InvalidSourceCatalog;
     }
     if (!std.mem.eql(u8, source.status, "searchable") and !std.mem.eql(u8, source.status, "pending") and !std.mem.eql(u8, source.status, "syncing") and !std.mem.eql(u8, source.status, "stale")) return error.InvalidSourceCatalog;
-    return .{ .search_version = source.search_version, .artifacts = source.artifacts, .fields = source.fields, .streams = source.streams, .name = source.id, .alias = source.alias, .table = source.table, .source_id = source.id, .document_field = source.document_field, .source_filter = source.filter, .access_id = source.access_id, .status = source.status, .valid_until = source.valid_until, .published_revision = source.published_revision };
+    return .{ .acquisition_id = source.acquisition_id, .knowledge = source.knowledge, .search_version = source.search_version, .artifacts = source.artifacts, .fields = source.fields, .streams = source.streams, .name = source.id, .alias = source.alias, .table = source.table, .source_id = source.id, .document_field = source.document_field, .source_filter = source.filter, .access_id = source.access_id, .status = source.status, .valid_until = source.valid_until, .published_revision = source.published_revision };
 }
 pub fn load(a: A, io: std.Io, path: []const u8) ![]const u8 {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(32 * 1024 * 1024));
@@ -227,4 +229,15 @@ test "media bindings cannot be interpreted as text tables" {
     var invalid = media;
     invalid.document_version = 1;
     try std.testing.expectError(error.UnsupportedSourceKind, table(invalid));
+}
+
+test "portable source acquisition and knowledge metadata survive strict catalog decoding" {
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(Catalog, a,
+        \\{"version":2,"endpoint":"http://127.0.0.1:8080/db/v1","sources":[{"id":"source","table":"docs","status":"searchable","filter":{},"acquisition_id":"current-config","knowledge":{"version":1}}]}
+    , .{});
+    defer parsed.deinit();
+    const binding = try table(parsed.value.sources[0]);
+    try std.testing.expectEqualStrings("current-config", binding.acquisition_id.?);
+    try std.testing.expectEqual(@as(i64, 1), binding.knowledge.?.object.get("version").?.integer);
 }

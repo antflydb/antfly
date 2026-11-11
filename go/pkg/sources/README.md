@@ -984,3 +984,21 @@ for search_version=2, semantic-only media, complete query compatibility, externa
 vector admission, generic artifact discovery, standalone processing/search commands,
 Colony integration and the model-free local fixture. Legacy TextStream declarations
 remain supported; processing configuration does not change acquisition identity.
+
+## Source knowledge
+
+Optional `knowledge` version 1 discovers native extractor outputs, resolver-backed
+entities and source-owned graphs alongside SearchStreams. See
+[Source knowledge](../../../docs/design/source-knowledge.md) for native builders,
+stable namespaces, curation references, temporal/current-state semantics, bounded
+queries, the standalone fixture and Colony deployment controls. Knowledge is
+fail-closed by default and requires an operator-enforced one-instance/one-audience
+boundary; source JSON cannot enable that boundary.
+
+Discovery-only edits reuse a completed publication only when its canonical
+acquisition identity (including the row-key namespace) and published revision
+match the local publication receipt. JSON object ordering does not change that
+identity. The receipt is written after successful inventory and catalog
+publication; interrupted publication or older state without a receipt requires a
+normal sync before discovery can be refreshed. Refresh never extends the access
+lease or relabels an old row-key generation.

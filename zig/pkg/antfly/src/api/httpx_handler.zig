@@ -10067,7 +10067,8 @@ pub const AntflyApiHandler = struct {
         if (http_server_mod.permissionsAllow(principal.permissions, .table, table, .admin)) return true;
         const reads = self.api_server.table_reads orelse return true;
         if (reads.vtable.privacy_policy_version == null) return true;
-        const version = try reads.privacyPolicyVersion(ctx.allocator, table, operationContext(ctx, identity).deadline_ns);
+        const native_context = try operationContext(ctx, identity).platformDeadline();
+        const version = try reads.privacyPolicyVersion(ctx.allocator, table, native_context.deadline_ns);
         return std.mem.allEqual(u8, &version, 0);
     }
 

@@ -64,6 +64,11 @@ func (r CatalogRecord) Validate() error {
 	if r.Version != CatalogRecordVersion || r.DocType != "source_catalog" || !canonicalID(r.Source.ID) || r.Source.Table == "" || (r.DocumentVersion < 3 && r.Source.DocumentField != "grep") || (r.DocumentVersion != 1 && r.DocumentVersion != 2 && r.DocumentVersion != SourceRecordVersion) || r.Provider == "" || r.Source.AccessID != "" {
 		return fmt.Errorf("invalid source catalog record")
 	}
+	if r.Source.Knowledge != nil {
+		if err := ValidateKnowledge(r.Source.Knowledge, r.Source.Knowledge.Audience); err != nil {
+			return err
+		}
+	} // Structural validation, never an authorization grant.
 	if r.DocumentVersion == SourceRecordVersion {
 		if r.Source.DocumentVersion != SourceRecordVersion || r.Source.Fields == nil || r.Source.Fields.Permissions == "" || r.Source.Fields.URI == "" || r.Source.Fields.Path == "" || r.Source.Fields.Revision == "" || r.Source.Fields.IndexedAt == "" {
 			return fmt.Errorf("source catalog requires explicit identity and permission fields")

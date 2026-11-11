@@ -30,6 +30,8 @@ import (
 
 // Publisher writes the ordinary Antfly table API. It installs no new database
 // routes and never treats a local catalog as server-side authorization.
+type responseLimitKey struct{}
+
 type Publisher struct {
 	Endpoint, Token string
 	Client          *http.Client
@@ -91,11 +93,15 @@ func (p *Publisher) callContentType(ctx context.Context, method, path string, bo
 		return nil, err
 	}
 	defer response.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(response.Body, 8<<20+1))
+	limit := 8 << 20
+	if requested, ok := ctx.Value(responseLimitKey{}).(int); ok && requested > 0 && requested < limit {
+		limit = requested
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, int64(limit)+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(data) > 8<<20 {
+	if len(data) > limit {
 		return nil, fmt.Errorf("Antfly response exceeds budget")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {

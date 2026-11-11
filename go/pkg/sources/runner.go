@@ -16,6 +16,7 @@
 package sources
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -55,6 +56,7 @@ type Identity struct {
 	Namespace string `json:"namespace,omitempty"`
 }
 type Source struct {
+	Knowledge     *KnowledgeDeclaration  `json:"knowledge,omitempty"`
 	Processing    *ProcessingDeclaration `json:"processing,omitempty"`
 	SearchVersion int                    `json:"search_version,omitempty"`
 	Artifacts     []ArtifactBinding      `json:"artifacts,omitempty"`
@@ -72,6 +74,7 @@ type Source struct {
 	Identity             Identity        `json:"identity,omitzero"`
 }
 type Runner struct {
+	KnowledgeAudience string // Trusted deployment boundary, never source configuration.
 	// SourceID selects one source while retaining the complete profile/catalog.
 	// Filtering Profile.Sources would incorrectly retire unrelated bindings.
 	SourceID string
@@ -186,7 +189,7 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 		if alias == "" {
 			alias = source.ID
 		}
-		binding := Binding{SearchVersion: source.SearchVersion, Artifacts: source.Artifacts, ID: source.ID, Alias: alias, Table: source.Table, DocumentVersion: SourceRecordVersion, Fields: CanonicalDocumentFields(), Streams: source.Streams, Filter: SourceFilter(source.ID), Status: "pending"}
+		binding := Binding{Knowledge: source.Knowledge, SearchVersion: source.SearchVersion, Artifacts: source.Artifacts, ID: source.ID, Alias: alias, Table: source.Table, DocumentVersion: SourceRecordVersion, Fields: CanonicalDocumentFields(), Streams: source.Streams, Filter: SourceFilter(source.ID), Status: "pending"}
 		if len(binding.Streams) == 0 && source.Publication != "media" {
 			binding.Streams = DefaultSearchStreams(source.SearchVersion)
 		}
@@ -195,6 +198,7 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 			binding.Publication = "native"
 		}
 		if prior, ok := old[source.ID]; ok && prior.Table == source.Table && binding.SameRecordLayout(prior) {
+			binding.AcquisitionID = prior.AcquisitionID
 			binding.Status = prior.Status
 			binding.ValidUntil = prior.ValidUntil
 			binding.PublishedRevision = prior.PublishedRevision
@@ -226,10 +230,15 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 			if err := r.Publisher.EnsureTable(ctx, source.Table); err != nil {
 				return err
 			}
-			if err := ReconcileProcessing(ctx, r.Publisher, source.Table, source.Processing); err != nil {
+			if err := ReconcileSourceSearch(ctx, r.Publisher, source, r.KnowledgeAudience); err != nil {
+				return err
+			}
+		} else if source.Knowledge != nil {
+			if err := ValidateInstalledKnowledge(ctx, r.Publisher, Binding{Table: source.Table, Knowledge: source.Knowledge}, r.KnowledgeAudience); err != nil {
 				return err
 			}
 		}
+		catalog.Sources[i].AcquisitionID = ""
 		catalog.Sources[i].Status = "syncing"
 		catalog.Sources[i].PublishedRevision = ""
 		catalog.Sources[i].ValidUntil = nil
@@ -252,6 +261,12 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 		until := started + int64(ttl)
 		// Each successful publication gets a new fence even for an unchanged inventory.
 		revision += ":" + rand.Text()
+		if source.Knowledge != nil {
+			catalog.Sources[i].AcquisitionID, err = sourceAcquisitionIdentity(source, connection)
+			if err != nil {
+				return err
+			}
+		}
 		catalog.Sources[i].PublishedRevision = revision
 		catalog.Sources[i].Status = "searchable"
 		catalog.Sources[i].ValidUntil = &until
@@ -259,6 +274,16 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 			return err
 		}
 		if err := writeJSON(r.CatalogPath, catalog, 32<<20); err != nil {
+			return err
+		}
+		// Tie the completed acquisition to the catalog fence only after both
+		// publications succeed. A crash before this checkpoint fails closed.
+		identity, err := sourceAcquisitionIdentity(source, connection)
+		if err != nil {
+			return err
+		}
+		receipt := completedPublication{Identity: identity, Revision: revision, Endpoint: r.Profile.Endpoint, Table: source.Table, SourceID: source.ID}
+		if err := writeJSON(filepath.Join(r.StateDir, source.ID+".publication.json"), receipt, 1<<20); err != nil {
 			return err
 		}
 	}
@@ -286,6 +311,9 @@ func (r *Runner) validate() error {
 		}
 		if !canonicalID(s.ID) || seen[s.ID] || s.Table == "" || strings.ContainsAny(s.Table, "\x00\r\n") || s.Table == "." || s.Table == ".." || s.Permissions == nil {
 			return fmt.Errorf("source needs a unique UUID, destination and explicit permissions")
+		}
+		if err := ValidateKnowledgeProcessing(s.Knowledge, s.Processing, r.KnowledgeAudience); err != nil {
+			return err
 		}
 		if err := ValidateProcessing(s.Processing); err != nil {
 			return err
@@ -337,6 +365,7 @@ func canonicalID(id string) bool {
 func sourceConfigurationHash(source Source, connection Connection) (string, error) {
 	source.Alias = ""
 	source.Streams = nil // Search/producer bindings do not change acquired bytes.
+	source.Knowledge = nil
 	source.Artifacts = nil
 	source.SearchVersion = 0
 	source.Processing = nil
@@ -691,7 +720,7 @@ func loadJSON(path string, out any, limit int64) error {
 	if int64(len(raw)) > limit {
 		return fmt.Errorf("JSON state exceeds budget")
 	}
-	return json.Unmarshal(raw, out)
+	return decodeJSONExact(raw, out)
 }
 func writeJSON(path string, value any, limit int64) error {
 	raw, err := json.Marshal(value)
@@ -843,4 +872,49 @@ func UsesNativeResource(source Source, item Item) bool {
 // Provider authentication and resource allowlists remain the runtime's job.
 func PublicationConnector(connector Connector, source Source) (Connector, error) {
 	return publicationConnector(connector, source)
+}
+
+// Preserve opaque native configuration integers throughout profile persistence
+// and copying. Typed integer fields continue to use their ordinary decoders.
+func decodeJSONExact(raw []byte, out any) error {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.UseNumber()
+	if err := d.Decode(out); err != nil {
+		return err
+	}
+	if err := d.Decode(new(any)); err != io.EOF {
+		return fmt.Errorf("expected exactly one JSON value")
+	}
+	return nil
+}
+
+// Publication identity includes row keying as well as acquired content/access.
+// Processing-only edits are deliberately excluded; key migrations and provider
+// selection edits cannot reuse a previous publication's authority.
+func sourceAcquisitionIdentity(source Source, connection Connection) (string, error) {
+	// A management client may reorder JSON object keys without changing the
+	// selected acquisition. Preserve numbers while canonicalizing that witness.
+	if len(source.Config) > 0 {
+		var config any
+		if err := decodeJSONExact(source.Config, &config); err != nil {
+			return "", err
+		}
+		canonical, err := json.Marshal(config)
+		if err != nil {
+			return "", err
+		}
+		source.Config = canonical
+	}
+	if connection.Provider == ProviderGoogleWorkspace {
+		connection.Services = nil
+	}
+	hash, err := sourceConfigurationHash(source, connection)
+	if err != nil {
+		return "", err
+	}
+	raw, err := json.Marshal([]string{hash, source.Identity.Namespace})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(raw)), nil
 }

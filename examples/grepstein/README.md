@@ -184,22 +184,33 @@ The showcase OCR profile uses revision-pinned LightOnOCR-3-4B on shared Antfly
 inference. Qualify both reader sizes on the deployed pool and run a representative
 PDF pilot before backfill. Its native `/read` contract uses
 an image-only prompt; the extraction producer sends no prompt to readers.
-The profile requests at most 2048 output tokens per page. A cached dense DOJ
-page exceeded the earlier 512-token allowance; both reader checkpoints completed
-it at 2048 and retained the checked page-tail text. This is a bounded sample,
-not a completeness guarantee for every page. The serving policy must permit
-`resources.inference.request_limits.max_output_tokens_per_item: 2048` and at
-least 12 `resources.inference.admission.max_work_units` for one image-only
-request. Keep request concurrency at one while qualifying the intended GPU and
-memory limits. The deployed 512-token/eight-unit policy needs a separately
-reviewed update before this profile can be used there.
-Truncated OCR returns an error instead of publishing incomplete text. Do not
-count failed or truncated pages as searchable. Complete the
+The profile permits up to 8192 output tokens per page, matching the native
+reader's dense-page ceiling. Redacted DOJ call-detail tables can exceed 2048
+because their HTML table structure and repeated redaction cells are part of the
+transcription. A full call-detail page that truncated at 2048 completed on
+rc.14 with 6994 output tokens at the 8192 ceiling, including its closing table
+and page footer. This single-page result establishes capacity for that sample;
+verify the remaining corpus and deployed pool separately. The serving policy
+must also permit
+`resources.inference.request_limits.max_output_tokens_per_item: 8192`.
+A larger ceiling increases per-request work and KV admission; it does not change
+memory, concurrency, or batch limits. Size the work budget for the intended
+parallelism as well: an image-only 8192-token LightOn request uses 36 work units,
+so four independent requests need 144 units with the current admission policy.
+Completed short pages still stop at EOS.
+Use `--reader-max-output-tokens 8192` with
+`zig/tools/qualify_reader_generator_pools.py` to exercise its exact rejection
+boundary. The synthetic probe does not establish corpus coverage.
+
+Truncated OCR remains an extraction failure. Inspect every page's completion
+status and retained-text warning; neither readable older text nor a converged
+merge proves that OCR completed. Run the
 [release qualification](../../docs/design/inference/grepstein-release-qualification.md)
-before backfill or enrichment. `zig/tools/qualify_reader_generator_pools.py`
-uses a 512-token reader policy by default; pass
-`--reader-max-output-tokens 2048` to check the larger serving ceiling and its
-exact rejection boundary. Its synthetic pass does not establish corpus coverage.
+before backfill or enrichment, and use durable table repair jobs for long-running
+retries. Pages that still truncate at the allowed ceiling require inspection and
+an explicitly qualified extraction strategy; never discard their warnings or
+mark them repaired merely because a manifest exists.
+
 The LightOnOCR models return
 Markdown, including table structure, through the same native reader API.
 `ocr.render.sampling` defaults to `auto`: smooth continuous-tone PDF images
