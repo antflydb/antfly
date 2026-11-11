@@ -293,7 +293,7 @@ not bypass table identity checks or infer complete coverage from accepted rows.
 
 ```sh
 ./grepstein enrich --url "$ANTFLY_URL" --stage semantic \
-  --embedder-config vertex-embedder.example.json
+  --embedder-config antfly-embedder.example.json
 ./grepstein wait --url "$ANTFLY_URL" --index embeddings
 ./grepstein enrich --url "$ANTFLY_URL" --stage graph
 ./grepstein graph --state ./grepstein-corpus --url "$ANTFLY_URL"
@@ -301,7 +301,8 @@ not bypass table identity checks or infer complete coverage from accepted rows.
 ./grepstein wait --url "$ANTFLY_URL" --index autograph_relations
 ```
 
-The showcase Vertex profile selects **`gemini-embedding-2`**, project
+The alternative `--embedder-config vertex-embedder.example.json` profile selects
+**`gemini-embedding-2`**, project
 `antfly-showcases`, location `global`, and 3072 dimensions. The index, generated
 embedding artifacts, and query embedder share the same dimensions/provider.
 The stable Google model ID is not `gemini-embedding-002`. The native adapter uses
@@ -344,8 +345,9 @@ page provenance, detects superseded extraction revisions, and reconciles stale
 unit rows. Relationship neighborhoods/path evidence are model outputs requiring
 inspection, not verified factual claims.
 
-V1 OCR uses the native Vertex reader with explicitly scoped Google identity.
-Colony's managed external gateway currently advertises text generation and
+The default OCR profile uses the native LightOnOCR reader through Antfly shared
+inference. The alternative Vertex profile requires explicitly scoped Google
+identity. Colony's managed external gateway currently advertises text generation and
 rejects image requests whose spend cannot be bounded. Do not point an OCR reader
 at that gateway and assume it works. Managed image billing/capability qualification,
 BYO Vertex connection UI/CLI, and Document AI OCR are separate follow-ups.
@@ -371,7 +373,10 @@ readiness is checked separately from source publication, including failed OCR.
 
 The binding maps the corpus's existing fields to source identity and permissions.
 New prepared rows include `indexed_at` and private `user:self` reader metadata;
-regenerate and publish older prepared rows before using the new binding. Local
+regenerate and publish older prepared rows before using the new binding. Preparation
+saves one `indexed_at` timestamp in `sources.json`, so resumed rows retain the
+same manifest bytes. Older preparation states without that timestamp require a
+new `--state`; do not edit sealed manifests to fabricate it. Local
 principal filtering narrows results; exposed APIs still require their own current
 caller authorization/RLS. The ordinary Antfly API and binding format are the
 same in Cloud and self-hosted deployments. Never distribute a write/admin key
@@ -379,6 +384,26 @@ with the binding.
 
 The former `--grep-table`, `--gcs-projection-bucket` and page source-job workflow
 are retired. Existing projection tables/buckets are not automatically deleted.
+
+### Local native smoke test
+
+Build both binaries from the same checkout, then run the real PDF-to-grep path:
+
+```sh
+(cd zig && zig build antfly grep -j2 -Doptimize=Debug)
+(cd examples/grepstein && GOWORK=off GOEXPERIMENT=simd \
+  ANTFLY_GREPSTEIN_E2E_BINARY="$PWD/../../zig/zig-out/bin/antfly" \
+  ANTFLY_GREPSTEIN_E2E_GREP_BINARY="$PWD/../../zig/zig-out/bin/antfly-grep" \
+  go test -run '^TestLocalNativeGCSExtraction$' -count=1 -v)
+```
+
+This starts a standalone Antfly server and a loopback GCS protocol fixture,
+extracts an actual digital-text PDF, qualifies the artifacts, and searches both
+native extraction units and chunks with the real grep CLI. It checks original
+source identity, no content reacquisition during grep, and rejection of
+out-of-scope or changed-generation objects. It does not qualify Cloud Workload
+Identity or GPU OCR, embeddings, or relationship extraction; those need a live
+sample on the deployed shared inference runtime.
 
 ## Explorer and hosting
 
@@ -425,7 +450,8 @@ are deferred; their raw originals can be preserved independently.
 ### Investigating incomplete OCR
 
 A manifest's `merge_status: converged` reports artifact publication, not OCR
-success. Inspect `ocr_failed_count` on document artifact summaries and run
+success. Inspect `ocr_failed_count` and the raw manifest's
+`incomplete_unit_count` and run
 `qualify` before declaring extraction complete. A nonempty text index can still
 contain embedded PDF text while OCR pages have failed. Failed OCR pages must not
 qualify for Antfly's unchanged-source fast path. Transient failures use the
