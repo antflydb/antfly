@@ -54,9 +54,20 @@ type archiveReceipt struct {
 	File            archiveFile `json:"file"`
 	SHA256          string      `json:"sha256"`
 	RetrievedAt     string      `json:"retrieved_at"`
+	MirrorStatus    string      `json:"mirror_reported_status,omitempty"`
 }
 
 func archiveItem(dataset string) string {
+	switch dataset {
+	case "doj-08":
+		return "epstein_library_transparency_act_hr_4405_dataset8"
+	case "doj-09":
+		return "epstein_library_transparency_act_hr_4405_dataset9_202602"
+	case "doj-10":
+		return "epstein_library_transparency_act_hr_4405_dataset10_202605"
+	case "doj-11":
+		return "epstein_library_transparency_act_hr_4405_dataset11_202602"
+	}
 	if dataset == "doj-12" {
 		return "epstein_library_transparency_act_hr_4405_dataset12_202602"
 	}
@@ -70,19 +81,22 @@ func archiveItem(dataset string) string {
 
 func fetchArchiveCmd(args []string) error {
 	f := flag.NewFlagSet("fetch-archive", flag.ContinueOnError)
-	selected := f.String("dataset", "all-small", "all-small or doj-01 through doj-07 / doj-12")
+	selected := f.String("dataset", "all-small", "all-small, all-large, or doj-01 through doj-12")
 	root := f.String("output", "./grepstein-archive", "Archived release ZIP directory")
+	expectedPlan := f.String("expected-plan-sha256", "", "Require this metadata-plan digest before downloading any content")
+	inventoryOnly := f.Bool("inventory-only", false, "Save archive metadata and a bounded acquisition plan without downloading content")
+	requestTimeout := f.Duration("timeout", 30*time.Minute, "Timeout for each archive request; large transfers may need several hours")
 	budget := f.Int64("max-bytes", 10<<30, "Maximum selected compressed archive bytes, including cached files")
 	if err := f.Parse(args); err != nil {
 		return err
 	}
-	if *budget < 1 {
-		return fmt.Errorf("max-bytes must be positive")
+	if *budget < 1 || *requestTimeout <= 0 {
+		return fmt.Errorf("max-bytes and timeout must be positive")
 	}
-	if *selected != "all-small" && archiveItem(*selected) == "" {
-		return fmt.Errorf("dataset is not in the small v1 release set")
+	if *selected != "all-small" && *selected != "all-large" && archiveItem(*selected) == "" {
+		return fmt.Errorf("unknown archived DOJ dataset")
 	}
-	client := &http.Client{Timeout: 30 * time.Minute, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+	client := &http.Client{Timeout: *requestTimeout, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		host := req.URL.Hostname()
 		if len(via) > 5 || req.URL.Scheme != "https" || req.URL.User != nil || (host != "archive.org" && !strings.HasSuffix(host, ".archive.org")) {
 			return fmt.Errorf("unexpected archive redirect")
@@ -97,9 +111,16 @@ func fetchArchiveCmd(args []string) error {
 		return err
 	}
 	defer unlock()
+	type acquisition struct {
+		Destination string         `json:"destination"`
+		Receipt     archiveReceipt `json:"receipt"`
+		Bytes       int64          `json:"bytes"`
+	}
+	var planned []acquisition
 	for _, dataset := range smallDatasets() {
 		item := archiveItem(dataset.ID)
-		if item == "" || (*selected != "all-small" && *selected != dataset.ID) {
+		large := dataset.ID >= "doj-08" && dataset.ID <= "doj-11"
+		if item == "" || (*selected == "all-small" && large) || (*selected == "all-large" && !large) || (*selected != "all-small" && *selected != "all-large" && *selected != dataset.ID) {
 			continue
 		}
 		response, err := client.Get("https://archive.org/metadata/" + item)
@@ -115,8 +136,11 @@ func fetchArchiveCmd(args []string) error {
 			return fmt.Errorf("archive metadata unavailable for %s", dataset.ID)
 		}
 		var metadata struct {
-			Files  []archiveFile `json:"files"`
-			IsDark bool          `json:"is_dark"`
+			Files    []archiveFile `json:"files"`
+			IsDark   bool          `json:"is_dark"`
+			Metadata struct {
+				Description string `json:"description"`
+			} `json:"metadata"`
 		}
 		if err := json.Unmarshal(body, &metadata); err != nil {
 			return err
@@ -154,15 +178,39 @@ func fetchArchiveCmd(args []string) error {
 		}
 		destination := filepath.Join(dir, name)
 		receipt := archiveReceipt{Dataset: dataset.ID, Item: item, URL: "https://archive.org/download/" + item + "/" + url.PathEscape(name), OfficialRelease: dataset.Release, OfficialStatus: "unresolved", File: file, RetrievedAt: time.Now().UTC().Format(time.RFC3339)}
-		fmt.Printf("%s: archived ZIP, %d bytes; current official status unresolved\n", dataset.ID, size)
-		if err := downloadArchive(client, destination, &receipt, size); err != nil {
-			return fmt.Errorf("%s: %w", dataset.ID, err)
+		receipt.MirrorStatus = "unspecified"
+		if strings.Contains(strings.ToLower(metadata.Metadata.Description), "incomplete") {
+			receipt.MirrorStatus = "incomplete"
 		}
-		if err := atomicCorpusJSON(destination+".json", receipt); err != nil {
+		planned = append(planned, acquisition{destination, receipt, size})
+	}
+	identities := make([]any, 0, len(planned))
+	for _, p := range planned {
+		identities = append(identities, []any{p.Receipt.Dataset, p.Receipt.Item, p.Receipt.URL, p.Receipt.File, p.Receipt.OfficialStatus, p.Receipt.MirrorStatus})
+	}
+	planData, _ := json.Marshal(identities)
+	planDigest := fmt.Sprintf("%x", sha256.Sum256(planData))
+	if *expectedPlan != "" && *expectedPlan != planDigest {
+		return fmt.Errorf("archive metadata changed: expected plan %s, got %s; review a new inventory", *expectedPlan, planDigest)
+	}
+	if err := atomicCorpusJSON(filepath.Join(*root, "acquisition-plan.json"), map[string]any{"sha256": planDigest, "archives": planned, "content_downloaded": false, "coverage": "archive snapshots; full official/media coverage unverified"}); err != nil {
+		return err
+	}
+	if *inventoryOnly {
+		return printCorpusJSON(planned)
+	}
+	for _, plan := range planned {
+		receipt := plan.Receipt
+		fmt.Printf("%s: archived ZIP, %d bytes; mirror status %s; current official status unresolved\n", receipt.Dataset, plan.Bytes, receipt.MirrorStatus)
+		if err := downloadArchive(client, plan.Destination, &receipt, plan.Bytes); err != nil {
+			return fmt.Errorf("%s: %w", receipt.Dataset, err)
+		}
+		if err := atomicCorpusJSON(plan.Destination+".json", receipt); err != nil {
 			return err
 		}
-		fmt.Printf("prepare --source %s=%s\n", dataset.ID, destination)
+		fmt.Printf("stage-originals --source %s=%s\n", receipt.Dataset, plan.Destination)
 	}
+
 	return nil
 }
 
@@ -208,33 +256,77 @@ func downloadArchive(client *http.Client, destination string, receipt *archiveRe
 			return nil
 		}
 	}
-	response, err := client.Get(receipt.URL)
+	identity, _ := json.Marshal([]any{receipt.URL, receipt.File})
+	binding := sha256.Sum256(identity)
+	partial := destination + ".partial-" + hex.EncodeToString(binding[:])
+	file, err := os.OpenFile(partial, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
-	if response.StatusCode != 200 {
-		return fmt.Errorf("archive download HTTP %d", response.StatusCode)
-	}
-	file, err := os.CreateTemp(filepath.Dir(destination), ".archive-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(file.Name())
 	defer file.Close()
-	digest, err := verify(io.TeeReader(response.Body, file))
+	info, err := file.Stat()
 	if err != nil {
 		return err
 	}
-	if err := file.Sync(); err != nil {
+	offset := info.Size()
+	if offset > size {
+		return fmt.Errorf("partial archive exceeds expected size")
+	}
+	if offset < size {
+		req, err := http.NewRequest(http.MethodGet, receipt.URL, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Accept-Encoding", "identity")
+		if offset > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		}
+		response, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer response.Body.Close()
+		if response.StatusCode == http.StatusOK {
+			if err := file.Truncate(0); err != nil {
+				return err
+			}
+			offset = 0
+		} else if offset == 0 || response.StatusCode != http.StatusPartialContent || response.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", offset, size-1, size) {
+			return fmt.Errorf("archive download rejected status/range: HTTP %d", response.StatusCode)
+		}
+		if _, err := file.Seek(offset, io.SeekStart); err != nil {
+			return err
+		}
+		n, copyErr := io.Copy(file, io.LimitReader(response.Body, size-offset+1))
+		if err := file.Sync(); err != nil {
+			return err
+		}
+		if n > size-offset {
+			os.Remove(partial)
+			return fmt.Errorf("archive exceeds expected size")
+		}
+		if copyErr != nil {
+			return copyErr
+		}
+		if n != size-offset {
+			return io.ErrUnexpectedEOF
+		}
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	digest, err := verify(file)
+	if err != nil {
+		os.Remove(partial)
 		return err
 	}
 	if err := file.Close(); err != nil {
 		return err
 	}
+
 	// Check the ZIP structure before making the download discoverable. HTML,
 	// partial archives, and archive-site derivatives never become source files.
-	z, err := zip.OpenReader(file.Name())
+	z, err := zip.OpenReader(partial)
 	if err != nil {
 		return err
 	}
@@ -243,7 +335,7 @@ func downloadArchive(client *http.Client, destination string, receipt *archiveRe
 		return fmt.Errorf("empty archive")
 	}
 	z.Close()
-	if err := os.Rename(file.Name(), destination); err != nil {
+	if err := os.Rename(partial, destination); err != nil {
 		return err
 	}
 	receipt.SHA256 = digest

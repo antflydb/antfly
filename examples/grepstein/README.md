@@ -5,7 +5,8 @@ Grepstein is the GCS-backed Antfly Cloud public-records showcase tracked in
 Antfly's native `document_extraction` artifacts. It has no DocsAF dependency.
 
 V1 indexes PDFs from DOJ datasets **1–7 and 12**. Indexing datasets **8–11 is
-deferred**, and the v1 downloader refuses them. Raw preservation is independent:
+deferred** in the default v1 workflow. Explicit large-archive acquisition and
+raw preservation are independent:
 `stage-originals` accepts PDFs, images, audio, video, and ancillary files from any
 explicitly supplied release directory or ZIP, including larger releases. The
 court collection can be supplied as an existing
@@ -115,10 +116,14 @@ Explicit local copies without acquisition receipts have no asserted official
 provenance. The catalog cannot be used as an Antfly load manifest.
 
 Uploads use ADC and the create-only publisher identity, with resumable GCS
-uploads, an 8 MiB upload buffer, and CRC32C validation before finalization.
+uploads, an 8 MiB buffer per in-flight upload, and CRC32C validation before
+finalization. Upload concurrency defaults to 8 (`--concurrency 1–16`), while
+catalog order and hashes remain deterministic. Active spool files are bounded
+by concurrency times the maximum object size; failed workers cancel siblings
+and remove their owned spools before returning.
 SHA-addressed objects are reused only after size/checksum verification; staged
-PDF originals use the same keys as subsequent PDF publication. ZIP members spool
-one at a time; scratch state must be outside input directories. Defaults cap
+PDF originals use the same keys as subsequent PDF publication. ZIP members are read/hashed one at a time and uploads run through the bounded
+worker window; scratch state must be outside input directories. Defaults cap
 total uncompressed inputs at 10 GiB, each original at 8 GiB, and a batch at two
 million files. Raise byte limits only for a reviewed batch and adequate worker
 scratch space. Split larger inventories into separate states.
@@ -132,8 +137,10 @@ them to the managed instance or existing source jobs.
 
 For releases 8–11, run bulk acquisition and staging on a separately approved
 Google Cloud worker rather than routing hundreds of GB through a laptop. The
-v1 downloader does not acquire those releases and this command does not provision
-that worker. Candidate archive metadata must be reviewed before transfer; some
+default acquisition selection remains the small releases. Explicit
+`fetch-archive --dataset all-large` supports selected large archive snapshots;
+it does not provision a worker or establish official completeness. Candidate
+archive metadata must be reviewed before transfer; some
 dataset 9 mirrors explicitly declare themselves incomplete. Record that as the
 **mirror's reported status**, separately from our **unverified dataset coverage**.
 It does not establish that every available copy of dataset 9 is incomplete.
@@ -506,3 +513,82 @@ content changes. The [native generation-cloning design](../../docs/design/source
 specifies the separate engine work needed to retain unchanged derived artifacts
 without full replacement writes. The qualification and load improvements here do
 not implement that engine feature.
+
+
+## Grow the qualified table without repeating sample OCR
+
+Keep the sample's table, state directory, sealed publication, document IDs,
+immutable GCS generations, page-window size, reader and index configuration.
+Raw staging never calls Antfly. Do not recreate the sample table or replace a
+managed source generation to perform this append.
+
+Prepare/publish each new batch into a separate state, then use the same table
+and the same reader/inference/semantic/graph/source-connection flags as the
+sample load. First inspect a read-only plan:
+
+```sh
+./grepstein load --state ./release-08 --url "$ANTFLY_URL" --table grepstein_corpus \
+  --append-only --accepted-state ./sample --plan-only
+# Repeat the same command without --plan-only to submit only absent documents.
+```
+
+The command streams the complete manifest through four bounded lookup workers
+before any writes, saving `append-plan.json` with new/reused counts and the
+manifest/table/configuration binding. Matching existing primary documents are
+reused without any write; a changed existing ID aborts the preflight. Uploader
+`indexed_at` alone is ignored during comparison. All source fields, permissions,
+and metadata remain significant. Newly absent IDs use an OCC transaction with
+version-zero predicates, so another writer cannot turn the append into an
+accidental update. A conflict or unknown commit outcome stops the command. Run
+it again with the same state: observed identical primaries are reused, including
+writes that committed before a response/checkpoint was lost. `load.json` is bound
+to append mode, preventing an accidental resume through ordinary upserts.
+
+Repeat `--accepted-state` for every completed prior batch in this table. These
+sealed catalogs detect identical immutable sources under different IDs across
+releases/mirrors. Such aliases currently stop with the canonical ID; they are
+not silently re-OCR'd, discarded, or granted new permissions. Reconcile them
+before publishing the append, retaining every source association in the raw
+originals catalogs. This is not automatic native artifact cloning. Source
+revisions, policy changes, producer changes, or repartitioning existing PDFs
+require an explicit update/migration rather than append mode. Coordinate table
+DDL/producer changes with the load; append does not hold an administrative lock.
+
+The native smoke covers digital PDFs and a PDF that actually invokes a loopback
+Reader fixture: load/qualify the sample, plan/append a second sealed catalog,
+resume, and query with `antfly-grep`. It asserts the sample's native extraction
+generation is unchanged, no extra sample Reader calls occur, and only the new
+PDF is fetched. It tests native OCR orchestration rather than model accuracy.
+
+## Preserve the large archive snapshots
+
+The [2026-11-11 candidate inventory](benchmarks/large-corpus-acquisition-2026-11-11.json)
+records four archive revisions: 229,696,444,373 compressed bytes and
+240,591,394,010 uncompressed bytes. Bounded ZIP-directory reads list 1,376,437
+PDFs, 1,491 videos, and 118 audio files plus metadata/attachments. These are
+metadata observations, not completed downloads or official coverage proofs.
+Dataset 9's selected mirror reports itself incomplete. Independent native-media
+collections and missing official files remain separate reconciliation work.
+
+`stage_large.py` defaults to metadata-only inventory. Run it on the dedicated
+staging worker with the built `grepstein` CLI, never on the application VM:
+
+```sh
+python3 stage_large.py --grepstein /usr/local/bin/grepstein \
+  --state /srv/grepstein/large
+# After reviewing the resulting acquisition-plan.json, use its stable digest.
+python3 stage_large.py --grepstein /usr/local/bin/grepstein \
+  --state /srv/grepstein/large --execute \
+  --expected-plan-sha256 750e308470b7046616906dce2c011accdc19422d8964e82ff2d79a1ade5e2f4a
+```
+
+The driver pins the metadata plan before content transfer; changed metadata
+requires a fresh inventory. Defaults bound compressed and total uncompressed
+inputs to 270 GB each, with an 8 GiB maximum member. Each release/revision seals
+its own raw GCS catalog. Downloads retain revision-bound partial files and resume
+only exact HTTP ranges, falling back to a full replacement download when a
+server ignores Range. Full size, SHA-1, MD5 and ZIP structure must validate before
+an archive becomes a usable source. Staging then verifies acquisition receipts,
+hashes every member, reuses verified GCS objects, and records object generations.
+No table keys, inference credentials, OCR, transcription or index creation are
+part of this command. Keep the current sample load running independently.

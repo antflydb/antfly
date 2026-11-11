@@ -29,7 +29,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/option"
@@ -228,5 +231,123 @@ func TestOriginalGCSUploadIsCreateOnlyAndChecksExistingBytes(t *testing.T) {
 	bad = true
 	if _, err := put(context.Background(), "private", "objects/test.mp4", bytes.NewReader(data), record); err == nil {
 		t.Fatal("reused different existing bytes")
+	}
+}
+
+func TestParallelOriginalUploadsRemainBoundedAndCatalogOrdered(t *testing.T) {
+	source := t.TempDir()
+	for i := 0; i < 9; i++ {
+		writeCorpusFixture(t, filepath.Join(source, fmt.Sprintf("%02d.pdf", i)), []byte(fmt.Sprintf("source-%d", i)))
+	}
+	var active, peak atomic.Int64
+	gate := make(chan struct{})
+	var open sync.Once
+	put := func(parallel bool) originalPut {
+		return func(ctx context.Context, _ string, key string, r io.ReadSeeker, record originalRecord) (string, error) {
+			if strings.HasPrefix(key, "originals-catalogs/") {
+				return "42", nil
+			}
+			if parallel {
+				n := active.Add(1)
+				defer active.Add(-1)
+				for old := peak.Load(); n > old; old = peak.Load() {
+					if peak.CompareAndSwap(old, n) {
+						break
+					}
+				}
+				if n == 3 {
+					open.Do(func() { close(gate) })
+				}
+				select {
+				case <-gate:
+				case <-ctx.Done():
+					return "", ctx.Err()
+				}
+			}
+			content, err := io.ReadAll(r)
+			if err != nil {
+				return "", err
+			}
+			if int64(len(content)) != record.Bytes {
+				return "", fmt.Errorf("spool changed")
+			}
+			return "42", nil
+		}
+	}
+	sequential, parallel := t.TempDir(), t.TempDir()
+	sources := []corpusSource{{Dataset: "doj-08", Path: source}}
+	if err := stageOriginalsConcurrent(t.Context(), sequential, "originals", sources, 10000, 1000, put(false), 1); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if err := stageOriginalsConcurrent(ctx, parallel, "originals", sources, 10000, 1000, put(true), 3); err != nil {
+		t.Fatal(err)
+	}
+	if peak.Load() != 3 {
+		t.Fatalf("upload width=%d, expected 3", peak.Load())
+	}
+	a, err := os.ReadFile(filepath.Join(sequential, "originals.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(parallel, "originals.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a, b) {
+		t.Fatal("parallel upload changed catalog order, identity or generation")
+	}
+	entries, _ := os.ReadDir(parallel)
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".original") {
+			t.Fatal("parallel upload leaked spool", entry.Name())
+		}
+	}
+}
+
+func TestParallelOriginalFailureCancelsAndNeverSeals(t *testing.T) {
+	source, state := t.TempDir(), t.TempDir()
+	for i := 0; i < 8; i++ {
+		writeCorpusFixture(t, filepath.Join(source, fmt.Sprintf("%02d.pdf", i)), []byte("source"))
+	}
+	var calls, catalogs atomic.Int64
+	put := func(ctx context.Context, _ string, key string, _ io.ReadSeeker, record originalRecord) (string, error) {
+		if strings.HasPrefix(key, "originals-catalogs/") {
+			catalogs.Add(1)
+			return "42", nil
+		}
+		calls.Add(1)
+		if record.Name == "00.pdf" {
+			return "", fmt.Errorf("injected upload failure")
+		}
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	err := stageOriginalsConcurrent(ctx, state, "originals", []corpusSource{{Dataset: "doj-08", Path: source}}, 10000, 1000, put, 3)
+	if err == nil || !strings.Contains(err.Error(), "injected upload failure") {
+		t.Fatal("lost upload failure", err)
+	}
+	if calls.Load() > 3 || catalogs.Load() != 0 {
+		t.Fatal("unbounded failure work or published partial catalog")
+	}
+	if _, err := os.Stat(filepath.Join(state, "originals.json")); !os.IsNotExist(err) {
+		t.Fatal("failed stage produced completion receipt")
+	}
+	entries, _ := os.ReadDir(state)
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".original") {
+			t.Fatal("failed upload leaked owned spool", entry.Name())
+		}
+	}
+}
+
+func TestOriginalMIMECoversLargeReleaseNativeFormats(t *testing.T) {
+	for ext, want := range map[string]string{".vob": "video/mpeg", ".ts": "video/mp2t", ".3gp": "video/3gpp", ".opus": "audio/ogg", ".amr": "audio/amr"} {
+		if got := originalMIME("native" + ext); got != want {
+			t.Fatalf("%s: %s != %s", ext, got, want)
+		}
 	}
 }

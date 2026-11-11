@@ -1,0 +1,180 @@
+{
+  "at": "2026-11-11",
+  "kind": "metadata_only_candidate_inventory",
+  "acquisition_plan_sha256": "750e308470b7046616906dce2c011accdc19422d8964e82ff2d79a1ade5e2f4a",
+  "content_downloaded": false,
+  "official_completeness": "unverified",
+  "archives": [
+    {
+      "item": "epstein_library_transparency_act_hr_4405_dataset8",
+      "metadata_url": "https://archive.org/metadata/epstein_library_transparency_act_hr_4405_dataset8",
+      "file": {
+        "name": "DataSet 8.zip",
+        "size": "10687851275",
+        "sha1": "fc97874f592b2e41a4093b25aa39f06884caa137",
+        "md5": "f86494c617ea79b7a290b48ae8b1c708",
+        "format": "ZIP"
+      },
+      "mirror_reported_status": "unspecified",
+      "directory_inventory": {
+        "item": "epstein_library_transparency_act_hr_4405_dataset8",
+        "inventory_only": true,
+        "full_archive_checksum_verified": false,
+        "range_bytes": 970617,
+        "etag": "\"6983f575-27d0bab0b\"",
+        "members": 11034,
+        "uncompressed_bytes": 11464941583,
+        "extensions": {
+          ".pdf": 10594,
+          ".mp4": 419,
+          ".m4a": 3,
+          ".xlsx": 9,
+          ".csv": 4,
+          ".xls": 2,
+          ".mp3": 1,
+          ".dat": 1,
+          ".opt": 1
+        },
+        "bytes_by_extension": {
+          ".pdf": 1909691409,
+          ".mp4": 9547816092,
+          ".m4a": 1234132,
+          ".xlsx": 623856,
+          ".csv": 2610787,
+          ".xls": 28160,
+          ".mp3": 901137,
+          ".dat": 370856,
+          ".opt": 1665154
+        }
+      }
+    },
+    {
+      "item": "epstein_library_transparency_act_hr_4405_dataset9_202602",
+      "metadata_url": "https://archive.org/metadata/epstein_library_transparency_act_hr_4405_dataset9_202602",
+      "file": {
+        "name": "DataSet 9.zip",
+        "size": "107127298328",
+        "sha1": "59f0936e395fb6175289c4cf4fff993a04b54c43",
+        "md5": "204a4d57345ac1d0cd02d577bc649b8c",
+        "format": "ZIP"
+      },
+      "mirror_reported_status": "incomplete",
+      "directory_inventory": {
+        "item": "epstein_library_transparency_act_hr_4405_dataset9_202602",
+        "inventory_only": true,
+        "full_archive_checksum_verified": false,
+        "range_bytes": 57327457,
+        "etag": "\"69850d8f-18f148d918\"",
+        "members": 531345,
+        "uncompressed_bytes": 113210425662,
+        "extensions": {
+          ".pdf": 531034,
+          ".mp4": 228,
+          ".m4a": 61,
+          ".wav": 9,
+          ".vob": 10,
+          ".ts": 1,
+          ".dat": 1,
+          ".opt": 1
+        },
+        "bytes_by_extension": {
+          ".pdf": 101476172009,
+          ".mp4": 4563768202,
+          ".m4a": 238120339,
+          ".wav": 5964663,
+          ".vob": 6563112960,
+          ".ts": 275086676,
+          ".dat": 18595776,
+          ".opt": 69605037
+        }
+      }
+    },
+    {
+      "item": "epstein_library_transparency_act_hr_4405_dataset10_202605",
+      "metadata_url": "https://archive.org/metadata/epstein_library_transparency_act_hr_4405_dataset10_202605",
+      "file": {
+        "name": "DataSet 10.zip",
+        "size": "84439381640",
+        "sha1": "e686d69249cc2b183e17dd6fa95f30a87ff5c8e3",
+        "md5": "b8a72424ae812fd21d225195812b2502",
+        "format": "ZIP"
+      },
+      "mirror_reported_status": "unspecified",
+      "directory_inventory": {
+        "item": "epstein_library_transparency_act_hr_4405_dataset10_202605",
+        "inventory_only": true,
+        "full_archive_checksum_verified": false,
+        "range_bytes": 66021320,
+        "etag": "\"6984e085-13a8fab688\"",
+        "members": 504030,
+        "uncompressed_bytes": 87136397092,
+        "extensions": {
+          ".dat": 1,
+          ".opt": 1,
+          ".pdf": 503154,
+          ".m4v": 25,
+          ".mov": 154,
+          ".mp4": 649,
+          ".3gp": 1,
+          ".m4a": 17,
+          ".opus": 16,
+          ".amr": 5,
+          ".pluginpayloadattachment": 1,
+          ".wav": 5,
+          ".mp3": 1
+        },
+        "bytes_by_extension": {
+          ".dat": 17610421,
+          ".opt": 54218880,
+          ".pdf": 73353229039,
+          ".m4v": 414260,
+          ".mov": 1720176590,
+          ".mp4": 11944122822,
+          ".3gp": 185003,
+          ".m4a": 35331821,
+          ".opus": 790942,
+          ".amr": 86070,
+          ".pluginpayloadattachment": 4861582,
+          ".wav": 5075470,
+          ".mp3": 294192
+        }
+      }
+    },
+    {
+      "item": "epstein_library_transparency_act_hr_4405_dataset11_202602",
+      "metadata_url": "https://archive.org/metadata/epstein_library_transparency_act_hr_4405_dataset11_202602",
+      "file": {
+        "name": "DataSet 11.zip",
+        "size": "27441913130",
+        "sha1": "574950c0f86765e897268834ac6ef38b370cad2a",
+        "md5": "d29aedba383b94acf4b1b473800332e0",
+        "format": "ZIP"
+      },
+      "mirror_reported_status": "unspecified",
+      "directory_inventory": {
+        "item": "epstein_library_transparency_act_hr_4405_dataset11_202602",
+        "inventory_only": true,
+        "full_archive_checksum_verified": false,
+        "range_bytes": 30978843,
+        "etag": "\"69843698-663aa5d2a\"",
+        "members": 331661,
+        "uncompressed_bytes": 28779629673,
+        "extensions": {
+          ".pdf": 331655,
+          ".m4v": 4,
+          ".dat": 1,
+          ".opt": 1
+        },
+        "bytes_by_extension": {
+          ".pdf": 28727514162,
+          ".m4v": 10869123,
+          ".dat": 11607956,
+          ".opt": 29638432
+        }
+      }
+    }
+  ],
+  "compressed_bytes": 229696444373,
+  "uncompressed_bytes": 240591394010,
+  "note": "Directory ranges are revision-fenced but do not verify complete archive checksums. Stage all members of these snapshots; do not equate them with the complete official corpus or independent native-media collections."
+}
