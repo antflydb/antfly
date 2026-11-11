@@ -434,6 +434,7 @@ const Worker = struct {
     store: *const Store,
     publication: catalog.Publication,
     bundle: ?catalog.OpeningBundle,
+    singleflight: bool = false,
     stopped: std.atomic.Value(bool) = .init(false),
     domain: [32]u8,
     cached: artifacts.CachedRead,
@@ -476,16 +477,21 @@ const Worker = struct {
         if (bundle.provider_generation) |generation| if (store.cloud_binding) |binding| {
             try binding.reader.bindOpeningHint(.{ .id = bundle.artifact.artifact_id, .bytes = bundle.artifact.byte_len, .generation = generation });
         };
-        // A pack-level singleflight marker avoids decoding and readmitting the
-        // same seeds on every warm query. It retains no reader or credentials.
-        var seed: SeedLoader = .{ .a = a, .store = store.artifactStore(), .bundle = bundle, .domain = self.domain, .cached = self.cached, .token = token };
-        const seed_key = @import("lake_wal_image.zig").digest(.{ .kind = "publication-opening-seed-v1", .store = store.identity, .scope = self.cached.scope, .namespace = self.publication.namespace, .generation = self.publication.generation, .bundle = bundle });
-        const marker = self.cached.cache.decoded.acquire(seed_key, decode_budget, self.cached.context, .{ .ptr = &seed, .load = SeedLoader.load }) catch |err| switch (err) {
-            // Immutable optional cache material cannot be repaired in place.
-            // Remember its absence for this publication; demand remains strict.
+        self.warmSeed(a, &store, bundle, token) catch |err| switch (err) {
+            // Optional corrupt/missing hints never hide required source reads.
             error.FileNotFound, error.NotFound, error.ObjectNotFound, error.ArtifactIntegrityMismatch, error.InvalidNativeLakeTextOpeningPack => return,
             else => return err,
         };
+    }
+    fn warmSeed(self: *Worker, a: A, store: *Store, bundle: catalog.OpeningBundle, token: Token) !void {
+        // Joined SQL opening already has a publication-level singleflight.
+        // Avoid nesting another decoded admission under that loading flight.
+        if (!self.singleflight) return packs.warmPublication(a, store.artifactStore(), .{ .artifact = .{ .artifact_id = bundle.artifact.artifact_id, .checksum = bundle.artifact.checksum, .byte_len = bundle.artifact.byte_len }, .decoded_bytes = bundle.decoded_bytes }, self.domain, self.cached, token);
+        // A pack-level marker avoids decoding and readmitting the same seeds
+        // on each pipelined warm query; it retains no reader or credentials.
+        var seed: SeedLoader = .{ .a = a, .store = store.artifactStore(), .bundle = bundle, .domain = self.domain, .cached = self.cached, .token = token };
+        const seed_key = @import("lake_wal_image.zig").digest(.{ .kind = "publication-opening-seed-v1", .store = store.identity, .scope = self.cached.scope, .namespace = self.publication.namespace, .generation = self.publication.generation, .bundle = bundle });
+        const marker = try self.cached.cache.decoded.acquire(seed_key, decode_budget, self.cached.context, .{ .ptr = &seed, .load = SeedLoader.load });
         marker.release();
     }
 };
@@ -540,7 +546,7 @@ pub const Pending = struct {
         const scope = (try stores.uploadScopeFromArtifactId(held.inventory.artifact_id)) orelse return error.InvalidLakeIndexCatalog;
         self.io = cached.context.io;
         for (held.opening_bundles, 0..) |bundle, i| {
-            self.work[i] = .{ .backing = std.heap.smp_allocator, .store = owned_store, .publication = held, .bundle = bundle, .domain = scope.domain, .cached = cached, .token = token };
+            self.work[i] = .{ .singleflight = true, .backing = std.heap.smp_allocator, .store = owned_store, .publication = held, .bundle = bundle, .domain = scope.domain, .cached = cached, .token = token };
             if (self.io) |io| {
                 const cost = 2 * (bundle.artifact.byte_len + bundle.decoded_bytes) + 2 * 1024 * 1024;
                 self.tasks[i] = local.sql_parallel_scheduler.global().submitIo(io, @intCast(cost), Worker.run, .{&self.work[i]});
