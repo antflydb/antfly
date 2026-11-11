@@ -233,6 +233,10 @@ func (c *GoogleConnector) OpenMedia(ctx context.Context, r Request, item Item, s
 			return nil, ErrInvalidInput
 		}
 		path = "/b/" + url.PathEscape(cfg.Bucket) + "/o/" + url.PathEscape(item.Path) + "?alt=media&generation=" + url.QueryEscape(item.Revision) + "&ifGenerationMatch=" + url.QueryEscape(item.Revision)
+		path, err = gcsMetadataFence(path, cfg, item)
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		id := configString(item.Metadata, "file_id")
 		if !googleFileID(id) || configString(item.Metadata, "export_mime_type") != "" {

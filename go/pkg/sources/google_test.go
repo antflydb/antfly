@@ -310,7 +310,7 @@ func TestGCSProjectedPageProvenance(t *testing.T) {
 				t.Error("listing did not request page provenance")
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{map[string]any{
-				"name": "pages/page.txt", "generation": "1", "size": fmt.Sprint(len(text)), "contentType": "text/plain",
+				"name": "pages/page.txt", "generation": "1", "metageneration": "7", "size": fmt.Sprint(len(text)), "contentType": "text/plain",
 				"metadata": map[string]string{
 					"original_pdf_uri": "gs://original/source.pdf?generation=42",
 					"original_page":    "12", "extraction_revision": "3",
@@ -318,8 +318,8 @@ func TestGCSProjectedPageProvenance(t *testing.T) {
 				},
 			}}})
 		case "/b/projection/o/pages/page.txt":
-			if r.URL.Query().Get("generation") != "1" || r.URL.Query().Get("ifGenerationMatch") != "1" {
-				t.Error("read did not pin the projection generation")
+			if r.URL.Query().Get("generation") != "1" || r.URL.Query().Get("ifGenerationMatch") != "1" || r.URL.Query().Get("ifMetagenerationMatch") != "7" {
+				t.Error("read did not pin the projection generation and metadata")
 			}
 			w.Header().Set("X-Goog-Generation", "1")
 			_, _ = w.Write(text)
