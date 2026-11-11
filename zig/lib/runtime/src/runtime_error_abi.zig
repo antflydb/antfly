@@ -1103,6 +1103,8 @@ pub const Detail = enum(c_int) {
     invalid_external_source_snapshot,
     external_source_snapshot_too_large,
     storage_owner_admission_pending,
+    reembed_budget_exceeded,
+    reembed_setup_retry,
     // Retained dataset catalog admission and owner-read outcomes.
     retained_dataset_source_in_use,
     retained_dataset_source_not_ready,
@@ -1880,6 +1882,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.GenerationDurabilityUncertain => status(.retryable, .generation_durability_uncertain),
         error.GenerationTransitionActive => status(.retryable, .generation_transition_active),
         error.IndexRebuilding => status(.retryable, .index_rebuilding),
+        error.ReembedBudgetExceeded => status(.unavailable, .reembed_budget_exceeded),
+        error.ReembedSetupRetry => status(.unavailable, .reembed_setup_retry),
         error.IncompletePublishedSnapshot => status(.retryable, .incomplete_published_snapshot),
         error.TableVisibilityTimeout => status(.timeout, .table_visibility_timeout),
         error.FileBusy => status(.retryable, .file_busy),
@@ -3002,6 +3006,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .table_lifecycle_conflict => "TableLifecycleConflict",
         .generation_durability_uncertain => "GenerationDurabilityUncertain",
         .generation_transition_active => "GenerationTransitionActive",
+        .reembed_budget_exceeded => "ReembedBudgetExceeded",
+        .reembed_setup_retry => "ReembedSetupRetry",
         .incomplete_published_snapshot => "IncompletePublishedSnapshot",
         .table_visibility_timeout => "TableVisibilityTimeout",
         .file_busy => "FileBusy",
@@ -3447,6 +3453,9 @@ test "stable status preserves public boundary semantics" {
         try std.testing.expectEqual(@backingInt(Code.retryable), readiness.code);
         try std.testing.expectEqual(err, errorFromStatus(readiness));
     }
+    try std.testing.expectEqual(error.ReembedBudgetExceeded, errorFromStatus(statusFromError(error.ReembedBudgetExceeded)));
+    try std.testing.expectEqual(error.ReembedSetupRetry, errorFromStatus(statusFromError(error.ReembedSetupRetry)));
+    try std.testing.expectEqual(@backingInt(Code.unavailable), statusFromError(error.ReembedBudgetExceeded).code);
     try std.testing.expectEqual(error.ReadIndexTimeout, errorFromStatus(statusFromError(error.ReadIndexTimeout)));
     try std.testing.expectEqual(@backingInt(Code.timeout), statusFromError(error.ReadIndexTimeout).code);
     try std.testing.expectEqual(error.GenerationTransitionActive, errorFromStatus(statusFromError(error.GenerationTransitionActive)));

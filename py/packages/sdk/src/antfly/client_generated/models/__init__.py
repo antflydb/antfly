@@ -1282,6 +1282,7 @@ from .lake_catalog_response import LakeCatalogResponse
 from .lake_catalog_response_metadata import LakeCatalogResponseMetadata
 from .lake_catalog_response_state import LakeCatalogResponseState
 from .leann_index_config import LeannIndexConfig
+from .leann_index_config_media_vectors import LeannIndexConfigMediaVectors
 from .leann_index_config_quantizer import LeannIndexConfigQuantizer
 from .leann_index_config_vector_storage import LeannIndexConfigVectorStorage
 from .legacy_graph_document_query import LegacyGraphDocumentQuery
@@ -3997,6 +3998,7 @@ __all__ = (
     "LakeCatalogResponseMetadata",
     "LakeCatalogResponseState",
     "LeannIndexConfig",
+    "LeannIndexConfigMediaVectors",
     "LeannIndexConfigQuantizer",
     "LeannIndexConfigVectorStorage",
     "LegacyGraphDocumentQuery",

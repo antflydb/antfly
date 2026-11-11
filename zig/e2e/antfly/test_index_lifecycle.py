@@ -3227,3 +3227,67 @@ def test_serverless_schema_migration_republishes_versioned_full_text_indexes(
     assert next_index["status"]["head_publication_action"] == "rebuild"
     assert ready_index_status(active_index, until="complete") is not None
     assert ready_index_status(next_index, until="complete") is not None
+
+
+def test_leann_index_returns_exact_nearest_first(stateful_api):
+    """A LEANN index built past its graph threshold ranks the nearest first."""
+    table = f"leann_e2e_{time.time_ns()}"
+    index_name = "leann_vectors"
+    dims = 8
+    count = 300  # past LeannStore's default build threshold of 256
+    stateful_api.create_table(table, num_shards=1)
+    stateful_api.create_index(
+        table,
+        index_name,
+        {
+            "type": "embeddings",
+            "external": True,
+            "dimension": dims,
+            "algorithm": "leann",
+            "leann": {"max_degree": 16},
+        },
+    )
+
+    def vector(i: int) -> list[float]:
+        # Deterministic points over a few clusters; the last coordinate makes
+        # each one distinct.
+        base = [float((i * (j + 3)) % 17) + (i % 5) * 0.01 for j in range(dims - 1)]
+        return base + [i * 0.05]
+
+    docs = {
+        f"doc:{i:04d}": {
+            "body": f"leann {i}",
+            "_embeddings": {index_name: _pack_f32_le(vector(i))},
+        }
+        for i in range(count)
+    }
+    stateful_api.batch_write(table, inserts=docs, sync_level="full_index")
+
+    def ready():
+        status = ready_index_status(
+            stateful_api.get_index(table, index_name), until="complete"
+        )
+        if status is None:
+            return None
+        if status.get("total_indexed", status.get("doc_count")) != count:
+            return None
+        return status
+
+    assert wait_until(ready, timeout_s=60, interval_s=0.1), stateful_api.get_index(
+        table, index_name
+    )
+
+    for i in (7, 123, 299):
+        result = stateful_api.query_table(
+            table,
+            {
+                "embeddings": {index_name: _pack_f32_le(vector(i))},
+                "indexes": [index_name],
+                "limit": 10,
+            },
+        )
+        hits = result["responses"][0]["hits"]["hits"]
+        assert hits, result
+        # The exact match comes first, not merely somewhere in the top 10.
+        assert hits[0]["_id"] == f"doc:{i:04d}", [hit["_id"] for hit in hits]
+        assert len({hit["_id"] for hit in hits}) == len(hits)

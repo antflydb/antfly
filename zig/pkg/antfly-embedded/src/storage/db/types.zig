@@ -5469,6 +5469,60 @@ pub const IndexTargetVisibility = struct {
     serving_set_effect: ServingSetEffect = .may_reduce,
 };
 
+/// New dense envelopes use formerly reserved bits. Gate the complete transport
+/// before proposal, including fragmented uploads whose header is not visible.
+/// Legacy commands retain their original minimum and remain replayable.
+pub fn requiresDenseArtifactFlagsProtocol(req: BatchRequest) bool {
+    const floor = @import("artifact_inventory.zig").dense_artifact_flags_protocol;
+    if (req.artifact_catalog) |catalog| if (catalog.binding.effect_protocol >= floor) return true;
+    if (req.group_source) |group| if (group.action == .activate_catalog) return true;
+    if (req.online_source) |source| if (source == .admit) {
+        if (source.admit.artifact_catalog) |catalog| if (catalog.effect_protocol >= floor) return true;
+    };
+    if (req.merge_checkpoint) |checkpoint| if (checkpoint.page_source) |source| if (source.artifact_catalog) |catalog| if (catalog.effect_protocol >= floor) return true;
+    if (req.leann_record != null) return true; // apply may emit an int8 stub
+    if (req.artifact_publication_transport) |transport| switch (transport.action) {
+        .begin, .chunk, .finalize => return true,
+        .prune, .abandon => {},
+    };
+    for (req.writes) |write| if (hasDenseArtifactFlags(write.value)) return true;
+    for (req.merge_artifacts) |write| if (hasDenseArtifactFlags(write.value)) return true;
+    if (req.artifact_publication) |command| for (command.mutations) |mutation| {
+        if (mutation.value) |value| if (hasDenseArtifactFlags(value)) return true;
+    };
+    if (req.merge_page) |page| {
+        if (page.source.artifact_catalog) |catalog| if (catalog.effect_protocol >= floor) return true;
+        for (page.artifact_effects) |effect| if (effect.value) |value| if (hasDenseArtifactFlags(value)) return true;
+        if (page.chunk) |chunk| if (chunk.payload == .artifact and @import("../internal_keys.zig").isEmbeddingArtifactKey(chunk.row_key)) return true;
+    }
+    return false;
+}
+
+fn hasDenseArtifactFlags(value: []const u8) bool {
+    const codec = @import("enrichment/artifact_codec.zig");
+    const header = codec.decodeHeaderPrefix(value) catch return false;
+    return header.kind == .dense_embedding and (header.flags.text_input or header.flags.int8_payload);
+}
+
+test "leann dense artifact flags require a distinct all-replica protocol floor" {
+    const a = std.testing.allocator;
+    const codec = @import("enrichment/artifact_codec.zig");
+    const old = try codec.encodeDenseEmbeddingAlloc(a, 7, &.{ 1, 2 });
+    defer a.free(old);
+    const text = try codec.encodeProducedDenseEmbeddingAlloc(a, 7, true, &.{ 1, 2 });
+    defer a.free(text);
+    const media = try codec.encodeInt8ElidedDenseEmbeddingAlloc(a, try codec.decodeHeader(old), &.{ 1, 2 }, 9);
+    defer a.free(media);
+    try std.testing.expect(!requiresDenseArtifactFlagsProtocol(.{ .writes = &.{.{ .key = "vector", .value = old }} }));
+    for ([_][]const u8{ text, media }) |value| try std.testing.expect(requiresDenseArtifactFlagsProtocol(.{ .writes = &.{.{ .key = "vector", .value = value }} }));
+    // Partial/base64 upload bytes cannot be reliably identified as an envelope.
+    try std.testing.expect(requiresDenseArtifactFlagsProtocol(.{ .artifact_publication_transport = .{ .action = .chunk } }));
+    try std.testing.expect(requiresDenseArtifactFlagsProtocol(.{ .leann_record = .{ .index_name = "idx", .record = "r" } }));
+    // Model a legacy validator: new bits were all reserved on old replicas.
+    try std.testing.expect((text[11] & 0xe0) != 0);
+    try std.testing.expect((old[11] & 0xe0) == 0);
+}
+
 /// New relationship keys and durable endpoint retirements require peers that
 /// understand their complete identities before any primary rows are applied.
 pub fn requiresGraphRelationshipProtocol(req: BatchRequest) bool {
@@ -5554,6 +5608,9 @@ pub fn validateLeannRecordCommand(req: BatchRequest) !void {
 
 test "leann record command must stand alone" {
     try validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .sync_level = .write });
+    try validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .document_version_scheme = .legacy });
+    // Version tags have no document effect on this standalone control.
+    try validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .document_version_scheme = .revision_v1 });
     try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "", .record = "r" } }));
     try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "" } }));
     try std.testing.expectError(error.InvalidBatchRequest, validateLeannRecordCommand(.{ .leann_record = .{ .index_name = "idx", .record = "r" }, .deletes = &.{"doc"} }));

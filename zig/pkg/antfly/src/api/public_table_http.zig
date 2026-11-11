@@ -210,6 +210,8 @@ pub const TableApi = struct {
         UnsupportedVersion,
         Corrupted,
         IncompletePublishedSnapshot,
+        ReembedBudgetExceeded,
+        ReembedSetupRetry,
         InternalFailure,
     };
 
@@ -2124,6 +2126,8 @@ pub fn handleTableQueryRequest(
             error.Timeout => {
                 return try queryDependencyErrorOwnedResponse(alloc, 504, "query_timeout", "query timed out", true);
             },
+            error.ReembedBudgetExceeded => return try queryDependencyErrorOwnedResponse(alloc, 422, "reembed_budget_exceeded", "re-embedding budget exceeded; increase reembed_budget_ms or set it to zero", false),
+            error.ReembedSetupRetry => return try queryDependencyErrorOwnedResponse(alloc, 503, "reembed_setup_retry", "re-embedding provider setup temporarily unavailable", true),
             error.IncompletePublishedSnapshot => {
                 std.log.warn("public table query detected incomplete index generation table={s}", .{table_name});
                 return try queryTemporarilyUnavailableOwnedResponse(alloc, .index_rebuilding);
@@ -4420,7 +4424,7 @@ test "public table query handler preserves retryable failure status" {
     @import("antfly_test_error_logs").expectErrorLogs(2);
 
     const Backend = struct {
-        err: TableApi.ExecuteQueryError,
+        err: ?TableApi.ExecuteQueryError,
 
         fn iface(self: *@This()) TableApi {
             return .{
@@ -4442,14 +4446,15 @@ test "public table query handler preserves retryable failure status" {
 
         fn executeTableQueryRequest(
             ptr: *anyopaque,
-            _: std.mem.Allocator,
+            alloc: std.mem.Allocator,
             _: []const u8,
             _: []const u8,
             _: ?[]const u8,
             _: operation.RequestContext,
         ) TableApi.ExecuteQueryError![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return self.err;
+            if (self.err) |err| return err;
+            return alloc.dupe(u8, "{\"hits\":[]}") catch return error.InternalFailure;
         }
     };
     const Case = struct {
@@ -4479,6 +4484,8 @@ test "public table query handler preserves retryable failure status" {
         .{ .err = error.HierarchyCursorStale, .status = 409, .body = "{\"status\":409,\"error\":\"hierarchy_cursor_stale\",\"message\":\"the source hierarchy changed after this cursor was issued\",\"action\":\"restart_hierarchy_traversal\",\"restart_without\":\"search_after\",\"retryable\":false}", .json = true },
         .{ .err = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
         .{ .err = error.CorruptInput, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"CorruptInput\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
+        .{ .err = error.ReembedBudgetExceeded, .status = 422, .body = "{\"code\":\"reembed_budget_exceeded\",\"error\":\"reembed_budget_exceeded\",\"message\":\"re-embedding budget exceeded; increase reembed_budget_ms or set it to zero\",\"retryable\":false}", .json = true },
+        .{ .err = error.ReembedSetupRetry, .status = 503, .body = "{\"code\":\"reembed_setup_retry\",\"error\":\"reembed_setup_retry\",\"message\":\"re-embedding provider setup temporarily unavailable\",\"retryable\":true}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.IncompletePublishedSnapshot, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
     };
 
@@ -4496,6 +4503,15 @@ test "public table query handler preserves retryable failure status" {
         }
         try std.testing.expectEqual(tc.json, resp.json);
         try std.testing.expectEqual(tc.retry_after_seconds, resp.retry_after_seconds);
+        if (tc.err == error.ReembedSetupRetry) {
+            backend.err = null;
+            var retry = try handleTableQueryRequest(std.testing.allocator, "docs",
+                \\{"query":{"match_all":{}}}
+            , null, backend.iface());
+            defer retry.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u16, 200), retry.status);
+            try std.testing.expectEqualStrings("{\"hits\":[]}", retry.body);
+        }
     }
 }
 

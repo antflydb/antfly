@@ -715,6 +715,39 @@ pub const DocStore = struct {
             return error.ReadOnly;
         }
 
+        /// Owned copies from one pinned generation, with read buffers released
+        /// before return. Payloads use the caller's allocation lifetime too.
+        pub fn getManySortedOwnedScoped(self: *Txn, alloc: Allocator, keys: []const []const u8, values: []?[]u8) !void {
+            if (keys.len != values.len) return error.InvalidArgument;
+            @memset(values, null);
+            errdefer for (values) |*value| {
+                if (value.*) |bytes| alloc.free(bytes);
+                value.* = null;
+            };
+            if (self.read == null) return error.ReadOnly;
+            if (keys.len == 0) return;
+            var scope = try self.openReadScope(alloc);
+            defer scope.close();
+            const physical = try alloc.alloc(?[]const u8, keys.len);
+            defer alloc.free(physical);
+            try scope.getManySorted(keys, physical);
+            for (keys, physical, values) |key, raw, *value| {
+                const bytes = raw orelse continue;
+                if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(bytes)) {
+                    const session = self.payload_session orelse return error.VectorMigrationReadEpochChanged;
+                    // Read-only sessions have no prepared writes: resolving a
+                    // reference returns an owned allocation from this allocator.
+                    value.* = @constCast(try session.getAlloc(alloc, key, bytes));
+                } else value.* = try alloc.dupe(u8, bytes);
+            }
+        }
+
+        pub fn getOwnedScoped(self: *Txn, alloc: Allocator, key: []const u8) ![]u8 {
+            var values: [1]?[]u8 = undefined;
+            try self.getManySortedOwnedScoped(alloc, &.{key}, &values);
+            return values[0] orelse error.NotFound;
+        }
+
         pub fn getManySorted(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
             try self.getManySortedPhysical(keys, values);
             if (self.payload_session) |session| {
@@ -6565,4 +6598,63 @@ test "logical source certificates invalidate transaction and batch mutations inc
     try std.testing.expect(store.source_certificates.capture() == null);
     try store.finishBulkIngestSessionWithOptions(.{});
     try std.testing.expect(store.source_certificates.capture() != null);
+}
+
+test "docstore scoped owned batches pin one generation and release external payloads" {
+    var budget = @import("test_allocator.zig").BoundedAllocator.init(std.heap.page_allocator, std.math.maxInt(usize));
+    defer std.debug.assert(budget.deinit() == 0);
+    const alloc = budget.allocator();
+    var backend = lsm_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const Payload = struct {
+        data: []const u8,
+        resolves: usize = 0,
+        fn retain(_: *anyopaque) void {}
+        fn release(_: *anyopaque) void {}
+        fn prepare(_: *anyopaque, _: []const artifact_payload.Prepared) !void {}
+        fn resolve(raw: *anyopaque, a: Allocator, _: []const u8, _: artifact_payload.Reference) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.resolves += 1;
+            return a.dupe(u8, self.data);
+        }
+    };
+    const codec = @import("db/enrichment/artifact_codec.zig");
+    const data: [4096]f32 = @splat(1);
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 99, &data);
+    defer alloc.free(artifact);
+    var payload = Payload{ .data = artifact };
+    const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "dense");
+    defer alloc.free(key);
+    const reference = try artifact_payload.Reference.forArtifact(key, artifact);
+    // Publish physical references before installing payload ownership policy.
+    try store.put(key, &reference.encode());
+    try store.put("a", "old");
+    store.configurePayloadPolicy(.{ .ptr = &payload, .vtable = &.{ .retain = Payload.retain, .release = Payload.release, .prepare = Payload.prepare, .resolve = Payload.resolve } }, false, null);
+    var txn = try store.beginReadTxn();
+    defer txn.abort();
+    try store.put("a", "new");
+    const baseline = budget.live;
+    budget.limit = baseline + 256 * 1024;
+    const before = backend.snapshotReadStats();
+    for (0..128) |_| {
+        var keys = [_][]const u8{ "a", "absent", key };
+        std.mem.sort([]const u8, &keys, {}, struct {
+            fn less(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.less);
+        var values: [3]?[]u8 = undefined;
+        try txn.getManySortedOwnedScoped(alloc, &keys, &values);
+        defer for (values) |value| if (value) |bytes| alloc.free(bytes);
+        for (keys, values) |read_key, value| {
+            if (std.mem.eql(u8, read_key, "a")) try std.testing.expectEqualStrings("old", value.?) else if (std.mem.eql(u8, read_key, "absent")) try std.testing.expect(value == null) else try std.testing.expectEqualSlices(u8, artifact, value.?);
+        }
+    }
+    const after = backend.snapshotReadStats();
+    try std.testing.expectEqual(@as(usize, 128), payload.resolves);
+    try std.testing.expectEqual(@as(u64, 128), after.get_many_sorted_calls - before.get_many_sorted_calls);
+    try std.testing.expectEqual(@as(u64, 384), after.get_many_sorted_keys - before.get_many_sorted_keys);
+    try std.testing.expect(budget.live < baseline + 64 * 1024);
 }

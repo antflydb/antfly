@@ -2,6 +2,7 @@ from enum import StrEnum
 
 
 class LeannIndexConfigVectorStorage(StrEnum):
+    AUTO = "auto"
     PERSISTENT = "persistent"
     TRANSIENT = "transient"
 

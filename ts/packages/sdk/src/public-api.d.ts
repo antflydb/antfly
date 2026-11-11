@@ -18716,10 +18716,10 @@ export interface components {
              */
             quantizer?: "rabitq" | "pq";
             /**
-             * @description Whether document embeddings stay stored after the graph covers them. "transient" (the default when possible) keeps only a small stub per document and re-embeds a few candidates per query from the document's field or template through the index's embedder, so the index stores about 15% of the raw vectors' bytes. "persistent" keeps every embedding, and is the only choice for external vectors, chunked indexes, indexes fed by other enrichments, and the pq quantizer.
+             * @description Whether document embeddings stay stored after the graph covers them. "auto" (the default when the index has its own embedder) keeps only a small stub for each embedding computed from text (a field, a text-only template, or a text chunk) and re-embeds a few such candidates per query, while embeddings computed from media (images, audio windows, model outputs) stay stored. "transient" stubs every covered embedding, so it requires inputs that re-embed from text: no media chunkers. "persistent" keeps every embedding, and is the only choice for external vectors, indexes fed by other enrichments, and the pq quantizer.
              * @enum {string}
              */
-            vector_storage?: "transient" | "persistent";
+            vector_storage?: "auto" | "transient" | "persistent";
             /**
              * @description Beam width for searches. 0 picks the default for the quantizer (512 for rabitq, 64 for pq).
              * @default 0
@@ -18732,10 +18732,21 @@ export interface components {
              */
             bound_scale?: number;
             /**
-             * @description Candidates recomputed per batch. 0 uses k.
+             * @description Candidates recomputed per batch. 0 uses k for bounded search and 128 for full-effort search.
              * @default 0
              */
             batch_size?: number;
+            /**
+             * @description Time a query may spend re-embedding candidates whose stored vectors were dropped. If the budget is spent before scoring finishes, the search returns an incomplete-coverage error; retry with a larger budget. 0 means no limit.
+             * @default 0
+             */
+            reembed_budget_ms?: number;
+            /**
+             * @description How vectors that cannot be re-embedded from text (images, audio windows, model outputs) are kept once the graph covers them. "full" keeps the stored float32 vector. "int8" replaces it with a stub holding an int8 copy (about a quarter of the size), read back instead of re-embedding. Requires "auto" or "transient" storage.
+             * @default full
+             * @enum {string}
+             */
+            media_vectors?: "full" | "int8";
         };
         /**
          * @description How an HBC dense index with quantization_bits above 1 uses its extended codes (not
