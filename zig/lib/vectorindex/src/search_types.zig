@@ -377,6 +377,20 @@ pub const HBCDebugNode = struct {
     }
 };
 
+/// Leaf work outside the metadata batch includes ID inspection and scoring.
+/// The route planner projects this rate over inspected candidates.
+pub fn leafWorkNsPerInspectedRow(profile: *const SearchProfile) u64 {
+    const inspected = @max(profile.filter_candidates, profile.approx_vectors_scored);
+    const elapsed = profile.leaf_score_ns -| profile.filter_metadata_batch_ns;
+    return if (inspected == 0 or elapsed == 0) 0 else @max(elapsed / inspected, 1);
+}
+
+test "sparse HBC scores do not inflate leaf work per inspected row" {
+    const sample = SearchProfile{ .leaf_score_ns = 1500, .filter_metadata_batch_ns = 500, .filter_candidates = 100, .approx_vectors_scored = 2 };
+    try std.testing.expectEqual(@as(u64, 10), leafWorkNsPerInspectedRow(&sample));
+    try std.testing.expectEqual(@as(u64, 10), leafWorkNsPerInspectedRow(&.{ .leaf_score_ns = 1000, .approx_vectors_scored = 100 }));
+}
+
 pub const RequestFilterState = struct {
     include: std.AutoHashMapUnmanaged(u64, void) = .empty,
     exclude: std.AutoHashMapUnmanaged(u64, void) = .empty,
