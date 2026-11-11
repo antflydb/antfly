@@ -146,14 +146,8 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 		t.Fatal(err)
 	}
 	tableURL := endpoint + "/tables/gcs_e2e"
-	if _, err := corpusRequestWithContext(ctx, client, "POST", tableURL, map[string]any{"num_shards": 1, "schema": corpusTableSchema(), "indexes": indexes}); err != nil {
-		t.Fatal(err)
-	}
 	source := "gs://e2e-originals/" + key + "?generation=123"
 	document := map[string]any{"url": source, "original_url": source, "filename": "evidence.pdf", "mime_type": "application/pdf", "version": digest + ":123", "indexed_at": time.Now().Unix(), "permissions": map[string]any{"public": false, "readers": []string{"user:self"}}, "metadata": map[string]any{"page_start": 1, "page_end": 1}}
-	if _, err := corpusRequestWithContext(ctx, client, "POST", tableURL+"/batch", map[string]any{"inserts": map[string]any{"evidence": document}, "sync_level": "write"}); err != nil {
-		t.Fatal(err)
-	}
 	record := corpusRecord{ID: "evidence", Document: document}
 	manifest, _ := json.Marshal(record)
 	manifest = append(manifest, '\n')
@@ -163,6 +157,21 @@ func TestLocalNativeGCSExtraction(t *testing.T) {
 	}
 	if err := atomicCorpusJSON(filepath.Join(root, "publication.json"), map[string]any{"sha256": manifestHash, "records": 1}); err != nil {
 		t.Fatal(err)
+	}
+	// Exercise the real table/configuration binding and durable load checkpoint,
+	// rather than inserting rows through a test-only shortcut.
+	if err := atomicCorpusJSON(filepath.Join(root, "prepare.json"), corpusProgress{Complete: true, Records: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicCorpusJSON(filepath.Join(root, "sources.json"), corpusConfig{IndexedAt: document["indexed_at"].(int64), PagesPerRecord: 25}); err != nil {
+		t.Fatal(err)
+	}
+	loadArgs := []string{"--state", root, "--url", endpoint, "--table", "gcs_e2e", "--source-connection", "gcs-e2e"}
+	if err := corpusLoadCmd(append(append([]string{}, loadArgs...), "--create-table")); err != nil {
+		t.Fatalf("native corpus load: %v", err)
+	}
+	if err := corpusLoadCmd(loadArgs); err != nil {
+		t.Fatalf("native corpus resume: %v", err)
 	}
 	var qualification extractionQualification
 	var last error

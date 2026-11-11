@@ -363,6 +363,13 @@ antfly-grep --table-config ./grepstein-corpus/grep.json 'pattern'
 antfly-grep --table-config ./grepstein-corpus/grep.json --artifact chunks 'pattern'
 ```
 
+Qualification streams the sealed manifest through at most four concurrent
+workers by default. Set `qualify --concurrency 1` for a constrained instance or
+choose another limit from 1–32. Each worker still verifies the current source
+and raw native completion evidence; an error cancels sibling requests and the
+receipt remains incomplete. Receipts include the configured concurrency and
+elapsed seconds. This does not alter extraction/model concurrency.
+
 The default `extracted` stream reads `document_units_v1` through
 `document_units_text`. Each native extraction unit is a matching boundary; a
 regex never spans pages or transcript units. The optional `chunks` stream uses
@@ -471,3 +478,31 @@ proxy routing/authentication problem. A Cloudflare `403` with error `1010` is a
 separate transport rejection. Diagnostic clients should identify themselves with
 a descriptive application `User-Agent`, such as `antfly-cloud/grepstein-diagnostics`.
 Do not treat either response as evidence that OCR failed or that the GPU is busy.
+
+## Measuring a private sample
+
+The bounded runners use an owned loopback server and never change Cloud tables.
+Use the released runtime and the exact model revisions from the example:
+
+```sh
+python3 benchmark_inference.py --antfly /absolute/path/antfly \
+  --models-dir /absolute/path/models --output ./timings/inference \
+  --stages ocr embed extract --ocr-concurrency 2 --budget-seconds 180
+python3 benchmark_corpus.py --antfly /absolute/path/antfly \
+  --pdf-dir /absolute/path/verified-sample --output ./timings/native
+```
+
+Inference timings distinguish cold/warm model use, disable prompt caching, use
+distinct embedding/extraction inputs, validate completed work, and record GPU
+contention. A failed or truncated page has no completed-page throughput. The
+native runner reports extraction time and incomplete units with OCR disabled;
+it does not call an incomplete artifact a successful OCR result. Both runners
+stop their own processes on exit and accept explicit sample/time/byte limits.
+The [Spark measurement](benchmarks/spark-rc14-2026-11-11.md) records the measured
+scope and the limits of corpus extrapolation.
+
+Managed source syncs still replace a complete physical generation when inventory
+content changes. The [native generation-cloning design](../../docs/design/source-generation-cloning.md)
+specifies the separate engine work needed to retain unchanged derived artifacts
+without full replacement writes. The qualification and load improvements here do
+not implement that engine feature.
