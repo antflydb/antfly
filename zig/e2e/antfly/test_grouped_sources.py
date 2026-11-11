@@ -48,12 +48,14 @@ def _write_grouped_fixture(
     started = time.monotonic()
     deadline = started + timeout_s
     observed = {}
+    attempts = admission_retries = pending_responses = 0
 
     def attempt():
-        nonlocal observed
+        nonlocal observed, attempts, admission_retries, pending_responses
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
+        attempts += 1
         try:
             observed = api.batch_write_with_timeout(
                 table_name,
@@ -73,12 +75,15 @@ def _write_grouped_fixture(
                 and response.text.strip() == "write unavailable"
             ):
                 observed = {"status": "write unavailable"}
+                admission_retries += 1
                 return False
             raise
         assert observed.get("status") != "committed_repair_required", (
             observed,
             api.debug_logs()[-16000:],
         )
+        if observed.get("status") == "committed_pending":
+            pending_responses += 1
         return (
             observed.get("status") != "committed_pending"
             and time.monotonic() <= deadline
@@ -93,6 +98,9 @@ def _write_grouped_fixture(
             "batch-visibility",
             sync_level=sync_level,
             result_status=observed.get("status"),
+            attempts=attempts,
+            admission_retries=admission_retries,
+            pending_responses=pending_responses,
             insert_count=len(inserts or {}),
             delete_count=len(deletes or []),
             visibility_wait_seconds=round(time.monotonic() - started, 6),

@@ -252,12 +252,24 @@ export function SeriesChart({ series }: { series: TimeSeries }) {
   const [dataOpen, setDataOpen] = useState(false);
   const [page, setPage] = useState(0);
   const pageSize = 100;
-  useEffect(() => setPage(0), [series]);
+  const [previousSeries, setPreviousSeries] = useState(series);
+  // Adjust before rendering the replacement series, rather than showing one
+  // frame of the old page and scheduling another render from an effect.
+  if (previousSeries !== series) {
+    setPreviousSeries(series);
+    setPage(0);
+  }
   const chart = useMemo(() => {
     const first = series.points[0];
     const last = series.points.at(-1);
     if (!first || !last)
-      return { path: "", dots: [] as { x: number; y: number }[], min: 0, max: 0, count: 0 };
+      return {
+        path: "",
+        dots: [] as { at: TimeSeries["points"][number]["at"]; x: number; y: number }[],
+        min: 0,
+        max: 0,
+        count: 0,
+      };
     const start = seriesTimestampNanoseconds(first.at);
     const span = seriesTimestampNanoseconds(last.at) - start;
     const x = (index: number) =>
@@ -294,6 +306,7 @@ export function SeriesChart({ series }: { series: TimeSeries }) {
     ].sort((a, b) => a - b);
     const y = (value: number) => 170 - (150 * (value - min)) / Math.max(1e-12, max - min);
     const samples = selected.map((index, i) => ({
+      at: series.points[index].at,
       x: x(index),
       y: y(series.points[index].measures.average ?? 0),
       begins: i === 0 || gaps[index] > gaps[selected[i - 1] + 1],
@@ -321,8 +334,8 @@ export function SeriesChart({ series }: { series: TimeSeries }) {
           className="w-full text-primary"
         >
           <path d={chart.path} stroke="currentColor" fill="none" strokeWidth="2" />
-          {chart.dots.map((point, i) => (
-            <circle key={i} cx={point.x} cy={point.y} r={3} fill="currentColor" />
+          {chart.dots.map((point) => (
+            <circle key={point.at} cx={point.x} cy={point.y} r={3} fill="currentColor" />
           ))}
         </svg>
       ) : (

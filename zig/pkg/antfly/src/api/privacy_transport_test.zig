@@ -53,8 +53,11 @@ test "privacy receivers fence legacy lookups and reject superseded assertions be
         version: [64]u8,
         calls: usize = 0,
         last: types.LookupOptions = .{},
-        fn capture(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?u64) ![64]u8 {
+        captured_deadline: ?u64 = null,
+        fn capture(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, deadline: ?u64) ![64]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.captured_deadline = deadline;
+            if (deadline) |end| if (end <= @import("antfly_platform").time.monotonicNs()) return error.DeadlineExceeded;
             return self.version;
         }
         fn lookup(raw: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8, opts: types.LookupOptions, consistency: Consistency) !?source.LookupResponse {
@@ -85,6 +88,37 @@ test "privacy receivers fence legacy lookups and reject superseded assertions be
     _ = try reads.lookupGroupLocal(std.testing.allocator, 7, "docs", "doc", .{ .privacy_original = true }, .read_index);
     try std.testing.expect(fake.last.privacy_original);
     try std.testing.expect(fake.last.privacy_policy_version == null);
+
+    const Clock = struct {
+        fn now(raw: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = @as(*const u64, @ptrCast(@alignCast(raw.?))).* };
+        }
+    };
+    var request_now: u64 = 17;
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Clock.now;
+    const io: std.Io = .{ .userdata = &request_now, .vtable = &vtable };
+    const options: types.LookupOptions = .{
+        .execution_deadline_ns = request_now + std.time.ns_per_s,
+        .execution_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io),
+    };
+    for ([_]bool{ false, true }) |group_local| {
+        const before = @import("antfly_platform").time.monotonicNs();
+        if (group_local) {
+            _ = try reads.lookupGroupLocal(std.testing.allocator, 7, "docs", "doc", options, .read_index);
+        } else {
+            _ = try reads.lookup(std.testing.allocator, "docs", "doc", options, .read_index);
+        }
+        const after = @import("antfly_platform").time.monotonicNs();
+        try std.testing.expect(fake.captured_deadline.? >= before + std.time.ns_per_s);
+        try std.testing.expect(fake.captured_deadline.? <= after + std.time.ns_per_s);
+        try std.testing.expectEqual(options.execution_deadline_ns, fake.last.execution_deadline_ns);
+        try std.testing.expectEqual(options.execution_io.?.userdata, fake.last.execution_io.?.userdata);
+    }
+    const reads_before_expiry = fake.calls;
+    request_now = options.execution_deadline_ns.?;
+    try std.testing.expectError(error.DeadlineExceeded, reads.lookupGroupLocal(std.testing.allocator, 7, "docs", "doc", options, .read_index));
+    try std.testing.expectEqual(reads_before_expiry, fake.calls);
 }
 
 test "privacy routed scans accept the public range response envelope and own cursors" {
