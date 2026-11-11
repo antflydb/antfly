@@ -38,9 +38,12 @@ class NativeBuildToolsTests(unittest.TestCase):
                     tool.chmod(0o755)
             sudo = root / "sudo"
             sudo.write_text(
-                '#!/bin/bash\nprintf \'%s\\n\' "$*" >> "$NATIVE_TOOLS_LOG"\nif [[ "${FAIL_UPDATE:-}" == 1 && "$2" == update ]]; then exit 7; fi\n'
+                '#!/bin/bash\nprintf \'%s\\n\' "$*" >> "$NATIVE_TOOLS_LOG"\nif [[ "${FAIL_UPDATE:-}" == 1 && "${!#}" == update ]]; then exit 7; fi\n'
             )
             sudo.chmod(0o755)
+            sleep = root / "sleep"
+            sleep.write_text("#!/bin/bash\nexit 0\n")
+            sleep.chmod(0o755)
             log = root / "calls"
             result = subprocess.run(
                 ["/bin/bash", str(SCRIPT)],
@@ -68,15 +71,17 @@ class NativeBuildToolsTests(unittest.TestCase):
                 self.assertEqual(
                     calls,
                     [
-                        "apt-get update",
-                        "apt-get install --no-install-recommends -y build-essential binutils pkg-config xz-utils",
+                        "apt-get -o Acquire::Retries=3 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true -o APT::Update::Error-Mode=any update",
+                        "apt-get -o Acquire::Retries=3 install -y --no-install-recommends build-essential binutils pkg-config xz-utils",
                     ],
                 )
 
     def test_package_failure_stops_before_install(self):
         result, calls = self.run_setup(missing=("nm",), fail_update=True)
         self.assertEqual(result.returncode, 7)
-        self.assertEqual(calls, ["apt-get update"])
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(call.endswith(" update") for call in calls))
+        self.assertTrue(all("APT::Update::Error-Mode=any" in call for call in calls))
 
 
 if __name__ == "__main__":
