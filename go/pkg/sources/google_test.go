@@ -303,15 +303,44 @@ func TestGCSStagedAccessIsBoundToPinnedGeneration(t *testing.T) {
 
 func TestGCSProjectedPageProvenance(t *testing.T) {
 	text := []byte("one repaired page\n")
-	item := Item{ID: "page", Path: "page.txt", URL: "gs://projection/page.txt", Revision: "1", SourceKind: ProviderGCS,
-		Metadata: map[string]any{
-			"projection_uri":      "gs://projection/page.txt",
-			"original_pdf_uri":    "gs://original/source.pdf?generation=42",
-			"original_page":       "12",
-			"extraction_revision": "3",
-			"content_sha256":      fmt.Sprintf("%x", sha256.Sum256(text)),
-		}}
-	doc, err := Normalize("test-source", item, text, Permissions{}, time.Time{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/b/projection/o":
+			if !strings.Contains(r.URL.Query().Get("fields"), "metadata") {
+				t.Error("listing did not request page provenance")
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{map[string]any{
+				"name": "pages/page.txt", "generation": "1", "size": fmt.Sprint(len(text)), "contentType": "text/plain",
+				"metadata": map[string]string{
+					"original_pdf_uri": "gs://original/source.pdf?generation=42",
+					"original_page":    "12", "extraction_revision": "3",
+					"content_sha256": fmt.Sprintf("%x", sha256.Sum256(text)),
+				},
+			}}})
+		case "/b/projection/o/pages/page.txt":
+			if r.URL.Query().Get("generation") != "1" || r.URL.Query().Get("ifGenerationMatch") != "1" {
+				t.Error("read did not pin the projection generation")
+			}
+			w.Header().Set("X-Goog-Generation", "1")
+			_, _ = w.Write(text)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	connector := GoogleConnector{ProviderName: ProviderGCS, HTTPClient: server.Client(), APIBase: server.URL}
+	request := Request{Mode: ImportModeSource, SourceNamespace: "test", Config: SourceConfig(`{"bucket":"projection","prefix":"pages/","page_provenance":true}`)}
+	inventory, err := connector.Enumerate(t.Context(), request)
+	if err != nil || len(inventory.Objects) != 1 {
+		t.Fatalf("page listing: %d objects, error = %v", len(inventory.Objects), err)
+	}
+	item := inventory.Objects[0]
+	data, err := connector.Read(t.Context(), request, item)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	doc, err := Normalize("test-source", item, data, Permissions{}, time.Time{})
 	if err != nil || doc.URI != "gs://original/source.pdf?generation=42#page=12" || doc.Metadata["projection_uri"] != item.URL {
 		t.Fatalf("projected page citation = %q, error = %v", doc.URI, err)
 	}
