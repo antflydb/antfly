@@ -1508,3 +1508,14 @@ but manual-vector reads still wait for the whole recipe set. Recovery scheduling
 alone does not establish immediate manual-vector visibility. Recipe-scoped
 preparation and readiness need further implementation and validation; this is
 still a merge blocker.
+
+
+With the corrected phase transitions, the local Parquet case passed the entire
+fixture at 1.953 s cold versus 2.005 s on GCS using the same engine binary. The
+transition waits only for canceled responses while Antfly is stopped; it never
+waits for provider idleness after cold startup. An initial stored-source retry
+was refused by the production-equivalent disk-headroom gate; repository cache
+GC restored headroom and the fresh retry passed the whole fixture at 1.510 s
+cold (1.652 s on GCS). Both corrected local cases completed their mutation,
+restart, retained-cursor and publication-barrier assertions. These results do
+not establish publication performance under the all-shaped stress policy.
