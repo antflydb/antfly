@@ -188,6 +188,10 @@ fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, ca
     // Unsupported declarations remain an explicit repair obligation.
     for (document.declarations) |declaration| {
         if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version != @import("lake_index_native_text.zig").metadata_version) return false;
+        // Old readers interpret recent runs as one all-recipe cohort. Upgrade
+        // vector publications before issuing independently prepared recipe cuts;
+        // compatible text-only generations keep their existing fast recovery.
+        if (ready.reader_protocol < 102 and (declaration.artifact.kind == .vector_segment or declaration.artifact.kind == .sparse_segment)) return false;
     }
     return true;
 }

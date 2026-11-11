@@ -869,7 +869,8 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     } else false;
     owner.cloud_generations = selected.publication().cloud_generations;
     if (has_vectors) if (owner.overlay) |pending_overlay| {
-        const recent_prepared: @import("lake_recent_vectors.zig").Prepared = if (prepared.retained) |cut| .{ .declarations = cut.recent, .cloud_generations = cut.recent_cloud, .runs = cut.recent_runs } else @import("lake_recent_vectors.zig").prepare(ca, current_table, selected.publication(), pending_overlay, owner.declarations, store, context, .{ .antfly_provider = server.antfly_provider, .io = server.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = normalized.deadline_ns, .cancellation = retained_cancellation, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content, .inference_api_url = server.configuredInferenceAPIURL(), .inference_api_key = server.cfg.inference_api_key, .provider_runtime = &server.embedding_provider_runtime, .source_table = table.name }, build_recent, cut_expires_ms, &server.lake_recent_vector_jobs) catch |err| {
+        const recent_options: local.inference_managed_embedder.InitOptions = .{ .antfly_provider = server.antfly_provider, .io = server.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = normalized.deadline_ns, .cancellation = retained_cancellation, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content, .inference_api_url = server.configuredInferenceAPIURL(), .inference_api_key = server.cfg.inference_api_key, .provider_runtime = &server.embedding_provider_runtime, .source_table = table.name };
+        const recent_prepared: @import("lake_recent_vectors.zig").Prepared = if (prepared.retained) |cut| .{ .declarations = cut.recent, .cloud_generations = cut.recent_cloud, .runs = cut.recent_runs } else (if (build_recent) @import("lake_recent_vectors.zig").prepare(ca, current_table, selected.publication(), pending_overlay, owner.declarations, store, context, recent_options, build_recent, cut_expires_ms, &server.lake_recent_vector_jobs) else @import("lake_recent_vectors.zig").prepareQuery(ca, current_table, selected.publication(), pending_overlay, owner.declarations, store, context, recent_options, cut_expires_ms, &server.lake_recent_vector_jobs, effective)) catch |err| {
             // Recent jobs need their own recovery wakeup even when native
             // serving-cut admission is disabled. A publication-only wakeup
             // cannot rebuild a pending dense/sparse suffix after restart.
@@ -880,13 +881,17 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         owner.recent_declarations = recent_prepared.declarations;
         owner.recent_runs = recent_prepared.runs;
         owner.recent_cloud = recent_prepared.cloud_generations;
-        // All declared vector recipes publish as one coherent recent cut.
-        var expected: usize = 0;
-        for (owner.declarations) |declaration| if (declaration.artifact.kind == .vector_segment or declaration.artifact.kind == .sparse_segment) {
-            expected += 1;
-        };
-        for (owner.recent_runs) |run| if (run.declarations.len != expected) return error.IndexRebuilding;
-        if (owner.recent_declarations.len != expected) return error.IndexRebuilding;
+        if (!build_recent) {
+            const required = try @import("lake_recent_vectors.zig").selectedRecipes(ca, owner.declarations, effective);
+            // A retained descriptor must cover every selected recipe. Extra
+            // recipes from legacy cursors are harmless; missing ones are not.
+            for (required) |recipe| {
+                const present = for (owner.recent_declarations) |ready| {
+                    if (ready.artifact.kind == recipe.artifact.kind and std.mem.eql(u8, ready.name, recipe.name)) break true;
+                } else false;
+                if (!present) return error.IndexRebuilding;
+            }
+        }
     };
     if (build_recent) return null;
     if (has_vectors) {
@@ -3876,7 +3881,17 @@ const Execution = struct {
             }
         };
         const legacy = [_]@import("lake_recent_vectors.zig").Run{.{ .prefix = 0, .digest = @splat(0), .declarations = self.recent_declarations, .cloud_generations = self.recent_cloud }};
-        const runs = if (self.recent_runs.len != 0) self.recent_runs else &legacy;
+        const available_runs = if (self.recent_runs.len != 0) self.recent_runs else &legacy;
+        var matching_runs: std.ArrayList(@import("lake_recent_vectors.zig").Run) = .empty;
+        defer matching_runs.deinit(a);
+        const kind: @FieldType(@FieldType(local.serverless_segment_sidecar_manifest.DeclaredArtifact, "artifact"), "kind") = if (@TypeOf(query) == types.DenseKnnQuery) .vector_segment else .sparse_segment;
+        if (@TypeOf(query) == types.DenseKnnQuery or @TypeOf(query) == types.SparseKnnQuery) for (available_runs) |run| {
+            const matches = for (run.declarations) |declaration| {
+                if (declaration.artifact.kind == kind and (if (req.index_name) |name| std.mem.eql(u8, declaration.name, name) else true)) break true;
+            } else false;
+            if (matches) try matching_runs.append(a, run);
+        };
+        const runs = if (@TypeOf(query) == types.DenseKnnQuery or @TypeOf(query) == types.SparseKnnQuery) matching_runs.items else available_runs;
         var first: usize = 0;
         const archive_count: usize = @intFromBool(include_archive);
         if (self.scheduled_component) {
@@ -4068,8 +4083,10 @@ const Execution = struct {
     fn payloadRuntime(self: *Execution, name: []const u8, public_parent: []const u8) !PayloadRuntime {
         try self.context.ensureActive();
         const recent = if (self.overlay) |overlay| overlay.row(public_parent) != null else false;
-        const run: ?@import("lake_recent_vectors.zig").Run = if (recent and self.recent_runs.len != 0) for (self.recent_runs) |candidate| {
-            if (std.mem.startsWith(u8, public_parent, "wal1:") and public_parent.len > 5 and candidate.prefix == public_parent[5]) break candidate;
+        const run: ?@import("lake_recent_vectors.zig").Run = if (recent and self.recent_runs.len != 0) find_run: for (self.recent_runs) |candidate| {
+            if (std.mem.startsWith(u8, public_parent, "wal1:") and public_parent.len > 5 and candidate.prefix == public_parent[5]) {
+                for (candidate.declarations) |declaration| if (std.mem.eql(u8, declaration.name, name)) break :find_run candidate;
+            }
         } else return error.InvalidChunkArtifact else null;
         const declarations = if (run) |value| value.declarations else if (recent) self.recent_declarations else self.declarations;
         const declaration = for (declarations) |candidate| {
@@ -5915,7 +5932,11 @@ test "external lake bounded WAL unit hydration chooses exact recent partition" {
     const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
     const first_decl: Declared = .{ .name = "vectors", .binding = undefined, .artifact = .{ .kind = .vector_segment, .metadata_version = 2, .artifact_id = &first_artifact, .checksum = first_artifact[7..71], .byte_len = 1 } };
     const second_decl: Declared = .{ .name = "vectors", .binding = undefined, .artifact = .{ .kind = .vector_segment, .metadata_version = 2, .artifact_id = &second_artifact, .checksum = second_artifact[7..71], .byte_len = 1 } };
-    const runs = [_]vectors.Run{ .{ .prefix = '7', .digest = @splat(1), .declarations = &.{first_decl} }, .{ .prefix = 'd', .digest = @splat(2), .declarations = &.{second_decl} } };
+    var unrelated = first_decl;
+    unrelated.name = "unrelated";
+    // Independently prepared recipes share a partition prefix. Deferred
+    // delivery must select the recipe too, not the first matching prefix.
+    const runs = [_]vectors.Run{ .{ .prefix = '7', .digest = @splat(1), .declarations = &.{unrelated} }, .{ .prefix = '7', .digest = @splat(1), .declarations = &.{first_decl} }, .{ .prefix = 'd', .digest = @splat(2), .declarations = &.{second_decl} } };
     var execution: Execution = undefined;
     execution.index_resolver = null;
     execution.navigation = null;

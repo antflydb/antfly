@@ -1519,3 +1519,72 @@ GC restored headroom and the fresh retry passed the whole fixture at 1.510 s
 cold (1.652 s on GCS). Both corrected local cases completed their mutation,
 restart, retained-cursor and publication-barrier assertions. These results do
 not establish publication performance under the all-shaped stress policy.
+
+
+### Comprehensive review of the cold-serving change
+
+Review covered publication/certificate binding and compatibility, map and seed
+integrity, credential-scoped caches, prepared/retained reader lifetimes, source
+and Parquet hydration, composed-source concurrency, transport admission and
+cancellation, publication/maintenance ownership, predicate lowering, metrics and
+benchmark validity. The baseline remains qualified at engine 340d977e8a; the
+following fixes require a fresh candidate build and HN HTTP regression.
+
+Merge blockers addressed in source:
+
+- Recent-vector jobs grouped all recipes in a partition, so manual-vector reads
+  waited for managed enrichment after restart. Protocol 102 / capability 89 adds
+  independently durable recipe partitions, prioritizes supplied vectors and
+  requires only query-selected recipes. Mixed queries still require all their
+  recipes at one WAL cut. Selected reads cannot claim table-wide readiness.
+- Independent recipe runs can share a partition prefix. Vector search lanes and
+  deferred chunk payload lookup must select the index as well as that prefix;
+  treating them as the old all-recipe runs can select the wrong runtime.
+- Optional Parquet chunk staging allocated its owner before quota admission.
+  Declined admission is a successful null return, so the errdefer leaked that
+  owner. Allocation now follows successful reservation.
+- Replacement recent-vector attempts carried forward the expired job's cloud
+  map. A declined new map capture could then bind a complete map for the wrong
+  output generation. Claims and interrupted cleanup now clear old declarations
+  and selectors before producing replacement artifacts.
+- Vector publications using the old reader protocol require controlled
+  republication before independent recipe runs are issued. Text-only compatible
+  generations do not require rebuilding.
+
+The biggest remaining cold-search opportunities are:
+
+- Publish a small first opening tier separately from the bulk seed packs. The
+  first pack is joined before navigation can continue and currently shares the
+  4 MiB decoded pack limit. A bounded micro-bootstrap containing only roots and
+  essential routing could start required reads sooner; remaining seeds must
+  stay optional, cancellable and subordinate to demand. Measure the extra
+  demand misses as well as fewer startup bytes before choosing its size.
+
+1. Reuse provider connection pools across short-lived store views. Preparation,
+   navigation, retained manifests and each seed worker still reopen separate
+   clients; the matched cold-query windows observed 19/22 connections for stored
+   source/Parquet. These are process-wide windows including background traffic,
+   not an attribution of every connection to the foreground query. Pool reuse
+   must preserve credential/endpoint isolation and per-request cancellation and
+   admission; sharing a mutable client configuration would be unsafe.
+2. Batch native stored-column metadata discovery with winner payload reads.
+   Winner hydration already batches identities and selected blocks, but opens
+   column cursors before scheduling their payloads. The stored-source GCS sample
+   recorded about 562 ms in native hydration; opening recorded about 623 ms.
+   These phase times overlap other work and must not be summed as independent
+   savings. Fewer sequential metadata/payload waves are the largest plausible
+   path to sub-second cold queries; further concurrency alone cannot remove
+   these dependencies.
+3. Complete direct locators for remaining required map lookups, and adapt
+   source chunk sizing to the selected range/transfer budget. The measured
+   stored-source query still used two map reads (~158 ms); Parquet used one
+   (~96 ms) and 19 source reads (~3.33 MB). Removing only map reads does not
+   explain enough of the 1.65/2.00 s total to establish a sub-second result.
+
+Follow-up performance work includes explicit non-diagnostic Parquet probe
+policy (large-chunk probe sizing still checks trace availability), fair
+admission under mixed demand/seed load, and fail-fast propagation across selected
+hydration lanes. None is a demonstrated additional wrong-result bug in this
+review. All-shaped archive construction/publication still exceeds the fixture
+readiness budget; the passing query-shaped local model does not qualify that
+stress case. Full-archive scale and tail distributions remain unqualified.

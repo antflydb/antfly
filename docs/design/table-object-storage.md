@@ -764,3 +764,24 @@ those recipe-specific segment roots through expiry. Aggregate table status can
 report incomplete enrichment without suppressing unrelated ready indexes;
 background recovery must resume missing recipes without rebuilding completed
 ones or allowing an old worker to publish into a newer cut.
+
+
+Reader protocol 102 / topology capability 89 separates durable recent-vector
+jobs by the authenticated archive generation, exact WAL-partition content and
+index recipe. Supplied-vector recipes run before managed model/chunker calls.
+Successful recipe partitions remain reusable when a different recipe is pending,
+failed or canceled. Query admission resolves its required dense/sparse recipes
+against the pinned publication and requires each at the same WAL horizon;
+selected reads cannot publish table-wide readiness. Each run retains its own
+cloud-generation map and expiry, and vector lanes and deferred chunk hydration
+select by both partition and index name. Retained descriptors authenticate and
+carry those exact runs. Older publications retain their prior interpretation;
+the coordinator republishes vector declarations under the new capability before
+using independent recipe cuts. Compatible text-only publications remain reusable.
+
+The first implementation's five-second accepted-write preparation window remains
+best effort, not a general full-index acknowledgement: caller deadlines and
+cancellation remain authoritative. Pending managed enrichment can still return
+retryable readiness errors for the affected index. Native HN immediate manual
+vector queries and mixed/manual/enrichment restart coverage must pass on the
+candidate binary before claiming that recovery regression fixed.

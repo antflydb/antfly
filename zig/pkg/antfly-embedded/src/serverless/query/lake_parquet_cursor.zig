@@ -228,12 +228,14 @@ pub const Cursor = struct {
         if (column.hydration_chunk == null) {
             const context = self.shared_reader.?.context;
             const length: usize = @intCast(chunk.compressed_len);
-            const held = try std.heap.smp_allocator.create(HydrationChunk);
-            errdefer std.heap.smp_allocator.destroy(held);
             // Whole-chunk staging is optional. Required page-sized reads
             // retain their usual progress path when the input quota is busy.
             if (!try self.admission.tryReserveInput(length, context)) return null;
             errdefer self.admission.releaseInput(length, context);
+            // Declining optional admission is a successful null return, so an
+            // errdefer cannot release an owner allocated before that decision.
+            const held = try std.heap.smp_allocator.create(HydrationChunk);
+            errdefer std.heap.smp_allocator.destroy(held);
             const parent = try self.reader.readPlannedLease(std.heap.smp_allocator, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = chunk.file_offset, .len = chunk.compressed_len }, .purpose = .parquet_column_chunk });
             errdefer parent.release();
             held.* = .{ .parent = try self.admission.wrapInput(parent, length, context) };
