@@ -92,6 +92,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const shared_lock_region = @import("shared_lock_region.zig");
 
 pub const Mode = enum { shared, exclusive };
 
@@ -263,7 +264,39 @@ pub const Entry = struct {
     /// present (so no other field's offset depends on the build mode),
     /// but only ever appended to or read in a Debug build.
     debug_outstanding: std.ArrayListUnmanaged(DebugAcquisition) = .empty,
+    /// §8.5: the shared mmap lock region for this inode's own
+    /// `<path>.aflite-lock` sidecar, opened lazily (`ensureRegion`) on
+    /// first need and shared by every NativeFile/Store referencing this
+    /// `Entry` -- the same "one registry entry, one resource, shared by
+    /// every same-process opener" shape this registry already gives the
+    /// kernel flock state above. Per §8.7's migration table, this is
+    /// what the writer lane, the epoch-reuse lock, and reader fences
+    /// move onto as each is migrated; until then it is additive and
+    /// unreferenced by any real caller, same posture `shared_lock_region
+    /// .zig` itself had through its own steps 1-3.
+    ///
+    /// Not yet handled: `rebind` changes `entry.path` (a generation
+    /// swap) without touching an already-open `region`, which would
+    /// then go on serving the *old* path's sidecar. Rebinding the region
+    /// too -- or deciding a generation swap should instead open a fresh
+    /// one -- is deferred to whichever migration step first gives a
+    /// rebound `Entry` a live `region` to actually carry across the
+    /// swap; nothing does yet.
+    region: ?shared_lock_region.Region = null,
 };
+
+/// Lazily opens (once per `Entry`, shared by every reference to it) and
+/// returns this inode's shared lock region. `entry.mutex` serializes
+/// concurrent first-use the same way it already serializes every other
+/// field above.
+pub fn ensureRegion(entry: *Entry, io: Io) !*shared_lock_region.Region {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    if (entry.region == null) {
+        entry.region = try shared_lock_region.Region.open(std.heap.page_allocator, io, entry.path);
+    }
+    return &entry.region.?;
+}
 
 var registry_mutex: Io.Mutex = .init;
 var registry: std.AutoHashMapUnmanaged(Io.File.INode, *Entry) = .empty;
@@ -527,6 +560,7 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
     registry_mutex.lockUncancelable(io);
     var destroy = false;
     var fd: ?Io.File = null;
+    var region: ?shared_lock_region.Region = null;
     {
         entry.mutex.lockUncancelable(io);
         defer entry.mutex.unlock(io);
@@ -538,12 +572,15 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
             fd = entry.fd;
             entry.fd = null;
             entry.state = .none;
+            region = entry.region;
+            entry.region = null;
         }
     }
     if (destroy) _ = registry.remove(entry.inode);
     registry_mutex.unlock(io);
     if (destroy) {
         if (fd) |held| held.close(io);
+        if (region) |*r| r.close();
         page.free(entry.path);
         entry.debug_outstanding.deinit(page);
         page.destroy(entry);
@@ -599,4 +636,68 @@ fn ensureFd(entry: *Entry, io: Io) !Io.File {
     const fd = try Io.Dir.cwd().openFile(io, entry.path, .{ .mode = .read_write });
     entry.fd = fd;
     return fd;
+}
+
+test "ensureRegion opens the shared lock region once and shares it across references" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const path = try std.fmt.allocPrint(a, "{s}/inode-region.data", .{buf[0..dir_len]});
+    defer a.free(path);
+    {
+        const f = try Io.Dir.cwd().createFile(io, path, .{});
+        f.close(io);
+    }
+
+    const entry = try open(io, path);
+    defer unref(entry, io);
+    // A second reference to the same inode shares the same `Entry`, and
+    // so the same `region` once opened -- never a second, independent
+    // one.
+    const entry2 = try open(io, path);
+    defer unref(entry2, io);
+    try std.testing.expectEqual(entry, entry2);
+
+    const region = try ensureRegion(entry, io);
+    const region_again = try ensureRegion(entry, io);
+    try std.testing.expectEqual(region, region_again);
+
+    const own_pid: u32 = @bitCast(std.c.getpid());
+    region.acquireWriter(own_pid);
+    region.releaseWriter();
+}
+
+test "ensureRegion's region closes when the entry is torn down" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const path = try std.fmt.allocPrint(a, "{s}/inode-region-teardown.data", .{buf[0..dir_len]});
+    defer a.free(path);
+    {
+        const f = try Io.Dir.cwd().createFile(io, path, .{});
+        f.close(io);
+    }
+
+    {
+        const entry = try open(io, path);
+        _ = try ensureRegion(entry, io);
+        unref(entry, io); // last reference: tears the entry (and its region) down.
+    }
+
+    // Reopening (a fresh `Entry`, since the old one was destroyed) and
+    // claiming the writer lock must succeed -- if the old region's
+    // liveness slot or writer hold had leaked past teardown, this would
+    // hang or fail instead.
+    const entry = try open(io, path);
+    defer unref(entry, io);
+    const region = try ensureRegion(entry, io);
+    const own_pid: u32 = @bitCast(std.c.getpid());
+    region.acquireWriter(own_pid);
+    region.releaseWriter();
 }

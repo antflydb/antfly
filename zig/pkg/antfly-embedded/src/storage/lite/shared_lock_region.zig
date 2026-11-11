@@ -1082,6 +1082,23 @@ fn reapBounded(pid: std.c.pid_t, timeout_ms: i64) !c_int {
     }
 }
 
+/// A forked child's "now simulate a crash: park until the parent's
+/// `kill -9` ends this process outright" idiom, isolated into one
+/// helper (per the module's own instruction to isolate the one fork-
+/// based pattern this file's cross-process tests genuinely need --
+/// `fork`, not `std.process.Child`, because the point in every one of
+/// these tests is a child that *inherits* the parent's existing mmap,
+/// which spawning a new program via `exec` would not). `poll` with no
+/// fds and a short timeout is a portable sleep, avoiding a separate
+/// `nanosleep` declaration for this one backoff; never returns, since
+/// the only way out is the parent's signal.
+fn parkForever() noreturn {
+    while (true) {
+        var no_fds: [0]std.c.pollfd = .{};
+        _ = std.c.poll(&no_fds, 0, 20);
+    }
+}
+
 // Two real OS processes (via `std.c.fork`, the same pattern
 // `writer_queue.zig`'s own multi-process tests use): the parent holds the
 // writer word, the child blocks in `acquireWriter` on the real shared
@@ -1617,10 +1634,7 @@ test "shared lock region refuses a corrupt header instead of rebuilding under a 
         _ = peer.tryAcquireWriter(@bitCast(std.c.getpid()));
         var sig: [1]u8 = .{1};
         _ = std.c.write(ready_fds[1], @ptrCast(&sig), 1);
-        while (true) {
-            var no_fds: [0]std.c.pollfd = .{};
-            _ = std.c.poll(&no_fds, 0, 20);
-        }
+        parkForever();
     }
     _ = std.posix.system.close(ready_fds[1]);
     defer _ = std.posix.system.close(ready_fds[0]);
@@ -1679,10 +1693,7 @@ test "shared lock region: a kill -9'd writer is detected dead and recovered" {
         _ = std.c.write(ready_fds[1], @ptrCast(&sig), 1);
         // Simulate a crash mid-commit: no releaseWriter, just park until
         // the parent's kill -9 below ends this process outright.
-        while (true) {
-            var no_fds: [0]std.c.pollfd = .{};
-            _ = std.c.poll(&no_fds, 0, 20);
-        }
+        parkForever();
     }
     _ = std.posix.system.close(ready_fds[1]);
     defer _ = std.posix.system.close(ready_fds[0]);
@@ -1743,10 +1754,7 @@ test "shared lock region: a kill -9'd reader's pin is cleared by the frontier sc
         var report: [4]u8 = undefined;
         std.mem.writeInt(u32, &report, slot, .little);
         _ = std.c.write(ready_fds[1], @ptrCast(&report), report.len);
-        while (true) {
-            var no_fds: [0]std.c.pollfd = .{};
-            _ = std.c.poll(&no_fds, 0, 20);
-        }
+        parkForever();
     }
     _ = std.posix.system.close(ready_fds[1]);
     defer _ = std.posix.system.close(ready_fds[0]);
