@@ -462,3 +462,5 @@ test "concurrency" {
 test "testing" {
     _ = testing_mod;
 }
+
+pub const QuotaAllocator = @import("util/quota_allocator.zig").QuotaAllocator;

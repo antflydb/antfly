@@ -38,7 +38,7 @@ const Client = @This();
 const mem = std.mem;
 const crypto = std.crypto;
 const assert = std.debug.assert;
-const Certificate = std.crypto.Certificate;
+const Certificate = @import("certificate_compat.zig");
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
 
