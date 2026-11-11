@@ -81,6 +81,8 @@ export {
   restore,
   restoreFile,
 } from "./files.js";
+export type { GraphDiagnostic } from "./graph-types.js";
+export { GraphError } from "./graph-types.js";
 export { Inference } from "./inference.js";
 export type { JsonInput, Uint64Like } from "./marshal.js";
 /** Native stack, in bytes, every libantfly call runs on (ANTFLY_MIN_THREAD_STACK_SIZE). */
@@ -89,8 +91,6 @@ export { Connection } from "./sql.js";
 export type { SqlColumn, SqlResult } from "./sql-types.js";
 
 export { SqlError } from "./sql-types.js";
-export { GraphError } from "./graph-types.js";
-export type { GraphDiagnostic } from "./graph-types.js";
 export type {
   Capabilities,
   CheckReport,

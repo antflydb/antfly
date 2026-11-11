@@ -819,7 +819,7 @@ test "capi path gate never hands an early lease to a waiter on a different Store
 const PathGate = struct {
     path: []u8,
     mutex: QueuedMutex = .{},
-    sql_preparation: @import("sql.zig").PreparationAdmission = .{},
+    sql_preparation: @import("../sql/preparation_admission.zig").PreparationAdmission = .{},
     references: usize = 1,
     owners: std.ArrayList(*Owner) = .empty,
 };

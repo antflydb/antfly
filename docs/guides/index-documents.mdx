@@ -306,6 +306,40 @@ The reader decides accuracy, cost, and speed, and `mode` decides how often you p
 
 If the reader fails, for example because the model is not installed, the page reports `extraction_status: "failed_ocr"`. Fix the cause and reprocess the artifact to retry.
 
+On a server with an enrichment runtime, document-artifact reprocessing durably
+submits a target generation and returns before extraction runs. The worker
+retains that request across cold starts, transient provider failures, and owner
+restart. A successful HTTP response acknowledges submission; inspect the
+artifact's generation, merge status, and OCR failure counts to observe completion.
+Embedded databases without an enrichment runtime execute extraction inline.
+
+For a collection of failed documents, use the existing table repair jobs rather
+than holding a synchronous repair request open through remote OCR:
+
+```bash
+curl -X POST "$ANTFLY_URL/db/v1/tables/docs/repair/jobs" \
+  -H "Authorization: Bearer $ANTFLY_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"artifact","kind":"asset","index":"page_text","limit":16,"advance":false}'
+```
+
+Retain the returned `job_id`, POST to `/repair/jobs/{job_id}/advance`, and GET
+`/repair/jobs/{job_id}` to inspect progress. Advance queued jobs until terminal;
+concurrent advances share the job's execution lease. Native document-extraction
+and embedding repairs submit durable work in each pass, so a pass may report
+`in_progress` while provider work continues. Generic asset and chunk producers
+retain their synchronous execution semantics. A later pass observes successful
+publication or a failed attempt; a fresh job explicitly retries failed work.
+The job's work counters accumulate across passes. Its `in_progress` and
+`unresolved` counts describe the latest bounded pass, so polling the same queued
+source does not inflate them. Earlier failures remain in the cumulative failure
+counts and `debt_remaining`; `remaining_failures` summarizes current document debt.
+
+Publication retires only older matching consumer debt, after a healthy extraction
+manifest and its index updates have reached that consumer. A partial or failed
+manifest retains repair debt, even if older searchable text is still present.
+
+
 Read `extraction_warning` for the cause. `ReadOutputTruncated` means the reader
 reached its token budget before completing the page; the
 [LightOn guide](/docs/guides/models/lightonocr3#read-documents-during-ingestion)

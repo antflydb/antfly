@@ -132,3 +132,25 @@ it("demands relationship projections for readiness and clears it when the defini
   fireEvent.click(screen.getByRole("button", { name: "Check readiness" }));
   expect(await screen.findByText(/Graph unavailable.*CatalogGenerationChanged/)).toBeTruthy();
 });
+
+it("creates and edits mappings on HTTP origins without randomUUID", async () => {
+  mocks.client.graphs.list.mockResolvedValue([]);
+  mocks.client.tables.list.mockResolvedValue([]);
+  vi.stubGlobal("crypto", {});
+  try {
+    render(<GraphCatalogPage />);
+    const create = await screen.findByRole("button", { name: "Create graph" });
+    await waitFor(() => expect(create.hasAttribute("disabled")).toBe(false));
+    const first = screen.getByLabelText("Label");
+    fireEvent.change(first, { target: { value: "Original" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add label" }));
+    const labels = screen.getAllByLabelText("Label");
+    expect(labels).toHaveLength(2);
+    expect(labels[0]).toBe(first);
+    expect((labels[0] as HTMLInputElement).value).toBe("Original");
+    fireEvent.click(screen.getByRole("button", { name: "Add relationship" }));
+    expect(screen.getByLabelText("Relationship type")).toBeDefined();
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});

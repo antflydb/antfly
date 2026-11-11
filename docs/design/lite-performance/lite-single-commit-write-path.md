@@ -729,3 +729,322 @@ pre-existing suites stayed green throughout:
 `-Dtest-filter="crash sweep exhaustive"` (7 tests), and
 `antfly-storage-test -Dtest-filter="crash sweep"` (23 tests) -- all
 0 failed, 0 leaked.
+
+## 8. Cross-process coordination: shared lock region
+
+Status: design landing on `perf/lwa-cpu`, in reviewable steps (§8.9),
+each gated green before the next starts. Supersedes `storage/lite/
+inode_lock.zig`'s process-wide flock registry from the immediately
+preceding round of this same effort (per-inode `Entry`, parked kernel
+locks, a `writer_queue.zig`-style ticket for cross-process handoff):
+that round cut per-write `flock()`/`open()` to zero by replacing a
+wall-clock fairness quantum with event-driven release, but the event
+itself was still a `pread` on a ticket-queue counter file, and the
+file-based reader-fence/epoch machinery (`reader_epochs.zig`,
+`ReaderCoordinator`) it left untouched is the larger remaining cost
+(open, stat and scan a namespace directory per reader admission).
+This section designs the replacement for all of it: one mapped region
+per database, modeled on SQLite's `-shm` WAL-index and LMDB's
+`lock.mdb`, where the steady state -- no contention, no crash -- never
+calls `open`, `flock`, or issues a read syscall for coordination at
+all, and the contended state hands a commit off to a waiting process
+in about one commit, not a fairness quantum or a `pread`-sampled
+timer.
+
+### 8.1 The shared region: `<db>.aflite-lock`
+
+One file next to the database, memory-mapped `MAP_SHARED` by every
+process with the database open, created and version-checked under a
+one-time `flock` (the only `flock` this design still issues, and only
+at open, not per commit):
+
+```
+offset  bytes  field
+0       8      magic ("AFLLOCK1")
+8       4      format_version (bump refuses an older/newer mapper, same
+               policy as native.zig's own checkpoint format bump)
+12      4      header_checksum (CRC32C of bytes 16..header_end, so a
+               torn header write is detected the same way a torn
+               native.zig slot is)
+16      8      writer_word (§8.2)
+24      8      writer_ticket_tail (§8.2's FIFO counter)
+32      N*32   reader slots (§8.3), N = max_readers (configurable at
+               create time, stored in the header; a region created by
+               an older binary with fewer slots is grown -- see
+               "region growth" below, not rewritten in place)
+...     M*1    process liveness bytes, one per slot (§8.4)
+```
+
+Opened lazily, the first time a `NativeFile` needs cross-process
+coordination for a given inode (mirroring `inode_lock.Entry`'s own
+open-on-first-use): `open`/`create` the file, `flock(.exclusive)`,
+check magic/version/checksum, initialize if absent or rebuild if the
+checksum fails (a corrupt region is never trusted, only replaced --
+same posture as `native.zig`'s own slot/manifest recovery), `flock`
+unlock, `mmap(MAP_SHARED, PROT_READ | PROT_WRITE)`, keep the mapping
+for the `NativeFile`'s (and every sibling same-inode `NativeFile`'s,
+via the in-process registry, §8.5) lifetime. Every field after the
+header is touched only through atomics on the mapping -- no further
+`read`/`write`/`pread` once mapped, by construction, not by a
+best-effort fast path with a slow fallback hiding behind it.
+
+**Region growth.** `max_readers` is fixed at creation; a process that
+needs more slots than the region has (more concurrent readers than any
+opener has ever configured) remaps a larger region under the same
+one-time `flock`, writes the new size into the header, and every other
+process notices the size change on its own next `fstat`-guarded
+lazy-remap check (done at the same cadence as the mmap-failure
+fallback probe below, not per commit). This is the one path that still
+touches the filesystem after the initial open, and only on the
+cold/rare growth transition, not on an ordinary command.
+
+### 8.2 Writer lock: CAS, FIFO ticket, futex handoff
+
+`writer_word` (offset 16, 8 bytes) is `0` when free, else the holder's
+`(pid, generation)` packed into the word (`generation` so a dead
+holder's stale word is distinguishable from a live one of the same
+reused pid, together with the liveness check in §8.4 -- never a PID
+reuse check alone).
+
+- **Uncontended acquire/release**: `cmpxchg(writer_word, 0, mine)` to
+  acquire, plain atomic store of `0` to release. No syscall either way
+  -- this is the whole point, and it is the path every warm write
+  takes.
+- **Contended acquire**: CAS fails. The waiter takes a ticket from
+  `writer_ticket_tail` (atomic fetch-add, in the region, no file) and
+  parks on a cross-process futex at a byte derived from its ticket
+  slot:
+  - macOS/Darwin: `__ulock_wait`/`__ulock_wake` with
+    `UL_COMPARE_AND_WAIT_SHARED` (the shared-memory variant; private
+    `UL_COMPARE_AND_WAIT` only works within one process's address
+    space, the wrong primitive for a `MAP_SHARED` region across
+    processes).
+  - Linux: `futex(2)` without `FUTEX_PRIVATE_FLAG` (the flag that
+    restricts a futex to one process's address space; cross-process
+    futexes on a shared mapping must omit it).
+  - Both are declared in `antfly_platform`'s existing per-OS syscall
+    surface (same module that already wraps `flock`/`fcntl` for this
+    codebase), not re-declared locally.
+- **Handoff**: the releaser, instead of a plain store when
+  `writer_ticket_tail` shows a waiter behind it, stores the next
+  ticket's holder into `writer_word` and wakes that specific futex
+  word. FIFO because the ticket counter orders waiters exactly as
+  `writer_queue.zig`'s file-based ticket does today, without a
+  directory, a per-ticket file, or a tail `flock`.
+- **No timer anywhere in this path.** The 1-second fairness quantum
+  this section replaces, and the quantum-free but still-polled design
+  one round before it, both exist only because a kernel `flock` cannot
+  tell its holder "someone is waiting" without the holder asking. A
+  futex can: `__ulock_wake`/`futex(..., FUTEX_WAKE, ...)` only returns
+  once a waiter is actually woken, so the releaser's cost is paid
+  exactly when, and only when, a waiter exists.
+
+### 8.3 Reader table: fixed slots, in-memory oldest-pin scan
+
+Each of the `max_readers` 32-byte slots (offset 32 onward) holds:
+
+```
+offset  bytes  field
+0       4      owner pid (0 = free slot)
+4       8      generation (packed (pid, open-generation) pair, to
+               detect a slot a dead reader never cleared being reused
+               by a new process with the same pid)
+12      8      pinned_sequence (the commit_sequence this reader will
+               not let the writer reclaim pages behind; monotonic,
+               written once at pin time, cleared to 0 on unpin)
+20      8      reserved (padding to 32 bytes; room for a second pin --
+               metadata vs. data, matching `minimum_reader_sequence`
+               vs. `minimum_metadata_reader_sequence` in native.zig
+               today -- without another format bump)
+```
+
+A reader claims a free slot (the first `owner == 0` it finds via CAS,
+same uncontended-fast-path shape as the writer word -- claiming is
+rare enough per-reader-lifetime that a short linear scan under
+contention is acceptable, unlike the per-commit writer path) once per
+`NativeFile`/pin lifetime, writes its `pinned_sequence`, and clears the
+slot (`owner = 0`) on unpin. A writer computing its reuse frontier
+(`scanReaderEpochsCached`'s replacement) scans the fixed slot array --
+bounded by `max_readers`, entirely in mapped memory, no directory
+walk, no namespace file, no per-reader marker file -- and takes the
+minimum `pinned_sequence` over slots with a live `owner` (live checked
+per §8.4, not just `owner != 0`, so a dead reader's never-cleared pin
+cannot block reclamation forever). This directly replaces
+`reader_epochs.zig`'s namespace-directory scan and
+`ReaderCoordinator`'s in-memory mirror of the same file-based state:
+once this lands, both describe a reader population a *different*
+process can also see without reading either's files, because that
+population now lives in the one region every process maps.
+
+### 8.4 Liveness: per-slot flock byte range, no PID-reuse assumption
+
+Every process, on first touching the region, opens (if not already
+open) one dedicated fd on `<db>.aflite-lock` and takes a lifetime
+`flock` on the byte range belonging to its own writer-word holder slot
+*or* reader slot (`fcntl(F_SETLK)` byte-range locking -- `flock`'s own
+whole-file granularity cannot do this, so liveness uses `fcntl` range
+locks specifically, a different primitive from the registry's
+whole-file `flock`; both operate on the same fd class and are declared
+side by side in `antfly_platform`). The kernel drops this lock
+unconditionally on process death (`exit`, `kill -9`, OOM-kill), with
+no dependency on the process having run any cleanup code.
+
+A process that finds `writer_word != 0` or a reader slot's `owner !=
+0` but needs to know whether that holder is *actually* still alive
+(the futex wait timed out with no wake, or a reader-frontier scan
+needs to decide whether a never-cleared pin is real) takes a
+non-blocking `fcntl(F_SETLK)` probe on that specific byte range:
+success means the recorded holder is dead (the kernel already dropped
+its lock), failure means it is genuinely still running. This is the
+only liveness signal; there is no PID-reuse heuristic anywhere in this
+design, matching `writer_queue.zig`'s own existing rule 5 but applied
+per-byte-range instead of per-ticket-file.
+
+**Recovery on a dead writer.** A process that proves (via the
+byte-range probe above) that the `writer_word` holder is dead must run
+the same crash recovery `native.zig` already performs on open
+(`recoverActiveCheckpoint`, slot/manifest validation) before clearing
+`writer_word` and taking the lock itself -- a holder that died
+mid-commit may have left the data file in a state only that recovery
+path already knows how to validate. This is existing code reused, not
+new recovery logic: the shared region only decides *who* clears the
+word and *when* (after recovery succeeds, not before), it does not
+reimplement what recovery checks.
+
+**Recovery on a dead reader.** Simpler: a dead reader's pin is just
+cleared (`owner = 0`) by whoever's frontier scan proves it dead via
+the byte-range probe; nothing the reader held needs validating, since
+a reader never mutates the file.
+
+### 8.5 In-process mapping: one region, one slot, every `NativeFile`
+
+`inode_lock.zig`'s registry already solves "every `NativeFile`/`Store`
+on the same inode in this process shares one thing" for the flock
+case; the shared region replaces *what* is shared, not the sharing
+mechanism. The process-wide registry keyed by inode (`inode_lock.open`/
+`unref`, reference-counted, rebound across
+`replaceWithPreparedGeneration`'s generation swap) keeps its exact
+shape: `Entry` gains the mapped region pointer and this process's
+writer-holder/reader-slot index in place of the kernel fd/`Io.File`
+state it holds today. Every `NativeFile` on the same inode -- same
+`Store`, or an `externally_locked` sibling -- resolves to the same
+`Entry`, hence the same mapping and the same slot, exactly as it
+resolves to the same kernel-lock `Entry` today. A `Handle`'s capture of
+"the exact `Entry` it was granted against, independent of a concurrent
+rebind" (`inode_lock.zig`'s module doc) carries over unchanged.
+
+### 8.6 Fallback: flock-based path, detected at open
+
+mmap or either OS's shared futex primitive can be unavailable: a
+non-local filesystem that does not support `MAP_SHARED` coherency
+across the machines involved (network filesystems, which `native.zig`
+already treats specially elsewhere), a sandboxed or restricted
+environment that denies the syscall, or (for a future, currently
+unsupported target) a platform with neither primitive declared in
+`antfly_platform`. Detected once, at the same first-open point that
+creates or opens the region: an `mmap` failure, or a one-time
+self-test futex wait/wake pair that does not behave as expected, flips
+a per-`Entry` flag and falls back to exactly the flock-based path this
+section replaces -- not a partial mix of the two within one `Entry`'s
+lifetime, so a `Handle`'s release path never has to ask "which mode
+was this acquired under" beyond that one flag. This is the same
+posture item 8.1 took for mmap itself: a fallback that is fully one
+thing or fully the other, never a best-effort layer silently degrading
+field by field.
+
+### 8.7 Migration: what this replaces, and deletes
+
+Every one of these moves onto the shared region; none is kept running
+alongside it once its migration step lands, per the explicit
+instruction to delete rather than dual-run:
+
+| Replaced | File | Becomes |
+|---|---|---|
+| Writer lane admission gate | `capi/lite_connection.zig` `WriterLane` | §8.2 writer word + futex |
+| Path write gate | `capi/lite_connection.zig` `PathWriterLock`/`PathGate`, `othersWaiting(AcrossProcesses)` | §8.2 (FIFO ticket already visible in the region; no separate signal needed) |
+| CLH ticket queue | `storage/lite/writer_queue.zig` (`Queue`/`Turn`/`Watch`, the `<sidecar>.q/` directory) | §8.2's in-region ticket counter |
+| Per-inode flock registry | `storage/lite/inode_lock.zig` | §8.5 (the `Entry`/registry *shape* survives; its kernel-lock payload does not) |
+| Epoch-reuse lock | `native.zig` `acquireEpochReuseLock`/`beginReaderWindow`/`resumeReuseIfUnblocked` | §8.2 writer word (reuse no longer needs its own lock once there is one writer word per inode, held for the commit's duration) |
+| Reader fences | `native.zig` `acquireReaderFence`/`releaseReaderFence` | §8.3 reader slot pin/unpin |
+| Reader epoch namespace | `storage/lite/reader_epochs.zig` (namespace directory, per-reader marker files, `identity` file) | §8.3 (deleted entirely; also removes the `identity`-file-escapes-to-cwd bug class `native.zig`'s own `bug2` regression test and `reader_coordinator.zig`'s cross-root marker-sweep test guard against, since there is no longer a namespace directory to escape) |
+| `ReaderCoordinator`'s in-memory mirror | `storage/lite/reader_coordinator.zig` | §8.3 (the region *is* the shared state; no process-local mirror of it is needed) |
+| Vacuum's data-rewrite lock | `native.zig` `acquireDataRewriteLock`, `vacuumWithCancel` | §8.2 writer word (vacuum is a writer like any other for this purpose) |
+| Backup/restore staging locks | `storage/lite/restore_staging.zig`, `artifact_source.zig`'s publication guard | §8.2/§8.4 (a backup reader is a reader slot; restore's exclusive staging window is a writer-word hold) |
+| Snapshot path | `native.zig` `captureFullReadSnapshot`, `captureAllocatorVerificationSnapshot` | §8.3 (a snapshot is a pinned reader slot with no file-based fence) |
+
+Each row lands as its own commit per §8.9; a row is deleted (not
+feature-flagged or kept as a fallback branch) in the same commit that
+migrates its callers, so the tree never carries two live
+implementations of the same mechanism.
+
+### 8.8 Tests
+
+- **Two- and N-process contention.** Fork `N` real child processes (as
+  `writer_queue.zig`'s own multi-process tests already do via
+  `std.c.fork`/`waitpid`) contending for the writer word; assert FIFO
+  grant order (ticket order == grant order) and that each handoff
+  completes within about one commit's wall time, not a fairness
+  quantum, with no process spinning or polling in between (a passing
+  run with zero `EAGAIN`-driven retries on the futex wait, not just a
+  bounded latency).
+- **`kill -9` of the writer mid-commit.** A child acquires the writer
+  word, is killed before releasing; the parent's byte-range liveness
+  probe must detect the dead holder, run crash recovery, and hand the
+  lock to a queued waiter -- no hang, and the recovered file passes
+  `check()`.
+- **`kill -9` of a reader holding a pin.** A child pins a reader slot,
+  is killed; a concurrent writer's reuse-frontier scan must notice the
+  dead slot (byte-range probe) and not be blocked from reclaiming
+  pages the dead reader was pinning.
+- **`kill -9` of a waiter.** A child takes a ticket and starts
+  futex-waiting, is killed before being granted; the next legitimate
+  handoff must skip it without hanging (mirrors `writer_queue.zig`'s
+  existing dead-waiter rule, re-verified against the region's own
+  ticket/futex implementation, not reused by just calling the old
+  file-based code).
+- **Region corruption / version mismatch.** A truncated, zeroed, or
+  version-bumped region must be detected (checksum or magic/version
+  fails) and rebuilt, not trusted or silently misread; a process
+  opening mid-rebuild must not observe a torn intermediate state
+  (bounded by the same one-time open `flock` §8.1 already takes).
+- **Fallback mode.** With mmap or the futex self-test forced to fail
+  (a test-only hook, not a real platform gap), every suite above still
+  passes through the flock-based fallback path, including the
+  multi-process and crash tests -- the fallback is not allowed to be
+  the untested half of this design.
+- **Existing suites stay green**: the multi-process, writer-lane,
+  path-lease and admission suites, the full crash sweep (durability
+  and stale-base assertions must not fire), vacuum, and backup/restore
+  tests.
+- **CPU gate.** `lite-write-amplification-cpu`: 0 `open`, 0 `flock`,
+  and now 0 extra `pread` per warm write (uncontended steady state),
+  *and* a reported lock-syscall count per contended handoff (the futex
+  wait/wake pair itself, and the byte-range probe when liveness is
+  checked) -- the new number this design adds to the table, since
+  "zero per warm write" no longer fully describes cost once a
+  contended handoff has its own, now directly measurable, syscall
+  price.
+
+### 8.9 Delivery plan: reviewable steps
+
+Each step lands as its own commit, gated green (the suites in §8.8
+that already apply to it) before the next starts:
+
+1. The region (§8.1) and the writer lock (§8.2): format, create/open/
+   version-check, CAS acquire/release, FIFO ticket, futex wait/wake on
+   both platforms, the fallback flag (§8.6) wired but with the reader
+   table and liveness still pending. `inode_lock.zig`'s existing
+   kernel-lock path keeps running underneath until a later step
+   retires it, so this step is additive, not yet a deletion.
+2. The reader table (§8.3): slot claim/pin/unpin, the writer's
+   oldest-pin scan. `reader_epochs.zig`/`ReaderCoordinator` keep
+   running in parallel one more step, so the two reuse-frontier
+   answers can be cross-checked against each other before the old one
+   is deleted.
+3. Liveness and recovery (§8.4): the byte-range locks, the dead-writer
+   recovery handoff, the dead-reader pin clear.
+4. Migration and deletion (§8.7), one replaced mechanism at a time in
+   the table's own order, each its own commit deleting that row's old
+   implementation in the same commit that switches its callers over --
+   never a commit that only adds the new caller and leaves the old
+   mechanism reachable.

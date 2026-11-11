@@ -870,6 +870,7 @@ pub fn isAllowedGraphResolverField(field: []const u8) bool {
         std.mem.eql(u8, field, "scorer") or
         std.mem.eql(u8, field, "scorer_json") or
         std.mem.eql(u8, field, "candidate_search") or
+        std.mem.eql(u8, field, "candidate_key_prefix") or
         std.mem.eql(u8, field, "candidate_ann_index") or
         std.mem.eql(u8, field, "candidate_limit") or
         std.mem.eql(u8, field, "name_embedding") or

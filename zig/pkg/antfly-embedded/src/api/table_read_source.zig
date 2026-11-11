@@ -616,6 +616,8 @@ pub const TableReadSource = struct {
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
+    /// This callback's deadline uses native MONOTONIC. Typed request wrappers
+    /// translate borrowed executor clocks before invoking it.
     pub fn privacyPolicyVersion(self: TableReadSource, a: std.mem.Allocator, table: []const u8, deadline: ?u64) ![64]u8 {
         const capture = self.vtable.privacy_policy_version orelse return error.PrivacyReadFenceUnavailable;
         return BoundaryAbi.call("privacy_policy_version", self.boundary_dispatch, capture, .{ self.ptr, a, table, deadline });
@@ -628,6 +630,17 @@ pub const TableReadSource = struct {
         return current;
     }
 
+    fn privacyFenceForRequest(self: TableReadSource, a: std.mem.Allocator, table: []const u8, request: anytype, expected: ?[64]u8) !?[64]u8 {
+        if (self.vtable.privacy_policy_version == null) return expected;
+        // The legacy policy callback accepts native MONOTONIC deadlines.
+        // Lookup ingress can carry an executor's awake clock, whose epoch
+        // differs on Darwin. Translate remaining time without losing the
+        // original clock on the request passed to the actual storage reader.
+        const budget = @import("routing_budget.zig").RouteBudget.fromRequest(request);
+        const deadline = (@import("routing_budget.zig").RoutingBudget{}).deadlineFrom(budget.clock);
+        return self.privacyFence(a, table, deadline, expected);
+    }
+
     fn rejectProtectedOpaqueRead(self: TableReadSource, a: std.mem.Allocator, table: []const u8) !void {
         if (try self.privacyFence(a, table, null, null)) |version| if (!std.mem.allEqual(u8, &version, 0)) return error.UnsupportedQueryRequest;
     }
@@ -638,7 +651,7 @@ pub const TableReadSource = struct {
         if (self.route_fence != null) return null;
         const open = self.vtable.open_relational_read orelse return null;
         var fenced = opts;
-        fenced.privacy_policy_version = try self.privacyFence(alloc, table_name, opts.execution_deadline_ns, opts.privacy_policy_version);
+        fenced.privacy_policy_version = try self.privacyFenceForRequest(alloc, table_name, opts, opts.privacy_policy_version);
         return BoundaryAbi.call("open_relational_read", self.boundary_dispatch, open, .{ self.ptr, alloc, table_name, from_key, to_key, fenced, consistency });
     }
 
@@ -646,7 +659,7 @@ pub const TableReadSource = struct {
         if (self.route_fence != null) return error.SqlStatementSnapshotRequired;
         const fenced = try alloc.dupe(RelationalStatementScan, scans);
         defer alloc.free(fenced);
-        for (fenced) |*scan_request| scan_request.opts.privacy_policy_version = try self.privacyFence(alloc, scan_request.table, scan_request.opts.execution_deadline_ns, scan_request.opts.privacy_policy_version);
+        for (fenced) |*scan_request| scan_request.opts.privacy_policy_version = try self.privacyFenceForRequest(alloc, scan_request.table, scan_request.opts, scan_request.opts.privacy_policy_version);
         const callback = self.vtable.open_relational_statement orelse return error.SqlStatementSnapshotRequired;
         return BoundaryAbi.call("open_relational_statement", self.boundary_dispatch, callback, .{ self.ptr, alloc, fenced, consistency });
     }
@@ -684,7 +697,7 @@ pub const TableReadSource = struct {
     /// release earlier owners before retrying acquisition on any participant.
     pub fn tryStatementReadFenceGroupLocal(self: TableReadSource, alloc: std.mem.Allocator, group: u64, table: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency) !?StatementReadFence {
         var fenced = opts;
-        fenced.privacy_policy_version = try self.privacyFence(alloc, table, opts.execution_deadline_ns, opts.privacy_policy_version);
+        fenced.privacy_policy_version = try self.privacyFenceForRequest(alloc, table, opts, opts.privacy_policy_version);
         const fence = self.route_fence orelse return error.CatalogRouteFenceRequired;
         const acquire = self.vtable.try_statement_read_fence_group_local_routed orelse return error.SqlStatementSnapshotRequired;
         return BoundaryAbi.call("try_statement_read_fence_group_local_routed", self.boundary_dispatch, acquire, .{ self.ptr, alloc, fence, group, table, fenced, consistency });
@@ -728,7 +741,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?LookupResponse {
         var fenced = opts;
-        if (!opts.privacy_original) fenced.privacy_policy_version = try self.privacyFence(alloc, table_name, opts.execution_deadline_ns, opts.privacy_policy_version);
+        if (!opts.privacy_original) fenced.privacy_policy_version = try self.privacyFenceForRequest(alloc, table_name, opts, opts.privacy_policy_version);
 
         return try BoundaryAbi.call("lookup", self.boundary_dispatch, self.vtable.lookup, .{ self.ptr, alloc, table_name, key, fenced, consistency });
     }
@@ -743,7 +756,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?ScanResponse {
         var fenced = opts;
-        if (!opts.privacy_original) fenced.privacy_policy_version = try self.privacyFence(alloc, table_name, opts.execution_deadline_ns, opts.privacy_policy_version);
+        if (!opts.privacy_original) fenced.privacy_policy_version = try self.privacyFenceForRequest(alloc, table_name, opts, opts.privacy_policy_version);
 
         return try BoundaryAbi.call("scan", self.boundary_dispatch, self.vtable.scan, .{ self.ptr, alloc, table_name, from_key, to_key, fenced, consistency });
     }
@@ -759,7 +772,7 @@ pub const TableReadSource = struct {
         sink: ScanStreamSink,
     ) !bool {
         var fenced = opts;
-        if (!opts.privacy_original) fenced.privacy_policy_version = try self.privacyFence(alloc, table_name, opts.execution_deadline_ns, opts.privacy_policy_version);
+        if (!opts.privacy_original) fenced.privacy_policy_version = try self.privacyFenceForRequest(alloc, table_name, opts, opts.privacy_policy_version);
 
         if (self.vtable.scan_stream) |stream_fn|
             return try BoundaryAbi.call("scan_stream", self.boundary_dispatch, stream_fn, .{ self.ptr, alloc, table_name, from_key, to_key, fenced, consistency, sink });
@@ -923,7 +936,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?query_api.QueryResponse {
         var fenced = req;
-        fenced.privacy_policy_version = try self.privacyFence(alloc, table_name, req.execution_deadline_ns, req.privacy_policy_version);
+        fenced.privacy_policy_version = try self.privacyFenceForRequest(alloc, table_name, req, req.privacy_policy_version);
         if (req.remote_snapshot != null) if (fenced.privacy_policy_version) |version| if (!std.mem.allEqual(u8, &version, 0)) return error.UnsupportedQueryRequest;
 
         return try BoundaryAbi.call("query", self.boundary_dispatch, self.vtable.query, .{ self.ptr, alloc, table_name, fenced, consistency });
@@ -940,7 +953,7 @@ pub const TableReadSource = struct {
         delivery: ?query_api.Delivery,
     ) !?query_api.QueryResponse {
         var fenced = req;
-        fenced.privacy_policy_version = try self.privacyFence(alloc, table_name, req.execution_deadline_ns, req.privacy_policy_version);
+        fenced.privacy_policy_version = try self.privacyFenceForRequest(alloc, table_name, req, req.privacy_policy_version);
         if (req.remote_snapshot != null) if (fenced.privacy_policy_version) |version| if (!std.mem.allEqual(u8, &version, 0)) return error.UnsupportedQueryRequest;
 
         if (delivery != null) if (self.vtable.query_with_delivery) |callback|
@@ -998,7 +1011,7 @@ pub const TableReadSource = struct {
         max_work: u32,
     ) !?runtime_preflight.RuntimePreflightSummary {
         var fenced = req;
-        fenced.privacy_policy_version = try self.privacyFence(alloc, table_name, req.execution_deadline_ns, req.privacy_policy_version);
+        fenced.privacy_policy_version = try self.privacyFenceForRequest(alloc, table_name, req, req.privacy_policy_version);
         if (req.remote_snapshot != null) if (fenced.privacy_policy_version) |version| if (!std.mem.allEqual(u8, &version, 0)) return error.UnsupportedQueryRequest;
 
         const fn_ptr = self.vtable.preflight_query orelse return null;
@@ -1015,7 +1028,7 @@ pub const TableReadSource = struct {
         max_work: u32,
     ) !?runtime_preflight.RuntimePreflightSummary {
         var req = input;
-        req.privacy_policy_version = try self.privacyFence(alloc, table_name, req.execution_deadline_ns, req.privacy_policy_version);
+        req.privacy_policy_version = try self.privacyFenceForRequest(alloc, table_name, req, req.privacy_policy_version);
         if (req.native_query_cut) |cut| if (cut.create) {
             req.native_query_cut = try cut.forGroup(group_id);
         };
@@ -1037,7 +1050,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?LookupResponse {
         var fenced_opts = opts;
-        if (!opts.privacy_original) fenced_opts.privacy_policy_version = try self.privacyFence(alloc, table_name, opts.execution_deadline_ns, opts.privacy_policy_version);
+        if (!opts.privacy_original) fenced_opts.privacy_policy_version = try self.privacyFenceForRequest(alloc, table_name, opts, opts.privacy_policy_version);
         if (self.route_fence) |fence| {
             const routed = self.vtable.lookup_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
             return try BoundaryAbi.call("lookup_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, key, fenced_opts, consistency });
@@ -1057,7 +1070,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?ScanResponse {
         var fenced_opts = opts;
-        if (!opts.privacy_original) fenced_opts.privacy_policy_version = try self.privacyFence(alloc, table_name, opts.execution_deadline_ns, opts.privacy_policy_version);
+        if (!opts.privacy_original) fenced_opts.privacy_policy_version = try self.privacyFenceForRequest(alloc, table_name, opts, opts.privacy_policy_version);
         if (self.route_fence) |fence| {
             const routed = self.vtable.scan_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
             return try BoundaryAbi.call("scan_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, from_key, to_key, fenced_opts, consistency });
@@ -1078,7 +1091,7 @@ pub const TableReadSource = struct {
         sink: ScanStreamSink,
     ) !bool {
         var fenced_opts = opts;
-        if (!opts.privacy_original) fenced_opts.privacy_policy_version = try self.privacyFence(alloc, table_name, opts.execution_deadline_ns, opts.privacy_policy_version);
+        if (!opts.privacy_original) fenced_opts.privacy_policy_version = try self.privacyFenceForRequest(alloc, table_name, opts, opts.privacy_policy_version);
         if (self.route_fence) |fence| {
             if (self.vtable.scan_group_local_routed_stream) |stream_fn|
                 return try BoundaryAbi.call("scan_group_local_routed_stream", self.boundary_dispatch, stream_fn, .{ self.ptr, alloc, fence, group_id, table_name, from_key, to_key, fenced_opts, consistency, sink });
@@ -1101,7 +1114,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?query_api.QueryResponse {
         var req = input;
-        req.privacy_policy_version = try self.privacyFence(alloc, table_name, req.execution_deadline_ns, req.privacy_policy_version);
+        req.privacy_policy_version = try self.privacyFenceForRequest(alloc, table_name, req, req.privacy_policy_version);
         if (req.native_query_cut) |cut| if (cut.create) {
             req.native_query_cut = try cut.forGroup(group_id);
         };
@@ -1122,7 +1135,7 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?db_types.SearchResult {
         var req = input;
-        req.privacy_policy_version = try self.privacyFence(alloc, table_name, req.execution_deadline_ns, req.privacy_policy_version);
+        req.privacy_policy_version = try self.privacyFenceForRequest(alloc, table_name, req, req.privacy_policy_version);
         if (req.native_query_cut) |cut| if (cut.create) {
             req.native_query_cut = try cut.forGroup(group_id);
         };

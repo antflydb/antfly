@@ -39,6 +39,7 @@ type extractionQualification struct {
 	Pages             int    `json:"pages"`
 	OCRAttempted      int    `json:"ocr_attempted"`
 	OCRFailed         int    `json:"ocr_failed"`
+	IncompleteUnits   int    `json:"incomplete_units"`
 }
 
 // Index readiness and successful document extraction are separate milestones.
@@ -160,8 +161,10 @@ func qualifyCorpus(client *http.Client, tableURL, state string) (extractionQuali
 		// The summary API defaults absent OCR counters to zero. Only the raw
 		// manifest can distinguish known zero coverage from missing evidence.
 		var coverage struct {
-			Attempted *int `json:"ocr_attempted_count"`
-			Failed    *int `json:"ocr_failed_count"`
+			Attempted           *int `json:"ocr_attempted_count"`
+			Failed              *int `json:"ocr_failed_count"`
+			Incomplete          *int `json:"incomplete_unit_count"`
+			RetryableIncomplete *int `json:"retryable_incomplete_unit_count"`
 		}
 		if err = json.Unmarshal([]byte(artifact.Manifest), &coverage); err != nil {
 			return q, fmt.Errorf("%s: missing or invalid extraction manifest: %w", record.ID, err)
@@ -171,6 +174,13 @@ func qualifyCorpus(client *http.Client, tableURL, state string) (extractionQuali
 		}
 		q.OCRAttempted += *coverage.Attempted
 		q.OCRFailed += *coverage.Failed
+		if coverage.Incomplete == nil || coverage.RetryableIncomplete == nil || *coverage.Incomplete < 0 || *coverage.Incomplete > *artifact.Units || *coverage.RetryableIncomplete < 0 || *coverage.RetryableIncomplete > *coverage.Incomplete {
+			return q, fmt.Errorf("%s: extraction completion coverage is unknown or invalid", record.ID)
+		}
+		q.IncompleteUnits += *coverage.Incomplete
+		if *coverage.Incomplete != 0 {
+			return q, fmt.Errorf("%s: %d extraction units remain incomplete", record.ID, *coverage.Incomplete)
+		}
 		if artifact.Route != "pdf" || artifact.Merge != "converged" || artifact.LastError != "" {
 			return q, fmt.Errorf("%s: extraction is failed, incomplete or unsupported (route=%q, merge=%q, error=%q)", record.ID, artifact.Route, artifact.Merge, artifact.LastError)
 		}

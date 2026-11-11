@@ -26568,6 +26568,8 @@ pub const GraphResolverConfig = struct {
     suppress: ?GraphResolverSuppressionConfig = null,
     scorer_json: ?[]const u8 = null,
     candidate_search: ?[]const u8 = null,
+    /// Optional canonical key namespace ending in /. Prefix and ANN blocking apply it before candidate limits. Redirects and final decisions must remain in this prefix and the configured target table. Empty preserves unrestricted native matching.
+    candidate_key_prefix: ?[]const u8 = null,
     candidate_ann_index: ?[]const u8 = null,
     candidate_limit: ?i64 = null,
     name_embedding: ?[]const u8 = null,
@@ -26597,6 +26599,7 @@ pub const GraphResolverConfig = struct {
         .{ "suppress", "suppress", true },
         .{ "scorer_json", "scorer_json", true },
         .{ "candidate_search", "candidate_search", true },
+        .{ "candidate_key_prefix", "candidate_key_prefix", true },
         .{ "candidate_ann_index", "candidate_ann_index", true },
         .{ "candidate_limit", "candidate_limit", true },
         .{ "name_embedding", "name_embedding", true },
@@ -26667,6 +26670,10 @@ pub const GraphResolverConfig = struct {
         }
         if (self.candidate_search) |value| {
             try jw.objectField("candidate_search");
+            try jw.write(value);
+        }
+        if (self.candidate_key_prefix) |value| {
+            try jw.objectField("candidate_key_prefix");
             try jw.write(value);
         }
         if (self.candidate_ann_index) |value| {
@@ -58561,7 +58568,7 @@ pub const TableRepairIssueList = struct {
     }
 };
 
-/// Durable table repair job state.
+/// Durable table repair job state. In result, work counters accumulate across passes, while unresolved and in_progress describe only the latest bounded pass. Earlier failures remain represented by cumulative failure counters, debt_remaining, and the current remaining_failures summary.
 pub const TableRepairJob = struct {
     /// Server-assigned durable repair job identifier.
     job_id: u64,
@@ -58860,7 +58867,7 @@ pub const TableRepairRunResult = struct {
     unsupported: u64,
     /// Number of attempted repair records that remained queued after this pass.
     unresolved: u64,
-    /// Number of selected repair records or indexes skipped because another repair pass already owns them.
+    /// Number of selected repair records or indexes still in progress after this pass, including queued native producer work and work owned by another repair pass.
     in_progress: u64,
     /// Number of indexes rebuilt by this pass when target is index.
     indexes_rebuilt: u64,

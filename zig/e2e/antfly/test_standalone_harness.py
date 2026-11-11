@@ -1105,3 +1105,188 @@ def test_scaling_readiness_rejects_process_exit_during_second_foreign_reply(
             [{"id": 101}], public_api=True, max_timeout_s=2, label="Data API"
         )
     assert replies[0] == 2
+
+
+def test_lake_readiness_allows_full_budget_after_bounded_probe_timeout(monkeypatch):
+    import test_lake_row_identity as lake
+
+    now = [0.0]
+    monkeypatch.setattr(
+        lake,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: now[0],
+            sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        ),
+    )
+    query = {"full_text_search": {"match": "needle", "field": "body"}}
+    queries = []
+
+    def raw(method, path, body):
+        assert (method, path) == ("POST", "/tables/docs/query")
+        queries.append(body)
+        if "timeout_ms" in body:
+            now[0] += 1
+            return SimpleNamespace(
+                ok=False,
+                status_code=504,
+                text="bounded probe expired",
+                json=lambda: {"code": "query_timeout", "retryable": True},
+            )
+        # A valid Debug query may need more than the readiness probe's second.
+        now[0] += 2
+        return SimpleNamespace(ok=True, status_code=200, text="ok")
+
+    revisions = iter(["old", "new"])
+
+    def indexes(method, path):
+        assert (method, path) == ("GET", "/tables/docs/indexes")
+        return [
+            {
+                "config": {"name": "text"},
+                "status": {
+                    "published_revision": next(revisions),
+                    "readiness": {"state": "ready", "queryable": True},
+                },
+            }
+        ]
+
+    assert (
+        lake._wait_for_native_indexes_ready(
+            raw, indexes, lambda: "", "docs", query, after="old"
+        )
+        == "new"
+    )
+    assert queries == [{**query, "timeout_ms": 1000}, query]
+    assert "timeout_ms" not in query
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_constraint_poll_gateway_timeouts_preserve_outer_budget(monkeypatch, ready):
+    import test_backup_restore as backup
+
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        backup,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock.now,
+            sleep=lambda seconds: setattr(clock, "now", clock.now + seconds),
+        ),
+    )
+    calls = []
+
+    def get(url, *, timeout):
+        calls.append(timeout)
+        clock.now += min(timeout, 0.5)
+        response = requests.Response()
+        response.status_code = 200 if ready and len(calls) > 1 else 504
+        response._content = (
+            b'{"state":"enforced"}'
+            if response.status_code == 200
+            else b'{"error":"constraint status deadline exceeded"}'
+        )
+        return response
+
+    assert (
+        backup._wait_for_constraints_enforced(
+            SimpleNamespace(get=get), "http://localhost/db/v1", "docs", timeout_s=3.0
+        )
+        is ready
+    )
+    assert len(calls) >= 2
+    assert all(0 < timeout <= 3 for timeout in calls)
+    assert clock.now <= 3
+
+
+@pytest.mark.parametrize("status", [401, 500, 504])
+def test_resolution_gateway_timeout_retry_requires_read_only_poll(status):
+    from test_resolution import _transient_poll_error
+
+    response = requests.Response()
+    response.status_code = status
+    error = requests.HTTPError(response=response)
+    assert not _transient_poll_error(error)
+    assert _transient_poll_error(error, read_only=True) is (status == 504)
+
+
+@pytest.mark.parametrize("transport_failure", [False, True])
+def test_root_enrollment_reconciles_unknown_outcome_without_replaying(
+    monkeypatch, transport_failure
+):
+    import test_backup_restore as backup
+
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        backup,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock.now,
+            sleep=lambda seconds: setattr(clock, "now", clock.now + seconds),
+        ),
+    )
+    identity = {
+        "node_id": 4,
+        "store_id": 4,
+        "root_incarnation": "123",
+        "public_key": "ab" * 32,
+        "metadata_incarnation": "incarnation",
+    }
+    proof = {"identity": identity, "signature": "cd" * 64}
+    writes = []
+    reads = []
+
+    def response(status, body):
+        import json
+
+        result = requests.Response()
+        result.status_code = status
+        result._content = json.dumps(body).encode()
+        return result
+
+    def post(url, **kwargs):
+        if url.endswith("/enrollment-status"):
+            return get(url, **kwargs)
+        writes.append((url, kwargs))
+        if transport_failure:
+            raise requests.ReadTimeout("reply lost after commit")
+        return response(503, {"error": "MetadataMutationOutcomeUnknown"})
+
+    def get(url, **kwargs):
+        reads.append((url, kwargs))
+        assert kwargs["json"] == identity
+        return response(404, {}) if len(reads) == 1 else response(200, identity)
+
+    backup._enroll_store_root_once(
+        SimpleNamespace(post=post, get=get), "http://metadata/db/v1", proof, timeout_s=1
+    )
+    assert len(writes) == 1
+    assert len(reads) == 2
+    assert clock.now <= 1
+
+
+@pytest.mark.parametrize("status", [401, 409])
+def test_root_enrollment_does_not_retry_permanent_rejection(status):
+    import test_backup_restore as backup
+
+    response = requests.Response()
+    response.status_code = status
+    response._content = b"enrollment rejected"
+    response.url = "http://metadata/db/v1/store-roots/enroll"
+    response.request = requests.Request("POST", response.url).prepare()
+    writes = []
+
+    def post(*args, **kwargs):
+        writes.append(args)
+        return response
+
+    def get(*args, **kwargs):
+        pytest.fail("permanent enrollment rejection must not be polled")
+
+    with pytest.raises((requests.HTTPError, AssertionError)):
+        backup._enroll_store_root_once(
+            SimpleNamespace(post=post, get=get),
+            "http://metadata/db/v1",
+            {"identity": {}},
+        )
+    assert len(writes) == 1

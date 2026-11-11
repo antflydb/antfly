@@ -193,34 +193,68 @@ def test_authenticated_cypher_storage_contract_on_replicated_owners(
     assert "Authenticated lossless Cypher storage contract passed" in result.stdout
 
 
+def test_authenticated_cypher_mutations_on_replicated_owners(
+    three_by_three_backup_cluster,  # noqa: F811
+):
+    _verify_cypher_mutations(three_by_three_backup_cluster, contract="mutations")
+
+
 @pytest.mark.parametrize("preexisting_producers", [False, True])
 def test_authenticated_cypher_producer_postimages_on_replicated_owners(
     preexisting_producers,
     three_by_three_backup_cluster,  # noqa: F811
 ):
-    cluster = three_by_three_backup_cluster
+    _verify_cypher_mutations(
+        three_by_three_backup_cluster,
+        contract="producers",
+        preexisting_producers=preexisting_producers,
+    )
+
+
+def _verify_cypher_mutations(cluster, *, contract, preexisting_producers=False):
     leader = urlsplit(cluster.metadata_leader_public_url())
     endpoint = f"{leader.scheme}://{leader.hostname}:{leader.port}"
     script = (
         Path(__file__).resolve().parents[2] / "scripts" / "verify_cypher_mutations.py"
     )
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(script),
-            "--url",
-            endpoint,
-            *(["--preexisting-producers"] if preexisting_producers else []),
-        ],
-        env={
-            **os.environ,
-            "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
-        },
-        capture_output=True,
-        text=True,
-        timeout=220,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "--url",
+                endpoint,
+                "--progress",
+                "--contract",
+                contract,
+                *(["--preexisting-producers"] if preexisting_producers else []),
+            ],
+            env={
+                **os.environ,
+                "ANTFLY_CYPHER_TEST_AUTH": f"admin:{AUTH_BOOTSTRAP_PASSWORD}",
+            },
+            capture_output=True,
+            text=True,
+            timeout=220,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+
+        def output(value):
+            return (
+                value.decode(errors="replace")
+                if isinstance(value, bytes)
+                else value or ""
+            )
+
+        pytest.fail(
+            "Cypher mutation qualification timed out.\n"
+            + output(error.stdout)
+            + output(error.stderr)
+            + "\n"
+            + cluster.debug_logs(),
+            pytrace=False,
+        )
     witnesses = []
     if result.returncode != 0:
         for metadata_node in range(3):
@@ -270,7 +304,7 @@ def test_authenticated_cypher_producer_postimages_on_replicated_owners(
         + "\n"
         + cluster.debug_logs()
     )
-    assert "producer postimages and deferred shortest paths passed" in result.stdout
+    assert f"Authenticated Cypher {contract} contract passed" in result.stdout
 
 
 def test_authenticated_cypher_across_replicated_owner_nodes(

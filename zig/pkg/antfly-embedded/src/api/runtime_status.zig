@@ -5144,31 +5144,11 @@ fn cloneResolverReplayDiagnostics(alloc: std.mem.Allocator, stats: db_mod.types.
     var resolvers = try alloc.alloc(db_mod.types.ResolverReplayDiagnostic, stats.resolvers.len);
     var initialized: usize = 0;
     errdefer {
-        for (resolvers[0..initialized]) |resolver| {
-            alloc.free(resolver.name);
-            alloc.free(resolver.table);
-            alloc.free(resolver.source_artifact);
-            alloc.free(resolver.resolution_artifact);
-        }
+        for (resolvers[0..initialized]) |resolver| resolver.deinit(alloc);
         if (resolvers.len > 0) alloc.free(resolvers);
     }
-
     for (stats.resolvers, 0..) |resolver, i| {
-        const name = try alloc.dupe(u8, resolver.name);
-        errdefer alloc.free(name);
-        const table = try alloc.dupe(u8, resolver.table);
-        errdefer alloc.free(table);
-        const source_artifact = try alloc.dupe(u8, resolver.source_artifact);
-        errdefer alloc.free(source_artifact);
-        const resolution_artifact = try alloc.dupe(u8, resolver.resolution_artifact);
-        errdefer alloc.free(resolution_artifact);
-        // Copy every scalar fence before replacing borrowed identity strings.
-        // New publication clocks must survive every cache/snapshot round trip.
-        resolvers[i] = resolver;
-        resolvers[i].name = name;
-        resolvers[i].table = table;
-        resolvers[i].source_artifact = source_artifact;
-        resolvers[i].resolution_artifact = resolution_artifact;
+        resolvers[i] = try resolver.clone(alloc);
         initialized += 1;
     }
 
@@ -5324,7 +5304,7 @@ fn testSyntheticSnapshotStatsOwnership(alloc: std.mem.Allocator) !void {
         .{ .name = "new", .kind = .full_text },
         .{ .name = "keep", .kind = .graph },
     };
-    var resolver = [_]types.ResolverReplayDiagnostic{.{ .name = "resolver", .table = "docs", .source_artifact = "source", .resolution_artifact = "resolved" }};
+    var resolver = [_]types.ResolverReplayDiagnostic{.{ .name = "resolver", .table = "docs", .source_artifact = "source", .resolution_artifact = "resolved", .candidate_key_prefix = "source/ours/" }};
     var expected = seedSnapshotValues(types.DBStats{});
     expected.schema_index_state = "ready";
     expected.index_count = previous_indexes.len;
@@ -12312,7 +12292,7 @@ test "resolver curation status cloning preserves every namespace publication fen
     defer if (source_live) source.deinit();
     const scratch = source.allocator();
     const rows = try scratch.alloc(db_mod.types.ResolverReplayDiagnostic, 1);
-    rows[0] = .{ .name = try scratch.dupe(u8, "selected"), .table = try scratch.dupe(u8, "entities"), .source_artifact = try scratch.dupe(u8, "source"), .resolution_artifact = try scratch.dupe(u8, "resolved"), .config_generation = 7, .effective_generation = 9, .curation_revision = 11, .namespace_curation_generation = 13, .namespace_curation_table_id = 42, .namespace_curation_missing = true };
+    rows[0] = .{ .name = try scratch.dupe(u8, "selected"), .table = try scratch.dupe(u8, "entities"), .source_artifact = try scratch.dupe(u8, "source"), .resolution_artifact = try scratch.dupe(u8, "resolved"), .candidate_key_prefix = try scratch.dupe(u8, "source/ours/"), .config_generation = 7, .effective_generation = 9, .curation_revision = 11, .namespace_curation_generation = 13, .namespace_curation_table_id = 42, .namespace_curation_missing = true };
     const snapshot: LocalTableRuntimeStatus = .{ .group_id = 5, .stats = .{ .resolver_replay = .{ .resolvers = rows } } };
     var cloned = try snapshot.clone(a);
     defer cloned.deinit(a);
@@ -12320,6 +12300,7 @@ test "resolver curation status cloning preserves every namespace publication fen
     source_live = false;
     const actual = cloned.stats.resolver_replay.resolvers[0];
     try std.testing.expectEqualStrings("selected", actual.name);
+    try std.testing.expectEqualStrings("source/ours/", actual.candidate_key_prefix);
     try std.testing.expectEqual(@as(u64, 7), actual.config_generation);
     try std.testing.expectEqual(@as(u64, 9), actual.effective_generation);
     try std.testing.expectEqual(@as(u64, 11), actual.curation_revision);

@@ -108,6 +108,14 @@ type RevisionChangedError struct{ Expected, Actual string }
 func (e *RevisionChangedError) Error() string {
 	return fmt.Sprintf("source revision changed while reading: enumerated %q, read %q", e.Expected, e.Actual)
 }
+
+type restartRequiredError struct{ cause error }
+
+func (e *restartRequiredError) Error() string {
+	return e.cause.Error() + "; restart the sync with a fresh inventory"
+}
+func (e *restartRequiredError) Unwrap() error { return e.cause }
+
 func decodeSourceConfig[T any](raw SourceConfig) (T, error) {
 	var out T
 	if len(raw) == 0 || string(raw) == "null" {

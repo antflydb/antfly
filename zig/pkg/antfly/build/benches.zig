@@ -771,6 +771,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     antfly_imports.configureStorageBenchmark(b, storage_bench_root_mod);
     @import("../../../build_support/embedded/storage.zig").configureLmdb(b, storage_bench_root_mod, lmdb_engine_mod, false);
     storage_bench_mod.addImport("antfly-zig", storage_bench_root_mod);
+    options.antfly_imports.build_info.link(storage_bench_mod);
     storage_bench_mod.addImport("antfly_platform", platform_mod);
 
     const storage_bench = b.addExecutable(.{
@@ -780,6 +781,21 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     });
 
     storage_bench_step.dependOn(&b.addInstallArtifact(storage_bench, .{}).step);
+
+    const filtered_vector_tests = b.addTest(.{
+        .root_module = storage_bench_root_mod,
+        .filters = &.{
+            "built-in exact dense scorer filters metadata",
+            "native exact lookup costs affect",
+            "one percent native filter routes through integrated dense search exactly",
+            "transient leann vectors become stubs and are re-embedded on demand",
+            "production external scorers use bounded cache-first artifact batches",
+            "hbc multi-bit codes refine leaf admission and survive reopen",
+            "hbc route observation counts external distance timing once",
+        },
+    });
+    b.step("filtered-vector-integration-test", "Run filtered HBC and LEANN integration regressions")
+        .dependOn(&b.addRunArtifact(filtered_vector_tests).step);
 
     // Keep focused DB workloads in separate compile artifacts under the same
     // owner target. Combining them with the API/HBC driver made a batch-only
@@ -799,6 +815,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
             .optimize = optimize,
         });
         module.addImport("antfly-zig", storage_bench_root_mod);
+        options.antfly_imports.build_info.link(module);
         const artifact = b.addExecutable(.{
             .name = workload[0],
             .root_module = module,

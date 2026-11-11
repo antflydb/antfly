@@ -40,6 +40,10 @@ pub struct Capabilities {
     pub processing_presets: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processing_jobs: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_versions: Option<Vec<i64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_audience: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +78,10 @@ pub struct Source {
     pub search_status: Option<SearchStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processing: Option<ProcessingDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge: Option<KnowledgeDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_status: Option<KnowledgeStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,4 +291,79 @@ pub struct ProcessingJobRequest {
     pub job_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeDeclaration {
+    pub version: i64,
+    pub mode: String,
+    pub audience: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entities: Option<Vec<EntityBinding>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphs: Option<Vec<GraphBinding>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityBinding {
+    pub name: String,
+    pub index: String,
+    pub resolver: String,
+    pub table: String,
+    pub namespace: String,
+    pub source_artifact: String,
+    pub resolution_artifact: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_field: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphBinding {
+    pub name: String,
+    pub index: String,
+    pub artifacts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entities: Option<Vec<String>>,
+    pub temporal: GraphTemporalBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_uri: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphTemporalBinding {
+    pub mapping: String,
+    pub history: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeStatus {
+    pub version: i64,
+    pub entities: Vec<RepresentationStatus>,
+    pub graphs: Vec<RepresentationStatus>,
+    pub observed_at: i64,
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeRequest {
+    pub graph: String,
+    pub start: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_snapshot: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity: Option<String>,
 }

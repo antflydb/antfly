@@ -184,22 +184,33 @@ The showcase OCR profile uses revision-pinned LightOnOCR-3-4B on shared Antfly
 inference. Qualify both reader sizes on the deployed pool and run a representative
 PDF pilot before backfill. Its native `/read` contract uses
 an image-only prompt; the extraction producer sends no prompt to readers.
-The profile requests at most 2048 output tokens per page. A cached dense DOJ
-page exceeded the earlier 512-token allowance; both reader checkpoints completed
-it at 2048 and retained the checked page-tail text. This is a bounded sample,
-not a completeness guarantee for every page. The serving policy must permit
-`resources.inference.request_limits.max_output_tokens_per_item: 2048` and at
-least 12 `resources.inference.admission.max_work_units` for one image-only
-request. Keep request concurrency at one while qualifying the intended GPU and
-memory limits. The deployed 512-token/eight-unit policy needs a separately
-reviewed update before this profile can be used there.
-Truncated OCR returns an error instead of publishing incomplete text. Do not
-count failed or truncated pages as searchable. Complete the
+The profile permits up to 8192 output tokens per page, matching the native
+reader's dense-page ceiling. Redacted DOJ call-detail tables can exceed 2048
+because their HTML table structure and repeated redaction cells are part of the
+transcription. A full call-detail page that truncated at 2048 completed on
+rc.14 with 6994 output tokens at the 8192 ceiling, including its closing table
+and page footer. This single-page result establishes capacity for that sample;
+verify the remaining corpus and deployed pool separately. The serving policy
+must also permit
+`resources.inference.request_limits.max_output_tokens_per_item: 8192`.
+A larger ceiling increases per-request work and KV admission; it does not change
+memory, concurrency, or batch limits. Size the work budget for the intended
+parallelism as well: an image-only 8192-token LightOn request uses 36 work units,
+so four independent requests need 144 units with the current admission policy.
+Completed short pages still stop at EOS.
+Use `--reader-max-output-tokens 8192` with
+`zig/tools/qualify_reader_generator_pools.py` to exercise its exact rejection
+boundary. The synthetic probe does not establish corpus coverage.
+
+Truncated OCR remains an extraction failure. Inspect every page's completion
+status and retained-text warning; neither readable older text nor a converged
+merge proves that OCR completed. Run the
 [release qualification](../../docs/design/inference/grepstein-release-qualification.md)
-before backfill or enrichment. `zig/tools/qualify_reader_generator_pools.py`
-uses a 512-token reader policy by default; pass
-`--reader-max-output-tokens 2048` to check the larger serving ceiling and its
-exact rejection boundary. Its synthetic pass does not establish corpus coverage.
+before backfill or enrichment, and use durable table repair jobs for long-running
+retries. Pages that still truncate at the allowed ceiling require inspection and
+an explicitly qualified extraction strategy; never discard their warnings or
+mark them repaired merely because a manifest exists.
+
 The LightOnOCR models return
 Markdown, including table structure, through the same native reader API.
 `ocr.render.sampling` defaults to `auto`: smooth continuous-tone PDF images
@@ -282,7 +293,7 @@ not bypass table identity checks or infer complete coverage from accepted rows.
 
 ```sh
 ./grepstein enrich --url "$ANTFLY_URL" --stage semantic \
-  --embedder-config vertex-embedder.example.json
+  --embedder-config antfly-embedder.example.json
 ./grepstein wait --url "$ANTFLY_URL" --index embeddings
 ./grepstein enrich --url "$ANTFLY_URL" --stage graph
 ./grepstein graph --state ./grepstein-corpus --url "$ANTFLY_URL"
@@ -290,7 +301,8 @@ not bypass table identity checks or infer complete coverage from accepted rows.
 ./grepstein wait --url "$ANTFLY_URL" --index autograph_relations
 ```
 
-The showcase Vertex profile selects **`gemini-embedding-2`**, project
+The alternative `--embedder-config vertex-embedder.example.json` profile selects
+**`gemini-embedding-2`**, project
 `antfly-showcases`, location `global`, and 3072 dimensions. The index, generated
 embedding artifacts, and query embedder share the same dimensions/provider.
 The stable Google model ID is not `gemini-embedding-002`. The native adapter uses
@@ -333,8 +345,9 @@ page provenance, detects superseded extraction revisions, and reconciles stale
 unit rows. Relationship neighborhoods/path evidence are model outputs requiring
 inspection, not verified factual claims.
 
-V1 OCR uses the native Vertex reader with explicitly scoped Google identity.
-Colony's managed external gateway currently advertises text generation and
+The default OCR profile uses the native LightOnOCR reader through Antfly shared
+inference. The alternative Vertex profile requires explicitly scoped Google
+identity. Colony's managed external gateway currently advertises text generation and
 rejects image requests whose spend cannot be bounded. Do not point an OCR reader
 at that gateway and assume it works. Managed image billing/capability qualification,
 BYO Vertex connection UI/CLI, and Document AI OCR are separate follow-ups.
@@ -360,7 +373,10 @@ readiness is checked separately from source publication, including failed OCR.
 
 The binding maps the corpus's existing fields to source identity and permissions.
 New prepared rows include `indexed_at` and private `user:self` reader metadata;
-regenerate and publish older prepared rows before using the new binding. Local
+regenerate and publish older prepared rows before using the new binding. Preparation
+saves one `indexed_at` timestamp in `sources.json`, so resumed rows retain the
+same manifest bytes. Older preparation states without that timestamp require a
+new `--state`; do not edit sealed manifests to fabricate it. Local
 principal filtering narrows results; exposed APIs still require their own current
 caller authorization/RLS. The ordinary Antfly API and binding format are the
 same in Cloud and self-hosted deployments. Never distribute a write/admin key
@@ -368,6 +384,26 @@ with the binding.
 
 The former `--grep-table`, `--gcs-projection-bucket` and page source-job workflow
 are retired. Existing projection tables/buckets are not automatically deleted.
+
+### Local native smoke test
+
+Build both binaries from the same checkout, then run the real PDF-to-grep path:
+
+```sh
+(cd zig && zig build antfly grep -j2 -Doptimize=Debug)
+(cd examples/grepstein && GOWORK=off GOEXPERIMENT=simd \
+  ANTFLY_GREPSTEIN_E2E_BINARY="$PWD/../../zig/zig-out/bin/antfly" \
+  ANTFLY_GREPSTEIN_E2E_GREP_BINARY="$PWD/../../zig/zig-out/bin/antfly-grep" \
+  go test -run '^TestLocalNativeGCSExtraction$' -count=1 -v)
+```
+
+This starts a standalone Antfly server and a loopback GCS protocol fixture,
+extracts an actual digital-text PDF, qualifies the artifacts, and searches both
+native extraction units and chunks with the real grep CLI. It checks original
+source identity, no content reacquisition during grep, and rejection of
+out-of-scope or changed-generation objects. It does not qualify Cloud Workload
+Identity or GPU OCR, embeddings, or relationship extraction; those need a live
+sample on the deployed shared inference runtime.
 
 ## Explorer and hosting
 
@@ -414,7 +450,8 @@ are deferred; their raw originals can be preserved independently.
 ### Investigating incomplete OCR
 
 A manifest's `merge_status: converged` reports artifact publication, not OCR
-success. Inspect `ocr_failed_count` on document artifact summaries and run
+success. Inspect `ocr_failed_count` and the raw manifest's
+`incomplete_unit_count` and run
 `qualify` before declaring extraction complete. A nonempty text index can still
 contain embedded PDF text while OCR pages have failed. Failed OCR pages must not
 qualify for Antfly's unchanged-source fast path. Transient failures use the

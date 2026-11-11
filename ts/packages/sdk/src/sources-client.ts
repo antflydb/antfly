@@ -31,6 +31,7 @@ export interface SourceDefinition {
   streams?: SearchStream[];
   artifacts?: ArtifactBinding[];
   processing?: ProcessingDeclaration;
+  knowledge?: KnowledgeDeclaration;
   identity?: { namespace?: string };
 }
 
@@ -69,7 +70,13 @@ export interface SourceSyncJob {
   code?: string;
   operation?: "sync" | "purge";
   purged_source_count?: number;
-  failure?: { source_id?: string; phase: string; code: string; retryable: boolean };
+  failure?: {
+    source_id?: string;
+    phase: string;
+    code: string;
+    retryable: boolean;
+    restart_required?: boolean;
+  };
 }
 
 export class SourceServiceError extends Error {
@@ -218,6 +225,11 @@ export class StandaloneSourcesClient extends SourceTransport {
 export type {
   ArtifactBinding,
   Capabilities,
+  EntityBinding,
+  GraphBinding,
+  KnowledgeDeclaration,
+  KnowledgeRequest,
+  KnowledgeStatus,
   Mutation,
   ProcessingDeclaration,
   ProcessingJobRequest,
@@ -238,6 +250,11 @@ export type {
 import type {
   ArtifactBinding,
   Capabilities,
+  EntityBinding,
+  GraphBinding,
+  KnowledgeDeclaration,
+  KnowledgeRequest,
+  KnowledgeStatus,
   Mutation,
   ProcessingDeclaration,
   ProcessingJobRequest,
@@ -283,6 +300,18 @@ export class SourcesClient extends SourceTransport {
       signal
     );
   }
+  queryKnowledge(
+    id: string,
+    input: KnowledgeRequest,
+    signal?: AbortSignal
+  ): Promise<Record<string, unknown>> {
+    return this.request(
+      "POST",
+      `/sources/${encodeURIComponent(id)}/knowledge-query`,
+      input,
+      signal
+    );
+  }
   processingJob(
     id: string,
     input: ProcessingJobRequest,
@@ -296,7 +325,7 @@ export class SourcesClient extends SourceTransport {
     );
   }
   putSource(source: Source, signal?: AbortSignal): Promise<Source> {
-    const { search_status: _observed, ...desired } = source;
+    const { search_status: _observed, knowledge_status: _knowledge, ...desired } = source;
     return this.request("PUT", `/sources/${encodeURIComponent(source.id)}`, desired, signal);
   }
   removeSource(
