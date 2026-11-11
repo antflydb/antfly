@@ -5541,6 +5541,7 @@ pub const StandaloneRetainedOwner = struct {
     node_id: u64,
     store_id: u64,
     metadata: *anyopaque,
+    /// Relative delay in nanoseconds; provider and executor clocks may differ.
     maintain_archive: *const fn (*anyopaque, antfly.public_api.operation.RequestContext) anyerror!u64,
     validate_root: *const fn (*anyopaque, std.mem.Allocator, @import("../metadata/store_root_enrollment.zig").Identity, antfly.public_api.operation.RequestContext) anyerror!void,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
@@ -6745,8 +6746,10 @@ pub const DataServer = struct {
         if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
         const owner = self.standalone_retained_owner orelse return;
         const context: antfly.public_api.operation.RequestContext = .{ .setting_admin = true, .deadline_ns = platform_time.monotonicNs() +| 2 * std.time.ns_per_s, .cancellation = .fromAtomic(&self.background_jobs_shutdown) };
-        const next = try owner.maintainArchive(context);
-        self.retained_archive_next_ns.store(@max(next, self.backgroundMonotonicNs() +| 10 * std.time.ns_per_ms), .release);
+        // The archive owner uses platform MONOTONIC, while this scheduler
+        // borrows Io.awake. Exchange a duration, never absolute timestamps.
+        const delay_ns = try owner.maintainArchive(context);
+        self.retained_archive_next_ns.store(self.backgroundMonotonicNs() +| @max(delay_ns, 10 * std.time.ns_per_ms), .release);
     }
 
     fn runRetainedMaintenanceRound(self: *DataServer) !void {

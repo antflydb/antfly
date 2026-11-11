@@ -944,6 +944,17 @@ pub const Status = enum(u32) {
     invalid_dataset_dependency = 984,
     invalid_dataset_location = 985,
     invalid_dataset_pin = 986,
+    invalid_retained_read_kind = 987,
+    invalid_retained_read_limits = 988,
+    invalid_retained_replacement = 989,
+    invalid_retained_resume_checkpoint_path = 990,
+    retained_dataset_generation_transition_required = 991,
+    retained_dataset_resource_changed = 992,
+    retained_dataset_retirement_pending = 993,
+    retained_dataset_source_in_use = 994,
+    retained_dataset_source_not_ready = 995,
+    retained_owner_plan_changed = 996,
+    retained_series_coordinated_ttl_unsupported = 997,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

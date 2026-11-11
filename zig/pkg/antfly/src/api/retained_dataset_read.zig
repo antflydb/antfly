@@ -149,6 +149,7 @@ pub fn read(a: A, snapshot: Snapshot, input: Request, context: operation.Request
     if (!snapshot.plan.registration_complete or snapshot.owners.len != snapshot.plan.registered) return error.InvalidRetainedOwnerPlan;
     var descriptor = try local.system_catalog_retained_datasets.parse(a, snapshot.resource.source_json);
     defer descriptor.deinit();
+    if (descriptor.value.phase == .retiring) return error.RetainedOwnerPlanChanged;
     if (descriptor.value.phase != .active and descriptor.value.phase != .closing and descriptor.value.phase != .closed) return error.RetainedSeriesNotReady;
     const definition = descriptor.value.definition;
     const summary = definition.summary orelse return error.InvalidDatasetDefinition;
@@ -250,6 +251,7 @@ pub fn fetchReadCut(server: anytype, a: A, target: local.system_catalog_domain.T
     defer descriptor.deinit();
     // A detached owner journal can retain its last closed plan. The current
     // resource phase must revoke serving before any archive I/O or replay.
+    if (descriptor.value.phase == .retiring) return error.RetainedOwnerPlanChanged;
     if (descriptor.value.phase != .active and descriptor.value.phase != .closing and descriptor.value.phase != .closed) return error.RetainedSeriesNotReady;
     return snapshot;
 }
@@ -404,7 +406,7 @@ test "retained owner native controls merge archived and native average states wi
     defer a.free(retired_json);
     var retired_snapshot = snapshot;
     retired_snapshot.resource.source_json = retired_json;
-    try std.testing.expectError(error.RetainedSeriesNotReady, read(a, retired_snapshot, range, .{}, &reader));
+    try std.testing.expectError(error.RetainedOwnerPlanChanged, read(a, retired_snapshot, range, .{}, &reader));
     try std.testing.expectEqual(@as(usize, 2), reader.archived_calls);
 }
 

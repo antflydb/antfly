@@ -951,6 +951,17 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_dataset_dependency, .err = error.InvalidDatasetDependency },
     .{ .status = .invalid_dataset_location, .err = error.InvalidDatasetLocation },
     .{ .status = .invalid_dataset_pin, .err = error.InvalidDatasetPin },
+    .{ .status = .invalid_retained_read_kind, .err = error.InvalidRetainedReadKind },
+    .{ .status = .invalid_retained_read_limits, .err = error.InvalidRetainedReadLimits },
+    .{ .status = .invalid_retained_replacement, .err = error.InvalidRetainedReplacement },
+    .{ .status = .invalid_retained_resume_checkpoint_path, .err = error.InvalidRetainedResumeCheckpointPath },
+    .{ .status = .retained_dataset_generation_transition_required, .err = error.RetainedDatasetGenerationTransitionRequired },
+    .{ .status = .retained_dataset_resource_changed, .err = error.RetainedDatasetResourceChanged },
+    .{ .status = .retained_dataset_retirement_pending, .err = error.RetainedDatasetRetirementPending },
+    .{ .status = .retained_dataset_source_in_use, .err = error.RetainedDatasetSourceInUse },
+    .{ .status = .retained_dataset_source_not_ready, .err = error.RetainedDatasetSourceNotReady },
+    .{ .status = .retained_owner_plan_changed, .err = error.RetainedOwnerPlanChanged },
+    .{ .status = .retained_series_coordinated_ttl_unsupported, .err = error.RetainedSeriesCoordinatedTtlUnsupported },
 };
 
 pub fn statusFromError(err: anyerror) abi.Status {
@@ -1334,7 +1345,7 @@ test "storage owner lease admission retains its independent stable identity" {
 }
 
 test "retained admission and read errors survive compiled storage boundaries" {
-    inline for (.{ error.InvalidRetainedSeriesRow, error.RetainedSeriesCorrectionWindow, error.RetainedSeriesHistoryExpired, error.RetainedSeriesSourceClosed, error.RetainedSeriesSourceRevoked, error.RetainedSeriesSourceDraining, error.RetainedSeriesPreparedHold, error.DatasetPageBudgetExceeded, error.RetainedSeriesResetRequired }) |expected| {
+    inline for (.{ error.InvalidRetainedSeriesRow, error.RetainedOwnerPlanChanged, error.RetainedDatasetSourceInUse, error.RetainedSeriesCorrectionWindow, error.RetainedSeriesHistoryExpired, error.RetainedSeriesSourceClosed, error.RetainedSeriesSourceRevoked, error.RetainedSeriesSourceDraining, error.RetainedSeriesPreparedHold, error.DatasetPageBudgetExceeded, error.RetainedSeriesResetRequired }) |expected| {
         const failure = failureFromError(expected, .storage_owner, abi.abi_version, 4);
         try std.testing.expect(failure.status != .internal);
         try validateFailureEnvelope(failure.status, &failure, abi.abi_version);

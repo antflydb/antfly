@@ -1183,6 +1183,11 @@ pub const Detail = enum(c_int) {
     invalid_dataset_dependency,
     invalid_dataset_location,
     invalid_dataset_pin,
+    invalid_retained_read_kind,
+    invalid_retained_read_limits,
+    invalid_retained_replacement,
+    invalid_retained_resume_checkpoint_path,
+    retained_series_coordinated_ttl_unsupported,
 };
 
 pub const Status = extern struct {
@@ -2279,6 +2284,11 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidDatasetDependency => status(.invalid_argument, .invalid_dataset_dependency),
         error.InvalidDatasetLocation => status(.invalid_argument, .invalid_dataset_location),
         error.InvalidDatasetPin => status(.invalid_argument, .invalid_dataset_pin),
+        error.InvalidRetainedReadKind => status(.invalid_argument, .invalid_retained_read_kind),
+        error.InvalidRetainedReadLimits => status(.invalid_argument, .invalid_retained_read_limits),
+        error.InvalidRetainedReplacement => status(.invalid_argument, .invalid_retained_replacement),
+        error.InvalidRetainedResumeCheckpointPath => status(.invalid_argument, .invalid_retained_resume_checkpoint_path),
+        error.RetainedSeriesCoordinatedTtlUnsupported => status(.conflict, .retained_series_coordinated_ttl_unsupported),
         error.ReadOutputTruncated => status(.invalid_argument, .read_output_truncated),
         else => blk: {
             // Private error identities cannot cross this stable ABI. Retain
@@ -3276,6 +3286,11 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .retained_series_history_expired => "RetainedSeriesHistoryExpired",
         .retained_series_snapshot_expired => "RetainedSeriesSnapshotExpired",
         .retained_series_reset_required => "RetainedSeriesResetRequired",
+        .invalid_retained_read_kind => "InvalidRetainedReadKind",
+        .invalid_retained_read_limits => "InvalidRetainedReadLimits",
+        .invalid_retained_replacement => "InvalidRetainedReplacement",
+        .invalid_retained_resume_checkpoint_path => "InvalidRetainedResumeCheckpointPath",
+        .retained_series_coordinated_ttl_unsupported => "RetainedSeriesCoordinatedTtlUnsupported",
         .dataset_already_exists => "DatasetAlreadyExists",
         .dataset_compaction_order => "DatasetCompactionOrder",
         .dataset_copy_fault => "DatasetCopyFault",

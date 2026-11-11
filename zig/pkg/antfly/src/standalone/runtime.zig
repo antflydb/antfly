@@ -2831,13 +2831,13 @@ const LocalStandaloneMetadata = struct {
 
     fn maintainRetainedArchive(ptr: *anyopaque, context: antfly.public_api.operation.RequestContext) anyerror!u64 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        const server = self.data_server orelse return platform_time.monotonicNs() +| std.time.ns_per_s;
-        const config = server.api_server_cfg.node_config orelse return platform_time.monotonicNs() +| std.time.ns_per_s;
-        const store = self.lifecycle_store orelse return platform_time.monotonicNs() +| std.time.ns_per_s;
+        const server = self.data_server orelse return std.time.ns_per_s;
+        const config = server.api_server_cfg.node_config orelse return std.time.ns_per_s;
+        const store = self.lifecycle_store orelse return std.time.ns_per_s;
         const io = self.backend_runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
         try context.ensureActive();
         try self.retained_archive.run(self.alloc, store, group_ids.main_metadata_group_id, config, server.api_server_cfg.secret_store, io, platform_time.monotonicNs(), &context);
-        return self.retained_archive.next_ns;
+        return self.retained_archive.next_ns -| platform_time.monotonicNs();
     }
 
     fn refreshRetainedDatasetProjectionLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, resource_id: u64) !void {
