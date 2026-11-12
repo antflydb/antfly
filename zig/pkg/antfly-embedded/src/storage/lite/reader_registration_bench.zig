@@ -13,7 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Standalone comparison of individual and admission-scoped epoch registration.
+//! Standalone timing of region-backed reader registration (claim+pin a
+//! `shared_lock_region.zig` slot, no filesystem I/O at all), with and
+//! without a `RegistrationBatch` wrapped around the run -- now a stable
+//! no-op kept only for API compatibility (see reader_coordinator.zig's own
+//! module doc), so both numbers should land close together; this bench
+//! exists to show that directly, replacing the old comparison against
+//! `reader_epochs.zig`'s file-marker registration (which this design
+//! deleted) and the batching that used to amortize its cost.
 //! From zig/: zig build-exe --dep antfly_runtime_fs
 //! -Mroot=pkg/antfly-embedded/src/storage/lite/reader_registration_bench.zig
 //! --dep antfly_platform -Mantfly_runtime_fs=lib/runtime/src/fs.zig
@@ -23,7 +30,7 @@
 //! Run zig-out/reader-registration-bench. Timings are observations, not assertions.
 const std = @import("std");
 const Coordinator = @import("reader_coordinator.zig").Coordinator;
-const epochs = @import("reader_epochs.zig");
+const shared_lock_region = @import("shared_lock_region.zig");
 
 pub fn main(init: std.process.Init) !void {
     // Match C API admission rather than measuring DebugAllocator bookkeeping.
@@ -40,8 +47,9 @@ pub fn main(init: std.process.Init) !void {
     const data = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true });
     defer data.close(io);
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    const binding = try epochs.namespaceForPublication(a, io, path);
     const inode = (try data.stat(io)).inode;
+    var region = try shared_lock_region.Region.open(a, io, path);
+    defer region.close();
     var owner = Coordinator.init(a, io);
     defer owner.deinit();
     const iterations = 2000;
@@ -54,13 +62,12 @@ pub fn main(init: std.process.Init) !void {
                 const file = try std.Io.Dir.cwd().openFile(io, path, .{});
                 defer file.close(io);
                 try file.lock(io, .shared);
-                const fence = try owner.registerEpoch(file, path, binding, inode, 1, @splat(0), false);
+                const fence = try owner.registerEpoch(file, &region, inode, 1, @splat(0), false);
                 owner.unregister(fence);
             }
             if (batch) |scope| scope.end();
             const elapsed = std.Io.Clock.awake.now(io).nanoseconds - began;
-            const frontier = try epochs.scan(a, io, path, binding, inode);
-            if (frontier.data != null or frontier.metadata != null) return error.LeakedReader;
+            if (region.minimumPinnedSequence() != null) return error.LeakedReader;
             std.debug.print("{{\"round\":{d},\"batched\":{},\"iterations\":{d},\"nanoseconds\":{d}}}\n", .{ round, batched, iterations, elapsed });
         }
     }

@@ -13,14 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Steps 1 and 2 of `docs/design/lite-performance/lite-single-commit-write-path.md`
-//! §8: the shared mmap region (§8.1), the writer lock (§8.2), and the
-//! reader table (§8.3). Liveness/recovery (§8.4) lands in the next step;
-//! the migration/deletion of `inode_lock.zig`, `writer_queue.zig`,
-//! `reader_epochs.zig`, `ReaderCoordinator`, and the rest of §8.7's table
-//! happens only once §8.4 exists to replace what they still rely on (a
-//! dead reader's never-cleared pin, a dead writer's held lock). Until then
-//! this module is additive and unreferenced by existing callers.
+//! Steps 1 through 3 of `docs/design/lite-performance/lite-single-commit-write-path.md`
+//! §8: the shared mmap region (§8.1), the writer lock (§8.2), the reader
+//! table (§8.3), and liveness/recovery (§8.4). §8.7's migration table is
+//! now underway on the reader side: `reader_epochs.zig` is deleted,
+//! `reader_coordinator.zig`'s `Coordinator` claims and pins a slot here
+//! per reader instead of writing a file marker, and `native.zig`'s
+//! `acquireReaderFence`/`acquireEpochReuseLock` read this region directly.
+//! The writer-lane/fairness rows of the same table are a separate,
+//! concurrently landing migration (`writer_queue.zig`, `PathWriterLock`'s
+//! writer-side constructors) -- not this file's own scope.
 //!
 //! One `<db>.aflite-lock` file, memory-mapped `MAP_SHARED` by every process
 //! with the database open (SQLite's `-shm`, LMDB's `lock.mdb`). The steady,
@@ -45,7 +47,18 @@ const Io = std.Io;
 const antfly_platform = @import("antfly_platform");
 
 const magic: [8]u8 = "AFLLOCK1".*;
-const format_version: u32 = 1;
+// v2: the ticket ring's own owner word widened from 64 to 128 bits (a
+// packed `(tag, owner)` pair instead of just `owner`), closing a window
+// where a ticket could be taken (`writer_ticket_tail` advanced) before
+// its owner was recorded -- a crash in that window left the ticket
+// permanently unresolvable (its ring slot read as "never claimed"
+// rather than "claimed by a now-dead process", so no liveness slot was
+// ever known to probe). See `packTicketSlot`'s own doc comment for the
+// new layout and `Region.tryClaimTicket`'s for the claim protocol this
+// enables. A v1 region is simply rebuilt (the file is a disposable
+// locking aid, not a migrated artifact), same as any other
+// magic/version mismatch.
+const format_version: u32 = 2;
 
 /// Fixed size of the header itself. The header's own `region_bytes` and
 /// `max_readers` fields (not this constant) are the source of truth for
@@ -152,15 +165,19 @@ const ReaderSlot = extern struct {
     /// The `commit_sequence` this reader will not let the writer reclaim
     /// pages behind. 0 means "not currently pinned" (sequence numbers
     /// start above 0), written once per pin by the slot's own owner,
-    /// cleared to 0 on unpin.
+    /// cleared to 0 on unpin. Every reader pins this one, regardless of
+    /// whether it also retains metadata (matching `native.zig`'s
+    /// `minimum_reader_sequence`, the broader of its two frontiers).
     pinned_sequence: std.atomic.Value(u64),
-    /// Pads the slot to 32 bytes (the compiler already inserts 4 bytes
-    /// between `owner` and `generation` for `generation`'s 8-byte
-    /// alignment, so 8 explicit bytes here, not 12, reaches 32) and
-    /// leaves room for a second pin (metadata vs. data, matching
-    /// `minimum_reader_sequence` vs. `minimum_metadata_reader_sequence`
-    /// in native.zig today) without another format bump.
-    _reserved: [8]u8 = @splat(0),
+    /// A second, narrower pin: set in addition to `pinned_sequence` only
+    /// by a reader that also retains allocator/recovery metadata pages
+    /// (a full graph scan, snapshot, or indexed-reclamation reader with
+    /// `metadata = true` -- matching `native.zig`'s
+    /// `minimum_metadata_reader_sequence`). 0 means "no metadata
+    /// retention from this slot"; a plain data-only reader never touches
+    /// this field. Exactly fills what was reserved padding before this
+    /// field existed, so no format bump was needed to add it.
+    metadata_pinned_sequence: std.atomic.Value(u64),
 };
 
 const reader_slot_bytes = 32;
@@ -231,6 +248,25 @@ fn holderPid(word: u64) u32 {
 
 fn holderLivenessSlot(word: u64) u32 {
     return @truncate(word >> 32);
+}
+
+/// Packs a ticket ring slot: `tag` (the claiming ticket's own absolute
+/// number, offset by one -- see `ticketSlots`'s own doc comment for why
+/// zero must stay reserved for "nobody has ever claimed this slot") in
+/// the upper 64 bits, `owner` (`packHolder`'s own pid/liveness-slot
+/// encoding) in the lower 64. A 128-bit word so claiming a ticket number
+/// and publishing its owner is one atomic CAS, not two separate writes
+/// with a window between them.
+fn packTicketSlot(tag: u64, owner: u64) u128 {
+    return (@as(u128, tag) << 64) | @as(u128, owner);
+}
+
+fn ticketSlotTag(word: u128) u64 {
+    return @truncate(word >> 64);
+}
+
+fn ticketSlotOwner(word: u128) u64 {
+    return @truncate(word);
 }
 
 /// True when mmap or the shared-futex self-test is unavailable and callers
@@ -405,6 +441,79 @@ fn releaseProcessFd(io: Io, entry: *FdEntry) void {
     }
 }
 
+/// Test-only counters for the writer word's own futex traffic (the
+/// `writer_ticket_head`/`writer_release_epoch` wait/wake calls in
+/// `acquireWriter`/`acquireWriterFairBounded`/`releaseWriter`/
+/// `advanceHeadPastAbandoned`, not the reader table's separate
+/// `reader_slot_released` futex) -- what "a reported lock-syscall count
+/// per contended handoff" (§8.8) needs a number for. `void` outside tests
+/// so these never cost anything in a real build; each forked test process
+/// gets its own copy (counters are per-process state, like everything
+/// else these calls touch), so a cross-process test simply reads them
+/// back after its own loop with no shared-memory bookkeeping of its own.
+pub const WriterFutexSnapshot = struct { wait: u64, wake: u64 };
+
+const WriterFutexCounters = struct {
+    wait: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    wake: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+
+    fn countWait(self: *WriterFutexCounters) void {
+        if (builtin.is_test) _ = self.wait.fetchAdd(1, .monotonic);
+    }
+    fn countWake(self: *WriterFutexCounters) void {
+        if (builtin.is_test) _ = self.wake.fetchAdd(1, .monotonic);
+    }
+    fn reset(self: *WriterFutexCounters) void {
+        if (builtin.is_test) {
+            self.wait.store(0, .monotonic);
+            self.wake.store(0, .monotonic);
+        }
+    }
+    fn snapshot(self: *const WriterFutexCounters) WriterFutexSnapshot {
+        if (!builtin.is_test) return .{ .wait = 0, .wake = 0 };
+        return .{ .wait = self.wait.load(.monotonic), .wake = self.wake.load(.monotonic) };
+    }
+};
+var writer_futex_counters: WriterFutexCounters = .{};
+
+/// Test-only reset, called once per measuring process (after `fork`, not
+/// before -- see the handoff-report test's own doc comment) so a loop's
+/// own counts aren't polluted by whatever setup ran before it.
+pub fn testResetWriterFutexCounters() void {
+    writer_futex_counters.reset();
+}
+
+/// Test-only snapshot of `writer_futex_counters`; `{0, 0}` outside tests.
+pub fn testWriterFutexCounters() WriterFutexSnapshot {
+    return writer_futex_counters.snapshot();
+}
+
+/// `antfly_platform.sync.rawFutexWaitShared`, counted. Every writer-word
+/// wait call in `acquireWriter`/`advanceHeadPastAbandoned`'s peers goes
+/// through this (not the raw platform call directly) so the counters
+/// above see every one of them.
+fn countedRawFutexWaitShared(ptr: *const u32, expect: u32, timeout_ms: ?u32) void {
+    writer_futex_counters.countWait();
+    antfly_platform.sync.rawFutexWaitShared(ptr, expect, timeout_ms);
+}
+
+/// `antfly_platform.sync.futexWaitSharedBounded`, counted -- the bounded
+/// peer `countedRawFutexWaitShared` above has for `acquireWriterFairBounded`.
+fn countedFutexWaitSharedBounded(io: Io, ptr: *const u32, expect: u32, deadline: Io.Timestamp) Io.Cancelable!void {
+    writer_futex_counters.countWait();
+    return antfly_platform.sync.futexWaitSharedBounded(io, ptr, expect, deadline);
+}
+
+/// Counted wake for the writer word only (`writer_ticket_head`/
+/// `writer_release_epoch`), wrapping this file's own `futexWakeShared`
+/// alias further below rather than the raw platform call, so the reader
+/// table's own `reader_slot_released` wakes (a separate mechanism, not
+/// part of this handoff) are deliberately not counted here.
+fn countedWriterFutexWakeShared(ptr: *const u32) void {
+    writer_futex_counters.countWake();
+    futexWakeShared(ptr);
+}
+
 pub const Region = struct {
     mapping: []align(std.heap.page_size_min) u8,
     /// This handle's own reference into `fd_registry` -- this process's
@@ -441,22 +550,22 @@ pub const Region = struct {
         return @ptrCast(@alignCast(self.mapping.ptr));
     }
 
-    /// Byte offset of ticket ring slot `ticket % max_readers`'s owner
-    /// word (packed `pid`/liveness-slot, `packHolder`'s own encoding),
-    /// immediately after the reader slot array -- 8-byte aligned for any
-    /// `max_readers` value, since the reader slot array's own size is
-    /// always a multiple of 8. See `ticketOwnerPids`'s own doc comment
-    /// for what this is for.
+    /// Byte offset of ticket ring slot `ticket % max_readers`'s own
+    /// packed (tag, owner) word (`packTicketSlot`'s own encoding),
+    /// immediately after the reader slot array -- 16-byte aligned for
+    /// any `max_readers` value, since both `header_bytes` and
+    /// `reader_slot_bytes` are themselves multiples of 16. See
+    /// `ticketSlots`'s own doc comment for what this ring is for.
     fn ticketOwnerOffset(max_readers: u32) usize {
         return header_bytes + @as(usize, max_readers) * reader_slot_bytes;
     }
 
     /// Byte offset of liveness slot `slot_index`'s dedicated byte,
-    /// immediately after the ticket owner ring (§8.1's "M*1 process
-    /// liveness bytes, one per slot"). Content is never read or written;
-    /// the byte exists purely as an `fcntl` lock target.
+    /// immediately after the ticket ring (§8.1's "M*1 process liveness
+    /// bytes, one per slot"). Content is never read or written; the
+    /// byte exists purely as an `fcntl` lock target.
     fn livenessByteOffset(max_readers: u32, slot_index: u32) i64 {
-        return @as(i64, @intCast(ticketOwnerOffset(max_readers))) + @as(i64, max_readers) * 8 + @as(i64, slot_index);
+        return @as(i64, @intCast(ticketOwnerOffset(max_readers))) + @as(i64, max_readers) * 16 + @as(i64, slot_index);
     }
 
     /// Byte offset of ticket `ticket`'s abandonment flag, in a fixed ring
@@ -639,7 +748,10 @@ pub const Region = struct {
             try ensureNoLivePeer(raw_fd, &existing_raw, size);
         }
         if (need_init) {
-            const region_bytes = header_bytes + @as(u64, max_readers) * (reader_slot_bytes + 10);
+            // Per-slot overhead: the reader slot itself, the ticket
+            // ring's own 16-byte (tag, owner) word (`packTicketSlot`),
+            // one liveness byte, and one abandonment-flag byte.
+            const region_bytes = header_bytes + @as(u64, max_readers) * (reader_slot_bytes + 18);
             // Rebuild from a clean slate: a corrupt region's leftover
             // reader-slot/liveness bytes are never trusted either, only
             // the header's own validity was checked above. `setLength(0)`
@@ -713,7 +825,7 @@ pub const Region = struct {
         if (claimed_max_readers == 0 or claimed_max_readers > max_sane_readers) {
             return RegionError.RegionCorrupt;
         }
-        const implied_bytes = header_bytes + @as(u64, claimed_max_readers) * (reader_slot_bytes + 10);
+        const implied_bytes = header_bytes + @as(u64, claimed_max_readers) * (reader_slot_bytes + 18);
         if (implied_bytes > actual_file_bytes) {
             // The claimed slot count doesn't even fit the file's actual
             // size -- the header is corrupt enough that this count can't
@@ -772,7 +884,15 @@ pub const Region = struct {
     /// alongside `pid` -- a struct-field read, not a syscall -- so a
     /// later `writerHolderDead` probe knows exactly which byte answers
     /// "is the process that wrote this word still alive".
-    fn tryAcquireWriter(self: *Region, pid: u32) bool {
+    ///
+    /// `pub` (unlike most of this module's own private building blocks)
+    /// because `native.zig`'s own §8.2 "plain" mode
+    /// (`lockWriterPathWithIo`) needs exactly this -- a single nonblocking
+    /// attempt that, like that function's own pre-region behavior, jumps
+    /// the FIFO rather than respecting it (`tryAcquireWriterFair` below
+    /// is the FIFO-respecting peer `tryFairWriterLockWithIo` migrates onto
+    /// instead).
+    pub fn tryAcquireWriter(self: *Region, pid: u32) bool {
         const want = packHolder(pid, self.own_liveness_slot);
         return self.header().writer_holder.cmpxchgStrong(0, want, .acquire, .monotonic) == null;
     }
@@ -827,15 +947,24 @@ pub const Region = struct {
         // needs a *bounded* step at all now, not a true indefinite park.
         var backoff_ms: u32 = ring_full_backoff_initial_ms;
         const my_ticket: u32 = while (true) {
-            if (self.ringHasRoom()) break @truncate(hdr.writer_ticket_tail.fetchAdd(1, .monotonic));
-            antfly_platform.sync.rawFutexWaitShared(&hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), backoff_ms);
-            backoff_ms = @min(backoff_ms * 2, ring_full_backoff_max_ms);
+            if (!self.ringHasRoom()) {
+                countedRawFutexWaitShared(&hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), backoff_ms);
+                backoff_ms = @min(backoff_ms * 2, ring_full_backoff_max_ms);
+                continue;
+            }
+            // `tryClaimTicket` publishes the owner atomically with the
+            // ticket number itself -- see its own doc comment. A `null`
+            // result resolves itself quickly (a live contender publishes
+            // within a couple of instructions; a dead one is cleared by
+            // this same call), so retrying immediately with a freshly
+            // read `tail` is deliberate, not a missing backoff.
+            const t = hdr.writer_ticket_tail.load(.monotonic);
+            if (self.tryClaimTicket(t, pid)) |ticket| break ticket;
         };
-        self.ticketOwnerPids()[my_ticket % hdr.max_readers].store(packHolder(pid, self.own_liveness_slot), .release);
         while (true) {
             const head = hdr.writer_ticket_head.load(.acquire);
             if (head == my_ticket) break;
-            antfly_platform.sync.rawFutexWaitShared(&hdr.writer_ticket_head.raw, head, dead_ticket_check_step_ms);
+            countedRawFutexWaitShared(&hdr.writer_ticket_head.raw, head, dead_ticket_check_step_ms);
             const head2 = hdr.writer_ticket_head.load(.acquire);
             if (head2 == my_ticket) break;
             if (head2 == head) self.tryHelpDeadTicketAt(head2);
@@ -857,7 +986,7 @@ pub const Region = struct {
             // itself (see this function's own doc comment, and
             // `writer_release_epoch`'s own, for why).
             const epoch = hdr.writer_release_epoch.load(.acquire);
-            antfly_platform.sync.rawFutexWaitShared(&hdr.writer_release_epoch.raw, epoch, null);
+            countedRawFutexWaitShared(&hdr.writer_release_epoch.raw, epoch, null);
         }
     }
 
@@ -902,13 +1031,19 @@ pub const Region = struct {
         const head = hdr.writer_ticket_head.load(.monotonic);
         const tail: u32 = @truncate(hdr.writer_ticket_tail.load(.monotonic));
         if (head == tail) return false;
-        const owners = self.ticketOwnerPids();
+        const slots = self.ticketSlots();
         const flags = self.ticketAbandonedFlags();
         var t = head;
         while (t != tail) : (t +%= 1) {
             const idx = t % hdr.max_readers;
             if (flags[idx].load(.acquire) != 0) continue;
-            const owner = owners[idx].load(.acquire);
+            const owner = ticketSlotOwner(slots[idx].load(.acquire));
+            // `0`: this exact ring index is mid-transition (its own
+            // claimant is between `tryClaimTicket`'s own two steps, or a
+            // resolver just cleared it and hasn't advanced `head` past it
+            // yet) -- not a foreign waiter to report either way; whoever
+            // is transitioning it will finish the job.
+            if (owner == 0) continue;
             if (holderPid(owner) == own_pid) continue;
             if (self.isSlotDead(holderLivenessSlot(owner))) continue;
             return true;
@@ -951,11 +1086,19 @@ pub const Region = struct {
         const hdr = self.header();
         if (hdr.writer_ticket_head.load(.monotonic) == @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))) and self.tryAcquireWriter(pid)) return;
         const my_ticket: u32 = while (true) {
-            if (self.ringHasRoom()) break @truncate(hdr.writer_ticket_tail.fetchAdd(1, .monotonic));
+            if (!self.ringHasRoom()) {
+                if (Io.Clock.now(.awake, io).compare(.gte, deadline)) return error.Timeout;
+                countedFutexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), deadline) catch return error.Canceled;
+                continue;
+            }
+            // See `acquireWriter`'s own identical claim loop:
+            // `tryClaimTicket` publishes the owner atomically with the
+            // ticket number, so a `null` result just means retry with a
+            // freshly read `tail`, not a wait.
+            const t = hdr.writer_ticket_tail.load(.monotonic);
+            if (self.tryClaimTicket(t, pid)) |ticket| break ticket;
             if (Io.Clock.now(.awake, io).compare(.gte, deadline)) return error.Timeout;
-            antfly_platform.sync.futexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), deadline) catch return error.Canceled;
         };
-        self.ticketOwnerPids()[my_ticket % hdr.max_readers].store(packHolder(pid, self.own_liveness_slot), .release);
         while (true) {
             const head = hdr.writer_ticket_head.load(.acquire);
             if (head == my_ticket) break;
@@ -963,7 +1106,7 @@ pub const Region = struct {
                 self.ticketAbandonedFlags()[my_ticket % hdr.max_readers].store(1, .release);
                 return error.Timeout;
             }
-            antfly_platform.sync.futexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, head, deadline) catch return error.Canceled;
+            countedFutexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, head, deadline) catch return error.Canceled;
             const head2 = hdr.writer_ticket_head.load(.acquire);
             if (head2 == head) self.tryHelpDeadTicketAt(head2);
         }
@@ -980,7 +1123,48 @@ pub const Region = struct {
                 return error.Timeout;
             }
             const epoch = hdr.writer_release_epoch.load(.acquire);
-            antfly_platform.sync.futexWaitSharedBounded(io, &hdr.writer_release_epoch.raw, epoch, deadline) catch return error.Canceled;
+            countedFutexWaitSharedBounded(io, &hdr.writer_release_epoch.raw, epoch, deadline) catch return error.Canceled;
+        }
+    }
+
+    /// Waits (bounded by `deadline`) until the writer word next looks
+    /// free, without taking a ticket or attempting the CAS itself --
+    /// for a caller that only needs a wake signal in place of busy-
+    /// polling the real kernel flock, not a second admission decision of
+    /// its own. Returns normally (not an error) on a plain deadline
+    /// expiry -- exactly like `acquireWriterFairBounded`'s own futex
+    /// waits, this is a wake signal, not a decision, so the caller's own
+    /// next real attempt is what decides success or `FileBusy`.
+    ///
+    /// Not yet wired to a caller: `native.zig`'s own `waitPathLockWithIo`
+    /// (nested under a ticket its own caller's `plainWriterLockUntil`
+    /// loop already resolved, or called with no ticket at all) would be
+    /// the natural one, but it has no `Region` of its own to call this
+    /// on -- opening a fresh one per retry iteration serializes every
+    /// concurrent retrier through `Region.open`'s own one-time setup
+    /// lock and was measured to intermittently blow a 10 s per-attempt
+    /// deadline under three-way contention. Reusing the caller's own
+    /// already-open `Region` needs that reference threaded through (a
+    /// signature change to this function or `plainWriterLockUntil`),
+    /// deliberately left for that decision rather than guessed at here.
+    ///
+    /// `releaseWriter` only wakes `writer_release_epoch` when a ticket is
+    /// outstanding (its own doc comment: "the fully uncontended release
+    /// stays a single store with no syscall") -- a caller here may have
+    /// no ticket, and nobody else may ever take one either, so this
+    /// cannot rely purely on that wake arriving. It re-checks on a short,
+    /// bounded step (`dead_ticket_check_step_ms`, the same cadence
+    /// `acquireWriter`'s own phase-1 dead-ticket poll already uses)
+    /// whenever no real wake arrives sooner.
+    pub fn waitWriterFreeBounded(self: *const Region, io: Io, deadline: Io.Timestamp) error{Canceled}!void {
+        const hdr = self.header();
+        while (hdr.writer_holder.load(.acquire) != 0) {
+            if (Io.Clock.now(.awake, io).compare(.gte, deadline)) return;
+            const epoch = hdr.writer_release_epoch.load(.acquire);
+            if (hdr.writer_holder.load(.acquire) == 0) return;
+            const step_deadline = Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(dead_ticket_check_step_ms));
+            const bounded_deadline = if (step_deadline.compare(.lt, deadline)) step_deadline else deadline;
+            countedFutexWaitSharedBounded(io, &hdr.writer_release_epoch.raw, epoch, bounded_deadline) catch return error.Canceled;
         }
     }
 
@@ -1010,20 +1194,38 @@ pub const Region = struct {
     /// in the meantime. See `tryHelpDeadTicketAt`'s own doc comment.
     const dead_ticket_check_step_ms: u32 = 50;
 
-    /// `true` (and clears the abandonment flag, if that is why) when
-    /// ticket `ticket` is already resolved one way or another -- either
-    /// explicitly abandoned, or its recorded owner is provably dead --
-    /// without this call itself needing to own or win it.
+    /// `true` (and clears the abandonment flag and the ticket's own ring
+    /// slot, if that is why -- freeing this exact ring index for a
+    /// future generation, same as a real winner's own ticket gets
+    /// cleared in `advanceHeadPastAbandoned`) when ticket `ticket` is
+    /// already resolved one way or another -- either explicitly
+    /// abandoned, or its recorded owner is provably dead -- without this
+    /// call itself needing to own or win it.
+    ///
+    /// A ring slot read as genuinely empty (`owner == 0`) here -- not
+    /// just "not yet this call's concern" -- answers `false`: it means
+    /// some other, concurrent caller (this same ticket's own real
+    /// claimant publishing it, or another helper that already resolved
+    /// it) is actively transitioning this exact slot, so there is
+    /// nothing for *this* call to do; whoever is responsible will finish
+    /// the job.
     fn ticketResolvedWithoutOwning(self: *Region, ticket: u32) bool {
         const hdr = self.header();
         const idx = ticket % hdr.max_readers;
         const flags = self.ticketAbandonedFlags();
+        const slots = self.ticketSlots();
         if (flags[idx].load(.acquire) != 0) {
             flags[idx].store(0, .monotonic);
+            slots[idx].store(0, .release);
             return true;
         }
-        const owner = self.ticketOwnerPids()[idx].load(.acquire);
-        return owner != 0 and self.isSlotDead(holderLivenessSlot(owner));
+        const existing = slots[idx].load(.acquire);
+        const owner = ticketSlotOwner(existing);
+        if (owner != 0 and self.isSlotDead(holderLivenessSlot(owner))) {
+            slots[idx].store(0, .release);
+            return true;
+        }
+        return false;
     }
 
     /// Called by a waiter stuck making no progress on `head` (any phase,
@@ -1061,16 +1263,21 @@ pub const Region = struct {
         while (self.ticketResolvedWithoutOwning(head)) {
             head = hdr.writer_ticket_head.fetchAdd(1, .release) +% 1;
         }
-        futexWakeShared(&hdr.writer_ticket_head.raw);
+        countedWriterFutexWakeShared(&hdr.writer_ticket_head.raw);
     }
 
     /// After winning ticket `my_ticket`'s CAS, or voluntarily stepping
     /// aside for it (`acquireWriterFairBounded`'s own phase-2 timeout),
-    /// advances `head` past it and delegates to `continueSkippingFrom`
-    /// for anything immediately following that is also already
-    /// resolved.
+    /// clears this now-resolved ticket's own ring slot (freeing this
+    /// exact ring index for a future generation, the same cleanup
+    /// `ticketResolvedWithoutOwning` does for a ticket resolved the
+    /// *other* way), advances `head` past it, and delegates to
+    /// `continueSkippingFrom` for anything immediately following that is
+    /// also already resolved.
     fn advanceHeadPastAbandoned(self: *Region) void {
         const hdr = self.header();
+        const my_ticket = hdr.writer_ticket_head.load(.monotonic);
+        self.ticketSlots()[my_ticket % hdr.max_readers].store(0, .release);
         const new_head = hdr.writer_ticket_head.fetchAdd(1, .release) +% 1;
         self.continueSkippingFrom(new_head);
     }
@@ -1087,7 +1294,7 @@ pub const Region = struct {
         hdr.writer_holder.store(0, .release);
         if (hdr.writer_ticket_head.load(.monotonic) != @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic)))) {
             _ = hdr.writer_release_epoch.fetchAdd(1, .release);
-            futexWakeShared(&hdr.writer_release_epoch.raw);
+            countedWriterFutexWakeShared(&hdr.writer_release_epoch.raw);
         }
     }
 
@@ -1128,7 +1335,7 @@ pub const Region = struct {
         const hdr = self.header();
         hdr.writer_holder.store(0, .release);
         if (hdr.writer_ticket_head.load(.monotonic) != @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic)))) {
-            futexWakeShared(&hdr.writer_ticket_head.raw);
+            countedWriterFutexWakeShared(&hdr.writer_ticket_head.raw);
         }
     }
 
@@ -1155,9 +1362,25 @@ pub const Region = struct {
         return base[0..max_readers];
     }
 
-    /// A ring of `max_readers` packed owner words (`packHolder`'s own
-    /// `(pid, liveness_slot)` encoding), one per `ticket % max_readers`,
-    /// written when a ticket is taken and read for two purposes:
+    /// A ring of `max_readers` packed `(tag, owner)` words
+    /// (`packTicketSlot`'s own encoding; `owner` is `packHolder`'s own
+    /// `(pid, liveness_slot)` encoding), one per `ticket % max_readers`.
+    /// `0` means genuinely empty -- nobody has ever claimed this
+    /// generation of the slot -- which is why `tag` is stored as the
+    /// claiming ticket's own number *plus one*: ticket 0 would otherwise
+    /// be indistinguishable from empty.
+    ///
+    /// Claimed atomically with the ticket number itself
+    /// (`tryClaimTicket`'s own doc comment has the full protocol) --
+    /// deliberately not a plain `store` after `writer_ticket_tail`'s own
+    /// `fetchAdd` the way this worked before v2 of this format: that left
+    /// a window where a ticket existed (tail already advanced) but its
+    /// owner wasn't recorded yet, and a crash in that exact window left
+    /// the ring slot permanently unresolvable (read as "never claimed"
+    /// rather than "claimed by a now-dead process", so no liveness slot
+    /// was ever known to probe).
+    ///
+    /// Read for two purposes, both via `ticketSlotOwner`:
     ///
     /// 1. `othersWaitingAcrossProcesses` -- telling a genuinely foreign
     ///    waiter apart from this same process's own other caller (its
@@ -1169,10 +1392,69 @@ pub const Region = struct {
     ///    `tryHelpDeadTicketAt`'s own doc comment for the full case this
     ///    closes (a `kill -9` of a queued waiter, in either phase, that
     ///    never gets the chance to mark its own abandonment).
-    fn ticketOwnerPids(self: *const Region) []std.atomic.Value(u64) {
+    ///
+    /// Cleared back to `0` once a ticket resolves one way or another
+    /// (`ticketResolvedWithoutOwning`'s own doc comment), freeing this
+    /// exact ring index for a future generation to claim.
+    fn ticketSlots(self: *const Region) []std.atomic.Value(u128) {
         const max_readers = self.header().max_readers;
-        const base: [*]std.atomic.Value(u64) = @ptrCast(@alignCast(self.mapping.ptr + ticketOwnerOffset(max_readers)));
+        const base: [*]std.atomic.Value(u128) = @ptrCast(@alignCast(self.mapping.ptr + ticketOwnerOffset(max_readers)));
         return base[0..max_readers];
+    }
+
+    /// Non-blocking attempt at the two confirming steps of a ticket
+    /// claim for the speculative tail value `t` this caller already
+    /// read: §8.2's own fix for the ownerless-ticket window
+    /// `ticketSlots`'s own doc comment describes.
+    ///
+    /// 1. CAS `ticketSlots()[t % max_readers]` from empty (`0`) to this
+    ///    process's own claim (`packTicketSlot(t +% 1, ...)`). Losing
+    ///    this means the slot is occupied -- either a live concurrent
+    ///    claimant racing for this *exact* `t` (another process read the
+    ///    same `writer_ticket_tail` value before either of us advanced
+    ///    it) or a dead one that crashed between this step and the next.
+    ///    Tells the two apart by tag: only a slot whose own tag matches
+    ///    `t +% 1` is this exact ticket's own contested claim (anything
+    ///    else is a different ticket number's own leftover, not this
+    ///    call's concern); if the owner is dead, clears the slot so a
+    ///    caller's own retry (from the top, with a fresh `t`) can win it
+    ///    -- it does not retry the claim itself.
+    /// 2. CAS `writer_ticket_tail` from `t` to `t +% 1`. Losing this
+    ///    means some other process's own step 2 already advanced it
+    ///    (this call only reaches here after *winning* step 1 for `t`,
+    ///    so a concurrent claimant for this exact `t` must have lost
+    ///    step 1 and cannot be the reason; this is instead a genuinely
+    ///    different ticket's own tail advance racing ahead, meaning `t`
+    ///    itself is now stale): undoes this call's own step 1 (stores
+    ///    the slot back to empty) so a retry with a fresh `t` can use
+    ///    this same ring index again once it's genuinely free.
+    ///
+    /// Returns the ticket number (always `t` itself, truncated to
+    /// `u32` like every other ticket number in this file) on success,
+    /// `null` on either failure above -- the caller should back off
+    /// briefly (this is expected to resolve in at most a few retries:
+    /// a live contender publishes within a couple of instructions, a
+    /// dead one gets cleared on this same call) and retry the whole
+    /// claim with a freshly read `t`.
+    fn tryClaimTicket(self: *Region, t: u64, pid: u32) ?u32 {
+        const hdr = self.header();
+        const idx: u32 = @intCast(t % @as(u64, hdr.max_readers));
+        const slots = self.ticketSlots();
+        const want = packTicketSlot(t +% 1, packHolder(pid, self.own_liveness_slot));
+        if (slots[idx].cmpxchgStrong(0, want, .acq_rel, .monotonic)) |existing| {
+            if (ticketSlotTag(existing) == t +% 1) {
+                const owner = ticketSlotOwner(existing);
+                if (self.isSlotDead(holderLivenessSlot(owner))) {
+                    _ = slots[idx].cmpxchgStrong(existing, 0, .acq_rel, .monotonic);
+                }
+            }
+            return null;
+        }
+        if (hdr.writer_ticket_tail.cmpxchgStrong(t, t +% 1, .monotonic, .monotonic) != null) {
+            slots[idx].store(0, .release);
+            return null;
+        }
+        return @truncate(t);
     }
 
     /// LMDB calls the same condition (a fixed `maxreaders` table with no
@@ -1195,6 +1477,7 @@ pub const Region = struct {
             if (slot.owner.cmpxchgStrong(0, pid, .acquire, .monotonic) == null) {
                 slot.generation = packHolder(pid, self.own_liveness_slot);
                 slot.pinned_sequence.store(0, .monotonic);
+                slot.metadata_pinned_sequence.store(0, .monotonic);
                 return @intCast(i);
             }
         }
@@ -1209,6 +1492,7 @@ pub const Region = struct {
             if (slot.owner.cmpxchgStrong(owner, pid, .acquire, .monotonic) == null) {
                 slot.generation = packHolder(pid, self.own_liveness_slot);
                 slot.pinned_sequence.store(0, .monotonic);
+                slot.metadata_pinned_sequence.store(0, .monotonic);
                 return @intCast(i);
             }
         }
@@ -1257,19 +1541,51 @@ pub const Region = struct {
         self.readerSlots()[slot_index].pinned_sequence.store(0, .release);
     }
 
+    /// The narrower, metadata-only pin (`ReaderSlot.metadata_pinned_sequence`):
+    /// set in addition to `pinReader`, never instead of it, by a reader
+    /// that also retains allocator/recovery metadata pages (a full graph
+    /// scan, snapshot, or indexed-reclamation reader opened with
+    /// `metadata = true`). Matches `native.zig`'s
+    /// `minimum_metadata_reader_sequence` frontier.
+    pub fn pinMetadataReader(self: *Region, slot_index: u32, sequence: u64) void {
+        self.readerSlots()[slot_index].metadata_pinned_sequence.store(sequence, .release);
+    }
+
+    /// Clears the pin recorded by `pinMetadataReader`, without releasing
+    /// the slot or touching the data pin from `pinReader`.
+    pub fn unpinMetadataReader(self: *Region, slot_index: u32) void {
+        self.readerSlots()[slot_index].metadata_pinned_sequence.store(0, .release);
+    }
+
     /// Frees a slot claimed by `claimReaderSlot` for reuse, and wakes
     /// anyone parked in `claimReaderSlotWait` on exhaustion. Callers must
-    /// unpin first; this clears the pin defensively anyway so a slot
+    /// unpin first; this clears both pins defensively anyway so a slot
     /// released while still (incorrectly) pinned never blocks
-    /// `minimumPinnedSequence` after release.
+    /// `minimumPinnedSequence`/`minimumMetadataPinnedSequence` after
+    /// release.
     pub fn releaseReaderSlot(self: *Region, slot_index: u32) void {
         const slot = &self.readerSlots()[slot_index];
         slot.pinned_sequence.store(0, .monotonic);
+        slot.metadata_pinned_sequence.store(0, .monotonic);
         slot.generation = 0;
         slot.owner.store(0, .release);
         const hdr = self.header();
         _ = hdr.reader_slot_released.fetchAdd(1, .release);
         futexWakeShared(&hdr.reader_slot_released.raw);
+    }
+
+    /// Whether `slot_index` (a `claimReaderSlot` return value, not a
+    /// liveness slot) currently has a live owner: `false` for a free slot
+    /// and for one whose recorded holder the byte-range liveness probe
+    /// proves dead (the same check `minimumPinnedSequence`'s own sweep
+    /// uses internally, exposed here for a caller -- e.g. a reader-side
+    /// migration step -- that needs to ask about one specific slot
+    /// without running a full frontier scan).
+    pub fn isReaderSlotLive(self: *const Region, slot_index: u32) bool {
+        const slot = &self.readerSlots()[slot_index];
+        const owner = slot.owner.load(.acquire);
+        if (owner == 0) return false;
+        return !self.isSlotDead(holderLivenessSlot(slot.generation));
     }
 
     /// §8.3's writer-side reuse-frontier scan, replacing
@@ -1278,11 +1594,13 @@ pub const Region = struct {
     /// no reader is currently pinned. "Live" here is just `owner != 0`;
     /// step 3's per-slot liveness byte-range probe (§8.4) replaces that
     /// with a real death check so a crashed reader's never-cleared pin
-    /// cannot block reclamation forever -- until then, a process that
-    /// dies while pinned leaks its pin here, same as it would in
-    /// `reader_epochs.zig` today without a sweep. Nothing calls this from
-    /// a real write path yet (§8.7's migration is a later step); it is
-    /// exercised only by this file's own tests.
+    /// cannot block reclamation forever. This is `native.zig`'s broader
+    /// frontier (`reuseFrontier`'s `minimum_reader_sequence` input,
+    /// protecting every pinned reader regardless of whether it also
+    /// retains metadata); see `minimumMetadataPinnedSequence` for the
+    /// narrower one. Name and semantics are relied on by more than one
+    /// caller (page reclamation here, log-record retention elsewhere) --
+    /// keep both stable.
     pub fn minimumPinnedSequence(self: *Region) ?u64 {
         var min: ?u64 = null;
         for (self.readerSlots()) |*slot| {
@@ -1296,6 +1614,7 @@ pub const Region = struct {
             // ever does), never on a reader's own pin/unpin path.
             if (self.isSlotDead(holderLivenessSlot(slot.generation))) {
                 slot.pinned_sequence.store(0, .monotonic);
+                slot.metadata_pinned_sequence.store(0, .monotonic);
                 slot.generation = 0;
                 slot.owner.store(0, .release);
                 const hdr = self.header();
@@ -1304,6 +1623,30 @@ pub const Region = struct {
                 continue;
             }
             const seq = slot.pinned_sequence.load(.acquire);
+            if (seq == 0) continue;
+            if (min == null or seq < min.?) min = seq;
+        }
+        return min;
+    }
+
+    /// The narrower companion to `minimumPinnedSequence`: the minimum
+    /// `metadata_pinned_sequence` over every slot with a live owner *and*
+    /// a nonzero metadata pin, or `null` if no reader currently retains
+    /// metadata. Matches `native.zig`'s `metadataReuseFrontier`'s
+    /// `minimum_metadata_reader_sequence` input. Dead-slot reclamation is
+    /// `minimumPinnedSequence`'s job (it runs on every writer-side
+    /// frontier check and this one is always called alongside it in
+    /// practice); this scan only reads, so calling this alone without
+    /// also calling `minimumPinnedSequence` leaves a dead reader's
+    /// metadata pin uncollected until the next data-frontier scan reaps
+    /// it.
+    pub fn minimumMetadataPinnedSequence(self: *Region) ?u64 {
+        var min: ?u64 = null;
+        for (self.readerSlots()) |*slot| {
+            const owner = slot.owner.load(.acquire);
+            if (owner == 0) continue;
+            if (self.isSlotDead(holderLivenessSlot(slot.generation))) continue;
+            const seq = slot.metadata_pinned_sequence.load(.acquire);
             if (seq == 0) continue;
             if (min == null or seq < min.?) min = seq;
         }
@@ -1512,6 +1855,25 @@ test "shared lock region: N-process contention grants in strict ticket order" {
         child_pids[my_index] = child_pid;
         var sig: [1]u8 = undefined;
         try readBounded(ready_fds[0], &sig, 2000);
+        // The write above only proves the child is about to *call*
+        // `acquireWriter`, not that it has actually taken ticket
+        // `my_index` yet -- under a loaded host, this process can win
+        // this `readBounded` and go on to fork the next child well
+        // before the one that just signaled is next scheduled to run
+        // its own `fetchAdd`, letting a *later* fork take an *earlier*
+        // ticket number and breaking the very "fork order is ticket
+        // order" assumption this test relies on (observed directly:
+        // ticket 2 reporting before ticket 1). Wait on the region's own
+        // shared `writer_ticket_tail` -- visible to this process through
+        // the same mapping, like the dead-queued-waiter test's own
+        // analogous wait -- until this child has genuinely taken ticket
+        // `my_index`, not merely signaled that it is about to try.
+        var waited_ms: u32 = 0;
+        while (region.header().writer_ticket_tail.load(.monotonic) <= @as(u64, my_index)) {
+            try io.sleep(.fromMilliseconds(5), .awake);
+            waited_ms += 5;
+            if (waited_ms > 5000) return error.TestTimeout;
+        }
     }
     _ = std.posix.system.close(ready_fds[1]);
     _ = std.posix.system.close(ready_fds[0]);
@@ -1526,10 +1888,200 @@ test "shared lock region: N-process contention grants in strict ticket order" {
     var got: u8 = 0;
     while (got < n_children) : (got += 1) {
         var report: [1]u8 = undefined;
-        try readBounded(order_fds[0], &report, 2000);
+        // Generous (10s, not the usual 2s used elsewhere in this file):
+        // this loop waits out up to `n_children` sequential handoffs, and
+        // each one's own scheduling delay (not the lock itself) can run
+        // long on a heavily loaded host -- a tight bound here produces a
+        // false timeout from scheduling noise, not a real correctness
+        // failure, exactly as observed under a 200-run parallel loop.
+        try readBounded(order_fds[0], &report, 10000);
         try std.testing.expectEqual(got, report[0]);
-        try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child_pids[got], 2000));
+        try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child_pids[got], 10000));
     }
+}
+
+// §8.8's own CPU gate calls out a number `lite-write-amplification-cpu`
+// cannot report by itself: not "zero per warm write" (that harness's own
+// job, and already zero -- see `write_amplification_cpu_bench_test.zig`),
+// but the real syscall price of a *contended* handoff, the case the region
+// design exists to make cheap and bounded instead of a 1 s fairness
+// quantum or a ticket-file `pread` poll. Two real OS processes (the same
+// `std.c.fork` pattern as the two tests above, and for the same reason:
+// the child uses no `Io` at all) repeatedly trade the writer word in a
+// tight loop with no artificial pacing -- the FIFO ticket protocol itself
+// (`acquireWriter`'s own doc comment: a new arrival may only take the
+// ticketless fast path when nobody is already queued) forces them to
+// alternate through the real ticket/futex path rather than one side
+// starving the other, so a tight loop is already a genuinely contended
+// workload, not a race that happens to usually avoid contention.
+//
+// Counters reset in each child right after `fork`, not in the parent
+// before it: `writer_futex_counters` is ordinary process memory, so each
+// child's copy already starts at whatever the parent had already done
+// against this same `region` value (its own `tryAcquireWriter` priming
+// below, same as the two tests above); resetting post-fork is what makes
+// each child's own report cover only its own loop.
+test "shared lock region: contended handoff reports lock syscalls and latency" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-handoff-report.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var region = try Region.open(a, io, db_path);
+    defer region.close();
+
+    const handoffs_per_child = 40;
+    const HandoffReport = extern struct {
+        completed: u64,
+        futex_wait: u64,
+        futex_wake: u64,
+        // Per-iteration release-to-acquire latency samples (see
+        // `last_release_ns` below for what each measures), `0` for a
+        // sample with no prior release to measure against (this child's
+        // own very first, uncontended iteration, before anyone has ever
+        // released). The parent filters those zeros out rather than
+        // trusting `valid_count` alone, so a real (non-first) sample that
+        // happens to land exactly on `0` -- impossible in practice at
+        // nanosecond resolution, but not a assumption worth relying on --
+        // still can't corrupt the statistic.
+        latencies_ns: [handoffs_per_child]u64,
+    };
+
+    // A real cross-process shared value for "when did the writer word
+    // last actually get released", independent of (and *not* reusing, to
+    // avoid widening it) the real `Header` this module maps -- the whole
+    // point of §8.8's own ask here is release-to-acquire, not
+    // request-to-acquire (the `start_ts`-based measurement the previous
+    // version of this test took, which folds in this test's own
+    // artificial per-iteration hold and so measures mostly that hold, not
+    // the handoff). An anonymous `MAP_SHARED` mapping, not a `Region`
+    // field: both children inherit the same physical page across `fork`
+    // exactly like a file-backed one would, with none of the overhead or
+    // version/format concerns of extending the real header for a number
+    // only this test ever reads.
+    const latency_scratch = try std.posix.mmap(null, std.heap.pageSize(), .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(latency_scratch);
+    const last_release_ns: *std.atomic.Value(i64) = @ptrCast(@alignCast(latency_scratch.ptr));
+    last_release_ns.* = .init(0);
+
+    var report_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&report_fds));
+
+    const n_children = 2;
+    var child_pids: [n_children]std.c.pid_t = undefined;
+    var ci: u8 = 0;
+    while (ci < n_children) : (ci += 1) {
+        const child_pid = std.c.fork();
+        if (child_pid == 0) {
+            _ = std.posix.system.close(report_fds[0]);
+            testResetWriterFutexCounters();
+            const my_pid: u32 = @bitCast(std.c.getpid());
+            var latencies_ns: [handoffs_per_child]u64 = @splat(0);
+            var h: u32 = 0;
+            while (h < handoffs_per_child) : (h += 1) {
+                region.acquireWriter(my_pid);
+                var acquired_ts: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.MONOTONIC, &acquired_ts);
+                const acquired_ns = @as(i64, acquired_ts.sec) * std.time.ns_per_s + acquired_ts.nsec;
+                // Release-to-acquire: the gap between *this* holder's own
+                // `releaseWriter` and the moment `acquireWriter` returned
+                // here, not this call's own total wait (which would also
+                // include the other side's artificial hold below).
+                const release_ns = last_release_ns.load(.acquire);
+                if (release_ns != 0 and acquired_ns > release_ns) {
+                    latencies_ns[h] = @intCast(acquired_ns - release_ns);
+                }
+                // Hold briefly, like real commit work (raw `nanosleep`,
+                // not `io.sleep`: no `Io` in a forked child, same reason
+                // as the two-process test above) -- without this, both
+                // children's own loop bodies are fast enough that they
+                // simply never overlap, and the "contended" handoff this
+                // test exists to measure never actually happens.
+                var hold: std.c.timespec = .{ .sec = 0, .nsec = 300_000 };
+                _ = std.c.nanosleep(&hold, null);
+                var release_ts: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.MONOTONIC, &release_ts);
+                last_release_ns.store(@as(i64, release_ts.sec) * std.time.ns_per_s + release_ts.nsec, .release);
+                region.releaseWriter();
+            }
+            const counters = testWriterFutexCounters();
+            const report: HandoffReport = .{
+                .completed = handoffs_per_child,
+                .futex_wait = counters.wait,
+                .futex_wake = counters.wake,
+                .latencies_ns = latencies_ns,
+            };
+            _ = std.c.write(report_fds[1], @ptrCast(&report), @sizeOf(HandoffReport));
+            std.c._exit(0);
+        }
+        child_pids[ci] = child_pid;
+    }
+    _ = std.posix.system.close(report_fds[1]);
+    defer _ = std.posix.system.close(report_fds[0]);
+
+    var total_completed: u64 = 0;
+    var total_wait: u64 = 0;
+    var total_wake: u64 = 0;
+    // Every child's own samples, combined: percentiles over the pooled
+    // set, not an average of two separately-computed percentiles (not
+    // the same statistic, and would hide one child getting starved more
+    // than the other). Filtered down from the fixed-size wire format
+    // above (dropping each child's own first, unmeasurable sample).
+    var all_latencies_ns: [n_children * handoffs_per_child]u64 = undefined;
+    var valid_count: usize = 0;
+    var got: u8 = 0;
+    while (got < n_children) : (got += 1) {
+        var report: HandoffReport = undefined;
+        // Generous (5s): two children doing 40 uncontended-sized handoffs
+        // each is normally well under a second even on a loaded host; this
+        // bound exists only to fail fast, not to constrain the real cost
+        // being measured (the latencies themselves, reported below).
+        try readBounded(report_fds[0], std.mem.asBytes(&report), 5000);
+        try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child_pids[got], 5000));
+        total_completed += report.completed;
+        total_wait += report.futex_wait;
+        total_wake += report.futex_wake;
+        for (report.latencies_ns) |ns| {
+            if (ns == 0) continue;
+            all_latencies_ns[valid_count] = ns;
+            valid_count += 1;
+        }
+    }
+    const samples = all_latencies_ns[0..valid_count];
+
+    try std.testing.expect(total_completed > 0);
+    try std.testing.expect(valid_count > 0);
+    const wait_per_handoff = @as(f64, @floatFromInt(total_wait)) / @as(f64, @floatFromInt(total_completed));
+    const wake_per_handoff = @as(f64, @floatFromInt(total_wake)) / @as(f64, @floatFromInt(total_completed));
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    const median_ns = samples[samples.len / 2];
+    const p99_index = @min(samples.len - 1, (samples.len * 99) / 100);
+    const p99_ns = samples[p99_index];
+    // §8.8's own report: the writer word takes no `fcntl` lock at all on
+    // this path (liveness is only ever probed for a *dead* holder, never
+    // on the happy path a plain handoff takes) and no `flock` either (the
+    // sidecar flock is a separate, still-authoritative mechanism this
+    // migration step does not touch) -- both genuinely zero, not merely
+    // unmeasured, so printed as constants rather than counted.
+    std.debug.print(
+        "shared lock region contended handoff report: handoffs={d} futex_wait/handoff={d:.2} futex_wake/handoff={d:.2} fcntl/handoff=0 flock/handoff=0 release-to-acquire latency_us(median)={d:.1} latency_us(p99)={d:.1}\n",
+        .{ total_completed, wait_per_handoff, wake_per_handoff, @as(f64, @floatFromInt(median_ns)) / 1000.0, @as(f64, @floatFromInt(p99_ns)) / 1000.0 },
+    );
+
+    // A correct implementation's own handoff is a small, bounded number of
+    // futex calls, not a retry storm, and the release-to-acquire latency
+    // this design exists to bound: about one commit's own hold time, not
+    // a fairness quantum or a lost wakeup (mirrors the two-process test
+    // above's 200ms bound, loosened here for a loaded host running many
+    // handoffs back to back).
+    try std.testing.expect(wait_per_handoff < 10);
+    try std.testing.expect(wake_per_handoff < 10);
+    try std.testing.expect(p99_ns < 500 * std.time.ns_per_ms);
 }
 
 test "shared lock region opens, initializes, and round-trips the writer lock uncontended" {
@@ -1611,6 +2163,51 @@ test "shared lock region: reader slots claim, pin, and release round-trip" {
     // A released slot is claimable again.
     const slot_c = try region.claimReaderSlot(300);
     try std.testing.expectEqual(slot_a, slot_c);
+}
+
+test "shared lock region: metadata pin is independent of the data pin and isReaderSlotLive reflects ownership" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-readers-metadata.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var region = try Region.openSized(a, io, db_path, 4);
+    defer region.close();
+
+    try std.testing.expectEqual(@as(?u64, null), region.minimumPinnedSequence());
+    try std.testing.expectEqual(@as(?u64, null), region.minimumMetadataPinnedSequence());
+
+    // A plain reader: pins the data frontier only.
+    const plain = try region.claimReaderSlot(100);
+    try std.testing.expect(region.isReaderSlotLive(plain));
+    region.pinReader(plain, 40);
+    try std.testing.expectEqual(@as(?u64, 40), region.minimumPinnedSequence());
+    try std.testing.expectEqual(@as(?u64, null), region.minimumMetadataPinnedSequence());
+
+    // A full/metadata reader: pins both, at a different (older) sequence.
+    const full = try region.claimReaderSlot(200);
+    region.pinReader(full, 25);
+    region.pinMetadataReader(full, 25);
+    try std.testing.expectEqual(@as(?u64, 25), region.minimumPinnedSequence());
+    try std.testing.expectEqual(@as(?u64, 25), region.minimumMetadataPinnedSequence());
+
+    // Unpinning the metadata-only side leaves the data pin (and the
+    // plain reader's own pin) untouched.
+    region.unpinMetadataReader(full);
+    try std.testing.expectEqual(@as(?u64, 25), region.minimumPinnedSequence());
+    try std.testing.expectEqual(@as(?u64, null), region.minimumMetadataPinnedSequence());
+
+    region.releaseReaderSlot(full);
+    try std.testing.expect(!region.isReaderSlotLive(full));
+    try std.testing.expectEqual(@as(?u64, 40), region.minimumPinnedSequence());
+
+    region.releaseReaderSlot(plain);
+    try std.testing.expect(!region.isReaderSlotLive(plain));
+    try std.testing.expectEqual(@as(?u64, null), region.minimumPinnedSequence());
 }
 
 test "shared lock region: reader slots exhaust and report ReadersExhausted" {
@@ -2167,6 +2764,20 @@ test "shared lock region: an abandoned ticket does not wedge an earlier or a lat
     defer _ = std.posix.system.close(done1_fds[0]);
     var sig1: [1]u8 = undefined;
     try readBounded(ready1_fds[0], &sig1, 2000);
+    // The signal above only proves child 1 is about to call
+    // `acquireWriter`, not that it has actually taken ticket 0 yet --
+    // see the N-process test's own identical fix for why that gap
+    // matters under a loaded host (fork order racing ahead of ticket-
+    // taking order). Wait on the region's own shared `writer_ticket_tail`
+    // until child 1 has genuinely taken ticket 0 before forking child 2.
+    {
+        var waited_ms: u32 = 0;
+        while (region.header().writer_ticket_tail.load(.monotonic) == 0) {
+            try io.sleep(.fromMilliseconds(5), .awake);
+            waited_ms += 5;
+            if (waited_ms > 5000) return error.TestTimeout;
+        }
+    }
 
     var ready2_fds: [2]std.c.fd_t = undefined;
     try std.testing.expectEqual(0, std.c.pipe(&ready2_fds));
@@ -2200,19 +2811,20 @@ test "shared lock region: an abandoned ticket does not wedge an earlier or a lat
 
     // Child 2 must have genuinely timed out (not raced into winning)
     // before this process releases -- generous margin past its own
-    // 100ms deadline.
+    // 100ms deadline, and past 2000ms per the N-process test's own
+    // note on scheduling delay under a loaded host.
     var timedout_report: [1]u8 = undefined;
-    try readBounded(timedout2_fds[0], &timedout_report, 2000);
+    try readBounded(timedout2_fds[0], &timedout_report, 10000);
     try std.testing.expectEqual(@as(u8, 1), timedout_report[0]);
-    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child2_pid, 2000));
+    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child2_pid, 10000));
 
     // Now release: child 1 (ticket 0, still patiently waiting) must win,
     // not be harmed by ticket 1's abandonment.
     region.releaseWriter();
     var done1_report: [1]u8 = undefined;
-    try readBounded(done1_fds[0], &done1_report, 2000);
+    try readBounded(done1_fds[0], &done1_report, 10000);
     try std.testing.expectEqual(@as(u8, 1), done1_report[0]);
-    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child1_pid, 2000));
+    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child1_pid, 10000));
 
     // Child 1's own release just advanced head past ticket 1's abandoned
     // flag. The region must be left in a sane, usable state -- not
@@ -2353,16 +2965,28 @@ test "shared lock region: a dead queued waiter does not wedge a later one" {
     // proving the skip itself doesn't depend on this release at all,
     // only the final win does. Not load-bearing for correctness (the
     // release below would eventually unstick things either way via the
-    // same poll), just makes the scenario this test means to exercise
-    // unambiguous.
-    try io.sleep(.fromMilliseconds(250), .awake);
-    try std.testing.expectEqual(@as(u32, 1), region.header().writer_ticket_head.load(.monotonic));
+    // same poll) -- a fixed, short sleep here only proves this on an
+    // unloaded host, though: child 1's own bounded poll step
+    // (`dead_ticket_check_step_ms`) still needs to actually get
+    // scheduled to run even once, and a fixed 250ms margin isn't enough
+    // for that under contention (observed directly in a 200-run loaded
+    // loop: `writer_ticket_head` still 0 at the 250ms mark). Poll with a
+    // generous bound instead, the same pattern this test's own earlier
+    // waits already use.
+    {
+        var waited_ms: u32 = 0;
+        while (region.header().writer_ticket_head.load(.monotonic) != 1) {
+            try io.sleep(.fromMilliseconds(5), .awake);
+            waited_ms += 5;
+            if (waited_ms > 10000) return error.TestTimeout;
+        }
+    }
 
     region.releaseWriter();
     var done1_report: [1]u8 = undefined;
-    try readBounded(done1_fds[0], &done1_report, 2000);
+    try readBounded(done1_fds[0], &done1_report, 10000);
     try std.testing.expectEqual(@as(u8, 1), done1_report[0]);
-    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child1_pid, 2000));
+    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child1_pid, 10000));
 
     // Left in a sane, usable state.
     try std.testing.expect(region.tryAcquireWriterFair(own_pid));
