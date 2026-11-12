@@ -130,6 +130,8 @@ pub const Create = struct {
             .keep_alive = .init(self.keep_alive),
             .max_loaded_models = self.max_loaded_models,
             .has_max_loaded_models = self.has_max_loaded_models,
+            // Policy arrives in the separately admitted raw RPC section.
+            .content_security_json = .{},
             .s3_credentials_json = .init(self.s3_credentials_json),
             .runtime_config_json = .init(self.runtime_config_json),
             .executor = .init(io),
@@ -412,4 +414,46 @@ test "native checkpoint worker streaming stays limited to exact POST resume rout
         try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/generate/context/checkpoint"));
         try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/chat/completions"));
     }
+}
+
+test "content security snapshot startup metadata roundtrips without policy JSON" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var out: ?*anyopaque = null;
+    const context = bridge.CreateContext{
+        .abi_version = bridge.abi_version,
+        .data_dir_ptr = "/data".ptr,
+        .data_dir_len = 5,
+        .models_dir = .init("/models"),
+        .ml_dir = .init("/ml"),
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = 0,
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .init("{\"allowed_paths\":[\"/private\"]}"),
+        .s3_credentials_json = .{},
+        .runtime_config_json = .init("{}"),
+        .executor = .init(&io),
+        .out_handle = &out,
+    };
+    const wire = try Create.fromContext(arena.allocator(), &context);
+    const json = try std.json.Stringify.valueAlloc(arena.allocator(), wire, .{});
+    try std.testing.expect(std.mem.indexOf(u8, json, "allowed_paths") == null);
+    const parsed = try std.json.parseFromSliceLeaky(Create, arena.allocator(), json, .{});
+    const reconstructed = try parsed.toContext(arena.allocator(), &io, &out);
+    try std.testing.expect(reconstructed.content_security_json.slice() == null);
+    try std.testing.expectEqualStrings("/models", reconstructed.models_dir.slice().?);
+    try std.testing.expectEqualStrings("{}", reconstructed.runtime_config_json.slice());
+    var wrong_version = parsed;
+    wrong_version.protocol_version -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, wrong_version.toContext(arena.allocator(), &io, &out));
 }

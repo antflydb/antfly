@@ -787,12 +787,12 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
     const executor = try context.executor.receive();
 
     var content_security = if (context.content_security_json.slice()) |json|
-        try std.json.parseFromSlice(scraping.ContentSecurityConfig, alloc, json, .{ .ignore_unknown_fields = true })
+        try std.json.parseFromSlice(scraping.ContentSecurityConfig, alloc, json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always })
     else
         null;
     errdefer if (content_security) |*parsed| parsed.deinit();
     var s3_credentials = if (context.s3_credentials_json.slice()) |json|
-        try std.json.parseFromSlice(scraping.S3CredentialsConfig, alloc, json, .{ .ignore_unknown_fields = true })
+        try std.json.parseFromSlice(scraping.S3CredentialsConfig, alloc, json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always })
     else
         null;
     errdefer if (s3_credentials) |*parsed| parsed.deinit();
@@ -800,7 +800,7 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
         InferenceRuntimeConfig,
         alloc,
         context.runtime_config_json.slice(),
-        .{ .ignore_unknown_fields = false },
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
     );
     errdefer runtime_config.deinit();
     try runtime_config.value.kernel_jit.validate();
@@ -4534,4 +4534,54 @@ test "local source policy reload reaches the real provider ABI with finite deadl
     publisher.failed = true;
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, linkedInferenceInvokeProvider(&invoke));
     try std.testing.expect(response == null);
+}
+
+test "content security snapshot startup owns policy credentials and runtime strings" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const policy = try a.dupe(u8, "{\"allowed_paths\":[\"/owned\"],\"user_agent\":\"owned-agent\"}");
+    defer a.free(policy);
+    const credentials = try a.dupe(u8, "{\"endpoint\":\"owned-endpoint\"}");
+    defer a.free(credentials);
+    const runtime = try a.dupe(u8, "{\"worker_environment\":[{\"name\":\"OWNED_NAME\",\"value\":\"owned-value\"}]}");
+    defer a.free(runtime);
+    var out: ?*anyopaque = null;
+    const handle = try linkedInferenceCreate(&.{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = root.ptr,
+        .data_dir_len = root.len,
+        .models_dir = .init(root),
+        .ml_dir = .init(root),
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = 0,
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .init(policy),
+        .s3_credentials_json = .init(credentials),
+        .runtime_config_json = .init(runtime),
+        .executor = .init(&io),
+        .out_handle = &out,
+        .execution_host = .embedded,
+    });
+    defer linkedInferenceDestroy(handle);
+    @memset(policy, 'x');
+    @memset(credentials, 'x');
+    @memset(runtime, 'x');
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    try std.testing.expectEqualStrings("/owned", state.content_security.?.value.allowed_paths.?[0]);
+    try std.testing.expectEqualStrings("owned-agent", state.content_security.?.value.user_agent.?);
+    try std.testing.expectEqualStrings("owned-endpoint", state.s3_credentials.?.value.endpoint.?);
+    try std.testing.expectEqualStrings("OWNED_NAME", state.runtime_config.value.worker_environment[0].name);
+    try std.testing.expectEqualStrings("owned-value", state.runtime_config.value.worker_environment[0].value);
 }
