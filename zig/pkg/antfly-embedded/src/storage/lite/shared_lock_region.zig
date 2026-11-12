@@ -851,7 +851,15 @@ pub const Region = struct {
     /// alongside `pid` -- a struct-field read, not a syscall -- so a
     /// later `writerHolderDead` probe knows exactly which byte answers
     /// "is the process that wrote this word still alive".
-    fn tryAcquireWriter(self: *Region, pid: u32) bool {
+    ///
+    /// `pub` (unlike most of this module's own private building blocks)
+    /// because `native.zig`'s own §8.2 "plain" mode
+    /// (`lockWriterPathWithIo`) needs exactly this -- a single nonblocking
+    /// attempt that, like that function's own pre-region behavior, jumps
+    /// the FIFO rather than respecting it (`tryAcquireWriterFair` below
+    /// is the FIFO-respecting peer `tryFairWriterLockWithIo` migrates onto
+    /// instead).
+    pub fn tryAcquireWriter(self: *Region, pid: u32) bool {
         const want = packHolder(pid, self.own_liveness_slot);
         return self.header().writer_holder.cmpxchgStrong(0, want, .acquire, .monotonic) == null;
     }
@@ -1060,6 +1068,47 @@ pub const Region = struct {
             }
             const epoch = hdr.writer_release_epoch.load(.acquire);
             countedFutexWaitSharedBounded(io, &hdr.writer_release_epoch.raw, epoch, deadline) catch return error.Canceled;
+        }
+    }
+
+    /// Waits (bounded by `deadline`) until the writer word next looks
+    /// free, without taking a ticket or attempting the CAS itself --
+    /// for a caller that only needs a wake signal in place of busy-
+    /// polling the real kernel flock, not a second admission decision of
+    /// its own. Returns normally (not an error) on a plain deadline
+    /// expiry -- exactly like `acquireWriterFairBounded`'s own futex
+    /// waits, this is a wake signal, not a decision, so the caller's own
+    /// next real attempt is what decides success or `FileBusy`.
+    ///
+    /// Not yet wired to a caller: `native.zig`'s own `waitPathLockWithIo`
+    /// (nested under a ticket its own caller's `plainWriterLockUntil`
+    /// loop already resolved, or called with no ticket at all) would be
+    /// the natural one, but it has no `Region` of its own to call this
+    /// on -- opening a fresh one per retry iteration serializes every
+    /// concurrent retrier through `Region.open`'s own one-time setup
+    /// lock and was measured to intermittently blow a 10 s per-attempt
+    /// deadline under three-way contention. Reusing the caller's own
+    /// already-open `Region` needs that reference threaded through (a
+    /// signature change to this function or `plainWriterLockUntil`),
+    /// deliberately left for that decision rather than guessed at here.
+    ///
+    /// `releaseWriter` only wakes `writer_release_epoch` when a ticket is
+    /// outstanding (its own doc comment: "the fully uncontended release
+    /// stays a single store with no syscall") -- a caller here may have
+    /// no ticket, and nobody else may ever take one either, so this
+    /// cannot rely purely on that wake arriving. It re-checks on a short,
+    /// bounded step (`dead_ticket_check_step_ms`, the same cadence
+    /// `acquireWriter`'s own phase-1 dead-ticket poll already uses)
+    /// whenever no real wake arrives sooner.
+    pub fn waitWriterFreeBounded(self: *const Region, io: Io, deadline: Io.Timestamp) error{Canceled}!void {
+        const hdr = self.header();
+        while (hdr.writer_holder.load(.acquire) != 0) {
+            if (Io.Clock.now(.awake, io).compare(.gte, deadline)) return;
+            const epoch = hdr.writer_release_epoch.load(.acquire);
+            if (hdr.writer_holder.load(.acquire) == 0) return;
+            const step_deadline = Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(dead_ticket_check_step_ms));
+            const bounded_deadline = if (step_deadline.compare(.lt, deadline)) step_deadline else deadline;
+            countedFutexWaitSharedBounded(io, &hdr.writer_release_epoch.raw, epoch, bounded_deadline) catch return error.Canceled;
         }
     }
 
@@ -1652,6 +1701,25 @@ test "shared lock region: N-process contention grants in strict ticket order" {
         child_pids[my_index] = child_pid;
         var sig: [1]u8 = undefined;
         try readBounded(ready_fds[0], &sig, 2000);
+        // The write above only proves the child is about to *call*
+        // `acquireWriter`, not that it has actually taken ticket
+        // `my_index` yet -- under a loaded host, this process can win
+        // this `readBounded` and go on to fork the next child well
+        // before the one that just signaled is next scheduled to run
+        // its own `fetchAdd`, letting a *later* fork take an *earlier*
+        // ticket number and breaking the very "fork order is ticket
+        // order" assumption this test relies on (observed directly:
+        // ticket 2 reporting before ticket 1). Wait on the region's own
+        // shared `writer_ticket_tail` -- visible to this process through
+        // the same mapping, like the dead-queued-waiter test's own
+        // analogous wait -- until this child has genuinely taken ticket
+        // `my_index`, not merely signaled that it is about to try.
+        var waited_ms: u32 = 0;
+        while (region.header().writer_ticket_tail.load(.monotonic) <= @as(u64, my_index)) {
+            try io.sleep(.fromMilliseconds(5), .awake);
+            waited_ms += 5;
+            if (waited_ms > 5000) return error.TestTimeout;
+        }
     }
     _ = std.posix.system.close(ready_fds[1]);
     _ = std.posix.system.close(ready_fds[0]);
@@ -1666,9 +1734,15 @@ test "shared lock region: N-process contention grants in strict ticket order" {
     var got: u8 = 0;
     while (got < n_children) : (got += 1) {
         var report: [1]u8 = undefined;
-        try readBounded(order_fds[0], &report, 2000);
+        // Generous (10s, not the usual 2s used elsewhere in this file):
+        // this loop waits out up to `n_children` sequential handoffs, and
+        // each one's own scheduling delay (not the lock itself) can run
+        // long on a heavily loaded host -- a tight bound here produces a
+        // false timeout from scheduling noise, not a real correctness
+        // failure, exactly as observed under a 200-run parallel loop.
+        try readBounded(order_fds[0], &report, 10000);
         try std.testing.expectEqual(got, report[0]);
-        try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child_pids[got], 2000));
+        try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child_pids[got], 10000));
     }
 }
 
@@ -1712,15 +1786,34 @@ test "shared lock region: contended handoff reports lock syscalls and latency" {
         completed: u64,
         futex_wait: u64,
         futex_wake: u64,
-        latency_ns_total: u64,
-        // Per-iteration latency samples, not just the sum above: a mean
-        // alone hides the tail a fairness mechanism most needs to bound.
-        // Sent whole (not pre-reduced in the child) so the parent can sort
-        // the *combined* sample from both children before taking the
-        // median/p99, not two separately-computed percentiles averaged
-        // together (which is not the same statistic).
+        // Per-iteration release-to-acquire latency samples (see
+        // `last_release_ns` below for what each measures), `0` for a
+        // sample with no prior release to measure against (this child's
+        // own very first, uncontended iteration, before anyone has ever
+        // released). The parent filters those zeros out rather than
+        // trusting `valid_count` alone, so a real (non-first) sample that
+        // happens to land exactly on `0` -- impossible in practice at
+        // nanosecond resolution, but not a assumption worth relying on --
+        // still can't corrupt the statistic.
         latencies_ns: [handoffs_per_child]u64,
     };
+
+    // A real cross-process shared value for "when did the writer word
+    // last actually get released", independent of (and *not* reusing, to
+    // avoid widening it) the real `Header` this module maps -- the whole
+    // point of §8.8's own ask here is release-to-acquire, not
+    // request-to-acquire (the `start_ts`-based measurement the previous
+    // version of this test took, which folds in this test's own
+    // artificial per-iteration hold and so measures mostly that hold, not
+    // the handoff). An anonymous `MAP_SHARED` mapping, not a `Region`
+    // field: both children inherit the same physical page across `fork`
+    // exactly like a file-backed one would, with none of the overhead or
+    // version/format concerns of extending the real header for a number
+    // only this test ever reads.
+    const latency_scratch = try std.posix.mmap(null, std.heap.pageSize(), .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(latency_scratch);
+    const last_release_ns: *std.atomic.Value(i64) = @ptrCast(@alignCast(latency_scratch.ptr));
+    last_release_ns.* = .init(0);
 
     var report_fds: [2]std.c.fd_t = undefined;
     try std.testing.expectEqual(0, std.c.pipe(&report_fds));
@@ -1734,20 +1827,21 @@ test "shared lock region: contended handoff reports lock syscalls and latency" {
             _ = std.posix.system.close(report_fds[0]);
             testResetWriterFutexCounters();
             const my_pid: u32 = @bitCast(std.c.getpid());
-            var latency_ns_total: u64 = 0;
-            var latencies_ns: [handoffs_per_child]u64 = undefined;
+            var latencies_ns: [handoffs_per_child]u64 = @splat(0);
             var h: u32 = 0;
             while (h < handoffs_per_child) : (h += 1) {
-                var start_ts: std.c.timespec = undefined;
-                _ = std.c.clock_gettime(.MONOTONIC, &start_ts);
                 region.acquireWriter(my_pid);
-                var end_ts: std.c.timespec = undefined;
-                _ = std.c.clock_gettime(.MONOTONIC, &end_ts);
-                const start_ns = @as(i64, start_ts.sec) * std.time.ns_per_s + start_ts.nsec;
-                const end_ns = @as(i64, end_ts.sec) * std.time.ns_per_s + end_ts.nsec;
-                const this_latency_ns: u64 = @intCast(end_ns - start_ns);
-                latencies_ns[h] = this_latency_ns;
-                latency_ns_total += this_latency_ns;
+                var acquired_ts: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.MONOTONIC, &acquired_ts);
+                const acquired_ns = @as(i64, acquired_ts.sec) * std.time.ns_per_s + acquired_ts.nsec;
+                // Release-to-acquire: the gap between *this* holder's own
+                // `releaseWriter` and the moment `acquireWriter` returned
+                // here, not this call's own total wait (which would also
+                // include the other side's artificial hold below).
+                const release_ns = last_release_ns.load(.acquire);
+                if (release_ns != 0 and acquired_ns > release_ns) {
+                    latencies_ns[h] = @intCast(acquired_ns - release_ns);
+                }
                 // Hold briefly, like real commit work (raw `nanosleep`,
                 // not `io.sleep`: no `Io` in a forked child, same reason
                 // as the two-process test above) -- without this, both
@@ -1756,6 +1850,9 @@ test "shared lock region: contended handoff reports lock syscalls and latency" {
                 // test exists to measure never actually happens.
                 var hold: std.c.timespec = .{ .sec = 0, .nsec = 300_000 };
                 _ = std.c.nanosleep(&hold, null);
+                var release_ts: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.MONOTONIC, &release_ts);
+                last_release_ns.store(@as(i64, release_ts.sec) * std.time.ns_per_s + release_ts.nsec, .release);
                 region.releaseWriter();
             }
             const counters = testWriterFutexCounters();
@@ -1763,7 +1860,6 @@ test "shared lock region: contended handoff reports lock syscalls and latency" {
                 .completed = handoffs_per_child,
                 .futex_wait = counters.wait,
                 .futex_wake = counters.wake,
-                .latency_ns_total = latency_ns_total,
                 .latencies_ns = latencies_ns,
             };
             _ = std.c.write(report_fds[1], @ptrCast(&report), @sizeOf(HandoffReport));
@@ -1777,36 +1873,41 @@ test "shared lock region: contended handoff reports lock syscalls and latency" {
     var total_completed: u64 = 0;
     var total_wait: u64 = 0;
     var total_wake: u64 = 0;
-    var total_latency_ns: u64 = 0;
     // Every child's own samples, combined: percentiles over the pooled
     // set, not an average of two separately-computed percentiles (not
     // the same statistic, and would hide one child getting starved more
-    // than the other).
+    // than the other). Filtered down from the fixed-size wire format
+    // above (dropping each child's own first, unmeasurable sample).
     var all_latencies_ns: [n_children * handoffs_per_child]u64 = undefined;
+    var valid_count: usize = 0;
     var got: u8 = 0;
     while (got < n_children) : (got += 1) {
         var report: HandoffReport = undefined;
         // Generous (5s): two children doing 40 uncontended-sized handoffs
         // each is normally well under a second even on a loaded host; this
         // bound exists only to fail fast, not to constrain the real cost
-        // being measured (that is `latency_ns_total` below).
+        // being measured (the latencies themselves, reported below).
         try readBounded(report_fds[0], std.mem.asBytes(&report), 5000);
         try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child_pids[got], 5000));
         total_completed += report.completed;
         total_wait += report.futex_wait;
         total_wake += report.futex_wake;
-        total_latency_ns += report.latency_ns_total;
-        @memcpy(all_latencies_ns[got * handoffs_per_child ..][0..handoffs_per_child], &report.latencies_ns);
+        for (report.latencies_ns) |ns| {
+            if (ns == 0) continue;
+            all_latencies_ns[valid_count] = ns;
+            valid_count += 1;
+        }
     }
+    const samples = all_latencies_ns[0..valid_count];
 
     try std.testing.expect(total_completed > 0);
+    try std.testing.expect(valid_count > 0);
     const wait_per_handoff = @as(f64, @floatFromInt(total_wait)) / @as(f64, @floatFromInt(total_completed));
     const wake_per_handoff = @as(f64, @floatFromInt(total_wake)) / @as(f64, @floatFromInt(total_completed));
-    const latency_us_per_handoff = @as(f64, @floatFromInt(total_latency_ns)) / @as(f64, @floatFromInt(total_completed)) / 1000.0;
-    std.mem.sort(u64, &all_latencies_ns, {}, std.sort.asc(u64));
-    const median_ns = all_latencies_ns[all_latencies_ns.len / 2];
-    const p99_index = @min(all_latencies_ns.len - 1, (all_latencies_ns.len * 99) / 100);
-    const p99_ns = all_latencies_ns[p99_index];
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    const median_ns = samples[samples.len / 2];
+    const p99_index = @min(samples.len - 1, (samples.len * 99) / 100);
+    const p99_ns = samples[p99_index];
     // §8.8's own report: the writer word takes no `fcntl` lock at all on
     // this path (liveness is only ever probed for a *dead* holder, never
     // on the happy path a plain handoff takes) and no `flock` either (the
@@ -1814,18 +1915,18 @@ test "shared lock region: contended handoff reports lock syscalls and latency" {
     // migration step does not touch) -- both genuinely zero, not merely
     // unmeasured, so printed as constants rather than counted.
     std.debug.print(
-        "shared lock region contended handoff report: handoffs={d} futex_wait/handoff={d:.2} futex_wake/handoff={d:.2} fcntl/handoff=0 flock/handoff=0 latency_us/handoff(mean)={d:.1} latency_us(median)={d:.1} latency_us(p99)={d:.1}\n",
-        .{ total_completed, wait_per_handoff, wake_per_handoff, latency_us_per_handoff, @as(f64, @floatFromInt(median_ns)) / 1000.0, @as(f64, @floatFromInt(p99_ns)) / 1000.0 },
+        "shared lock region contended handoff report: handoffs={d} futex_wait/handoff={d:.2} futex_wake/handoff={d:.2} fcntl/handoff=0 flock/handoff=0 release-to-acquire latency_us(median)={d:.1} latency_us(p99)={d:.1}\n",
+        .{ total_completed, wait_per_handoff, wake_per_handoff, @as(f64, @floatFromInt(median_ns)) / 1000.0, @as(f64, @floatFromInt(p99_ns)) / 1000.0 },
     );
 
     // A correct implementation's own handoff is a small, bounded number of
-    // futex calls, not a retry storm, and the latency this design exists
-    // to bound: about one commit's own hold time, not a fairness quantum
-    // or a lost wakeup (mirrors the two-process test above's 200ms bound,
-    // loosened here for a loaded host running many handoffs back to back).
+    // futex calls, not a retry storm, and the release-to-acquire latency
+    // this design exists to bound: about one commit's own hold time, not
+    // a fairness quantum or a lost wakeup (mirrors the two-process test
+    // above's 200ms bound, loosened here for a loaded host running many
+    // handoffs back to back).
     try std.testing.expect(wait_per_handoff < 10);
     try std.testing.expect(wake_per_handoff < 10);
-    try std.testing.expect(latency_us_per_handoff < 500_000);
     try std.testing.expect(p99_ns < 500 * std.time.ns_per_ms);
 }
 
@@ -2509,6 +2610,20 @@ test "shared lock region: an abandoned ticket does not wedge an earlier or a lat
     defer _ = std.posix.system.close(done1_fds[0]);
     var sig1: [1]u8 = undefined;
     try readBounded(ready1_fds[0], &sig1, 2000);
+    // The signal above only proves child 1 is about to call
+    // `acquireWriter`, not that it has actually taken ticket 0 yet --
+    // see the N-process test's own identical fix for why that gap
+    // matters under a loaded host (fork order racing ahead of ticket-
+    // taking order). Wait on the region's own shared `writer_ticket_tail`
+    // until child 1 has genuinely taken ticket 0 before forking child 2.
+    {
+        var waited_ms: u32 = 0;
+        while (region.header().writer_ticket_tail.load(.monotonic) == 0) {
+            try io.sleep(.fromMilliseconds(5), .awake);
+            waited_ms += 5;
+            if (waited_ms > 5000) return error.TestTimeout;
+        }
+    }
 
     var ready2_fds: [2]std.c.fd_t = undefined;
     try std.testing.expectEqual(0, std.c.pipe(&ready2_fds));
@@ -2542,19 +2657,20 @@ test "shared lock region: an abandoned ticket does not wedge an earlier or a lat
 
     // Child 2 must have genuinely timed out (not raced into winning)
     // before this process releases -- generous margin past its own
-    // 100ms deadline.
+    // 100ms deadline, and past 2000ms per the N-process test's own
+    // note on scheduling delay under a loaded host.
     var timedout_report: [1]u8 = undefined;
-    try readBounded(timedout2_fds[0], &timedout_report, 2000);
+    try readBounded(timedout2_fds[0], &timedout_report, 10000);
     try std.testing.expectEqual(@as(u8, 1), timedout_report[0]);
-    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child2_pid, 2000));
+    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child2_pid, 10000));
 
     // Now release: child 1 (ticket 0, still patiently waiting) must win,
     // not be harmed by ticket 1's abandonment.
     region.releaseWriter();
     var done1_report: [1]u8 = undefined;
-    try readBounded(done1_fds[0], &done1_report, 2000);
+    try readBounded(done1_fds[0], &done1_report, 10000);
     try std.testing.expectEqual(@as(u8, 1), done1_report[0]);
-    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child1_pid, 2000));
+    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child1_pid, 10000));
 
     // Child 1's own release just advanced head past ticket 1's abandoned
     // flag. The region must be left in a sane, usable state -- not
@@ -2695,16 +2811,28 @@ test "shared lock region: a dead queued waiter does not wedge a later one" {
     // proving the skip itself doesn't depend on this release at all,
     // only the final win does. Not load-bearing for correctness (the
     // release below would eventually unstick things either way via the
-    // same poll), just makes the scenario this test means to exercise
-    // unambiguous.
-    try io.sleep(.fromMilliseconds(250), .awake);
-    try std.testing.expectEqual(@as(u32, 1), region.header().writer_ticket_head.load(.monotonic));
+    // same poll) -- a fixed, short sleep here only proves this on an
+    // unloaded host, though: child 1's own bounded poll step
+    // (`dead_ticket_check_step_ms`) still needs to actually get
+    // scheduled to run even once, and a fixed 250ms margin isn't enough
+    // for that under contention (observed directly in a 200-run loaded
+    // loop: `writer_ticket_head` still 0 at the 250ms mark). Poll with a
+    // generous bound instead, the same pattern this test's own earlier
+    // waits already use.
+    {
+        var waited_ms: u32 = 0;
+        while (region.header().writer_ticket_head.load(.monotonic) != 1) {
+            try io.sleep(.fromMilliseconds(5), .awake);
+            waited_ms += 5;
+            if (waited_ms > 10000) return error.TestTimeout;
+        }
+    }
 
     region.releaseWriter();
     var done1_report: [1]u8 = undefined;
-    try readBounded(done1_fds[0], &done1_report, 2000);
+    try readBounded(done1_fds[0], &done1_report, 10000);
     try std.testing.expectEqual(@as(u8, 1), done1_report[0]);
-    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child1_pid, 2000));
+    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child1_pid, 10000));
 
     // Left in a sane, usable state.
     try std.testing.expect(region.tryAcquireWriterFair(own_pid));

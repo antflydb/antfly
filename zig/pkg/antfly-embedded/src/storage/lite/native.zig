@@ -14814,6 +14814,19 @@ pub fn create(io: std.Io, path: []const u8) !void {
     try fs_paths.syncDirPortable(io, std.fs.path.dirname(create_target) orelse ".");
 }
 
+/// Deliberately not migrated onto the region: this owns a fresh `io_impl`
+/// (CLI backup/export/import's "no caller-supplied `Io`" path), and a
+/// `Region` caches whatever `Io` opened it (`Region.io`, used later by
+/// `close`) for that handle's whole lifetime -- but `PathWriterLock`
+/// values, `io_impl` included, are copied/moved pervasively by their own
+/// callers (see `PathWriterLock.region`'s own doc comment), which would
+/// leave a `Region` opened here pointing at a stale address the moment
+/// this function's own `io_impl` local gets copied into the value this
+/// returns. `lockWriterPathWithIo`, migrated below, has no such problem:
+/// its `io` is always borrowed from a caller who owns their own `Io`
+/// instance stably, never a freshly-created local about to move. A CLI
+/// single-shot nonblocking attempt has little to gain from the region's
+/// own fairness anyway.
 pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
     var io_impl = threaded_io_limits.initService(allocator);
     errdefer io_impl.deinit();
@@ -14827,8 +14840,37 @@ pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
     };
 }
 
-/// Acquires the same cross-process writer lock through a caller-owned std.Io.
+/// Acquires the same cross-process writer lock through a caller-owned
+/// std.Io. §8.2's "plain" mode (the region's own `tryAcquireWriter`): a
+/// single nonblocking attempt that, unlike `tryFairWriterLockWithIo`,
+/// jumps the FIFO -- exactly this function's own pre-region behavior,
+/// which never consulted `writer_queue` either. The real sidecar `flock`
+/// (still the actual safety authority -- see `PathWriterLock.region`'s
+/// own doc comment) is what every error below actually comes from.
 pub fn lockWriterPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) !PathWriterLock {
+    const pid = antfly_platform.process.currentId() orelse 0;
+    if (shared_lock_region.Region.open(std.heap.page_allocator, io, path)) |region_val| {
+        var region = region_val;
+        if (!region.tryAcquireWriter(pid)) {
+            region.close();
+            return error.WouldBlock;
+        }
+        errdefer region.close();
+        errdefer region.releaseWriter();
+        const file = (try acquireWriterLock(allocator, io, path)).file;
+        errdefer file.close(io);
+        const owned_region = try std.heap.page_allocator.create(shared_lock_region.Region);
+        owned_region.* = region;
+        return .{
+            .io_impl = undefined,
+            .borrowed_io = io,
+            .file = file,
+            .region = owned_region,
+            .acquired_ns = std.Io.Clock.awake.now(io).nanoseconds,
+        };
+    } else |err| {
+        if (!inode_lock.isRegionUnusable(err)) return err;
+    }
     const file = (try acquireWriterLock(allocator, io, path)).file;
     errdefer file.close(io);
     return .{
@@ -14841,6 +14883,31 @@ pub fn lockWriterPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
 /// Wait in the operating system's lock queue rather than racing short unlock
 /// windows. Only an existing sidecar may be opened here: its creation must
 /// continue to exclude readers using the data inode as their lock authority.
+///
+/// Not migrated onto the region, for either of `writer`'s two callers.
+/// The reader case (`writer == false`, `capi/lite_connection.zig`'s own
+/// blocking fallback when `lockReaderPathWithIo` returns busy) moves onto
+/// the region's reader-pin table in a later, separate cutover; left
+/// alone here so that cutover is a one-line swap, not a signature
+/// change. The writer case (`writer == true`) is purely
+/// `plainWriterLockUntil`'s own nested retry primitive -- never a public
+/// admission decision of its own, since whatever ticket mattered for
+/// fairness was already won (or never needed) by whichever top-level
+/// constructor called `plainWriterLockUntil` in the first place. A first
+/// attempt at migrating this one onto `Region.waitWriterFreeBounded`
+/// opened a *fresh* `Region` on every retry iteration -- `Region.open`'s
+/// own one-time setup section takes a real, blocking `fcntl` lock
+/// (`setup_lock_offset`) that serializes against every other `openSized`
+/// call on this file, existing-and-valid or not -- so three threads
+/// retrying concurrently (`lite fair writer lock bounds every writer's
+/// wait under sustained contention`) serialized through that setup lock
+/// on *every* retry and intermittently blew the test's own 10 s per-
+/// attempt deadline. Reusing the caller's own already-open `Region`
+/// would fix it, but threading one through means changing this
+/// function's signature (or `plainWriterLockUntil`'s) -- exactly the
+/// kind of call this design's own delivery plan reserves for a real
+/// decision, not a guess under this step's own "keep the constructor's
+/// signature stable" instruction.
 pub fn waitPathLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, writer: bool, deadline_ns: i96) !PathWriterLock {
     const lock_path = try writerLockPathAlloc(allocator, io, path);
     defer allocator.free(lock_path);
@@ -14957,8 +15024,41 @@ fn fairWriterLockLegacy(allocator: Allocator, io: std.Io, wait_io: std.Io, path:
 }
 
 /// Nonblocking writer acquisition that never jumps the FIFO: returns
-/// `error.WouldBlock` while any writer is queued or holds a turn.
+/// `error.WouldBlock` while any writer is queued or holds a turn. §8.2's
+/// "try" mode (`region.tryAcquireWriterFair`), the second of this
+/// design's six constructors to migrate (after `fairWriterLockWithIo`);
+/// falls back to the unchanged `writer_queue`-based implementation
+/// (renamed `tryFairWriterLockLegacy`) when the region can't be used, the
+/// same `inode_lock.isRegionUnusable` check every migrated caller shares.
 pub fn tryFairWriterLockWithIo(allocator: Allocator, io: std.Io, path: []const u8) !PathWriterLock {
+    const pid = antfly_platform.process.currentId() orelse 0;
+    var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
+        if (inode_lock.isRegionUnusable(err)) return tryFairWriterLockLegacy(allocator, io, path);
+        return err;
+    };
+    if (!region.tryAcquireWriterFair(pid)) {
+        region.close();
+        return error.WouldBlock;
+    }
+    errdefer region.close();
+    errdefer region.releaseWriter();
+    const file = (try acquireWriterLock(allocator, io, path)).file;
+    errdefer file.close(io);
+    const owned_region = try std.heap.page_allocator.create(shared_lock_region.Region);
+    owned_region.* = region;
+    return .{
+        .io_impl = undefined,
+        .borrowed_io = io,
+        .file = file,
+        .region = owned_region,
+        .acquired_ns = std.Io.Clock.awake.now(io).nanoseconds,
+    };
+}
+
+/// Today's `writer_queue`-based nonblocking try, unchanged --
+/// `tryFairWriterLockWithIo`'s own fallback for when the region can't be
+/// used (see its doc comment).
+fn tryFairWriterLockLegacy(allocator: Allocator, io: std.Io, path: []const u8) !PathWriterLock {
     const lock_path = try writerLockPathAlloc(allocator, io, path);
     defer allocator.free(lock_path);
     var queue = writer_queue.Queue.open(allocator, io, lock_path) catch |err| switch (err) {
