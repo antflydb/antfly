@@ -59,6 +59,22 @@ pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan,
                 }
                 scan.request.graph_filters = try filters.toOwnedSlice(a);
                 scan.request.graph_predicates = &.{};
+                // Null tests are unary scalar hints and arrive as boolean
+                // comparisons. Retained readers use the same exact conjunct
+                // contract as equality seeks; disjunctions remain residual.
+                if (scan.table.retained != null) {
+                    var conditions: std.ArrayList(catalog.Condition) = .empty;
+                    try conditions.appendSlice(a, scan.request.conditions);
+                    for (scan.request.graph_filters) |filter| if (filter == .comparison) {
+                        const condition = filter.comparison;
+                        if (condition.op != .is_null and condition.op != .is_not_null) continue;
+                        const duplicate = for (conditions.items) |existing| {
+                            if (existing.op == condition.op and std.mem.eql(u8, existing.column, condition.column)) break true;
+                        } else false;
+                        if (!duplicate) try conditions.append(a, condition);
+                    };
+                    scan.request.conditions = try conditions.toOwnedSlice(a);
+                }
             }
             if (scan.request.search) |original| {
                 const search = try a.create(catalog.Scan.Search);
@@ -126,7 +142,7 @@ test "graph condition deduplication preserves exact operand domains and NULL sem
 pub fn outerGraphScans(a: Allocator, relation: *const binding.Bound, predicate: ?scalar.Program) ![]const catalog.StatementScan {
     const program = predicate orelse return relation.scans;
     const has_graph = for (relation.scans) |scan| {
-        if (scan.table.graph != null and !scan.request.graph_source_ordinals) break true;
+        if ((scan.table.graph != null or scan.table.retained != null) and !scan.request.graph_source_ordinals) break true;
     } else false;
     if (!has_graph) return relation.scans;
     const scans = try a.dupe(catalog.StatementScan, relation.scans);
@@ -1327,7 +1343,10 @@ fn Engine(comptime Context: type) type {
                     .materialized_ref => |source| self.cached_reader = try (try engine.staticRows(source)).openReader(),
                     .join => |join| {
                         if (recursive_id == null and !apply_mode and !join.correlation and join.membership == null) {
-                            if (engine.context.backend.distributed_join) |remote| {
+                            const has_retained = for (engine.context.binding.relation.?.scans) |scan| {
+                                if (scan.table.retained != null) break true;
+                            } else false;
+                            if (if (has_retained) null else engine.context.backend.distributed_join) |remote| {
                                 self.remote_join = try remote.open(remote.ptr, alloc, node, engine.context.binding.relation.?.scans, engine.cursors, engine.context.parameters, engine.context.backend.distributed_context);
                                 if (self.remote_join != null) return self;
                             }
@@ -3641,6 +3660,31 @@ fn Source(comptime Context: type) type {
             var search_arena = std.heap.ArenaAllocator.init(context.alloc);
             defer search_arena.deinit();
             var scans = try bindSearchScans(search_arena.allocator(), try outerGraphScans(search_arena.allocator(), relation, context.binding.scalars.predicate), context.parameters);
+            // A finite unordered prefix is safe only across identity lineage,
+            // without residual predicates, observers, ordering or fallible outputs.
+            // Reuse the exact-prefix certificate; row_goal remains advisory.
+            if (context.statement_capture == null and context.binding.aggregate == null and context.binding.window == null and
+                !relation.statement.count_all and !relation.statement.scalar_cardinality_limit and relation.statement.limit != null and
+                relation.statement.order_by.len == 0 and relation.statement.predicate == null and context.binding.scalars.predicate == null)
+            license_retained: {
+                if (!try context.hasRowLimit(relation.statement.limit)) break :license_retained;
+                const index = binding.rowPreservingScan(relation.root) orelse break :license_retained;
+                if (scans[index].table.retained == null) break :license_retained;
+                for (context.binding.scalars.projections) |program| if (program) |value| {
+                    if (value.instructions.len != 1 or value.root != 0) break :license_retained;
+                    switch (value.instructions[0].operation) {
+                        .column, .literal => {},
+                        else => break :license_retained,
+                    }
+                };
+                const request = scans[index].request;
+                if (request.primary_key != null or request.after != null or request.conditions.len != 0 or request.order.len != 0) break :license_retained;
+                const maximum = (try context.count(relation.statement.offset, 0)) +| (try context.count(relation.statement.limit, 0));
+                if (maximum == 0 or maximum > context.limits.scan_rows) break :license_retained;
+                const changed = try search_arena.allocator().dupe(catalog.StatementScan, scans);
+                changed[index].request.ordered_window = maximum;
+                scans = changed;
+            }
             // A transparent graph scan preserves its physical cursor's order.
             // Negotiate before capturing the statement cut; never reopen a
             // captured cursor or propagate order through joins/derived errors.
@@ -3797,6 +3841,14 @@ pub fn openCursor(context: anytype) !catalog.Cursor {
 }
 
 pub fn execute(context: anytype) anyerror!@import("runtime.zig").Output {
+    try @import("window_runtime.zig").validateInvocation(context);
+    // Binding and invocation admission have already run. A zero demand must
+    // not open eager retained/archive sources, including aggregate fallbacks.
+    const statement = context.binding.relation.?.statement;
+    if (statement.limit != null and try context.hasRowLimit(statement.limit) and try context.count(statement.limit, 0) == 0) {
+        if (try context.offsetCount(statement.offset) > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
+        return .{ .columns = context.binding.columns, .command_tag = "SELECT" };
+    }
     const owner = try Source(@TypeOf(context)).create(context);
     defer owner.close();
     var lowered = owner.engine.context;
@@ -4984,4 +5036,168 @@ test "distributed SQL sampled remote children replay before batch and scalar pul
         }
         try std.testing.expectEqual(total, index);
     };
+}
+
+test "SQL retained source finite prefixes require a complete consumer proof" {
+    const Fixture = struct {
+        window: ?u64 = null,
+        conditions: usize = 0,
+        position: usize = 0,
+        examined: usize = 0,
+        fn resolve(_: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return error.UnexpectedPhysicalResolve;
+        }
+        fn retained(_: *anyopaque, a: Allocator, definition: @import("ast.zig").RetainedTable) !catalog.Table {
+            const spec = try a.create(catalog.Table.RetainedBinding);
+            spec.* = .{ .definition = definition, .dataset = @splat(1), .fingerprint = @splat(2), .generation = 1 };
+            return .{ .id = 1, .physical_name = "summary", .schema_version = 1, .retained = spec, .columns = &.{.{ .name = "n", .path = "n", .type = .integer }} };
+        }
+        fn open(raw: *anyopaque, _: Allocator, _: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.window = request.ordered_window;
+            self.conditions = request.conditions.len;
+            return .{ .ptr = self, .next = next, .close = close, .order_satisfied = request.order.len == 0 };
+        }
+        fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const maximum = self.window orelse 1000;
+            const end = @min(maximum, self.position + limit);
+            const rows = try a.alloc(catalog.Row, end - self.position);
+            const layout = try catalog.Row.TypedLayout.init(a, &.{"n"});
+            for (rows, self.position..) |*row, index| row.* = try catalog.Row.fromDatums(a, "row", layout, &.{Datum.json(.{ .integer = @intCast(index) })});
+            self.examined += rows.len;
+            self.position = end;
+            return .{ .rows = rows, .after = if (end < maximum) "more" else null };
+        }
+        fn close(_: *anyopaque) void {}
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    for ([_]struct { sql: []const u8, window: ?u64, conditions: usize = 0 }{
+        .{ .sql = "SELECT n FROM retained_summary(public.stats, '0', '60') LIMIT 1", .window = 1 },
+        .{ .sql = "SELECT d.n FROM (SELECT n FROM retained_summary(public.stats, '0', '60')) d LIMIT 1", .window = 1 },
+        .{ .sql = "SELECT d.n FROM (SELECT n FROM retained_summary(public.stats, '0', '60') WHERE n > 5) d LIMIT 1", .window = null, .conditions = 1 },
+        .{ .sql = "SELECT n FROM retained_summary(public.stats, '0', '60') LIMIT 2 OFFSET 3", .window = 5 },
+        .{ .sql = "SELECT n FROM retained_summary(public.stats, '0', '60') LIMIT NULL OFFSET 3", .window = null },
+        .{ .sql = "SELECT n FROM retained_summary(public.stats, '0', '60') WHERE n > 5 LIMIT 1", .window = null, .conditions = 1 },
+        .{ .sql = "SELECT n FROM retained_summary(public.stats, '0', '60') WHERE n IS NULL LIMIT 1", .window = null, .conditions = 1 },
+        .{ .sql = "SELECT n FROM retained_summary(public.stats, '0', '60') ORDER BY n DESC LIMIT 1", .window = null },
+        .{ .sql = "SELECT COUNT(*) FROM retained_summary(public.stats, '0', '60') LIMIT 1", .window = null },
+        .{ .sql = "SELECT 10 / (n + 1) FROM retained_summary(public.stats, '0', '60') LIMIT 1", .window = null },
+    }) |case| {
+        var fixture: Fixture = .{};
+        const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .resolve_retained = Fixture.retained, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .open_scan = Fixture.open, .checkpoint = Fixture.checkpoint } };
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{}, .{ .result_rows = 2000 });
+        defer result.deinit();
+        try std.testing.expectEqual(case.window, fixture.window);
+        try std.testing.expectEqual(case.conditions, fixture.conditions);
+        if (case.window) |maximum| try std.testing.expectEqual(maximum, fixture.examined);
+    }
+}
+
+const RetainedDemandFixture = struct {
+    opens: usize = 0,
+    offset: usize = 0,
+    mutations: usize = 0,
+    overflow_first: bool = true,
+    fn resolve(_: *anyopaque, _: Allocator, name: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+        if (!std.mem.eql(u8, name.table, "sink")) return error.UnexpectedPhysicalResolve;
+        return .{ .id = 2, .physical_name = "sink", .schema_version = 1, .columns = &.{ .{ .name = "_id", .path = "_id", .type = .string }, .{ .name = "v", .path = "v", .type = .number } } };
+    }
+    fn retained(_: *anyopaque, a: Allocator, definition: @import("ast.zig").RetainedTable) !catalog.Table {
+        const spec = try a.create(catalog.Table.RetainedBinding);
+        spec.* = .{ .definition = definition, .dataset = @splat(1), .fingerprint = @splat(2), .generation = 1 };
+        return .{ .id = 1, .physical_name = "summary", .schema_version = 1, .retained = spec, .columns = &.{ .{ .name = "n", .path = "n", .type = .integer }, .{ .name = "sum_v", .path = "sum_v", .type = .number } } };
+    }
+    fn open(raw: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.opens += 1;
+        return .{ .ptr = self, .next = next, .close = close };
+    }
+    fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const end = @min(2, self.offset + limit);
+        const rows = try a.alloc(catalog.Row, end - self.offset);
+        const layout = try catalog.Row.TypedLayout.init(a, &.{ "n", "sum_v" });
+        for (rows, self.offset..) |*row, index| row.* = try catalog.Row.fromDatums(a, "row", layout, &.{ Datum.json(.{ .integer = if (index == 0) 2 else 1 }), if ((index == 0) == self.overflow_first) Datum.failed(.retained_numeric_overflow) else Datum.json(.{ .float = 42 }) });
+        self.offset = end;
+        return .{ .rows = rows, .after = if (end < 2) "more" else null };
+    }
+    fn mutate(raw: *anyopaque, _: Allocator, _: Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.mutations += 1;
+        return error.UnexpectedMutation;
+    }
+    fn close(_: *anyopaque) void {}
+    fn checkpoint(_: *anyopaque) !void {}
+};
+
+test "SQL retained source finite prefixes preserve lazy cell failures and zero demand" {
+    const Fixture = RetainedDemandFixture;
+    for ([_]struct { sql: []const u8, rows: usize, fails: bool = false }{
+        .{ .sql = "SELECT sum_v FROM retained_summary(stats,'0','60') WHERE n=1", .rows = 1 },
+        .{ .sql = "SELECT CASE WHEN n=1 THEN sum_v ELSE 0 END FROM retained_summary(stats,'0','60')", .rows = 2 },
+        .{ .sql = "SELECT sum_v FROM retained_summary(stats,'0','60') LIMIT 1 OFFSET 1", .rows = 1 },
+        .{ .sql = "SELECT COALESCE(7, sum_v) FROM retained_summary(stats,'0','60')", .rows = 2 },
+        .{ .sql = "SELECT CASE WHEN s.n=1 THEN s.sum_v ELSE 0 END FROM retained_summary(stats,'0','60') s JOIN (VALUES(1),(2)) x(n) ON s.n=x.n", .rows = 2 },
+        .{ .sql = "SELECT CASE WHEN n=1 THEN sum_v ELSE 0 END FROM retained_summary(stats,'0','60') ORDER BY n", .rows = 2 },
+        .{ .sql = "SELECT COUNT(*) FROM retained_summary(stats,'0','60')", .rows = 1 },
+        .{ .sql = "SELECT COUNT(sum_v) FROM retained_summary(stats,'0','60')", .rows = 0, .fails = true },
+        .{ .sql = "SELECT COUNT(*) FROM retained_summary(stats,'0','60') LIMIT 0", .rows = 0 },
+        .{ .sql = "SELECT sum_v FROM retained_summary(stats,'0','60') LIMIT $1", .rows = 0 },
+        .{ .sql = "SELECT sum_v FROM retained_summary(stats,'0','60')", .rows = 0, .fails = true },
+        .{ .sql = "SELECT n FROM retained_summary(stats,'0','60') WHERE sum_v > 0", .rows = 0, .fails = true },
+    }) |case| {
+        var fixture: Fixture = .{};
+        const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .resolve_retained = Fixture.retained, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .open_scan = Fixture.open, .checkpoint = Fixture.checkpoint } };
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        const parameters: []const std.json.Value = if (std.mem.indexOf(u8, case.sql, "$1") != null) &.{.{ .integer = 0 }} else &.{};
+        if (case.fails) {
+            try std.testing.expectError(error.RetainedSeriesNumericOverflow, @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, parameters, .{}));
+        } else {
+            var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, parameters, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(case.rows, result.output.rows.len);
+            if (case.rows == 0) try std.testing.expectEqual(@as(usize, 0), fixture.opens);
+        }
+    }
+}
+
+test "SQL retained source storage assignments reject failures before writer admission" {
+    const Fixture = RetainedDemandFixture;
+    // Both first-row and later-row failures must abort before writer admission.
+    for ([_]bool{ true, false }) |overflow_first| {
+        var fixture: Fixture = .{ .overflow_first = overflow_first };
+        const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .resolve_retained = Fixture.retained, .scan = SetTestBackend.scan, .mutate = Fixture.mutate, .open_scan = Fixture.open, .checkpoint = Fixture.checkpoint } };
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, "INSERT INTO sink(_id,v) SELECT 'result',sum_v FROM retained_summary(stats,'0','60')", .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.RetainedSeriesNumericOverflow, @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), fixture.mutations);
+    }
+}
+
+test "SQL retained source window invocation validates offsets before opening sources" {
+    const Fixture = RetainedDemandFixture;
+    for ([_][]const u8{
+        "SELECT SUM(n) OVER (ROWS $1 PRECEDING) FROM retained_summary(stats,'0','60') LIMIT 0",
+        "SELECT SUM(n) OVER (ROWS $1 PRECEDING) FROM retained_summary(stats,'0','60') LIMIT 1",
+        "SELECT SUM(n) OVER (ROWS BETWEEN CURRENT ROW AND $1 FOLLOWING) FROM retained_summary(stats,'0','60') LIMIT 0",
+        "SELECT SUM(n) OVER (ROWS $1 PRECEDING) FROM (SELECT n FROM retained_summary(stats,'0','60')) r LIMIT 0",
+    }) |sql| {
+        for ([_]std.json.Value{ .{ .integer = -1 }, .null, .{ .integer = 0 } }) |parameter| {
+            if (parameter == .integer and parameter.integer == 0 and std.mem.endsWith(u8, sql, "LIMIT 1")) continue;
+            var fixture: Fixture = .{};
+            const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .resolve_retained = Fixture.retained, .scan = SetTestBackend.scan, .mutate = Fixture.mutate, .open_scan = Fixture.open, .checkpoint = Fixture.checkpoint } };
+            var compiled = try @import("compiler.zig").compile(std.testing.allocator, sql, .{});
+            defer compiled.deinit();
+            if (parameter == .integer and parameter.integer == 0) {
+                var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{parameter}, .{});
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 0), result.output.rows.len);
+            } else try std.testing.expectError(error.InvalidSqlParameters, @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{parameter}, .{}));
+            try std.testing.expectEqual(@as(usize, 0), fixture.opens);
+        }
+    }
 }

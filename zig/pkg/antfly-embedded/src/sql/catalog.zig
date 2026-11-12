@@ -114,7 +114,14 @@ pub const Table = struct {
             return parts.next() == null and std.mem.eql(u8, first, self.database) and std.mem.eql(u8, second, self.namespace) and std.mem.eql(u8, third, self.name);
         }
     };
+    pub const RetainedBinding = struct {
+        definition: ast.RetainedTable,
+        dataset: [32]u8,
+        fingerprint: [32]u8,
+        generation: u64,
+    };
     graph: ?*const @import("graph_relation.zig").Binding = null,
+    retained: ?*const RetainedBinding = null,
     id: u64,
     physical_name: []const u8,
     schema_version: u32,
@@ -202,7 +209,7 @@ pub const Scan = struct {
     /// Advisory SQL OFFSET + LIMIT for costing only. Never a scan stop bound.
     /// Absent when residual selectivity is unknown. Page size remains limit.
     row_goal: ?u64 = null,
-    /// Explicit consumer proof of an exact finite ordered prefix. A provider
+    /// Explicit consumer proof of an exact finite prefix (unordered if order is empty). A provider
     /// may truncate only when it also attests order_satisfied. Advisory row_goal
     /// alone never grants this capability.
     ordered_window: ?u64 = null,
@@ -1055,6 +1062,7 @@ pub const Backend = struct {
         // All returned data belongs to the supplied allocator. Scans receive
         // a short-lived page arena, not the retained statement result arena.
         resolve: *const fn (*anyopaque, std.mem.Allocator, ast.Name, Action) anyerror!Table,
+        resolve_retained: ?*const fn (*anyopaque, std.mem.Allocator, ast.RetainedTable) anyerror!Table = null,
         resolve_graph: ?*const fn (*anyopaque, std.mem.Allocator, ast.GraphTable) anyerror!Table = null,
         scan: *const fn (*anyopaque, std.mem.Allocator, Table, Scan) anyerror!Page,
         /// null means this provider cannot retain a statement snapshot. Never

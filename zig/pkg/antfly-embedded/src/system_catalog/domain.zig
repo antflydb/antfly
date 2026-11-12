@@ -25,7 +25,8 @@ pub const default_namespace_id: u64 = 2;
 pub const max_name_bytes = 128;
 pub const max_command_bytes = 3 * 1024 * 1024;
 pub const ServiceOwner = @import("../common/service_ownership.zig").Owner;
-pub const Kind = enum { database, namespace, tablespace, table, query_source, graph };
+pub const Kind = enum { database, namespace, tablespace, table, query_source, graph, dataset };
+pub const retained_datasets = @import("retained_datasets.zig");
 
 /// Request-owned query preparation data, excluding topology and unrelated
 /// tables. Read schema and index generations are captured together.
@@ -140,11 +141,13 @@ pub const Resource = struct {
     graph_tables: []const GraphTableBinding = &.{},
     graph_indexes: []const GraphIndexBinding = &.{},
     graph_revision: u64 = 1,
+    retained: ?retained_datasets.Identity = null,
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
             const graph_field = comptime std.mem.eql(u8, name, "graph_tables") or std.mem.eql(u8, name, "graph_indexes") or std.mem.eql(u8, name, "graph_revision");
-            if ((!graph_field or self.kind == .graph) and (!std.mem.eql(u8, name, "native_service") or self.native_service != null)) {
+            const retained_field = comptime std.mem.eql(u8, name, "retained");
+            if ((!retained_field or self.kind == .dataset) and (!graph_field or self.kind == .graph) and (!std.mem.eql(u8, name, "native_service") or self.native_service != null)) {
                 try jw.objectField(name);
                 try jw.write(@field(self, name));
             }
@@ -152,6 +155,18 @@ pub const Resource = struct {
         try jw.endObject();
     }
 };
+
+pub fn validateRetainedProjection(a: std.mem.Allocator, resource: Resource) !void {
+    if (resource.kind != .dataset) {
+        if (resource.retained != null) return error.InvalidCatalogRecord;
+        return;
+    }
+    var parsed = try retained_datasets.parse(a, resource.source_json);
+    defer parsed.deinit();
+    if (resource.retained == null or !std.meta.eql(resource.retained.?, parsed.value.identity())) return error.InvalidCatalogRecord;
+}
+
+pub const RetainedWork = struct { revision: u64, resource: ?Resource };
 
 pub const GraphTableBinding = struct { label_index: u8, table_id: u64, storage_name: []const u8 };
 pub const GraphIndexBinding = struct { mapping_index: u8, identity: @import("cypher").catalog.IndexIdentity };
@@ -321,14 +336,15 @@ pub const Mutation = struct {
     location_json: []const u8 = "null",
     source_json: []const u8 = "null",
     expected_graph_revision: ?u64 = null,
+    expected_dataset_revision: ?u64 = null,
     /// Populated only by native table admission, never accepted from public JSON.
     table_id: u64 = 0,
     storage_name: []const u8 = "",
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "expected_graph_revision")) {
-                if (self.expected_graph_revision) |revision| {
+            if (comptime std.mem.eql(u8, name, "expected_graph_revision") or std.mem.eql(u8, name, "expected_dataset_revision")) {
+                if (@field(self, name)) |revision| {
                     try jw.objectField(name);
                     try jw.write(revision);
                 }
@@ -399,6 +415,8 @@ pub const StateIndex = struct {
     storage_names: std.StringHashMapUnmanaged(Resource) = .empty,
     tablespace_users: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     child_positions: std.AutoHashMapUnmanaged(Id, usize) = .empty,
+    dataset_ids: std.AutoHashMapUnmanaged(retained_datasets.Id, u64) = .empty,
+    retained_source_users: std.AutoHashMapUnmanaged(u64, usize) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, state: State) !StateIndex {
         var self: StateIndex = .{};
@@ -406,6 +424,16 @@ pub const StateIndex = struct {
         try self.names.ensureTotalCapacity(alloc, @intCast(state.resources.len));
         try self.ids.ensureTotalCapacity(alloc, @intCast(state.resources.len));
         for (state.resources) |r| {
+            try validateRetainedProjection(alloc, r);
+            if (r.retained) |retained| {
+                const owner = try self.dataset_ids.getOrPut(alloc, retained.dataset);
+                if (owner.found_existing) return error.InvalidCatalogRecord;
+                owner.value_ptr.* = r.id;
+                if (retained.source_table_id != 0) {
+                    const count = try self.retained_source_users.getOrPutValue(alloc, retained.source_table_id, 0);
+                    count.value_ptr.* += 1;
+                }
+            }
             const name = try self.names.getOrPut(alloc, .{ .kind = r.kind, .parent = r.parent_id, .name = r.name });
             if (name.found_existing) return error.InvalidCatalogRecord;
             name.value_ptr.* = r;
@@ -443,6 +471,12 @@ pub const StateIndex = struct {
         try self.storage_names.ensureUnusedCapacity(alloc, n);
         try self.tablespace_users.ensureUnusedCapacity(alloc, n);
         try self.child_positions.ensureUnusedCapacity(alloc, n);
+        var retained_n: u32 = 0;
+        for (resources) |r| if (r.retained != null) {
+            retained_n += 1;
+        };
+        try self.dataset_ids.ensureUnusedCapacity(alloc, retained_n);
+        try self.retained_source_users.ensureUnusedCapacity(alloc, retained_n);
         for (resources) |r| {
             const entry = try self.children.getOrPut(alloc, .{ .kind = r.kind, .parent = r.parent_id });
             if (!entry.found_existing) entry.value_ptr.* = .empty;
@@ -462,6 +496,14 @@ pub const StateIndex = struct {
         }
     }
     fn remove(self: *StateIndex, r: Resource) void {
+        if (r.retained) |retained| {
+            _ = self.dataset_ids.remove(retained.dataset);
+            if (retained.source_table_id != 0) {
+                const count = self.retained_source_users.getPtr(retained.source_table_id).?;
+                count.* -= 1;
+                if (count.* == 0) _ = self.retained_source_users.remove(retained.source_table_id);
+            }
+        }
         _ = self.names.remove(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name });
         _ = self.ids.remove(.{ .kind = r.kind, .id = r.id });
         if (r.kind == .table) _ = self.storage_names.remove(r.storage_name);
@@ -479,6 +521,14 @@ pub const StateIndex = struct {
         }
     }
     fn insert(self: *StateIndex, r: Resource) void {
+        if (r.retained) |retained| {
+            self.dataset_ids.putAssumeCapacity(retained.dataset, r.id);
+            if (retained.source_table_id != 0) {
+                const count = self.retained_source_users.getOrPutAssumeCapacity(retained.source_table_id);
+                if (!count.found_existing) count.value_ptr.* = 0;
+                count.value_ptr.* += 1;
+            }
+        }
         self.names.putAssumeCapacity(.{ .kind = r.kind, .parent = r.parent_id, .name = r.name }, r);
         self.ids.putAssumeCapacity(.{ .kind = r.kind, .id = r.id }, r);
         if (r.kind == .table) self.storage_names.putAssumeCapacity(r.storage_name, r);
@@ -501,6 +551,8 @@ pub const StateIndex = struct {
         self.storage_names.deinit(alloc);
         self.tablespace_users.deinit(alloc);
         self.child_positions.deinit(alloc);
+        self.dataset_ids.deinit(alloc);
+        self.retained_source_users.deinit(alloc);
         self.names.deinit(alloc);
         self.ids.deinit(alloc);
         self.* = undefined;
@@ -772,6 +824,7 @@ pub const PhysicalTable = struct {
     name: []const u8,
     /// Test/algorithm reader inventory. Production resolves these lazily from
     /// the same committed transaction through graphIndexIdentity.
+    retained_source: ?retained_datasets.Source = null,
     graph_indexes: []const struct { name: []const u8, identity: @import("cypher").catalog.IndexIdentity } = &.{},
 };
 
@@ -800,10 +853,19 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
             error.OutOfMemory => return err,
             else => return error.InvalidCatalogMutation,
         };
+    } else if (request.kind == .dataset and (request.action == .create or request.action == .set_definition)) {
+        var descriptor = try retained_datasets.parse(alloc, request.source_json);
+        defer descriptor.deinit();
+        if (request.action == .create) try descriptor.value.validateCreation();
     } else if (!std.mem.eql(u8, request.source_json, "null")) return error.InvalidCatalogMutation;
     if (request.action == .set_definition) {
-        if (request.kind != .graph or request.expected_graph_revision == null or request.expected_graph_revision.? == 0 or request.new_name != null or request.tablespace != null) return error.InvalidCatalogMutation;
-    } else if (request.expected_graph_revision != null) return error.InvalidCatalogMutation;
+        if (request.new_name != null or request.tablespace != null) return error.InvalidCatalogMutation;
+        if (request.kind == .graph) {
+            if (request.expected_graph_revision == null or request.expected_graph_revision.? == 0 or request.expected_dataset_revision != null) return error.InvalidCatalogMutation;
+        } else if (request.kind == .dataset) {
+            if (request.expected_dataset_revision == null or request.expected_dataset_revision.? == 0 or request.expected_graph_revision != null) return error.InvalidCatalogMutation;
+        } else return error.InvalidCatalogMutation;
+    } else if (request.expected_graph_revision != null or request.expected_dataset_revision != null) return error.InvalidCatalogMutation;
     if (request.location_json.len > 64 * 1024) return error.InvalidTablespaceLocation;
     var location = std.json.parseFromSlice(std.json.Value, alloc, request.location_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -815,7 +877,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     const parent_id: u64 = switch (request.kind) {
         .database, .tablespace, .query_source, .graph => 0,
         .namespace => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
-        .table => (try reader.namespaceFor(request.database, request.namespace)).id,
+        .table, .dataset => (try reader.namespaceFor(request.database, request.namespace)).id,
     };
     var found = try reader.lookup(request.kind, parent_id, request.name);
     if (found == null and request.kind == .table and parent_id == default_namespace_id and request.action != .create) {
@@ -838,14 +900,22 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
             if (!replacing and found != null) return error.CatalogAlreadyExists;
             if (replacing) {
                 const existing = found orelse return error.CatalogNotFound;
-                if (existing.graph_revision != request.expected_graph_revision.?) return error.CatalogGenerationChanged;
+                if (request.kind == .graph and existing.graph_revision != request.expected_graph_revision.?) return error.CatalogGenerationChanged;
+                if (request.kind == .dataset) {
+                    var old = try retained_datasets.parse(alloc, existing.source_json);
+                    defer old.deinit();
+                    var updated = try retained_datasets.parse(alloc, request.source_json);
+                    defer updated.deinit();
+                    if (old.value.revision != request.expected_dataset_revision.?) return error.CatalogGenerationChanged;
+                    try old.value.validateNext(alloc, updated.value);
+                }
             }
             if (request.new_name != null) return error.InvalidCatalogMutation;
             const binding = if (request.tablespace) |name| ((try reader.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
             if (request.kind == .tablespace and binding != 0) return error.InvalidCatalogMutation;
             var resource: Resource = if (replacing) found.? else .{ .native_service = request.native_service, .kind = request.kind, .id = next_id, .parent_id = parent_id, .name = request.name, .tablespace_id = binding, .placement_policy = request.placement_policy, .location_json = request.location_json, .source_json = request.source_json };
             if (replacing) {
-                resource.graph_revision = std.math.add(u64, resource.graph_revision, 1) catch return error.CatalogIdExhausted;
+                if (request.kind == .graph) resource.graph_revision = std.math.add(u64, resource.graph_revision, 1) catch return error.CatalogIdExhausted;
                 resource.source_json = request.source_json;
             }
             if (request.kind == .graph) {
@@ -884,7 +954,24 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                 }
                 resource.graph_indexes = graph_indexes;
             }
+            if (request.kind == .dataset) {
+                var descriptor = try retained_datasets.parse(alloc, request.source_json);
+                defer descriptor.deinit();
+                const identity = descriptor.value.identity();
+                if (try reader.datasetOwner(identity.dataset)) |owner| if (owner != resource.id) return error.CatalogAlreadyExists;
+                if (!replacing) if (descriptor.value.source) |source| {
+                    const current = (try reader.retainedSource(source.table_id)) orelse return error.TableNotFound;
+                    if (!std.meta.eql(current.identity(), source.identity()) or !std.mem.eql(u8, current.storage_name, source.storage_name) or
+                        !std.mem.eql(u8, &current.schema, &source.schema) or current.schema_version != source.schema_version) return error.CatalogGenerationChanged;
+                };
+                resource.retained = identity;
+                if (try reader.lookup(.table, parent_id, request.name) != null) return error.CatalogAlreadyExists;
+                if (parent_id == default_namespace_id) if (try reader.physicalByName(request.name)) |table| {
+                    if (try reader.byId(.table, table.id) == null) return error.CatalogAlreadyExists;
+                };
+            }
             if (request.kind == .table) {
+                if (try reader.lookup(.dataset, parent_id, request.name) != null) return error.CatalogAlreadyExists;
                 if (request.table_id == 0 or request.storage_name.len == 0) return error.InvalidCatalogMutation;
                 if (try reader.byId(.table, request.table_id) != null or try reader.bindingForStorage(request.storage_name) != null or
                     try reader.physicalById(request.table_id) != null or try reader.physicalByName(request.storage_name) != null) return error.CatalogAlreadyExists;
@@ -905,7 +992,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
             const existing = found orelse return error.CatalogNotFound;
             if (existing.native_service != null) return error.Forbidden;
             if (request.action == .set_tablespace) {
-                if (existing.kind == .tablespace or request.new_name != null) return error.InvalidCatalogMutation;
+                if (existing.kind == .tablespace or existing.kind == .dataset or request.new_name != null) return error.InvalidCatalogMutation;
                 var updated = existing;
                 updated.tablespace_id = if (request.tablespace) |name| ((try reader.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
                 try upserts.append(alloc, updated);
@@ -914,7 +1001,11 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                 if (request.action == .rename) {
                     const name = request.new_name orelse return error.InvalidCatalogMutation;
                     if (try reader.lookup(existing.kind, parent_id, name)) |other| if (other.id != existing.id) return error.CatalogAlreadyExists;
-                    if (existing.kind == .table and parent_id == default_namespace_id) if (try reader.physicalByName(name)) |table| {
+                    if (existing.kind == .table or existing.kind == .dataset) {
+                        const other: Kind = if (existing.kind == .table) .dataset else .table;
+                        if (try reader.lookup(other, parent_id, name) != null) return error.CatalogAlreadyExists;
+                    }
+                    if ((existing.kind == .table or existing.kind == .dataset) and parent_id == default_namespace_id) if (try reader.physicalByName(name)) |table| {
                         if (try reader.byId(.table, table.id) == null) return error.CatalogAlreadyExists;
                     };
                     var updated = existing;
@@ -925,15 +1016,21 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                         .database => {
                             const namespaces = try reader.children(.namespace, existing.id, 0);
                             for (namespaces) |namespace| {
-                                if ((try reader.children(.table, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
+                                if ((try reader.children(.table, namespace.id, 1)).len != 0 or (try reader.children(.dataset, namespace.id, 1)).len != 0) return error.DatabaseNotEmpty;
                                 try removes.append(alloc, namespace);
                             }
                         },
-                        .namespace => if ((try reader.children(.table, existing.id, 1)).len != 0) return error.NamespaceNotEmpty,
+                        .namespace => if ((try reader.children(.table, existing.id, 1)).len != 0 or (try reader.children(.dataset, existing.id, 1)).len != 0) return error.NamespaceNotEmpty,
                         .tablespace => if (try reader.tablespaceInUse(existing.id)) return error.TablespaceInUse,
                         .query_source, .graph => {},
+                        .dataset => {
+                            var descriptor = try retained_datasets.parse(alloc, existing.source_json);
+                            defer descriptor.deinit();
+                            if (descriptor.value.phase != .retiring or descriptor.value.source != null) return error.RetainedDatasetRetirementPending;
+                        },
                         .table => {
                             if (!dropping_table) return error.CatalogTableTopologyRequired;
+                            if (try reader.hasRetainedSourceUsers(existing.id)) return error.RetainedDatasetSourceInUse;
                             if (request.table_id != existing.id or !std.mem.eql(u8, request.storage_name, existing.storage_name)) return error.CatalogGenerationChanged;
                         },
                     }
@@ -992,6 +1089,15 @@ pub const MemoryReader = struct {
     pub fn physicalById(self: @This(), id: u64) !?PhysicalTable {
         for (self.tables) |table| if (id == table.id) return table;
         return null;
+    }
+    pub fn datasetOwner(self: @This(), id: retained_datasets.Id) !?u64 {
+        return self.index.dataset_ids.get(id);
+    }
+    pub fn hasRetainedSourceUsers(self: @This(), id: u64) !bool {
+        return self.index.retained_source_users.contains(id);
+    }
+    pub fn retainedSource(self: @This(), id: u64) !?retained_datasets.Source {
+        return if (try self.physicalById(id)) |table| table.retained_source else null;
     }
     pub fn graphIndexIdentity(self: @This(), table_id: u64, index_name: []const u8) !?@import("cypher").catalog.IndexIdentity {
         const table = (try self.physicalById(table_id)) orelse return null;
@@ -1064,6 +1170,12 @@ pub const Request = struct {
     create_table_json: ?[]const u8 = null,
     /// Trusted ingress allocates identity before sealing durable destinations.
     physical_name: ?[]const u8 = null,
+    expected_catalog_revision: ?u64 = null,
+
+    pub fn jsonStringify(self: Request, writer: anytype) !void {
+        if (self.expected_catalog_revision == null) return writer.write(.{ .mutation = self.mutation, .create_table_json = self.create_table_json, .physical_name = self.physical_name });
+        try writer.write(.{ .mutation = self.mutation, .create_table_json = self.create_table_json, .physical_name = self.physical_name, .expected_catalog_revision = self.expected_catalog_revision });
+    }
 };
 
 /// Relation names share a namespace with tables, indexes and constraint indexes.
@@ -1223,14 +1335,25 @@ pub fn logicalNamesAlloc(alloc: std.mem.Allocator, reader: anytype, names: []con
 pub const Read = struct {
     kind: Kind,
     database: []const u8 = default_database_name,
+    namespace: []const u8 = default_namespace_name,
     name: ?[]const u8 = null,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (!std.mem.eql(u8, field, "namespace") or self.kind == .dataset) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 /// Selected resources plus the related records needed to render their labels.
 /// Values borrow the index; the caller owns only the returned slice.
 pub fn projectRead(alloc: std.mem.Allocator, index: *const StateIndex, request: Read) ![]Resource {
     if (request.kind == .table) return error.InvalidCatalogMutation;
-    const parent = if (request.kind == .namespace) (index.find(.database, 0, request.database) orelse return error.DatabaseNotFound).id else 0;
+    const parent = if (request.kind == .namespace) (index.find(.database, 0, request.database) orelse return error.DatabaseNotFound).id else if (request.kind == .dataset) (try index.namespaceFor(request.database, request.namespace)).id else 0;
     var out: std.ArrayListUnmanaged(Resource) = .empty;
     errdefer out.deinit(alloc);
     if (request.name) |name| {
@@ -1281,10 +1404,12 @@ pub fn httpStatus(err: anyerror) u16 {
         error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.TableNotFound, error.IndexNotFound => 404,
         error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.GenerationPublicationChanged, error.GenerationPublicationNotFound, error.ForeignKeyGenerationPublicationRequired, error.RowPolicyCatalogChanged, error.RowPolicyInstallationPending, error.RowPolicyReadersActive, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.TableAlreadyExists => 409,
         error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidGenerationPublication, error.InvalidInitialFkRetirementPage, error.InvalidRowPolicyPublication, error.InvalidRowPolicyRecord, error.InvalidSettingRecord, error.InvalidSettingValue, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.InvalidCreateTableRequest => 400,
+        error.RetainedDatasetSourceInUse, error.RetainedDatasetRetirementPending, error.RetainedDatasetResourceChanged, error.RetainedDatasetGenerationTransitionRequired => 409,
+        error.InvalidRetainedDatasetResource => 400,
         error.CatalogCommandTooLarge, error.CreateTableRequestTooLarge, error.RowPolicyLimitExceeded => 413,
         error.TableTopologyProtocolUpgradeRequired, error.TableTopologyUpgradeRequired, error.RowPolicyUnsupported => 426,
         error.ExtensionOwnedObject => 405,
-        error.CatalogPublicationProofPending => 503,
+        error.CatalogPublicationProofPending, error.RetainedDatasetSourceNotReady => 503,
         error.Forbidden => 403,
         error.InvalidInitialFkRetirementSignature, error.InitialFkRetirementSigningKeyUnavailable => 403,
         error.StoreRootEnrollmentChanged, error.ResolverCurationConflict => 409,
@@ -1466,7 +1591,7 @@ pub fn validateTableName(name: []const u8) !void {
 }
 
 pub fn validateResourceName(kind: Kind, name: []const u8) !void {
-    if (kind == .table) return validateTableName(name);
+    if (kind == .table or kind == .dataset) return validateTableName(name);
     return validateName(name);
 }
 
@@ -1793,4 +1918,46 @@ test "system catalog native memory ownership is durable identity and cannot be r
     const copy = try identity.clone(a);
     defer copy.deinit(a);
     try std.testing.expectEqual(ServiceOwner.memory, copy.native_service.?);
+}
+
+test "system catalog retained datasets own scoped identity and fence physical source deletion" {
+    const a = std.testing.allocator;
+    const source: retained_datasets.Source = .{ .metadata_incarnation = "11111111111111111111111111111111".*, .table_id = 7, .storage_name = "raw", .schema = @splat(9), .schema_version = 1 };
+    var schema: retained_datasets.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash("{}", &schema, .{});
+    const descriptor: retained_datasets.Descriptor = .{ .definition = .{ .id = @splat(1), .generation = 1, .kind = .summary, .schema = schema, .schema_json = "{}", .authorization = @splat(3), .retention_ns = 1000, .local_residence_ns = 100, .summary = .{ .source = source.identity(), .timestamp = "ts", .interval_ns = 10, .mutable_for_ns = 100, .measures = &.{.{ .name = "n", .law = .count }} } }, .source = source, .catalog_location = @splat(4), .catalog_storage_identity = @splat(5) };
+    const bytes = try std.json.Stringify.valueAlloc(a, descriptor, .{});
+    defer a.free(bytes);
+    const namespace: Resource = .{ .kind = .namespace, .id = 6, .parent_id = 1, .name = "analytics" };
+    const tables = [_]PhysicalTable{.{ .id = 7, .name = "raw", .retained_source = source }};
+    var created = try plan(a, .{ .resources = &.{namespace}, .next_id = 8 }, .{ .action = .create, .kind = .dataset, .name = "stats", .namespace = "analytics", .source_json = bytes }, &tables);
+    defer created.deinit(a);
+    const resource = created.upserts[0];
+    try std.testing.expectEqual(namespace.id, resource.parent_id);
+    try std.testing.expectEqual(@as(u64, 7), resource.retained.?.source_table_id);
+    const state: State = .{ .resources = &.{ namespace, resource }, .next_id = created.next_id };
+    var index = try StateIndex.init(a, state);
+    defer index.deinit(a);
+    const reader: MemoryReader = .{ .index = &index, .tables = &tables };
+    try std.testing.expectError(error.RetainedDatasetSourceInUse, planWithTopology(a, reader, state.next_id, .{ .action = .drop, .kind = .table, .name = "raw", .table_id = 7, .storage_name = "raw" }, true));
+    try std.testing.expectError(error.NamespaceNotEmpty, plan(a, state, .{ .action = .drop, .kind = .namespace, .name = "analytics" }, &tables));
+    try std.testing.expectError(error.CatalogAlreadyExists, plan(a, state, .{ .action = .create, .kind = .dataset, .name = "another", .source_json = bytes }, &tables));
+    try std.testing.expectError(error.CatalogAlreadyExists, plan(a, state, .{ .action = .create, .kind = .table, .name = "stats", .namespace = "analytics", .table_id = 9, .storage_name = "new-physical" }, &tables));
+    var renamed = try plan(a, state, .{ .action = .rename, .kind = .dataset, .name = "stats", .namespace = "analytics", .new_name = "renamed" }, &tables);
+    defer renamed.deinit(a);
+    try std.testing.expectEqualDeep(resource.retained, renamed.upserts[0].retained);
+    try std.testing.expectEqualStrings(bytes, renamed.upserts[0].source_json);
+    var active = descriptor;
+    active.phase = .active;
+    active.revision += 1;
+    const active_json = try std.json.Stringify.valueAlloc(a, active, .{});
+    defer a.free(active_json);
+    try std.testing.expectError(error.CatalogGenerationChanged, plan(a, state, .{ .action = .set_definition, .kind = .dataset, .name = "stats", .namespace = "analytics", .source_json = active_json, .expected_dataset_revision = 2 }, &tables));
+    var activated = try plan(a, state, .{ .action = .set_definition, .kind = .dataset, .name = "stats", .namespace = "analytics", .source_json = active_json, .expected_dataset_revision = 1 }, &tables);
+    defer activated.deinit(a);
+    try std.testing.expectEqualDeep(resource.retained, activated.upserts[0].retained);
+    try std.testing.expectError(error.RetainedDatasetRetirementPending, plan(a, state, .{ .action = .drop, .kind = .dataset, .name = "stats", .namespace = "analytics" }, &tables));
+    const selected = try projectRead(a, &index, .{ .kind = .dataset, .namespace = "analytics", .name = "stats" });
+    defer a.free(selected);
+    try std.testing.expectEqual(resource.id, selected[0].id);
 }

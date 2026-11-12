@@ -33,6 +33,7 @@ const backend_types = @import("backend_types.zig");
 const change_journal_mod = @import("db/derived/change_journal.zig");
 const internal_keys = @import("internal_keys.zig");
 const retained_effects = @import("retained_effects.zig");
+const retained_series_capture = @import("retained_series_capture.zig");
 const artifact_payload = @import("artifact_payload.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
@@ -477,6 +478,7 @@ pub const DocStore = struct {
     // 0 unknown, 1 no retention catalog, 2 catalog may exist. Admission marks
     // this before its commit; an aborted admission merely leaves a safe probe.
     retained_effects_cache: std.atomic.Value(u8) = .init(0),
+    retained_series_cache: retained_series_capture.Cache = .init(0),
     runtime_store: backend_erased.Store,
     owns_runtime_store: bool,
     owned_lsm_backend: ?lsm_backend.BackendHandle,
@@ -518,6 +520,7 @@ pub const DocStore = struct {
     pub const Txn = struct {
         range_mutation: @import("range_protection.zig").Mutation = .{},
         retained: retained_effects.Capture = .{},
+        retained_series: retained_series_capture.Capture = .{},
         artifact_inputs: @import("artifact_input_capture.zig").Capture = .{},
         artifact_footprint: @import("artifact_footprint.zig").Capture = .{},
         document_revisions: @import("document_mutation_revision.zig").Capture = .{},
@@ -582,6 +585,8 @@ pub const DocStore = struct {
 
         pub fn abort(self: *Txn) void {
             self.retained.deinit(self.alloc);
+            self.retained_series.completed(if (self.columnar_owner) |owner| &owner.retained_series_cache else null);
+            self.retained_series.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
             const reader_owner = self.portable_import_reader_owner;
@@ -608,6 +613,7 @@ pub const DocStore = struct {
             // Reload the durable cut on the next observation, but never
             // rewind the reservation allocator (the outcome is ambiguous).
             errdefer if (self.columnar_owner) |owner| owner.committed_replay_next_cached.store(0, .release);
+            try self.retained_series.stage(self.alloc, self);
             try self.retained.stage(self.alloc, self);
             {
                 self.retained.staging = true;
@@ -635,6 +641,8 @@ pub const DocStore = struct {
                 session.release();
             }
             self.retained.deinit(self.alloc);
+            self.retained_series.completed(if (self.columnar_owner) |owner| &owner.retained_series_cache else null);
+            self.retained_series.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
             self.* = undefined;
@@ -826,6 +834,7 @@ pub const DocStore = struct {
             try self.artifact_footprint.touch(key, value);
             try self.range_mutation.touch(self, key);
             try self.artifact_inputs.touch(self.alloc, self, key, value);
+            try self.retained_series.touch(self.alloc, self, key, if (self.columnar_owner) |owner| &owner.retained_series_cache else null);
             try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), if (self.columnar_owner) |owner| &owner.retained_effects_cache else null);
             if (self.mutation_capture) |capture| try capture.touch(key);
             try self.markColumnarDirty(key, value);
@@ -850,6 +859,7 @@ pub const DocStore = struct {
             try self.artifact_footprint.touch(key, null);
             try self.range_mutation.touch(self, key);
             try self.artifact_inputs.touch(self.alloc, self, key, null);
+            try self.retained_series.touch(self.alloc, self, key, if (self.columnar_owner) |owner| &owner.retained_series_cache else null);
             try self.retained.touch(self.alloc, self, key, internal_keys.isStoredDocumentRowKey(key), if (self.columnar_owner) |owner| &owner.retained_effects_cache else null);
             if (self.mutation_capture) |capture| try capture.touch(key);
             try self.markColumnarDirty(key, null);
@@ -922,6 +932,7 @@ pub const DocStore = struct {
     pub const Batch = struct {
         range_mutation: @import("range_protection.zig").Mutation = .{},
         retained: retained_effects.Capture = .{},
+        retained_series: retained_series_capture.Capture = .{},
         artifact_inputs: @import("artifact_input_capture.zig").Capture = .{},
         artifact_footprint: @import("artifact_footprint.zig").Capture = .{},
         document_revisions: @import("document_mutation_revision.zig").Capture = .{},
@@ -942,6 +953,8 @@ pub const DocStore = struct {
         pub const BatchTxn = struct {
             range_mutation: *@import("range_protection.zig").Mutation,
             retained: *retained_effects.Capture,
+            retained_series: *retained_series_capture.Capture,
+            retained_series_cache: ?*retained_series_capture.Cache = null,
             artifact_inputs: *@import("artifact_input_capture.zig").Capture,
             artifact_footprint: *@import("artifact_footprint.zig").Capture,
             document_revisions: *@import("document_mutation_revision.zig").Capture,
@@ -1008,6 +1021,7 @@ pub const DocStore = struct {
                 try self.artifact_footprint.touch(key, value);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, value);
+                try self.retained_series.touch(self.alloc, self, key, self.retained_series_cache);
                 try self.retained.touch(self.alloc, self, key, internal_keys.isStoredSourceRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, value);
                 try self.invalidateColumns(key);
@@ -1048,6 +1062,7 @@ pub const DocStore = struct {
                 // defer activation until their unordered import is complete.
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, value);
+                try self.retained_series.touch(self.alloc, self, key, self.retained_series_cache);
                 try self.retained.touch(self.alloc, self, key, internal_keys.isStoredSourceRowKey(key), self.retained_cache);
                 if (self.unordered_bulk_append_puts and internal_keys.isRelationalRowKey(key)) {
                     // Keep auxiliary records in the bulk arena too. A regular
@@ -1081,6 +1096,7 @@ pub const DocStore = struct {
                 try self.artifact_footprint.touch(key, null);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, null);
+                try self.retained_series.touch(self.alloc, self, key, self.retained_series_cache);
                 try self.retained.touch(self.alloc, self, key, internal_keys.isStoredSourceRowKey(key), self.retained_cache);
                 try self.markColumnarDirty(key, null);
                 try self.invalidateColumns(key);
@@ -1141,6 +1157,8 @@ pub const DocStore = struct {
 
         pub fn abort(self: *Batch) void {
             self.retained.deinit(self.alloc);
+            self.retained_series.completed(if (self.columnar_owner) |owner| &owner.retained_series_cache else null);
+            self.retained_series.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
             const payload_session = self.payload_session;
@@ -1156,6 +1174,7 @@ pub const DocStore = struct {
             if (self.columnar_owner) |owner| _ = owner.query_generation_revision.fetchAdd(1, .release);
             errdefer self.retained.poisoned = true;
             errdefer if (self.columnar_owner) |owner| owner.committed_replay_next_cached.store(0, .release);
+            try self.retained_series.stage(self.alloc, self.asTxn());
             try self.retained.stage(self.alloc, self.asTxn());
             {
                 self.retained.staging = true;
@@ -1180,6 +1199,8 @@ pub const DocStore = struct {
                 session.release();
             }
             self.retained.deinit(self.alloc);
+            self.retained_series.completed(if (self.columnar_owner) |owner| &owner.retained_series_cache else null);
+            self.retained_series.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
             self.document_revisions.deinit(self.alloc);
             self.* = undefined;
@@ -1190,6 +1211,8 @@ pub const DocStore = struct {
             return .{
                 .range_mutation = &self.range_mutation,
                 .retained = &self.retained,
+                .retained_series = &self.retained_series,
+                .retained_series_cache = if (self.columnar_owner) |owner| &owner.retained_series_cache else null,
                 .artifact_inputs = &self.artifact_inputs,
                 .artifact_footprint = &self.artifact_footprint,
                 .document_revisions = &self.document_revisions,
@@ -2207,8 +2230,32 @@ pub const DocStore = struct {
     pub fn finishPortableImportPublication(self: *DocStore) void {
         self.source_certificates.end();
         self.retained_effects_cache.store(0, .release);
+        retained_series_capture.invalidateCache(&self.retained_series_cache);
         std.debug.assert(self.portable_import_reader_state.load(.monotonic) == portable_import_publication_bit);
         self.portable_import_reader_state.store(0, .release);
+    }
+
+    /// Active capture is distinct from retained generations still owned here.
+    /// Registry/marker mutation and import invalidate this negative cache.
+    pub fn retainedSeriesActive(self: *DocStore) !bool {
+        const observed = self.retained_series_cache.load(.acquire);
+        if (observed & 1 != 0) return false;
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+        const active = try retained_series_capture.isCapturing(self.alloc, &txn);
+        if (!active) retained_series_capture.cacheAbsent(&self.retained_series_cache, observed);
+        return active;
+    }
+
+    /// Rare lifecycle admission must also account for closed local generations.
+    pub fn retainedSeriesPresent(self: *DocStore) !bool {
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+        _ = txn.get(retained_series_capture.registry_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        return true;
     }
 
     pub fn portableImportPublicationInProgress(self: *const DocStore) bool {

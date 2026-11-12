@@ -12792,6 +12792,313 @@ pub const RestoreRequest = struct {
     connection: []const u8,
 };
 
+pub const RetainedDatasetArchiveProgress = struct {
+    pages: []const u8,
+    sealed: bool,
+    next_bucket_ns: []const u8,
+};
+
+pub const RetainedDatasetInfo = struct {
+    /// Stable dataset identifier in hexadecimal.
+    id: []const u8,
+    name: []const u8,
+    revision: u64,
+    phase: []const u8,
+    /// True after verified native revocation or archive handoff releases the source dependency. Retiring remains a durable discard tombstone while archive collection proceeds independently.
+    source_released: bool,
+    initial_history: []const u8,
+    dimensions: []const []const u8,
+    measures: []const RetainedDatasetMeasure,
+    retention_ns: []const u8,
+    interval_ns: []const u8,
+    origin_ns: []const u8,
+    progress: OpenApiOptionalNullable(RetainedDatasetProgress) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("revision");
+        try jw.write(self.revision);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("source_released");
+        try jw.write(self.source_released);
+        try jw.objectField("initial_history");
+        try jw.write(self.initial_history);
+        try jw.objectField("dimensions");
+        try jw.write(self.dimensions);
+        try jw.objectField("measures");
+        try jw.write(self.measures);
+        try jw.objectField("retention_ns");
+        try jw.write(self.retention_ns);
+        try jw.objectField("interval_ns");
+        try jw.write(self.interval_ns);
+        try jw.objectField("origin_ns");
+        try jw.write(self.origin_ns);
+        switch (self.progress) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("progress");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("progress");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RetainedDatasetMeasure = struct {
+    name: []const u8,
+    law: []const u8,
+    field: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("law");
+        try jw.write(self.law);
+        switch (self.field) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("field");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("field");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RetainedDatasetNativeProgress = struct {
+    ready: bool,
+    draining: bool,
+    closed: bool,
+    archive_handoff: bool,
+    backfill_cleanup_complete: bool,
+    source_sequence: []const u8,
+    replay_floor: []const u8,
+    replay_latest: []const u8,
+    retention_clock_ns: []const u8,
+    last_attempt_ns: OpenApiOptionalNullable([]const u8) = .absent,
+    /// Durable error name from the most recent failed maintenance operation; cleared by successful maintenance.
+    last_error: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("ready");
+        try jw.write(self.ready);
+        try jw.objectField("draining");
+        try jw.write(self.draining);
+        try jw.objectField("closed");
+        try jw.write(self.closed);
+        try jw.objectField("archive_handoff");
+        try jw.write(self.archive_handoff);
+        try jw.objectField("backfill_cleanup_complete");
+        try jw.write(self.backfill_cleanup_complete);
+        try jw.objectField("source_sequence");
+        try jw.write(self.source_sequence);
+        try jw.objectField("replay_floor");
+        try jw.write(self.replay_floor);
+        try jw.objectField("replay_latest");
+        try jw.write(self.replay_latest);
+        try jw.objectField("retention_clock_ns");
+        try jw.write(self.retention_clock_ns);
+        switch (self.last_attempt_ns) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("last_attempt_ns");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("last_attempt_ns");
+                try jw.write(value);
+            },
+        }
+        switch (self.last_error) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("last_error");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("last_error");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RetainedDatasetOwnerProgress = struct {
+    group: []const u8,
+    mode: []const u8,
+    archive_authoritative: bool,
+    native: OpenApiOptionalNullable(RetainedDatasetNativeProgress) = .absent,
+    archive: OpenApiOptionalNullable(RetainedDatasetArchiveProgress) = .absent,
+    /// Failure to obtain this owner's current status; distinct from a persisted maintenance failure.
+    status_error: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("group");
+        try jw.write(self.group);
+        try jw.objectField("mode");
+        try jw.write(self.mode);
+        try jw.objectField("archive_authoritative");
+        try jw.write(self.archive_authoritative);
+        switch (self.native) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("native");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("native");
+                try jw.write(value);
+            },
+        }
+        switch (self.archive) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("archive");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("archive");
+                try jw.write(value);
+            },
+        }
+        switch (self.status_error) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("status_error");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("status_error");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RetainedDatasetProgress = struct {
+    phase: []const u8,
+    registration_complete: bool,
+    registered_owners: u32,
+    ready_owners: u32,
+    revoked_owners: u32,
+    archived_owners: u32,
+    owners: []const RetainedDatasetOwnerProgress,
+    /// Pass as after_group to obtain the next bounded owner page.
+    next_group: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("registration_complete");
+        try jw.write(self.registration_complete);
+        try jw.objectField("registered_owners");
+        try jw.write(self.registered_owners);
+        try jw.objectField("ready_owners");
+        try jw.write(self.ready_owners);
+        try jw.objectField("revoked_owners");
+        try jw.write(self.revoked_owners);
+        try jw.objectField("archived_owners");
+        try jw.write(self.archived_owners);
+        try jw.objectField("owners");
+        try jw.write(self.owners);
+        switch (self.next_group) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("next_group");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("next_group");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RetainedDatasetReadError = struct {
+    /// Stable machine-readable domain failure
+    code: []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
+pub const RetainedSubscriptionFrame = struct {
+    kind: []const u8,
+    cursor: []const u8,
+    /// True when the server caught up through a fresh bounded snapshot instead of replaying every intermediate state.
+    resynchronized: ?bool = null,
+    initial_history: ?[]const u8 = null,
+    dimensions: ?[]const []const u8 = null,
+    measures: ?[]const RetainedDatasetMeasure = null,
+    events: []const std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "kind", "kind", false },
+        .{ "cursor", "cursor", false },
+        .{ "resynchronized", "resynchronized", true },
+        .{ "initial_history", "initial_history", true },
+        .{ "dimensions", "dimensions", true },
+        .{ "measures", "measures", true },
+        .{ "events", "events", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("cursor");
+        try jw.write(self.cursor);
+        if (self.resynchronized) |value| {
+            try jw.objectField("resynchronized");
+            try jw.write(value);
+        }
+        if (self.initial_history) |value| {
+            try jw.objectField("initial_history");
+            try jw.write(value);
+        }
+        if (self.dimensions) |value| {
+            try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        if (self.measures) |value| {
+            try jw.objectField("measures");
+            try jw.write(value);
+        }
+        try jw.objectField("events");
+        try jw.write(self.events);
+        try jw.endObject();
+    }
+};
+
 /// Request for the retrieval agent. Queries define which tables and indexes to search, each as an ordinary QueryRequest. Optional tree or graph exploration is configured by steps.retrieval.navigation, targeting one query by index. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes. A query may contain only a table scope and caller constraints: build_query delegates to the query-builder agent, then search executes its validated QueryRequest. Refinements use the same canonical full-DSL validator, not keyword substitution. Authenticated row filters are enforced on every initial and generated operation in both modes, including scans, aggregates, and graph/tree traversal. They cannot be replaced or weakened by model tool arguments.
 pub const RetrievalAgentRequest = struct {
     context_management: ?AgentContextManagement = null,

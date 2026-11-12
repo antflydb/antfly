@@ -879,6 +879,90 @@ const mappings = [_]Mapping{
     .{ .status = .cypher_variable_conflict, .err = error.CypherVariableConflict },
     .{ .status = .cypher_variable_type_conflict, .err = error.CypherVariableTypeConflict },
     .{ .status = .cypher_write_union_unsupported, .err = error.CypherWriteUnionUnsupported },
+    .{ .status = .dataset_dependency_pending, .err = error.DatasetDependencyPending },
+    .{ .status = .dataset_lease_expired, .err = error.DatasetLeaseExpired },
+    .{ .status = .dataset_location_unavailable, .err = error.DatasetLocationUnavailable },
+    .{ .status = .dataset_page_budget_exceeded, .err = error.DatasetPageBudgetExceeded },
+    .{ .status = .dataset_reader_budget_exceeded, .err = error.DatasetReaderBudgetExceeded },
+    .{ .status = .invalid_dataset_binding, .err = error.InvalidDatasetBinding },
+    .{ .status = .invalid_dataset_coverage, .err = error.InvalidDatasetCoverage },
+    .{ .status = .invalid_dataset_definition, .err = error.InvalidDatasetDefinition },
+    .{ .status = .invalid_dataset_segment, .err = error.InvalidDatasetSegment },
+    .{ .status = .invalid_retained_dataset_resource, .err = error.InvalidRetainedDatasetResource },
+    .{ .status = .invalid_retained_owner_plan, .err = error.InvalidRetainedOwnerPlan },
+    .{ .status = .invalid_retained_read_lease, .err = error.InvalidRetainedReadLease },
+    .{ .status = .invalid_retained_read_page, .err = error.InvalidRetainedReadPage },
+    .{ .status = .invalid_retained_read_page_limit, .err = error.InvalidRetainedReadPageLimit },
+    .{ .status = .invalid_retained_read_query, .err = error.InvalidRetainedReadQuery },
+    .{ .status = .invalid_retained_read_response, .err = error.InvalidRetainedReadResponse },
+    .{ .status = .invalid_retained_read_token, .err = error.InvalidRetainedReadToken },
+    .{ .status = .invalid_retained_series, .err = error.InvalidRetainedSeries },
+    .{ .status = .invalid_retained_series_row, .err = error.InvalidRetainedSeriesRow },
+    .{ .status = .invalid_retained_subscription_token, .err = error.InvalidRetainedSubscriptionToken },
+    .{ .status = .retained_series_already_exists, .err = error.RetainedSeriesAlreadyExists },
+    .{ .status = .retained_series_archive_budget_exceeded, .err = error.RetainedSeriesArchiveBudgetExceeded },
+    .{ .status = .retained_series_backfill_fence, .err = error.RetainedSeriesBackfillFence },
+    .{ .status = .retained_series_batch_too_large, .err = error.RetainedSeriesBatchTooLarge },
+    .{ .status = .retained_series_commit_context_missing, .err = error.RetainedSeriesCommitContextMissing },
+    .{ .status = .retained_series_correction_window, .err = error.RetainedSeriesCorrectionWindow },
+    .{ .status = .retained_series_corrupt, .err = error.RetainedSeriesCorrupt },
+    .{ .status = .retained_series_coverage_missing, .err = error.RetainedSeriesCoverageMissing },
+    .{ .status = .retained_series_definition_mismatch, .err = error.RetainedSeriesDefinitionMismatch },
+    .{ .status = .retained_series_duplicate_row, .err = error.RetainedSeriesDuplicateRow },
+    .{ .status = .retained_series_history_expired, .err = error.RetainedSeriesHistoryExpired },
+    .{ .status = .retained_series_not_final, .err = error.RetainedSeriesNotFinal },
+    .{ .status = .retained_series_not_ready, .err = error.RetainedSeriesNotReady },
+    .{ .status = .retained_series_numeric_overflow, .err = error.RetainedSeriesNumericOverflow },
+    .{ .status = .retained_series_prepared_hold, .err = error.RetainedSeriesPreparedHold },
+    .{ .status = .retained_series_reservation_mismatch, .err = error.RetainedSeriesReservationMismatch },
+    .{ .status = .retained_series_reset_required, .err = error.RetainedSeriesResetRequired },
+    .{ .status = .retained_series_resolution_mismatch, .err = error.RetainedSeriesResolutionMismatch },
+    .{ .status = .retained_series_schema_missing, .err = error.RetainedSeriesSchemaMissing },
+    .{ .status = .retained_series_sequence_mismatch, .err = error.RetainedSeriesSequenceMismatch },
+    .{ .status = .retained_series_snapshot_expired, .err = error.RetainedSeriesSnapshotExpired },
+    .{ .status = .retained_series_source_closed, .err = error.RetainedSeriesSourceClosed },
+    .{ .status = .retained_series_source_draining, .err = error.RetainedSeriesSourceDraining },
+    .{ .status = .retained_series_source_revoked, .err = error.RetainedSeriesSourceRevoked },
+    .{ .status = .retained_series_time_overflow, .err = error.RetainedSeriesTimeOverflow },
+    .{ .status = .retained_series_topology_unsupported, .err = error.RetainedSeriesTopologyUnsupported },
+    .{ .status = .retained_series_transaction_poisoned, .err = error.RetainedSeriesTransactionPoisoned },
+    .{ .status = .retained_series_transactions_unsupported, .err = error.RetainedSeriesTransactionsUnsupported },
+    .{ .status = .dataset_already_exists, .err = error.DatasetAlreadyExists },
+    .{ .status = .dataset_compaction_order, .err = error.DatasetCompactionOrder },
+    .{ .status = .dataset_copy_fault, .err = error.DatasetCopyFault },
+    .{ .status = .dataset_coverage_overlap, .err = error.DatasetCoverageOverlap },
+    .{ .status = .dataset_coverage_unavailable, .err = error.DatasetCoverageUnavailable },
+    .{ .status = .dataset_definition_conflict, .err = error.DatasetDefinitionConflict },
+    .{ .status = .dataset_delete_fault, .err = error.DatasetDeleteFault },
+    .{ .status = .dataset_dependency_conflict, .err = error.DatasetDependencyConflict },
+    .{ .status = .dataset_location_conflict, .err = error.DatasetLocationConflict },
+    .{ .status = .dataset_migration_unsupported, .err = error.DatasetMigrationUnsupported },
+    .{ .status = .dataset_not_found, .err = error.DatasetNotFound },
+    .{ .status = .dataset_placement_conflict, .err = error.DatasetPlacementConflict },
+    .{ .status = .dataset_readers_active, .err = error.DatasetReadersActive },
+    .{ .status = .dataset_resolution_unavailable, .err = error.DatasetResolutionUnavailable },
+    .{ .status = .dataset_restore_required, .err = error.DatasetRestoreRequired },
+    .{ .status = .dataset_retention_pending, .err = error.DatasetRetentionPending },
+    .{ .status = .dataset_segment_already_exists, .err = error.DatasetSegmentAlreadyExists },
+    .{ .status = .dataset_segment_budget_exceeded, .err = error.DatasetSegmentBudgetExceeded },
+    .{ .status = .dataset_segment_corrupt, .err = error.DatasetSegmentCorrupt },
+    .{ .status = .dataset_segment_expired, .err = error.DatasetSegmentExpired },
+    .{ .status = .dataset_segment_not_found, .err = error.DatasetSegmentNotFound },
+    .{ .status = .dataset_segment_retired, .err = error.DatasetSegmentRetired },
+    .{ .status = .invalid_dataset_dependency, .err = error.InvalidDatasetDependency },
+    .{ .status = .invalid_dataset_location, .err = error.InvalidDatasetLocation },
+    .{ .status = .invalid_dataset_pin, .err = error.InvalidDatasetPin },
+    .{ .status = .invalid_retained_read_kind, .err = error.InvalidRetainedReadKind },
+    .{ .status = .invalid_retained_read_limits, .err = error.InvalidRetainedReadLimits },
+    .{ .status = .invalid_retained_replacement, .err = error.InvalidRetainedReplacement },
+    .{ .status = .invalid_retained_resume_checkpoint_path, .err = error.InvalidRetainedResumeCheckpointPath },
+    .{ .status = .retained_dataset_generation_transition_required, .err = error.RetainedDatasetGenerationTransitionRequired },
+    .{ .status = .retained_dataset_resource_changed, .err = error.RetainedDatasetResourceChanged },
+    .{ .status = .retained_dataset_retirement_pending, .err = error.RetainedDatasetRetirementPending },
+    .{ .status = .retained_dataset_source_in_use, .err = error.RetainedDatasetSourceInUse },
+    .{ .status = .retained_dataset_source_not_ready, .err = error.RetainedDatasetSourceNotReady },
+    .{ .status = .retained_owner_plan_changed, .err = error.RetainedOwnerPlanChanged },
+    .{ .status = .retained_series_coordinated_ttl_unsupported, .err = error.RetainedSeriesCoordinatedTtlUnsupported },
 };
 
 pub fn statusFromError(err: anyerror) abi.Status {
@@ -1259,6 +1343,16 @@ test "storage owner lease admission retains its independent stable identity" {
     const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
     try validateFailureEnvelope(value, &failure, abi.abi_version);
     try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
+}
+
+test "retained admission and read errors survive compiled storage boundaries" {
+    inline for (.{ error.InvalidRetainedSeriesRow, error.RetainedOwnerPlanChanged, error.RetainedDatasetSourceInUse, error.RetainedSeriesCorrectionWindow, error.RetainedSeriesHistoryExpired, error.RetainedSeriesSourceClosed, error.RetainedSeriesSourceRevoked, error.RetainedSeriesSourceDraining, error.RetainedSeriesPreparedHold, error.DatasetPageBudgetExceeded, error.RetainedSeriesResetRequired }) |expected| {
+        const failure = failureFromError(expected, .storage_owner, abi.abi_version, 4);
+        try std.testing.expect(failure.status != .internal);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(expected, statusToError(failure.status));
+        try std.testing.expectEqualStrings(@errorName(expected), failure.errorName());
+    }
 }
 
 test "unsupported graph node filter survives the storage boundary" {

@@ -27,6 +27,8 @@ const setting_catalog = @import("antfly_local_sources").sql_setting_catalog;
 
 test {
     _ = @import("sql_memory_owner.zig");
+    _ = @import("retained_sql_projection.zig");
+    _ = @import("retained_native_materialize.zig");
 }
 
 // Parsed syntax equality excludes diagnostic positions and is charged to the
@@ -635,7 +637,7 @@ pub const Adapter = struct {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
-        return .{ .distributed_join = self.server.cfg.distributed_sql_join, .distributed_context = self.context, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .estimate_scans = estimateScans, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .distributed_join = self.server.cfg.distributed_sql_join, .distributed_context = self.context, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .resolve_graph = resolveGraph, .resolve_retained = resolveRetained, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .estimate_scans = estimateScans, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -723,6 +725,56 @@ pub const Adapter = struct {
                 try bindings.append(alloc, current);
             }
         }
+    }
+
+    fn resolveRetained(ptr: *anyopaque, alloc: std.mem.Allocator, reference: ast.RetainedTable) !catalog.Table {
+        const self: *Adapter = @ptrCast(@alignCast(ptr));
+        const target: system_catalog.Target = .{ .database = reference.name.database orelse self.database, .namespace = reference.name.namespace orelse self.namespace, .table = reference.name.table };
+        const logical = try target.resourceNameAlloc(alloc);
+        defer alloc.free(logical);
+        if (!try http_server.resourcePermissionCurrentlyAllowed(self.identity.*, .dataset, logical, .read)) return error.Forbidden;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const read = @import("retained_dataset_read.zig");
+        const snapshot = try read.fetchReadCut(self.server, a, target, self.context);
+        if (snapshot.catalog_revision == 0) return error.InvalidSqlBackendResponse;
+        if (self.revision) |expected| if (expected != snapshot.catalog_revision) return error.CatalogGenerationChanged;
+        self.revision = snapshot.catalog_revision;
+        var descriptor = try @import("antfly_local_sources").system_catalog_retained_datasets.parse(a, snapshot.resource.source_json);
+        defer descriptor.deinit();
+        const definition = descriptor.value.definition;
+        const summary = definition.summary orelse return error.UnsupportedSqlExecution;
+        const Frozen = struct { dimensions: []const struct { name: []const u8, type: ast.ColumnType } = &.{} };
+        const schema = try std.json.parseFromSliceLeaky(Frozen, a, definition.schema_json, .{ .ignore_unknown_fields = true });
+        if (schema.dimensions.len != summary.dimensions.len) return error.UnsupportedSqlExecution;
+        const columns = try alloc.alloc(catalog.Column, 1 + summary.dimensions.len + summary.measures.len);
+        columns[0] = .{ .name = "bucket_start", .path = "bucket_start", .type = .datetime, .nullable = false };
+        for (summary.dimensions, schema.dimensions, columns[1 .. 1 + summary.dimensions.len]) |name, dimension, *column| {
+            if (!std.mem.eql(u8, name, dimension.name)) return error.InvalidDatasetDefinition;
+            const column_name = try alloc.dupe(u8, name);
+            column.* = .{ .name = column_name, .path = column_name, .type = dimension.type };
+        }
+        for (summary.measures, columns[1 + summary.dimensions.len ..]) |measure, *column| {
+            const column_name = try alloc.dupe(u8, measure.name);
+            column.* = .{ .name = column_name, .path = column_name, .type = if (measure.law == .count) .integer else .number, .nullable = measure.law != .count };
+        }
+        for (columns, 0..) |column, index| {
+            if (std.mem.eql(u8, column.name, "_id")) return error.DuplicateSqlColumn;
+            for (columns[0..index]) |previous| if (std.mem.eql(u8, previous.name, column.name)) return error.DuplicateSqlColumn;
+        }
+        const binding = try alloc.create(catalog.Table.RetainedBinding);
+        binding.* = .{ .definition = reference, .dataset = definition.id, .fingerprint = try definition.fingerprint(a), .generation = definition.generation };
+        const table: catalog.Table = .{
+            .id = snapshot.resource.id,
+            .physical_name = try std.fmt.allocPrint(alloc, "retained:{s}", .{std.fmt.bytesToHex(definition.id, .lower)}),
+            .schema_version = 1,
+            .columns = columns,
+            .scope = .{ .database = target.database, .namespace = target.namespace, .name = target.table, .revision = definition.generation },
+            .retained = binding,
+        };
+        try self.recordPreparedBinding(alloc, table);
+        return table;
     }
 
     fn resolveGraph(ptr: *anyopaque, alloc: std.mem.Allocator, definition: ast.GraphTable) !catalog.Table {
@@ -830,6 +882,13 @@ pub const Adapter = struct {
 
     fn verify(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !void {
         try self.context.ensureActive();
+        if (table.retained != null) {
+            const scope = table.scope orelse return error.InvalidSqlBackendResponse;
+            const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(alloc);
+            defer alloc.free(logical);
+            if (!try http_server.resourcePermissionCurrentlyAllowed(self.identity.*, .dataset, logical, .read)) return error.Forbidden;
+            return;
+        }
         if (table.graph) |binding| {
             var scratch = std.heap.ArenaAllocator.init(alloc);
             defer scratch.deinit();
@@ -1094,12 +1153,12 @@ pub const Adapter = struct {
 
     fn openScan(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
-        if (table.graph != null) {
-            const statement = try self.openGraphStatement(alloc, &.{.{ .table = table, .request = request }});
+        if (table.graph != null or table.retained != null) {
+            const statement = try openStatement(ptr, alloc, &.{.{ .table = table, .request = request }});
             errdefer statement.close(statement.ptr);
             const wrapper = try alloc.create(SingleStatementCursor);
             wrapper.* = .{ .alloc = alloc, .statement = statement };
-            return .{ .ptr = wrapper, .next = SingleStatementCursor.next, .close = SingleStatementCursor.close };
+            return if (table.retained != null) wrapper.asCursor() else .{ .ptr = wrapper, .next = SingleStatementCursor.next, .close = SingleStatementCursor.close };
         }
         if (table.external_base_source != null) return try self.openLakeScan(alloc, table, request);
         if (self.range_reads != null) {
@@ -1288,6 +1347,7 @@ pub const Adapter = struct {
         }
     };
     fn openAggregatePartials(raw: *anyopaque, a: std.mem.Allocator, table: catalog.Table, recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe) !?catalog.AggregatePartialCursor {
+        if (table.retained != null) return null;
         const self: *Adapter = @ptrCast(@alignCast(raw));
         if (self.read_requirements.after_write != null or self.lake_visibility == .accepted or table.external_base_source == null or table.external_indexes == null) return null;
         const local = @import("antfly_local_sources");
@@ -2412,7 +2472,7 @@ pub const Adapter = struct {
             try self.context.ensureActive();
             try self.verify(alloc, request.table);
             // Native status cannot price a lake inventory or a ranked search.
-            if (request.table.external_base_source != null or request.request.search != null) continue;
+            if (request.table.retained != null or request.table.external_base_source != null or request.request.search != null) continue;
             const table = generation.tables.get(request.table.physical_name) orelse continue;
             if (!table.identity_ready or table.table_id != request.table.id) continue;
             estimate.* = .{
@@ -2423,8 +2483,204 @@ pub const Adapter = struct {
         return result;
     }
 
+    const RetainedStatement = struct {
+        alloc: std.mem.Allocator,
+        memory: @import("antfly_platform").allocator.BoundedAllocator,
+        arena: std.heap.ArenaAllocator,
+        raw: ?catalog.StatementRead = null,
+
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.raw) |ordinary| ordinary.close(ordinary.ptr);
+            self.arena.deinit();
+            std.debug.assert(self.memory.live == 0);
+            self.alloc.destroy(self);
+        }
+    };
+    const RetainedCursor = struct {
+        rows: []const catalog.Row,
+        position: usize = 0,
+        fn next(ptr: *anyopaque, _: std.mem.Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (limit == 0) return error.InvalidSqlBackendResponse;
+            const end = @min(self.rows.len, self.position +| limit);
+            const rows = self.rows[self.position..end];
+            self.position = end;
+            return .{ .rows = rows, .after = if (end < self.rows.len) rows[rows.len - 1].id else null };
+        }
+    };
+
+    fn retainedBound(self: *Adapter, a: std.mem.Allocator, value: ast.Value) ![]const u8 {
+        return switch (value) {
+            .integer => |number| std.fmt.allocPrint(a, "{d}", .{number}),
+            .string => |text| text,
+            .parameter => |slot| switch (try self.graphParameter(a, slot)) {
+                .integer => |number| std.fmt.allocPrint(a, "{d}", .{number}),
+                .string => |text| text,
+                else => error.InvalidSqlParameters,
+            },
+            else => error.InvalidSqlParameters,
+        };
+    }
+
+    fn openRetainedStatement(self: *Adapter, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) !catalog.StatementRead {
+        // Read-only optimistic capture: all retained observations precede the
+        // ordinary snapshot capture, and all are certified afterwards. A
+        // monotone owner sequence proves a common visibility interval without
+        // holding primary writers across RPCs or materialization. Retry before
+        // exposing any cursor; contention never produces mixed snapshots.
+        for (0..8) |_| {
+            try self.context.ensureActive();
+            const captured = self.captureRetainedStatement(alloc, requests) catch |err| switch (err) {
+                error.RetainedReadRestartRequired => continue,
+                else => return err,
+            };
+            if (captured) |read| return read;
+        }
+        return error.RetainedReadRestartRequired;
+    }
+
+    fn captureRetainedStatement(self: *Adapter, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) !?catalog.StatementRead {
+        if (self.range_reads != null or self.active_transaction != null or self.dynamic_snapshot != null or self.read_requirements.after_write != null) return error.UnsupportedSqlExecution;
+        // Raw staged-write overlays have no maintained-state counterpart.
+        // Certification covers committed snapshots, never an unstaged rollup.
+        if (self.staged) |staged| if (staged.tables.len != 0) return error.UnsupportedSqlExecution;
+        if (requests.len == 0 or requests.len > 64) return error.SqlProgramLimitExceeded;
+        const owner = try alloc.create(RetainedStatement);
+        owner.* = .{ .alloc = alloc, .memory = .{ .backing = self.server.alloc, .limit = 32 * 1024 * 1024 }, .arena = undefined };
+        owner.arena = std.heap.ArenaAllocator.init(owner.memory.allocator());
+        errdefer RetainedStatement.close(owner);
+        return self.captureRetainedStatementAdmitted(owner, requests) catch |err| {
+            return if (err == error.OutOfMemory and owner.memory.denied) error.SqlProgramLimitExceeded else err;
+        };
+    }
+    fn captureRetainedStatementAdmitted(self: *Adapter, owner: *RetainedStatement, requests: []const catalog.StatementScan) !?catalog.StatementRead {
+        const alloc = owner.alloc;
+        const a = owner.arena.allocator();
+        const cursors = try a.alloc(catalog.Cursor, requests.len);
+        var ordinary: std.ArrayList(catalog.StatementScan) = .empty;
+        var positions: std.ArrayList(usize) = .empty;
+        var budget: usize = 32 * 1024 * 1024;
+        var captures = std.ArrayList(@import("retained_dataset_read.zig").Capture).empty;
+        for (requests, cursors, 0..) |request, *cursor, index| {
+            if (request.table.retained) |binding| {
+                const rows = try self.materializeRetainedRows(a, owner.memory.allocator(), request.table, request.request, binding.*, &budget, &captures);
+                const reader = try a.create(RetainedCursor);
+                reader.* = .{ .rows = rows };
+                cursor.* = .{ .ptr = reader, .next = RetainedCursor.next, .close = StatementRead.borrowedClose, .estimated_rows = rows.len, .order_satisfied = request.request.order.len == 0 };
+            } else {
+                try ordinary.append(a, request);
+                try positions.append(a, index);
+            }
+        }
+        if (ordinary.items.len != 0) {
+            owner.raw = try openStatement(self, alloc, ordinary.items);
+            if (owner.raw.?.cursors.len != positions.items.len) return error.InvalidSqlBackendResponse;
+            for (owner.raw.?.cursors, positions.items) |cursor, index| cursors[index] = cursor;
+        }
+        if ((captures.items.len > 1 or ordinary.items.len != 0) and !try @import("retained_dataset_read.zig").certify(self.server, a, captures.items, self.context)) {
+            RetainedStatement.close(owner);
+            return null;
+        }
+        return .{ .ptr = owner, .cursors = cursors, .close = RetainedStatement.close };
+    }
+
+    fn materializeRetainedRows(self: *Adapter, a: std.mem.Allocator, working: std.mem.Allocator, table: catalog.Table, scan_request: catalog.Scan, binding: catalog.Table.RetainedBinding, budget: *usize, captures: *std.ArrayList(@import("retained_dataset_read.zig").Capture)) ![]const catalog.Row {
+        try self.verify(a, table);
+        if (scan_request.after != null or scan_request.include_primary_digest or scan_request.search != null or scan_request.index_equality != null) return error.UnsupportedSqlExecution;
+        const scope = table.scope orelse return error.InvalidSqlBackendResponse;
+        const read = @import("retained_dataset_read.zig");
+        const target: system_catalog.Target = .{ .database = scope.database, .namespace = scope.namespace, .table = scope.name };
+        const snapshot = try read.fetchReadCut(self.server, a, target, self.context);
+        const local = @import("antfly_local_sources");
+        var descriptor = try local.system_catalog_retained_datasets.parse(a, snapshot.resource.source_json);
+        defer descriptor.deinit();
+        const definition = descriptor.value.definition;
+        if (snapshot.resource.id != table.id or definition.generation != binding.generation or !std.mem.eql(u8, &definition.id, &binding.dataset) or
+            !std.mem.eql(u8, &try definition.fingerprint(a), &binding.fingerprint)) return error.CatalogGenerationChanged;
+        const summary = definition.summary orelse return error.UnsupportedSqlExecution;
+        var dimension_filter: ?[]const u8 = null;
+        if (summary.dimensions.len != 0) point: {
+            const values = try a.alloc(std.json.Value, summary.dimensions.len);
+            for (summary.dimensions, values) |name, *value| {
+                const term = for (scan_request.conditions) |condition| {
+                    if (std.mem.eql(u8, name, condition.column) and (condition.op == .eq or condition.op == .is_null)) break condition;
+                } else break :point;
+                value.* = if (term.op == .is_null) .null else term.datum().value;
+            }
+            // Equality hints may use a SQL-coercible operand that is not a
+            // stored dimension encoding. Decline that optimization and keep
+            // SQL's original comparison rather than adding a new type error.
+            dimension_filter = read.canonicalDimensions(a, definition, values) catch |err| switch (err) {
+                error.InvalidDatasetCoverage => null,
+                else => return err,
+            };
+        }
+        const window = if (scan_request.order.len == 0 and scan_request.conditions.len == 0 and scan_request.primary_key == null) scan_request.ordered_window else null;
+        const prefix = if (window) |maximum| maximum > 0 and maximum <= read.max_input_rows else false;
+        const projection = try @import("retained_sql_projection.zig").Projection.init(a, summary, scan_request);
+        const request: read.Request = .{ .start_ns = try self.retainedBound(a, binding.definition.start), .end_ns = try self.retainedBound(a, binding.definition.end), .max_rows = if (prefix) @intCast(window.?) else read.max_input_rows, .dimensions_json = dimension_filter, .page = prefix };
+        var result = try read.readResolvedAdmitted(self.server, working, snapshot, definition, request, self.context, prefix);
+        defer result.deinit();
+        var native_owners: usize = 0;
+        for (snapshot.owners) |owner| if (owner.independent_receipt == null) {
+            native_owners += 1;
+        };
+        if (result.captures.len != native_owners) return error.RetainedReadRestartRequired;
+        if (result.captures.len > 4096 -| captures.items.len) return error.SqlProgramLimitExceeded;
+        for (result.captures) |capture| {
+            const cost = @sizeOf(read.Capture) + capture.table.len;
+            if (cost > budget.*) return error.SqlProgramLimitExceeded;
+            budget.* -= cost;
+            var owned = capture;
+            owned.table = try a.dupe(u8, capture.table);
+            try captures.append(a, owned);
+        }
+        var rows: std.ArrayList(catalog.Row) = .empty;
+        row_loop: for (result.rows) |row| {
+            try self.context.ensureActive();
+            const key = local.storage_retained_series_archive.key(row);
+            if (scan_request.primary_key) |primary| if (!std.mem.eql(u8, primary, &key)) continue;
+            const cost = projection.rowCost(row);
+            if (cost > budget.*) return error.SqlProgramLimitExceeded;
+            budget.* -= cost;
+            var projected = try projection.project(a, row);
+            projected.version = binding.generation;
+            for (scan_request.conditions) |condition| {
+                const value = if (std.mem.eql(u8, condition.column, "_id")) std.json.Value{ .string = &key } else (try (try projected.cell(condition.column)).requireValue()).value;
+                switch (condition.op) {
+                    .is_null => if (value != .null) continue :row_loop,
+                    .is_not_null => if (value == .null) continue :row_loop,
+                    else => {
+                        const operand = condition.datum();
+                        if (value == .null or operand.sql_null) continue :row_loop;
+                        const column = try table.column(condition.column);
+                        const order = if (column.type == .datetime)
+                            std.math.order(local.datetime.rangeNanoseconds(value) orelse return error.SqlTypeMismatch, local.datetime.rangeNanoseconds(operand.value) orelse return error.SqlTypeMismatch)
+                        else
+                            try local.sql_scalar.compareDatums(.fromJson(value), operand);
+                        const matches = switch (condition.op) {
+                            .eq => order == .eq,
+                            .neq => order != .eq,
+                            .lt => order == .lt,
+                            .lte => order != .gt,
+                            .gt => order == .gt,
+                            .gte => order != .lt,
+                            else => unreachable,
+                        };
+                        if (!matches) continue :row_loop;
+                    },
+                }
+            }
+            try rows.append(a, projected);
+        }
+        try self.verify(a, table);
+        return rows.items;
+    }
+
     fn openStatement(ptr: *anyopaque, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) anyerror!catalog.StatementRead {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
+        for (requests) |request| if (request.table.retained != null) return self.openRetainedStatement(alloc, requests);
         for (requests) |request| if (request.table.graph != null) return self.openGraphStatement(alloc, requests);
         for (requests) |request| if (request.table.external_base_source != null) return self.openLakeStatement(alloc, requests);
         if (self.dynamic_snapshot != null) return self.openDynamicStatement(alloc, requests);
@@ -2739,6 +2995,8 @@ fn classifyMutationFailure(status: u16, body: []const u8) MutationFailure {
 }
 
 fn definiteMutationFailure(status: u16, native: []const u8) ?anyerror {
+    const retained = @import("retained_series_errors.zig");
+    if (retained.decode(native)) |reason| if (status == retained.describe(reason).status) return reason;
     if (status == 409) {
         if (std.mem.eql(u8, native, "batch transaction conflicted") or std.mem.eql(u8, native, "PreparedReadSetChanged") or std.mem.eql(u8, native, "VersionConflict")) return error.SqlWriteConflict;
         if (std.mem.eql(u8, native, "UniqueConstraintViolation")) return error.DuplicateSqlRow;
@@ -4959,4 +5217,49 @@ test "lake SQL GRAPH_TABLE shared graph joins reuse typed bindings and bounded s
     try std.testing.expect(!try sameGraphSyntax(cypher.ast.Query, one.query, different.query, &budget));
     budget.remaining = 0;
     try std.testing.expect(!try sameGraphSyntax(cypher.ast.Query, one.query, one.query, &budget));
+}
+
+test "SQL retained source responses preserve definitive failures without overriding unknown commit outcomes" {
+    const a = std.testing.allocator;
+    for ([_]struct { reason: anyerror, status: u16 }{
+        .{ .reason = error.RetainedSeriesSourceDraining, .status = 503 },
+        .{ .reason = error.RetainedSeriesCorrectionWindow, .status = 409 },
+        .{ .reason = error.RetainedSeriesCoverageMissing, .status = 409 },
+        .{ .reason = error.RetainedSeriesBatchTooLarge, .status = 413 },
+        .{ .reason = error.InvalidRetainedSeriesRow, .status = 422 },
+        .{ .reason = error.RetainedSeriesNumericOverflow, .status = 422 },
+        .{ .reason = error.RetainedSeriesTimeOverflow, .status = 422 },
+    }) |item| {
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .@"error" = @errorName(item.reason) }, .{});
+        defer a.free(bytes);
+        try std.testing.expectEqual(item.reason, classifyMutationFailure(item.status, bytes).err);
+        try std.testing.expectEqual(@as(?anyerror, null), definiteMutationFailure(500, @errorName(item.reason)));
+        const unknown = try std.json.Stringify.valueAlloc(a, .{ .@"error" = @errorName(item.reason), .status = "committed_pending" }, .{});
+        defer a.free(unknown);
+        try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(item.status, unknown).err);
+    }
+}
+
+test "SQL retained source capture rejects staged raw writes before opening snapshots" {
+    var tables = [_]@import("transactions.zig").TableCommitRequest{.{ .table_name = @constCast("events"), .batch = .{} }};
+    var staged: @import("transactions.zig").OwnedTransactionCommitRequest = .{ .tables = &tables };
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = undefined, .identity = &identity, .context = .{}, .staged = &staged };
+    // No server or snapshot access is safe here: the committed rollup cannot
+    // represent the raw overlay, regardless of which source the query scans.
+    try std.testing.expectError(error.UnsupportedSqlExecution, adapter.captureRetainedStatement(std.testing.allocator, &.{}));
+}
+
+test "SQL retained source range uses a separate read-only table function binding" {
+    const a = std.testing.allocator;
+    const compiler = @import("antfly_local_sources").sql_compiler;
+    var compiled = try compiler.compile(a, "SELECT bucket_start FROM retained_summary(public.stats, $1, '600')", .{});
+    defer compiled.deinit();
+    const relation = compiled.statement.select.source.?.table;
+    const dataset = relation.retained.?;
+    try std.testing.expect(relation.graph == null and relation.search == null and !relation.mutation_target);
+    try std.testing.expectEqualStrings("public", dataset.name.namespace.?);
+    try std.testing.expectEqualStrings("stats", dataset.name.table);
+    try std.testing.expectEqual(@as(u32, 1), dataset.start.parameter);
+    try std.testing.expectEqualStrings("600", dataset.end.string);
 }

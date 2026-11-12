@@ -23,7 +23,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Older owners must reject their operation identifiers before dispatch.
 // Version 90 also fences certified graph document-key descriptor domains.
 // Version 91 fences selected-role merge-readiness projection responses.
-pub const abi_version: u32 = 91;
+// Version 92 combines retained owner descriptors with bounded controlled native readers.
+pub const abi_version: u32 = 92;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -2004,6 +2005,23 @@ pub extern fn antfly_storage_owner_backup_pin_control_json(
     request: *const ControlledJsonOperationRequest,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_retained_query_json(
+    owner: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
+    out: *OwnedBytes,
+) callconv(.c) Status;
+pub extern fn antfly_storage_owner_retained_read_open(
+    owner: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
+    out_session: *?*anyopaque,
+) callconv(.c) Status;
+pub extern fn antfly_storage_retained_read_next_json(
+    session: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
+    out: *OwnedBytes,
+) callconv(.c) Status;
+pub extern fn antfly_storage_retained_read_close(session: ?*anyopaque) callconv(.c) void;
 
 pub extern fn antfly_storage_owner_source_artifact_json(
     owner: ?*anyopaque,

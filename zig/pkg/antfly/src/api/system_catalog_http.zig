@@ -119,6 +119,7 @@ fn projectMutation(alloc: std.mem.Allocator, a: std.mem.Allocator, kind: domain.
         .query_source => response(alloc, status, try sourceValue(a, resource)),
         .graph => response(alloc, status, try graphValue(a, null, resource)),
         .table => error.InvalidCatalogMutation,
+        .dataset => error.UnsupportedOperation,
     };
 }
 
@@ -148,6 +149,7 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
             .query_source => response(alloc, status, try sourceValue(a, resource)),
             .graph => response(alloc, status, try graphValue(a, state, resource)),
             .table => failure(alloc, error.InvalidCatalogMutation),
+            .dataset => failure(alloc, error.UnsupportedOperation),
         };
     }
     switch (route.kind) {
@@ -192,6 +194,7 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
             return response(alloc, status, out.items);
         },
         .table => return failure(alloc, error.InvalidCatalogMutation),
+        .dataset => return failure(alloc, error.UnsupportedOperation),
     }
 }
 

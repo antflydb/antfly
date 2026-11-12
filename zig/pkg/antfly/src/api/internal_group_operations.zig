@@ -1531,7 +1531,7 @@ fn consumerTests() type {
                 source.failure = @field(errors.Error, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
-            const execution_errors = @import("antfly_local_sources").schema_relational_expression_errors.Error || @import("relational_row_errors.zig").PolicyError;
+            const execution_errors = @import("antfly_local_sources").storage_retained_series_control.Rejection || @import("antfly_local_sources").schema_relational_expression_errors.Error || @import("relational_row_errors.zig").PolicyError;
             inline for (@typeInfo(execution_errors).error_set.error_names.?) |field| {
                 source.failure = @field(execution_errors, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));

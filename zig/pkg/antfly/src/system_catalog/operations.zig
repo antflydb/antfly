@@ -96,7 +96,7 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
             .indexes_json = create_req.indexes_json orelse tables_api.default_indexes_json,
         });
     }
-    const required_version = @max(if (request.mutation.native_service != null) protocol.native_service_tables_version else @as(u16, 0), @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (request.mutation.kind == .graph) protocol.graph_definition_version else if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version));
+    const required_version = @max(if (request.mutation.native_service != null) protocol.native_service_tables_version else @as(u16, 0), @max(if (resolver_create) protocol.resolver_namespaces_version else @as(u16, 0), if (request.mutation.kind == .dataset) protocol.retained_datasets_version else if (request.mutation.kind == .graph) protocol.graph_definition_version else if (object_create) protocol.object_table_engine_version else if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version));
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
@@ -107,6 +107,10 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     defer arena.deinit();
     const a = arena.allocator();
     const admission = try store.systemCatalogAdmission(a, svc.metadata_group_id, request.mutation);
+    if (request.expected_catalog_revision) |expected| {
+        if (request.mutation.kind != .dataset or request.mutation.action != .create) return error.InvalidCatalogMutation;
+        if (admission.meta.revision != expected) return error.CatalogGenerationChanged;
+    }
     var command: storage.SystemCatalogCommand = .{ .expected_revision = admission.meta.revision, .mutation = request.mutation };
     if (request.mutation.action == .create and request.mutation.kind == .table) {
         const json = request.create_table_json orelse return error.InvalidCatalogMutation;
@@ -506,8 +510,67 @@ fn listTablesJson(svc: anytype, alloc: std.mem.Allocator, context: operation.Req
     return result;
 }
 
+pub fn verifyRetainedArchive(
+    a: std.mem.Allocator,
+    config: *const @import("antfly_local_sources").common_config.Config,
+    secrets: ?*@import("antfly_local_sources").common_secrets.FileStore,
+    io: std.Io,
+    context: *const operation.RequestContext,
+    scope: @import("../metadata/retained_dataset_owners.zig").ArchiveScope,
+    snapshot: @import("../api/retained_owner_control.zig").Snapshot,
+) !@import("../metadata/retained_dataset_owners.zig").ArchiveAcknowledgement {
+    const local = @import("antfly_local_sources");
+    const closed = snapshot.owner.cut orelse return error.RetainedOwnerPlanChanged;
+    if (snapshot.plan.phase != .closing or snapshot.owner.mode != .closed or snapshot.owner.independent_receipt != null) return error.RetainedOwnerPlanChanged;
+    var descriptor = try local.system_catalog_retained_datasets.parse(a, snapshot.resource.source_json);
+    defer descriptor.deinit();
+    const spec = try @import("../api/retained_owner_binding.zig").specification(a, descriptor.value.definition, snapshot.owner.partition, snapshot.owner.incarnation);
+    const cut: @import("../serverless/datasets/closure_manifest.zig").Cut = .{ .closure = closed.closure, .sequence = closed.sequence, .complete_from_ns = try std.fmt.parseInt(i128, closed.complete_from_ns, 10), .admitted_ns = try std.fmt.parseInt(i128, closed.admitted_ns, 10) };
+    // Verify independently with the metadata host's read-only connection.
+    // The owner request carries no catalog receipt or storage location.
+    const receipt = verify: {
+        var archive = try @import("../serverless/datasets/configured_archive.zig").Opened.init(a, config, secrets, descriptor.value, true);
+        defer archive.deinit();
+        const manifest = (try archive.store(io, context).getClosedExport(spec, cut)) orelse return error.DatasetDependencyPending;
+        break :verify try manifest.receipt();
+    };
+    return .{ .scope = scope, .closure = closed.closure, .receipt = receipt };
+}
+
+fn archiveRetainedOwner(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, scope: @import("../metadata/retained_dataset_owners.zig").ArchiveScope) ![]u8 {
+    if (!context.setting_admin) return error.Forbidden;
+    const model = @import("../metadata/retained_dataset_owners.zig");
+    const read: model.Read = .{ .owner = scope };
+    try read.validate();
+    const config = svc.retained_archive_config orelse return error.InvalidDatasetBinding;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.retained_archive_acknowledgements_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try store.retainedOwnerReadJson(a, svc.metadata_group_id, read);
+    const snapshot = try std.json.parseFromSliceLeaky(@import("../api/retained_owner_control.zig").Snapshot, a, bytes, .{});
+    const io = (try svc.ensureBackendRuntime()).apiIo() orelse return error.BackendRuntimeUnavailable;
+    const proof = try verifyRetainedArchive(a, config, svc.secret_store, io, &context, scope, snapshot);
+    svc.lockCatalogMutation();
+    defer svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    try context.ensureActive();
+    const admitted = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .acknowledge_retained_archive = proof });
+    svc.waitForTransitionAppliedWithContext(admitted, context) catch return error.MetadataMutationOutcomeUnknown;
+    var observed_scope = scope;
+    observed_scope.revision += 1;
+    const observed = store.retainedOwnerReadJson(alloc, svc.metadata_group_id, .{ .owner = observed_scope }) catch return error.MetadataMutationOutcomeUnknown;
+    errdefer alloc.free(observed);
+    const result = std.json.parseFromSliceLeaky(struct { owner: model.Owner }, a, observed, .{ .ignore_unknown_fields = true }) catch return error.MetadataMutationOutcomeUnknown;
+    if (!std.meta.eql(result.owner.independent_receipt, @as(?model.Id, proof.receipt))) return error.MetadataMutationOutcomeUnknown;
+    return observed;
+}
+
 pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) anyerror![]u8 {
     return switch (input) {
+        .api_node_uri => |node| @import("../api/api_node_directory.zig").readJson(svc, alloc, node, context),
         .resolver_authority_mutate => |write| @import("../metadata/resolver_authority.zig").mutateOnService(svc, alloc, write, context),
         .resolver_catalog_read => |read| blk: {
             try svc.ensureLinearizableReadWithContext(context);
@@ -516,6 +579,121 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             errdefer alloc.free(bytes);
             try context.ensureActive();
             break :blk bytes;
+        },
+        .retained_source_candidate => |target| blk: {
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.retainedSourceCandidateJson(alloc, svc.metadata_group_id, target);
+        },
+        .retained_dataset_read_cut => |target| blk: {
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.retainedDatasetReadCutJson(alloc, svc.metadata_group_id, target);
+        },
+        .retained_dataset_pending => |after| blk: {
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.retainedDatasetPendingJson(alloc, svc.metadata_group_id, after);
+        },
+        .retained_dataset_activate, .retained_dataset_release => |request| blk: {
+            const releasing = input == .retained_dataset_release;
+            if (!context.setting_admin) return error.Forbidden;
+            try request.validate();
+            const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (releasing) protocol.retained_archive_acknowledgements_version else protocol.retained_datasets_version);
+            svc.lockCatalogMutation();
+            defer svc.unlockCatalogMutation();
+            try svc.ensureLinearizableReadWithContext(context);
+            try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const before_bytes = try store.retainedOwnerReadJson(alloc, svc.metadata_group_id, .{ .plan = .{ .resource = request.resource, .generation = request.generation } });
+            defer alloc.free(before_bytes);
+            var before = try std.json.parseFromSlice(?@import("../metadata/retained_dataset_owners.zig").Plan, alloc, before_bytes, .{});
+            defer before.deinit();
+            const plan = before.value orelse return error.RetainedOwnerPlanChanged;
+            if (!std.mem.eql(u8, &plan.id, &request.plan) or plan.revision != request.revision) return error.RetainedOwnerPlanChanged;
+            if (releasing) {
+                if (!plan.canReleaseSource()) return error.RetainedOwnerPlanChanged;
+            } else {
+                _ = try plan.activate();
+            }
+            const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, if (releasing) .{ .release_retained_source = request } else .{ .activate_retained_dataset = request });
+            svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+            const bytes = store.retainedOwnerReadJson(alloc, svc.metadata_group_id, .{ .plan = .{ .resource = request.resource, .generation = request.generation } }) catch return error.MetadataMutationOutcomeUnknown;
+            errdefer alloc.free(bytes);
+            var observed = try std.json.parseFromSlice(?@import("../metadata/retained_dataset_owners.zig").Plan, alloc, bytes, .{});
+            defer observed.deinit();
+            const after = observed.value orelse return error.MetadataMutationOutcomeUnknown;
+            if (!std.mem.eql(u8, &after.id, &request.plan) or (if (releasing) after.source_release_receipt == null else after.phase != .active)) return error.MetadataMutationOutcomeUnknown;
+            break :blk bytes;
+        },
+        .retained_owner_archive => |scope| archiveRetainedOwner(svc, alloc, context, scope),
+        .retained_owner_acknowledge => |proof| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try proof.verify();
+            const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.retained_owner_acknowledgements_version);
+            svc.lockCatalogMutation();
+            defer svc.unlockCatalogMutation();
+            try svc.ensureLinearizableReadWithContext(context);
+            try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            try store.validateRetainedOwnerReceipt(svc.metadata_group_id, proof);
+            const admitted = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .acknowledge_retained_owner = proof });
+            svc.waitForTransitionAppliedWithContext(admitted, context) catch return error.MetadataMutationOutcomeUnknown;
+            // A stale committed command is a semantic no-op. Return success
+            // only after seeing its exact native receipt on the owner row.
+            const bytes = store.retainedOwnerReadJson(alloc, svc.metadata_group_id, .{ .owner = .{
+                .resource = proof.resource,
+                .generation = proof.generation,
+                .plan = proof.plan,
+                .group = proof.group,
+                .revision = proof.owner_revision + 1,
+            } }) catch return error.MetadataMutationOutcomeUnknown;
+            errdefer alloc.free(bytes);
+            var observed = std.json.parseFromSlice(struct { owner: @import("../metadata/retained_dataset_owners.zig").Owner }, alloc, bytes, .{ .ignore_unknown_fields = true }) catch return error.MetadataMutationOutcomeUnknown;
+            defer observed.deinit();
+            if (observed.value.owner.native_receipt == null or !std.mem.eql(u8, &observed.value.owner.native_receipt.?, &try proof.digest())) return error.MetadataMutationOutcomeUnknown;
+            break :blk bytes;
+        },
+        .retained_owner_register => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try request.validate();
+            const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.retained_datasets_version);
+            svc.lockCatalogMutation();
+            defer svc.unlockCatalogMutation();
+            try svc.ensureLinearizableReadWithContext(context);
+            try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const before_bytes = try store.retainedOwnerReadJson(alloc, svc.metadata_group_id, .{ .plan = .{ .resource = request.resource, .generation = request.generation } });
+            defer alloc.free(before_bytes);
+            var before = try std.json.parseFromSlice(?@import("../metadata/retained_dataset_owners.zig").Plan, alloc, before_bytes, .{});
+            defer before.deinit();
+            const plan = before.value orelse return error.RetainedOwnerPlanChanged;
+            if (!std.mem.eql(u8, &plan.id, &request.plan) or plan.revision != request.revision or plan.phase != .activating or plan.registration_complete) return error.RetainedOwnerPlanChanged;
+            const receipt = try @import("../metadata/service.zig").proposeCatalogWithContext(svc, context, .{ .register_retained_owners = request });
+            svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+            const bytes = store.retainedOwnerReadJson(alloc, svc.metadata_group_id, .{ .plan = .{ .resource = request.resource, .generation = request.generation } }) catch return error.MetadataMutationOutcomeUnknown;
+            errdefer alloc.free(bytes);
+            var observed = std.json.parseFromSlice(?@import("../metadata/retained_dataset_owners.zig").Plan, alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+            defer observed.deinit();
+            const after = observed.value orelse return error.MetadataMutationOutcomeUnknown;
+            if (!std.mem.eql(u8, &after.id, &request.plan) or after.revision <= request.revision or after.registered <= plan.registered or after.phase != .activating) return error.MetadataMutationOutcomeUnknown;
+            try context.ensureActive();
+            break :blk bytes;
+        },
+        .retained_owner_read => |request| blk: {
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const bytes = try store.retainedOwnerReadJson(alloc, svc.metadata_group_id, request);
+            errdefer alloc.free(bytes);
+            try context.ensureActive();
+            break :blk bytes;
+        },
+        .retained_dataset_work => |request| blk: {
+            try context.ensureActive();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.retainedDatasetWorkJson(alloc, svc.metadata_group_id, request.after_id, request.native);
         },
         .lake_source_owner_read => |table_id| @import("../metadata/lake_source_owner_view.zig").readOnService(svc, alloc, table_id, context),
         .lake_index_lifecycle_read => |table_id| @import("../metadata/lake_index_lifecycle.zig").readOnService(svc, alloc, table_id, context),

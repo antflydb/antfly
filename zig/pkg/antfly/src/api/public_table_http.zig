@@ -105,7 +105,7 @@ pub const TableApi = struct {
         };
     }
 
-    pub const ExecuteBatchError = error{
+    pub const ExecuteBatchError = @import("retained_series_errors.zig").Error || error{
         RelationalIndexKeyTooLarge,
         InvalidBatchRequest,
         Forbidden,
@@ -1775,6 +1775,10 @@ pub fn handleNativeTableBatch(alloc: std.mem.Allocator, table_name: []const u8, 
 
 fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batch_req: batch_api.OwnedBatchRequest, api: TableApi) !OwnedResponse {
     api.executeTableBatch(alloc, table_name, batch_req.req) catch |err| switch (err) {
+        error.InvalidRetainedSeriesRow, error.RetainedSeriesBatchTooLarge, error.RetainedSeriesCorrectionWindow, error.RetainedSeriesCoverageMissing, error.RetainedSeriesSourceDraining, error.RetainedSeriesNumericOverflow, error.RetainedSeriesTimeOverflow => {
+            const spec = @import("retained_series_errors.zig").describe(@errorCast(err));
+            return .{ .status = spec.status, .json = true, .retry_after_seconds = if (spec.retryable) 1 else null, .body = try std.json.Stringify.valueAlloc(alloc, .{ .@"error" = @errorName(err), .code = spec.code, .message = spec.message, .retryable = spec.retryable }, .{}) };
+        },
         error.RelationalIndexKeyTooLarge => return .{ .status = 413, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"RelationalIndexKeyTooLarge\",\"message\":\"encoded relational index keys, including the document ID, must not exceed 1048576 bytes\"}") },
         error.Forbidden => return .{ .status = 403, .body = try alloc.dupe(u8, "write permission required for every table affected by this mutation") },
         error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
@@ -3877,6 +3881,8 @@ test "public table batch handler maps write unavailable errors" {
         retry_after_seconds: ?u32 = null,
     }{
         .{ .err = error.WriteUnavailable, .status = 503, .body = "write unavailable" },
+        .{ .err = error.RetainedSeriesSourceDraining, .status = 503, .body = "{\"error\":\"RetainedSeriesSourceDraining\",\"code\":\"retained_series_source_draining\",\"message\":\"Retained dataset closure is draining prepared writes; retry shortly.\",\"retryable\":true}", .json = true, .retry_after_seconds = 1 },
+        .{ .err = error.RetainedSeriesCorrectionWindow, .status = 409, .body = "{\"error\":\"RetainedSeriesCorrectionWindow\",\"code\":\"retained_series_correction_window\",\"message\":\"The mutation changes finalized retained history.\",\"retryable\":false}", .json = true },
         .{ .err = error.WritePrecommitReadUnavailable, .status = 503, .body = "{\"code\":\"transaction_precommit_read_unavailable\",\"message\":\"a required integrity read is unavailable; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.ConstraintActivationUnavailable, .status = 503, .body = "{\"code\":\"constraint_activation_pending\",\"message\":\"constraint activation is not ready; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.WriteDefinitelyAbortedUnavailable, .status = 503, .body = "{\"code\":\"transaction_precommit_aborted\",\"message\":\"the transaction was durably aborted before commit; retrying the batch is safe\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },

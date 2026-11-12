@@ -25,8 +25,8 @@ pub const Route = struct {
     suffix: []const u8 = "",
 
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
-        if (self.kind == .namespace or self.kind == .table) alloc.free(self.database);
-        if (self.kind == .table) alloc.free(self.namespace);
+        if (self.kind == .namespace or self.kind == .table or self.kind == .dataset) alloc.free(self.database);
+        if (self.kind == .table or self.kind == .dataset) alloc.free(self.namespace);
         if (self.name) |name| alloc.free(name);
     }
 
@@ -65,6 +65,10 @@ pub fn parseAlloc(alloc: std.mem.Allocator, path: []const u8) !?Route {
     errdefer alloc.free(ns);
     const ns_suffix = parts.rest();
     const third = parts.next() orelse return .{ .kind = .namespace, .name = ns, .database = db, .namespace = ns };
+    if (std.mem.eql(u8, third, "datasets")) {
+        const dataset_name = parts.next() orelse return .{ .kind = .dataset, .database = db, .namespace = ns };
+        return .{ .kind = .dataset, .name = try nameAlloc(alloc, dataset_name), .database = db, .namespace = ns, .suffix = parts.rest() };
+    }
     if (!std.mem.eql(u8, third, "tables")) return .{ .kind = .namespace, .name = ns, .database = db, .namespace = ns, .suffix = ns_suffix };
     const table_raw = parts.next() orelse return .{ .kind = .table, .database = db, .namespace = ns };
     return .{ .kind = .table, .name = try tableNameAlloc(alloc, table_raw), .database = db, .namespace = ns, .suffix = parts.rest() };
@@ -89,7 +93,7 @@ pub fn resourceNameAlloc(alloc: std.mem.Allocator, route: Route) ![]u8 {
     return switch (route.kind) {
         .database, .tablespace, .query_source, .graph => alloc.dupe(u8, name),
         .namespace => std.fmt.allocPrint(alloc, "{s}.{s}", .{ route.database, name }),
-        .table => (domain.TableScope{ .database = route.database, .namespace = route.namespace, .table = route.name }).keyAlloc(alloc),
+        .table, .dataset => (domain.TableScope{ .database = route.database, .namespace = route.namespace, .table = route.name }).keyAlloc(alloc),
     };
 }
 

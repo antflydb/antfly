@@ -40,14 +40,34 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 29;
-/// Version 29 understands dense text-origin and int8-stub flags. Activation
-/// certifies every applying replica before these envelopes or fragments appear.
-pub const batch_dense_artifact_flags_protocol_version: u16 = 29;
+/// Version 32 reclaims revoked retained state in bounded batches.
+pub const batch_protocol_version: u16 = 36;
+/// Version 35 requires exact retained numeric state and archive encoding 3.
+/// Version 34 fences archival revocation against the transferred retention clock.
+pub const batch_retained_clock_handoff_protocol_version: u16 = 35;
+/// Version 33 durably admits retention read clocks without changing replay.
+pub const batch_retained_read_admission_protocol_version: u16 = 33;
+/// Main introduced dense text-origin/int8-stub flags at version 29 while the
+/// retained branch independently advanced to 35. Version 36 certifies the
+/// combined decoder; advertising retained v35 alone cannot prove flag support.
+pub const batch_dense_artifact_flags_protocol_version: u16 = 36;
 /// Version 28 preserves neutral document-version semantics when decoding
 /// guarded graph cleanup. Earlier v27 peers reject these commands, so the
 /// corrected leader must activate this version across every applying replica.
 pub const batch_graph_cleanup_neutral_protocol_version: u16 = 28;
+/// Version 29 maintains retained summaries in primary commits, including durable
+/// producer revocation so delayed installs cannot resurrect capture after
+/// source dependency release.
+/// Version 30 persists an immutable closure clock separately from the moving
+/// retention clock, and a fair maintenance cursor which survives leader changes.
+/// Version 31 fences owner-derived installs against the actual source schema,
+/// including legacy extraction programs without a compiled projection.
+pub const batch_retained_series_protocol_version: u16 = 35;
+pub fn retainedSeriesCommandVersion(command: anytype) u16 {
+    if (command.action == .archive_handoff or command.expected_admitted_ns != null) return batch_retained_clock_handoff_protocol_version;
+    return if (command.action == .admit_retention) batch_retained_read_admission_protocol_version else batch_retained_series_protocol_version;
+}
+
 /// Explicit document revision semantics and source-preserving retained tails.
 /// Missing command tags retain the pre-v27 timestamp semantics on replay.
 pub const batch_document_revisions_protocol_version: u16 = 27;
@@ -95,3 +115,9 @@ pub const batch_merge_retirements_protocol_version: u16 = 20;
 /// Version 22 adds qualified endpoint cleanup, ordered retirement stamps, and
 /// bounded owner revival pages. It subsumes version 21 endpoint incarnations.
 pub const batch_graph_cleanup_generation_protocol_version: u16 = 22;
+
+test "retained series merged decoder barrier includes dense artifact flags" {
+    const std = @import("std");
+    try std.testing.expect(batch_dense_artifact_flags_protocol_version > batch_retained_series_protocol_version);
+    try std.testing.expect(batch_protocol_version >= batch_dense_artifact_flags_protocol_version);
+}

@@ -295,6 +295,18 @@ test "row-policy Raft apply persists fail-closed intent and finalizes after rest
                 .range_end = range.end,
             }).digest(),
         };
+        // A delayed policy-install RPC must recheck native capture under the
+        // same apply fence as retained installation. Retirement then releases
+        // the source without requiring an empty initial backfill to finish.
+        const sources = @import("antfly_local_sources");
+        var partition: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&sources.storage_db_online_source_contract.namespaceBytes(namespace), &partition, .{});
+        const binding: sources.storage_retained_series_capture.Binding = .{ .spec = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .source_partition = partition, .source_incarnation = 1, .interval_ns = 10, .mutable_for_ns = 100, .laws = &.{.count} }, .timestamp = "id", .fields = &.{null} };
+        const fence: sources.storage_retained_series_control.Fence = .{ .id = binding.spec.id, .generation = 1, .definition = binding.spec.definition, .partition = partition, .incarnation = 1 };
+        try db.batch(.{ .timestamp_ns = 1, .retained_series = .{ .action = .install, .fence = fence, .binding = binding } });
+        try std.testing.expectError(error.RowPolicyTopologyUnsupported, db.applyReplicatedRowPolicyPublication(bundle_bytes, request, .{ .term = 3, .index = 11 }));
+        try std.testing.expectEqual(table_catalog_mod.RowPolicyPhase.disabled, db.core.table_catalog.row_policy_phase);
+        try db.batch(.{ .timestamp_ns = 2, .retained_series = .{ .action = .revoke, .fence = fence } });
         var old_reader = try db.local_execution.row_policy_gate.enterRaw();
         const delayed_scan = try db.openRelationalReadSession(alloc, "", "", .{ .relational_query = .{ .fields = &.{"id"} } });
         try std.testing.expect((try db.applyReplicatedRowPolicyPublication(bundle_bytes, request, .{ .term = 3, .index = 11 })) == null);

@@ -120,7 +120,19 @@ const std = @import("std");
 /// Version 86 admits authenticated demand locators in opening bundles.
 /// Version 87 admits bootstrap selectors in reader protocol 100 publications.
 /// Version 88 admits bounded inline map navigation in reader protocol 101.
-pub const current_version: u16 = 89;
+/// Version 89 admits cold lake ranking and authenticated hydration.
+/// Version 90 owns independent retained dataset resources and source/work indexes.
+/// Version 91 journals native retained owners before activation and requires
+/// verified journal progress before source release or producer collection.
+/// Version 92 verifies signed observations against current store enrollment.
+/// Version 93 distinguishes snapshot-origin summaries from certified history.
+/// Version 94 verifies archive authority and atomically releases sources.
+/// Version 95 publishes terminal retained collection and removes scheduling work.
+pub const current_version: u16 = 95;
+pub const retained_collection_version: u16 = 95;
+pub const retained_archive_acknowledgements_version: u16 = 94;
+pub const retained_owner_acknowledgements_version: u16 = 92;
+pub const retained_datasets_version: u16 = 93;
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;
@@ -328,3 +340,11 @@ pub const store_report_baseline_version: u16 = 10;
 
 /// Atomic, bounded acknowledgements for local schema migration readiness.
 pub const schema_progress_batch_version: u16 = 10;
+
+test "retained series topology gates do not reuse main cold lake protocol versions" {
+    try std.testing.expect(retained_datasets_version > lake_index_catalog_version);
+    try std.testing.expect(retained_owner_acknowledgements_version > lake_index_catalog_version);
+    try std.testing.expect(retained_archive_acknowledgements_version > retained_datasets_version);
+    try std.testing.expect(retained_collection_version > retained_archive_acknowledgements_version);
+    try std.testing.expect(current_version >= retained_collection_version);
+}

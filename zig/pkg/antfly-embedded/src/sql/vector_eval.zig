@@ -1190,6 +1190,7 @@ fn evaluateInput(a: std.mem.Allocator, program: *const scalar.Program, inputs: a
     return vectors[0];
 }
 pub fn unary(op: @import("ast.zig").Scalar.Unary, value: Datum) !Datum {
+    _ = try value.requireValue();
     if (op == .is_null or op == .is_not_null or op == .is_unknown or op == .is_not_unknown) return Datum.json(.{ .bool = value.sql_null == (op == .is_null or op == .is_unknown) });
     if (value.array != null or value.numeric != null) return error.SqlTypeMismatch;
     if (op == .is_true or op == .is_not_true or op == .is_false or op == .is_not_false) {
@@ -1216,6 +1217,8 @@ fn comparison(op: Binary) bool {
     };
 }
 pub fn binary(op: Binary, left: Datum, right: Datum) !Datum {
+    _ = try left.requireValue();
+    _ = try right.requireValue();
     if (op == .is_distinct or op == .is_not_distinct) {
         const equal = if (left.sql_null or right.sql_null) left.sql_null and right.sql_null else (try scalar.compareDatums(left, right)) == .eq;
         return Datum.json(.{ .bool = equal == (op == .is_not_distinct) });

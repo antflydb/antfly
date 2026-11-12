@@ -2488,6 +2488,7 @@ pub const MetadataServiceConfig = struct {
     // Embedded services may cohost data; dedicated metadata runtimes opt out.
     local_data_owner: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
+    retained_archive_config: ?*const @import("antfly_local_sources").common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
@@ -3585,11 +3586,17 @@ fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16
         },
         else => {},
     }
+    if (command == .finish_retained_collection) return metadata_topology_protocol.retained_collection_version;
+    if (command == .activate_retained_dataset) return metadata_topology_protocol.retained_datasets_version;
+    if (command == .acknowledge_retained_archive or command == .release_retained_source) return metadata_topology_protocol.retained_archive_acknowledgements_version;
+    if (command == .acknowledge_retained_owner) return metadata_topology_protocol.retained_owner_acknowledgements_version;
+    if (command == .register_retained_owners) return metadata_topology_protocol.retained_datasets_version;
     if (command == .apply_transaction_sessions) return metadata_topology_protocol.transaction_sessions_version;
     if (command == .apply_system_catalog) {
         const Header = struct { mutation: struct { kind: @import("antfly_local_sources").system_catalog_domain.Kind } };
         var parsed = std.json.parseFromSlice(Header, std.heap.page_allocator, command.apply_system_catalog, .{ .ignore_unknown_fields = true }) catch return metadata_topology_protocol.current_version;
         defer parsed.deinit();
+        if (parsed.value.mutation.kind == .dataset) return metadata_topology_protocol.retained_datasets_version;
         if (parsed.value.mutation.kind == .graph) return metadata_topology_protocol.graph_definition_version;
     }
     if (command == .apply_resolver_authority or command == .advance_resolver_namespace) return metadata_topology_protocol.resolver_records_version;
@@ -6727,6 +6734,12 @@ pub const MetadataService = struct {
         return error.MetadataProposalApplyTimeout;
     }
 
+    pub fn ensureRetainedSourceDropAllowedWithContext(self: *MetadataService, request: api_operation.RequestContext, table_id: u64) !void {
+        try self.ensureLinearizableReadWithContext(request);
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        try store.requireRetainedSourceDropAllowed(self.metadata_group_id, table_id);
+    }
+
     pub fn captureTableDropAdmission(
         self: *MetadataService,
         alloc: std.mem.Allocator,
@@ -8801,6 +8814,7 @@ pub const MetadataHttpService = struct {
     // state.
     cdc_snapshot_cursor: metadata_replication_backfill.SourceRoundCursor = .{},
     cdc_streaming_cursor: metadata_replication_backfill.SourceRoundCursor = .{},
+    retained_archive_config: ?*const @import("antfly_local_sources").common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
@@ -8866,6 +8880,7 @@ pub const MetadataHttpService = struct {
             .lifecycle_signal = LifecycleSignal.init(alloc),
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
+            .retained_archive_config = cfg.retained_archive_config,
             .secret_store = cfg.secret_store,
             .internal_service_secret = cfg.internal_service_secret,
             .internal_service_issuer = cfg.internal_service_issuer,

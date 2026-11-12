@@ -31,6 +31,10 @@ pub const PatternSet = struct {
     close: *const fn (*anyopaque) void,
 };
 pub const Datum = struct {
+    /// A source cell can be structurally copied before SQL demands its value.
+    /// Stable, inline failures survive projection, joins and local spilling;
+    /// predicates and lazy branches decide whether the error is observable.
+    pub const Failure = enum(u8) { retained_numeric_overflow = 1 };
     /// Exact immutable NUMERIC payload, owned by the pinned value region.
     /// JSON null is only a placeholder and is never SQL NULL or numeric data.
     numeric: ?*const @import("numeric_value.zig").Value = null,
@@ -42,6 +46,17 @@ pub const Datum = struct {
     sql_null: bool = true,
     /// A missing JSON source member is distinct from a present JSON/SQL NULL.
     missing: bool = false,
+    failure: ?Failure = null,
+
+    pub fn failed(reason: Failure) Datum {
+        return .{ .failure = reason, .sql_null = false, .value = .{ .float = std.math.inf(f64) } };
+    }
+    pub fn requireValue(self: Datum) !Datum {
+        if (self.failure) |reason| return switch (reason) {
+            .retained_numeric_overflow => error.RetainedSeriesNumericOverflow,
+        };
+        return self;
+    }
 
     pub fn fromJson(value: Json) Datum {
         return .{ .value = value, .sql_null = value == .null };
@@ -3743,6 +3758,9 @@ const Evaluator = struct {
     }
 
     fn runDatum(self: *Evaluator, index: u32, depth: usize) anyerror!Datum {
+        return (try self.runDatumInner(index, depth)).requireValue();
+    }
+    fn runDatumInner(self: *Evaluator, index: u32, depth: usize) anyerror!Datum {
         if (depth >= self.limits.depth) return self.workOwner().limit();
         try self.workOwner().charge(1);
         const instruction = self.program.instructions[index];
@@ -5761,6 +5779,8 @@ pub fn compareDatums(left: Datum, right: Datum) anyerror!std.math.Order {
 }
 
 pub fn compareDatumsWithBudget(left: Datum, right: Datum, work: *json_order.Budget) anyerror!std.math.Order {
+    _ = try left.requireValue();
+    _ = try right.requireValue();
     try work.consume(1);
     if (left.sql_null or right.sql_null) return if (left.sql_null == right.sql_null) .eq else if (left.sql_null) .gt else .lt;
     if (left.numeric) |number| {
@@ -5786,6 +5806,7 @@ pub fn compareDatumsWithBudget(left: Datum, right: Datum, work: *json_order.Budg
 }
 
 pub fn semanticHashDatum(value: Datum) anyerror!u64 {
+    _ = try value.requireValue();
     if (value.sql_null) return 0;
     if (value.numeric) |number| {
         var none = std.heap.FixedBufferAllocator.init(&.{});

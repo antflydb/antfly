@@ -38,3 +38,7 @@ pub const local_test_sources = if (@import("builtin").is_test) @import("local_te
 test "system catalog native memory ownership storage root" {
     _ = storage.raft_apply_store;
 }
+
+test "system catalog retained owner journal storage root" {
+    _ = @import("metadata/retained_dataset_owner_store_test.zig");
+}

@@ -1,0 +1,354 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Open the same configured archive from data publishers and metadata
+//! verification. The descriptor pins the physical destination across retries.
+const std = @import("std");
+const local = @import("antfly_local_sources");
+const catalog = @import("catalog.zig");
+const artifact_store = @import("../../api/lake_index_store.zig");
+const operation = local.api_operation;
+
+pub const Opened = struct {
+    alloc: std.mem.Allocator,
+    storage: artifact_store.Store,
+    prefix: []const u8,
+    namespace: [64]u8,
+    dataset: [32]u8,
+    location_id: [32]u8,
+    writer: [16]u8,
+    clock: catalog.Clock = .{},
+
+    pub fn init(a: std.mem.Allocator, config: *const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, descriptor: local.system_catalog_retained_datasets.Descriptor, read_only: bool) !Opened {
+        var storage = try artifact_store.Store.open(a, config, secrets, read_only);
+        errdefer storage.deinit();
+        if (storage.locator.protocol == .filesystem) return error.InvalidDatasetBinding;
+        const id = locationIdentity(storage.identity);
+        if (!std.mem.eql(u8, &id, &descriptor.catalog_location) or !std.mem.eql(u8, &storage.identity, &descriptor.catalog_storage_identity)) return error.InvalidDatasetBinding;
+        const prefix = try std.fmt.allocPrint(a, "{s}/retained", .{storage.opened.prefix});
+        errdefer a.free(prefix);
+        var authority = std.crypto.hash.sha2.Sha256.init(.{});
+        authority.update("antfly/retained-archive-writer/v1");
+        authority.update(&descriptor.definition.id);
+        authority.update(&(descriptor.definition.summary orelse return error.InvalidDatasetDefinition).source);
+        const writer = authority.finalResult();
+        return .{ .alloc = a, .storage = storage, .prefix = prefix, .namespace = std.fmt.bytesToHex(descriptor.definition.id, .lower), .dataset = descriptor.definition.id, .location_id = id, .writer = writer[0..16].* };
+    }
+    pub fn deinit(self: *Opened) void {
+        self.alloc.free(self.prefix);
+        self.storage.deinit();
+    }
+    pub fn store(self: *const Opened, io: std.Io, context: *const operation.RequestContext) catalog.Catalog {
+        return .{ .context = .{ .alloc = self.alloc, .client = self.storage.opened.client, .bucket = self.storage.opened.bucket, .prefix = self.prefix, .namespace = &self.namespace, .io = io, .cancellation = .fromCallback(context, canceled) }, .dataset = self.dataset, .owner = self.writer, .clock = self.clock };
+    }
+    /// Bind transient catalog and object I/O to the caller's working budget.
+    /// The opened transport/configuration retains its own stable lifetime.
+    pub fn storeWithAllocator(self: *const Opened, a: std.mem.Allocator, io: std.Io, context: *const operation.RequestContext) catalog.Catalog {
+        var result = self.store(io, context);
+        result.context.alloc = a;
+        return result;
+    }
+    pub fn location(self: *const Opened) catalog.Location {
+        return .{ .id = self.location_id, .storage_identity = self.storage.identity, .client = self.storage.opened.client, .bucket = self.storage.opened.bucket, .prefix = self.prefix, .access = .queryable };
+    }
+    fn canceled(raw: *const anyopaque) bool {
+        const context: *const operation.RequestContext = @ptrCast(@alignCast(raw));
+        context.ensureActive() catch return true;
+        return false;
+    }
+};
+
+/// The metadata authority drives a bounded indexed expiry sweep. The resume
+/// positions are scheduling hints; durable archive state governs collection.
+pub const ExpiryMaintenance = struct {
+    after: u64 = 0,
+    next_ns: u64 = 0,
+    cycle_progress: bool = false,
+    backoff: Backoff = .{},
+    // Hash the exact descriptor bytes, including its revision and dataset
+    // identity. This also throttles malformed descriptors without parsing them
+    // outside failure admission. The durable cursor remains authoritative.
+    const RetryKey = struct { resource: u64, descriptor: [32]u8 };
+    const Backoff = @import("../../metadata/retained_dataset_owners.zig").RetryBackoff(RetryKey);
+
+    fn retryKey(resource: local.system_catalog_domain.Resource) RetryKey {
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(resource.source_json, &hash, .{});
+        return .{ .resource = resource.id, .descriptor = hash };
+    }
+    fn elapsedNow(now: u64, started: u64) u64 {
+        return now +| (@import("antfly_platform").time.monotonicNs() -| started);
+    }
+    fn deferred(err: anyerror) bool {
+        return switch (err) {
+            // These visits advanced a durable segment cursor. Continue to the
+            // next extent rather than delaying all work in this dataset.
+            error.DatasetDependencyPending, error.DatasetRetentionPending, error.DatasetReadersActive, error.DatasetCompactionOrder => true,
+            else => false,
+        };
+    }
+
+    pub fn deinit(self: *ExpiryMaintenance, alloc: std.mem.Allocator) void {
+        self.backoff.deinit(alloc);
+    }
+
+    pub fn run(
+        self: *ExpiryMaintenance,
+        alloc: std.mem.Allocator,
+        store_: anytype,
+        group: u64,
+        config: *const local.common_config.Config,
+        secrets: ?*local.common_secrets.FileStore,
+        io: std.Io,
+        now: u64,
+        context: *const operation.RequestContext,
+        completion: anytype,
+    ) !void {
+        if (now < self.next_ns) return;
+        if (config.storage.artifacts.connection == null) {
+            self.next_ns = now +| std.time.ns_per_s;
+            return;
+        }
+        const Worker = struct {
+            maintenance: *ExpiryMaintenance,
+            source: @TypeOf(store_),
+            group: u64,
+            config: *const local.common_config.Config,
+            secrets: ?*local.common_secrets.FileStore,
+            io: std.Io,
+            context: *const operation.RequestContext,
+            completion: @TypeOf(completion),
+            fn next(self_: @This(), a: std.mem.Allocator, after: u64) !?local.system_catalog_domain.Resource {
+                const bytes = try self_.source.retainedArchiveWorkJson(a, self_.group, after);
+                return std.json.parseFromSliceLeaky(?local.system_catalog_domain.Resource, a, bytes, .{});
+            }
+            fn visit(self_: @This(), a: std.mem.Allocator, resource: local.system_catalog_domain.Resource) !bool {
+                const result = try self_.maintenance.process(a, resource, self_.config, self_.secrets, self_.io, self_.context);
+                if (result.receipt) |receipt| try self_.completion.finish(resource, receipt);
+                return result.progress;
+            }
+        };
+        return self.drain(alloc, now, context, Worker{ .maintenance = self, .source = store_, .group = group, .config = config, .secrets = secrets, .io = io, .context = context, .completion = completion });
+    }
+
+    fn drain(self: *ExpiryMaintenance, alloc: std.mem.Allocator, now: u64, context: *const operation.RequestContext, worker: anytype) !void {
+        self.next_ns = now +| 10 * std.time.ns_per_ms;
+        const started = @import("antfly_platform").time.monotonicNs();
+        const until = started +| 100 * std.time.ns_per_ms;
+        for (0..32) |_| {
+            if (@import("antfly_platform").time.monotonicNs() >= until) break;
+            try context.ensureActive();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const resource = (try worker.next(a, self.after)) orelse {
+                self.next_ns = now +| std.time.ns_per_s;
+                self.cycle_progress = false;
+                return;
+            };
+            if (resource.id <= self.after) {
+                if (!self.cycle_progress) {
+                    self.after = 0;
+                    self.next_ns = now +| std.time.ns_per_s;
+                    return;
+                }
+                self.cycle_progress = false;
+            }
+            self.after = resource.id;
+            const key = retryKey(resource);
+            if (!self.backoff.due(key, elapsedNow(now, started))) continue;
+            const progress = worker.visit(a, resource) catch |err| {
+                if (deferred(err)) {
+                    self.backoff.succeeded(key);
+                    continue;
+                }
+                // Shutdown cancellation is not a resource failure. A resource
+                // which consumed its deadline still receives a retry delay,
+                // measured from completion instead of this turn's start.
+                try context.cancellation.check();
+                try self.backoff.failed(alloc, key, elapsedNow(now, started));
+                if (err == error.Canceled or err == error.Timeout) return err;
+                if (!retryable(err)) std.log.warn("retained archive work deferred resource={d} err={s}", .{ resource.id, @errorName(err) });
+                continue;
+            };
+            self.backoff.succeeded(key);
+            self.cycle_progress = self.cycle_progress or progress;
+        }
+    }
+
+    const Outcome = struct { progress: bool = false, receipt: ?[32]u8 = null };
+
+    fn process(_: *ExpiryMaintenance, a: std.mem.Allocator, resource: local.system_catalog_domain.Resource, config: *const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, io: std.Io, context: *const operation.RequestContext) !Outcome {
+        var descriptor = try local.system_catalog_retained_datasets.parse(a, resource.source_json);
+        defer descriptor.deinit();
+        var archive = try Opened.init(a, config, secrets, descriptor.value, false);
+        defer archive.deinit();
+        const archive_catalog = archive.store(io, context);
+        if (descriptor.value.phase == .retiring) {
+            try archive_catalog.beginDiscard(descriptor.value.definition);
+            if (try archive_catalog.reclaimUpload(archive.location())) return .{ .progress = true };
+            const work = (try archive_catalog.nextMaintenanceDiscard()) orelse return .{ .receipt = try archive_catalog.discardReceipt() };
+            return .{ .progress = try archive_catalog.discardOne(work, archive.location()) };
+        }
+        if (try archive_catalog.reclaimUpload(archive.location())) return .{ .progress = true };
+        const work = (try archive_catalog.nextMaintenanceExpiry()) orelse return .{};
+        return .{ .progress = try archive_catalog.collectExpired(work.segment, archive.location()) };
+    }
+
+    pub fn retryable(err: anyerror) bool {
+        return switch (err) {
+            error.DatasetDependencyPending, error.DatasetRetentionPending, error.DatasetReadersActive, error.DatasetCompactionOrder, error.DatasetLocationUnavailable, error.PreconditionFailed => true,
+            else => false,
+        };
+    }
+};
+
+pub fn collectionProof(a: std.mem.Allocator, resource: local.system_catalog_domain.Resource, receipt: [32]u8) !@import("../../metadata/retained_dataset_owners.zig").Collection {
+    var descriptor = try local.system_catalog_retained_datasets.parse(a, resource.source_json);
+    defer descriptor.deinit();
+    if (descriptor.value.phase != .retiring or descriptor.value.source != null) return error.RetainedOwnerPlanChanged;
+    return .{ .resource = resource.id, .generation = descriptor.value.definition.generation, .revision = descriptor.value.revision, .definition = try descriptor.value.definition.fingerprint(a), .receipt = receipt };
+}
+
+pub fn locationIdentity(storage_identity: [32]u8) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("antfly/retained-archive-location/v1");
+    hash.update(&storage_identity);
+    return hash.finalResult();
+}
+
+test "retained owner native controls archive scheduler drains fair batches and resumes after idle wrap" {
+    const Worker = struct {
+        visits: [2]usize = .{ 0, 0 },
+        busy: bool = true,
+        held: bool = false,
+        fn next(_: *@This(), _: std.mem.Allocator, after: u64) !?local.system_catalog_domain.Resource {
+            return .{ .id = if (after == 1) 2 else 1, .kind = .dataset, .name = "summary" };
+        }
+        fn visit(self: *@This(), _: std.mem.Allocator, resource: local.system_catalog_domain.Resource) !bool {
+            self.visits[@intCast(resource.id - 1)] += 1;
+            if (self.held and resource.id == 1) return error.DatasetReadersActive;
+            return self.busy;
+        }
+    };
+    var maintenance: ExpiryMaintenance = .{};
+    defer maintenance.deinit(std.testing.allocator);
+    var worker: Worker = .{};
+    const context: operation.RequestContext = .{};
+    try maintenance.drain(std.testing.allocator, 1000, &context, &worker);
+    try std.testing.expectEqual(@as(usize, 16), worker.visits[0]);
+    try std.testing.expectEqual(@as(usize, 16), worker.visits[1]);
+    try std.testing.expectEqual(@as(u64, 1000 + 10 * std.time.ns_per_ms), maintenance.next_ns);
+    worker.busy = false;
+    try maintenance.drain(std.testing.allocator, 2000, &context, &worker);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.after);
+    try std.testing.expectEqual(@as(u64, 2000 + std.time.ns_per_s), maintenance.next_ns);
+    worker.busy = true;
+    worker.held = true;
+    const previous = worker.visits[1];
+    try maintenance.drain(std.testing.allocator, maintenance.next_ns, &context, &worker);
+    try std.testing.expect(worker.visits[1] > previous + 1);
+    try std.testing.expectEqual(@as(usize, 0), maintenance.backoff.entries.count());
+}
+
+test "retained owner native controls archive failure backoff isolates revisions and preserves healthy cleanup" {
+    const Resource = local.system_catalog_domain.Resource;
+    const Worker = struct {
+        visits: [2]usize = .{ 0, 0 },
+        revision: bool = false,
+        fail: bool = true,
+        fn next(self: *@This(), _: std.mem.Allocator, after: u64) !?Resource {
+            return .{ .id = if (after == 1) 2 else 1, .kind = .dataset, .name = "summary", .source_json = if (self.revision) "revision-2" else "revision-1" };
+        }
+        fn visit(self: *@This(), _: std.mem.Allocator, resource: Resource) !bool {
+            self.visits[@intCast(resource.id - 1)] += 1;
+            if (resource.id == 1 and self.fail) return error.DatasetLocationUnavailable;
+            return true;
+        }
+    };
+    const a = std.testing.allocator;
+    var maintenance: ExpiryMaintenance = .{};
+    defer maintenance.deinit(a);
+    var worker: Worker = .{};
+    var now: u64 = std.time.ns_per_s;
+    const first = (try worker.next(a, 0)).?;
+    const key = ExpiryMaintenance.retryKey(first);
+    try maintenance.drain(a, now, &.{}, &worker);
+    try std.testing.expectEqual(@as(usize, 1), worker.visits[0]);
+    try std.testing.expect(worker.visits[1] > 0);
+    const healthy = worker.visits[1];
+    try maintenance.drain(a, now + std.time.ns_per_ms, &.{}, &worker);
+    try std.testing.expectEqual(@as(usize, 1), worker.visits[0]);
+    try std.testing.expect(worker.visits[1] > healthy);
+    for (1..12) |attempt| {
+        const retry = maintenance.backoff.entries.get(key).?;
+        now = retry.until_ns;
+        try maintenance.drain(a, now, &.{}, &worker);
+        try std.testing.expectEqual(attempt + 1, worker.visits[0]);
+        const recorded = maintenance.backoff.entries.get(key).?;
+        const delay = recorded.until_ns - recorded.touched_ns;
+        try std.testing.expect(delay >= 7 * std.time.ns_per_s / 8);
+        try std.testing.expect(delay <= 30 * std.time.ns_per_s);
+    }
+    // A lifecycle revision (for example discard) bypasses the old retry delay.
+    worker.revision = true;
+    const before = worker.visits[0];
+    try maintenance.drain(a, now + std.time.ns_per_ms, &.{}, &worker);
+    try std.testing.expectEqual(before + 1, worker.visits[0]);
+    const replacement = ExpiryMaintenance.retryKey((try worker.next(a, 0)).?);
+    const retry_at = maintenance.backoff.entries.get(replacement).?.until_ns;
+    worker.fail = false;
+    try maintenance.drain(a, retry_at, &.{}, &worker);
+    try std.testing.expect(worker.visits[0] > before + 1);
+    try std.testing.expect(maintenance.backoff.entries.get(replacement) == null);
+}
+
+test "retained owner native controls archive resource timeouts back off while shutdown leaves no failure" {
+    const Resource = local.system_catalog_domain.Resource;
+    const Worker = struct {
+        visits: usize = 0,
+        stop: ?*std.atomic.Value(bool) = null,
+        fn next(_: *@This(), _: std.mem.Allocator, _: u64) !?Resource {
+            return .{ .id = 1, .kind = .dataset, .name = "summary" };
+        }
+        fn visit(self: *@This(), _: std.mem.Allocator, _: Resource) !bool {
+            self.visits += 1;
+            if (self.stop) |stopping| {
+                stopping.store(true, .release);
+                return error.Canceled;
+            }
+            return error.Timeout;
+        }
+    };
+    const a = std.testing.allocator;
+    var maintenance: ExpiryMaintenance = .{};
+    defer maintenance.deinit(a);
+    var worker: Worker = .{};
+    try std.testing.expectError(error.Timeout, maintenance.drain(a, 1, &.{}, &worker));
+    try maintenance.drain(a, 2, &.{}, &worker);
+    try std.testing.expectEqual(@as(usize, 1), worker.visits);
+    var shutdown = std.atomic.Value(bool).init(true);
+    const context: operation.RequestContext = .{ .cancellation = .fromAtomic(&shutdown) };
+    const entries = maintenance.backoff.entries.count();
+    try std.testing.expectError(error.Canceled, maintenance.drain(a, 100 * std.time.ns_per_s, &context, &worker));
+    try std.testing.expectEqual(entries, maintenance.backoff.entries.count());
+    // Cancellation can arrive while the archive operation is in flight.
+    shutdown.store(false, .release);
+    worker.stop = &shutdown;
+    var interrupted: ExpiryMaintenance = .{};
+    defer interrupted.deinit(a);
+    try std.testing.expectError(error.Canceled, interrupted.drain(a, 1, &context, &worker));
+    try std.testing.expectEqual(@as(usize, 0), interrupted.backoff.entries.count());
+}

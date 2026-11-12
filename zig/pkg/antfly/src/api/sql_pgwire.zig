@@ -94,6 +94,22 @@ fn resolveOnPath(native_backend: catalog.Backend, alloc: std.mem.Allocator, name
     return error.TableNotFound;
 }
 
+fn resolveRetainedOnPath(backend: catalog.Backend, alloc: std.mem.Allocator, reference: ast.RetainedTable, path: ?*const @import("../pgwire/search_path.zig").Path) !catalog.Table {
+    const resolve = backend.vtable.resolve_retained orelse return error.UnsupportedSqlExecution;
+    if (reference.name.namespace != null or reference.name.database != null or path == null) return resolve(backend.ptr, alloc, reference);
+    for (path.?.entries[0..path.?.len]) |*entry| {
+        var scoped = reference;
+        scoped.name.namespace = entry.slice();
+        return resolve(backend.ptr, alloc, scoped) catch |err| switch (err) {
+            // A namespace may disappear after SET or statement preparation.
+            // Explicit qualification still takes the direct path above.
+            error.CatalogNotFound, error.NamespaceNotFound => continue,
+            else => return err,
+        };
+    }
+    return error.CatalogNotFound;
+}
+
 test "SQL pgwire ordered native resolver falls back only on exact table absence" {
     // sql-0038 / sql-0040: SET SESSION and SET LOCAL share this ordered,
     // authorization-fenced native binding path after pgwire scope selection.
@@ -418,7 +434,49 @@ const OwnedRead = struct {
     columns: []const wire.Column,
     policies: []const Policy,
     detached: bool = false,
-    const Policy = struct { table: []const u8, filter: ?[]const u8, name: ?ast.Name = null, id: u64 = 0, schema_version: u32 = 0 };
+    const Policy = struct { table: []const u8, filter: ?[]const u8, name: ?ast.Name = null, id: u64 = 0, schema_version: u32 = 0, retained: ?catalog.Table.RetainedBinding = null };
+
+    fn capturePolicy(a: std.mem.Allocator, identity: ?http.AuthenticatedIdentity, table: catalog.Table) !Policy {
+        var policy: Policy = .{
+            .table = try GuardedCatalog.authorityName(a, table),
+            .filter = if (table.retained == null) try http.resolveEffectiveRowFilterJson(a, identity, table.physical_name) else null,
+            .retained = if (table.retained) |binding| binding.* else null,
+        };
+        if (table.scope) |scope| {
+            policy.name = .{ .database = try a.dupe(u8, scope.database), .namespace = try a.dupe(u8, scope.namespace), .table = try a.dupe(u8, scope.name) };
+            policy.id = table.id;
+            policy.schema_version = table.schema_version;
+        }
+        if (policy.retained) |*binding| {
+            // Detached portals release the stream and plan cache lease. Own
+            // the resolved name and bound spellings independently of both.
+            binding.definition.name = policy.name orelse return error.InvalidSqlBackendResponse;
+            inline for (.{ "start", "end" }) |field| {
+                const value = &@field(binding.definition, field);
+                value.* = switch (value.*) {
+                    .string => |text| .{ .string = try a.dupe(u8, text) },
+                    .numeric => |text| .{ .numeric = try a.dupe(u8, text) },
+                    else => value.*,
+                };
+            }
+        }
+        return policy;
+    }
+
+    fn validateBindings(a: std.mem.Allocator, backend: catalog.Backend, policies: []const Policy) !void {
+        for (policies) |policy| {
+            if (policy.retained) |expected| {
+                const resolve = backend.vtable.resolve_retained orelse return error.UnsupportedSqlExecution;
+                const table = try resolve(backend.ptr, a, expected.definition);
+                const current = table.retained orelse return error.CatalogGenerationChanged;
+                if (table.id != policy.id or table.schema_version != policy.schema_version or current.generation != expected.generation or
+                    !std.mem.eql(u8, &current.dataset, &expected.dataset) or !std.mem.eql(u8, &current.fingerprint, &expected.fingerprint)) return error.CatalogGenerationChanged;
+            } else if (policy.name) |name| {
+                const table = try backend.vtable.resolve(backend.ptr, a, name, .read);
+                if (table.id != policy.id or table.schema_version != policy.schema_version or !std.mem.eql(u8, table.physical_name, policy.table)) return error.CatalogGenerationChanged;
+            }
+        }
+    }
 
     fn open(adapter: *Adapter, alloc: std.mem.Allocator, credential: *Credential, request: wire.Request) !?wire.ReadStream {
         const server = adapter.server;
@@ -529,12 +587,7 @@ const OwnedRead = struct {
         const policies = try arena.alloc(Policy, if (binding.relation) |relation| relation.scans.len else if (binding.table != null) 1 else 0);
         for (policies, 0..) |*policy, i| {
             const table = if (binding.relation) |relation| relation.scans[i].table else binding.table.?;
-            policy.* = .{ .table = try arena.dupe(u8, table.physical_name), .filter = try http.resolveEffectiveRowFilterJson(arena, self.identity, table.physical_name) };
-            if (table.scope) |scope| {
-                policy.name = .{ .database = try arena.dupe(u8, scope.database), .namespace = try arena.dupe(u8, scope.namespace), .table = try arena.dupe(u8, scope.name) };
-                policy.id = table.id;
-                policy.schema_version = table.schema_version;
-            }
+            policy.* = try capturePolicy(arena, self.identity, table);
         }
         self.policies = policies;
         const columns = try arena.alloc(wire.Column, self.stream.context.binding.columns.len);
@@ -570,10 +623,7 @@ const OwnedRead = struct {
         var authority: Authority = .{ .credential = self.authority.credential, .identity = &current, .request = request };
         var adapter: execution.Adapter = .{ .server = self.adapter.server, .identity = &current, .context = try authority.context(), .database = original.database.?, .namespace = original.namespace.? };
         const catalog_backend = adapter.backend();
-        for (self.policies) |policy| if (policy.name) |name| {
-            const table = try catalog_backend.vtable.resolve(catalog_backend.ptr, alloc, name, .read);
-            if (table.id != policy.id or table.schema_version != policy.schema_version or !std.mem.eql(u8, table.physical_name, policy.table)) return error.CatalogGenerationChanged;
-        };
+        try validateBindings(alloc, catalog_backend, self.policies);
     }
 
     fn next(raw: *anyopaque, alloc: std.mem.Allocator, request: wire.Request, limit: u32) !wire.StreamPage {
@@ -619,6 +669,12 @@ const OwnedRead = struct {
         // they need not cause another native cursor.next call.
         for (admitted.catalog_aliases) |alias| try http.projectCatalogIdentity(alloc, fresh, alias.logical, alias.physical);
         for (policies) |policy| {
+            if (policy.retained != null) {
+                // Buffered retained rows belong to the dataset authority, not
+                // its synthetic physical name or the underlying raw table.
+                if (!try http.resourcePermissionCurrentlyAllowed(fresh.*, .dataset, policy.table, .read)) return error.Forbidden;
+                continue;
+            }
             if (!(try http.tablePermissionCurrentlyAllowed(fresh.*, policy.table, .read))) return error.Forbidden;
             const filter = try http.resolveEffectiveRowFilterJson(alloc, fresh.*, policy.table);
             defer if (filter) |value| alloc.free(value);
@@ -646,7 +702,7 @@ const OwnedRead = struct {
                 if (self.page.columns[column].type != .json) return error.InvalidSqlBackendResponse;
                 return .{ .json_bytes = bytes, .sql_null = false };
             }
-            const value = try self.page.values.cell(alloc, row, column);
+            const value = try (try self.page.values.cell(alloc, row, column)).requireValue();
             if (value.array) |array| {
                 const definition = self.page.columns[column];
                 if (value.sql_null or value.value != .null or value.patterns != null or definition.type != .array or definition.element_type != array.element_type) return error.InvalidSqlBackendResponse;
@@ -1294,8 +1350,24 @@ const GuardedCatalog = struct {
     fn backend(self: *GuardedCatalog) catalog.Backend {
         var result = self.native;
         result.ptr = self;
-        result.vtable = &.{ .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
+        result.vtable = &.{ .resolve = resolve, .resolve_graph = resolveGraph, .resolve_retained = resolveRetained, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
         return result;
+    }
+    fn resolveRetained(raw: *anyopaque, alloc: std.mem.Allocator, reference: ast.RetainedTable) !catalog.Table {
+        const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
+        try checkpoint(raw);
+        try self.authority.credential.validate();
+        const table = try resolveRetainedOnPath(self.native, alloc, reference, if (self.authority.request.search_path) |*path| path else null);
+        if (self.expected_guard) |guard| try verifyBindingGuard(guard, self.revision.* orelse return error.InvalidSqlBackendResponse, table);
+        try self.checkTableRead(table);
+        return table;
+    }
+    fn authorityName(alloc: std.mem.Allocator, table: catalog.Table) ![]u8 {
+        if (table.retained != null) {
+            const scope = table.scope orelse return error.InvalidSqlBackendResponse;
+            return (@import("antfly_local_sources").system_catalog_domain.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(alloc);
+        }
+        return alloc.dupe(u8, table.physical_name);
     }
     fn resolveGraph(raw: *anyopaque, alloc: std.mem.Allocator, definition: ast.GraphTable) !catalog.Table {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
@@ -1307,7 +1379,14 @@ const GuardedCatalog = struct {
         return table;
     }
     fn checkTableRead(self: *GuardedCatalog, table: catalog.Table) !void {
-        if (table.graph) |binding| {
+        if (table.retained != null) {
+            try checkpoint(self);
+            try self.authority.credential.validate();
+            var buffer: [4096]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+            const name = try authorityName(fixed.allocator(), table);
+            if (!try http.resourcePermissionCurrentlyAllowed(self.authority.identity.*, .dataset, name, .read)) return error.Forbidden;
+        } else if (table.graph) |binding| {
             try checkpoint(self);
             if (!try http.resourcePermissionCurrentlyAllowed(self.authority.identity.*, .graph, binding.graph.name, .read)) return error.Forbidden;
             for (binding.dependencies) |dependency| try self.checkRead(dependency.physical_name);
@@ -1378,10 +1457,17 @@ const GuardedCatalog = struct {
         guard: *GuardedCatalog,
         table: []u8,
         is_graph: bool = false,
+        is_dataset: bool = false,
         graph_dependencies: [][]u8 = &.{},
         inner: catalog.Cursor,
 
         fn checkAuthority(self: *@This()) !void {
+            if (self.is_dataset) {
+                try GuardedCatalog.checkpoint(self.guard);
+                try self.guard.authority.credential.validate();
+                if (!try http.resourcePermissionCurrentlyAllowed(self.guard.authority.identity.*, .dataset, self.table, .read)) return error.Forbidden;
+                return;
+            }
             if (!self.is_graph) return self.guard.checkRead(self.table);
             try GuardedCatalog.checkpoint(self.guard);
             if (!try http.resourcePermissionCurrentlyAllowed(self.guard.authority.identity.*, .graph, self.table, .read)) return error.Forbidden;
@@ -1434,7 +1520,7 @@ const GuardedCatalog = struct {
         }
         fn wantsExactFilter(raw: *anyopaque, columns: []const @import("antfly_local_sources").sql_dynamic_filter.Column) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.guard.checkRead(self.table);
+            try self.checkAuthority();
             return self.inner.wants_exact_filter.?(self.inner.ptr, columns);
         }
         fn setDynamicFilter(raw: *anyopaque, filter: *const @import("antfly_local_sources").sql_dynamic_filter.Filter) !bool {
@@ -1465,7 +1551,7 @@ const GuardedCatalog = struct {
                 const deps = try GuardedCatalog.copyDependencies(alloc, self.graph_dependencies);
                 errdefer GuardedCatalog.freeDependencies(alloc, deps);
                 const owner = try alloc.create(ReadCursor);
-                owner.* = .{ .alloc = alloc, .guard = self.guard, .table = name, .is_graph = self.is_graph, .graph_dependencies = deps, .inner = child };
+                owner.* = .{ .alloc = alloc, .guard = self.guard, .table = name, .is_graph = self.is_graph, .is_dataset = self.is_dataset, .graph_dependencies = deps, .inner = child };
                 out.* = owner.cursor(close);
                 wrapped += 1;
             }
@@ -1504,12 +1590,12 @@ const GuardedCatalog = struct {
         const open = self.native.vtable.open_scan orelse return null;
         const inner = (try open(self.native.ptr, alloc, table, request)) orelse return null;
         errdefer inner.close(inner.ptr);
-        const name = try alloc.dupe(u8, table.physical_name);
+        const name = try authorityName(alloc, table);
         errdefer alloc.free(name);
         const deps = try dependencies(alloc, table);
         errdefer freeDependencies(alloc, deps);
         const cursor = try alloc.create(ReadCursor);
-        cursor.* = .{ .alloc = alloc, .guard = self, .table = name, .is_graph = table.graph != null, .graph_dependencies = deps, .inner = inner };
+        cursor.* = .{ .alloc = alloc, .guard = self, .table = name, .is_graph = table.graph != null, .is_dataset = table.retained != null, .graph_dependencies = deps, .inner = inner };
         // Materialized execution closes before returning; streaming execution
         // retains the heap-owned guard and authority in its OwnedRead capsule.
         return cursor.cursor(ReadCursor.close);
@@ -1571,7 +1657,7 @@ const GuardedCatalog = struct {
         for (scans, inner.cursors, wrappers, cursors) |scan_request, cursor, *wrapper, *out| {
             const deps = try dependencies(alloc, scan_request.table);
             errdefer freeDependencies(alloc, deps);
-            wrapper.* = .{ .alloc = alloc, .guard = self, .table = try alloc.dupe(u8, scan_request.table.physical_name), .is_graph = scan_request.table.graph != null, .graph_dependencies = deps, .inner = cursor };
+            wrapper.* = .{ .alloc = alloc, .guard = self, .table = try authorityName(alloc, scan_request.table), .is_graph = scan_request.table.graph != null, .is_dataset = scan_request.table.retained != null, .graph_dependencies = deps, .inner = cursor };
             count += 1;
             out.* = wrapper.cursor(StatementRead.borrowedClose);
         }
@@ -2150,4 +2236,108 @@ test "SQL pgwire native trusted credential and identity allocation failures rele
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{ &server, token });
+}
+
+test "SQL retained source pgwire resolves namespaces and binds dataset authority" {
+    const path_api = @import("../pgwire/search_path.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        failure: anyerror = error.CatalogNotFound,
+        fn resolve(raw: *anyopaque, _: std.mem.Allocator, reference: ast.RetainedTable) !catalog.Table {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (!std.mem.eql(u8, reference.name.namespace.?, "analytics")) return self.failure;
+            return .{ .id = 7, .physical_name = "retained:opaque", .schema_version = 1, .columns = &.{} };
+        }
+    };
+    var fixture: Fixture = .{};
+    const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = undefined, .resolve_retained = Fixture.resolve, .scan = undefined, .mutate = undefined, .checkpoint = undefined } };
+    var path: path_api.Path = .{};
+    try path.append(try path_api.Namespace.init("missing"));
+    try path.append(try path_api.Namespace.init("analytics"));
+    const reference: ast.RetainedTable = .{ .name = .{ .table = "stats" }, .start = .{ .string = "0" }, .end = .{ .string = "60" } };
+    const table = try resolveRetainedOnPath(backend, std.testing.allocator, reference, &path);
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    fixture.failure = error.NamespaceNotFound;
+    _ = try resolveRetainedOnPath(backend, std.testing.allocator, reference, &path);
+    try std.testing.expectEqual(@as(usize, 4), fixture.calls);
+    var explicit = reference;
+    explicit.name.namespace = "missing";
+    try std.testing.expectError(error.NamespaceNotFound, resolveRetainedOnPath(backend, std.testing.allocator, explicit, &path));
+    for ([_]anyerror{ error.Forbidden, error.DatabaseNotFound, error.CatalogGenerationChanged, error.RetainedSeriesNotReady }) |failure| {
+        fixture.failure = failure;
+        const before = fixture.calls;
+        try std.testing.expectError(failure, resolveRetainedOnPath(backend, std.testing.allocator, reference, &path));
+        try std.testing.expectEqual(before + 1, fixture.calls);
+    }
+    var guarded: GuardedCatalog = undefined;
+    guarded.native = backend;
+    try std.testing.expect(guarded.backend().vtable.resolve_retained != null);
+    var retained_binding: catalog.Table.RetainedBinding = .{ .dataset = @splat(1), .fingerprint = @splat(2), .generation = 1, .definition = reference };
+    var retained = table;
+    retained.retained = &retained_binding;
+    retained.scope = .{ .database = "default", .namespace = "analytics", .name = "stats", .revision = 1 };
+    const logical = try GuardedCatalog.authorityName(std.testing.allocator, retained);
+    defer std.testing.allocator.free(logical);
+    const expected = try (@import("antfly_local_sources").system_catalog_domain.Target{ .database = "default", .namespace = "analytics", .table = "stats" }).resourceNameAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, logical);
+}
+
+test "SQL retained source buffered pgwire rows retain dataset authority and resource identity" {
+    const a = std.testing.allocator;
+    const casbin = @import("antfly_casbin");
+    var store = usermgr.MemoryStore.init(a);
+    defer store.deinit();
+    var rules = casbin.MemoryAdapter.init(a);
+    defer rules.deinit();
+    var manager = try usermgr.UserManager.init(a, store.iface(), try usermgr.initDefaultEnforcer(a, rules.iface()));
+    defer manager.deinit();
+    var read = try usermgr.Permission.initOwned(a, .dataset, "stats", .read);
+    defer read.deinit(a);
+    var user = try manager.createUser("reader", "secret", &.{read});
+    defer user.deinit(a);
+    const credential = try Credential.authenticate(a, &manager, "reader", "secret");
+    defer Credential.release(credential, a);
+    var admitted = try credential.identity(a);
+    defer admitted.deinit(a);
+    var binding: catalog.Table.RetainedBinding = .{ .dataset = @splat(1), .fingerprint = @splat(2), .generation = 1, .definition = .{ .name = .{ .namespace = "public", .table = "stats" }, .start = .{ .string = "0" }, .end = .{ .string = "60" } } };
+    var table: catalog.Table = .{ .id = 7, .physical_name = "retained:opaque", .schema_version = 1, .columns = &.{}, .scope = .{ .database = "default", .namespace = "public", .name = "stats", .revision = 1 }, .retained = &binding };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const borrowed_start = try a.dupe(u8, "0");
+    binding.definition.start = .{ .string = borrowed_start };
+    const policy = try OwnedRead.capturePolicy(arena.allocator(), admitted, table);
+    a.free(borrowed_start);
+    binding.definition.start = .{ .parameter = 1 };
+    try std.testing.expectEqualStrings("0", policy.retained.?.definition.start.string);
+    try std.testing.expect(!try http.tablePermissionCurrentlyAllowed(admitted, table.physical_name, .read));
+    {
+        var current = try credential.identity(a);
+        defer current.deinit(a);
+        try OwnedRead.validatePolicies(a, &current, admitted, &.{policy});
+    }
+    const Fixture = struct {
+        table: *catalog.Table,
+        calls: usize = 0,
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, reference: ast.RetainedTable) !catalog.Table {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("stats", reference.name.table);
+            self.calls += 1;
+            return self.table.*;
+        }
+    };
+    var fixture: Fixture = .{ .table = &table };
+    const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = undefined, .resolve_retained = Fixture.resolve, .scan = undefined, .mutate = undefined, .checkpoint = undefined } };
+    try OwnedRead.validateBindings(a, backend, &.{policy});
+    binding.fingerprint = @splat(3);
+    try std.testing.expectError(error.CatalogGenerationChanged, OwnedRead.validateBindings(a, backend, &.{policy}));
+    binding.fingerprint = @splat(2);
+    table.id += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, OwnedRead.validateBindings(a, backend, &.{policy}));
+    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
+    try manager.removePermissionFromUser("reader", "stats", .dataset);
+    var current = try credential.identity(a);
+    defer current.deinit(a);
+    try std.testing.expectError(error.Forbidden, OwnedRead.validatePolicies(a, &current, admitted, &.{policy}));
 }

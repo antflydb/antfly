@@ -3338,9 +3338,18 @@ pub const DB = struct {
     pub const tryLockApplyForPortableRuntime = local_mutation.tryLockApplyForPortableRuntime;
 
     fn lockApplySharedForPortableRuntime(self: *DB) !void {
+        return self.lockApplySharedForPortableRuntimeControlled(null);
+    }
+    fn lockApplySharedForPortableRuntimeControlled(self: *DB, operation: ?@import("../retained_series_reader.zig").Control) !void {
         try self.enforcePortableRuntimeGate();
-        lockApplyShared(self);
+        if (operation) |admission| {
+            while (!self.core.tryLockApplyShared()) {
+                try admission.check();
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+            }
+        } else lockApplyShared(self);
         errdefer self.core.unlockApplyShared();
+        if (operation) |admission| try admission.check();
         try self.enforcePortableRuntimeGate();
         // A failed split may have withdrawn only some graph owners. Keep the
         // live handle closed to reads until the durable retirement is repaired.
@@ -4021,6 +4030,13 @@ pub const DB = struct {
             );
             var core_owned = true;
             errdefer if (core_owned) core.deinit(alloc);
+            {
+                var retained_read = try core.store.beginReadTxn();
+                defer retained_read.abort();
+                var retained_arena = std.heap.ArenaAllocator.init(alloc);
+                defer retained_arena.deinit();
+                try @import("../retained_series_capture.zig").requireNamespace(retained_arena.allocator(), &retained_read, @import("online_source_contract.zig").namespaceBytes(core.identity_namespace));
+            }
             profile.core_resources_ns = elapsedSince(core_resources_started_ns);
             const async_context = try runtime_alloc.create(AsyncContext);
             owned_async_context = async_context;
@@ -8392,6 +8408,9 @@ pub const DB = struct {
             return already;
         }
         diagnostic_stage = "catalog_fences";
+        // Serialize both directions of admission under the native apply fence:
+        // policy installation must not race an unrestricted summary producer.
+        if (phase != .disabled and try self.core.store.retainedSeriesActive()) return error.RowPolicyTopologyUnsupported;
         {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
@@ -9165,6 +9184,24 @@ pub const DB = struct {
         if (req.artifact_catalog != null and req.online_source == null and req.merge_checkpoint == null) return self.applyArtifactCatalogBatch(req, opts);
         if (req.artifact_publication != null) return self.applyArtifactPublicationBatch(req, opts);
         if (req.artifact_publication_transport != null) return self.applyArtifactPublicationTransportBatch(req, opts);
+        // Prepared expiration provenance belongs to the transaction dispatcher.
+        // Ordinary batch entry points cannot silently reinterpret it as a delete.
+        if (req.expiration_deletes.len != 0) return error.InvalidRetainedSeries;
+        if (req.retained_series != null) return self.applyRetainedSeriesBatch(req, opts);
+        // Transaction envelopes require the dispatcher, which commits their
+        // state machine operation and ordered receipt. A plain batch cannot
+        // acknowledge them as an empty primary mutation.
+        if (req.transaction != null) {
+            if (try self.core.store.retainedSeriesActive()) return error.RetainedSeriesTransactionsUnsupported;
+            return error.UnsupportedOperation;
+        }
+        if (req.online_source != null or req.restore_staging != null or req.relational_topology != null or
+            req.split_checkpoint != null or req.split_transition != null or req.split_replication != null or
+            req.merge_source_transition != null or req.merge_checkpoint != null or req.merge_replication != null or
+            req.merge_page != null or req.merge_artifacts.len != 0)
+        {
+            if (try self.core.store.retainedSeriesPresent()) return error.RetainedSeriesTopologyUnsupported;
+        }
         if (req.online_source != null) {
             if (comptime builtin.os.tag == .freestanding) {
                 return error.UnsupportedPlatform;
@@ -21072,6 +21109,7 @@ pub const DB = struct {
     }
 
     fn requireSupportedRelationalTopology(self: *DB) !void {
+        if (try self.core.store.retainedSeriesPresent()) return error.RetainedSeriesTopologyUnsupported;
         if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyTopologyUnsupported;
         var view = self.core.acquireSchemaView();
         defer if (view) |*pinned| pinned.release();
@@ -25724,9 +25762,10 @@ pub const DB = struct {
         var preparation: RequestPreparationContext = undefined;
         preparation.init(self);
         defer preparation.deinit();
+        const admitted_timestamp_ns = currentTimeNs();
         var retries: usize = 0;
         while (true) {
-            self.writeIntentsPreparedOnce(txn_id, intents, predicates, preparation.guard.allocator()) catch |err| switch (err) {
+            self.writeIntentsPreparedOnce(txn_id, intents, predicates, preparation.guard.allocator(), admitted_timestamp_ns) catch |err| switch (err) {
                 error.PreparedGenerationChanged => {
                     if (retries >= 2) return err;
                     retries += 1;
@@ -25738,12 +25777,31 @@ pub const DB = struct {
         }
     }
 
+    fn prepareRetainedIntentEffects(self: *DB, a: Allocator, transaction: transactions_mod.TxnId, admitted_timestamp_ns: u64, intents: []const transactions_mod.WriteIntent, expiration_deletes: []const []const u8) !@import("../retained_series_capture.zig").PrepareEffects {
+        const capture = @import("../retained_series_capture.zig");
+        if (!try self.core.store.retainedSeriesActive()) return .{ .writes = &.{}, .deletes = &.{}, .costs = &.{} };
+        var inputs: std.ArrayList(capture.PreparedInput) = .empty;
+        for (intents) |intent| {
+            if (isMetadataKey(intent.key) or isProtectedIntegrityKey(intent.key) or isProtectedRangeWriteKey(intent.key)) continue;
+            const physical = if (relationalColumns(self) != null) try relational_store.keyAlloc(a, intent.key) else try internal_keys.documentKeyAlloc(a, intent.key);
+            try inputs.append(a, .{ .key = physical, .logical_key = intent.key, .after = intent.prepared_row orelse intent.value, .cause = if (for (expiration_deletes) |key| {
+                if (std.mem.eql(u8, key, intent.key)) break true;
+            } else false) .expiration else .mutation });
+        }
+        if (inputs.items.len == 0) return .{ .writes = &.{}, .deletes = &.{}, .costs = &.{} };
+        if (admitted_timestamp_ns == 0) return error.InvalidRetainedSeries;
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        return capture.planPrepare(a, &read, transaction, admitted_timestamp_ns, inputs.items);
+    }
+
     fn writeIntentsPreparedOnce(
         self: *DB,
         txn_id: transactions_mod.TxnId,
         intents: []const transactions_mod.WriteIntent,
         predicates: []const transactions_mod.VersionPredicate,
         preparation_alloc: Allocator,
+        admitted_timestamp_ns: u64,
     ) !void {
         const schema_namespace = self.core.schemaNamespaceGeneration();
         const prepared_intents = try preparation_alloc.dupe(transactions_mod.WriteIntent, intents);
@@ -25768,6 +25826,9 @@ pub const DB = struct {
 
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
+        // Legacy local intent admission chooses its time at ingress. Ordered
+        // owners must use TransactionIntentRequest's replicated admission time.
+        if (try self.core.store.retainedSeriesActive() and try self.maintenanceRequiresOrderedApply()) return error.RetainedSeriesTransactionsUnsupported;
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
         if (binding == null) try self.validatePreparedSchemaViewLocked(view);
@@ -25789,7 +25850,13 @@ pub const DB = struct {
         var endpoint_dependencies = std.heap.ArenaAllocator.init(preparation_alloc);
         defer endpoint_dependencies.deinit();
         try self.prepareGraphEndpointDependenciesLocked(preparation_alloc, endpoint_dependencies.allocator(), txn_id, prepared_intents, view, &guarded_predicates);
+        var retained_arena = std.heap.ArenaAllocator.init(preparation_alloc);
+        defer retained_arena.deinit();
+        const retained = try self.prepareRetainedIntentEffects(retained_arena.allocator(), txn_id, admitted_timestamp_ns, prepared_intents, &.{});
         try self.core.writeIntentsExtraBatch(txn_id, prepared_intents, guarded_predicates.items, .{
+            .writes = retained.writes,
+            .deletes = retained.deletes,
+            .retained_series_costs = retained.costs,
             .preparation_allocator = preparation_alloc,
             .schema_binding = .{ .version = if (view) |pinned| pinned.version() else null },
             .index_span_digests = index_spans,
@@ -25854,9 +25921,11 @@ pub const DB = struct {
         preparation.init(self);
         defer preparation.deinit();
         const max_prepared_retries = 2;
+        var admitted_request = req;
+        if (admitted_request.admitted_timestamp_ns == 0 and ordered_receipt == null) admitted_request.admitted_timestamp_ns = currentTimeNs();
         var retries: usize = 0;
         while (true) {
-            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
+            self.writeTransactionInternalOnce(txn_id, admitted_request, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                     if (retries >= max_prepared_retries) return err;
                     retries += 1;
@@ -25877,6 +25946,7 @@ pub const DB = struct {
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
     ) !void {
+        try types.validateExpirationDeletes(req);
         if (req.relational_index_maintenance != null and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
                 req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or
@@ -26209,6 +26279,9 @@ pub const DB = struct {
         defer endpoint_dependencies.deinit();
         try self.prepareGraphEndpointDependenciesLocked(preparation_alloc, endpoint_dependencies.allocator(), txn_id, intents.items, prepared_schema_view, &predicates);
         if (row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        var retained_arena = std.heap.ArenaAllocator.init(preparation_alloc);
+        defer retained_arena.deinit();
+        const retained_alloc = retained_arena.allocator();
         if (ordered_receipt) |identity| {
             switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
                 .already_applied => return,
@@ -26216,14 +26289,22 @@ pub const DB = struct {
             }
             var value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
             const marker = orderedApplyReceiptWrite(identity, &value_buf);
+            const retained = try self.prepareRetainedIntentEffects(retained_alloc, txn_id, req.admitted_timestamp_ns, intents.items, req.expiration_deletes);
+            var retained_writes: std.ArrayList(docstore_mod.KVPair) = .empty;
+            try retained_writes.appendSlice(retained_alloc, retained.writes);
+            try retained_writes.append(retained_alloc, marker);
             try self.core.writeIntentsExtraBatch(
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
+                .{ .writes = retained_writes.items, .deletes = retained.deletes, .retained_series_costs = retained.costs, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
         } else {
+            const retained = try self.prepareRetainedIntentEffects(retained_alloc, txn_id, req.admitted_timestamp_ns, intents.items, req.expiration_deletes);
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+                .writes = retained.writes,
+                .deletes = retained.deletes,
+                .retained_series_costs = retained.costs,
                 .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
@@ -27074,6 +27155,86 @@ pub const DB = struct {
     /// Internal source-retention controls share the lifecycle transaction path:
     /// source progress, retained log, replication marker and durable outbox are
     /// one commit. The public API has no admission route for these commands.
+    fn applyRetainedSeriesBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
+        const control = @import("../retained_series_control.zig");
+        try control.validateRequest(req);
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+        defer if (replication_mutation) |*lease| lease.release();
+        if (!opts.bypass_replication_write_gate) {
+            try self.enforceReplicationWriteGate();
+            try self.ensureDurableReplicationStartupBarrier();
+            try self.flushDurableReplicationOutboxes();
+            try self.preflightReplicationBatchSyncCommit();
+        }
+        var payload: ?[]u8 = null;
+        defer if (payload) |bytes| self.alloc.free(bytes);
+        {
+            var admission = self.core.snapshot_admission.acquireMutation();
+            defer admission.release();
+            try self.lockApplyForPortableRuntime();
+            defer self.core.unlockApply();
+            if (opts.ordered_apply_receipt) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+                .already_applied => return,
+                .apply => {},
+            };
+            const command = req.retained_series.?;
+            const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+            var partition: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(&namespace, &partition, .{});
+            if (!std.mem.eql(u8, &partition, &command.fence.partition)) return error.IdentityNamespaceMismatch;
+            if (command.action == .install) {
+                var manager = try self.core.initTxnManager();
+                defer manager.deinit();
+                if (try manager.hasTopologySensitiveTransactions()) return error.RetainedSeriesTransactionsUnsupported;
+                if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyTopologyUnsupported;
+            }
+            var txn = try self.core.store.beginWriteTxn();
+            var retained_txn_open = true;
+            defer if (retained_txn_open) txn.abort();
+            try @import("restore_staging.zig").requireScope(self.alloc, &txn, null, false);
+            if (command.action == .install) {
+                if (self.core.shard_manager.getSplitState() != null) return error.RetainedSeriesTopologyUnsupported;
+                try self.requireOnlineArtifactCatalogMutableLocked(&txn);
+                try @import("relational_integrity_topology.zig").requireUnfenced(&txn);
+                const merge_raw = txn.get(merge_state_mod.key) catch |err| switch (err) {
+                    error.NotFound => txn.get(merge_state_mod.legacy_key) catch |legacy_err| switch (legacy_err) {
+                        error.NotFound => null,
+                        else => return legacy_err,
+                    },
+                    else => return err,
+                };
+                if (merge_raw) |bytes| {
+                    var merge = try merge_state_mod.decodeAlloc(self.alloc, bytes);
+                    defer merge.deinit(self.alloc);
+                    if (merge.phase != .none and merge.phase != .finalized and merge.phase != .rolled_back) return error.RetainedSeriesTopologyUnsupported;
+                }
+            }
+            const sequence = try self.core.store.lastReplaySequenceFromTxn(&txn, 0);
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            try control.stage(arena.allocator(), &txn, command, sequence, @as(i128, req.timestamp_ns));
+            if (!opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null)
+                payload = try replication_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req);
+            for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
+            if (opts.outcome_marker_write) |write| try txn.put(write.key, write.value);
+            if (opts.ordered_apply_receipt) |entry| {
+                var bytes: [ordered_apply_receipt_value_len]u8 = undefined;
+                const marker = orderedApplyReceiptWrite(entry, &bytes);
+                try txn.put(marker.key, marker.value);
+            }
+            if (opts.replication_applied_lsn_marker) |lsn| {
+                var bytes: [replication_applied_lsn_value_len]u8 = undefined;
+                const marker = replicationAppliedSequenceWrite(lsn, &bytes);
+                try txn.put(marker.key, marker.value);
+            }
+            try self.stageRestoreStagingReplicationOutbox(&txn, payload);
+            try txn.commit();
+            retained_txn_open = false;
+        }
+        if (payload != null) try self.flushDurableReplicationOutboxes();
+    }
+
     fn applyOnlineSourceBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
         try @import("online_source_contract.zig").validateRequest(req);
         const command = req.online_source orelse return error.InvalidOnlineSourceCommand;
@@ -39770,6 +39931,13 @@ pub const DB = struct {
     ) !PreparedPortableRuntimeMetadata {
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         errdefer row_policy_lease.release();
+        {
+            var retained_read = try source_store.beginReadTxn();
+            defer retained_read.abort();
+            var retained_arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer retained_arena.deinit();
+            try @import("../retained_series_capture.zig").requireNamespace(retained_arena.allocator(), &retained_read, @import("online_source_contract.zig").namespaceBytes(target_identity));
+        }
         const identity_summary = try doc_identity.visibilitySummaryFromStore(source_store);
         const restored_schema = try schema_mod.loadSchema(source_store, self.alloc);
         var restored_schema_owned = true;
@@ -42707,6 +42875,59 @@ pub const DB = struct {
     pub const RelationalReadSession = @import("read_session_backend").Relational;
 
     pub const DocumentReadSession = @import("read_session_backend").Document;
+
+    pub fn queryRetainedSeriesJson(self: *DB, alloc: Allocator, request: @import("../retained_series_read_contract.zig").Request) ![]u8 {
+        return self.queryRetainedSeriesJsonControlled(alloc, request, .{});
+    }
+    pub fn queryRetainedSeriesJsonControlled(self: *DB, alloc: Allocator, request: @import("../retained_series_read_contract.zig").Request, operation: @import("../retained_series_read_contract.zig").Control) ![]u8 {
+        try operation.check();
+        var policy = try self.local_execution.row_policy_gate.enterRawRead();
+        defer policy.release();
+        var cut = read_cut: {
+            try self.lockApplySharedForPortableRuntimeControlled(operation);
+            defer self.core.unlockApplyShared();
+            const fence: ?@import("../retained_series_control.zig").Fence = switch (request) {
+                .status => null,
+                .revocation => |value| value,
+                .poll => |value| value.fence,
+            };
+            if (fence) |value| {
+                var partition: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(&@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace), &partition, .{});
+                if (!std.mem.eql(u8, &partition, &value.partition)) return error.IdentityNamespaceMismatch;
+            }
+            break :read_cut .{ .txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient), .root = self.root_incarnation };
+        };
+        defer cut.txn.abort();
+        const response = try @import("../retained_series_query.zig").executeJsonControlled(alloc, &cut.txn, cut.root, request, operation);
+        errdefer alloc.free(response);
+        try policy.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        try operation.check();
+        return response;
+    }
+
+    /// The apply lock protects snapshot/identity capture only. Immutable reads
+    /// and validation run outside it while retaining row-policy admission.
+    pub fn openRetainedSeriesRead(self: *DB, alloc: Allocator, query: @import("../retained_series_reader.zig").Query) !*@import("../retained_series_reader.zig").Session {
+        return self.openRetainedSeriesReadControlled(alloc, query, .{});
+    }
+    pub fn openRetainedSeriesReadControlled(self: *DB, alloc: Allocator, query: @import("../retained_series_reader.zig").Query, operation: @import("../retained_series_read_contract.zig").Control) !*@import("../retained_series_reader.zig").Session {
+        try operation.check();
+        var policy = try self.local_execution.row_policy_gate.enterRawRead();
+        errdefer policy.release();
+        const cut = read_cut: {
+            try self.lockApplySharedForPortableRuntimeControlled(operation);
+            defer self.core.unlockApplyShared();
+            const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
+            var partition: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(&namespace, &partition, .{});
+            if (!std.mem.eql(u8, &partition, &query.fence.partition)) return error.IdentityNamespaceMismatch;
+            break :read_cut .{ .txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient), .root = self.root_incarnation };
+        };
+        const session = try @import("../retained_series_reader.zig").Session.openControlled(alloc, cut.txn, query, cut.root, operation);
+        session.row_policy_lease = policy;
+        return session;
+    }
 
     pub fn openDocumentReadSession(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !*DocumentReadSession {
         if (comptime storage_engine.enabled) return DocumentReadSession.fromHandle(alloc, try storage_engine.call("openDocumentReadSession", .{ self, alloc, from_key, to_key, opts }));
@@ -53975,6 +54196,12 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
                 return error.ForeignKeyCoordinationRequired;
         }
     }
+    var summary_arena = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer summary_arena.deinit();
+    const summary_alloc = summary_arena.allocator();
+    var summary_read: ?docstore_mod.DocStore.Txn = if (ttl_guard != null and try ctx.store.retainedSeriesActive()) try ctx.store.beginReadTxn() else null;
+    defer if (summary_read) |*read| read.abort();
+    const summary_guard = if (summary_read) |*read| try @import("../retained_series_capture.zig").ExpirationGuard.init(summary_alloc, read) else null;
     var eligible = std.ArrayList([]const u8).empty;
     defer eligible.deinit(ctx.alloc);
     const eligible_keys = if (ttl_guard) |guard| blk: {
@@ -53991,6 +54218,14 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
             const current = (try ttl_mod.readSourceTimestamp(ctx.store, ctx.alloc, candidate.key)) orelse continue;
             if (current != candidate.timestamp_ns or
                 !ttl_mod.isExpiredWithGrace(current, guard.duration_ns, guard.grace_period_ns, guard.now_ns)) continue;
+            if (summary_guard) |required| {
+                const primary = if (ctx.relational_base_rows) try relational_store.keyAlloc(summary_alloc, candidate.key) else try internal_keys.documentKeyAlloc(summary_alloc, candidate.key);
+                const physical = summary_read.?.get(primary) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                if (!try required.allowed(summary_alloc, &summary_read.?, physical, guard.now_ns)) continue;
+            }
             try eligible.append(ctx.alloc, candidate.key);
         }
         break :blk eligible.items;
@@ -54211,6 +54446,15 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     }
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
+    try @import("../retained_series_capture.zig").appendContext(
+        ctx.alloc,
+        ctx.store,
+        sequence,
+        if (ttl_guard) |guard| guard.now_ns else platform_time.realtimeNs(),
+        if (ttl_guard != null) .expiration else .mutation,
+        &store_writes,
+        &owned_store_values,
+    );
     var primary_replication = try PrimaryReplicationEffect.prepare(ctx, store_writes.items, delete_keys.items, replay_payload);
     defer primary_replication.deinit(ctx.alloc);
     try primary_replication.stage(ctx, &store_writes);
@@ -54274,6 +54518,12 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
         const schema = pinned.tableSchema();
         if (schema.ttl_duration_ns == 0) return 0;
         const now = ctx.clock.nowRealtimeNs();
+        var summary_arena = std.heap.ArenaAllocator.init(ctx.batch.alloc);
+        defer summary_arena.deinit();
+        const summary_alloc = summary_arena.allocator();
+        var summary_read: ?docstore_mod.DocStore.Txn = if (try ctx.batch.store.retainedSeriesActive()) try ctx.batch.store.beginReadTxn() else null;
+        defer if (summary_read) |*read| read.abort();
+        const summary_guard = if (summary_read) |*read| try @import("../retained_series_capture.zig").ExpirationGuard.init(summary_alloc, read) else null;
         var prepared = std.ArrayList(coordinated_ttl.Candidate).empty;
         defer prepared.deinit(ctx.batch.alloc);
         {
@@ -54300,6 +54550,12 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
                     error.NotFound => continue,
                     else => return err,
                 };
+                if (summary_guard) |required| {
+                    // The observation is only a prefilter. Prepared participant
+                    // admission revalidates exact current contributions.
+                    const observed = try summary_alloc.dupe(u8, raw);
+                    if (!try required.allowed(summary_alloc, &summary_read.?, observed, now)) continue;
+                }
                 var digest: [32]u8 = undefined;
                 std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
                 try prepared.append(ctx.batch.alloc, .{

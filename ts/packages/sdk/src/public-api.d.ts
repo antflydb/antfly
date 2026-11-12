@@ -3013,6 +3013,151 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        /** Get retained summary status */
+        get: operations["getRetainedDataset"];
+        put?: never;
+        /**
+         * Create a retained summary
+         * @description Starts a background backfill of source rows that still exist. Previously expired source rows are outside initial history. Requires administration permission on the dataset and source table.
+         */
+        post: operations["createRetainedDataset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/close": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Close and archive a retained summary
+         * @description Begins asynchronous archive closure of an active summary. Set discard to permanently abandon any phase, including a closure blocked by archive unavailability. Discard releases the source only after verified native revocation and cleanup; archive collection resumes independently when storage returns. Retiring is a permanent tombstone and cannot be reopened. cancel_activation is retained for activating summaries only. Neither discard nor cancellation preserves summary history.
+         */
+        post: operations["closeRetainedDataset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Open a retained summary subscription
+         * @description Captures a bounded initial snapshot. Supply an aligned half-open range or a moving window. Requires dataset read permission.
+         */
+        post: operations["createRetainedSubscription"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/poll": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Replay retained summary changes
+         * @description Poll with the last cursor through any cluster API node; its authenticated issuer routes to the serving session. Repeating a poll after a lost response returns the last committed frame. Replay gaps can coalesce through a fresh snapshot; reset is required when the serving session is lost.
+         */
+        post: operations["pollRetainedSubscription"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a retained summary subscription
+         * @description Releases serving state for the authenticated cursor.
+         */
+        post: operations["cancelRetainedSubscription"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Query retained summary buckets
+         * @description Reads a half-open range aligned to the summary's bucket width and origin. Follow next using the same range and dimensions until null. Each page captures fresh authority; active data may change between pages. Rows are ordered by bucket time and a stable dimension hash. Requires read permission on the qualified dataset.
+         */
+        post: operations["queryRetainedDataset"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query": {
         parameters: {
             query?: never;
@@ -7299,6 +7444,105 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        RetainedDatasetReadError: {
+            /**
+             * @description Stable machine-readable domain failure
+             * @example retained_series_numeric_overflow
+             */
+            code: string;
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
+        RetainedSubscriptionFrame: {
+            /** @enum {string} */
+            kind: "snapshot" | "changes";
+            cursor: string;
+            /** @description True when the server caught up through a fresh bounded snapshot instead of replaying every intermediate state. */
+            resynchronized?: boolean;
+            /** @enum {string} */
+            initial_history?: "certified" | "retained_source_rows";
+            dimensions?: string[];
+            measures?: components["schemas"]["RetainedDatasetMeasure"][];
+            events: {
+                /** @enum {string} */
+                type: "upsert" | "remove";
+                key: string;
+                bucket_start_ns?: string;
+                dimensions?: unknown[];
+                values?: unknown[];
+            }[];
+        };
+        RetainedDatasetMeasure: {
+            name: string;
+            /** @enum {string} */
+            law: "count" | "sum" | "avg" | "min" | "max";
+            field?: string | null;
+        };
+        RetainedDatasetInfo: {
+            /** @description Stable dataset identifier in hexadecimal. */
+            id: string;
+            name: string;
+            /** Format: uint64 */
+            revision: number;
+            /** @enum {string} */
+            phase: "activating" | "active" | "closing" | "closed" | "retiring";
+            /** @description True after verified native revocation or archive handoff releases the source dependency. Retiring remains a durable discard tombstone while archive collection proceeds independently. */
+            source_released: boolean;
+            /** @enum {string} */
+            initial_history: "certified" | "retained_source_rows";
+            dimensions: string[];
+            measures: components["schemas"]["RetainedDatasetMeasure"][];
+            retention_ns: string;
+            interval_ns: string;
+            origin_ns: string;
+            progress?: components["schemas"]["RetainedDatasetProgress"] | null;
+        };
+        RetainedDatasetNativeProgress: {
+            ready: boolean;
+            draining: boolean;
+            closed: boolean;
+            archive_handoff: boolean;
+            backfill_cleanup_complete: boolean;
+            source_sequence: string;
+            replay_floor: string;
+            replay_latest: string;
+            retention_clock_ns: string;
+            last_attempt_ns?: string | null;
+            /** @description Durable error name from the most recent failed maintenance operation; cleared by successful maintenance. */
+            last_error?: string | null;
+        };
+        RetainedDatasetArchiveProgress: {
+            pages: string;
+            sealed: boolean;
+            next_bucket_ns: string;
+        };
+        RetainedDatasetOwnerProgress: {
+            group: string;
+            /** @enum {string} */
+            mode: "registered" | "installed" | "ready" | "closed" | "revoked";
+            archive_authoritative: boolean;
+            native?: components["schemas"]["RetainedDatasetNativeProgress"] | null;
+            archive?: components["schemas"]["RetainedDatasetArchiveProgress"] | null;
+            /** @description Failure to obtain this owner's current status; distinct from a persisted maintenance failure. */
+            status_error?: string | null;
+        };
+        RetainedDatasetProgress: {
+            /** @enum {string} */
+            phase: "activating" | "active" | "closing" | "closed" | "retiring" | "retired";
+            registration_complete: boolean;
+            /** Format: uint32 */
+            registered_owners: number;
+            /** Format: uint32 */
+            ready_owners: number;
+            /** Format: uint32 */
+            revoked_owners: number;
+            /** Format: uint32 */
+            archived_owners: number;
+            owners: components["schemas"]["RetainedDatasetOwnerProgress"][];
+            /** @description Pass as after_group to obtain the next bounded owner page. */
+            next_group?: string | null;
+        };
         PrivacyProducer: {
             /** @enum {string} */
             type: "extractor" | "generator";
@@ -15843,7 +16087,7 @@ export interface components {
          * @example table
          * @enum {string}
          */
-        ResourceType: "table" | "database" | "namespace" | "tablespace" | "graph" | "user" | "inference" | "*";
+        ResourceType: "table" | "database" | "namespace" | "tablespace" | "graph" | "dataset" | "user" | "inference" | "*";
         /**
          * @description Type of permission.
          * @example read
@@ -38564,6 +38808,515 @@ export interface operations {
             404: components["responses"]["NotFound"];
             /** @description Explicit catalog table lifecycle is not supported by the configured local table write backend. */
             501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getRetainedDataset: {
+        parameters: {
+            query?: {
+                after_group?: string;
+                max_owners?: number;
+            };
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Retained summary definition and lifecycle phase. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedDatasetInfo"];
+                };
+            };
+            /** @description Dataset read permission is required. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    createRetainedDataset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    source: {
+                        /** @default default */
+                        database?: string;
+                        /** @default public */
+                        namespace?: string;
+                        table: string;
+                    };
+                    timestamp: string;
+                    dimensions?: string[];
+                    /** @description Positive bucket width in nanoseconds as a decimal string. */
+                    interval_ns: string;
+                    /**
+                     * @description Signed UTC nanoseconds as a decimal string.
+                     * @default 0
+                     */
+                    origin_ns?: string;
+                    mutable_for_ns: string;
+                    retention_ns: string;
+                    measures: components["schemas"]["RetainedDatasetMeasure"][];
+                };
+            };
+        };
+        responses: {
+            /** @description Summary accepted and awaiting activation. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedDatasetInfo"];
+                };
+            };
+            /** @description Invalid or unsupported summary definition. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset and source table administration permission required. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The catalog changed or the dataset already exists. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Shared archive storage or metadata authority is unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    closeRetainedDataset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** Format: uint64 */
+                    expected_revision: number;
+                    /**
+                     * @description Permanently discard the summary, fence publication, and asynchronously collect native and archived state. Mutually exclusive with cancel_activation.
+                     * @default false
+                     */
+                    discard?: boolean;
+                    /**
+                     * @description Explicitly cancel an activating summary and discard partial state. Rejected for an active summary; omit or set false to close and archive an active summary.
+                     * @default false
+                     */
+                    cancel_activation?: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description Summary is closing, being discarded, or activation is being cancelled. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedDatasetInfo"];
+                };
+            };
+            /** @description Dataset administration permission required. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The summary phase or revision changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    createRetainedSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Inclusive signed decimal nanoseconds. */
+                    start_ns?: string;
+                    /** @description Exclusive signed decimal nanoseconds. */
+                    end_ns?: string;
+                    /** @description Sliding window width in decimal nanoseconds, aligned to the dataset interval. */
+                    window_ns?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Snapshot or committed delta frame and its next cursor. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedSubscriptionFrame"];
+                };
+            };
+            /** @description Invalid cursor or range. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset read permission or cursor authority is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Replay or serving state was lost. Open a fresh snapshot. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Subscription exceeds its result or state budget. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A retained aggregate is outside its supported numeric range. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedDatasetReadError"];
+                };
+            };
+            /** @description Subscription owner is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    pollRetainedSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    cursor: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Snapshot or committed delta frame and its next cursor. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedSubscriptionFrame"];
+                };
+            };
+            /** @description Invalid cursor or range. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset read permission or cursor authority is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Replay or serving state was lost. Open a fresh snapshot. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Subscription exceeds its result or state budget. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A retained aggregate is outside its supported numeric range. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedDatasetReadError"];
+                };
+            };
+            /** @description Subscription owner is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    cancelRetainedSubscription: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    cursor: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Subscription canceled. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid cursor or range. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset read permission or cursor authority is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Replay or serving state was lost. Open a fresh snapshot. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Subscription exceeds its result or state budget. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Subscription owner is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    queryRetainedDataset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                datasetName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Inclusive UTC nanoseconds as a signed decimal string. */
+                    start_ns: string;
+                    /** @description Exclusive UTC nanoseconds as a signed decimal string. */
+                    end_ns: string;
+                    /** @default 4096 */
+                    max_rows?: number;
+                    /** @description Opaque exclusive continuation key from next. Reuse the same range and dimension filter. */
+                    after?: string;
+                    /** @description Optional exact tuple in the definition's dimension order. Values are normalized using the frozen column types; null is supported. */
+                    dimensions?: unknown[];
+                };
+            };
+        };
+        responses: {
+            /** @description Summary buckets with dimensions and measures in the listed order. Count values are exact decimal strings. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description Exclusive continuation key; null when complete. An empty page may still have a next key. */
+                        next: string | null;
+                        /** @enum {string} */
+                        initial_history: "certified" | "retained_source_rows";
+                        dimensions: string[];
+                        measures: {
+                            name: string;
+                            /** @enum {string} */
+                            law: "count" | "sum" | "avg" | "min" | "max";
+                            field?: string;
+                        }[];
+                        rows: {
+                            bucket_start_ns: string;
+                            dimensions: unknown[];
+                            values: unknown[];
+                        }[];
+                    };
+                };
+            };
+            /** @description Invalid range or bucket alignment. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset read permission is required. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset not found. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Dataset coverage or owner authority changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Requested history has expired. */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request or result exceeds the range budget. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A retained aggregate is outside its supported numeric range. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetainedDatasetReadError"];
+                };
+            };
+            /** @description Dataset authority is temporarily unavailable. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

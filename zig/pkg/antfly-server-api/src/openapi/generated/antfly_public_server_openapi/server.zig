@@ -399,6 +399,90 @@ pub const DropNamespacePathParams = struct {
     namespace_name: []const u8,
 };
 
+/// Get retained summary status
+pub const GetRetainedDatasetPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    dataset_name: []const u8,
+};
+
+pub const GetRetainedDatasetParams = struct {
+    after_group: ?[]const u8 = null,
+    max_owners: ?[]const u8 = null,
+};
+
+/// Create a retained summary
+pub const CreateRetainedDatasetPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    dataset_name: []const u8,
+};
+
+/// Parse the JSON request body for createRetainedDataset.
+pub fn parseCreateRetainedDatasetBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Close and archive a retained summary
+pub const CloseRetainedDatasetPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    dataset_name: []const u8,
+};
+
+/// Parse the JSON request body for closeRetainedDataset.
+pub fn parseCloseRetainedDatasetBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Query retained summary buckets
+pub const QueryRetainedDatasetPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    dataset_name: []const u8,
+};
+
+/// Parse the JSON request body for queryRetainedDataset.
+pub fn parseQueryRetainedDatasetBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Open a retained summary subscription
+pub const CreateRetainedSubscriptionPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    dataset_name: []const u8,
+};
+
+/// Parse the JSON request body for createRetainedSubscription.
+pub fn parseCreateRetainedSubscriptionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Cancel a retained summary subscription
+pub const CancelRetainedSubscriptionPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    dataset_name: []const u8,
+};
+
+/// Parse the JSON request body for cancelRetainedSubscription.
+pub fn parseCancelRetainedSubscriptionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Replay retained summary changes
+pub const PollRetainedSubscriptionPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    dataset_name: []const u8,
+};
+
+/// Parse the JSON request body for pollRetainedSubscription.
+pub fn parsePollRetainedSubscriptionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Rename catalog resource
 pub const RenameNamespacePathParams = struct {
     database_name: []const u8,
@@ -2416,6 +2500,13 @@ pub const routes = [_]Route{
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces", .operation_id = "listNamespaces", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}", .operation_id = "createNamespace", .request_body = .none, .streaming_response = false },
     .{ .method = "DELETE", .path = "/databases/{databaseName}/namespaces/{namespaceName}", .operation_id = "dropNamespace", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}", .operation_id = "getRetainedDataset", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}", .operation_id = "createRetainedDataset", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/close", .operation_id = "closeRetainedDataset", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/query", .operation_id = "queryRetainedDataset", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions", .operation_id = "createRetainedSubscription", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/cancel", .operation_id = "cancelRetainedSubscription", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/poll", .operation_id = "pollRetainedSubscription", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/rename", .operation_id = "renameNamespace", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables", .operation_id = "listNamespaceTables", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}", .operation_id = "getNamespaceTable", .request_body = .none, .streaming_response = false },
@@ -2670,6 +2761,13 @@ pub const routes = [_]Route{
 //   fn listNamespaces(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response
 //   fn createNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
 //   fn dropNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
+//   fn getRetainedDataset(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8, params: GetRetainedDatasetParams) !httpx.Response
+//   fn createRetainedDataset(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response
+//   fn closeRetainedDataset(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response
+//   fn queryRetainedDataset(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response
+//   fn createRetainedSubscription(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response
+//   fn cancelRetainedSubscription(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response
+//   fn pollRetainedSubscription(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, dataset_name: []const u8) !httpx.Response
 //   fn renameNamespace(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8) !httpx.Response
 //   fn listNamespaceTables(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, params: ListNamespaceTablesParams) !httpx.Response
 //   fn getNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response

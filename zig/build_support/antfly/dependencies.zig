@@ -1500,7 +1500,11 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     sql_test_mod.addImport("bloom", bloom_mod);
     // The SQL memory budget borrows the storage resource manager's host
     // admission, which imports the shared cache budget.
+    // Typed spill cells use the shared packed-vector codec in both the
+    // SQL contract root and its extracted local-source owner.
+    sql_test_mod.addImport("antfly_vector", vector_mod);
     sql_test_mod.addImport("antfly_cache_budget", cache_budget_mod);
+    pgwire_test_mod.addImport("antfly_vector", vector_mod);
     pgwire_test_mod.addImport("antfly_cache_budget", cache_budget_mod);
     sql_test_mod.link_libc = link_libc;
     const refinement_bench_mod = b.createModule(.{
@@ -1517,6 +1521,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     refinement_bench_mod.addImport("antfly_regex", regex_mod);
     refinement_bench_mod.addImport("antfly_sql_regex", sql_regex_mod);
     refinement_bench_mod.addImport("antfly_hash", hash_mod);
+    refinement_bench_mod.addImport("antfly_vector", vector_mod);
     refinement_bench_mod.addImport("bloom", bloom_mod);
     refinement_bench_mod.link_libc = link_libc;
     const refinement_bench = b.addTest(.{ .root_module = refinement_bench_mod, .filters = &.{"native refinements benchmark"} });

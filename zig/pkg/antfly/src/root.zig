@@ -316,6 +316,7 @@ test {
 
     // Public API
     _ = public_api;
+    _ = public_api.retained_owner_control;
     _ = public_api.row_policy_install;
     _ = public_api.relational_fk_generation_publication;
     _ = public_api.row_policy_publication_coordinator;

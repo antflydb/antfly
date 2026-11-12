@@ -54,6 +54,7 @@ pub const AddTestsResult = struct {
     run_api_table_writes_docid_tests: *std.Build.Step.Run,
     run_api_table_reads_docid_tests: *std.Build.Step.Run,
     run_api_public_table_http_docid_tests: *std.Build.Step.Run,
+    api_public_table_http_test_mod: *std.Build.Module,
     run_raft_transition_runtime_docid_tests: *std.Build.Step.Run,
     run_api_table_writes_production_regression_unit_tests: *std.Build.Step.Run,
     run_lib_docid_lifecycle_tests: *std.Build.Step.Run,
@@ -1740,6 +1741,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-rewrite-admission-contract-test", "Verify scoped rewrite admission and durable intent binding")
         .dependOn(&addFilteredTestRunArtifact(b, rewrite_admission_contract_tests).step);
+    const retained_series_ttl_tests = b.addTest(.{
+        .root_module = api_transactions_docid_test_mod,
+        .filters = &.{ "retained series expiration", "distributed txn retained series", "distributed txn ttl", "distributed txn atomic cascade closure" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("retained-series-ttl-test", "Verify coordinated expiration provenance, foreign-key closure and fail-closed transport")
+        .dependOn(&addFilteredTestRunArtifact(b, retained_series_ttl_tests).step);
     const row_semantics_codec_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn prepare preserves JSON null", "distributed txn prepare JSON null", "internal batch JSON null", "distributed txn range guard wire" },
@@ -2552,6 +2560,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .hosted_recovery_step = hosted_recovery_step,
         .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ public_api_parity_tests, lib_api_auth_tests, cypher_cohort_tests.executable, api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_recovery_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_recovery_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_recovery_tests }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
+        .api_public_table_http_test_mod = api_public_table_http_docid_test_mod,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,
         .run_lib_docid_lifecycle_tests = run_lib_docid_lifecycle_tests,

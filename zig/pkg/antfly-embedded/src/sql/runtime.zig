@@ -608,6 +608,7 @@ pub const Context = struct {
     /// Arrays are owned envelopes and NUMERIC values are exact decimal text,
     /// never their JSON-null placeholders.
     pub fn outputDatum(self: Context, datum: Datum, kind: ?ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !Json {
+        _ = try datum.requireValue();
         if (kind == .array) {
             const checked = try describe.coerceDatum(self.arena, datum, .array, element_type);
             if (checked.sql_null) return .null;
@@ -2006,6 +2007,9 @@ fn putField(arena: std.mem.Allocator, object: *std.json.ObjectMap, path: []const
 /// independently prepared MERGE images. Never encode a typed array's JSON
 /// placeholder or retain payloads borrowed from an evaluator's scratch arena.
 pub fn encodeStorageDatum(arena: std.mem.Allocator, datum: Datum, column: catalog.Column, retained_bytes: usize) !Json {
+    // Assignment consumes the value: structural coercion deliberately preserves
+    // deferred source errors, but storage must never encode their placeholders.
+    _ = try datum.requireValue();
     const assigned = if (column.type == .array) try @import("scalar.zig").assignArray(arena, datum, column.element_type orelse return error.SqlAssignmentTypeMismatch, .{ .output_bytes = retained_bytes }) else datum;
     const checked = try describe.coerceDatum(arena, assigned, column.type, column.element_type);
     if (checked.sql_null) {
@@ -6625,4 +6629,12 @@ test "SQL ordered scalar groups keep the cut alive and stop after accepted HAVIN
         if (!empty) try std.testing.expectEqualStrings("63", result.output.rows[0][0].string);
         try std.testing.expectEqual(@as(usize, 1), driver.closed);
     }
+}
+
+test "SQL storage assignments reject deferred errors before domain conversion" {
+    for ([_]catalog.Column{
+        .{ .name = "v", .path = "v", .type = .number },
+        .{ .name = "v", .path = "v", .type = .integer },
+        .{ .name = "v", .path = "v", .type = .array, .element_type = .float64 },
+    }) |column| try std.testing.expectError(error.RetainedSeriesNumericOverflow, encodeStorageDatum(std.testing.allocator, Datum.failed(.retained_numeric_overflow), column, 1024));
 }

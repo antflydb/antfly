@@ -167,8 +167,9 @@ pub fn expireStep(alloc: std.mem.Allocator, source: catalog.CatalogSource, reade
         var deletion = initial;
         deletion.predicates = &.{predicate};
         deletion.deletes = &.{candidate.key};
+        deletion.expiration_deletes = &.{candidate.key};
         var prepared = integrity.prepareWithCoverageControlled(alloc, reader, snapshot.value.tables, snapshot.value.ranges, &.{deletion}, authorized) catch |err| switch (err) {
-            error.ForeignKeyReferenced, error.VersionConflict, error.PreparedReadSetChanged => continue,
+            error.ForeignKeyReferenced, error.VersionConflict, error.PreparedReadSetChanged, error.RetainedSeriesNotReady, error.RetainedSeriesPreparedHold, error.RetainedSeriesCorrectionWindow, error.RetainedSeriesCoverageMissing => continue,
             else => {
                 result.failedAttempt(err);
                 return result;
@@ -181,7 +182,7 @@ pub fn expireStep(alloc: std.mem.Allocator, source: catalog.CatalogSource, reade
         };
         try integrity.authorizePrimaryMutations(authorized, true, prepared.tables);
         const outcome = (writer.commitBatchWithCancellation(alloc, prepared.tables, .write, commit_cancellation) catch |err| switch (err) {
-            error.ForeignKeyReferenced, error.VersionConflict, error.PreparedReadSetChanged => continue,
+            error.ForeignKeyReferenced, error.VersionConflict, error.PreparedReadSetChanged, error.RetainedSeriesNotReady, error.RetainedSeriesPreparedHold, error.RetainedSeriesCorrectionWindow, error.RetainedSeriesCoverageMissing => continue,
             else => {
                 result.failedAttempt(err);
                 return result;
@@ -263,6 +264,7 @@ test "distributed txn ttl shares cascade restrict and set null semantics" {
                     .relational_integrity_generation_set = request.relational_integrity_generation_set,
                     .writes = request.writes,
                     .deletes = request.deletes,
+                    .expiration_deletes = request.expiration_deletes,
                     .predicates = request.predicates,
                     .integrity_commands = request.integrity_commands,
                 });
@@ -290,6 +292,15 @@ test "distributed txn ttl shares cascade restrict and set null semantics" {
         } }});
         defer inserted.deinit();
         _ = try Fixture.commit(&fixture, alloc, inserted.tables, .write);
+        const retained = @import("antfly_local_sources").storage_retained_series;
+        const capture = @import("antfly_local_sources").storage_retained_series_capture;
+        const namespace = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(db.core.identity_namespace);
+        var partition: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&namespace, &partition, .{});
+        const binding: capture.Binding = .{ .spec = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .source_partition = partition, .source_incarnation = 1, .interval_ns = 10, .mutable_for_ns = 0, .laws = &.{.count} }, .timestamp = "expires", .fields = &.{null} };
+        const fence: @import("antfly_local_sources").storage_retained_series_control.Fence = .{ .id = binding.spec.id, .generation = 1, .definition = binding.spec.definition, .partition = partition, .incarnation = 1 };
+        try db.batch(.{ .timestamp_ns = 102, .retained_series = .{ .action = .install, .fence = fence, .binding = binding } });
+        try db.batch(.{ .timestamp_ns = 103, .retained_series = .{ .action = .backfill, .fence = fence } });
         const candidates = [_]expiry.Candidate{ try fixture.candidate("p"), try fixture.candidate("free") };
         fixture.inject_refresh = inject_refresh;
         fixture.inject_timeout = inject_timeout;
@@ -330,5 +341,12 @@ test "distributed txn ttl shares cascade restrict and set null semantics" {
         var free = try db.lookup(alloc, "free", .{});
         defer if (free) |*row| row.deinit(alloc);
         try std.testing.expect(free == null);
+        var summary_read = try db.core.store.beginReadTxn();
+        defer summary_read.abort();
+        var summary_arena = std.heap.ArenaAllocator.init(alloc);
+        defer summary_arena.deinit();
+        const summary = try (retained.Engine{ .alloc = alloc, .spec = binding.spec }).scan(summary_arena.allocator(), &summary_read, 0, 10, 1000, null, 10);
+        try std.testing.expectEqual(@as(usize, 1), summary.rows.len);
+        try std.testing.expectEqual(@as(i64, 3), summary.rows[0].rows);
     };
 }

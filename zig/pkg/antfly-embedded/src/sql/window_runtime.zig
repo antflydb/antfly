@@ -877,12 +877,18 @@ pub fn evaluate(context: anytype, cells: anytype, indices: anytype, sort: bindin
     }
 }
 
-pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtime.zig").Output {
-    const bound = context.binding.window orelse return error.InvalidSqlBackendResponse;
+/// Validate statement constants independently of row demand and source admission.
+pub fn validateInvocation(context: anytype) !void {
+    const bound = context.binding.window orelse return;
     for (bound.specs) |spec| if (spec.frame) |definition| for ([_]ast.Window.Bound{ definition.start, definition.end }) |boundary| switch (boundary) {
         .preceding, .following => |value| _ = try offsetValue(context, value),
         else => {},
     };
+}
+
+pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtime.zig").Output {
+    const bound = context.binding.window orelse return error.InvalidSqlBackendResponse;
+    try validateInvocation(context);
     const limit = statement.capRows(try context.count(statement.limit, context.limits.result_rows));
     const offset = try context.offsetCount(statement.offset);
     if (limit > context.limits.result_rows or offset > context.limits.scan_rows) return error.SqlProgramLimitExceeded;

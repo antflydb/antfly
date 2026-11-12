@@ -113,6 +113,7 @@ pub const StandaloneCatalogUpdate = struct {
     /// An exact physical-root proof for native schema finalization, or a
     /// binding-only first registration before any FK publication begins.
     native_owner: ?@import("../standalone_native_owner.zig").Binding = null,
+    native_owner_signing_identity: ?@import("../store_root_enrollment.zig").Identity = null,
     import_catalog: ?@import("antfly_local_sources").system_catalog_domain.State = null,
     /// Applied in the same local transaction as the standalone revision and
     /// mirrored outbox. Mutually exclusive with an ordinary logical delta.
@@ -250,6 +251,9 @@ pub const CatalogAdmission = struct { meta: system_catalog.Meta, placement_polic
 pub fn transitionMutatesRelationSource(command: anytype) bool {
     return switch (command) {
         .apply_system_catalog,
+        .activate_retained_dataset,
+        .release_retained_source,
+        .finish_retained_collection,
         .apply_restore_staging,
         .create_restore_job_with_staging,
         .apply_sql_completion_reference,
@@ -323,4 +327,12 @@ pub const CatalogProjectionRequest = union(enum) {
     fk_initial_retirement_page: @import("../fk_initial_retirement_wire.zig").PageRequest,
     store_root_control: @import("../fk_initial_retirement_wire.zig").Control,
     fk_initial_parent_decision: @import("../fk_generation_publication.zig").DecisionRequest,
+    retained_dataset_pending: u64,
+    retained_archive_work: u64,
+    retained_source_candidate: @import("antfly_local_sources").system_catalog_domain.Target,
+    retained_dataset_read_cut: @import("antfly_local_sources").system_catalog_domain.Target,
+    retained_owner_receipt_preflight: @import("../retained_dataset_owner_receipt.zig").Receipt,
+    retained_owner_read: @import("../retained_dataset_owners.zig").Read,
+    retained_dataset_work: struct { after_id: u64, native: bool },
+    require_retained_source_drop_allowed: u64,
 };

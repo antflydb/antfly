@@ -1255,6 +1255,28 @@ const RaftTableApplyStateMachine = struct {
 
     const ExpectedApplyFailure = enum {
         RetainedEffectsFull,
+        InvalidRetainedSeries,
+        InvalidRetainedSeriesRow,
+        RetainedSeriesAlreadyExists,
+        RetainedSeriesBackfillFence,
+        RetainedSeriesBatchTooLarge,
+        RetainedSeriesCorrectionWindow,
+        RetainedSeriesCoverageMissing,
+        RetainedSeriesDefinitionMismatch,
+        RetainedSeriesDuplicateRow,
+        RetainedSeriesHistoryExpired,
+        RetainedSeriesNotReady,
+        RetainedSeriesPreparedHold,
+        RetainedSeriesReservationMismatch,
+        RetainedSeriesNumericOverflow,
+        RetainedSeriesResetRequired,
+        RetainedSeriesResolutionMismatch,
+        RetainedSeriesSequenceMismatch,
+        RetainedSeriesTimeOverflow,
+        RetainedSeriesTransactionsUnsupported,
+        RetainedSeriesTopologyUnsupported,
+        RetainedSeriesCoordinatedTtlUnsupported,
+
         RetainedEffectsConsumerLimit,
         RetainedEffectsNamespaceMismatch,
         RetainedEffectsFenceMismatch,
@@ -1335,8 +1357,14 @@ const RaftTableApplyStateMachine = struct {
         InitialChildProvisionAlreadyCommitted,
         SqlFeatureNotSupported,
         SqlArraySubscriptError,
+        RetainedSeriesSourceClosed,
+        RetainedSeriesSourceRevoked,
+        RetainedSeriesSourceDraining,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
+            inline for (@typeInfo(@import("antfly_local_sources").storage_retained_series_control.Rejection).error_set.error_names.?) |field| {
+                if (err == @field(@import("antfly_local_sources").storage_retained_series_control.Rejection, field)) return @field(ExpectedApplyFailure, field);
+            }
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
                 if (err == @field(@import("antfly_local_sources").storage_db_online_source_contract.Rejection, field)) return @field(ExpectedApplyFailure, field);
             }
@@ -1392,6 +1420,9 @@ const RaftTableApplyStateMachine = struct {
         }
 
         fn toError(self: ExpectedApplyFailure) anyerror {
+            inline for (@typeInfo(@import("antfly_local_sources").storage_retained_series_control.Rejection).error_set.error_names.?) |field| {
+                if (self == @field(ExpectedApplyFailure, field)) return @field(@import("antfly_local_sources").storage_retained_series_control.Rejection, field);
+            }
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
                 if (self == @field(ExpectedApplyFailure, field)) return @field(@import("antfly_local_sources").storage_db_online_source_contract.Rejection, field);
             }
@@ -1440,6 +1471,12 @@ const RaftTableApplyStateMachine = struct {
                 if (control == .resolve and control.resolve.status == .committed) return null;
             };
             if (req.transaction) |control| if (control == .resolve and control.resolve.status == .committed) {
+                // These checks are prepare-time obligations. Dropping a
+                // committed decision on a late lifecycle rejection would lose
+                // source writes while the coordinator reports success.
+                inline for (@typeInfo(@import("antfly_local_sources").storage_retained_series_control.Rejection).error_set.error_names.?) |field| {
+                    if (err == @field(@import("antfly_local_sources").storage_retained_series_control.Rejection, field)) return null;
+                }
                 inline for (@typeInfo(@import("../api/relational_row_errors.zig").PolicyError).error_set.error_names.?) |field| {
                     if (err == @field(@import("../api/relational_row_errors.zig").PolicyError, field)) return null;
                 }
@@ -2373,7 +2410,7 @@ fn batchRequiresDocumentDbApply(req: antfly.db.types.BatchRequest) bool {
 }
 
 fn batchRequiresTopologyArbitration(req: antfly.db.types.BatchRequest) bool {
-    return req.online_source != null or req.relational_topology != null or req.relational_generation_gc != null or req.split_transition != null or
+    return req.retained_series != null or req.online_source != null or req.relational_topology != null or req.relational_generation_gc != null or req.split_transition != null or
         req.split_checkpoint != null or req.merge_source_transition != null or req.merge_checkpoint != null or
         req.merge_replication != null or req.merge_page != null;
 }
@@ -5500,6 +5537,27 @@ fn storeRootRegistrationRefreshDue(confirmed: bool, active: bool, urgent: bool, 
     return elapsed_ms >= 60_000 or (urgent and elapsed_ms >= 5_000);
 }
 
+pub const StandaloneRetainedOwner = struct {
+    node_id: u64,
+    store_id: u64,
+    metadata: *anyopaque,
+    /// Relative delay in nanoseconds; provider and executor clocks may differ.
+    maintain_archive: *const fn (*anyopaque, antfly.public_api.operation.RequestContext) anyerror!u64,
+    validate_root: *const fn (*anyopaque, std.mem.Allocator, @import("../metadata/store_root_enrollment.zig").Identity, antfly.public_api.operation.RequestContext) anyerror!void,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    const VTable = struct {
+        maintain_archive: *const fn (*anyopaque, antfly.public_api.operation.RequestContext) anyerror!u64,
+        validate_root: *const fn (*anyopaque, std.mem.Allocator, @import("../metadata/store_root_enrollment.zig").Identity, antfly.public_api.operation.RequestContext) anyerror!void,
+    };
+    const BoundaryAbi = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
+    fn maintainArchive(self: @This(), context: antfly.public_api.operation.RequestContext) !u64 {
+        return BoundaryAbi.call("maintain_archive", self.boundary_dispatch, self.maintain_archive, .{ self.metadata, context });
+    }
+    fn validateRoot(self: @This(), a: std.mem.Allocator, identity: @import("../metadata/store_root_enrollment.zig").Identity, context: antfly.public_api.operation.RequestContext) !void {
+        return BoundaryAbi.call("validate_root", self.boundary_dispatch, self.validate_root, .{ self.metadata, a, identity, context });
+    }
+};
+
 pub const DataServer = struct {
     const StoreReportWorkState = enum(u8) { idle, capturing, ready };
     const StoreReportCollection = struct {
@@ -5532,6 +5590,17 @@ pub const DataServer = struct {
     /// thread to continue during blocking restore and catalog durability I/O.
     data_raft_reconcile_mutex: std.atomic.Mutex = .unlocked,
     initial_fk_retirement_running: std.atomic.Value(bool) = .init(false),
+    retained_maintenance_running: std.atomic.Value(bool) = .init(false),
+    retained_archive_running: std.atomic.Value(bool) = .init(false),
+    retained_archive_next_ns: std.atomic.Value(u64) = .init(0),
+    retained_maintenance_next_ns: std.atomic.Value(u64) = .init(0),
+    retained_resource_next_ns: u64 = 0,
+    retained_owner_next_ns: u64 = 0,
+    retained_resource_cursor: u64 = 0,
+    retained_owner_cursor: @import("../metadata/retained_dataset_owners.zig").Cursor = .{},
+    retained_owner_sweep: @import("../metadata/retained_dataset_owners.zig").WorkSweep = .{},
+    retained_archive_backoff: @import("../metadata/retained_dataset_owners.zig").ArchiveBackoff = .{},
+    retained_plan_turn: bool = false,
     graph_cleanup_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
     leann_replication_running: std.atomic.Value(bool) = .init(false),
@@ -5558,6 +5627,7 @@ pub const DataServer = struct {
     data_raft_apply: ?*RaftTableApplyStateMachine = null,
     data_raft_base_uri: ?[]u8 = null,
     metadata_local_providers_registered: bool = false,
+    standalone_retained_owner: ?StandaloneRetainedOwner = null,
     store_registration: ?StoreRegistrationConfig = null,
     store_registration_confirmed: bool = false,
     store_root_registration_active: std.atomic.Value(bool) = .init(false),
@@ -6656,6 +6726,328 @@ pub const DataServer = struct {
         return std.json.parseFromSliceLeaky(bool, a, raw, .{});
     }
 
+    // Dispatch only: metadata and native proposals must never block the Raft
+    // driver which advances them. Each job visits bounded indexed work and
+    // only the current source-group leader performs reconciliation.
+    fn runRetainedArchiveMaintenanceRound(self: *DataServer) !void {
+        if (self.standalone_retained_owner == null or self.background_jobs_shutdown.load(.acquire)) return;
+        const runtime = self.backend_runtime orelse return;
+        if (runtime.durable_jobs.executesInline() or self.backgroundMonotonicNs() < self.retained_archive_next_ns.load(.acquire)) return;
+        if (self.retained_archive_running.swap(true, .acq_rel)) return;
+        errdefer self.retained_archive_running.store(false, .release);
+        try runtime.durable_jobs.submit(.{ .owner_id = try self.dataServerBackgroundOwnerId(runtime), .class = .maintenance, .ptr = self, .run = runRetainedArchiveMaintenanceJob, .deinit = deinitRetainedArchiveMaintenanceJob });
+    }
+    fn deinitRetainedArchiveMaintenanceJob(ptr: *anyopaque) void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        self.retained_archive_running.store(false, .release);
+    }
+    fn runRetainedArchiveMaintenanceJob(ptr: *anyopaque) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        self.retained_archive_next_ns.store(self.backgroundMonotonicNs() +| std.time.ns_per_s, .release);
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        const owner = self.standalone_retained_owner orelse return;
+        const context: antfly.public_api.operation.RequestContext = .{ .setting_admin = true, .deadline_ns = platform_time.monotonicNs() +| 2 * std.time.ns_per_s, .cancellation = .fromAtomic(&self.background_jobs_shutdown) };
+        // The archive owner uses platform MONOTONIC, while this scheduler
+        // borrows Io.awake. Exchange a duration, never absolute timestamps.
+        const delay_ns = try owner.maintainArchive(context);
+        self.retained_archive_next_ns.store(self.backgroundMonotonicNs() +| @max(delay_ns, 10 * std.time.ns_per_ms), .release);
+    }
+
+    fn runRetainedMaintenanceRound(self: *DataServer) !void {
+        if (self.standalone_retained_owner == null and (self.data_raft == null or !self.store_root_registration_active.load(.acquire))) return;
+        const runtime = self.backend_runtime orelse return;
+        if (runtime.durable_jobs.executesInline() or self.background_jobs_shutdown.load(.acquire)) return;
+        const now = self.backgroundMonotonicNs();
+        if (now < self.retained_maintenance_next_ns.load(.acquire)) return;
+        if (self.retained_maintenance_running.swap(true, .acq_rel)) return;
+        errdefer self.retained_maintenance_running.store(false, .release);
+        self.retained_maintenance_next_ns.store(now +| std.time.ns_per_s, .release);
+        try runtime.durable_jobs.submit(.{ .owner_id = try self.dataServerBackgroundOwnerId(runtime), .class = .maintenance, .ptr = self, .run = runRetainedMaintenanceJob, .deinit = deinitRetainedMaintenanceJob });
+    }
+    fn deinitRetainedMaintenanceJob(ptr: *anyopaque) void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        self.retained_maintenance_running.store(false, .release);
+    }
+    fn retainedMaintenanceLeader(self: *DataServer, group: u64) bool {
+        lockAtomic(&self.data_raft_mutex);
+        defer self.data_raft_mutex.unlock();
+        const raft = self.data_raft orelse return self.standalone_retained_owner != null;
+        return raft.host.http_host.host.isLocalLeader(group);
+    }
+    fn runRetainedMaintenanceJob(ptr: *anyopaque) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (self.hotStandbyWriteGate()) |gate| try gate.check();
+        const model = @import("../metadata/retained_dataset_owners.zig");
+        const control = antfly.public_api.retained_owner_control;
+        var budget = resource_manager_mod.BudgetedAllocator.init(&self.provisioned_storage.resource_manager, .shard_transition_working_set, self.alloc, 1);
+        defer budget.deinit();
+        var arena = std.heap.ArenaAllocator.init(budget.allocator());
+        defer arena.deinit();
+        const a = arena.allocator();
+        const context: antfly.public_api.operation.RequestContext = .{ .setting_admin = true, .deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s, .cancellation = .fromAtomic(&self.background_jobs_shutdown) };
+        // Schedule the two indexed lanes independently. Idle resources must
+        // not delay active backfill; alternating eligible lanes preserves
+        // fairness when both have work.
+        const now = self.backgroundMonotonicNs();
+        const resource_due = now >= self.retained_resource_next_ns;
+        const owner_due = now >= self.retained_owner_next_ns;
+        defer self.retained_maintenance_next_ns.store(@min(self.retained_resource_next_ns, self.retained_owner_next_ns), .release);
+        if (!resource_due and !owner_due) return;
+        self.retained_plan_turn = resource_due and (!owner_due or !self.retained_plan_turn);
+        if (self.retained_plan_turn) {
+            self.retained_resource_next_ns = now +| 10 * std.time.ns_per_ms;
+            const Pending = struct { resource: @import("antfly_local_sources").system_catalog_domain.Resource, coordinator_group: u64 };
+            const bytes = try self.status_source.systemCatalog(a, context, .{ .retained_dataset_pending = self.retained_resource_cursor });
+            const pending = (try std.json.parseFromSliceLeaky(?Pending, a, bytes, .{})) orelse {
+                self.retained_resource_next_ns = now +| 10 * std.time.ns_per_s;
+                return;
+            };
+            self.retained_resource_cursor = pending.resource.id;
+            if (!self.retainedMaintenanceLeader(pending.coordinator_group)) return;
+            const descriptor = try @import("antfly_local_sources").system_catalog_retained_datasets.parse(a, pending.resource.source_json);
+            const raw = try self.status_source.systemCatalog(a, context, .{ .retained_owner_read = .{ .plan = .{ .resource = pending.resource.id, .generation = descriptor.value.definition.generation } } });
+            const plan = (try std.json.parseFromSliceLeaky(?model.Plan, a, raw, .{})) orelse return;
+            try context.ensureActive();
+            if (!self.retainedMaintenanceLeader(pending.coordinator_group)) return error.GroupLeaderUnavailable;
+            if (plan.canReleaseSource()) {
+                _ = try self.status_source.systemCatalog(a, context, .{ .retained_dataset_release = .{ .resource = plan.resource, .generation = plan.generation, .plan = plan.id, .revision = plan.revision } });
+                return;
+            }
+            if (plan.phase != .activating) return;
+            if (!plan.registration_complete) {
+                _ = try self.status_source.systemCatalog(a, context, .{ .retained_owner_register = .{ .resource = plan.resource, .generation = plan.generation, .plan = plan.id, .revision = plan.revision } });
+                self.retained_resource_next_ns = now +| 100 * std.time.ns_per_ms;
+            } else if (plan.ready == plan.registered) {
+                _ = try self.status_source.systemCatalog(a, context, .{ .retained_dataset_activate = .{ .resource = plan.resource, .generation = plan.generation, .plan = plan.id, .revision = plan.revision } });
+            }
+            return;
+        }
+        // Cheap keys avoid transferring schemas or opening owners for groups
+        // led elsewhere. The subsequent same-cut snapshot uses latest owner
+        // revision; the native actor independently validates it again.
+        // Drain a bounded fair sweep without a per-command one-second sleep.
+        // Preserve the cursor between jobs, including on transient failures.
+        self.retained_owner_next_ns = now +| 10 * std.time.ns_per_ms;
+        const turn_deadline = now +| 100 * std.time.ns_per_ms;
+        for (0..64) |_| {
+            if (self.backgroundMonotonicNs() >= turn_deadline) break;
+            var owner_arena = std.heap.ArenaAllocator.init(budget.allocator());
+            defer owner_arena.deinit();
+            const owner_alloc = owner_arena.allocator();
+            try context.ensureActive();
+            const raw = try self.status_source.systemCatalog(owner_alloc, context, .{ .retained_owner_read = .{ .work_key = self.retained_owner_cursor } });
+            const key = (try std.json.parseFromSliceLeaky(?model.WorkKey, owner_alloc, raw, .{})) orelse {
+                self.retained_owner_sweep = .{};
+                self.retained_owner_next_ns = now +| 10 * std.time.ns_per_s;
+                return;
+            };
+            if (!self.retained_owner_sweep.admit(key.cursor)) {
+                self.retained_owner_next_ns = self.backgroundMonotonicNs() +| self.retained_owner_sweep.finish();
+                return;
+            }
+            self.retained_owner_cursor = key.cursor;
+            if (!self.retainedMaintenanceLeader(key.cursor.owner_group)) continue;
+            const bytes = try self.status_source.systemCatalog(owner_alloc, context, .{ .retained_owner_read = .{ .selection = key } });
+            const snapshot = try std.json.parseFromSliceLeaky(control.Snapshot, owner_alloc, bytes, .{});
+            if (snapshot.plan.phase == .closing and snapshot.owner.mode == .closed and snapshot.owner.independent_receipt == null) {
+                if (self.api_server_cfg.node_config) |config| {
+                    if (config.storage.artifacts.connection != null) {
+                        const scope: model.ArchiveScope = .{ .resource = snapshot.plan.resource, .generation = snapshot.plan.generation, .plan = snapshot.plan.id, .group = snapshot.owner.group, .revision = snapshot.owner.revision };
+                        if (!self.retained_archive_backoff.due(scope, self.backgroundMonotonicNs())) continue;
+                        const receipt = self.exportRetainedOwnerPage(owner_alloc, snapshot, context) catch |err| {
+                            self.retained_archive_backoff.failed(self.alloc, scope, self.backgroundMonotonicNs()) catch {};
+                            self.recordRetainedOwnerFailure(owner_alloc, snapshot, err, context) catch {};
+                            std.log.warn("retained archive handoff deferred group={d} err={s}", .{ snapshot.owner.group, @errorName(err) });
+                            continue;
+                        };
+                        if (receipt != null) {
+                            if (!self.retainedMaintenanceLeader(snapshot.owner.group)) return error.GroupLeaderUnavailable;
+                            _ = self.status_source.systemCatalog(owner_alloc, context, .{ .retained_owner_archive = scope }) catch |err| {
+                                self.retained_archive_backoff.failed(self.alloc, scope, self.backgroundMonotonicNs()) catch {};
+                                self.recordRetainedOwnerFailure(owner_alloc, snapshot, err, context) catch {};
+                                continue;
+                            };
+                        }
+                        self.retained_archive_backoff.succeeded(scope);
+                        self.retained_owner_sweep.busy = true;
+                        continue;
+                    }
+                }
+                continue;
+            }
+            const action: @FieldType(control.Request, "action") = switch (snapshot.plan.phase) {
+                .activating, .active => .reconcile,
+                .closing => if (snapshot.owner.mode == .closed) (if (snapshot.owner.independent_receipt != null) .revoke else continue) else .close,
+                .retiring => .revoke,
+                .closed, .retired => continue,
+            };
+            const table = snapshot.source_table orelse continue;
+            const result = self.drainRetainedOwner(owner_alloc, table.name, snapshot.owner.mode, &self.retained_owner_sweep.busy, snapshot.owner.group, .{ .resource = snapshot.plan.resource, .generation = snapshot.plan.generation, .plan = snapshot.plan.id, .group = snapshot.owner.group, .revision = snapshot.owner.revision, .action = action }, context) catch |err| switch (err) {
+                error.Canceled, error.Timeout => return err,
+                error.RetainedSeriesNotReady => {
+                    self.retained_owner_sweep.busy = true;
+                    continue;
+                },
+                else => {
+                    self.recordRetainedOwnerFailure(owner_alloc, snapshot, err, context) catch {};
+                    std.log.warn("retained owner maintenance deferred group={d} err={s}", .{ snapshot.owner.group, @errorName(err) });
+                    continue;
+                },
+            };
+            // Maintenance ticks do not rewrite the metadata owner journal.
+            // Only a logical state transition needs a verified acknowledgement.
+            if (result.mode != snapshot.owner.mode) {
+                _ = self.status_source.systemCatalog(owner_alloc, context, .{ .retained_owner_acknowledge = result }) catch |err| {
+                    self.recordRetainedOwnerFailure(owner_alloc, snapshot, err, context) catch {};
+                    std.log.warn("retained owner acknowledgement deferred group={d} err={s}", .{ snapshot.owner.group, @errorName(err) });
+                    continue;
+                };
+                // A rejected acknowledgement made no durable progress. Only
+                // successful transitions license the fast follow-up sweep.
+                self.retained_owner_sweep.busy = true;
+            }
+        }
+    }
+
+    fn drainRetainedOwner(self: *DataServer, alloc: std.mem.Allocator, table: []const u8, expected_mode: @import("../metadata/retained_dataset_owners.zig").Mode, busy: *bool, group: u64, request: antfly.public_api.retained_owner_control.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.retained_owner_control.Response {
+        const deadline = self.backgroundMonotonicNs() +| 25 * std.time.ns_per_ms;
+        var result: antfly.public_api.retained_owner_control.Response = undefined;
+        for (0..32) |_| {
+            var did_work = false;
+            result = try executeRetainedOwnerControlOnce(self, alloc, table, group, request, context, &did_work);
+            if (request.action != .reconcile or result.mode != expected_mode or !did_work) return result;
+            if (self.backgroundMonotonicNs() >= deadline) break;
+        }
+        // Revisit unfinished pages promptly; an idle complete sweep can sleep.
+        busy.* = true;
+        return result;
+    }
+
+    fn recordRetainedOwnerFailure(self: *DataServer, a: std.mem.Allocator, snapshot: antfly.public_api.retained_owner_control.Snapshot, failure: anyerror, context: antfly.public_api.operation.RequestContext) !void {
+        const local = @import("antfly_local_sources");
+        if (self.hotStandbyWriteGate()) |gate| try gate.check();
+        const source = snapshot.source_table orelse return;
+        if (!self.retainedMaintenanceLeader(snapshot.owner.group)) return error.GroupLeaderUnavailable;
+        const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        const status = try std.json.parseFromSliceLeaky(local.storage_retained_series_query.Status, a, try owner.queryRetainedSeriesJson(a, snapshot.owner.group, source.name, .status, context), .{});
+        const progress = for (status.entries) |entry| {
+            if (std.mem.eql(u8, &entry.binding.spec.id, &snapshot.plan.dataset) and entry.binding.spec.generation == snapshot.plan.generation) break entry.progress;
+        } else return;
+        const now = platform_time.realtimeNs();
+        const name = @errorName(failure);
+        if (progress.last_error) |previous| if (std.mem.eql(u8, previous, name) and now -| (progress.last_attempt_ns orelse 0) < std.time.ns_per_min) return;
+        const term = blk: {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            const raft = self.data_raft orelse break :blk @as(?u64, null);
+            if (!raft.host.http_host.host.isLocalLeader(snapshot.owner.group)) return error.GroupLeaderUnavailable;
+            const current = raft.host.http_host.host.raftStatus(snapshot.owner.group) orelse return error.UnknownGroup;
+            break :blk @as(?u64, current.hard.current_term);
+        };
+        const batch: antfly.db.types.BatchRequest = .{ .timestamp_ns = now, .retained_series = .{ .action = .diagnostic, .diagnostic_error = name, .fence = .{ .id = snapshot.plan.dataset, .generation = snapshot.plan.generation, .definition = snapshot.plan.definition, .partition = snapshot.owner.partition, .incarnation = snapshot.owner.incarnation } } };
+        if (term) |leader_term| try self.proposeRaftBatchGroup(a, snapshot.owner.group, source.name, batch, .{ .discovery = .cached, .required_local_term = leader_term, .allow_remote_forward = false, .admission_deadline_ns = context.deadline_ns, .visibility_cancellation = context.cancellation }) else {
+            if (self.standalone_retained_owner == null) return error.GroupLeaderUnavailable;
+            try owner.applyRetainedSeriesNative(a, snapshot.owner.group, source.name, batch, context);
+        }
+    }
+
+    fn freezeRetainedArchiveClock(self: *DataServer, a: std.mem.Allocator, group: u64, table: []const u8, spec: @import("antfly_local_sources").storage_retained_series.Spec, store: @import("../serverless/datasets/catalog.zig").Catalog, context: antfly.public_api.operation.RequestContext) !void {
+        const local = @import("antfly_local_sources");
+        const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        const fence: local.storage_retained_series_control.Fence = .{ .id = spec.id, .generation = spec.generation, .definition = spec.definition, .partition = spec.source_partition, .incarnation = spec.source_incarnation };
+        const before = try std.json.parseFromSliceLeaky(local.storage_retained_series_query.Status, a, try owners.queryRetainedSeriesJson(a, group, table, .status, context), .{});
+        const previous = for (before.entries) |entry| {
+            if (std.mem.eql(u8, &entry.binding.spec.id, &spec.id) and entry.binding.spec.generation == spec.generation) break entry.progress;
+        } else return error.RetainedSeriesNotReady;
+        if (!previous.closed or previous.revoked) return error.RetainedSeriesNotReady;
+        if (previous.archive_handoff) {
+            if (!self.retainedMaintenanceLeader(group)) return error.GroupLeaderUnavailable;
+            _ = try store.admitRetentionClock(spec, previous.admitted_ns);
+            return;
+        }
+        const batch: antfly.db.types.BatchRequest = .{ .retained_series = .{ .action = .archive_handoff, .fence = fence }, .timestamp_ns = platform_time.realtimeNs() };
+        if (self.hotStandbyWriteGate()) |gate| try gate.check();
+        const term = blk: {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            const raft = self.data_raft orelse break :blk @as(?u64, null);
+            if (!raft.host.http_host.host.isLocalLeader(group)) return error.GroupLeaderUnavailable;
+            const current = raft.host.http_host.host.raftStatus(group) orelse return error.UnknownGroup;
+            break :blk @as(?u64, current.hard.current_term);
+        };
+        if (term) |leader_term| try self.proposeRaftBatchGroup(a, group, table, batch, .{
+            .discovery = .cached,
+            .required_local_term = leader_term,
+            .allow_remote_forward = false,
+            .admission_deadline_ns = context.deadline_ns,
+            .visibility_cancellation = context.cancellation,
+        }) else {
+            if (self.standalone_retained_owner == null) return error.GroupLeaderUnavailable;
+            try owners.applyRetainedSeriesNative(a, group, table, batch, context);
+        }
+        const status = try std.json.parseFromSliceLeaky(local.storage_retained_series_query.Status, a, try owners.queryRetainedSeriesJson(a, group, table, .status, context), .{});
+        const progress = for (status.entries) |entry| {
+            if (std.mem.eql(u8, &entry.binding.spec.id, &spec.id) and entry.binding.spec.generation == spec.generation) break entry.progress;
+        } else return error.RetainedSeriesNotReady;
+        if (!progress.archive_handoff or !progress.closed or progress.revoked) return error.RetainedSeriesNotReady;
+        if (!self.retainedMaintenanceLeader(group)) return error.GroupLeaderUnavailable;
+        _ = try store.admitRetentionClock(spec, progress.admitted_ns);
+    }
+
+    fn exportRetainedOwnerPage(self: *DataServer, a: std.mem.Allocator, snapshot: antfly.public_api.retained_owner_control.Snapshot, context: antfly.public_api.operation.RequestContext) !?@import("../metadata/retained_dataset_owners.zig").Id {
+        const local = @import("antfly_local_sources");
+        const exported = @import("../serverless/datasets/closure_export.zig");
+        const manifest = @import("../serverless/datasets/closure_manifest.zig");
+        try context.ensureActive();
+        if (!self.retainedMaintenanceLeader(snapshot.owner.group)) return error.GroupLeaderUnavailable;
+        const closed = snapshot.owner.cut orelse return error.RetainedOwnerPlanChanged;
+        const source = snapshot.source_table orelse return error.RetainedOwnerPlanChanged;
+        var descriptor = try local.system_catalog_retained_datasets.parse(a, snapshot.resource.source_json);
+        defer descriptor.deinit();
+        const definition = descriptor.value.definition;
+        const spec = try @import("../api/retained_owner_binding.zig").specification(a, definition, snapshot.owner.partition, snapshot.owner.incarnation);
+        const cut: manifest.Cut = .{ .closure = closed.closure, .sequence = closed.sequence, .complete_from_ns = try std.fmt.parseInt(i128, closed.complete_from_ns, 10), .admitted_ns = try std.fmt.parseInt(i128, closed.admitted_ns, 10) };
+        const config = self.api_server_cfg.node_config orelse return error.InvalidDatasetBinding;
+        var archive = try @import("../serverless/datasets/configured_archive.zig").Opened.init(a, config, self.api_server_cfg.secret_store, descriptor.value, false);
+        defer archive.deinit();
+        const io = (try self.ensureBackendRuntime()).apiIo() orelse return error.BackendRuntimeUnavailable;
+        const store = archive.store(io, &context);
+        const location = archive.location();
+        store.create(definition) catch |err| switch (err) {
+            error.DatasetAlreadyExists => {},
+            else => return err,
+        };
+        const progress = (try store.getClosedExport(spec, cut)) orelse try manifest.Manifest.init(spec, cut);
+        if (progress.sealed) {
+            try self.freezeRetainedArchiveClock(a, snapshot.owner.group, source.name, spec, store, context);
+            return try progress.receipt();
+        }
+        const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        const fence: local.storage_retained_series_control.Fence = .{ .id = spec.id, .generation = spec.generation, .definition = spec.definition, .partition = spec.source_partition, .incarnation = spec.source_incarnation };
+        const bytes = read: {
+            var reader = try owners.openRetainedRead(a, snapshot.owner.group, source.name, .{ .fence = fence, .start_ns = 0, .end_ns = 0, .admitted_ns = cut.admitted_ns, .archive = .{ .sequence = cut.sequence, .complete_from_ns = cut.complete_from_ns, .closed_at_ns = cut.admitted_ns, .first_key = progress.next } }, context);
+            defer reader.deinit();
+            break :read try reader.nextJson(a, 256, context);
+        };
+        const response = try std.json.parseFromSliceLeaky(struct { root_incarnation: []const u8, page: local.storage_retained_series.Page }, a, bytes, .{});
+        if (!self.retainedMaintenanceLeader(snapshot.owner.group)) return error.GroupLeaderUnavailable;
+        try context.ensureActive();
+        _ = try store.admitRetentionClock(spec, @max(cut.admitted_ns, response.page.admitted_ns));
+        if (try exported.encode(a, definition, spec, cut, progress.next, response.page.rows, response.page.after != null, location)) |page| {
+            defer exported.deinit(a, page);
+            try exported.publish(store, spec, cut, page, location);
+            return null;
+        }
+        try self.freezeRetainedArchiveClock(a, snapshot.owner.group, source.name, spec, store, context);
+        var empty_tail = progress.next;
+        if (!std.mem.allEqual(u8, empty_tail[32..], '0')) {
+            const bucket = try local.retained_dataset_types.rowKeyTimestamp(empty_tail);
+            empty_tail = local.retained_dataset_types.rowKey(try std.math.add(i128, bucket, spec.interval_ns), @splat(0));
+        }
+        return try (try store.sealClosedExport(spec, cut, empty_tail)).receipt();
+    }
+
     const GraphCleanupJob = struct {
         server: *DataServer,
         table: []const u8,
@@ -7010,6 +7402,8 @@ pub const DataServer = struct {
         api_server_cfg.fk_generation_parent = .{ .ptr = self, .execute_fn = fkGenerationParentControl };
         api_server_cfg.fk_generation_source = .{ .ptr = self, .execute_fn = fkGenerationSourceControl };
         api_server_cfg.fk_initial_child = .{ .ptr = self, .execute_fn = fkInitialChildControl };
+        api_server_cfg.retained_owner_control = .{ .ptr = self, .execute_fn = executeRetainedOwnerControl };
+        api_server_cfg.retained_owner_read = .{ .ptr = self, .read_fn = queryRetainedOwnerRows, .poll_fn = pollRetainedOwner };
         api_server_cfg.row_policy_install = .{ .ptr = self, .execute_fn = installRowPolicyControl };
         // Distributed session/publication routes may resolve to another data
         // owner, including a hidden initial-FK child not yet publicly listed.
@@ -9576,6 +9970,12 @@ pub const DataServer = struct {
         // Durable cleanup epochs survive transient allocation/queue failures;
         // the control loop is their allocation-free watchdog.
         self.write_source.maintainDroppedTableRecovery();
+        self.runRetainedArchiveMaintenanceRound() catch |err| {
+            std.log.warn("retained archive dispatch deferred err={s}", .{@errorName(err)});
+        };
+        self.runRetainedMaintenanceRound() catch |err| {
+            std.log.warn("retained dataset dispatch deferred err={s}", .{@errorName(err)});
+        };
         self.runGroupSourceRound() catch |err| {
             std.log.warn("group source dispatch deferred err={s}", .{@errorName(err)});
         };
@@ -9891,6 +10291,7 @@ pub const DataServer = struct {
         var protocol_activation_it = self.data_raft_protocol_activations.valueIterator();
         while (protocol_activation_it.next()) |entry| entry.*.release(self.alloc);
         self.data_raft_protocol_activations.deinit(self.alloc);
+        self.retained_archive_backoff.deinit(self.alloc);
         self.local_split_key_cache.deinit(self.alloc);
         self.local_group_status_cache.clear(self.alloc);
         self.runtime_status_disk_usage_cache.deinit(self.alloc);
@@ -10622,6 +11023,7 @@ pub const DataServer = struct {
                 .local_status = dataReadRouterLocalStatus,
                 .group_leader_node_id = dataReadRouterGroupLeaderNodeId,
                 .node_base_uri = dataReadRouterNodeBaseUri,
+                .node_base_uri_controlled = dataReadRouterNodeBaseUriControlled,
                 .node_base_uri_for_group = dataReadRouterNodeBaseUriForGroup,
                 .group_node_ids = dataReadRouterGroupNodeIds,
                 .resolve_group_routes = dataReadRouterResolveGroupRoutes,
@@ -11083,9 +11485,13 @@ pub const DataServer = struct {
     }
 
     fn dataReadRouterNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+        return dataReadRouterNodeBaseUriControlled(ptr, alloc, node_id, .{});
+    }
+    fn dataReadRouterNodeBaseUriControlled(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64, budget: antfly.public_api.table_router.RouteBudget) !?[]u8 {
+        try budget.check();
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.remote_metadata) |metadata| {
-            const peers = try metadata.acquireControlReadGeneration(.{});
+            const peers = try metadata.acquireControlReadGeneration(budget);
             defer peers.release();
             return peers.nodeUri(alloc, node_id);
         }
@@ -11976,6 +12382,305 @@ pub const DataServer = struct {
         return receipt;
     }
 
+    fn loadRetainedReadOwner(self: *DataServer, a: std.mem.Allocator, table_name: []const u8, scope: @import("../metadata/retained_dataset_owners.zig").ArchiveScope, status_only: bool, context: antfly.public_api.operation.RequestContext) !antfly.public_api.retained_owner_control.Snapshot {
+        const bytes = try self.status_source.systemCatalog(a, context, .{ .retained_owner_read = .{ .owner = scope } });
+        if (bytes.len > 4 * 1024 * 1024) return error.CatalogCommandTooLarge;
+        const snapshot = try std.json.parseFromSliceLeaky(antfly.public_api.retained_owner_control.Snapshot, a, bytes, .{});
+        const source = snapshot.source_table orelse return error.RetainedOwnerPlanChanged;
+        if (!std.mem.eql(u8, source.name, table_name) or (!status_only and ((snapshot.plan.phase != .active and snapshot.plan.phase != .closing) or (snapshot.owner.mode != .ready and snapshot.owner.mode != .closed) or snapshot.owner.independent_receipt != null))) return error.RetainedOwnerPlanChanged;
+        return snapshot;
+    }
+
+    fn admitRetainedOwnerClock(self: *DataServer, a: std.mem.Allocator, table_name: []const u8, group: u64, fence: @import("antfly_local_sources").storage_retained_series_control.Fence, proposed: i128, context: antfly.public_api.operation.RequestContext) !struct { clock: i128, spec: @import("antfly_local_sources").storage_retained_series.Spec } {
+        const local = @import("antfly_local_sources");
+        const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        // The read clock must survive failover/rollback before it can hide
+        // history. Quantize to bucket expiry boundaries: steady-state reads
+        // share one durable admission per interval rather than one write/read.
+        const now = @max(platform_time.realtimeNs(), proposed);
+        const status = try std.json.parseFromSliceLeaky(local.storage_retained_series_query.Status, a, try owners.queryRetainedSeriesJson(a, group, table_name, .status, context), .{});
+        const entry = for (status.entries) |entry| {
+            if (std.mem.eql(u8, &entry.binding.spec.id, &fence.id) and entry.binding.spec.generation == fence.generation) break entry;
+        } else return error.RetainedSeriesNotReady;
+        try local.storage_retained_series_control.requireFence(fence, entry.binding.spec);
+        const spec = entry.binding.spec;
+        const threshold = try std.math.add(i128, try spec.bucket(try std.math.sub(i128, now, spec.retention_ns)), spec.retention_ns);
+        if (entry.progress.admitted_ns < threshold) {
+            if (self.hotStandbyWriteGate()) |gate| try gate.check();
+            const batch: antfly.db.types.BatchRequest = .{ .retained_series = .{ .action = .admit_retention, .fence = fence }, .timestamp_ns = std.math.cast(u64, threshold) orelse return error.RetainedSeriesTimeOverflow };
+            const term = blk: {
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+                const raft = self.data_raft orelse break :blk @as(?u64, null);
+                if (!raft.host.http_host.host.isLocalLeader(group)) return error.GroupLeaderUnavailable;
+                const current = raft.host.http_host.host.raftStatus(group) orelse return error.UnknownGroup;
+                break :blk @as(?u64, current.hard.current_term);
+            };
+            if (term) |leader_term| try self.proposeRaftBatchGroup(a, group, table_name, batch, .{
+                .discovery = .cached,
+                .required_local_term = leader_term,
+                .allow_remote_forward = false,
+                .admission_deadline_ns = context.deadline_ns,
+                .visibility_cancellation = context.cancellation,
+            }) else {
+                if (self.standalone_retained_owner == null) return error.GroupLeaderUnavailable;
+                try owners.applyRetainedSeriesNative(a, group, table_name, batch, context);
+            }
+        }
+        return .{ .clock = @max(now, entry.progress.admitted_ns), .spec = spec };
+    }
+
+    fn pollRetainedOwner(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group: u64, request: @import("../api/retained_dataset_read.zig").NativeReplay, input: antfly.public_api.operation.RequestContext) ![]u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try request.validate(group);
+        var context = try input.platformDeadline();
+        context.setting_admin = true;
+        try context.ensureActive();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const snapshot = try self.loadRetainedReadOwner(arena.allocator(), table_name, request.scope, false, context);
+        const local = @import("antfly_local_sources");
+        const fence: local.storage_retained_series_control.Fence = .{ .id = snapshot.plan.dataset, .generation = snapshot.plan.generation, .definition = snapshot.plan.definition, .partition = snapshot.owner.partition, .incarnation = snapshot.owner.incarnation };
+        _ = try self.admitRetainedOwnerClock(arena.allocator(), table_name, group, fence, request.clock_ns, context);
+        const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        return owner.queryRetainedSeriesJson(alloc, group, table_name, .{ .poll = .{ .fence = fence, .root_incarnation = try std.fmt.parseInt(u128, request.root_incarnation, 10), .cursor = request.cursor, .limit = request.limit, .include_latest = request.version >= 3 } }, context);
+    }
+
+    fn queryRetainedOwnerRows(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group: u64, request: @import("../api/retained_dataset_read.zig").NativeQuery, input: antfly.public_api.operation.RequestContext) ![]u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try request.validate(group);
+        var context = try input.platformDeadline();
+        try context.ensureActive();
+        context.setting_admin = true;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const local = @import("antfly_local_sources");
+        const snapshot = try self.loadRetainedReadOwner(a, table_name, request.scope, request.status_only, context);
+        const fence: local.storage_retained_series_control.Fence = .{ .id = snapshot.plan.dataset, .generation = snapshot.plan.generation, .definition = snapshot.plan.definition, .partition = snapshot.owner.partition, .incarnation = snapshot.owner.incarnation };
+        const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        if (request.status_only) {
+            const status = try std.json.parseFromSliceLeaky(local.storage_retained_series_query.Status, a, try owners.queryRetainedSeriesJson(a, group, table_name, .status, context), .{});
+            const entry = for (status.entries) |entry| {
+                if (std.mem.eql(u8, &entry.binding.spec.id, &fence.id) and entry.binding.spec.generation == fence.generation) break entry;
+            } else return error.RetainedSeriesNotReady;
+            try local.storage_retained_series_control.requireFence(fence, entry.binding.spec);
+            return std.json.Stringify.valueAlloc(alloc, @import("../api/retained_dataset_read.zig").NativeReply{ .rows = &.{}, .root_incarnation = status.root_incarnation, .cursor = .{ .definition = fence.definition, .partition = fence.partition, .incarnation = fence.incarnation, .sequence = entry.progress.feed_latest }, .progress = entry.progress }, .{});
+        }
+        const admission = try self.admitRetainedOwnerClock(a, table_name, group, fence, request.clock_ns, context);
+        const now = admission.clock;
+        const read_api = @import("../api/retained_dataset_read.zig");
+        if (request.observe_only) {
+            const status = try std.json.parseFromSliceLeaky(local.storage_retained_series_query.Status, a, try owners.queryRetainedSeriesJson(a, group, table_name, .status, context), .{});
+            const entry = for (status.entries) |entry| {
+                if (std.mem.eql(u8, &entry.binding.spec.id, &fence.id) and entry.binding.spec.generation == fence.generation) break entry;
+            } else return error.RetainedSeriesNotReady;
+            try local.storage_retained_series_control.requireFence(fence, entry.binding.spec);
+            const observed = try read_api.Observation.from(try std.fmt.parseInt(u128, status.root_incarnation, 10), entry.progress, entry.binding.spec);
+            return std.json.Stringify.valueAlloc(alloc, read_api.NativeReply{ .rows = &.{}, .root_incarnation = status.root_incarnation, .cursor = observed.cursor, .admitted_ns = @max(now, entry.progress.admitted_ns), .observation = observed }, .{});
+        }
+        var reader = try owners.openRetainedRead(a, group, table_name, .{ .fence = fence, .start_ns = try std.fmt.parseInt(i128, request.start_ns, 10), .end_ns = try std.fmt.parseInt(i128, request.end_ns, 10), .admitted_ns = now, .dimensions_json = request.dimensions_json, .after = request.after }, context);
+        defer reader.deinit();
+        return @import("../api/retained_native_materialize.zig").collect(self.alloc, alloc, &reader, request, admission.spec, now, context);
+    }
+
+    fn executeRetainedOwnerControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.retained_owner_control.Request, input: antfly.public_api.operation.RequestContext) !antfly.public_api.retained_owner_control.Response {
+        return executeRetainedOwnerControlOnce(ptr, alloc, table_name, group_id, request, input, null);
+    }
+
+    fn executeRetainedOwnerControlOnce(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.retained_owner_control.Request, input: antfly.public_api.operation.RequestContext, did_work: ?*bool) !antfly.public_api.retained_owner_control.Response {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const series = @import("antfly_local_sources").storage_retained_series;
+        const controls = @import("antfly_local_sources").storage_retained_series_control;
+        const queries = @import("antfly_local_sources").storage_retained_series_query;
+        const context = try input.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group_id);
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (self.hotStandbyWriteGate()) |gate| try gate.check();
+        const term = blk: {
+            lockAtomic(&self.data_raft_mutex);
+            defer self.data_raft_mutex.unlock();
+            const raft = self.data_raft orelse break :blk @as(?u64, null);
+            if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
+            const status = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
+            break :blk @as(?u64, status.hard.current_term);
+        };
+        if (term != null) {
+            try self.waitDataReadSafeWithCancellation(group_id, "retained-owner-control", 5_000, context.cancellation);
+        } else if (self.standalone_retained_owner == null) return error.GroupLeaderUnavailable;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var metadata_context = context;
+        metadata_context.setting_admin = true;
+        const bytes = try self.status_source.systemCatalog(a, metadata_context, .{ .retained_owner_read = request.read() });
+        if (bytes.len > 4 * 1024 * 1024) return error.CatalogCommandTooLarge;
+        const snapshot = try std.json.parseFromSliceLeaky(antfly.public_api.retained_owner_control.Snapshot, a, bytes, .{});
+        try request.admit(snapshot.plan, snapshot.owner);
+        const source = snapshot.source_table orelse return error.RetainedOwnerPlanChanged;
+        const descriptor = try @import("antfly_local_sources").system_catalog_retained_datasets.parse(a, snapshot.resource.source_json);
+        const lineage = descriptor.value.source orelse return error.RetainedOwnerPlanChanged;
+        if (!std.mem.eql(u8, source.name, table_name) or source.table_id != snapshot.plan.source_table) return error.RetainedOwnerPlanChanged;
+        const signing = @import("antfly_local_sources").storage_db_root_signing_identity;
+        const io = (try self.ensureBackendRuntime()).apiIo() orelse return error.BackendRuntimeUnavailable;
+        const local_root: ?signing.State = if (term == null) local: {
+            const owner = self.standalone_retained_owner orelse return error.GroupLeaderUnavailable;
+            const root = try signing.load(a, io, self.write_source.replica_root_dir);
+            try owner.validateRoot(a, .{
+                .metadata_incarnation = lineage.metadata_incarnation,
+                .node_id = owner.node_id,
+                .store_id = owner.store_id,
+                .root_incarnation = root.root_incarnation,
+                .public_key = root.public_key,
+            }, context);
+            break :local root;
+        } else null;
+        const fence: controls.Fence = .{ .id = snapshot.plan.dataset, .generation = snapshot.plan.generation, .definition = snapshot.plan.definition, .partition = snapshot.owner.partition, .incarnation = snapshot.owner.incarnation };
+        const owners = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
+        var revocation = try std.json.parseFromSliceLeaky(queries.Revocation, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .{ .revocation = fence }, context), .{});
+        var command: ?controls.Command = null;
+        if (request.action == .revoke and !revocation.revoked) {
+            command = .{ .action = .revoke, .fence = fence };
+            // Cancellation already has durable metadata work. Stop fresh
+            // votes before waiting for old prepares, including unready or
+            // installed-but-unacknowledged producers. A missing install goes
+            // directly to the durable tombstone operation.
+            const status = try std.json.parseFromSliceLeaky(queries.Status, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .status, context), .{});
+            for (status.entries) |entry| {
+                if (!std.mem.eql(u8, &entry.binding.spec.id, &fence.id) or entry.binding.spec.generation != fence.generation) continue;
+                try controls.requireFence(fence, entry.binding.spec);
+                if (!entry.progress.closed and !entry.progress.draining) command = .{ .action = .drain, .fence = fence };
+                break;
+            }
+        } else if (request.action == .revoke and !revocation.reclaimed) {
+            command = .{ .action = .purge, .fence = fence, .work_limit = 512 };
+        } else if (!revocation.revoked) {
+            const status = try std.json.parseFromSliceLeaky(queries.Status, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .status, context), .{});
+            const found: ?queries.Entry = for (status.entries) |entry| {
+                if (std.mem.eql(u8, &entry.binding.spec.id, &fence.id) and entry.binding.spec.generation == fence.generation) break entry;
+            } else null;
+            if (found) |entry| {
+                try controls.requireFence(fence, entry.binding.spec);
+                if (request.action != .drain) try @import("../api/retained_owner_binding.zig").validate(a, descriptor.value.definition, entry.binding, source.schema_json);
+                switch (request.action) {
+                    .reconcile => {
+                        var planner: controls.maintenance.Planner = .{ .next_slot = entry.progress.maintenance_next_slot };
+                        if (try planner.next(&.{.{ .spec = entry.binding.spec, .progress = entry.progress }}, platform_time.realtimeNs())) |task|
+                            command = .{ .action = switch (task.action) {
+                                .backfill => .backfill,
+                                .tick => .tick,
+                                .cleanup => .cleanup,
+                            }, .fence = fence, .expected_cursor = task.expected_cursor, .work_limit = task.work_limit };
+                    },
+                    .drain => if (!entry.progress.draining and !entry.progress.closed) {
+                        command = .{ .action = .drain, .fence = fence };
+                    },
+                    .close => if (!entry.progress.closed or entry.progress.closed_at_ns == null) {
+                        command = .{ .action = if (!entry.progress.draining and !entry.progress.closed) .drain else .close, .fence = fence };
+                    },
+                    .observe, .revoke => {},
+                }
+            } else if (request.action == .reconcile and snapshot.owner.mode == .registered) {
+                const summary = descriptor.value.definition.summary orelse return error.InvalidDatasetDefinition;
+                // Automatic capture cannot manufacture certified pre-existing
+                // event history. The initial provenance must be explicit.
+                if (summary.initial_history != .retained_source_rows) return error.RetainedSeriesCoverageMissing;
+                const binding = try @import("../api/retained_owner_binding.zig").compile(a, descriptor.value.definition, source.schema_json, snapshot.owner.partition, snapshot.owner.incarnation);
+                command = .{ .action = .install, .fence = fence, .binding = binding, .complete_from_ns = try @import("../api/retained_owner_binding.zig").minimumBucketStart(binding.spec), .expected_source_schema = lineage.schema };
+            } else return error.RetainedSeriesNotReady;
+        }
+        if (command) |prepared| {
+            var native = prepared;
+            if (native.action == .revoke and snapshot.plan.phase == .closing and snapshot.owner.independent_receipt != null) {
+                // Transfer the moving read clock before revocation, and fence
+                // the native commit against any racing read admission. No
+                // admitted native clock can disappear at archive handoff.
+                const status = try std.json.parseFromSliceLeaky(queries.Status, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .status, context), .{});
+                const progress = for (status.entries) |entry| {
+                    if (std.mem.eql(u8, &entry.binding.spec.id, &fence.id) and entry.binding.spec.generation == fence.generation) break entry.progress;
+                } else return error.RetainedSeriesNotReady;
+                const spec = try @import("../api/retained_owner_binding.zig").specification(a, descriptor.value.definition, snapshot.owner.partition, snapshot.owner.incarnation);
+                var archive = try @import("../serverless/datasets/configured_archive.zig").Opened.init(a, self.api_server_cfg.node_config orelse return error.InvalidDatasetBinding, self.api_server_cfg.secret_store, descriptor.value, false);
+                defer archive.deinit();
+                _ = try archive.store(io, &context).admitRetentionClock(spec, progress.admitted_ns);
+                native.expected_admitted_ns = progress.admitted_ns;
+            }
+            try context.ensureActive();
+            if (did_work) |value| value.* = true;
+            const batch: antfly.db.types.BatchRequest = .{ .retained_series = native, .timestamp_ns = platform_time.realtimeNs() };
+            if (term) |leader_term| try self.proposeRaftBatchGroup(a, group_id, table_name, batch, .{
+                .discovery = .cached,
+                .required_local_term = leader_term,
+                .allow_remote_forward = false,
+                .admission_deadline_ns = context.deadline_ns,
+                .visibility_cancellation = context.cancellation,
+            }) else try owners.applyRetainedSeriesNative(a, group_id, table_name, batch, context);
+            revocation = try std.json.parseFromSliceLeaky(queries.Revocation, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .{ .revocation = fence }, context), .{});
+        }
+        if (revocation.revoked and !revocation.reclaimed) return error.RetainedSeriesNotReady;
+        var mode: @import("../metadata/retained_dataset_owners.zig").Mode = .revoked;
+        var cut: @import("../metadata/retained_dataset_owner_receipt.zig").Cut = .{ .sequence = 0, .complete_from_ns = 0, .admitted_ns = 0 };
+        var native_root = try std.fmt.parseInt(u128, revocation.root_incarnation, 10);
+        if (!revocation.revoked) {
+            const status = try std.json.parseFromSliceLeaky(queries.Status, a, try owners.queryRetainedSeriesJson(a, group_id, table_name, .status, context), .{});
+            const entry = for (status.entries) |entry| {
+                if (std.mem.eql(u8, &entry.binding.spec.id, &fence.id) and entry.binding.spec.generation == fence.generation) break entry;
+            } else return error.RetainedSeriesNotReady;
+            try controls.requireFence(fence, entry.binding.spec);
+            try @import("../api/retained_owner_binding.zig").validate(a, descriptor.value.definition, entry.binding, source.schema_json);
+            const progress: series.Progress = entry.progress;
+            if (progress.revoked) return error.RetainedSeriesDefinitionMismatch;
+            mode = if (progress.closed) .closed else if (progress.ready) .ready else .installed;
+            cut = .{ .sequence = progress.source_sequence, .complete_from_ns = progress.complete_from_ns, .admitted_ns = progress.admitted_ns };
+            if (progress.closed) {
+                const closed = try progress.closureCut();
+                cut = .{ .sequence = closed.sequence, .complete_from_ns = closed.complete_from_ns, .admitted_ns = closed.admitted_ns };
+            }
+            native_root = try std.fmt.parseInt(u128, status.root_incarnation, 10);
+        } else if (request.action != .revoke and request.action != .observe) return error.RetainedSeriesSourceRevoked;
+        const root = local_root orelse try signing.load(a, io, self.write_source.replica_root_dir);
+        const authority = blk: {
+            const Authority = struct { node: u64, store: u64, reporter: u64, replica: u64, version: u64 };
+            if (term) |leader_term| {
+                const registration = self.store_registration orelse return error.StoreRegistrationUnavailable;
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+                const raft = self.data_raft orelse return error.GroupLeaderUnavailable;
+                if (!raft.host.http_host.host.isLocalLeader(group_id)) return error.GroupLeaderUnavailable;
+                const current = raft.host.http_host.host.raftStatus(group_id) orelse return error.UnknownGroup;
+                if (current.hard.current_term != leader_term) return error.GroupLeaderUnavailable;
+                var point = (try raft.host.http_host.host.readReplicaCatalogRecord(a, group_id)) orelse return error.ReplicaCatalogUnavailable;
+                defer point.deinit(a);
+                const record = point.record orelse return error.ReplicaCatalogUnavailable;
+                if (record.local_node_id != registration.node_id or record.group_id != group_id) return error.RetainedOwnerPlanChanged;
+                break :blk Authority{ .node = registration.node_id, .store = registration.store_id, .reporter = self.reporter_incarnation, .replica = record.replica_id, .version = record.metadata_version };
+            }
+            const local = self.standalone_retained_owner orelse return error.GroupLeaderUnavailable;
+            break :blk Authority{ .node = local.node_id, .store = local.store_id, .reporter = 1, .replica = group_id, .version = 0 };
+        };
+        const receipt = try (antfly.public_api.retained_owner_control.Response{
+            .resource = request.resource,
+            .generation = request.generation,
+            .plan = request.plan,
+            .dataset = snapshot.plan.dataset,
+            .definition = snapshot.plan.definition,
+            .group = group_id,
+            .partition = snapshot.owner.partition,
+            .incarnation = snapshot.owner.incarnation,
+            .owner_revision = request.revision,
+            .mode = mode,
+            .cut = cut,
+            .native_root = native_root,
+            .identity = .{ .metadata_incarnation = lineage.metadata_incarnation, .node_id = authority.node, .store_id = authority.store, .root_incarnation = root.root_incarnation, .public_key = root.public_key },
+            .reporter_incarnation = authority.reporter,
+            .replica_id = authority.replica,
+            .metadata_version = authority.version,
+        }).sign(root.seed);
+        try context.ensureActive();
+        return receipt;
+    }
+
     fn installRowPolicyControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.row_policy_install.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.row_policy_install.Response {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const Receipt = antfly.public_api.row_policy_install.Response;
@@ -12660,7 +13365,7 @@ pub const DataServer = struct {
         // Source-bound pages carry certified per-row timestamps. Ordered
         // artifact admission is a catalog-only command with no row timestamp.
         // A wall-clock override would change either command's replay contract.
-        if (proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null or proposal_req.leann_record != null or proposal_req.row_policy_publication != null) return proposal_req;
+        if (proposal_req.retained_series != null or proposal_req.merge_page != null or proposal_req.online_source != null or proposal_req.artifact_catalog != null or proposal_req.artifact_publication != null or proposal_req.artifact_publication_transport != null or proposal_req.group_source != null or proposal_req.resolver_review != null or proposal_req.leann_record != null or proposal_req.row_policy_publication != null) return proposal_req;
         // DB.batch treats zero as "read realtime now". Materialize that value
         // once before any forwarding or Raft encoding so every replica applies
         // identical document versions and TTL deadlines. Preserve zero as the
@@ -12710,6 +13415,8 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.retained_series) |command| return @import("../common/data_raft_protocol.zig").retainedSeriesCommandVersion(command);
+        if (req.retained_series != null or req.expiration_deletes.len != 0) return @import("../common/data_raft_protocol.zig").batch_retained_series_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
             return @import("../common/data_raft_protocol.zig").batch_dense_artifact_flags_protocol_version;
         if (req.graph_endpoint_cleanup) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version;
@@ -57864,4 +58571,49 @@ test "grouped source protocol dominates coexisting graph envelope features" {
     var decoded = try data_raft_batch.decode(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@TypeOf(request.group_source.?.action).activate_catalog, decoded.batch.req.group_source.?.action);
+}
+
+test "retained series lifecycle protocol dominates document revision negotiation" {
+    const p = @import("../common/data_raft_protocol.zig");
+    var req: antfly.db.types.BatchRequest = .{ .timestamp_ns = 1, .retained_series = .{ .action = .tick, .fence = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .partition = @splat(3), .incarnation = 1 } } };
+    try std.testing.expectEqual(p.batch_retained_series_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+    req.document_version_scheme = .revision_v1;
+    try std.testing.expectEqual(p.batch_retained_series_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+    req.retained_series.?.action = .admit_retention;
+    try std.testing.expectEqual(p.batch_retained_read_admission_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+    req.retained_series.?.action = .archive_handoff;
+    try std.testing.expectEqual(p.batch_retained_clock_handoff_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+    req.retained_series.?.action = .revoke;
+    req.retained_series.?.expected_admitted_ns = 1;
+    try std.testing.expectEqual(p.batch_retained_clock_handoff_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+    req.retained_series = null;
+    req.expiration_deletes = &.{"expired"};
+    try std.testing.expectEqual(p.batch_retained_series_protocol_version, DataServer.requiredRaftBatchProtocolVersion(req));
+    try std.testing.expect(p.batch_protocol_version >= p.batch_retained_series_protocol_version);
+}
+
+test "retained series lifecycle rejections round trip and never discard a committed resolution" {
+    const Failure = RaftTableApplyStateMachine.ExpectedApplyFailure;
+    const Rejection = @import("antfly_local_sources").storage_retained_series_control.Rejection;
+    const committed: antfly.db.types.BatchRequest = .{ .transaction = .{ .resolve = .{ .txn_id = @splat(1), .status = .committed, .commit_version = 2 } } };
+    inline for (@typeInfo(Rejection).error_set.error_names.?) |name| {
+        const reason = @field(Rejection, name);
+        const failure = Failure.fromError(reason) orelse return error.TestExpectedSemanticRejection;
+        try std.testing.expectEqual(reason, failure.toError());
+        try std.testing.expect(Failure.forRequest(reason, .{}) != null);
+        try std.testing.expect(Failure.forRequest(reason, committed) == null);
+    }
+}
+
+test "retained series native owner controller rejects malformed scope before touching its server" {
+    var server: DataServer = undefined;
+    try std.testing.expectError(error.InvalidRetainedOwnerPlan, DataServer.executeRetainedOwnerControl(&server, std.testing.allocator, "raw", 11, .{ .resource = 0, .generation = 1, .plan = @splat(1), .group = 11, .revision = 1 }, .{}));
+}
+
+test "retained series maintenance stops before authority IO on shutdown" {
+    var server: DataServer = undefined;
+    server.background_jobs_shutdown = .init(true);
+    try std.testing.expectError(error.Canceled, DataServer.runRetainedMaintenanceJob(&server));
+    server.data_raft = null;
+    try server.runRetainedMaintenanceRound();
 }

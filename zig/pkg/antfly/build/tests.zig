@@ -440,6 +440,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "system catalog", "catalog rename", "catalog names", "metadata raft apply store projects backup restore bootstrap source in placement intents" },
     });
+    const retained_catalog_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "system catalog retained", "retained dataset resource", "snapshot key registry covers every durable projection class" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("retained-dataset-catalog-test", "Verify retained resource identity, indexed dependencies and source-drop fences")
+        .dependOn(&addFilteredTestRunArtifact(b, retained_catalog_tests).step);
+    const retained_owner_rpc_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "retained owner controls", "retained owner acknowledgement", "system catalog retained work" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("retained-dataset-owner-rpc-test", "Verify private retained owner transport grants and version rejection")
+        .dependOn(&addFilteredTestRunArtifact(b, retained_owner_rpc_tests).step);
     const relation_namespace_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "system catalog relation namespace transaction", "relation mutation ownership" },
@@ -528,6 +542,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);
+    const retained_public_filters = &.{ "retained subscription", "retained owner native controls", "retained source write diagnostics", "SQL retained source", "relational row query errors preserve exact remote reasons and HTTP classes", "relational row query remote transaction prepare preserves scalar validation failures", "distributed txn internal operations preserve every semantic participant rejection" };
+    const retained_public_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = retained_public_filters, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const retained_public_step = b.step("retained-series-public-test", "Verify source write constraints and retry semantics across HTTP, SQL and participant transport");
+    retained_public_step.dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, retained_public_tests, retained_public_filters).step);
+    const retained_sql_diagnostic_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/sql/errors.zig"), .target = target, .optimize = optimize });
+    const retained_sql_diagnostic_tests = b.addTest(.{ .root_module = retained_sql_diagnostic_mod, .filters = &.{"SQL retained source"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    retained_public_step.dependOn(&b.addRunArtifact(retained_sql_diagnostic_tests).step);
+    const retained_sql_prefix_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/retained_sql_prefix_test_root.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, retained_sql_prefix_mod, true, true);
+    const retained_sql_prefix_tests = b.addTest(.{ .root_module = retained_sql_prefix_mod, .filters = &.{"SQL retained source finite prefixes"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    retained_public_step.dependOn(&b.addRunArtifact(retained_sql_prefix_tests).step);
     const sql_index_ddl_tests = b.addTest(.{ .root_module = api_http_runtime_test_mod, .filters = &.{ "SQL catalog", "SQL index DDL", "SQL pgwire", "SQL rewrite response" } });
     b.step("antfly-sql-index-ddl-test", "Verify qualified SQL index ownership, authorization and guarded schema admission")
         .dependOn(&b.addRunArtifact(sql_index_ddl_tests).step);
@@ -3166,6 +3191,39 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     // The page engine is shared with Lite/object-store users. Dependency
     // module tests need their own compilation root after the extraction.
+    const retained_dataset_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/retained_dataset_test_root.zig"), .target = target, .optimize = optimize });
+    const retained_contract_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/retained_dataset_contract_sources.zig"), .target = target, .optimize = optimize });
+    retained_dataset_mod.addImport("antfly_local_sources", retained_contract_mod);
+    retained_dataset_mod.addImport("objectstore", antfly_imports.objectstore);
+    retained_dataset_mod.addImport("antfly_platform", platform_mod);
+    const retained_dataset_tests = b.addTest(.{ .root_module = retained_dataset_mod, .filters = selectTestFilters(b, &.{"retained dataset"}), .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const retained_dataset_step = b.step("retained-dataset-test", "Run durable dataset placement, replay coverage and reader-safe retention contracts");
+    retained_dataset_step.dependOn(&b.addRunArtifact(retained_dataset_tests).step);
+    serverless_test_step.dependOn(retained_dataset_step);
+
+    const retained_owner_receipt_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/metadata/retained_dataset_owner_receipt.zig"), .target = target, .optimize = optimize });
+    retained_owner_receipt_mod.addImport("antfly_local_sources", retained_contract_mod);
+    const retained_owner_receipt_tests = b.addTest(.{ .root_module = retained_owner_receipt_mod, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("retained-dataset-owner-receipt-test", "Verify signed native owner observations and stable logical closure")
+        .dependOn(&b.addRunArtifact(retained_owner_receipt_tests).step);
+
+    const retained_owner_plan_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/metadata/retained_dataset_owners.zig"), .target = target, .optimize = optimize });
+    retained_owner_plan_mod.addImport("antfly_local_sources", retained_contract_mod);
+    const retained_owner_plan_tests = b.addTest(.{ .root_module = retained_owner_plan_mod, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const retained_owner_plan_step = b.step("retained-dataset-owner-plan-test", "Verify durable owner registration, cancellation and independent source release transitions");
+    retained_owner_plan_step.dependOn(&b.addRunArtifact(retained_owner_plan_tests).step);
+    serverless_test_step.dependOn(retained_owner_plan_step);
+
+    const retained_resource_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/retained_dataset_resource_test_root.zig"), .target = target, .optimize = optimize });
+    const retained_resource_tests = b.addTest(.{ .root_module = retained_resource_mod, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("retained-dataset-resource-test", "Verify independent retained resource identity and source dependency lifecycle").dependOn(&b.addRunArtifact(retained_resource_tests).step);
+    const retained_series_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/retained_series_test_root.zig"), .target = target, .optimize = optimize });
+    retained_series_mod.addImport("antfly_platform", platform_mod);
+    const retained_series_tests = b.addTest(.{ .root_module = retained_series_mod, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const retained_series_step = b.step("retained-series-test", "Run transactional retained aggregate, TTL fence and bounded feed contracts");
+    retained_series_step.dependOn(&b.addRunArtifact(retained_series_tests).step);
+    serverless_test_step.dependOn(retained_series_step);
+
     const ordered_tree_mod = b.createModule(.{ .root_source_file = b.path("lib/objectstore/src/ordered_tree.zig"), .target = target, .optimize = optimize });
     test_imports.configure(b, ordered_tree_mod, true, true);
     const ordered_tree_tests = b.addTest(.{ .root_module = ordered_tree_mod, .filters = &.{"serverless"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
@@ -3471,6 +3529,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_api_table_writes_docid_tests = api_tests_addTests_result.run_api_table_writes_docid_tests;
     const run_api_table_reads_docid_tests = api_tests_addTests_result.run_api_table_reads_docid_tests;
     const run_api_public_table_http_docid_tests = api_tests_addTests_result.run_api_public_table_http_docid_tests;
+    const retained_batch_response_tests = b.addTest(.{ .root_module = api_tests_addTests_result.api_public_table_http_test_mod, .filters = &.{"public table batch handler maps write unavailable errors"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    retained_public_step.dependOn(&addFilteredTestRunArtifact(b, retained_batch_response_tests).step);
     const run_raft_transition_runtime_docid_tests = api_tests_addTests_result.run_raft_transition_runtime_docid_tests;
     const run_api_table_writes_production_regression_unit_tests = api_tests_addTests_result.run_api_table_writes_production_regression_unit_tests;
     const run_lib_docid_lifecycle_tests = api_tests_addTests_result.run_lib_docid_lifecycle_tests;
@@ -6927,7 +6987,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
+    const retained_series_native_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"retained series"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("retained-series-native-test", "Verify native source commit, schema decoding and TTL history maintenance").dependOn(&addFilteredTestRunArtifact(b, retained_series_native_tests).step);
     const grouped_source_production_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{ "grouped sources production", "group worker resumes durable activation", "ordered artifact inventory completion checkpoint resumes", "ordered artifact inventory completion control preserves bounded binary claims" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const retained_series_protocol_tests = b.addTest(.{ .root_module = data_implementation_module, .filters = &.{"retained series"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    b.step("retained-series-protocol-test", "Verify retained summary capability negotiation and native delegate enforcement").dependOn(&addFilteredTestRunArtifact(b, retained_series_protocol_tests).step);
     const grouped_source_protocol_tests = b.addTest(.{ .root_module = data_implementation_module, .filters = &.{"grouped source protocol dominates"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const grouped_source_step = b.step("antfly-group-sources-test", "Verify grouped source publication, graph proofs, protocol negotiation and durable owner lifecycle");
     grouped_source_step.dependOn(&addFilteredTestRunArtifact(b, grouped_source_production_tests).step);

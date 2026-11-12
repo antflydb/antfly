@@ -834,6 +834,10 @@ const Encoder = struct {
     }
     fn cell(self: *Encoder, value: Datum) anyerror!void {
         try self.append(&.{@intFromBool(value.sql_null)});
+        if (value.failure) |reason| {
+            try self.append(&.{ 12, @backingInt(reason) });
+            return;
+        }
         if (value.numeric) |number| {
             if (value.sql_null or value.array != null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
             const numeric = @import("numeric_value.zig");
@@ -1187,7 +1191,11 @@ const Decoder = struct {
         for (values) |*value| {
             const flag = try self.byte();
             if (flag > 1) return error.InvalidSqlSpill;
-            if (self.position < self.bytes.len and self.bytes[self.position] == 11) {
+            if (self.position < self.bytes.len and self.bytes[self.position] == 12) {
+                self.position += 1;
+                if (flag != 0) return error.InvalidSqlSpill;
+                value.* = Datum.failed(std.enums.fromInt(Datum.Failure, try self.byte()) orelse return error.InvalidSqlSpill);
+            } else if (self.position < self.bytes.len and self.bytes[self.position] == 11) {
                 self.position += 1;
                 if (!self.compact_arrays or flag != 0) return error.InvalidSqlSpill;
                 const arrays = @import("array_value.zig");
@@ -2724,7 +2732,7 @@ pub const Sequential = struct {
         return true;
     }
     fn tag(value: Datum) u8 {
-        if (value.patterns != null or value.array != null or value.numeric != null) return 255;
+        if (value.failure != null or value.patterns != null or value.array != null or value.numeric != null) return 255;
         return switch (value.value) {
             .null => 0,
             .bool => 1,
@@ -10733,4 +10741,22 @@ test "SQL adaptive payload cache lazy growth publication retires concurrent subs
     try std.testing.expectEqual(capacity, permanent.load(.acquire));
     try std.testing.expectEqual(capacity, state.owner.unsubscribe(&link));
     linked = false;
+}
+
+test "SQL retained source finite prefixes deferred failures survive row and columnar spill ownership" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const failed = Datum.failed(.retained_numeric_overflow);
+    const copied = try operators.cloneDatum(arena.allocator(), failed);
+    const bytes = try encodeDatumsAlloc(a, &.{copied}, 4096);
+    defer a.free(bytes);
+    const decoded = try decodeDatumsInArena(arena.allocator(), bytes, 4096);
+    try std.testing.expectError(error.RetainedSeriesNumericOverflow, decoded[0].requireValue());
+    for ([_]ColumnarVersion{ .v1, .v2 }) |version| {
+        const block_bytes = try encodeColumnarBlockVersionAlloc(a, &.{.{ .values = &.{failed}, .keys = &.{}, .ordinal = 0 }}, 4096, version);
+        defer a.free(block_bytes);
+        const block = try decodeColumnarBlockInArena(arena.allocator(), block_bytes, 4096);
+        try std.testing.expectError(error.RetainedSeriesNumericOverflow, (try block.cell(0, 0)).requireValue());
+    }
 }

@@ -527,6 +527,8 @@ pub const OwnedBatchRequest = struct {
     row_policy_admission_bytes: ?[]u8 = null,
     restore_staging: ?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control) = null,
     online_source: ?std.json.Parsed(@import("../storage/db/online_source_contract.zig").Command) = null,
+    expiration_deletes: ?std.json.Parsed([]const []const u8) = null,
+    retained_series: ?std.json.Parsed(@import("../storage/retained_series_control.zig").Command) = null,
     group_source: ?std.json.Parsed(@import("../storage/db/group_source_contract.zig").Command) = null,
     resolver_review: ?std.json.Parsed(@import("../storage/db/resolver_review.zig").Command) = null,
     artifact_catalog: ?std.json.Parsed(@import("../storage/db/artifact_inventory.zig").Command) = null,
@@ -564,6 +566,8 @@ pub const OwnedBatchRequest = struct {
         if (self.row_policy_admission_bytes) |bytes| alloc.free(bytes);
         if (self.restore_staging) |*control| control.deinit();
         if (self.online_source) |*control| control.deinit();
+        if (self.expiration_deletes) |*control| control.deinit();
+        if (self.retained_series) |*control| control.deinit();
         if (self.group_source) |*control| control.deinit();
         if (self.resolver_review) |*control| control.deinit();
         if (self.artifact_catalog) |*control| control.deinit();
@@ -905,6 +909,30 @@ fn parseBatchRequestWithOptions(
         break :control @as(?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").Control), try std.json.parseFromValue(@import("../storage/db/restore_staging_contract.zig").Control, alloc, value, .{ .allocate = .alloc_always }));
     } else null;
     errdefer if (restore_staging) |*control| control.deinit();
+    var expiration_deletes = if (root.get("_expiration_deletes")) |value| control: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
+        if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
+        const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "retained_expiration_v1")) return error.InvalidBatchRequest;
+        const control = try std.json.parseFromValue([]const []const u8, alloc, value, .{ .allocate = .alloc_always });
+        if (control.value.len == 0) {
+            var owned = control;
+            owned.deinit();
+            return error.InvalidBatchRequest;
+        }
+        break :control @as(?std.json.Parsed([]const []const u8), control);
+    } else null;
+    errdefer if (expiration_deletes) |*control| control.deinit();
+    var retained_series = if (root.get("_retained_series")) |value| control: {
+        if (!allow_internal) return error.InvalidBatchRequest;
+        const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
+        if (marker != .object or marker.object.count() != 1) return error.InvalidBatchRequest;
+        const kind = marker.object.get("kind") orelse return error.InvalidBatchRequest;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "retained_series_v1")) return error.InvalidBatchRequest;
+        break :control @as(?std.json.Parsed(@import("../storage/retained_series_control.zig").Command), try std.json.parseFromValue(@import("../storage/retained_series_control.zig").Command, alloc, value, .{ .allocate = .alloc_always }));
+    } else null;
+    errdefer if (retained_series) |*control| control.deinit();
     var online_source = if (root.get("_online_source")) |value| control: {
         if (!allow_internal) return error.InvalidBatchRequest;
         const marker = root.get("_merge_checkpoint") orelse return error.InvalidBatchRequest;
@@ -1411,6 +1439,14 @@ fn parseBatchRequestWithOptions(
             if (merge_proof_adoption == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
         }
+        if (std.mem.eql(u8, kind_value.string, "retained_expiration_v1")) {
+            if (expiration_deletes == null or object.count() != 1) return error.InvalidBatchRequest;
+            break :merge null;
+        }
+        if (std.mem.eql(u8, kind_value.string, "retained_series_v1")) {
+            if (retained_series == null or object.count() != 1) return error.InvalidBatchRequest;
+            break :merge null;
+        }
         if (std.mem.eql(u8, kind_value.string, "online_source_v4")) {
             if (online_source == null or object.count() != 1) return error.InvalidBatchRequest;
             break :merge null;
@@ -1654,6 +1690,7 @@ fn parseBatchRequestWithOptions(
     errdefer if (admission_bytes) |bytes| alloc.free(bytes);
     const result_value: OwnedBatchRequest = .{
         .writes = writes,
+        .expiration_deletes = expiration_deletes,
         .deletes = deletes,
         .transforms = transforms,
         .graph_writes = graph_writes,
@@ -1673,6 +1710,7 @@ fn parseBatchRequestWithOptions(
         .row_policy_admission_bytes = admission_bytes,
         .restore_staging = restore_staging,
         .online_source = online_source,
+        .retained_series = retained_series,
         .group_source = group_source,
         .resolver_review = resolver_review,
         .artifact_catalog = artifact_catalog,
@@ -1710,6 +1748,7 @@ fn parseBatchRequestWithOptions(
             .row_policy_install_bundle = row_policy_install_bundle orelse "",
             .restore_staging = if (restore_staging) |control| control.value else null,
             .online_source = if (online_source) |control| control.value else null,
+            .retained_series = if (retained_series) |control| control.value else null,
             .group_source = if (group_source) |control| control.value else null,
             .resolver_review = if (resolver_review) |control| control.value else null,
             .artifact_catalog = if (artifact_catalog) |control| control.value else null,
@@ -1725,6 +1764,7 @@ fn parseBatchRequestWithOptions(
             .relational_repair = relational_repair,
             .activate_range_tracking = activate_range_tracking,
             .writes = writes,
+            .expiration_deletes = if (expiration_deletes) |owned| owned.value else &.{},
             .deletes = deletes,
             .transforms = transforms,
             .graph_endpoint_cleanup_planned = if (root.get("_graph_endpoint_cleanup_planned")) |value| if (allow_internal and value == .bool) value.bool else return error.InvalidBatchRequest else false,
@@ -1762,9 +1802,12 @@ fn parseBatchRequestWithOptions(
     try merge_pages.validateRequest(result_value.req);
     try @import("../storage/db/merge_proof_adoption.zig").validateRequest(result_value.req);
     try @import("../storage/db/online_source_contract.zig").validateRequest(result_value.req);
+    try @import("../storage/retained_series_control.zig").validateRequest(result_value.req);
     try @import("../storage/db/artifact_inventory.zig").validateRequest(result_value.req);
     if (requiresRowSemanticsEnvelope(result_value.req.writes, result_value.req.predicates) and !versioned) return error.InvalidBatchRequest;
     if (allow_internal and requiresDocumentVersionsEnvelope(result_value.req) != document_versions_envelope) return error.InvalidBatchRequest;
+    try db_mod.types.validateExpirationDeletes(result_value.req);
+    if (result_value.req.expiration_deletes.len != 0 and (transaction == null or transaction.? != .prepare)) return error.InvalidBatchRequest;
     return result_value;
 }
 
@@ -1868,6 +1911,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     try @import("../storage/range_protection.zig").validateRequest(req);
     try @import("../storage/db/merge_proof_adoption.zig").validateRequest(req);
     try @import("../storage/db/online_source_contract.zig").validateRequest(req);
+    try @import("../storage/retained_series_control.zig").validateRequest(req);
     try @import("../storage/db/artifact_inventory.zig").validateRequest(req);
     try merge_pages.validateRequest(req);
     if (req.merge_checkpoint) |checkpoint| {
@@ -2072,6 +2116,20 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     if (req.restore_staging) |control| {
         if (req.online_source != null or req.merge_checkpoint != null or req.merge_page != null) return error.InvalidBatchRequest;
         try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"restore_v3\"},\"_restore_staging\":");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
+        defer alloc.free(encoded);
+        try writer.writeAll(encoded);
+    }
+    if (req.expiration_deletes.len != 0) {
+        try db_mod.types.validateExpirationDeletes(req);
+        if (req.transaction == null or req.transaction.? != .prepare or req.merge_checkpoint != null or req.retained_series != null or req.restore_staging != null or req.online_source != null) return error.InvalidBatchRequest;
+        try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"retained_expiration_v1\"},\"_expiration_deletes\":");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, req.expiration_deletes, .{});
+        defer alloc.free(encoded);
+        try writer.writeAll(encoded);
+    }
+    if (req.retained_series) |control| {
+        try writer.writeAll(",\"_merge_checkpoint\":{\"kind\":\"retained_series_v1\"},\"_retained_series\":");
         const encoded = try std.json.Stringify.valueAlloc(alloc, control, .{});
         defer alloc.free(encoded);
         try writer.writeAll(encoded);
@@ -3717,4 +3775,35 @@ test "distributed txn private control wire keeps document revision metadata inde
         const mixed_error = if (versioned.artifact_catalog != null) error.InvalidArtifactCatalogCommand else if (versioned.group_source != null) error.InvalidGroupedSourceCommand else if (versioned.resolver_review != null) error.InvalidResolverCurationRequest else error.InvalidBatchRequest;
         try std.testing.expectError(mixed_error, encodeBatchRequest(a, versioned));
     };
+}
+
+test "retained series expiration prepare codec is private and owns provenance through allocation failures" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const req: db_mod.types.BatchRequest = .{ .timestamp_ns = 120, .deletes = &.{"expired"}, .expiration_deletes = &.{"expired"}, .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 1 } } };
+            const bytes = try encodeBatchRequest(alloc, req);
+            defer alloc.free(bytes);
+            var parsed = try parseInternalBatchRequest(alloc, bytes);
+            defer parsed.deinit(alloc);
+            try std.testing.expectEqualStrings("expired", parsed.req.expiration_deletes[0]);
+            if (parseBatchRequest(alloc, bytes)) |value| {
+                var unexpected = value;
+                unexpected.deinit(alloc);
+                return error.TestExpectedError;
+            } else |err| if (err != error.InvalidBatchRequest) return err;
+            var invalid = req;
+            invalid.expiration_deletes = &.{"unrelated"};
+            if (encodeBatchRequest(alloc, invalid)) |unexpected| {
+                alloc.free(unexpected);
+                return error.TestExpectedError;
+            } else |err| if (err != error.InvalidBatchRequest) return err;
+            invalid = req;
+            invalid.transaction = null;
+            if (encodeBatchRequest(alloc, invalid)) |unexpected| {
+                alloc.free(unexpected);
+                return error.TestExpectedError;
+            } else |err| if (err != error.InvalidBatchRequest) return err;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

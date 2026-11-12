@@ -860,6 +860,85 @@ pub const ApiHttpClient = struct {
         return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").InitialChildReceipt, routes.Routes.fk_initial_child_suffix, base_uri, group_id, table_name, request, context);
     }
 
+    pub fn fetchRetainedOwnerRows(self: *ApiHttpClient, base_uri: []const u8, group: u64, table_name: []const u8, request: @import("retained_dataset_read.zig").NativeQuery, input: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        return self.fetchRetainedOwnerReadBytes(base_uri, group, table_name, routes.Routes.retained_owner_read_suffix, request, input);
+    }
+
+    pub fn fetchRetainedOwnerReplay(self: *ApiHttpClient, base_uri: []const u8, group: u64, table_name: []const u8, request: @import("retained_dataset_read.zig").NativeReplay, input: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        return self.fetchRetainedOwnerReadBytes(base_uri, group, table_name, routes.Routes.retained_owner_replay_suffix, request, input);
+    }
+
+    fn fetchRetainedOwnerReadBytes(self: *ApiHttpClient, base_uri: []const u8, group: u64, table_name: []const u8, suffix: []const u8, request: anytype, input: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        const context = try input.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group);
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group, routes.Routes.tables_prefix, encoded_name, suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation, .max_response_bytes = 32 * 1024 * 1024 });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            401, 403 => return error.Forbidden,
+            410 => return error.RetainedSeriesHistoryExpired,
+            413, 422 => {
+                if (@import("retained_series_errors.zig").remoteReadFailure(response.status, response.body)) |reason| return reason;
+                return if (response.status == 413) error.DatasetPageBudgetExceeded else error.RetainedSeriesNotReady;
+            },
+            409 => {
+                if (std.mem.eql(u8, response.body, "RetainedSeriesCoverageMissing")) return error.RetainedSeriesCoverageMissing;
+                if (std.mem.eql(u8, response.body, "RetainedSeriesResolutionMismatch")) return error.RetainedSeriesResolutionMismatch;
+                if (std.mem.eql(u8, response.body, "RetainedSeriesResetRequired")) return error.RetainedSeriesResetRequired;
+                return error.RetainedOwnerPlanChanged;
+            },
+            else => return error.RetainedSeriesNotReady,
+        }
+        if (response.body.len > 32 * 1024 * 1024) return error.DatasetPageBudgetExceeded;
+        try context.ensureActive();
+        return self.alloc.dupe(u8, response.body);
+    }
+
+    pub fn fetchRetainedOwnerControl(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("retained_owner_control.zig").Request, input: @import("antfly_local_sources").api_operation.RequestContext) !@import("retained_owner_control.zig").Response {
+        const context = try input.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group_id);
+        const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(encoded_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group_id, routes.Routes.tables_prefix, encoded_name, routes.Routes.retained_owner_control_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > 4096) return error.InvalidRetainedOwnerPlan;
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse (platform_time.monotonicNs() + 30 * std.time.ns_per_s), .cancellation = context.cancellation };
+        var cancellation = http_common.RequestCancellation{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = try control.remainingTimeoutMs(), .cancellation = &cancellation });
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {},
+            400, 409 => return error.RetainedOwnerPlanChanged,
+            401, 403 => return error.Forbidden,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.RetainedSeriesNotReady,
+            else => return error.UnexpectedHttpStatus,
+        }
+        if (response.body.len > @import("../metadata/retained_dataset_owner_receipt.zig").max_bytes) return error.CatalogCommandTooLarge;
+        var parsed = try std.json.parseFromSlice(@import("retained_owner_control.zig").Response, self.alloc, response.body, .{});
+        defer parsed.deinit();
+        try parsed.value.verify();
+        if (parsed.value.resource != request.resource or parsed.value.generation != request.generation or
+            !std.mem.eql(u8, &parsed.value.plan, &request.plan) or parsed.value.group != group_id or parsed.value.owner_revision != request.revision) return error.RetainedOwnerPlanChanged;
+        return parsed.value;
+    }
+
     pub fn fetchRowPolicyInstall(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("row_policy_install.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !@import("row_policy_install.zig").Response {
         const context = try input_context.platformDeadline();
         try context.ensureActive();
@@ -4327,6 +4406,12 @@ test "relational row query remote transaction prepare preserves scalar validatio
     }
     inline for (@typeInfo(@import("relational_row_errors.zig").PolicyError).error_set.error_names.?) |field| {
         const reason = @field(@import("relational_row_errors.zig").PolicyError, field);
+        executor.status = @import("relational_row_errors.zig").status(reason);
+        executor.body = field;
+        try std.testing.expectError(reason, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
+    }
+    inline for (@typeInfo(@import("antfly_local_sources").storage_retained_series_control.Rejection).error_set.error_names.?) |field| {
+        const reason = @field(@import("antfly_local_sources").storage_retained_series_control.Rejection, field);
         executor.status = @import("relational_row_errors.zig").status(reason);
         executor.body = field;
         try std.testing.expectError(reason, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));

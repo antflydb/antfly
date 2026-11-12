@@ -181,24 +181,7 @@ fn retainedIntentBytes(alloc: Allocator, intent: WriteIntent) !u64 {
     if (isRawMetadataIntentKey(intent.key)) return 0;
     var payload: u64 = if (intent.prepared_row) |row| row.len else if (intent.value) |value| value.len else 0;
     if (intent.prepared_row == null) if (intent.value) |value| {
-        // No escaped property name and no special spelling means the mapper
-        // borrows original bytes; do not parse or allocate on that common path.
-        if (std.mem.indexOf(u8, value, "_edges") != null or std.mem.indexOf(u8, value, "_embeddings") != null or std.mem.indexOfScalar(u8, value, '\\') != null) {
-            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{ .parse_numbers = false }) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return error.InvalidTxnRecord,
-            };
-            defer parsed.deinit();
-            if (parsed.value == .object) {
-                var buffer: [1024]u8 = undefined;
-                var counter = std.Io.Writer.Discarding.init(&buffer);
-                try std.json.Stringify.value(parsed.value, .{}, &counter.writer);
-                // Native DB removes special/vector fields, while the generic
-                // transaction manager can preserve raw document bytes. Cover
-                // both authorities; removing fields never grows this encoding.
-                payload = @max(payload, counter.fullCount());
-            }
-        }
+        payload = try @import("document_value_bound.zig").maximumStoredBytes(alloc, value);
     };
     const primary = std.math.add(u64, 16 + 2 + internal_keys.encodedComponentLen(intent.key), payload) catch return error.TransactionTooLarge;
     return std.math.add(u64, primary, intent.retained_artifact_bytes) catch error.TransactionTooLarge;
@@ -364,6 +347,9 @@ pub const ResolutionExtraBatch = struct {
 /// transaction metadata transition. Raft apply uses this to fence the exact log
 /// entry without a crash window between the transaction and its replay marker.
 pub const MutationExtraBatch = struct {
+    /// Engine-owned retained-summary reservation bytes, charged with the
+    /// corresponding source intent and replaced with it on later prepares.
+    retained_series_costs: []const @import("retained_series.zig").AdmissionCost = &.{},
     document_revisions: ?bool = null,
     writes: []const docstore.KVPair = &.{},
     deletes: []const []const u8 = &.{},
@@ -824,6 +810,14 @@ pub const TxnManager = struct {
             for (writes.items) |write| try pending_costs.put(self.alloc, write.key[intent_members_prefix.len + 17 ..], .{ .bytes = std.mem.readInt(u64, write.value[0..8], .little), .retained = std.mem.readInt(u64, write.value[8..16], .little), .retained_keys = @intFromBool(std.mem.readInt(u64, write.value[8..16], .little) != 0) });
         }
 
+        var retained_costs = std.StringHashMapUnmanaged(u64).empty;
+        defer retained_costs.deinit(self.alloc);
+        for (extra_batch.retained_series_costs) |charge| {
+            const entry = try retained_costs.getOrPut(self.alloc, charge.key);
+            if (entry.found_existing) return error.InvalidTxnRecord;
+            entry.value_ptr.* = charge.bytes;
+        }
+
         // Compute the final replacement-aware ledger before allocating any
         // payload envelopes. Repeated keys retain only their final mutation.
         for (intents, 0..) |intent, index| {
@@ -838,7 +832,7 @@ pub const TxnManager = struct {
                 if (raw.len != 16 and raw.len != 24) return error.InvalidTxnRecord;
                 break :blk IntentCost{ .bytes = std.mem.readInt(u64, raw[0..8], .little), .retained = std.mem.readInt(u64, raw[8..16], .little), .retained_keys = if (raw.len == 24) std.mem.readInt(u64, raw[16..24], .little) else @intFromBool(std.mem.readInt(u64, raw[8..16], .little) != 0) };
             };
-            const cost = try intentAdmissionBytes(intent);
+            const cost = std.math.add(u64, try intentAdmissionBytes(intent), retained_costs.get(intent.key) orelse 0) catch return error.TransactionTooLarge;
             const retained = try retainedIntentBytesForLanguage(self.alloc, intent, source_language);
             const retained_keys = try retainedIntentKeys(intent, retained);
             if (prior) |old| {
@@ -854,6 +848,7 @@ pub const TxnManager = struct {
             try pending_costs.put(self.alloc, intent.key, .{ .bytes = cost, .retained = retained, .retained_keys = retained_keys });
             try last_intents.put(self.alloc, intent.key, index);
         }
+        for (extra_batch.retained_series_costs) |charge| if (!last_intents.contains(charge.key)) return error.InvalidTxnRecord;
         var range_reservations = std.ArrayListUnmanaged(VersionPredicate).empty;
         defer range_reservations.deinit(self.alloc);
         try range_reservations.appendSlice(self.alloc, predicates);

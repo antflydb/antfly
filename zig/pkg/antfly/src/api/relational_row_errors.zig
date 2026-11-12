@@ -15,7 +15,7 @@
 
 //! Allowlisted row execution failures shared by local and remote owner paths.
 pub const PolicyError = error{ RowPolicyDenied, RowPolicyAuthenticationRequired, RowPolicyCatalogChanged };
-pub const Error = PolicyError || @import("antfly_local_sources").schema_relational_expression_errors.Error || error{
+pub const Error = @import("antfly_local_sources").storage_retained_series_control.Rejection || PolicyError || @import("antfly_local_sources").schema_relational_expression_errors.Error || error{
     RelationalIndexNotReady,
     PartialIndexPredicateNotImplied,
     InvalidRelationalIndexBound,
@@ -45,9 +45,13 @@ pub fn decode(bytes: []const u8) ?Error {
 }
 
 pub fn status(err: Error) u16 {
+    if (@import("retained_series_errors.zig").classify(err)) |reason| return @import("retained_series_errors.zig").describe(reason).status;
     return switch (err) {
         error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => 403,
         error.RowPolicyCatalogChanged => 409,
+        error.RetainedSeriesNotReady, error.RetainedSeriesPreparedHold, error.RetainedSeriesBackfillFence, error.RetainedSeriesAlreadyExists, error.RetainedSeriesSourceClosed, error.RetainedSeriesSourceRevoked, error.RetainedSeriesTopologyUnsupported, error.RetainedSeriesTransactionsUnsupported, error.RetainedSeriesCoordinatedTtlUnsupported, error.RetainedSeriesResetRequired, error.RetainedSeriesResolutionMismatch => 409,
+        error.RetainedSeriesHistoryExpired => 410,
+        error.RetainedSeriesDefinitionMismatch, error.RetainedSeriesReservationMismatch, error.RetainedSeriesSequenceMismatch => 503,
         error.RelationalIndexNotReady, error.PreparedGenerationChanged, error.PreparedSchemaChanged, error.SchemaVersionChanged, error.RelationalIndexColumnTypeMismatch, error.GeneratedColumnRewriteRequired => 409,
         error.RelationalRowsOutputBudgetExceeded, error.RelationalRowResultTooLarge, error.RelationalIndexKeyTooLarge => 413,
         error.IndexNotFound => 404,

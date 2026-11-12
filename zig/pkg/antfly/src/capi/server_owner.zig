@@ -2178,6 +2178,38 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.sqlPolicyPublicationStatusJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .retained_owner_receipt_preflight => |input| {
+                    handle.store.validateRetainedOwnerReceipt(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
+                },
+                .retained_source_candidate => |input| {
+                    const value = handle.store.retainedSourceCandidateJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .retained_dataset_read_cut => |input| {
+                    const value = handle.store.retainedDatasetReadCutJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .retained_archive_work => |input| {
+                    const value = handle.store.retainedArchiveWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .retained_dataset_pending => |input| {
+                    const value = handle.store.retainedDatasetPendingJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .retained_owner_read => |input| {
+                    const value = handle.store.retainedOwnerReadJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .retained_dataset_work => |input| {
+                    const value = handle.store.retainedDatasetWorkJson(a, group_id, input.after_id, input.native) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
+                .require_retained_source_drop_allowed => |input| {
+                    handle.store.requireRetainedSourceDropAllowed(group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
+                },
                 .sql_policy_publication_work => |input| {
                     const value = handle.store.sqlPolicyPublicationWorkJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
@@ -4614,6 +4646,77 @@ pub fn storageOwnerOnlineMergeIoJson(owner: ?*anyopaque, request: *const kernel_
     }
     out.* = .{ .ptr = response.ptr, .len = response.len };
     return .ok;
+}
+
+pub fn storageOwnerRetainedQueryJson(owner: ?*anyopaque, request: *const kernel_owner_abi.ControlledJsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    if (request.version != kernel_owner_abi.query_abi_version) return .invalid_abi;
+    if (request.request_json.len > 4096) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(antfly.capi_dependencies.storage_retained_series_reader.Request, handle.alloc, request.request_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+    defer parsed.deinit();
+    const control: backups_api.BackupOperationControl = .{ .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else std.math.maxInt(u64), .cancellation = ownerQueryCancellation(request) };
+    control.ensureActive() catch |err| return storageOwnerStatusFromError(err);
+    const response = handle.db.queryRetainedSeriesJsonControlled(handle.alloc, parsed.value, retainedReadControl(&control)) catch |err| return storageOwnerStatusFromError(err);
+    control.ensureActive() catch |err| {
+        handle.alloc.free(response);
+        return storageOwnerStatusFromError(err);
+    };
+    out.* = .{ .ptr = response.ptr, .len = response.len };
+    return .ok;
+}
+
+fn retainedReadControl(control: *const backups_api.BackupOperationControl) antfly.capi_dependencies.storage_retained_series_reader.Control {
+    return .{ .deadline_ns = control.deadline_ns, .cancellation_ctx = control, .is_cancelled_fn = struct {
+        fn canceled(raw: *const anyopaque) bool {
+            const operation: *const backups_api.BackupOperationControl = @ptrCast(@alignCast(raw));
+            return operation.cancellation.isCancelled();
+        }
+    }.canceled };
+}
+
+pub fn storageOwnerRetainedReadOpen(owner: ?*anyopaque, request: *const kernel_owner_abi.ControlledJsonOperationRequest, out_session: *?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    out_session.* = null;
+    if (request.version != kernel_owner_abi.query_abi_version) return .invalid_abi;
+    if (request.request_json.len > 32768) return .invalid_argument;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    const reader = antfly.capi_dependencies.storage_retained_series_reader;
+    var parsed = std.json.parseFromSlice(reader.Query, handle.alloc, request.request_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+    defer parsed.deinit();
+    const control: backups_api.BackupOperationControl = .{ .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else std.math.maxInt(u64), .cancellation = ownerQueryCancellation(request) };
+    control.ensureActive() catch |err| return storageOwnerStatusFromError(err);
+    const session = handle.db.openRetainedSeriesReadControlled(handle.alloc, parsed.value, retainedReadControl(&control)) catch |err| return storageOwnerStatusFromError(err);
+    control.ensureActive() catch |err| {
+        session.close();
+        return storageOwnerStatusFromError(err);
+    };
+    out_session.* = session;
+    return .ok;
+}
+
+pub fn storageRetainedReadNextJson(raw: ?*anyopaque, request: *const kernel_owner_abi.ControlledJsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out.* = .{};
+    if (request.version != kernel_owner_abi.query_abi_version) return .invalid_abi;
+    if (request.request_json.len > 128) return .invalid_argument;
+    const session: *antfly.capi_dependencies.storage_retained_series_reader.Session = @ptrCast(@alignCast(raw orelse return .invalid_argument));
+    var parsed = std.json.parseFromSlice(struct { limit: u16 = 128 }, session.alloc, request.request_json.slice(), .{}) catch |err| return storageOwnerStatusFromError(err);
+    defer parsed.deinit();
+    const control: backups_api.BackupOperationControl = .{ .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else std.math.maxInt(u64), .cancellation = ownerQueryCancellation(request) };
+    control.ensureActive() catch |err| return storageOwnerStatusFromError(err);
+    const response = session.nextJson(parsed.value.limit, retainedReadControl(&control)) catch |err| return storageOwnerStatusFromError(err);
+    control.ensureActive() catch |err| {
+        session.memory.backing.free(response);
+        return storageOwnerStatusFromError(err);
+    };
+    out.* = .{ .ptr = response.ptr, .len = response.len };
+    return .ok;
+}
+
+pub fn storageRetainedReadClose(raw: ?*anyopaque) callconv(.c) void {
+    const session: *antfly.capi_dependencies.storage_retained_series_reader.Session = @ptrCast(@alignCast(raw orelse return));
+    session.close();
 }
 
 pub fn storageOwnerSourceArtifactJson(owner: ?*anyopaque, request: *const kernel_owner_abi.ControlledJsonOperationRequest, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {

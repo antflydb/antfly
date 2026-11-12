@@ -126,10 +126,24 @@ pub const Call = union(enum) {
     write_validation_revision: void,
     resolver_catalog_read: @import("../metadata/resolver_catalog_read.zig").Request,
     lake_source_owner_read: u64,
+    /// Bounded metadata-derived registration, protected by an administrative grant.
+    /// Trusted API-node directory; includes metadata-only issuers.
+    api_node_uri: u64,
+    retained_dataset_pending: u64,
+    retained_source_candidate: domain.Target,
+    retained_dataset_read_cut: domain.Target,
+    retained_dataset_release: @import("../metadata/retained_dataset_owners.zig").Activation,
+    retained_dataset_activate: @import("../metadata/retained_dataset_owners.zig").Activation,
+    retained_owner_archive: @import("../metadata/retained_dataset_owners.zig").ArchiveScope,
+    retained_owner_acknowledge: @import("../metadata/retained_dataset_owner_receipt.zig").Receipt,
+    retained_owner_register: @import("../metadata/retained_dataset_owners.zig").Registration,
+    /// Point reads and bounded supervisor selection require a body-bound read grant.
+    retained_owner_read: @import("../metadata/retained_dataset_owners.zig").Read,
+    retained_dataset_work: struct { after_id: u64 = 0, native: bool = true },
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .relation_replace, .relation_schema_mutate, .native_memory_create => true,
+            .retained_dataset_activate, .retained_dataset_release, .retained_owner_archive, .retained_owner_acknowledge, .retained_owner_register, .relation_replace, .relation_schema_mutate, .native_memory_create => true,
             .sql_completion_reference_mutate, .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -141,6 +155,12 @@ pub const Call = union(enum) {
     /// internal service, but ordinary table reads need no setting authority.
     pub fn requiresSettingAuthorityReadGrant(self: @This()) bool {
         return switch (self) {
+            .api_node_uri,
+            .retained_dataset_pending,
+            .retained_dataset_read_cut,
+            .retained_source_candidate,
+            .retained_owner_read,
+            .retained_dataset_work,
             .lake_index_lifecycle_read,
             .lake_source_owner_read,
             .lake_index_lifecycle_work,
@@ -169,7 +189,7 @@ pub const Call = union(enum) {
     /// Calls whose native owners report the first possible durable effect.
     pub fn tracksSQLSubmission(self: @This()) bool {
         return switch (self) {
-            .mutate, .relation_replace, .relation_schema_mutate, .fk_initial_create_begin, .fk_generation_publication_begin => true,
+            .mutate, .relation_replace, .relation_schema_mutate, .fk_initial_create_begin, .fk_generation_publication_begin, .retained_owner_acknowledge => true,
             else => false,
         };
     }
@@ -273,4 +293,53 @@ test "privacy table record transport is a service read without mutation authorit
     const read: Call = .{ .table_record_read = "private" };
     try std.testing.expect(!read.isMutation());
     try std.testing.expect(!read.requiresAdministrativeGrant());
+}
+
+test "system catalog retained work is read only and requires a body bound supervisor grant" {
+    const a = std.testing.allocator;
+    const request: Call = .{ .retained_dataset_work = .{ .after_id = 7 } };
+    try std.testing.expect(request.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!request.isMutation());
+    const bytes = try std.json.Stringify.valueAlloc(a, request, .{});
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(Call, a, bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 7), parsed.value.retained_dataset_work.after_id);
+    const Legacy = union(enum) { resolve_many: ResolveMany, mutate: Request };
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Legacy, a, bytes, .{}));
+}
+
+test "retained owner controls bind grants to distinct private request bodies" {
+    const a = std.testing.allocator;
+    const calls = [_]Call{
+        .{ .api_node_uri = 1 },
+        .{ .api_node_uri = 2 },
+        .{ .retained_owner_read = .{ .work = .{} } },
+        .{ .retained_owner_read = .{ .plan = .{ .resource = 7, .generation = 1 } } },
+        .{ .retained_owner_read = .{ .owner = .{ .resource = 7, .generation = 1, .plan = @splat(3), .group = 11, .revision = 1 } } },
+        .{ .retained_owner_register = .{ .resource = 7, .generation = 1, .plan = @splat(3), .revision = 1 } },
+    };
+    try std.testing.expect((Call{ .retained_owner_acknowledge = undefined }).requiresAdministrativeGrant());
+    try std.testing.expect((Call{ .retained_owner_acknowledge = undefined }).isMutation());
+    try std.testing.expect(!(Call{ .retained_owner_acknowledge = undefined }).requiresSettingAuthorityReadGrant());
+    for (calls) |request| {
+        const mutation = request == .retained_owner_register;
+        try std.testing.expectEqual(mutation, request.requiresAdministrativeGrant());
+        try std.testing.expectEqual(mutation, request.isMutation());
+        try std.testing.expectEqual(!mutation, request.requiresSettingAuthorityReadGrant());
+        const bytes = try std.json.Stringify.valueAlloc(a, request, .{});
+        defer a.free(bytes);
+        var parsed = try std.json.parseFromSlice(Call, a, bytes, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualDeep(request, parsed.value);
+        const Legacy = union(enum) { retained_dataset_work: struct { after_id: u64 = 0 } };
+        try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Legacy, a, bytes, .{}));
+    }
+}
+
+test "retained owner acknowledgements preserve preflight non-admission" {
+    const call: Call = .{ .retained_owner_acknowledge = undefined };
+    try std.testing.expect(call.isMutation());
+    try std.testing.expect(call.requiresAdministrativeGrant());
+    try std.testing.expect(call.tracksSQLSubmission());
 }

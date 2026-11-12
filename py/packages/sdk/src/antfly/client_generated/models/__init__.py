@@ -100,6 +100,7 @@ from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
 from .brave_search_config_provider import BraveSearchConfigProvider
 from .calendar_interval import CalendarInterval
+from .cancel_retained_subscription_body import CancelRetainedSubscriptionBody
 from .capability import Capability
 from .cardinality_mode import CardinalityMode
 from .catalog_mutation_visibility_pending import CatalogMutationVisibilityPending
@@ -168,6 +169,7 @@ from .chunker_provider import ChunkerProvider
 from .classification_step_config import ClassificationStepConfig
 from .classification_transformation_result import ClassificationTransformationResult
 from .close_prepared_sql_response_200 import ClosePreparedSQLResponse200
+from .close_retained_dataset_body import CloseRetainedDatasetBody
 from .close_sql_connection_response_200 import CloseSQLConnectionResponse200
 from .cloudflare_embedder_config import CloudflareEmbedderConfig
 from .cloudflare_embedder_config_provider import CloudflareEmbedderConfigProvider
@@ -240,6 +242,9 @@ from .create_index_common import CreateIndexCommon
 from .create_query_source_body import CreateQuerySourceBody
 from .create_relational_index_request import CreateRelationalIndexRequest
 from .create_relational_index_request_type import CreateRelationalIndexRequestType
+from .create_retained_dataset_body import CreateRetainedDatasetBody
+from .create_retained_dataset_body_source import CreateRetainedDatasetBodySource
+from .create_retained_subscription_body import CreateRetainedSubscriptionBody
 from .create_table_request import CreateTableRequest
 from .create_table_request_indexes import CreateTableRequestIndexes
 from .create_table_storage_migration_body import CreateTableStorageMigrationBody
@@ -2062,6 +2067,7 @@ from .pattern_step import PatternStep
 from .permission import Permission
 from .permission_type import PermissionType
 from .phrase_query import PhraseQuery
+from .poll_retained_subscription_body import PollRetainedSubscriptionBody
 from .predicate_decision_question import PredicateDecisionQuestion
 from .predicate_decision_question_type import PredicateDecisionQuestionType
 from .prefix_query import PrefixQuery
@@ -2228,6 +2234,12 @@ from .query_result_base_analyses import QueryResultBaseAnalyses
 from .query_result_base_evaluation import QueryResultBaseEvaluation
 from .query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
 from .query_result_base_source_ranking import QueryResultBaseSourceRanking
+from .query_retained_dataset_body import QueryRetainedDatasetBody
+from .query_retained_dataset_response_200 import QueryRetainedDatasetResponse200
+from .query_retained_dataset_response_200_initial_history import QueryRetainedDatasetResponse200InitialHistory
+from .query_retained_dataset_response_200_measures_item import QueryRetainedDatasetResponse200MeasuresItem
+from .query_retained_dataset_response_200_measures_item_law import QueryRetainedDatasetResponse200MeasuresItemLaw
+from .query_retained_dataset_response_200_rows_item import QueryRetainedDatasetResponse200RowsItem
 from .query_score_details import QueryScoreDetails
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
@@ -2396,6 +2408,23 @@ from .restore_job_scope import RestoreJobScope
 from .restore_request import RestoreRequest
 from .result_extract_document_job_response_200 import ResultExtractDocumentJobResponse200
 from .result_read_document_job_response_200 import ResultReadDocumentJobResponse200
+from .retained_dataset_archive_progress import RetainedDatasetArchiveProgress
+from .retained_dataset_info import RetainedDatasetInfo
+from .retained_dataset_info_initial_history import RetainedDatasetInfoInitialHistory
+from .retained_dataset_info_phase import RetainedDatasetInfoPhase
+from .retained_dataset_measure import RetainedDatasetMeasure
+from .retained_dataset_measure_law import RetainedDatasetMeasureLaw
+from .retained_dataset_native_progress import RetainedDatasetNativeProgress
+from .retained_dataset_owner_progress import RetainedDatasetOwnerProgress
+from .retained_dataset_owner_progress_mode import RetainedDatasetOwnerProgressMode
+from .retained_dataset_progress import RetainedDatasetProgress
+from .retained_dataset_progress_phase import RetainedDatasetProgressPhase
+from .retained_dataset_read_error import RetainedDatasetReadError
+from .retained_subscription_frame import RetainedSubscriptionFrame
+from .retained_subscription_frame_events_item import RetainedSubscriptionFrameEventsItem
+from .retained_subscription_frame_events_item_type import RetainedSubscriptionFrameEventsItemType
+from .retained_subscription_frame_initial_history import RetainedSubscriptionFrameInitialHistory
+from .retained_subscription_frame_kind import RetainedSubscriptionFrameKind
 from .retrieval_agent_request import RetrievalAgentRequest
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
@@ -2797,6 +2826,7 @@ __all__ = (
     "BraveSearchConfigFreshness",
     "BraveSearchConfigProvider",
     "CalendarInterval",
+    "CancelRetainedSubscriptionBody",
     "Capability",
     "CardinalityMode",
     "CatalogMutationVisibilityPending",
@@ -2865,6 +2895,7 @@ __all__ = (
     "ClassificationStepConfig",
     "ClassificationTransformationResult",
     "ClosePreparedSQLResponse200",
+    "CloseRetainedDatasetBody",
     "CloseSQLConnectionResponse200",
     "CloudflareEmbedderConfig",
     "CloudflareEmbedderConfigProvider",
@@ -2959,6 +2990,9 @@ __all__ = (
     "CreateQuerySourceBody",
     "CreateRelationalIndexRequest",
     "CreateRelationalIndexRequestType",
+    "CreateRetainedDatasetBody",
+    "CreateRetainedDatasetBodySource",
+    "CreateRetainedSubscriptionBody",
     "CreateTableRequest",
     "CreateTableRequestIndexes",
     "CreateTablespaceRequest",
@@ -4537,6 +4571,7 @@ __all__ = (
     "Permission",
     "PermissionType",
     "PhraseQuery",
+    "PollRetainedSubscriptionBody",
     "PredicateDecisionQuestion",
     "PredicateDecisionQuestionType",
     "PrefixQuery",
@@ -4701,6 +4736,12 @@ __all__ = (
     "QueryResultBaseEvaluation",
     "QueryResultBaseGraphMetricResults",
     "QueryResultBaseSourceRanking",
+    "QueryRetainedDatasetBody",
+    "QueryRetainedDatasetResponse200",
+    "QueryRetainedDatasetResponse200InitialHistory",
+    "QueryRetainedDatasetResponse200MeasuresItem",
+    "QueryRetainedDatasetResponse200MeasuresItemLaw",
+    "QueryRetainedDatasetResponse200RowsItem",
     "QueryScoreDetails",
     "QueryStrategy",
     "QueryStringQuery",
@@ -4869,6 +4910,23 @@ __all__ = (
     "RestoreRequest",
     "ResultExtractDocumentJobResponse200",
     "ResultReadDocumentJobResponse200",
+    "RetainedDatasetArchiveProgress",
+    "RetainedDatasetInfo",
+    "RetainedDatasetInfoInitialHistory",
+    "RetainedDatasetInfoPhase",
+    "RetainedDatasetMeasure",
+    "RetainedDatasetMeasureLaw",
+    "RetainedDatasetNativeProgress",
+    "RetainedDatasetOwnerProgress",
+    "RetainedDatasetOwnerProgressMode",
+    "RetainedDatasetProgress",
+    "RetainedDatasetProgressPhase",
+    "RetainedDatasetReadError",
+    "RetainedSubscriptionFrame",
+    "RetainedSubscriptionFrameEventsItem",
+    "RetainedSubscriptionFrameEventsItemType",
+    "RetainedSubscriptionFrameInitialHistory",
+    "RetainedSubscriptionFrameKind",
     "RetrievalAgentRequest",
     "RetrievalAgentResult",
     "RetrievalAgentSteps",

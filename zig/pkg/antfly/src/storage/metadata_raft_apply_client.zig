@@ -574,6 +574,32 @@ pub const RaftApplyStore = struct {
     pub fn sqlPolicyPublicationStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .sql_policy_publication_status = table_id });
     }
+    pub fn validateRetainedOwnerReceipt(self: *RaftApplyStore, group: u64, receipt: @import("../metadata/retained_dataset_owner_receipt.zig").Receipt) !void {
+        try receipt.verify();
+        if (!try self.catalogProjection(bool, self.alloc, group, .{ .retained_owner_receipt_preflight = receipt })) return error.RetainedOwnerPlanChanged;
+    }
+    pub fn retainedOwnerReadJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, request: @import("../metadata/retained_dataset_owners.zig").Read) ![]u8 {
+        try request.validate();
+        return self.catalogProjection([]u8, alloc, group, .{ .retained_owner_read = request });
+    }
+    pub fn retainedSourceCandidateJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, target: @import("antfly_local_sources").system_catalog_domain.Target) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group, .{ .retained_source_candidate = target });
+    }
+    pub fn retainedDatasetReadCutJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, target: @import("antfly_local_sources").system_catalog_domain.Target) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group, .{ .retained_dataset_read_cut = target });
+    }
+    pub fn retainedArchiveWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, after: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group, .{ .retained_archive_work = after });
+    }
+    pub fn retainedDatasetPendingJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, after: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group, .{ .retained_dataset_pending = after });
+    }
+    pub fn retainedDatasetWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, after: u64, native: bool) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group, .{ .retained_dataset_work = .{ .after_id = after, .native = native } });
+    }
+    pub fn requireRetainedSourceDropAllowed(self: *RaftApplyStore, group: u64, table: u64) !void {
+        if (!try self.catalogProjection(bool, self.alloc, group, .{ .require_retained_source_drop_allowed = table })) return error.RetainedDatasetSourceInUse;
+    }
     pub fn sqlPolicyPublicationWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after_table_id: u64) ![]u8 {
         return self.catalogProjection([]u8, alloc, group_id, .{ .sql_policy_publication_work = after_table_id });
     }

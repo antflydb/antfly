@@ -9125,6 +9125,556 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: datasetName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+    get:
+      summary: Get retained summary status
+      tags:
+        - query_operations
+      operationId: getRetainedDataset
+      parameters:
+        - name: after_group
+          in: query
+          schema:
+            type: string
+            pattern: ^[0-9]+$
+        - name: max_owners
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 64
+            default: 16
+      responses:
+        '200':
+          description: Retained summary definition and lifecycle phase.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetainedDatasetInfo'
+        '403':
+          description: Dataset read permission is required.
+        '404':
+          description: Dataset not found.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    post:
+      summary: Create a retained summary
+      description: Starts a background backfill of source rows that still exist. Previously expired source
+        rows are outside initial history. Requires administration permission on the dataset and source
+        table.
+      tags:
+        - query_operations
+      operationId: createRetainedDataset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - source
+                - timestamp
+                - interval_ns
+                - mutable_for_ns
+                - retention_ns
+                - measures
+              properties:
+                source:
+                  type: object
+                  required:
+                    - table
+                  properties:
+                    database:
+                      type: string
+                      default: default
+                    namespace:
+                      type: string
+                      default: public
+                    table:
+                      type: string
+                timestamp:
+                  type: string
+                dimensions:
+                  type: array
+                  items:
+                    type: string
+                interval_ns:
+                  type: string
+                  description: Positive bucket width in nanoseconds as a decimal string.
+                origin_ns:
+                  type: string
+                  default: '0'
+                  description: Signed UTC nanoseconds as a decimal string.
+                mutable_for_ns:
+                  type: string
+                retention_ns:
+                  type: string
+                measures:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/RetainedDatasetMeasure'
+      responses:
+        '201':
+          description: Summary accepted and awaiting activation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetainedDatasetInfo'
+        '400':
+          description: Invalid or unsupported summary definition.
+        '403':
+          description: Dataset and source table administration permission required.
+        '409':
+          description: The catalog changed or the dataset already exists.
+        '503':
+          description: Shared archive storage or metadata authority is unavailable.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/close:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: datasetName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+    post:
+      summary: Close and archive a retained summary
+      description: Begins asynchronous archive closure of an active summary. Set discard to permanently
+        abandon any phase, including a closure blocked by archive unavailability. Discard releases the
+        source only after verified native revocation and cleanup; archive collection resumes independently
+        when storage returns. Retiring is a permanent tombstone and cannot be reopened. cancel_activation
+        is retained for activating summaries only. Neither discard nor cancellation preserves summary
+        history.
+      tags:
+        - query_operations
+      operationId: closeRetainedDataset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - expected_revision
+              properties:
+                expected_revision:
+                  type: integer
+                  format: uint64
+                  minimum: 1
+                  maximum: 9007199254740991
+                discard:
+                  type: boolean
+                  default: false
+                  description: Permanently discard the summary, fence publication, and asynchronously
+                    collect native and archived state. Mutually exclusive with cancel_activation.
+                cancel_activation:
+                  type: boolean
+                  default: false
+                  description: Explicitly cancel an activating summary and discard partial state. Rejected
+                    for an active summary; omit or set false to close and archive an active summary.
+      responses:
+        '202':
+          description: Summary is closing, being discarded, or activation is being cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetainedDatasetInfo'
+        '403':
+          description: Dataset administration permission required.
+        '404':
+          description: Dataset not found.
+        '409':
+          description: The summary phase or revision changed.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: datasetName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+    post:
+      summary: Open a retained summary subscription
+      tags:
+        - query_operations
+      operationId: createRetainedSubscription
+      description: Captures a bounded initial snapshot. Supply an aligned half-open range or a moving
+        window. Requires dataset read permission.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                start_ns:
+                  type: string
+                  description: Inclusive signed decimal nanoseconds.
+                end_ns:
+                  type: string
+                  description: Exclusive signed decimal nanoseconds.
+                window_ns:
+                  type: string
+                  description: Sliding window width in decimal nanoseconds, aligned to the dataset interval.
+      responses:
+        '201':
+          description: Snapshot or committed delta frame and its next cursor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetainedSubscriptionFrame'
+        '400':
+          description: Invalid cursor or range.
+        '403':
+          description: Dataset read permission or cursor authority is missing.
+        '409':
+          description: Replay or serving state was lost. Open a fresh snapshot.
+        '413':
+          description: Subscription exceeds its result or state budget.
+        '422':
+          description: A retained aggregate is outside its supported numeric range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetainedDatasetReadError'
+        '503':
+          description: Subscription owner is temporarily unavailable.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/poll:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: datasetName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+    post:
+      summary: Replay retained summary changes
+      tags:
+        - query_operations
+      operationId: pollRetainedSubscription
+      description: Poll with the last cursor through any cluster API node; its authenticated issuer routes
+        to the serving session. Repeating a poll after a lost response returns the last committed frame.
+        Replay gaps can coalesce through a fresh snapshot; reset is required when the serving session
+        is lost.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - cursor
+              additionalProperties: false
+              properties:
+                cursor:
+                  type: string
+                  maxLength: 160
+      responses:
+        '200':
+          description: Snapshot or committed delta frame and its next cursor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetainedSubscriptionFrame'
+        '400':
+          description: Invalid cursor or range.
+        '403':
+          description: Dataset read permission or cursor authority is missing.
+        '409':
+          description: Replay or serving state was lost. Open a fresh snapshot.
+        '413':
+          description: Subscription exceeds its result or state budget.
+        '422':
+          description: A retained aggregate is outside its supported numeric range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetainedDatasetReadError'
+        '503':
+          description: Subscription owner is temporarily unavailable.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/subscriptions/cancel:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: datasetName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+    post:
+      summary: Cancel a retained summary subscription
+      tags:
+        - query_operations
+      operationId: cancelRetainedSubscription
+      description: Releases serving state for the authenticated cursor.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - cursor
+              additionalProperties: false
+              properties:
+                cursor:
+                  type: string
+                  maxLength: 160
+      responses:
+        '204':
+          description: Subscription canceled.
+        '400':
+          description: Invalid cursor or range.
+        '403':
+          description: Dataset read permission or cursor authority is missing.
+        '409':
+          description: Replay or serving state was lost. Open a fresh snapshot.
+        '413':
+          description: Subscription exceeds its result or state budget.
+        '503':
+          description: Subscription owner is temporarily unavailable.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/datasets/{datasetName}/query:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+      - name: datasetName
+        in: path
+        required: true
+        schema:
+          type: string
+          maxLength: 128
+    post:
+      summary: Query retained summary buckets
+      description: Reads a half-open range aligned to the summary's bucket width and origin. Follow next
+        using the same range and dimensions until null. Each page captures fresh authority; active data
+        may change between pages. Rows are ordered by bucket time and a stable dimension hash. Requires
+        read permission on the qualified dataset.
+      tags:
+        - query_operations
+      operationId: queryRetainedDataset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - start_ns
+                - end_ns
+              properties:
+                start_ns:
+                  type: string
+                  description: Inclusive UTC nanoseconds as a signed decimal string.
+                end_ns:
+                  type: string
+                  description: Exclusive UTC nanoseconds as a signed decimal string.
+                max_rows:
+                  type: integer
+                  minimum: 1
+                  maximum: 4096
+                  default: 4096
+                after:
+                  type: string
+                  minLength: 96
+                  maxLength: 96
+                  pattern: ^[0-9a-f]{96}$
+                  description: Opaque exclusive continuation key from next. Reuse the same range and dimension
+                    filter.
+                dimensions:
+                  type: array
+                  description: Optional exact tuple in the definition's dimension order. Values are normalized
+                    using the frozen column types; null is supported.
+                  items: {}
+      responses:
+        '200':
+          description: Summary buckets with dimensions and measures in the listed order. Count values
+            are exact decimal strings.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - initial_history
+                  - dimensions
+                  - measures
+                  - rows
+                  - next
+                properties:
+                  next:
+                    type: string
+                    nullable: true
+                    description: Exclusive continuation key; null when complete. An empty page may still
+                      have a next key.
+                  initial_history:
+                    type: string
+                    enum:
+                      - certified
+                      - retained_source_rows
+                  dimensions:
+                    type: array
+                    items:
+                      type: string
+                  measures:
+                    type: array
+                    items:
+                      type: object
+                      required:
+                        - name
+                        - law
+                      properties:
+                        name:
+                          type: string
+                        law:
+                          type: string
+                          enum:
+                            - count
+                            - sum
+                            - avg
+                            - min
+                            - max
+                        field:
+                          type: string
+                  rows:
+                    type: array
+                    items:
+                      type: object
+                      required:
+                        - bucket_start_ns
+                        - dimensions
+                        - values
+                      properties:
+                        bucket_start_ns:
+                          type: string
+                        dimensions:
+                          type: array
+                          items: {}
+                        values:
+                          type: array
+                          items: {}
+        '400':
+          description: Invalid range or bucket alignment.
+        '403':
+          description: Dataset read permission is required.
+        '404':
+          description: Dataset not found.
+        '409':
+          description: Dataset coverage or owner authority changed.
+        '410':
+          description: Requested history has expired.
+        '413':
+          description: Request or result exceeds the range budget.
+        '422':
+          description: A retained aggregate is outside its supported numeric range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RetainedDatasetReadError'
+        '503':
+          description: Dataset authority is temporarily unavailable.
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query:
     parameters:
       - name: databaseName
@@ -24457,6 +25007,285 @@ components:
         type: string
         example: role:tenant_reader
   schemas:
+    RetainedDatasetReadError:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - retryable
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable domain failure
+          example: retained_series_numeric_overflow
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - false
+    RetainedSubscriptionFrame:
+      type: object
+      required:
+        - kind
+        - cursor
+        - events
+      properties:
+        kind:
+          type: string
+          enum:
+            - snapshot
+            - changes
+        cursor:
+          type: string
+          maxLength: 160
+        resynchronized:
+          type: boolean
+          description: True when the server caught up through a fresh bounded snapshot instead of replaying
+            every intermediate state.
+        initial_history:
+          type: string
+          enum:
+            - certified
+            - retained_source_rows
+        dimensions:
+          type: array
+          items:
+            type: string
+        measures:
+          type: array
+          items:
+            $ref: '#/components/schemas/RetainedDatasetMeasure'
+        events:
+          type: array
+          items:
+            type: object
+            required:
+              - type
+              - key
+            properties:
+              type:
+                type: string
+                enum:
+                  - upsert
+                  - remove
+              key:
+                type: string
+              bucket_start_ns:
+                type: string
+              dimensions:
+                type: array
+                items: {}
+              values:
+                type: array
+                items: {}
+    RetainedDatasetMeasure:
+      type: object
+      required:
+        - name
+        - law
+      properties:
+        name:
+          type: string
+        law:
+          type: string
+          enum:
+            - count
+            - sum
+            - avg
+            - min
+            - max
+        field:
+          type: string
+          nullable: true
+    RetainedDatasetInfo:
+      type: object
+      required:
+        - id
+        - name
+        - revision
+        - phase
+        - source_released
+        - initial_history
+        - dimensions
+        - measures
+        - retention_ns
+        - interval_ns
+        - origin_ns
+      properties:
+        id:
+          type: string
+          description: Stable dataset identifier in hexadecimal.
+        name:
+          type: string
+        revision:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 9007199254740991
+        phase:
+          type: string
+          enum:
+            - activating
+            - active
+            - closing
+            - closed
+            - retiring
+        source_released:
+          type: boolean
+          description: True after verified native revocation or archive handoff releases the source dependency.
+            Retiring remains a durable discard tombstone while archive collection proceeds independently.
+        initial_history:
+          type: string
+          enum:
+            - certified
+            - retained_source_rows
+        dimensions:
+          type: array
+          items:
+            type: string
+        measures:
+          type: array
+          items:
+            $ref: '#/components/schemas/RetainedDatasetMeasure'
+        retention_ns:
+          type: string
+        interval_ns:
+          type: string
+        origin_ns:
+          type: string
+        progress:
+          allOf:
+            - $ref: '#/components/schemas/RetainedDatasetProgress'
+          nullable: true
+    RetainedDatasetNativeProgress:
+      type: object
+      required:
+        - ready
+        - draining
+        - closed
+        - archive_handoff
+        - backfill_cleanup_complete
+        - source_sequence
+        - replay_floor
+        - replay_latest
+        - retention_clock_ns
+      properties:
+        ready:
+          type: boolean
+        draining:
+          type: boolean
+        closed:
+          type: boolean
+        archive_handoff:
+          type: boolean
+        backfill_cleanup_complete:
+          type: boolean
+        source_sequence:
+          type: string
+        replay_floor:
+          type: string
+        replay_latest:
+          type: string
+        retention_clock_ns:
+          type: string
+        last_attempt_ns:
+          type: string
+          nullable: true
+        last_error:
+          type: string
+          nullable: true
+          description: Durable error name from the most recent failed maintenance operation; cleared by
+            successful maintenance.
+    RetainedDatasetArchiveProgress:
+      type: object
+      required:
+        - pages
+        - sealed
+        - next_bucket_ns
+      properties:
+        pages:
+          type: string
+        sealed:
+          type: boolean
+        next_bucket_ns:
+          type: string
+    RetainedDatasetOwnerProgress:
+      type: object
+      required:
+        - group
+        - mode
+        - archive_authoritative
+      properties:
+        group:
+          type: string
+        mode:
+          type: string
+          enum:
+            - registered
+            - installed
+            - ready
+            - closed
+            - revoked
+        archive_authoritative:
+          type: boolean
+        native:
+          allOf:
+            - $ref: '#/components/schemas/RetainedDatasetNativeProgress'
+          nullable: true
+        archive:
+          allOf:
+            - $ref: '#/components/schemas/RetainedDatasetArchiveProgress'
+          nullable: true
+        status_error:
+          type: string
+          nullable: true
+          description: Failure to obtain this owner's current status; distinct from a persisted maintenance
+            failure.
+    RetainedDatasetProgress:
+      type: object
+      required:
+        - phase
+        - registration_complete
+        - registered_owners
+        - ready_owners
+        - revoked_owners
+        - archived_owners
+        - owners
+      properties:
+        phase:
+          type: string
+          enum:
+            - activating
+            - active
+            - closing
+            - closed
+            - retiring
+            - retired
+        registration_complete:
+          type: boolean
+        registered_owners:
+          type: integer
+          format: uint32
+        ready_owners:
+          type: integer
+          format: uint32
+        revoked_owners:
+          type: integer
+          format: uint32
+        archived_owners:
+          type: integer
+          format: uint32
+        owners:
+          type: array
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/RetainedDatasetOwnerProgress'
+        next_group:
+          type: string
+          nullable: true
+          description: Pass as after_group to obtain the next bounded owner page.
     PrivacyProducer:
       type: object
       additionalProperties: false
@@ -39104,6 +39933,7 @@ components:
         - namespace
         - tablespace
         - graph
+        - dataset
         - user
         - inference
         - '*'

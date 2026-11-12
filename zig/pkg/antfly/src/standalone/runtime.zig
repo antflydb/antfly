@@ -763,6 +763,7 @@ const LocalStandaloneMetadata = struct {
     catalog_store: ?*antfly.storage_backend_erased.Store,
     lifecycle_store: ?*antfly.metadata.RaftApplyStore = null,
     data_server: ?*antfly.data.runtime.DataServer = null,
+    retained_archive: @import("../serverless/datasets/configured_archive.zig").ExpiryMaintenance = .{},
     initial_fk_round_mutex: std.atomic.Mutex = .unlocked,
     /// An empty coherent cut can be reused until durable metadata changes.
     /// Never suppress progress or retirement for a resident private owner.
@@ -775,6 +776,7 @@ const LocalStandaloneMetadata = struct {
     /// retirement. Durable terminal metadata remains the authority.
     initial_fk_primed: std.AutoHashMapUnmanaged(u64, TrackedInitialOwner) = .empty,
     metadata_incarnation: ?@import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation = null,
+    retained_owner_signing_identity: ?@import("../metadata/store_root_enrollment.zig").Identity = null,
     native_owner_binding: ?@import("../metadata/standalone_native_owner.zig").Binding = null,
     coordinated_lifecycle_allowed: bool = true,
     hot_standby_gate: ?antfly.db.ReplicationWriteGate = null,
@@ -847,6 +849,13 @@ const LocalStandaloneMetadata = struct {
         committed: bool = false,
 
         fn upsertTable(self: *CatalogMutation, metadata: *LocalStandaloneMetadata, table: antfly.metadata.TableRecord) !void {
+            if (metadata.system_catalog_state) |state| if (state.index.retained_source_users.contains(table.table_id)) {
+                if (metadata.manager.tables.get(table.table_id)) |previous| {
+                    if (!std.mem.eql(u8, previous.name, table.name) or
+                        !std.mem.eql(u8, previous.schema_json, table.schema_json) or
+                        !std.mem.eql(u8, previous.read_schema_json, table.read_schema_json)) return error.RetainedDatasetSourceInUse;
+                } else return error.RetainedDatasetSourceInUse;
+            };
             if (metadata.lifecycle_store) |store| {
                 if (!try store.resolverProjectionValid(metadata.alloc, group_ids.main_metadata_group_id, table)) return error.ResolverCurationConflict;
             }
@@ -860,6 +869,10 @@ const LocalStandaloneMetadata = struct {
             try self.previous_tables.put(metadata.alloc, id, owned);
         }
         fn upsertRange(self: *CatalogMutation, metadata: *LocalStandaloneMetadata, range: antfly.metadata.RangeRecord) !void {
+            if (metadata.system_catalog_state) |state| if (state.index.retained_source_users.contains(range.table_id)) {
+                const previous = metadata.manager.ranges.get(range.group_id) orelse return error.RetainedDatasetSourceInUse;
+                if (!antfly.metadata.table_manager.rangeRecordsEqual(previous, range)) return error.RetainedDatasetSourceInUse;
+            };
             try self.captureRange(metadata, range.group_id);
             try metadata.manager.upsertRange(range);
         }
@@ -1047,6 +1060,7 @@ const LocalStandaloneMetadata = struct {
     }
 
     pub fn deinit(self: *LocalStandaloneMetadata) void {
+        self.retained_archive.deinit(self.alloc);
         var initial_owners = self.initial_fk_primed.valueIterator();
         while (initial_owners.next()) |owner| self.alloc.free(owner.table_name);
         self.initial_fk_primed.deinit(self.alloc);
@@ -2435,6 +2449,19 @@ const LocalStandaloneMetadata = struct {
             const table = self.owner.manager.tables.get(id) orelse return null;
             return .{ .id = table.table_id, .name = try self.alloc.dupe(u8, table.name) };
         }
+        pub fn datasetOwner(self: @This(), id: system_catalog.retained_datasets.Id) !?u64 {
+            return self.index.dataset_ids.get(id);
+        }
+        pub fn hasRetainedSourceUsers(self: @This(), id: u64) !bool {
+            return self.index.retained_source_users.contains(id);
+        }
+        pub fn retainedSource(self: @This(), id: u64) !?system_catalog.retained_datasets.Source {
+            const table = self.owner.manager.tables.get(id) orelse return null;
+            if (table.read_schema_json.len != 0 or table.storage_migration != null) return error.RetainedDatasetSourceNotReady;
+            for (self.owner.systemCatalogState().policy_publications) |publication| if (publication.table_id == id and
+                (publication.phase != .disabled or @import("../system_catalog/storage.zig").policyPublicationNeedsWork(publication))) return error.RowPolicyUnsupported;
+            return try system_catalog.retained_datasets.Source.fromTable(self.alloc, table, self.owner.metadata_incarnation orelse return error.InvalidMetadataIncarnation);
+        }
         pub fn graphIndexIdentity(self: @This(), id: u64, name: []const u8) !?@import("cypher").catalog.IndexIdentity {
             const table = self.owner.manager.tables.get(id) orelse return null;
             return @import("../system_catalog/graph_bindings.zig").indexIdentity(self.alloc, table.indexes_json, name);
@@ -2764,6 +2791,85 @@ const LocalStandaloneMetadata = struct {
         return reply;
     }
 
+    fn enrollRetainedOwnerRootLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator) !void {
+        const binding = try self.ensureNativeOwnerBindingLocked();
+        const io = self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
+        const root = try @import("antfly_local_sources").storage_db_root_signing_identity.loadOrCreate(alloc, io, self.replica_root_dir);
+        if (root.root_incarnation != binding.root_incarnation) return error.StoreRootEnrollmentChanged;
+        const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+        const identity: @import("../metadata/store_root_enrollment.zig").Identity = .{
+            .metadata_incarnation = binding.metadata_incarnation,
+            .node_id = binding.node_id,
+            .store_id = binding.store_id,
+            .root_incarnation = binding.root_incarnation,
+            .public_key = root.public_key,
+        };
+        if (self.retained_owner_signing_identity) |existing| {
+            if (!std.meta.eql(existing, identity)) return error.StoreRootEnrollmentChanged;
+        } else {
+            try store.updateStandaloneCatalog(group_ids.main_metadata_group_id, self.durable_revision, .{ .native_owner = binding, .native_owner_signing_identity = identity });
+            self.durable_revision = try store.standaloneRevision();
+            self.retained_owner_signing_identity = identity;
+        }
+    }
+
+    fn validateRetainedOwnerRoot(ptr: *anyopaque, alloc: std.mem.Allocator, identity: @import("../metadata/store_root_enrollment.zig").Identity, context: antfly.public_api.operation.RequestContext) anyerror!void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        try lockAtomicForRequest(&self.mutex, context);
+        defer self.mutex.unlock();
+        const binding = self.native_owner_binding orelse return error.RetainedOwnerPlanChanged;
+        if (binding.node_id != identity.node_id or binding.store_id != identity.store_id or binding.root_incarnation != identity.root_incarnation or
+            !std.mem.eql(u8, &binding.metadata_incarnation, &identity.metadata_incarnation)) return error.RetainedOwnerPlanChanged;
+        if (self.retained_owner_signing_identity) |pinned| {
+            if (!std.meta.eql(pinned, identity)) return error.StoreRootEnrollmentChanged;
+            return;
+        }
+        const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+        const verified = try store.storeRootControlJson(alloc, group_ids.main_metadata_group_id, .{ .enrollment_status = identity });
+        alloc.free(verified);
+        self.retained_owner_signing_identity = identity;
+    }
+
+    fn maintainRetainedArchive(ptr: *anyopaque, context: antfly.public_api.operation.RequestContext) anyerror!u64 {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        const server = self.data_server orelse return std.time.ns_per_s;
+        const config = server.api_server_cfg.node_config orelse return std.time.ns_per_s;
+        const store = self.lifecycle_store orelse return std.time.ns_per_s;
+        const io = self.backend_runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
+        try context.ensureActive();
+        const Completion = struct {
+            metadata: *LocalStandaloneMetadata,
+            pub fn finish(value: @This(), resource: @import("antfly_local_sources").system_catalog_domain.Resource, receipt: [32]u8) !void {
+                const proof = try @import("../serverless/datasets/configured_archive.zig").collectionProof(value.metadata.alloc, resource, receipt);
+                lockAtomic(&value.metadata.mutex);
+                defer value.metadata.mutex.unlock();
+                try value.metadata.applyJobCommandLocked(.{ .finish_retained_collection = proof });
+                try value.metadata.refreshRetainedDatasetProjectionLocked(value.metadata.alloc, resource.id);
+            }
+        };
+        try self.retained_archive.run(self.alloc, store, group_ids.main_metadata_group_id, config, server.api_server_cfg.secret_store, io, platform_time.monotonicNs(), &context, Completion{ .metadata = self });
+        return self.retained_archive.next_ns -| platform_time.monotonicNs();
+    }
+
+    fn refreshRetainedDatasetProjectionLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, resource_id: u64) !void {
+        const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+        const catalog = if (self.system_catalog_state) |*value| value else return error.InvalidStandaloneCatalog;
+        const current = catalog.index.byId(.dataset, resource_id) orelse return error.CatalogNotFound;
+        const namespace = catalog.index.byId(.namespace, current.parent_id) orelse return error.InvalidCatalogRecord;
+        const database = catalog.index.byId(.database, namespace.parent_id) orelse return error.InvalidCatalogRecord;
+        const bytes = try store.systemCatalogRead(alloc, group_ids.main_metadata_group_id, .{ .kind = .dataset, .database = database.name, .namespace = namespace.name, .name = current.name });
+        defer alloc.free(bytes);
+        var observed = try std.json.parseFromSlice(system_catalog.State, alloc, bytes, .{});
+        defer observed.deinit();
+        if (observed.value.revision == catalog.value.revision) return;
+        if (observed.value.revision != catalog.value.revision +| 1) return self.reloadLifecycleProjectionLocked();
+        const resource = observed.value.byId(.dataset, resource_id) orelse return error.InvalidCatalogRecord;
+        var upserts = [_]system_catalog.Resource{resource};
+        var removes: [0]system_catalog.Resource = .{};
+        var change = try catalog.apply(.{ .upserts = &upserts, .removes = &removes, .next_id = observed.value.next_id });
+        change.finish(catalog, true);
+    }
+
     fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call, admission: antfly.public_api.operation.RequestContext) anyerror![]u8 {
         if (call == .native_memory_create) {
             if (!context.setting_admin or context.native_service != .memory) return error.Forbidden;
@@ -2773,6 +2879,155 @@ const LocalStandaloneMetadata = struct {
         }
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
+        if (call == .api_node_uri) {
+            if (!context.setting_admin) return error.Forbidden;
+            if (call.api_node_uri == 0) return error.InvalidArgument;
+            // Standalone subscriptions are local; unknown issuers reset.
+            return alloc.dupe(u8, "null");
+        }
+        if (call == .retained_dataset_read_cut) {
+            try lockAtomicForRequest(&self.mutex, admission);
+            defer self.mutex.unlock();
+            return (self.lifecycle_store orelse return error.UnsupportedOperation).retainedDatasetReadCutJson(alloc, group_ids.main_metadata_group_id, call.retained_dataset_read_cut);
+        }
+        if (call == .retained_dataset_pending) {
+            try lockAtomicForRequest(&self.mutex, admission);
+            defer self.mutex.unlock();
+            return (self.lifecycle_store orelse return error.UnsupportedOperation).retainedDatasetPendingJson(alloc, group_ids.main_metadata_group_id, call.retained_dataset_pending);
+        }
+        if (call == .retained_dataset_activate or call == .retained_dataset_release) {
+            if (!context.setting_admin) return error.Forbidden;
+            const releasing = call == .retained_dataset_release;
+            const request = if (releasing) call.retained_dataset_release else call.retained_dataset_activate;
+            try request.validate();
+            try lockAtomicForRequest(&self.mutex, admission);
+            defer self.mutex.unlock();
+            if (self.hot_standby_catalog_server) |server|
+                try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
+            const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+            const model = @import("../metadata/retained_dataset_owners.zig");
+            const query: model.Read = .{ .plan = .{ .resource = request.resource, .generation = request.generation } };
+            const before_bytes = try store.retainedOwnerReadJson(alloc, group_ids.main_metadata_group_id, query);
+            defer alloc.free(before_bytes);
+            var before = try std.json.parseFromSlice(?model.Plan, alloc, before_bytes, .{});
+            defer before.deinit();
+            const plan = before.value orelse return error.RetainedOwnerPlanChanged;
+            if (!std.mem.eql(u8, &plan.id, &request.plan) or plan.revision != request.revision) return error.RetainedOwnerPlanChanged;
+            if (releasing) {
+                if (!plan.canReleaseSource()) return error.RetainedOwnerPlanChanged;
+            } else {
+                _ = try plan.activate();
+            }
+            try self.applyJobCommandLocked(if (releasing) .{ .release_retained_source = request } else .{ .activate_retained_dataset = request });
+            self.refreshRetainedDatasetProjectionLocked(alloc, request.resource) catch {
+                self.durable_revision = 0;
+                return error.MetadataMutationOutcomeUnknown;
+            };
+            const bytes = try store.retainedOwnerReadJson(alloc, group_ids.main_metadata_group_id, query);
+            errdefer alloc.free(bytes);
+            var observed = try std.json.parseFromSlice(?model.Plan, alloc, bytes, .{});
+            defer observed.deinit();
+            const after = observed.value orelse return error.MetadataMutationOutcomeUnknown;
+            if (!std.mem.eql(u8, &after.id, &request.plan) or (if (releasing) after.source_release_receipt == null else after.phase != .active)) return error.MetadataMutationOutcomeUnknown;
+            return bytes;
+        }
+        if (call == .retained_owner_archive) {
+            if (!context.setting_admin) return error.Forbidden;
+            const server = self.data_server orelse return error.UnsupportedOperation;
+            if (self.hot_standby_catalog_server != null) return error.UnsupportedOperation;
+            const config = server.api_server_cfg.node_config orelse return error.InvalidDatasetBinding;
+            const io = self.backend_runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
+            const model = @import("../metadata/retained_dataset_owners.zig");
+            const scope = call.retained_owner_archive;
+            const query: model.Read = .{ .owner = scope };
+            try query.validate();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const snapshot = read: {
+                try lockAtomicForRequest(&self.mutex, admission);
+                defer self.mutex.unlock();
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                const bytes = try store.retainedOwnerReadJson(a, group_ids.main_metadata_group_id, query);
+                break :read try std.json.parseFromSliceLeaky(@import("../api/retained_owner_control.zig").Snapshot, a, bytes, .{});
+            };
+            const proof = try @import("../system_catalog/operations.zig").verifyRetainedArchive(a, config, server.api_server_cfg.secret_store, io, &context, scope, snapshot);
+            try lockAtomicForRequest(&self.mutex, admission);
+            defer self.mutex.unlock();
+            try context.ensureActive();
+            const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+            try self.applyCdcStatusCommandLocked(.{ .acknowledge_retained_archive = proof });
+            var observed_scope = scope;
+            observed_scope.revision += 1;
+            const bytes = try store.retainedOwnerReadJson(alloc, group_ids.main_metadata_group_id, .{ .owner = observed_scope });
+            errdefer alloc.free(bytes);
+            const observed = try std.json.parseFromSliceLeaky(@import("../api/retained_owner_control.zig").Snapshot, a, bytes, .{});
+            if (!std.meta.eql(observed.owner.independent_receipt, @as(?model.Id, proof.receipt))) return error.MetadataMutationOutcomeUnknown;
+            return bytes;
+        }
+        if (call == .retained_owner_acknowledge) {
+            if (!context.setting_admin) return error.Forbidden;
+            const proof = call.retained_owner_acknowledge;
+            try proof.verify();
+            try lockAtomicForRequest(&self.mutex, admission);
+            defer self.mutex.unlock();
+            const server = self.data_server orelse return error.UnsupportedOperation;
+            if (server.standalone_retained_owner == null or self.hot_standby_catalog_server != null) return error.UnsupportedOperation;
+            const binding = try self.ensureNativeOwnerBindingLocked();
+            const io = self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
+            const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, self.replica_root_dir);
+            if (root.root_incarnation != binding.root_incarnation or
+                !std.mem.eql(u8, &root.public_key, &proof.identity.public_key) or proof.metadata_version != 0)
+                return error.RetainedOwnerPlanChanged;
+            const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+            try self.applyCdcStatusCommandLocked(.{ .acknowledge_retained_owner = proof });
+            return store.retainedOwnerReadJson(alloc, group_ids.main_metadata_group_id, .{ .owner = .{
+                .resource = proof.resource,
+                .generation = proof.generation,
+                .plan = proof.plan,
+                .group = proof.group,
+                .revision = proof.owner_revision + 1,
+            } });
+        }
+        if (call == .retained_owner_register) {
+            if (!context.setting_admin) return error.Forbidden;
+            const request = call.retained_owner_register;
+            try request.validate();
+            try lockAtomicForRequest(&self.mutex, admission);
+            defer self.mutex.unlock();
+            if (self.hot_standby_catalog_server) |server|
+                try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
+            const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+            const before_bytes = try store.retainedOwnerReadJson(alloc, group_ids.main_metadata_group_id, .{ .plan = .{ .resource = request.resource, .generation = request.generation } });
+            defer alloc.free(before_bytes);
+            var before = try std.json.parseFromSlice(?@import("../metadata/retained_dataset_owners.zig").Plan, alloc, before_bytes, .{});
+            defer before.deinit();
+            const plan = before.value orelse return error.RetainedOwnerPlanChanged;
+            if (!std.mem.eql(u8, &plan.id, &request.plan) or plan.revision != request.revision or plan.phase != .activating or plan.registration_complete) return error.RetainedOwnerPlanChanged;
+            try self.applyCdcStatusCommandLocked(.{ .register_retained_owners = request });
+            return store.retainedOwnerReadJson(alloc, group_ids.main_metadata_group_id, .{ .plan = .{ .resource = request.resource, .generation = request.generation } });
+        }
+        if (call == .retained_owner_read) {
+            try call.retained_owner_read.validate();
+            try lockAtomicForRequest(&self.mutex, admission);
+            defer self.mutex.unlock();
+            return (self.lifecycle_store orelse return error.UnsupportedOperation).retainedOwnerReadJson(alloc, group_ids.main_metadata_group_id, call.retained_owner_read);
+        }
+        if (call == .retained_source_candidate) {
+            if (!context.setting_admin) return error.Forbidden;
+            try lockAtomicForRequest(&self.mutex, admission);
+            defer self.mutex.unlock();
+            const server = self.data_server orelse return error.UnsupportedOperation;
+            if (server.standalone_retained_owner == null) return error.UnsupportedOperation;
+            const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+            return store.retainedSourceCandidateJson(alloc, group_ids.main_metadata_group_id, call.retained_source_candidate);
+        }
+        if (call == .retained_dataset_work) {
+            try lockAtomicForRequest(&self.mutex, admission);
+            defer self.mutex.unlock();
+            const request = call.retained_dataset_work;
+            return (self.lifecycle_store orelse return error.UnsupportedOperation).retainedDatasetWorkJson(alloc, group_ids.main_metadata_group_id, request.after_id, request.native);
+        }
         if (call == .lake_source_owner_read) {
             try lockAtomicForRequest(&self.mutex, admission);
             defer self.mutex.unlock();
@@ -2863,7 +3118,7 @@ const LocalStandaloneMetadata = struct {
                 read.standalone = true;
                 return self.lifecycle_store.?.resolverCatalogRead(alloc, group_ids.main_metadata_group_id, read);
             },
-            .lake_source_owner_read, .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
+            .api_node_uri, .retained_owner_archive, .retained_dataset_release, .retained_source_candidate, .retained_dataset_pending, .retained_dataset_read_cut, .retained_dataset_activate, .retained_owner_acknowledge, .retained_owner_register, .retained_owner_read, .retained_dataset_work, .lake_source_owner_read, .lake_index_lifecycle_read, .lake_index_lifecycle_work, .lake_index_lifecycle_mutate => unreachable,
             .fk_initial_retirement_page,
             .fk_initial_retirement_signed_page,
             .fk_initial_retirement_ack,
@@ -3291,6 +3546,11 @@ const LocalStandaloneMetadata = struct {
                 const a = arena.allocator();
                 const state = self.systemCatalogState();
                 var command = request.mutation;
+                if (command.kind == .dataset and (command.action == .create or command.action == .set_definition)) {
+                    if (request.expected_catalog_revision) |expected| {
+                        if (expected != state.revision) return error.CatalogGenerationChanged;
+                    }
+                }
                 var table: ?antfly.metadata.TableRecord = null;
                 var ranges: []const antfly.metadata.RangeRecord = &.{};
                 if (command.kind == .table and command.action == .create) {
@@ -3324,6 +3584,14 @@ const LocalStandaloneMetadata = struct {
                     }
                     return err;
                 };
+                if (command.kind == .dataset and (command.action == .create or command.action == .set_definition)) {
+                    const retained = delta.upserts[0].retained orelse return error.InvalidRetainedDatasetResource;
+                    if (retained.source_table_id != 0) {
+                        const server = self.data_server orelse return error.UnsupportedOperation;
+                        if (server.standalone_retained_owner == null) return error.UnsupportedOperation;
+                        if (command.action == .create) try self.enrollRetainedOwnerRootLocked(a);
+                    }
+                }
                 const empty: system_catalog.StateIndex = .{};
                 const reader: CatalogReader = .{ .owner = self, .alloc = a, .index = if (self.system_catalog_state) |*catalog| &catalog.index else &empty };
                 const result = try std.json.Stringify.valueAlloc(alloc, try system_catalog.mutationResult(reader, state.revision + 1, delta), .{});
@@ -3729,6 +3997,7 @@ const LocalStandaloneMetadata = struct {
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
         if (table.storage_migration != null) return error.VectorMigrationActive;
         const table_id = table.table_id;
+        if (self.system_catalog_state) |state| if (state.index.retained_source_users.contains(table_id)) return error.RetainedDatasetSourceInUse;
         const ranges = try self.manager.listRanges(alloc);
         defer self.manager.freeRanges(alloc, ranges);
         var dropped_group_ids = std.ArrayListUnmanaged(u64).empty;
@@ -6371,6 +6640,15 @@ pub fn runFromIterator(
     data_server.api_server_cfg.sql_deployment = try @import("../serverless/sql/deployment.zig").Config.fromEnv(sql_configuration.allocator(), init.environ_map, &secret_store);
     try data_server.initApiServer();
     local_metadata.data_server = &data_server;
+    if (!hot_standby_role_requested and local_metadata.localFkPublicationSupported()) {
+        data_server.standalone_retained_owner = .{
+            .node_id = local_metadata.local_node_id,
+            .store_id = local_metadata.store_id,
+            .metadata = &local_metadata,
+            .maintain_archive = LocalStandaloneMetadata.maintainRetainedArchive,
+            .validate_root = LocalStandaloneMetadata.validateRetainedOwnerRoot,
+        };
+    }
     defer local_metadata.shutdownCdc();
     if (local_metadata.localFkPublicationSupported() and try local_metadata.nativeOwnerBindingRequiredOnOpen()) {
         var binding_lock = try local_metadata.lockMutation();

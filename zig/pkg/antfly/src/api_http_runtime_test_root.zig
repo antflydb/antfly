@@ -140,3 +140,16 @@ test "httpx inference gateway source discovery" {
 test "linear merge discovery" {
     _ = @import("api/linear_merge.zig");
 }
+
+test "retained owner native controls discovery" {
+    _ = @import("api/retained_owner_control.zig");
+    _ = @import("api/retained_owner_binding.zig");
+    _ = httpx_handler;
+    _ = @import("api/retained_dataset_read.zig");
+    _ = @import("api/retained_dataset_status.zig");
+    _ = @import("api/retained_subscription.zig");
+}
+
+test {
+    _ = @import("api/api_node_directory.zig");
+}

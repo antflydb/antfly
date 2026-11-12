@@ -38,6 +38,13 @@ fn fail(index: u8) anyerror!u64 {
         8 => error.DocumentTokenLimitExceeded,
         9 => error.ReadOutputTruncated,
         10 => error.StorageOwnerAdmissionPending,
+        11 => error.InvalidRetainedSeriesRow,
+        12 => error.RetainedSeriesCorrectionWindow,
+        13 => error.RetainedSeriesHistoryExpired,
+        14 => error.DatasetPageBudgetExceeded,
+        15 => error.RetainedSeriesResetRequired,
+        16 => error.DatasetReadersActive,
+        17 => error.DatasetSegmentRetired,
         else => 42,
     };
 }
@@ -61,9 +68,11 @@ test "model-aware chunk failures cross independent native error domains" {
     const method: @FieldType(Methods, "fail") = @ptrCast(@alignCast(provider.fail));
     var distinct = false;
     for ([_][]const u8{
-        "StaleChunkContinuation",     "IncompleteChunkCoverage",   "SourceVersionChanged",         "MemoryBudgetExceeded",
-        "UnsupportedChunkMediaType",  "EmbeddingIdentityMismatch", "InvalidChunkPolicy",           "InvalidChunkReplay",
-        "DocumentTokenLimitExceeded", "ReadOutputTruncated",       "StorageOwnerAdmissionPending",
+        "StaleChunkContinuation",         "IncompleteChunkCoverage",      "SourceVersionChanged",         "MemoryBudgetExceeded",
+        "UnsupportedChunkMediaType",      "EmbeddingIdentityMismatch",    "InvalidChunkPolicy",           "InvalidChunkReplay",
+        "DocumentTokenLimitExceeded",     "ReadOutputTruncated",          "StorageOwnerAdmissionPending", "InvalidRetainedSeriesRow",
+        "RetainedSeriesCorrectionWindow", "RetainedSeriesHistoryExpired", "DatasetPageBudgetExceeded",    "RetainedSeriesResetRequired",
+        "DatasetReadersActive",           "DatasetSegmentRetired",
     }, 0..) |name, index| {
         const expected = @import("storage_engine_errors").fromName(name);
         const code: u8 = @intCast(index);

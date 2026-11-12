@@ -1955,6 +1955,16 @@ fn sqlstate(err: anyerror) []const u8 {
         error.PortalExecutionFailed => "55000",
         error.TooManyConnections, error.SqlWriteCapacityUnavailable => "53300",
         error.CachedPlanResultTypeChanged, error.UnsupportedParameterType, error.UnsupportedParameterFormat, error.UnsupportedResultFormat, error.UnsupportedProtocolMessage, error.UnsupportedContinuation, error.UnsupportedResultPrecision, error.UnsupportedStatement, error.ResultShapeChanged => "0A000",
-        else => "XX000",
+        // Row delivery can fail after statement diagnostics were produced.
+        // Reuse the core SQL registry for those late value/domain failures.
+        else => @import("antfly_local_sources").sql_errors.describe(err).code,
     };
+}
+
+test "pgwire late SQL value failures retain core SQLSTATEs" {
+    for ([_]anyerror{ error.RetainedSeriesNumericOverflow, error.RetainedSeriesTimeOverflow, error.DatasetPageBudgetExceeded, error.RetainedReadRestartRequired, error.RetainedSeriesHistoryExpired, error.RetainedSeriesSourceDraining, error.SqlDivisionByZero }) |reason| {
+        try std.testing.expectEqualStrings(@import("antfly_local_sources").sql_errors.describe(reason).code, sqlstate(reason));
+    }
+    try std.testing.expectEqualStrings("22003", sqlstate(error.RetainedSeriesNumericOverflow));
+    try std.testing.expectEqualStrings("XX000", sqlstate(error.UnclassifiedLateValueFailure));
 }

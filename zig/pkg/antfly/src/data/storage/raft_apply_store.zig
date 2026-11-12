@@ -2089,7 +2089,7 @@ pub const RaftApplyStore = struct {
             .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
             .merge_receiver_checkpoint => |checkpoint| checkpoint.deinit(alloc),
             .merge_page_fence => |payload| alloc.free(payload),
-            .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
+            .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .require_raft_batch_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
         }
     }
 
@@ -2143,7 +2143,7 @@ pub const RaftApplyStore = struct {
                 .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
                 .merge_receiver_checkpoint => |checkpoint| checkpoint.deinit(alloc),
                 .merge_page_fence => |payload| alloc.free(payload),
-                .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
+                .acknowledge_split, .merge_source_transition, .merge_copy_fence, .set_raft_batch_protocol, .require_source_pin_protocol, .require_raft_batch_protocol, .topology_guard, .topology_end, .flush_split_delta => {},
             };
             operations.deinit(alloc);
         }
@@ -2449,6 +2449,13 @@ pub const RaftApplyStore = struct {
         if (decoded.protocol_barrier_version) |version| {
             try operations.append(alloc, .{ .set_raft_batch_protocol = version });
             return;
+        }
+        if (decoded.batch.req.retained_series != null or decoded.batch.req.expiration_deletes.len != 0) {
+            if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
+            try @import("antfly_local_sources").storage_retained_series_control.validateRequest(decoded.batch.req);
+            const protocol = @import("../../common/data_raft_protocol.zig");
+            try operations.append(alloc, .{ .require_raft_batch_protocol = if (decoded.batch.req.retained_series) |command| protocol.retainedSeriesCommandVersion(command) else protocol.batch_retained_series_protocol_version });
+            if (decoded.batch.req.retained_series != null) return;
         }
         const native_transfer = decoded.batch.req.restore_staging != null or
             (if (decoded.batch.req.merge_page) |page| page.source.integrity != null else false) or
@@ -5923,4 +5930,32 @@ test "privacy data raft apply compaction families are contiguous and separate ho
     };
     try std.testing.expect(!std.mem.eql(u8, applyRunPartition(keys[10]), applyRunPartition(keys[11])));
     try std.testing.expectEqualStrings(applyRunPartition(keys[11]), applyRunPartition(keys[12]));
+}
+
+test "retained series raft projection requires native effects and a durable protocol barrier" {
+    const a = std.testing.allocator;
+    const bytes = try data_raft_batch.encode(a, "docs", .{ .timestamp_ns = 1, .document_version_scheme = .legacy, .retained_series = .{ .action = .tick, .fence = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .partition = @splat(3), .incarnation = 1 } } });
+    defer a.free(bytes);
+    var operations: std.ArrayListUnmanaged(shard_state_store.DataOperation) = .empty;
+    defer {
+        for (operations.items) |op| RaftApplyStore.freeDataOperation(a, op);
+        operations.deinit(a);
+    }
+    try std.testing.expectError(error.StorageKernelOwnerUnavailable, RaftApplyStore.appendDataOperations(a, 1, bytes, &operations, false));
+    try std.testing.expectEqual(@as(usize, 0), operations.items.len);
+    try RaftApplyStore.appendDataOperations(a, 1, bytes, &operations, true);
+    try std.testing.expectEqual(@as(usize, 1), operations.items.len);
+    try std.testing.expectEqual(@import("../../common/data_raft_protocol.zig").batch_retained_series_protocol_version, operations.items[0].require_raft_batch_protocol);
+    const admission = try data_raft_batch.encode(a, "docs", .{ .timestamp_ns = 1, .document_version_scheme = .legacy, .retained_series = .{ .action = .admit_retention, .fence = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .partition = @splat(3), .incarnation = 1 } } });
+    defer a.free(admission);
+    try RaftApplyStore.appendDataOperations(a, 1, admission, &operations, true);
+    try std.testing.expectEqual(@as(usize, 2), operations.items.len);
+    try std.testing.expectEqual(@import("../../common/data_raft_protocol.zig").batch_retained_read_admission_protocol_version, operations.items[1].require_raft_batch_protocol);
+    const handoff = try data_raft_batch.encode(a, "docs", .{ .timestamp_ns = 1, .document_version_scheme = .legacy, .retained_series = .{ .action = .revoke, .expected_admitted_ns = 7, .fence = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .partition = @splat(3), .incarnation = 1 } } });
+    defer a.free(handoff);
+    var decoded = try data_raft_batch.decode(a, handoff);
+    defer decoded.deinit(a);
+    try std.testing.expectEqual(@as(?i128, 7), decoded.batch.req.retained_series.?.expected_admitted_ns);
+    try RaftApplyStore.appendDataOperations(a, 1, handoff, &operations, true);
+    try std.testing.expectEqual(@import("../../common/data_raft_protocol.zig").batch_retained_clock_handoff_protocol_version, operations.items[2].require_raft_batch_protocol);
 }

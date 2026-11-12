@@ -234,6 +234,19 @@ pub fn describe(err: anyerror) Diagnostic {
         error.ConflictingSqlParameterTypes => .{ .code = "42P08", .message = "A parameter is used with incompatible types.", .hint = "Use separate parameters for incompatible column types." },
         error.SqlGeneratedColumnWrite => .{ .code = "428C9", .message = "A generated column cannot be assigned directly.", .hint = "Omit the generated column and let the server compute its value." },
         error.InvalidSqlNumber, error.RelationalExpressionOverflow => .{ .code = "22003", .message = "A numeric value is outside the supported range.", .hint = "Use a value representable by the target column type." },
+        error.RetainedDatasetSourceInUse => .{ .code = "2BP01", .message = "The source table still supplies a retained dataset.", .hint = "Close the dataset and wait for archive handoff before dropping its source.", .retryable = false },
+        error.RetainedDatasetSourceNotReady => .{ .code = "55000", .message = "The retained dataset source is temporarily unavailable.", .retryable = true },
+        error.RetainedSeriesNumericOverflow => .{ .code = "22003", .message = "A retained aggregate is outside its supported numeric range.", .retryable = false },
+        error.RetainedSeriesHistoryExpired => .{ .code = "55000", .message = "The requested retained history has expired.", .retryable = false },
+        error.RetainedSeriesResolutionMismatch, error.InvalidDatasetCoverage => .{ .code = "22023", .message = "The retained range must align to the dataset bucket boundaries.", .retryable = false },
+        error.DatasetPageBudgetExceeded => .{ .code = "54000", .message = "The retained query exceeds its range or result budget.", .hint = "Use a narrower time range.", .retryable = false },
+        error.RetainedOwnerPlanChanged, error.RetainedSeriesNotReady, error.DatasetDependencyPending => .{ .code = "55000", .message = "The retained dataset authority is temporarily unavailable.", .retryable = true },
+        error.RetainedSeriesCoverageMissing => .{ .code = "55000", .message = "The requested history is outside retained coverage.", .hint = "Use a timestamp within coverage or rebuild the summary.", .retryable = false },
+        error.InvalidRetainedSeriesRow => .{ .code = "22023", .message = "Source fields do not satisfy a retained dataset definition.", .retryable = false },
+        error.RetainedSeriesTimeOverflow => .{ .code = "22008", .message = "A retained timestamp or bucket boundary is outside its supported range.", .retryable = false },
+        error.RetainedSeriesBatchTooLarge => .{ .code = "54000", .message = "Retained maintenance exceeds the write budget.", .hint = "Reduce the batch or document size.", .retryable = false },
+        error.RetainedSeriesCorrectionWindow => .{ .code = "55000", .message = "The mutation changes finalized retained history.", .hint = "Change the mutation or rebuild the summary with a wider correction window.", .retryable = false },
+        error.RetainedSeriesSourceDraining => .{ .code = "55P03", .message = "Retained dataset closure is draining prepared writes.", .hint = "Retry after dataset closure finishes.", .retryable = true },
         error.RelationalExpressionDivisionByZero => .{ .code = "22012", .message = "An expression attempted division by zero.", .hint = "Check divisors in the mutation and computed expressions." },
         error.SqlFeatureNotSupported => .{ .code = "0A000", .message = "The requested value conversion is not supported.", .hint = "Check nonfinite numeric values and the target type.", .retryable = false },
         error.DuplicateSqlRow, error.UniqueConstraintViolation => .{ .code = "23505", .message = "The mutation violates a unique constraint.", .hint = "Use distinct row identities and unique column values.", .retryable = false },
@@ -400,4 +413,22 @@ test "SQL decision evidence failures are nonretryable client diagnostics" {
     }
     try std.testing.expectEqualStrings("38000", describe(error.InvalidDecisionOutput).code);
     try std.testing.expectEqual(@as(u16, 502), describe(error.InvalidDecisionOutput).httpStatus());
+}
+
+test "SQL retained source failures expose definite constraints and retry only draining admissions" {
+    for ([_]struct { reason: anyerror, code: []const u8 }{
+        .{ .reason = error.RetainedDatasetSourceInUse, .code = "2BP01" },
+        .{ .reason = error.InvalidRetainedSeriesRow, .code = "22023" },
+        .{ .reason = error.RetainedSeriesTimeOverflow, .code = "22008" },
+        .{ .reason = error.RetainedSeriesNumericOverflow, .code = "22003" },
+        .{ .reason = error.RetainedSeriesBatchTooLarge, .code = "54000" },
+        .{ .reason = error.RetainedSeriesCorrectionWindow, .code = "55000" },
+        .{ .reason = error.RetainedSeriesCoverageMissing, .code = "55000" },
+        .{ .reason = error.RetainedSeriesSourceDraining, .code = "55P03" },
+    }) |item| {
+        const diagnostic = describe(item.reason);
+        try std.testing.expectEqualStrings(item.code, diagnostic.code);
+        try std.testing.expectEqual(@as(?bool, item.reason == error.RetainedSeriesSourceDraining), diagnostic.retryable);
+        try std.testing.expectEqual(item.reason, notApplied(item.reason));
+    }
 }
