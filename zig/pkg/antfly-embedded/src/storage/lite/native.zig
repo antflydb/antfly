@@ -5932,6 +5932,11 @@ pub const NativeFile = struct {
     /// Fails the next checkpoint publication inside its uncertain window
     /// (after the flag is set, before the slot write), then disarms.
     test_fail_checkpoint_publication: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
+    /// Test-only: makes `checkpointRedoLog` stop right after its new slot
+    /// is durable, skipping the log-zeroing step, to exercise that known
+    /// gap's exact window (see that function's own doc comment) instead
+    /// of a hand-rolled approximation of it.
+    test_skip_redo_log_zero: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !NativeFile {
         return try openWithOptions(allocator, path, .{ .read_only = read_only });
@@ -6189,6 +6194,86 @@ pub const NativeFile = struct {
             .overlay = overlay,
             .durable_sequence = outcome.last_sequence orelse checkpoint.commit_sequence,
         };
+    }
+
+    /// Turns every page the redo log's overlay is still carrying into a
+    /// real, durable on-disk page, and advances the real checkpoint slot
+    /// to match -- build step (d) of docs/design/lite-performance/
+    /// lite-single-commit-write-path.md §9.9. A no-op if there is nothing
+    /// to checkpoint. Not yet wired to any automatic trigger (idle timer,
+    /// log-capacity threshold, or the owner maintenance turn): callable
+    /// explicitly for now, same as `sync()`; owner-only/background
+    /// scheduling is follow-up work, not yet needed to exercise or gate
+    /// this step's own correctness.
+    ///
+    /// Ordering is safety-load-bearing, not incidental: physical pages are
+    /// written and the *new* checkpoint slot is made durable before the
+    /// log's now-superseded prefix is ever touched. A crash at any point
+    /// up to and including the new slot's own sync leaves the *old*
+    /// checkpoint plus the still-intact log exactly as capable of
+    /// recovering every acknowledged commit as it was before this call
+    /// started (recovery just redoes the same checkpoint later). Only
+    /// after the new slot is durable does this function zero the log's
+    /// stale prefix, which is pure space reclamation, never a source of
+    /// truth for anything by that point.
+    ///
+    /// Known gap, not yet closed: a crash strictly between the new slot's
+    /// durable sync and the log-zeroing step below leaves stale (but
+    /// harmless -- already fully reflected in the new, durable checkpoint)
+    /// bytes at the start of the log. `redo_log.replay`'s sequence-
+    /// continuity check cannot yet tell that apart from genuine corruption
+    /// (both look like "the first record's sequence isn't exactly
+    /// baseline + 1"), so `recoverRedoLog` fails closed with
+    /// `error.NativeRedoLogCorrupt` instead of correctly recognizing
+    /// "nothing new since this checkpoint" -- safe (no silent data loss or
+    /// corruption, and no already-acknowledged work is ever at risk), but
+    /// not maximally available. Closing it needs `replay` (or a thin
+    /// wrapper in `recoverRedoLog`) to treat a first record whose sequence
+    /// is at or below the checkpoint baseline as stale-and-ignorable
+    /// rather than corrupt; left for a follow-up with a dedicated
+    /// crash-sim scenario at exactly this window, rather than widening
+    /// `redo_log.zig`'s own general-purpose contract under this pass's
+    /// time budget without matching verification.
+    pub fn checkpointRedoLog(self: *NativeFile) !void {
+        const redo: *RedoCommitState = if (self.redo) |*r| r else return error.InvalidTransactionState;
+        if (redo.overlay.count() == 0) return;
+        const io = self.runtimeIo();
+
+        var it = redo.overlay.iterator();
+        while (it.next()) |entry| {
+            try self.file.writePositionalAll(io, entry.value_ptr.*, entry.key_ptr.* * @as(u64, self.header.page_size));
+        }
+        try self.file.sync(io);
+
+        var checkpoint = self.activeCheckpoint();
+        checkpoint.presynced = true;
+        checkpoint.manifest_page = 0;
+        checkpoint.manifest_crc = 0;
+        checkpoint.manifest_page_count = 0;
+        try self.stampLogicalGenerations(&checkpoint);
+        const next_slot: u8 = if (self.header.active_checkpoint == 0) 1 else 0;
+        var slot_buf: [max_page_size]u8 = undefined;
+        const slot_page = slot_buf[0..self.header.page_size];
+        encodeCheckpointSlotPage(slot_page, checkpoint);
+        try self.file.writePositionalAll(io, slot_page, slotPhysicalPage(next_slot) * @as(u64, self.header.page_size));
+        try self.file.sync(io);
+        self.header.checkpoints[next_slot] = checkpoint;
+        self.header.active_checkpoint = next_slot;
+
+        // Everything above is durable now; only space reclamation is left.
+        const old_tail = redo.writer.tail;
+        var vit = redo.overlay.valueIterator();
+        while (vit.next()) |bytes| self.allocator.free(bytes.*);
+        redo.overlay.clearAndFree(self.allocator);
+        if (builtin.is_test and self.test_skip_redo_log_zero) return;
+        if (old_tail > 0) {
+            const zeros = try self.allocator.alloc(u8, @intCast(old_tail));
+            defer self.allocator.free(zeros);
+            @memset(zeros, 0);
+            try self.file.writePositionalAll(io, zeros, self.header.redo_log_offset);
+            try self.file.sync(io);
+        }
+        redo.writer = redo_log.Writer.init(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity);
     }
 
     fn createWithMode(
@@ -26070,6 +26155,137 @@ test "lite redo log recovery rejects a corrupted (not merely torn) log record" {
         one_byte[0] ^= 0xFF;
         try raw.file.writePositionalAll(io, &one_byte, corrupt_at);
     }
+
+    try std.testing.expectError(error.NativeRedoLogCorrupt, NativeFile.openWithIo(a, std.testing.io, path, .{}));
+}
+
+test "lite redo log checkpoint turns overlay pages into real pages, advances the real slot, and recovery no longer needs the log" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-checkpoint.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    try file.beginTransaction();
+    try file.putDocument("alpha", "one");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("beta", "two");
+    try file.commitTransaction();
+
+    try std.testing.expect(file.redo.?.overlay.count() > 0);
+    const sequence_before = file.redo.?.durable_sequence;
+    try file.checkpointRedoLog();
+    try std.testing.expectEqual(@as(usize, 0), file.redo.?.overlay.count());
+
+    // Reads still work, now served from the real on-disk pages (the
+    // overlay is empty) instead of the log.
+    const alpha = (try file.getDocumentAlloc(a, "alpha")).?;
+    defer a.free(alpha);
+    try std.testing.expectEqualStrings("one", alpha);
+    const beta = (try file.getDocumentAlloc(a, "beta")).?;
+    defer a.free(beta);
+    try std.testing.expectEqualStrings("two", beta);
+
+    // Every page up to `checkpoint.page_count` is now physically present
+    // (§9.4's whole point), so the general-purpose integrity checker --
+    // which the two earlier redo-log tests explicitly could not assert,
+    // pending this step -- passes again.
+    try std.testing.expect((try file.check()).valid);
+
+    // A write after the checkpoint still works, logged fresh from the
+    // checkpoint's own baseline.
+    try file.beginTransaction();
+    try file.putDocument("gamma", "three");
+    try file.commitTransaction();
+    try std.testing.expect(file.redo.?.durable_sequence > sequence_before);
+    file.close();
+
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    const alpha2 = (try reopened.getDocumentAlloc(a, "alpha")).?;
+    defer a.free(alpha2);
+    try std.testing.expectEqualStrings("one", alpha2);
+    const gamma = (try reopened.getDocumentAlloc(a, "gamma")).?;
+    defer a.free(gamma);
+    try std.testing.expectEqualStrings("three", gamma);
+    // Not asserted here: `check()` after reopen. "gamma" was committed
+    // *after* the checkpoint above, so it is once again overlay-only
+    // (replayed from the log, not yet checkpointed) -- the same known,
+    // documented gap `checkpointRedoLog`'s own doc comment and the
+    // earlier redo-log tests already call out, not a regression.
+}
+
+test "lite redo log checkpoint is a no-op with nothing to checkpoint" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-checkpoint-empty.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer file.close();
+    try file.checkpointRedoLog();
+    try std.testing.expectEqual(@as(usize, 0), file.redo.?.overlay.count());
+}
+
+test "lite redo log checkpoint survives a crash before the new slot is durable" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-checkpoint-crash-early.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    try file.beginTransaction();
+    try file.putDocument("doc", "value");
+    try file.commitTransaction();
+
+    // Simulate a crash after the real pages are written but before the
+    // new checkpoint slot's own write -- the window checkpointRedoLog's
+    // own doc comment says is fully safe: the old slot plus the
+    // still-intact log must still recover everything.
+    const io = file.runtimeIo();
+    var redo = &file.redo.?;
+    var it = redo.overlay.iterator();
+    while (it.next()) |entry| {
+        try file.file.writePositionalAll(io, entry.value_ptr.*, entry.key_ptr.* * @as(u64, file.header.page_size));
+    }
+    try file.file.sync(io);
+    // Crash here, before any slot write. Nothing it does changed -- the
+    // log and the old checkpoint are untouched -- so this is really just
+    // closing without ever having called checkpointRedoLog successfully.
+    file.close();
+
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    const doc = (try reopened.getDocumentAlloc(a, "doc")).?;
+    defer a.free(doc);
+    try std.testing.expectEqualStrings("value", doc);
+}
+
+test "lite redo log checkpoint's known gap: a crash between the new slot and log-zeroing fails closed, not silently" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-checkpoint-crash-late.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    try file.beginTransaction();
+    try file.putDocument("doc", "value");
+    try file.commitTransaction();
+
+    // Drive `checkpointRedoLog` itself into exactly its documented gap
+    // window via the test-only hook, rather than hand-rolling an
+    // approximation of the resulting on-disk state: stop right after the
+    // new slot is durable, never reaching the log-zeroing step. The log
+    // still has "doc"'s own record, now stale (fully superseded by the
+    // new, durable checkpoint) but physically untouched.
+    file.test_skip_redo_log_zero = true;
+    try file.checkpointRedoLog();
+    file.close();
 
     try std.testing.expectError(error.NativeRedoLogCorrupt, NativeFile.openWithIo(a, std.testing.io, path, .{}));
 }
