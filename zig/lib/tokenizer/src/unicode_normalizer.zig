@@ -424,3 +424,125 @@ test "SentencePiece precompiled normalization rewrites Unicode and deletes contr
     try std.testing.expectError(error.InvalidTokenizerNormalizer, Precompiled.init(allocator, "AAAA"));
     try std.testing.expectError(error.InvalidTokenizerNormalizer, Precompiled.init(allocator, "not base64"));
 }
+
+// BERT uses per-codepoint Unicode lowercase, canonical decomposition and Mn
+// removal. Reuse the pinned NFC decomposition data; no locale or OS dependency.
+pub const Bert = struct {
+    lowercase: bool = true,
+    strip_accents: bool = true,
+    clean_text: bool = true,
+
+    pub fn normalize(self: Bert, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        var output = std.ArrayListUnmanaged(u8).empty;
+        errdefer output.deinit(allocator);
+        try output.ensureTotalCapacity(allocator, text.len);
+        var units = std.ArrayListUnmanaged(Unit).empty;
+        defer units.deinit(allocator);
+        var marks = std.ArrayListUnmanaged(Unit).empty;
+        defer marks.deinit(allocator);
+        var iter = (try std.unicode.Utf8View.init(text)).iterator();
+        while (iter.nextCodepoint()) |original| {
+            var cp = original;
+            // Keep the common ASCII path linear with no Unicode table probes.
+            if (cp < 0x80) {
+                var byte: u8 = @intCast(cp);
+                if (self.clean_text) {
+                    if (byte == '\t' or byte == '\n' or byte == '\r') {
+                        byte = ' ';
+                    } else if (byte < 0x20 or byte == 0x7f) continue;
+                }
+                try flushBertMarks(allocator, &output, &marks);
+                try output.append(allocator, if (self.lowercase) std.ascii.toLower(byte) else byte);
+                continue;
+            }
+            if (self.clean_text) {
+                if (cp == 0 or cp == 0xfffd) continue;
+                if (cp == '\t' or cp == '\n' or cp == '\r' or inRanges(cp, &data.spaces)) {
+                    cp = ' ';
+                } else if (inRanges(cp, &data.controls)) continue;
+            }
+            const identity = [_]u21{cp};
+            const lowered = if (self.lowercase) lowercaseCodepoint(cp) orelse &identity else &identity;
+            for (lowered) |value| {
+                if (self.strip_accents and value >= 0x80) {
+                    units.clearRetainingCapacity();
+                    try decompose(allocator, value, &units);
+                    for (units.items) |unit| {
+                        // Canonical ordering precedes Mn removal, including
+                        // the uncommon retained spacing combining marks.
+                        if (unit.class == 0) try flushBertMarks(allocator, &output, &marks);
+                        if (inRanges(unit.cp, &data.nonspacing_marks)) continue;
+                        if (unit.class == 0) {
+                            try appendCodepoint(allocator, &output, unit.cp);
+                        } else {
+                            try marks.append(allocator, .{ .cp = unit.cp, .class = unit.class, .order = marks.items.len });
+                        }
+                    }
+                } else {
+                    try flushBertMarks(allocator, &output, &marks);
+                    try appendCodepoint(allocator, &output, value);
+                }
+            }
+        }
+        try flushBertMarks(allocator, &output, &marks);
+        return output.toOwnedSlice(allocator);
+    }
+};
+
+fn flushBertMarks(allocator: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8), marks: *std.ArrayListUnmanaged(Unit)) !void {
+    std.mem.sort(Unit, marks.items, {}, Unit.less);
+    for (marks.items) |unit| try appendCodepoint(allocator, output, unit.cp);
+    marks.clearRetainingCapacity();
+}
+
+fn appendCodepoint(allocator: std.mem.Allocator, output: *std.ArrayListUnmanaged(u8), cp: u21) !void {
+    var bytes: [4]u8 = undefined;
+    const len = try std.unicode.utf8Encode(cp, &bytes);
+    try output.appendSlice(allocator, bytes[0..len]);
+}
+
+fn inRanges(cp: u21, ranges: []const data.Range) bool {
+    var lo: usize = 0;
+    var hi = ranges.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (ranges[mid].last < cp) lo = mid + 1 else hi = mid;
+    }
+    return lo < ranges.len and ranges[lo].first <= cp;
+}
+
+fn lowercaseCodepoint(cp: u21) ?[]const u21 {
+    var lo: usize = 0;
+    var hi = data.lowercase.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (data.lowercase[mid].cp < cp) lo = mid + 1 else hi = mid;
+    }
+    return if (lo < data.lowercase.len and data.lowercase[lo].cp == cp) data.lowercase[lo].values else null;
+}
+
+fn exerciseBertNormalization(allocator: std.mem.Allocator) !void {
+    const cases = [_]struct { profile: Bert = .{}, text: []const u8, expected: []const u8 }{
+        .{ .text = "CAFÉ cafe\u{301} 世界!", .expected = "cafe cafe 世界!" },
+        .{ .text = "İΣẮ が ば ぱ", .expected = "iσa か は は" },
+        .{ .text = "a\x00b\u{200d}c\u{a0}d\u{fffd}", .expected = "abc d" },
+        .{ .profile = .{ .strip_accents = false }, .text = "CAFÉ", .expected = "café" },
+        .{ .profile = .{ .lowercase = false }, .text = "CAFÉ", .expected = "CAFE" },
+        .{ .profile = .{ .clean_text = false }, .text = "a\x00b\u{200d}c", .expected = "a\x00b\u{200d}c" },
+        // Mn includes zero-combining-class marks (variation selectors).
+        .{ .text = "x\u{fe0f}", .expected = "x" },
+        .{ .text = "x\u{1d16d}\u{1d165}", .expected = "x\u{1d165}\u{1d16d}" },
+        .{ .text = "ASCII\ttext\n", .expected = "ascii text " },
+        .{ .text = "a\u{e000}b\u{378}c", .expected = "ab\u{378}c" },
+    };
+    for (cases) |case| {
+        const normalized = try case.profile.normalize(allocator, case.text);
+        defer allocator.free(normalized);
+        try std.testing.expectEqualStrings(case.expected, normalized);
+    }
+}
+
+test "BERT normalization honors Unicode categories and independent configuration" {
+    try exerciseBertNormalization(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseBertNormalization, .{});
+}

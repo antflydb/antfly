@@ -137,6 +137,7 @@ pub const HfTokenizer = struct {
     /// without explicit wrap tokens must not be wrapped with those defaults.
     wrap_specials_explicit: bool,
     do_lowercase: bool,
+    bert_normalizer: ?unicode_normalizer.Bert = null,
     /// BertNormalizer.handle_chinese_chars: pad every Han-ideograph codepoint
     /// with spaces before pre-tokenization, matching HF's `_is_chinese_char`.
     /// Only ever set from a `BertNormalizer` block (not `Lowercase`).
@@ -823,6 +824,23 @@ pub const HfTokenizer = struct {
         // Until normalized alignment tracking is implemented, do not expose
         // offsets from the unnormalized fast path. GLiNER owns its word maps.
         if (self.unigram_normalizer.len != 0 or self.bpe_normalizer.len != 0) return null;
+        if (self.bert_normalizer) |normalizer| {
+            // Existing WordPiece offsets are valid only when normalization
+            // preserves the source bytes apart from ASCII case. Otherwise the
+            // caller must use the exact counting path without invented offsets.
+            const normalized = try normalizer.normalize(allocator, text);
+            defer allocator.free(normalized);
+            if (normalized.len != text.len) return null;
+            for (normalized, text) |actual, original| {
+                const expected = if (normalizer.clean_text and (original == '\t' or original == '\n' or original == '\r'))
+                    ' '
+                else if (normalizer.lowercase)
+                    std.ascii.toLower(original)
+                else
+                    original;
+                if (actual != expected) return null;
+            }
+        }
         if (self.model_type == .word_piece and self.pre_tokenizer_type == .bert) {
             return try self.encodeWordPieceWithOffsets(allocator, text);
         }
@@ -1530,6 +1548,11 @@ pub const HfTokenizer = struct {
                     } else {
                         self.do_lowercase = true;
                     }
+                    self.bert_normalizer = .{
+                        .lowercase = self.do_lowercase,
+                        .strip_accents = if (obj.get("strip_accents")) |v| (if (v == .bool) v.bool else self.do_lowercase) else self.do_lowercase,
+                        .clean_text = if (obj.get("clean_text")) |v| (if (v == .bool) v.bool else true) else true,
+                    };
                     if (obj.get("handle_chinese_chars")) |hcc| {
                         self.handle_chinese_chars = switch (hcc) {
                             .bool => hcc.bool,
@@ -1873,7 +1896,11 @@ pub const HfTokenizer = struct {
         var owned: ?[]u8 = null;
         defer if (owned) |buf| allocator.free(buf);
         var normalized: []const u8 = text;
-        if (self.do_lowercase) {
+        if (self.bert_normalizer) |normalizer| {
+            const value = try normalizer.normalize(allocator, normalized);
+            owned = value;
+            normalized = value;
+        } else if (self.do_lowercase) {
             const lowered = try toLowerAlloc(allocator, normalized);
             owned = lowered;
             normalized = lowered;
@@ -1905,14 +1932,18 @@ pub const HfTokenizer = struct {
         if (self.unigram_normalizer.len != 0)
             return self.encodeNormalizedUnigram(allocator, text, null, ids);
 
-        if (!self.do_lowercase and self.replace_space_with == null) {
+        if (self.bert_normalizer == null and !self.do_lowercase and self.replace_space_with == null) {
             return self.encodeWithAddedTokens(allocator, text, ids);
         }
 
         var owned: ?[]u8 = null;
         defer if (owned) |buf| allocator.free(buf);
         var normalized: []const u8 = text;
-        if (self.do_lowercase) {
+        if (self.bert_normalizer) |normalizer| {
+            const value = try normalizer.normalize(allocator, normalized);
+            owned = value;
+            normalized = value;
+        } else if (self.do_lowercase) {
             const lowered = try toLowerAlloc(allocator, normalized);
             owned = lowered;
             normalized = lowered;
@@ -9911,15 +9942,19 @@ test "real tokenizer.json golden values" {
     const Case = struct { text: []const u8, expected: []const i32 };
     const cases = [_]Case{
         .{ .text = "hello world", .expected = &.{ 7592, 2088 } },
+        // Independent tokenizers==0.22.1, identical checked-in tokenizer.json,
+        // padding/truncation disabled and add_special_tokens=false.
+        .{ .text = "Café 世界!", .expected = &.{ 7668, 1745, 100, 999 } },
+        .{ .text = "CAFÉ cafe\u{301} 世界!", .expected = &.{ 7668, 7668, 1745, 100, 999 } },
+        .{ .text = "İΣẮ が ば ぱ", .expected = &.{ 1045, 29733, 2050, 1651, 1672, 1672 } },
+        .{ .text = "a\x00b\u{200d}c\u{a0}d", .expected = &.{ 5925, 1040 } },
+        .{ .text = "Antfly maintains counterrevolutionary representations. Café 世界! ", .expected = &.{ 14405, 14151, 9319, 4675, 2890, 6767, 7630, 3508, 5649, 15066, 1012, 7668, 1745, 100, 999 } },
+        .{ .text = "Antfly maintains counterrevolutionary representations. Plain text! ", .expected = &.{ 14405, 14151, 9319, 4675, 2890, 6767, 7630, 3508, 5649, 15066, 1012, 5810, 3793, 999 } },
         .{ .text = "testing", .expected = &.{5604} },
         .{ .text = "machine learning", .expected = &.{ 3698, 4083 } },
         .{ .text = "The quick brown fox jumps over the lazy dog.", .expected = &.{ 1996, 4248, 2829, 4419, 14523, 2058, 1996, 13971, 3899, 1012 } },
         // #933: unspaced Japanese sentence — was 1 token (whole sentence as
         // one [UNK]); reference (HF `tokenizers`, same tokenizer.json) is 16.
-        // (Picked a sentence with no voiced/handakuten kana: those normalize
-        // through BertNormalizer's accent-stripping step, which is a
-        // separate, not-yet-implemented gap — see the NFD/strip_accents note
-        // in the patch plan's Risks section.)
         .{
             .text = "私は毎日日本語を勉強しています。",
             .expected = &.{ 100, 1672, 100, 1864, 1864, 1876, 1950, 1690, 100, 100, 1657, 30191, 30173, 30203, 30184, 1636 },
@@ -9947,6 +9982,10 @@ test "real tokenizer.json golden values" {
         for (tc.expected, 0..) |expected_id, i| {
             try std.testing.expectEqual(expected_id, ids[i]);
         }
+        var reused = std.ArrayListUnmanaged(i32).empty;
+        defer reused.deinit(allocator);
+        try tok.encodeInto(allocator, tc.text, &reused);
+        try std.testing.expectEqualSlices(i32, tc.expected, reused.items);
     }
 
     const special = tok.getSpecialTokens();

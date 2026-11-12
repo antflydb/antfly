@@ -4440,11 +4440,16 @@ test "public api integration supports hybrid query pruner and reranker" {
     var rounds: usize = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
 
+    var graph_index = try client.createTableIndex(base_uri, "docs", "knowledge",
+        \\{"type":"graph","edge_types":[{"name":"link","field":"links"}]}
+    );
+    defer graph_index.deinit(std.testing.allocator);
+
     const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
         \\{"inserts":{
-        \\  "doc:a":{"title":"alpha","body":"alpha body"},
-        \\  "doc:b":{"title":"beta","body":"beta body"},
-        \\  "doc:c":{"title":"plain","body":"body body"}
+        \\  "doc:a":{"title":"alpha","body":"alpha body","links":["evidence:a"]},
+        \\  "doc:b":{"title":"beta","body":"beta body","links":["evidence:b"]},
+        \\  "doc:c":{"title":"plain","body":"body body","links":["evidence:c"]}
         \\}}
     );
     defer std.testing.allocator.free(batch_body);
@@ -4472,6 +4477,37 @@ test "public api integration supports hybrid query pruner and reranker" {
     const hybrid_reranker = hybrid_profile.get("reranker").?.object;
     try std.testing.expectEqualStrings("cross-encoder/ms-marco-MiniLM-L-6-v2", hybrid_reranker.get("model").?.string);
     for (hits) |hit| try std.testing.expect(!std.mem.eql(u8, hit._id, "doc:c"));
+    // The public single-range coordinator must resolve the limited start set
+    // after reranking, with the same identity as an explicit winning root.
+    const cases = [_]struct { rerank: bool, explicit: bool }{
+        .{ .rerank = false, .explicit = false },
+        .{ .rerank = true, .explicit = false },
+        .{ .rerank = true, .explicit = true },
+        .{ .rerank = true, .explicit = false },
+    };
+    for (cases) |case| {
+        const reranker = if (case.rerank) try std.fmt.allocPrint(std.testing.allocator,
+            \\,"reranker":{{"provider":"antfly","model":"cross-encoder/ms-marco-MiniLM-L-6-v2","url":{f},"field":"body","candidate_count":3,"top_n":2}}
+        , .{std.json.fmt(antfly_base_uri, .{})}) else try std.testing.allocator.dupe(u8, "");
+        defer std.testing.allocator.free(reranker);
+        const query = try std.fmt.allocPrint(std.testing.allocator,
+            \\{{"full_text_search":{{"match":{{"field":"body","text":"body"}}}},"graph_queries":{{"neighbors":{{"index":"knowledge","traverse":{{"start":{s},"edge_types":["link"],"direction":"out","max_depth":1}}}}}},"limit":3{s}}}
+        , .{ if (case.explicit) "{\"keys\":[\"doc:b\"]}" else "{\"result_ref\":\"$query_results\",\"limit\":1}", reranker });
+        defer std.testing.allocator.free(query);
+        var response = try client.fetchQuery(base_uri, "docs", query);
+        defer response.deinit(std.testing.allocator);
+        var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, response.body, .{});
+        defer parsed.deinit();
+        const cell = parsed.value.responses.?[0];
+        const winner = cell.hits.?.hits.?[0]._id;
+        if (case.rerank) try std.testing.expectEqualStrings("doc:b", winner);
+        if (!case.rerank) try std.testing.expect(!std.mem.eql(u8, "doc:b", winner));
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "evidence:{s}", .{winner[4..]});
+        defer std.testing.allocator.free(expected);
+        const neighbors = cell.graph_results.?.map.get("neighbors").?.graph_nodes_result.nodes;
+        try std.testing.expectEqual(@as(usize, 1), neighbors.len);
+        try std.testing.expectEqualStrings(expected, neighbors[0].key);
+    }
 }
 
 test "public api integration supports retrieval agent pipeline queries" {

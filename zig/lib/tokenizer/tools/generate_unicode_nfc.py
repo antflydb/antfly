@@ -69,7 +69,34 @@ lines += [
     f"    .{{ .pair = 0x{pair:x}, .cp = 0x{cp:x} }},"
     for pair, cp in sorted(compositions)
 ]
-lines += ["};", ""]
+lines += [
+    "};",
+    "pub const Lowercase = struct { cp: u21, values: []const u21 };",
+    "pub const lowercase = [_]Lowercase{",
+]
+for cp in range(0x110000):
+    lowered = chr(cp).lower()
+    if lowered != chr(cp):
+        values = ", ".join(f"0x{ord(ch):x}" for ch in lowered)
+        array = f"&.{{{values}}}" if len(lowered) == 1 else f"&.{{ {values} }}"
+        lines.append(f"    .{{ .cp = 0x{cp:x}, .values = {array} }},")
+lines += ["};", "pub const Range = struct { first: u21, last: u21 };"]
+for name, categories in [
+    ("nonspacing_marks", {"Mn"}),
+    ("controls", {"Cc", "Cf", "Co", "Cs"}),
+    ("spaces", {"Zs"}),
+]:
+    lines.append(f"pub const {name} = [_]Range{{")
+    start = None
+    for cp in range(0x110001):
+        included = cp < 0x110000 and ud.category(chr(cp)) in categories
+        if included and start is None:
+            start = cp
+        elif not included and start is not None:
+            lines.append(f"    .{{ .first = 0x{start:x}, .last = 0x{cp - 1:x} }},")
+            start = None
+    lines.append("};")
+lines.append("")
 output = Path(__file__).resolve().parents[1] / "src" / "unicode_nfc_data.zig"
 data = (unicode_source_header(__file__) + "\n".join(lines)).encode()
 output.write_bytes(data)

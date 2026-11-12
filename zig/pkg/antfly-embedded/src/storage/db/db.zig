@@ -95733,6 +95733,12 @@ test "db dense repair reprocesses corrupt managed source before rebuilding" {
 }
 
 test "db dense enrichment skips unchanged multimodal parts" {
+    try testDensePartsHashReuse(.write);
+    try testDensePartsHashReuse(.enrichments);
+    try testDensePartsHashReuse(.full_index);
+}
+
+fn testDensePartsHashReuse(sync_level: types.SyncLevel) !void {
     const alloc = std.testing.allocator;
     const Probe = struct {
         calls: usize = 0,
@@ -95752,25 +95758,25 @@ test "db dense enrichment skips unchanged multimodal parts" {
     defer db.close();
     try db.addIndex(.{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{body}}\"}}" });
 
-    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"same source\"}" }}, .sync_level = .write });
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"same source\"}" }}, .sync_level = sync_level });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
 
-    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"same source\"}" }}, .sync_level = .write });
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"same source\"}" }}, .sync_level = sync_level });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
 
-    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"new source\"}" }}, .sync_level = .write });
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"new source\"}" }}, .sync_level = sync_level });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 2), probe.calls);
 }
 
 test "db dense enrichment skips unchanged source hash" {
-    try testDenseSourceHashReuse(.{});
+    try testDenseSourceHashReuse(.{}, .write);
 }
 
 test "source vector table reuses unchanged enrichment source hash" {
-    try testDenseSourceHashReuse(.{ .dense_embeddings = .vector_store });
+    try testDenseSourceHashReuse(.{ .dense_embeddings = .vector_store }, .write);
 }
 
 test "source vector table rejects delayed enrichment after source update deletion or recreation" {
@@ -95873,7 +95879,13 @@ test "source vector table rejects delayed enrichment after source update deletio
     }
 }
 
-fn testDenseSourceHashReuse(settings: table_storage_mod.Settings) !void {
+test "db full_index reuses unchanged embedding input across metadata updates" {
+    try testDenseSourceHashReuse(.{}, .enrichments);
+    try testDenseSourceHashReuse(.{}, .full_index);
+    try testDenseSourceHashReuse(.{ .dense_embeddings = .vector_store }, .full_index);
+}
+
+fn testDenseSourceHashReuse(settings: table_storage_mod.Settings, sync_level: types.SyncLevel) !void {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -95899,7 +95911,7 @@ fn testDenseSourceHashReuse(settings: table_storage_mod.Settings) !void {
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"same source\"}" }},
-        .sync_level = .write,
+        .sync_level = sync_level,
     });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
@@ -95916,14 +95928,14 @@ fn testDenseSourceHashReuse(settings: table_storage_mod.Settings) !void {
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"same source\"}" }},
-        .sync_level = .write,
+        .sync_level = sync_level,
     });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"new source\"}" }},
-        .sync_level = .write,
+        .sync_level = sync_level,
     });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 2), counting.calls);
@@ -95937,9 +95949,9 @@ fn testDenseSourceHashReuse(settings: table_storage_mod.Settings) !void {
 
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
-    try std.testing.expectEqual(@as(u64, 1), stats.enrichment.skip_by_hash_count);
+    if (sync_level == .write) try std.testing.expectEqual(@as(u64, 1), stats.enrichment.skip_by_hash_count);
     try std.testing.expectEqual(@as(u64, 0), stats.enrichment.codec_decode_failures);
-    try std.testing.expect(stats.enrichment.dense_artifact_bytes_written >= @as(u64, @intCast(artifacts[0].value.len * 2)));
+    if (sync_level == .write) try std.testing.expect(stats.enrichment.dense_artifact_bytes_written >= @as(u64, @intCast(artifacts[0].value.len * 2)));
     try std.testing.expectEqual(stats.enrichment.dense_artifact_bytes_written, stats.enrichment.artifact_bytes_written);
 }
 
@@ -96903,6 +96915,12 @@ test "db generated enrichment recovery skips empty fields and advances coverage 
 }
 
 test "db sparse enrichment skips unchanged source hash" {
+    try testSparseSourceHashReuse(.write);
+    try testSparseSourceHashReuse(.enrichments);
+    try testSparseSourceHashReuse(.full_index);
+}
+
+fn testSparseSourceHashReuse(sync_level: types.SyncLevel) !void {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -96928,21 +96946,21 @@ test "db sparse enrichment skips unchanged source hash" {
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"same source\"}" }},
-        .sync_level = .write,
+        .sync_level = sync_level,
     });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"same source\"}" }},
-        .sync_level = .write,
+        .sync_level = sync_level,
     });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 1), counting.calls);
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"changed\",\"body\":\"new source\"}" }},
-        .sync_level = .write,
+        .sync_level = sync_level,
     });
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 2), counting.calls);
@@ -96956,9 +96974,9 @@ test "db sparse enrichment skips unchanged source hash" {
 
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
-    try std.testing.expectEqual(@as(u64, 1), stats.enrichment.skip_by_hash_count);
+    if (sync_level == .write) try std.testing.expectEqual(@as(u64, 1), stats.enrichment.skip_by_hash_count);
     try std.testing.expectEqual(@as(u64, 0), stats.enrichment.codec_decode_failures);
-    try std.testing.expect(stats.enrichment.sparse_artifact_bytes_written >= @as(u64, @intCast(artifacts[0].value.len * 2)));
+    if (sync_level == .write) try std.testing.expect(stats.enrichment.sparse_artifact_bytes_written >= @as(u64, @intCast(artifacts[0].value.len * 2)));
     try std.testing.expectEqual(stats.enrichment.sparse_artifact_bytes_written, stats.enrichment.artifact_bytes_written);
 }
 
@@ -99287,6 +99305,12 @@ test "db terminal enrichment markers do not resurrect across rollback recreation
 }
 
 test "db templated dense artifact reuse follows the resolved model revision" {
+    try testDenseRevisionReuse(.write);
+    try testDenseRevisionReuse(.enrichments);
+    try testDenseRevisionReuse(.full_index);
+}
+
+fn testDenseRevisionReuse(sync_level: types.SyncLevel) !void {
     const a = std.testing.allocator;
     const Probe = struct {
         revision: u8 = 1,
@@ -99294,11 +99318,15 @@ test "db templated dense artifact reuse follows the resolved model revision" {
         fn equivalent(_: *anyopaque, _: []const u8) bool {
             return true;
         }
-        fn single(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
-            return error.UnexpectedSingle;
+        fn single(ptr: *anyopaque, allocator: Allocator, _: []const u8, _: []const u8, dims: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const vector = try allocator.alloc(f32, dims);
+            @memset(vector, @floatFromInt(self.revision));
+            return vector;
         }
-        fn parts(_: *anyopaque, _: Allocator, _: []const u8, _: []const template_mod.ContentPart, _: u32) ![]f32 {
-            return error.UnexpectedParts;
+        fn parts(ptr: *anyopaque, allocator: Allocator, name: []const u8, _: []const template_mod.ContentPart, dims: u32) ![]f32 {
+            return single(ptr, allocator, name, "", dims);
         }
         fn caps(ptr: *anyopaque, _: Allocator, _: []const u8) !@import("antfly_inference_work").InferenceCapabilities {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -99330,7 +99358,7 @@ test "db templated dense artifact reuse follows the resolved model revision" {
         if (version == 2) probe.revision = 2;
         const raw = try std.fmt.allocPrint(a, "{{\"body\":\"same passage\",\"version\":{d}}}", .{version});
         defer a.free(raw);
-        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = raw }}, .sync_level = .write });
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = raw }}, .sync_level = sync_level });
         try db.runUntilIdle();
         try std.testing.expectEqual(@as(usize, if (version == 2) 2 else 1), probe.calls);
     }

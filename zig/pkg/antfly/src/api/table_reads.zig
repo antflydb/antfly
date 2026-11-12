@@ -5143,6 +5143,21 @@ pub const ProvisionedTableReadSource = struct {
             }
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
+            var meta: query_api.QueryResponseMeta = .{
+                .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
+                .shard_count = logical_shard_count,
+                .merged = true,
+            };
+            defer meta.deinit(alloc);
+            // Resolve $query_results from the final ranked and pruned page.
+            try applyQueryPostProcessing(
+                alloc,
+                graph_req,
+                &merged,
+                &meta,
+                routed.managedReadRuntimeConfig().forTable(table_name),
+            );
+
             // Distributed graph execution can cross table boundaries. Do not
             // retain the source table's admission while acquiring a target
             // table: opposing A -> B and B -> A traversals can otherwise form
@@ -5170,12 +5185,6 @@ pub const ProvisionedTableReadSource = struct {
             // completed, preserving the single-table-at-a-time invariant.
             try routed.reacquirePinnedSpanRead(alloc, table_name, readPreparationKindForQuery(req), &prepared);
 
-            var meta: query_api.QueryResponseMeta = .{
-                .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
-                .shard_count = logical_shard_count,
-                .merged = true,
-            };
-            defer meta.deinit(alloc);
             applyProvisionedQueryAggregations(routed, alloc, group_ids, table_name, graph_req, &merged, &meta, null, null, .stale) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     prepared.releaseActivity();
@@ -5185,13 +5194,7 @@ pub const ProvisionedTableReadSource = struct {
                 else => return err,
             };
             try checkQueryDeadline(graph_req);
-            try applyQueryPostProcessing(
-                alloc,
-                graph_req,
-                &merged,
-                &meta,
-                routed.managedReadRuntimeConfig().forTable(table_name),
-            );
+            meta.took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms));
             return try query_api.encodeQueryResponsesWithDelivery(alloc, table_name, graph_req, meta, merged, delivery);
         }
         const collection_req = aggregationOnlyCollectionRequest(req);
@@ -7759,6 +7762,15 @@ pub const HostedProvisionedTableReadSource = struct {
             }
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
+            var meta: query_api.QueryResponseMeta = .{
+                .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
+                .shard_count = logical_shard_count,
+                .merged = true,
+            };
+            defer meta.deinit(alloc);
+            // Resolve $query_results from the final ranked and pruned page.
+            try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
+
             const worker = hostedGraphWorker(self);
             const graph_results = distributed_graph.executeCrossRangeWithMatchAnchors(
                 alloc,
@@ -7772,15 +7784,9 @@ pub const HostedProvisionedTableReadSource = struct {
             ) catch |err| return normalizeDistributedQueryOperationalError(err);
             merged.graph_results = graph_results;
 
-            var meta: query_api.QueryResponseMeta = .{
-                .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
-                .shard_count = logical_shard_count,
-                .merged = true,
-            };
-            defer meta.deinit(alloc);
             try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, null, null, consistency);
             try checkQueryDeadline(graph_req);
-            try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
+            meta.took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms));
             return try query_api.encodeQueryResponsesWithDelivery(alloc, table_name, graph_req, meta, merged, delivery);
         }
         const collection_req = aggregationOnlyCollectionRequest(req);
@@ -33155,6 +33161,248 @@ fn implementationTests() type {
 
             try std.testing.expect(std.mem.indexOf(u8, incoming_response.json, "\"doc:a\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, incoming_response.json, "\"zdoc:a\"") != null);
+        }
+
+        test "hosted cross-range graph start set follows final reranking" {
+            const alloc = std.testing.allocator;
+            var path_tmp = try TestDirectory.init("antfly-api-hosted-cross-range-graph-rerank");
+            defer path_tmp.cleanup();
+            const path = path_tmp.path();
+
+            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            defer io_impl.deinit();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+            defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+            const left_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
+            defer alloc.free(left_path);
+            const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7002);
+            defer alloc.free(right_path);
+
+            const graph_indexes_json =
+                \\{"full_text_index_v0":{"type":"full_text"},"relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}]}}
+            ;
+            const graph_config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}";
+            const graph_coverage_generation = internal_keys.derivedCoverageGeneration(graph_config_json);
+
+            {
+                var left_db = try db_mod.DB.open(alloc, left_path, .{
+                    .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+                });
+                defer left_db.close();
+                try left_db.addIndex(.{
+                    .name = "relations_graph",
+                    .kind = .graph,
+                    .config_json = graph_config_json,
+                    .coverage_generation = graph_coverage_generation,
+                });
+                try left_db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+                try left_db.batch(.{
+                    .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"left\"}" }},
+                    .graph_writes = &.{.{
+                        .index_name = "relations_graph",
+                        .source = "doc:a",
+                        .target = "evidence:left",
+                        .edge_type = "mentions",
+                    }},
+                    .sync_level = .full_index,
+                });
+            }
+
+            {
+                var right_db = try db_mod.DB.open(alloc, right_path, .{
+                    .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 },
+                });
+                defer right_db.close();
+                try right_db.addIndex(.{
+                    .name = "relations_graph",
+                    .kind = .graph,
+                    .config_json = graph_config_json,
+                    .coverage_generation = graph_coverage_generation,
+                });
+                try right_db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+                try right_db.batch(.{
+                    .writes = &.{.{ .key = "zdoc:a", .value = "{\"title\":\"right\"}" }},
+                    .graph_writes = &.{.{
+                        .index_name = "relations_graph",
+                        .source = "zdoc:a",
+                        .target = "evidence:right",
+                        .edge_type = "mentions",
+                    }},
+                    .sync_level = .full_index,
+                });
+            }
+
+            const FakeCatalog = struct {
+                const statuses = [_]metadata_reconciler.MergedGroupStatus{
+                    .{
+                        .group_id = 7001,
+                        .doc_identity = .{
+                            .namespace_table_id = 7,
+                            .namespace_shard_id = 7001,
+                            .namespace_range_id = 7001,
+                            .next_ordinal = 3,
+                            .allocated_ordinals = 2,
+                            .state_rows = 2,
+                            .live_ordinals = 2,
+                            .complete = true,
+                        },
+                    },
+                    .{
+                        .group_id = 7002,
+                        .doc_identity = .{
+                            .namespace_table_id = 7,
+                            .namespace_shard_id = 7002,
+                            .namespace_range_id = 7002,
+                            .next_ordinal = 2,
+                            .allocated_ordinals = 1,
+                            .state_rows = 1,
+                            .live_ordinals = 1,
+                            .complete = true,
+                        },
+                    },
+                };
+
+                fn iface() table_catalog.CatalogSource {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .admin_snapshot = adminSnapshot,
+                            .free_admin_snapshot = freeAdminSnapshot,
+                            .routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).routingSnapshot,
+                            .linearizable_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).linearizableSnapshot,
+                            .free_routing_snapshot = table_catalog.TestAdminRoutingAdapter(adminSnapshot, freeAdminSnapshot).freeRoutingSnapshot,
+                        },
+                    };
+                }
+
+                fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return .{
+                        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                            .table_id = 7,
+                            .name = "docs",
+                            .placement_role = "data",
+                            .indexes_json = graph_indexes_json,
+                        }})[0..]),
+                        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                            .{ .group_id = 7001, .table_id = 7, .range_id = 7001, .start_key = "", .end_key = "m" },
+                            .{ .group_id = 7002, .table_id = 7, .range_id = 7002, .start_key = "m", .end_key = null },
+                        })[0..]),
+                        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                        .merged_group_statuses = @constCast(statuses[0..]),
+                    };
+                }
+
+                fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+
+            const FakeRouter = struct {
+                fn iface() table_router.HostedGroupRouter {
+                    return .{
+                        .ptr = undefined,
+                        .vtable = &.{
+                            .local_node_id = localNodeId,
+                            .local_status = localStatus,
+                            .group_leader_node_id = groupLeaderNodeId,
+                            .node_status = nodeStatus,
+                            .node_base_uri = nodeBaseUri,
+                        },
+                    };
+                }
+
+                fn localNodeId(_: *anyopaque) u64 {
+                    return 1;
+                }
+
+                fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+                    return .active;
+                }
+
+                fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+                    return 1;
+                }
+
+                fn nodeStatus(_: *anyopaque, _: u64, _: u64) raft_mod.HostedReplicaStatus {
+                    return .absent;
+                }
+
+                fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+                    return null;
+                }
+            };
+
+            const ExecutorState = struct {
+                fn iface(self: *@This()) http_common.RequestExecutor {
+                    return .{
+                        .ptr = self,
+                        .vtable = &.{ .execute = execute },
+                    };
+                }
+
+                fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+                    return error.UnexpectedHttpRequest;
+                }
+            };
+
+            var executor_state = ExecutorState{};
+            var hosted = HostedProvisionedTableReadSource.init(
+                path,
+                FakeCatalog.iface(),
+                raft_mod.read_gate.alreadyReadSafeBarrier(),
+                FakeRouter.iface(),
+                executor_state.iface(),
+            );
+            _ = hosted.withIo(&io_impl);
+
+            const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+                .name = "neighbors",
+                .query = .{
+                    .query_type = .traverse,
+                    .index_name = "relations_graph",
+                    .start_nodes = .{ .result_ref = .{ .ref = "$query_results", .limit = 1 } },
+                    .params = .{ .edge_types = &.{"mentions"}, .direction = .out, .max_results = 10 },
+                },
+            }};
+            var ts = try httpx.TestServer.start(alloc, io_impl.io(), &.{
+                .{ .method = .GET, .path = "/ai/v1/models", .respond = .{ .body = "{\"rerankers\":{\"test-model\":{}}}" } },
+                .{ .method = .POST, .path = "/rerank", .respond = .{ .body = "{\"scores\":[0.1,0.9]}" } },
+            });
+            defer ts.deinit();
+            const Serve = struct {
+                fn run(server: *httpx.TestServer) !void {
+                    for (0..2) |_| try server.handleOne();
+                }
+            };
+            var serving = try io_impl.io().concurrent(Serve.run, .{&ts});
+            defer _ = serving.cancel(io_impl.io()) catch {};
+            var response = (try hosted.source().query(alloc, "docs", .{
+                .query = .{ .doc_id = .{ .ids = &.{ "doc:a", "zdoc:a" } } },
+                .limit = 2,
+                .reranker = .{ .provider = .antfly, .model = "test-model", .field = "title", .url = ts.baseUrl() },
+                .reranker_query_text = "right",
+                .graph_queries = &graph_queries,
+                .graph_query_transport = .{
+                    .dialect = .canonical,
+                    .operations_json =
+                    \\{"neighbors":{"index":"relations_graph","traverse":{"start":{"result_ref":"$query_results","limit":1},"edge_types":["mentions"],"direction":"out","max_depth":1}}}
+                    ,
+                    .admitted_operations_ptr = @ptrCast(graph_queries[0..].ptr),
+                    .admitted_operations_len = graph_queries.len,
+                },
+            }, .read_index)).?;
+            defer response.deinit(alloc);
+            var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryResponses, alloc, response.json, .{});
+            defer parsed.deinit();
+            const cell = parsed.value.responses.?[0];
+            try std.testing.expectEqualStrings("zdoc:a", cell.hits.?.hits.?[0]._id);
+            const neighbors = cell.graph_results.?.map.get("neighbors").?.graph_nodes_result.nodes;
+            try std.testing.expectEqual(@as(usize, 1), neighbors.len);
+            try std.testing.expectEqualStrings("evidence:right", neighbors[0].key);
+            try serving.await(io_impl.io());
         }
 
         test "provisioned read cache keys entries by lsm root generation" {

@@ -18513,6 +18513,10 @@ pub const HBCIndex = struct {
         persisted_admission: ?vectorindex_quantized_directory.AdmissionStats,
     ) u64 {
         if (active_count == 0) return 0;
+        if (vectorindex_search_types.requiresExhaustiveCoverage(req)) {
+            const eligible = if (req.filter_ids.len != 0) @min(active_count, req.filter_ids.len) else active_count;
+            return @max(eligible *| @as(u64, self.config.dims) *| @sizeOf(f32), 1);
+        }
         const search_width: u64 = @intCast(req.search_width orelse self.config.search_width);
         const branching_factor: u64 = @intCast(@max(self.config.branching_factor, 2));
         // A bulk-built high-fanout tree has approximately one internal node
@@ -18783,6 +18787,15 @@ pub const HBCIndex = struct {
         const generation = experimentalPostingGenerationFromTxn(txn) orelse
             return error.PostingWalMutationStoreUnavailable;
         if (lease.generation_identity != generation) return error.StalePublishedSnapshot;
+        if (vectorindex_search_types.requiresExhaustiveCoverage(req)) {
+            // Exact scoring loads authoritative f32 vectors, not just codes.
+            // Reserve the full scan once rather than upgrading every posting.
+            if (lease.scan_credit_bytes == 0) {
+                lease.selected_scan_bytes = lease.estimated_scan_bytes;
+                try self.reserveSelectedScanBandwidth(lease, lease.estimated_scan_bytes, req);
+            }
+            return;
+        }
         lease.selected_scan_bytes +|= try selectedLeafScanBytes(generation, probe, requestNeedsProjectionScan(req), lease);
         if (lease.selected_scan_bytes <= lease.scan_credit_bytes) return;
         var target = @max(lease.selected_scan_bytes, lease.scan_credit_bytes *| 2);
@@ -18816,7 +18829,7 @@ pub const HBCIndex = struct {
     /// accounted scratch, but never queue for reranking with a scan permit.
     pub fn finishCandidateScan(self: *HBCIndex, lease: *SearchAdmissionLease, req: SearchRequest) !void {
         const manager = self.resource_manager orelse return;
-        if (manager.dense_scan_prediction and lease.progressive_tree_bandwidth) {
+        if (manager.dense_scan_prediction and lease.progressive_tree_bandwidth and !vectorindex_search_types.requiresExhaustiveCoverage(req)) {
             if (lease.generation_identity) |identity| {
                 const generation = @constCast(identity);
                 const predictor = &generation.scan_prediction[@intFromBool(requestNeedsProjectionScan(req))];
@@ -18899,6 +18912,7 @@ pub const HBCIndex = struct {
         } else {
             selected_bytes = @max(selected_bytes, 1);
         }
+        if (vectorindex_search_types.requiresExhaustiveCoverage(req)) selected_bytes = @max(selected_bytes, lease.estimated_scan_bytes);
         lease.selected_scan_bytes = selected_bytes;
         try self.reserveSelectedScanBandwidth(lease, selected_bytes, req);
         lease.deferred_flat_bandwidth = false;
@@ -23779,6 +23793,11 @@ test "hbc search charges estimated quantized scan bytes to node admission" {
     try std.testing.expectEqual(@as(u64, 1), stats.peak_active_queries);
     try std.testing.expectEqual(@as(u64, 0), stats.active_queries);
 
+    var complete = try idx.searchWithRequest(.{ .query = &first, .k = 1, .search_effort = 1 });
+    defer complete.deinit();
+    try std.testing.expectEqual(@as(u64, 256), resource_manager.denseSearchAdmissionStats().peak_active_bytes);
+    try std.testing.expectEqual(@as(u64, 0), resource_manager.denseSearchAdmissionStats().active_queries);
+
     // A real oversized posting immediately raises subsequent admission. The
     // estimate uses the observed posting high-water rather than assuming this
     // synthetic tree is balanced from only its aggregate node count.
@@ -23793,8 +23812,8 @@ test "hbc search charges estimated quantized scan bytes to node admission" {
         .k = 1,
         .search_width = 2,
     });
+    defer idx.releaseSearchAdmission(&skew_lease);
     try std.testing.expectEqual(@as(u64, 112), skew_lease.bandwidth.bytes);
-    idx.releaseSearchAdmission(&skew_lease);
 }
 
 test "missing optional projections preserve immutable scan admission and shadow fallback" {
@@ -36117,4 +36136,85 @@ test "external lake bounded WAL native dense construction cancels within a mutat
     try std.testing.expect(probe.checks >= 4);
     try std.testing.expectError(error.Canceled, index.publishExperimentalPostingCheckpoint(0));
     try std.testing.expectError(error.Canceled, index.finalizeExperimentalPostingGenerationAtAppliedSequence(0, .{}));
+}
+
+test "full effort filtered recall matches eligible cosine oracle across dimensions and selectivity" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    const count = 2048;
+    const Scored = struct {
+        id: u64,
+        distance: f64,
+        fn less(_: void, a: @This(), b: @This()) bool {
+            return a.distance < b.distance;
+        }
+        fn distanceTo(a: []const f32, b: []const f32) f64 {
+            var dot: f64 = 0;
+            for (a, b) |x, y| dot += @as(f64, x) * @as(f64, y);
+            return 1 - dot;
+        }
+    };
+    for ([_]HBCConfig.CentroidDirectoryMode{ .hbc, .flat_exact, .flat_rabitq }) |directory_mode| {
+        for ([_]usize{ 8, 384 }) |dims| {
+            var tp: TestPath = .{};
+            const path = tp.init();
+            defer tp.cleanup();
+            var idx = try HBCIndex.open(alloc, path, .{
+                .dims = @intCast(dims),
+                .metric = .cosine,
+                .centroid_directory_mode = directory_mode,
+                .leaf_size = 16,
+                .branching_factor = 4,
+                .search_width = 2,
+                .use_quantization = true,
+                .rerank_policy = .boundary,
+            });
+            defer idx.close();
+            var prng = std.Random.DefaultPrng.init(126);
+            const random = prng.random();
+            const vectors = try alloc.alloc(f32, (count + 5) * dims);
+            defer alloc.free(vectors);
+            const items = try alloc.alloc(BatchInsertItem, count);
+            defer alloc.free(items);
+            for (0..count + 5) |i| {
+                const vector = vectors[i * dims ..][0..dims];
+                var norm: f64 = 0;
+                for (vector) |*value| {
+                    // Box-Muller gives seeded Gaussian directions.
+                    value.* = @sqrt(-2 * @log(@max(random.float(f32), 0.000001))) * @cos(2 * std.math.pi * random.float(f32));
+                    norm += @as(f64, value.*) * value.*;
+                }
+                for (vector) |*value| value.* /= @floatCast(@sqrt(norm));
+                if (i < count) items[i] = .{ .vector_id = @intCast(i + 1), .vector = vector };
+            }
+            try idx.bulkBuildWithMetadata(items);
+            const ordering = try alloc.alloc(Scored, count);
+            defer alloc.free(ordering);
+            const eligible = try alloc.alloc(u64, count);
+            defer alloc.free(eligible);
+            const oracle = try alloc.alloc(Scored, count);
+            defer alloc.free(oracle);
+            for ([_]bool{ false, true }) |correlated| {
+                const anchor = vectors[count * dims ..][0..dims];
+                for (ordering, 0..) |*entry, i| entry.* = .{ .id = @intCast(i + 1), .distance = Scored.distanceTo(anchor, items[i].vector) };
+                if (correlated) std.mem.sort(Scored, ordering, {}, Scored.less) else random.shuffle(Scored, ordering);
+                for ([_]usize{ 2, 10, 100, 1000 }) |divisor| {
+                    const eligible_count = count / divisor;
+                    for (eligible[0..eligible_count], ordering[0..eligible_count]) |*id, entry| id.* = entry.id;
+                    std.mem.sort(u64, eligible[0..eligible_count], {}, std.sort.asc(u64));
+                    for (1..5) |q| {
+                        const query = vectors[(count + q) * dims ..][0..dims];
+                        for (oracle[0..eligible_count], eligible[0..eligible_count]) |*entry, id| entry.* = .{ .id = id, .distance = Scored.distanceTo(query, items[@intCast(id - 1)].vector) };
+                        std.mem.sort(Scored, oracle[0..eligible_count], {}, Scored.less);
+                        var result = try idx.searchWithRequest(.{ .query = query, .k = 10, .search_effort = 1, .filter_ids = eligible[0..eligible_count], .load_metadata = false });
+                        defer result.deinit();
+                        const hits = result.getHits();
+                        try std.testing.expectEqual(@min(@as(usize, 10), eligible_count), hits.len);
+                        for (hits, oracle[0..hits.len]) |hit, expected| try std.testing.expectEqual(expected.id, hit.vector_id);
+                    }
+                }
+            }
+        }
+    }
 }

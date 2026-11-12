@@ -277,6 +277,46 @@ npx skills add antflydb/antfly-skills
 
 Then prompt it with the outcome, for example "Create an artifact-backed embeddings index over my docs table that unions document-level and chunk-level vectors", and use this page to judge the result.
 
+## Producer changes, freshness, and model upgrades
+
+A named producer definition selects how subsequent work executes. Replacing its
+model or revision does not, by itself, request table-wide reprocessing of every
+existing descendant artifact. A metadata-only document update can reuse an
+embedding when its effective input, producer configuration, resolved revision,
+and reprocess generation still match. This reuse also applies to synchronous
+`enrichments` and `full_index` writes.
+
+For an in-place producer upgrade, replace the producer with an immutable model
+revision and explicitly request table-wide reprocessing with
+`POST /db/v1/tables/{table}/artifacts/{artifact}/reprocess`. Follow the returned
+continuations until `reprocess_status` is `complete`; inspect failures and the
+consumer index's readiness before using the new space. A successful request
+that starts a bounded pass is not proof that the whole table has migrated.
+Source updates, deletions, and producer generations fence delayed work at
+publication, so a late response must pass the current source and producer guards.
+
+`publication_policy: "atomic"` controls validation and activation of a new index
+generation. It does not make arbitrary producer mapping edits a transaction
+across every document or shard. To keep a serving application on one model space
+throughout an upgrade, create a separately named producer, artifact, and index
+for the new revision, wait for that index's readiness, then switch query routing
+and the query embedder together. Keep the old resources until callers have moved.
+This also provides an explicit rollback target.
+
+An asynchronous source write can be acknowledged while its previous published
+vector is still queryable. Aggregate `coverage.complete` describes processing
+progress; it is not a promise that each result reflects the latest acknowledged
+source version. Use `sync_level: "full_index"` when the write response must wait
+for indexed visibility. `sync_level: "enrichments"` already supports computing
+configured enrichments before the source commits and rejecting the write if a
+synchronous producer fails; it does not wait for every index to publish.
+
+An unpinned provider alias can change its model behind an unchanged endpoint.
+Antfly cannot infer a common vector space from an alias or matching dimensions.
+Use an immutable provider revision and, where supported by the provider, an
+explicit `model_identity` pin that can be verified against its response.
+Changing an alias without an enforceable revision is not a fenced model upgrade.
+
 ## Next Steps
 
 - [Build a Knowledge Graph from Your Docs](/docs/guides/knowledge-graph): an extractor-fed graph index with entity resolution, end to end

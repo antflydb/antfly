@@ -2584,7 +2584,10 @@ fn searchProfiledRequestAttempt(
     var profile = search_types.SearchProfile{};
     const Index = comptime childType(@TypeOf(self));
     defer if (!capture_durable_snapshot and comptime @hasDecl(Index, "observeSearchCacheBenefit")) {
-        self.observeSearchCacheBenefit(&profile);
+        // Full-precision exhaustive scans must not train quantized ANN scan
+        // estimates upward for unrelated subsequent approximate requests.
+        if (!(self.config.use_quantization and search_types.requiresExhaustiveCoverage(req)))
+            self.observeSearchCacheBenefit(&profile);
     };
     const total_start = now_fn_u64();
     try search_types.checkCancelled(req);
@@ -2768,7 +2771,7 @@ fn searchProfiledRequestAttempt(
     const search_width = req.search_width orelse self.config.search_width;
     const epsilon = req.epsilon orelse self.config.epsilon;
     const rerank_factor: usize = req.rerank_factor orelse search_mod.rerankFactor(epsilon);
-    const should_rerank = self.config.use_quantization and self.config.rerank_policy != .never;
+    const should_rerank = !exhaustive_coverage and self.config.use_quantization and self.config.rerank_policy != .never;
     const candidate_limit: usize = if (should_rerank) req.k * rerank_factor else req.k;
     const candidate_capacity: usize = search_mod.candidateCapacity(search_width, self.metadata.branching_factor);
     const root_node_id = published_snapshot.root_node;
@@ -4498,12 +4501,16 @@ fn scoreLeafMemberIds(
     const filters_active = !filter_state.isTrivial() or req.filter_prefix.len > 0 or req.key_predicate != null;
     const NativeIndex = childType(@TypeOf(self));
     const fuse_no_copy = if (comptime @hasDecl(NativeIndex, "nativeFusedNoCopyEnabled")) self.nativeFusedNoCopyEnabled() else false;
-    const direct_no_copy = fuse_no_copy and native_projections == null and
+    // Exhaustive coverage must not lose true neighbors at the bounded
+    // approximate heap. Filter first, then reuse the batched authoritative
+    // scoring path below. Scratch remains bounded by one posting and top-k.
+    const approximate_scoring = coverage_policy != .complete_snapshot;
+    const direct_no_copy = approximate_scoring and fuse_no_copy and native_projections == null and
         !filters_active and req.distance_over == null and req.distance_under == null and
         self.config.use_quantization and leaf_has_fresh_stored_payload and native_quantized != null and
         std.meta.activeTag(native_quantized.?.*) == .rabit;
     const direct_native_scoring = direct_no_copy or if (native_projections) |plane|
-        !filters_active and req.distance_over == null and req.distance_under == null and
+        approximate_scoring and !filters_active and req.distance_over == null and req.distance_under == null and
             self.config.use_quantization and leaf_has_fresh_stored_payload and native_quantized != null and
             std.meta.activeTag(native_quantized.?.*) == .rabit and
             plane.validFor(member_ids.len, @intCast(self.config.dims)) and plane.checksums.len == member_ids.len
@@ -4618,7 +4625,7 @@ fn scoreLeafMemberIds(
     scoring_req.filter_ids = &.{};
     scoring_req.exclude_ids = &.{};
     const empty_filter_state = search_types.RequestFilterState{};
-    if (native_projections) |projection_plane| {
+    if (if (approximate_scoring) native_projections else null) |projection_plane| {
         const dims: usize = @intCast(self.config.dims);
         if (projection_plane.validFor(member_ids.len, dims)) {
             // The immutable leaf already co-locates RaBitQ and float16. Use
@@ -4730,7 +4737,7 @@ fn scoreLeafMemberIds(
             return;
         }
     }
-    if (self.config.use_quantization and leaf_has_fresh_stored_payload) {
+    if (approximate_scoring and self.config.use_quantization and leaf_has_fresh_stored_payload) {
         var loaded_quantized = if (native_quantized == null)
             try loadQuantizedReadHandleProfiledWithCachePolicy(self, txn, leaf_id, leaf_uses_nonquantized_payload, member_ids.len, profile, use_search_cache, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)
         else
