@@ -187,8 +187,8 @@ recorded separately from sampled child scratch.
 Both runners clear inherited bulk/probe flags before applying a case's settings.
 Local-file overrides, compact mode, resume flags and headroom experiments cannot
 silently change a GCS variant. The GCS worker records its explicit probe settings.
-SIGTERM and SIGHUP follow the same cleanup path as timeout/interrupt, signal the owned
-worker group and reaps its leader. Cleanup also signals surviving descendants
+SIGTERM and SIGHUP follow the same cleanup path as timeout/interrupt, signal the
+owned worker group and reap its leader. Cleanup also signals surviving descendants
 when the group leader has already exited and is safe to call repeatedly.
 
 The native probe emits the actual complete Parquet inventory. Qualification

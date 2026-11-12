@@ -3078,7 +3078,7 @@ test "gcs conditional media creates retry ambiguous responses without widening o
         .{ .first_status = 403, .expected = error.AccessDenied, .attempts = 1 },
         .{ .first_status = 503, .retries = 0, .expected = error.RemoteUnavailable, .attempts = 1 },
         .{ .first_status = 503, .second_status = 503, .retries = 1, .expected = error.RemoteUnavailable },
-        .{ .first_status = 503, .timeout_ms = 100, .retry_delay_ms = 1000, .expected = error.Timeout, .attempts = 1 },
+        .{ .first_status = 503, .timeout_ms = 1000, .retry_delay_ms = 10000, .expected = error.Timeout, .attempts = 1 },
         .{ .first_status = 503, .cancel_after_first = true, .retry_delay_ms = 1000, .expected = error.Canceled, .attempts = 1 },
     }) |case| {
         var canceled: std.atomic.Value(bool) = .init(false);
@@ -3125,7 +3125,10 @@ test "gcs conditional media creates retry ambiguous responses without widening o
             defer value.deinit(a);
             try std.testing.expectEqualStrings("42", value.version_id.?);
         }
-        try group.await(io);
+        // A deadline can fire before the server accepts the first connection.
+        // Join by cancellation on error rather than wait forever for a request
+        // that the client is no longer obliged to send.
+        if (case.expected != null) group.cancel(io) else try group.await(io);
         try std.testing.expectEqual(case.attempts, server.route_hits[0] + server.route_hits[1]);
     }
 }

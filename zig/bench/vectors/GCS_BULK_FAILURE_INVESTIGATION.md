@@ -75,8 +75,9 @@ Offline transport fixtures exercise disconnects and truncated responses,
 successful retry, ambiguous commit followed by a 412 conflict, transient 503,
 terminal 403, an exhausted retry budget, and an ordinary POST that must not
 replay. Cancellation and deadline fixtures interrupt retry backoff; buffered and
-writer redirect fixtures require replay admission to be cleared. An artifact-layer fixture additionally checks that a lost success plus
-412 accepts matching bytes under generation 42 and rejects corrupt bytes.
+writer redirect fixtures require replay admission to be cleared. An artifact-layer
+fixture additionally checks that a lost success plus 412 accepts matching bytes
+under generation 42 and rejects corrupt bytes.
 
 Probe-only operation records distinguish identity source reads, spill append
 and reduction, identity chunk upload/finish, exact-vector flush, and spool
