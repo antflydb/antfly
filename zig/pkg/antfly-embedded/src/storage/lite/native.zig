@@ -6083,6 +6083,14 @@ pub const NativeFile = struct {
     /// Fails the next checkpoint publication inside its uncertain window
     /// (after the flag is set, before the slot write), then disarms.
     test_fail_checkpoint_publication: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
+    /// Fails the very next `checkpointRedoLog` call outright (before it
+    /// touches anything), then disarms. For exercising a caller's own
+    /// error handling around that call directly -- e.g. docstore.zig's
+    /// `maybeCheckpointRedoLogOnIdleTurn`, which the real
+    /// `error.OutcomeUnknown`-from-a-close-during-the-crash-sweep case
+    /// only reaches occasionally -- without needing to reproduce that
+    /// exact crash timing by hand.
+    test_fail_checkpoint_redo_log: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
     /// Test-only: makes `checkpointRedoLog` stop right after its new slot
     /// is durable, skipping the log-zeroing step, to exercise that known
     /// gap's exact window (see that function's own doc comment) instead
@@ -6500,6 +6508,10 @@ pub const NativeFile = struct {
     /// checkpoint recovers cleanly from a crash between the new slot and
     /// log-zeroing" for the exercised scenario.
     pub fn checkpointRedoLog(self: *NativeFile) anyerror!void {
+        if (comptime builtin.is_test) if (self.test_fail_checkpoint_redo_log) |err| {
+            self.test_fail_checkpoint_redo_log = null;
+            return err;
+        };
         const redo: *RedoCommitState = if (self.redo) |*r| r else return error.InvalidTransactionState;
         const io = self.runtimeIo();
         const has_logical_work = for (0..3) |root_idx| {
