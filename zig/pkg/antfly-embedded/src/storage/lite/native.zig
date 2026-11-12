@@ -16043,6 +16043,25 @@ pub const NativeFile = struct {
         const retired_header = self.header;
         self.header = prepared.header;
         prepared.header = retired_header;
+        // `self.inode_lock_ref` now names a different `inode_lock.Entry`
+        // (the swap above) -- `prepared`'s own, which may carry a
+        // `last_committed_sequence` from `prepared`'s own, entirely
+        // separate lineage (its own vacuum/compaction attempt, possibly
+        // itself a retried or abandoned one) that has no relationship to
+        // the header this call is adopting. A monotonic merge
+        // (`publishCommittedSequenceToInode`) is the wrong operation here:
+        // if that unrelated leftover happens to be *higher* than the
+        // adopted header's own `commit_sequence`, merging would strand
+        // this inode's registered sequence permanently ahead of a header
+        // that can never publish a commit at that number -- every future
+        // publish would then fail the `base < latest` backstop forever,
+        // even though nothing is actually racing (reproduced: see
+        // `resetCommittedSequence`'s own doc comment). Reset it outright
+        // instead: the adopted header's own sequence is this inode's one
+        // and only truth immediately after the swap, and nothing else may
+        // have published to this entry since (the swap runs under the
+        // writer-lease admission gate's own exclusivity).
+        if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.resetCommittedSequence(entry, self.activeCheckpoint().commit_sequence);
         // §9.3a/§9.4: `prepared` (built by `prepareVacuum`) never carries a
         // redo-log region of its own -- its header's `redo_log_capacity` is
         // always 0 -- but the live `self.redo`, if this file had one, still

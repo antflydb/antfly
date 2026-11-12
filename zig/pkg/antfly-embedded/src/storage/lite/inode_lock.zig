@@ -386,6 +386,25 @@ pub fn committedSequence(entry: *Entry) u64 {
     return entry.last_committed_sequence.load(.monotonic);
 }
 
+/// Unconditionally overwrites this inode's latest known-durable commit
+/// sequence, discarding whatever was recorded before -- unlike
+/// `publishCommittedSequence`'s monotonic merge, which assumes the
+/// existing high-water mark is still meaningful for the *same* lineage.
+/// For a generation swap (`NativeFile.replaceWithPreparedGeneration`):
+/// the entry being adopted is the one the discarded `prepared` instance
+/// used for its own, unrelated lineage (its own vacuum/compaction
+/// attempt, possibly itself a retried or abandoned one) -- a high
+/// leftover value there does not describe any commit that exists in the
+/// newly adopted header's own numbering, so merging monotonically would
+/// permanently strand this inode's registered sequence ahead of a header
+/// that can never catch up to it. The newly adopted header's own
+/// sequence is this inode's one and only truth immediately after the
+/// swap; nothing else may have published to this entry since (the swap
+/// runs under the writer-lease admission gate's own exclusivity).
+pub fn resetCommittedSequence(entry: *Entry, sequence: u64) void {
+    entry.last_committed_sequence.store(sequence, .monotonic);
+}
+
 /// One live reader's pinned sequence(s), registered in `Entry.reader_pins`.
 /// Mirrors `shared_lock_region.Region`'s own data/metadata split so a
 /// reader that only dereferences one domain can pin just that one; most
