@@ -41,14 +41,27 @@ const Namespace = struct {
     guard: std.Io.File,
     digest: [32]u8,
     fn open(a: Allocator, io: std.Io, path: []const u8, publication: bool, no_sync: bool) !Namespace {
-        const canonical = if (publication) blk: {
-            const parent = try std.Io.Dir.cwd().realPathFileAlloc(io, std.fs.path.dirname(path) orelse ".", a);
-            defer a.free(parent);
-            break :blk try std.fs.path.joinZ(a, &.{ parent, std.fs.path.basename(path) });
-        } else try std.Io.Dir.cwd().realPathFileAlloc(io, path, a);
-        errdefer a.free(canonical);
-        const parent = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(canonical).?, .{});
+        // Capture relative paths once. All subsequent lookups use an absolute
+        // path or a pinned directory handle, so a later cwd change cannot move
+        // the namespace (or its identity marker) into the process directory.
+        var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const absolute = if (std.fs.path.isAbsolute(path))
+            try a.dupe(u8, path)
+        else blk: {
+            const len = try std.Io.Dir.cwd().realPath(io, &cwd_buffer);
+            break :blk try std.fs.path.join(a, &.{ cwd_buffer[0..len], path });
+        };
+        defer a.free(absolute);
+        // Existing files must canonicalize symlink aliases to the same binding.
+        const resolved = if (publication) null else try std.Io.Dir.cwd().realPathFileAlloc(io, absolute, a);
+        defer if (resolved) |value| a.free(value);
+        const target = resolved orelse absolute;
+        const parent = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(target).?, .{});
         defer parent.close(io);
+        var parent_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const parent_len = try parent.realPath(io, &parent_buffer);
+        const canonical = try std.fs.path.joinZ(a, &.{ parent_buffer[0..parent_len], std.fs.path.basename(target) });
+        errdefer a.free(canonical);
         // The path chooses a bounded location, never the authority to reuse.
         var path_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(canonical, &path_digest, .{});
@@ -306,4 +319,63 @@ test "lite reader epochs guard cross-generation registration and reject replaced
     try std.testing.expectError(error.UnsafeNativeReaderAlias, register(a, io, path, binding, inode, 1, true));
     try std.testing.expectError(error.WouldBlock, scan(a, io, path, binding, inode));
     try std.testing.expectError(error.FileNotFound, namespace.directory.access(io, "identity", .{}));
+}
+
+// Reject pathname-based parent canonicalization: publication must resolve the
+// directory through its open handle, including for relative database paths.
+test "lite reader epochs publish identity only inside the pinned namespace" {
+    const Probe = struct {
+        fn realPathFile(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: []u8) std.Io.Dir.RealPathFileError!usize {
+            return error.OperationUnsupported;
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/relative.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    const data = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true });
+    defer data.close(io);
+    var vtable = io.vtable.*;
+    vtable.dirRealPathFile = Probe.realPathFile;
+    const pinned_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    const published = try Namespace.open(a, pinned_io, path, true, true);
+    defer published.close(a, io);
+    try std.testing.expectEqual(@as(u64, 32), (try published.guard.stat(io)).size);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "identity", .{}));
+    const reopened = try Namespace.open(a, io, path, false, true);
+    defer reopened.close(a, io);
+    try std.testing.expectEqualSlices(u8, &published.digest, &reopened.digest);
+    try std.testing.expectEqualStrings(published.canonical, reopened.canonical);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(published.canonical, &digest, .{});
+    const marker = try std.fmt.allocPrint(a, ".aflite-readers-{x}/identity", .{digest});
+    defer a.free(marker);
+    const identity = try tmp.dir.openFile(io, marker, .{});
+    defer identity.close(io);
+    try std.testing.expectEqual((try published.guard.stat(io)).inode, (try identity.stat(io)).inode);
+}
+
+test "lite reader epochs preserve symlink bindings and reject missing databases" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "target.aflite" });
+    defer a.free(path);
+    const alias = try std.fs.path.join(a, &.{ root, "alias.aflite" });
+    defer a.free(alias);
+    try std.testing.expectError(error.FileNotFound, Namespace.open(a, io, path, false, true));
+    const data = try tmp.dir.createFile(io, "target.aflite", .{ .read = true });
+    defer data.close(io);
+    const published = try Namespace.open(a, io, path, true, true);
+    defer published.close(a, io);
+    try tmp.dir.symLink(io, "target.aflite", "alias.aflite", .{});
+    const reader = try Namespace.open(a, io, alias, false, true);
+    defer reader.close(a, io);
+    try std.testing.expectEqualStrings(published.canonical, reader.canonical);
+    try std.testing.expectEqualSlices(u8, &published.digest, &reader.digest);
 }
