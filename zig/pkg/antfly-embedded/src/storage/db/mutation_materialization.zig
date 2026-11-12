@@ -1739,6 +1739,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
             dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+            preparation_memo: *GeneratedEmbeddingMemo,
         ) !void {
             for (view.chunks) |entry| {
                 const chunks = if (entry.chunker_json.len > 0)
@@ -1771,6 +1772,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const runtime = S.ownerField(db, "enrichment_runtime").*;
                 const dense_embedder = if (runtime) |rt| rt.config.dense_embedder else null;
                 const sparse_embedder = if (runtime) |rt| rt.config.sparse_embedder else null;
+
+                if (dense_embedder) |provider| {
+                    for (dense_pending.items) |*pending| pending.generation = try preparation_memo.generation(provider, pending.embedding_name);
+                }
+                if (sparse_embedder) |provider| {
+                    for (sparse_pending.items) |*pending| pending.revision = @as(?[32]u8, try preparation_memo.sparseRevision(provider, pending.embedding_name));
+                }
 
                 var arena_state = std.heap.ArenaAllocator.init(alloc);
                 defer arena_state.deinit();
@@ -5817,6 +5825,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             force_reprocess: bool,
             document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution,
             coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
+            preparation_memo: *GeneratedEmbeddingMemo,
         ) !void {
             var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
             defer producer_cfg.deinit(alloc);
@@ -5905,6 +5914,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     sparse_embeddings,
                     force_reprocess,
                     document_execution,
+                    preparation_memo,
                 );
                 var selected_manifest: ?[]const u8 = null;
                 var i = artifact_writes.items.len;
@@ -6434,6 +6444,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
             force_reprocess: bool,
             document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution,
+            preparation_memo: *GeneratedEmbeddingMemo,
         ) !void {
             const artifact_name = requestArtifactName(request);
             var config = try document_extraction_mod.parseConfig(alloc, config_json);
@@ -6817,7 +6828,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     });
                 }
 
-                try appendDocumentUnitChunkWrites(alloc, db, view, request.doc_key, artifact_name, unit_key, unit_descriptor.fingerprint, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges, artifact_writes, documents, dense_embeddings, sparse_embeddings);
+                try appendDocumentUnitChunkWrites(alloc, db, view, request.doc_key, artifact_name, unit_key, unit_descriptor.fingerprint, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges, artifact_writes, documents, dense_embeddings, sparse_embeddings, preparation_memo);
             }
 
             const manifest = try documentExtractionManifestPayloadAlloc(
@@ -8751,6 +8762,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !void {
             if (pending.chunk_texts.items.len == 0) return;
             if (pending.reprocess_generation == null) pending.reprocess_generation = try enrichment_runtime_mod.embeddingReprocessGeneration(runtime, doc_key, pending.embedding_name);
+            if (pending.generation == null) pending.generation = try dense_embedder.captureTextGeneration(alloc, pending.embedding_name);
             const synthetic_request: enrichment_types.GeneratedEnrichmentRequest = .{
                 .kind = .dense_embedding,
                 .index_name = "",
@@ -8763,7 +8775,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try flushGeneratedDenseChunkBatch(
                 alloc,
                 runtime,
-                dense_embedder,
+                dense_embedder.withTextGeneration(pending.generation.?),
                 pending.embedding_name,
                 synthetic_request,
                 artifact_writes,
@@ -8791,6 +8803,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 defer alloc.free(doc_key);
                 pending.reprocess_generation = try enrichment_runtime_mod.embeddingReprocessGeneration(runtime, doc_key, pending.embedding_name);
             }
+            if (pending.revision == null) pending.revision = @as(?[32]u8, try sparse_embedder.captureRevision(alloc, pending.embedding_name));
             try flushGeneratedSparseChunkBatch(
                 alloc,
                 runtime,
@@ -8798,7 +8811,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 pending.embedding_name,
                 pending.producer_json,
                 pending.reprocess_generation.?,
-                try sparse_embedder.captureRevision(alloc, pending.embedding_name),
+                pending.revision.?,
                 artifact_writes,
                 sparse_embeddings,
                 pending.sources.items,

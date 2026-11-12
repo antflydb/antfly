@@ -606,7 +606,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             for (source_indexes.items, vectors) |source_index, vector| {
                 const source = sources[source_index];
-                const source_hash = if (request.input_kind == .inline_chunks and !source.has_metadata)
+                const source_hash = if (!source.has_metadata)
                     enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision)
                 else
                     enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
@@ -925,6 +925,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     request.reprocess_generation = try embeddingTargetGeneration(self, alloc, request.*, force_generated_artifact_names);
                 }
             };
+            var fallback_memo = GeneratedEmbeddingMemo.init(alloc);
+            defer fallback_memo.deinit();
+            const preparation_memo = generated_memo orelse &fallback_memo;
             if (preplanned) |plan| if (generated_memo) |memo| {
                 try prewarmGeneratedDenseMemo(self, req, extracted, precompute_mode, plan, memo, force_generated_artifact_names);
                 try prewarmGeneratedSparseMemo(self, req, extracted, precompute_mode, plan, memo, force_generated_artifact_names);
@@ -1106,6 +1109,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 containsName(force_generated_artifact_names, requestArtifactName(request)),
                                 document_execution,
                                 &coverage_outcomes,
+                                preparation_memo,
                             );
                             const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
                             defer alloc.free(asset_key);
@@ -1147,7 +1151,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try indexPendingArtifactWrites(alloc, &pending_writes, artifact_writes.items, &indexed_write_count);
                             const before = dense_embeddings.items.len;
                             const reuse_unchanged = !containsName(force_generated_artifact_names, requestArtifactName(request)) and !containsName(force_generated_artifact_names, requestEmbeddingName(request));
-                            computeDenseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &dense_embeddings, &chunk_cache, generated_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
+                            computeDenseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &dense_embeddings, &chunk_cache, preparation_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
                                 error.MissingDenseEmbedder => {
                                     try appendGeneratedEnrichmentRef(alloc, &planned, request);
                                     continue;
@@ -1167,7 +1171,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try indexPendingArtifactWrites(alloc, &pending_writes, artifact_writes.items, &indexed_write_count);
                             const before = sparse_embeddings.items.len;
                             const reuse_unchanged = !containsName(force_generated_artifact_names, requestArtifactName(request)) and !containsName(force_generated_artifact_names, requestEmbeddingName(request));
-                            computeSparseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &sparse_embeddings, &chunk_cache, generated_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
+                            computeSparseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &sparse_embeddings, &chunk_cache, preparation_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
                                 error.MissingSparseEmbedder => {
                                     try appendGeneratedEnrichmentRef(alloc, &planned, request);
                                     continue;
@@ -1213,6 +1217,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     candidate.produced,
                 )) try appendGeneratedEnrichmentRef(alloc, &planned, candidate.request);
             }
+
+            if (S.ownerField(self, "enrichment_runtime").*) |runtime|
+                try preparation_memo.validateRevisions(runtime.config.dense_embedder, runtime.config.sparse_embedder);
 
             var result = PrecomputedGeneratedBatch{};
             errdefer result.deinit(alloc);
