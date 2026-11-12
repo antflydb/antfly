@@ -1737,6 +1737,11 @@ pub const Owner = struct {
                 .monotonic,
             );
         };
+        // Marks the new generation subject to the `active_writer` backstop
+        // (native.zig's `publishCheckpoint`/inode_lock.zig's own doc
+        // comment): this is `self.current`'s only other reassignment point
+        // besides `Owner.create`'s own initial open.
+        replacement.owned_lite_backend.?.native_docstore.?.file.lease_managed = true;
         self.current = replacement;
         for (self.connections.items) |connection| {
             connection.current = replacement;
@@ -2454,6 +2459,12 @@ pub const Owner = struct {
                 store.test_maintenance_hook = source.test_maintenance_hook;
             }
         }
+        // Marks this detached snapshot subject to the `active_writer`
+        // backstop (native.zig's `publishCheckpoint`/inode_lock.zig's own
+        // doc comment): it is exactly the "other" instance the writer-lease
+        // admission gate must keep from racing the foreground's own live
+        // root (`Owner.current`) on the same inode.
+        store.file.lease_managed = true;
         self.maintenance_snapshot = snapshot;
         return snapshot;
     }
@@ -3770,6 +3781,11 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         resolved.externally_locked = true;
         initial = try api.openLiteHandleAllocWithRuntime(alloc, path, resolved, true, h.handleLockIo(), null);
         initial.?.owned_lite_backend.?.native_docstore.?.file.releaseWriterOwnership();
+        // Marks this instance subject to the `active_writer` backstop
+        // (native.zig's `publishCheckpoint`/inode_lock.zig's own doc
+        // comment): this becomes `owner.current` below, the Owner's own
+        // live root under the writer-lease admission gate.
+        initial.?.owned_lite_backend.?.native_docstore.?.file.lease_managed = true;
     } else {
         const probe = try std.Io.Dir.cwd().openFile(h.handleLockIo(), path, .{
             .mode = if (h.liteOpenModeCanWrite(options.open_mode)) .read_write else .read_only,

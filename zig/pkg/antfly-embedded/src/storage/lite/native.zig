@@ -5844,6 +5844,38 @@ pub const NativeFile = struct {
     // Lease-only metadata transactions may append without proving free-page
     // reuse. General mutations still validate before any physical reuse.
     artifact_lease_transaction: bool = false,
+    /// Set (only) by the capi Owner/Connection layer (lite_connection.zig)
+    /// on the specific instances it subjects to the writer-lease admission
+    /// gate: the Owner's own `current` live root, at both of the two
+    /// places that are ever assigned (`Owner.create`'s initial open and
+    /// the generation-swap in its "replace" helper), and `Owner
+    /// .refreshMaintenanceSnapshot`'s detached snapshot, at the one place
+    /// it creates a new one. Gates the `active_writer` backstop in
+    /// `publishCheckpoint`/`beginTransaction` below: countless legitimate
+    /// `NativeFile` publishers never go through that gate at all --
+    /// recovery/replay at open, bare docstore.zig unit tests, backend.zig's
+    /// vector-block storage, a borrowed index writer's
+    /// `adoptIndexPublicationHeader` rebind, a vacuum-prepared image -- and
+    /// checking `active_writer` against any of them is a guaranteed false
+    /// positive, since nothing ever claims it on their behalf. `false` by
+    /// default: only a file this layer explicitly marks is ever subject to
+    /// the check.
+    lease_managed: bool = false,
+    /// Set by `beginTransaction` (only when `lease_managed`) right after it
+    /// claims `inode_lock.Entry.active_writer`; consumed (checked, then
+    /// cleared) by the one `publishCheckpoint` call that actually ends
+    /// this transaction, and cleared without being checked by
+    /// `abortTransaction`/at the end of `commitTransactionWithDurability`
+    /// on every other path (the deferred-publication branch, and the
+    /// "not changed" branch's plain `sync()`, neither of which call
+    /// `publishCheckpoint` for this transaction's own commit at all).
+    /// Scopes the backstop to only the commit that follows a
+    /// `beginTransaction` on *this* instance: `publishCheckpoint` is also
+    /// reached directly from `sync()` to flush an already-pending
+    /// `durable_header` with no transaction open at all, and
+    /// `active_writer` can otherwise still hold a stale, unrelated claim
+    /// that call never itself contested.
+    claimed_active_writer: bool = false,
     /// Native connection owners carry checked allocator ownership across live
     /// commits. Primitives retain explicit certification and proof semantics.
     allocator_certificate_on_commit: bool = false,
@@ -14592,6 +14624,10 @@ pub const NativeFile = struct {
         // failing (or an inconsistent latch) falls through to the refusal.
         if (self.checkpoint_publication_uncertain) try self.reconcilePublicationUncertainty();
         try self.refreshIfWriterBaseStale();
+        if (self.lease_managed) {
+            if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.claimActiveWriter(entry, @intFromPtr(self));
+            self.claimed_active_writer = true;
+        }
         self.transaction_header = self.header;
         self.artifact_lease_transaction = false;
         self.allocator_certificate_staged = false;
@@ -14735,6 +14771,12 @@ pub const NativeFile = struct {
     pub fn abortTransaction(self: *NativeFile) void {
         defer self.artifact_lease_transaction = false;
         defer self.allocator_certificate_staged = false;
+        // No commit follows, so no `publishCheckpoint` call will ever
+        // consume this -- clear it now rather than leaving it to fire
+        // against a later, unrelated `sync()`-triggered durable-header
+        // flush on this same instance. See `claimed_active_writer`'s own
+        // doc comment.
+        defer self.claimed_active_writer = false;
         self.invalidateLedger();
         const previous = self.transaction_header orelse return;
         if (self.transaction_writes) |writes| writes.deinit(self.allocator);
@@ -14851,6 +14893,20 @@ pub const NativeFile = struct {
     pub fn commitTransactionWithDurability(self: *NativeFile, durable: bool, hooks: ?SyncLockHooks) !void {
         defer self.artifact_lease_transaction = false;
         defer self.allocator_certificate_staged = false;
+        // Whatever `beginTransaction` claimed is no longer meaningfully
+        // pending once this call returns, on every path: the deferred
+        // (non-durable) branch below never calls `publishCheckpoint` at
+        // all for this transaction's own commit, and the "not changed"
+        // branch's plain `sync()` may not either (nothing pending). Left
+        // set, a stale `true` would let a much later, logically unrelated
+        // `publishCheckpoint` call on this same instance (most commonly a
+        // final `sync()` flushing a leftover `durable_header` at close)
+        // wrongly check itself against a claim this instance no longer
+        // means to still be asserting -- see `claimed_active_writer`'s own
+        // doc comment. Deferred *after* the explicit `self.publishCheckpoint`
+        // call the "changed" branch below makes synchronously, so that
+        // call's own check-and-consume still sees the true value it needs.
+        defer self.claimed_active_writer = false;
         const previous = self.transaction_header orelse return error.InvalidTransactionState;
         // A deferred (non-durable) commit never calls publishCheckpoint or
         // tryBuildCommitManifest below -- it only stages `next` into
@@ -15174,6 +15230,24 @@ pub const NativeFile = struct {
         // harness.
         if (self.transaction_header == null) {
             if (self.inode_lock_ref.load(.acquire)) |entry| {
+                // Second backstop, scoped to `self.lease_managed` (see its
+                // own doc comment): only the Owner's own live root and its
+                // detached maintenance snapshot are ever marked, and only
+                // `self.claimed_active_writer` (see its own doc comment)
+                // narrows further to the one publish that actually ends a
+                // transaction this exact instance began. Every other
+                // publisher (recovery/replay at open, bare tests, a
+                // borrowed index writer's rebind, a vacuum-prepared image,
+                // ...) never claims or is checked here at all -- checking
+                // them would be a guaranteed false positive, not a real
+                // signal. The writer-lease admission gate (`WriterLane`/
+                // `Owner`, capi/lite_connection.zig) is supposed to
+                // guarantee at most one claimant between `beginTransaction`
+                // and here for the instances this *does* cover.
+                if (self.lease_managed and self.claimed_active_writer) {
+                    self.claimed_active_writer = false;
+                    inode_lock.assertActiveWriter(entry, @intFromPtr(self));
+                }
                 const base = self.activeCheckpoint().commit_sequence;
                 const latest = inode_lock.committedSequence(entry);
                 if (base < latest) {
