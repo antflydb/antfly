@@ -322,8 +322,13 @@ pub const GeneratedSourceGuard = struct {
 pub fn validateGeneratedSourceGuard(alloc: Allocator, txn: anytype, guard: GeneratedSourceGuard) !void {
     if (guard.embedding) |embedding| {
         try @import("../artifact_inventory.zig").requirePublicationDigest(txn, embedding.catalog_digest);
-        try @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, txn, guard.document_key.?, embedding.name, embedding.generation);
     }
+    return validateGeneratedSourceAfterCatalog(alloc, txn, guard);
+}
+
+fn validateGeneratedSourceAfterCatalog(alloc: Allocator, txn: anytype, guard: GeneratedSourceGuard) !void {
+    if (guard.embedding) |embedding|
+        try @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, txn, guard.document_key.?, embedding.name, embedding.generation);
     return validateGeneratedSourceRecord(alloc, txn, guard);
 }
 
@@ -621,7 +626,91 @@ const CoverageOutcomeTransition = struct {
     failure_guards: std.ArrayListUnmanaged(FailureIdentity) = .empty,
     source_specific: bool = false,
     source_document: ?[]u8 = null,
+    guard_document: ?[]u8 = null,
+    embedding_names: std.StringHashMapUnmanaged(void) = .empty,
 };
+
+/// Compile routing once per window, independent of the order in which guards
+/// and transitions were queued. Keys borrow the window's owned source guards.
+/// Work is linear in guards plus actual producer/consumer coverage edges.
+const CoverageGuardIndex = struct {
+    const Key = struct { document: []const u8, producer: []const u8, sequence: u64 };
+    const Context = struct {
+        pub fn hash(_: @This(), key: Key) u64 {
+            var h = std.hash.Wyhash.init(key.sequence);
+            h.update(std.mem.asBytes(&key.document.len));
+            h.update(key.document);
+            h.update(key.producer);
+            return h.final();
+        }
+        pub fn eql(_: @This(), a: Key, b: Key) bool {
+            return a.sequence == b.sequence and std.mem.eql(u8, a.document, b.document) and std.mem.eql(u8, a.producer, b.producer);
+        }
+    };
+    heads: std.HashMapUnmanaged(Key, usize, Context, 80) = .empty,
+    next: []?usize,
+    seen: []usize,
+    selected: std.ArrayListUnmanaged(GeneratedSourceGuard) = .empty,
+
+    fn init(alloc: Allocator, guards: []const GeneratedSourceGuard) !@This() {
+        const next = try alloc.alloc(?usize, guards.len);
+        errdefer alloc.free(next);
+        const seen = try alloc.alloc(usize, guards.len);
+        errdefer alloc.free(seen);
+        @memset(next, null);
+        @memset(seen, std.math.maxInt(usize));
+        var result = @This(){ .next = next, .seen = seen };
+        errdefer result.heads.deinit(alloc);
+        for (guards, 0..) |guard, i| if (guard.embedding) |embedding| {
+            const document = guard.document_key orelse return error.InvalidGeneratedSourceGuard;
+            const entry = try result.heads.getOrPut(alloc, .{ .document = document, .producer = embedding.name, .sequence = guard.source_sequence });
+            if (entry.found_existing) next[i] = entry.value_ptr.*;
+            entry.value_ptr.* = i;
+        };
+        return result;
+    }
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        self.heads.deinit(alloc);
+        alloc.free(self.next);
+        alloc.free(self.seen);
+        self.selected.deinit(alloc);
+    }
+    fn forTransitions(self: *@This(), alloc: Allocator, transitions: []const CoverageOutcomeTransition, guards: []const GeneratedSourceGuard, group: usize) ![]const GeneratedSourceGuard {
+        self.selected.clearRetainingCapacity();
+        for (transitions) |transition| {
+            const document = transition.guard_document orelse continue;
+            var names = transition.embedding_names.keyIterator();
+            while (names.next()) |name| {
+                var cursor = self.heads.get(.{ .document = document, .producer = name.*, .sequence = transition.source_sequence });
+                while (cursor) |i| : (cursor = self.next[i]) {
+                    if (self.seen[i] == group) continue;
+                    self.seen[i] = group;
+                    try self.selected.append(alloc, guards[i]);
+                }
+            }
+        }
+        return self.selected.items;
+    }
+};
+
+fn clearCoverageEmbeddingNames(alloc: Allocator, names: *std.StringHashMapUnmanaged(void)) void {
+    var it = names.keyIterator();
+    while (it.next()) |name| alloc.free(name.*);
+    names.deinit(alloc);
+    names.* = .empty;
+}
+
+fn addCoverageEmbeddingName(alloc: Allocator, names: *std.StringHashMapUnmanaged(void), name: []const u8) !void {
+    if (names.contains(name)) return;
+    const owned = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned);
+    try names.put(alloc, owned, {});
+}
+
+fn mergeCoverageEmbeddingNames(alloc: Allocator, target: *std.StringHashMapUnmanaged(void), source: *const std.StringHashMapUnmanaged(void)) !void {
+    var it = source.keyIterator();
+    while (it.next()) |name| try addCoverageEmbeddingName(alloc, target, name.*);
+}
 
 const graph_stage_prefix = "\x00\x00__graph_stage__:v1:";
 const graph_stage_recovery_page_keys: usize = 256;
@@ -27500,6 +27589,10 @@ fn runtimeDocumentExtractionWindowBytes(window: *const GeneratedReplayWindow) us
     for (window.coverage_transitions.items) |transition| {
         total = addUsizeSaturating(total, transition.index_name.len);
         total = addUsizeSaturating(total, transition.marker_key.len);
+        if (transition.guard_document) |document| total = addUsizeSaturating(total, document.len);
+        total = addUsizeSaturating(total, transition.embedding_names.capacity() *| (@sizeOf([]const u8) + 8));
+        var producer_names = transition.embedding_names.keyIterator();
+        while (producer_names.next()) |name| total = addUsizeSaturating(total, name.*.len);
         for (transition.counter_keys) |key| total = addUsizeSaturating(total, key.len);
         total = addUsizeSaturating(total, transition.failure_guards.capacity *| @sizeOf(FailureIdentity));
         for (transition.failure_guards.items) |failure| {
@@ -30846,6 +30939,8 @@ fn processMaterializedChunkDenseRequest(
     scope: *FailureScope,
 ) !void {
     if (try processOrderedChunkVectorRequest(runtime, request, dense_embedder, null, consumer_indexes)) return;
+    const generation = try dense_embedder.captureTextGenerationWithContext(runtime.alloc, embedding_artifact_name, assetProviderRequestContext(runtime));
+    const pinned_embedder = dense_embedder.withTextGeneration(generation);
     const source_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(source_key);
     const source_digest = try currentRecordDigest(runtime, source_key);
@@ -30923,6 +31018,7 @@ fn processMaterializedChunkDenseRequest(
             request: enrichment_types.GeneratedEnrichmentRequest,
             prefix: []const u8,
             embedding_artifact_name: []const u8,
+            revision: ?[32]u8,
             chunk_texts: *std.ArrayListUnmanaged([]const u8),
             chunk_items: *std.ArrayListUnmanaged(ChunkedDenseWindowItem),
             cached_items: *std.ArrayListUnmanaged(CachedChunkDenseWindowItem),
@@ -30940,7 +31036,7 @@ fn processMaterializedChunkDenseRequest(
                 const text = (try chunkPayloadTextAlloc(ctx.runtime.alloc, value, ctx.request.source_field)) orelse return .@"continue";
                 var text_owned = true;
                 errdefer if (text_owned) ctx.runtime.alloc.free(text);
-                const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, ctx.request.producer_json, ctx.request.reprocess_generation);
+                const source_hash = retainedTextEmbeddingHashAtRevision(ctx.request, text, ctx.revision);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(ctx.runtime.alloc, key, ctx.embedding_artifact_name);
                 var embedding_key_owned = true;
                 errdefer if (embedding_key_owned) ctx.runtime.alloc.free(embedding_key);
@@ -30984,6 +31080,7 @@ fn processMaterializedChunkDenseRequest(
             .request = request,
             .prefix = prefix,
             .embedding_artifact_name = embedding_artifact_name,
+            .revision = generation.revision,
             .chunk_texts = &chunk_texts,
             .chunk_items = &chunk_items,
             .cached_items = &cached_items,
@@ -30993,8 +31090,9 @@ fn processMaterializedChunkDenseRequest(
         };
         try backend_scan.scanWithContext(&runtime.store, lower, upper_bound, .{}, &collect, Collect.scan);
 
+        try dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, assetProviderRequestContext(runtime));
         try processCachedChunkDenseItems(runtime, request, consumer_indexes, window, &cached_items, max_window_items, scope);
-        const complete = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope, &rejected_requests);
+        const complete = try flushChunkedDenseItems(runtime, pinned_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope, &rejected_requests);
         if (!complete) return;
         if (rejected_requests.contains(requestFailureFingerprint(request))) return;
         try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
@@ -31007,6 +31105,7 @@ fn processMaterializedChunkDenseRequest(
         lower = next_lower;
     }
 
+    try dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, assetProviderRequestContext(runtime));
     if (rejected_requests.contains(requestFailureFingerprint(request))) return;
     var source_guarded_in_window = false;
     for (existing_embedding_keys.items) |embedding_key| {
@@ -38172,7 +38271,9 @@ fn initCoverageOutcomeTransition(
         if (marker_initialized) runtime.alloc.free(transition.marker_key);
         for (transition.counter_keys[0..initialized_counters]) |key| runtime.alloc.free(key);
         runtime.alloc.free(transition.index_name);
+        if (transition.guard_document) |document| runtime.alloc.free(document);
     }
+    transition.guard_document = try runtime.alloc.dupe(u8, doc_key);
     transition.marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(runtime.alloc, index_name, generation, doc_key);
     marker_initialized = true;
     inline for (std.meta.tags(CoverageOutcome), 0..) |candidate_outcome, i| {
@@ -38228,6 +38329,9 @@ fn appendCoverageFailureGuard(
 fn deinitCoverageOutcomeTransition(alloc: Allocator, transition: CoverageOutcomeTransition) void {
     alloc.free(transition.index_name);
     if (transition.source_document) |document| alloc.free(document);
+    if (transition.guard_document) |document| alloc.free(document);
+    var embedding_names = transition.embedding_names;
+    clearCoverageEmbeddingNames(alloc, &embedding_names);
     alloc.free(transition.marker_key);
     for (transition.counter_keys) |key| alloc.free(key);
     var failure_guards = transition.failure_guards;
@@ -38333,6 +38437,8 @@ fn queueDerivedCoverageOutcomeForScope(
     const generation = runtime.index_manager.coverageGenerationForIndex(index_name) orelse return;
     var transition = try initCoverageOutcomeTransition(runtime, index_name, generation, request.doc_key, request.sequence, outcome);
     errdefer deinitCoverageOutcomeTransition(runtime.alloc, transition);
+    if (request.kind == .dense_embedding or request.kind == .sparse_embedding)
+        try addCoverageEmbeddingName(runtime.alloc, &transition.embedding_names, requestEmbeddingName(request));
     if (scope) |name| {
         const marker = try internal_keys.derivedCoverageOutcomeKeyAlloc(runtime.alloc, name, generation, request.doc_key);
         runtime.alloc.free(transition.marker_key);
@@ -38355,12 +38461,19 @@ fn queueDerivedCoverageOutcomeForScope(
                     if (outcome == .terminal_failed) {
                         try appendCoverageFailureGuard(runtime.alloc, &replacement_guards, failureIdentityForRequest(request));
                     }
+                    if (request.sequence == queued.source_sequence) {
+                        try mergeCoverageEmbeddingNames(runtime.alloc, &queued.embedding_names, &transition.embedding_names);
+                    } else {
+                        std.mem.swap(std.StringHashMapUnmanaged(void), &queued.embedding_names, &transition.embedding_names);
+                    }
                     clearCoverageFailureGuards(runtime.alloc, &queued.failure_guards);
                     queued.source_sequence = request.sequence;
                     queued.outcome = outcome;
                     queued.failure_guards = replacement_guards;
-                } else if (request.sequence == queued.source_sequence and outcome == .terminal_failed) {
-                    try appendCoverageFailureGuard(runtime.alloc, &queued.failure_guards, failureIdentityForRequest(request));
+                } else if (request.sequence == queued.source_sequence) {
+                    try mergeCoverageEmbeddingNames(runtime.alloc, &queued.embedding_names, &transition.embedding_names);
+                    if (outcome == .terminal_failed)
+                        try appendCoverageFailureGuard(runtime.alloc, &queued.failure_guards, failureIdentityForRequest(request));
                 }
                 break;
             }
@@ -38441,6 +38554,8 @@ fn applyCoverageOutcomeTransitionsGuarded(runtime: *EnrichmentRuntime, transitio
         }
     }.lessThan);
 
+    var guard_index = try CoverageGuardIndex.init(runtime.alloc, source_guards);
+    defer guard_index.deinit(runtime.alloc);
     var group_start: usize = 0;
     while (group_start < ordered.len) {
         var group_end = group_start + 1;
@@ -38484,9 +38599,14 @@ fn applyCoverageOutcomeTransitionsGuarded(runtime: *EnrichmentRuntime, transitio
         }
         retained = pending_retained;
         if (retained > 0) {
+            const group_guards = guard_index.forTransitions(runtime.alloc, ordered[group_start .. group_start + retained], source_guards, group_start) catch |err| {
+                if (failure_fence) |fence| fence.unlock();
+                apply_guard.unlock();
+                return err;
+            };
             var local_coverage_guard = runtime.index_manager.lockLocalCoverage();
             defer local_coverage_guard.release();
-            applyCoverageOutcomeTransitionsForIndexGuarded(runtime, ordered[group_start .. group_start + retained], source_guards) catch |err| {
+            applyCoverageOutcomeTransitionsForIndexGuarded(runtime, ordered[group_start .. group_start + retained], group_guards) catch |err| {
                 if (failure_fence) |fence| fence.unlock();
                 apply_guard.unlock();
                 return err;
@@ -38552,7 +38672,14 @@ fn applyCurrentCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, t
     // Per-artifact CAS guards describe pre-replay values, some of which that
     // replay intentionally deleted. Only producer/source guards survive into
     // the independent coverage transaction.
-    for (source_guards) |guard| if (guard.embedding != null) try validateGeneratedSourceGuard(runtime.alloc, &batch, guard);
+    if (source_guards.len != 0) {
+        const digest = source_guards[0].embedding.?.catalog_digest;
+        try @import("../artifact_inventory.zig").requirePublicationDigest(&batch, digest);
+        for (source_guards) |guard| {
+            if (!std.mem.eql(u8, &digest, &guard.embedding.?.catalog_digest)) return error.EnrichmentSourceChanged;
+            try validateGeneratedSourceAfterCatalog(runtime.alloc, &batch, guard);
+        }
+    }
 
     var writes = std.ArrayListUnmanaged(KVPair).empty;
     defer writes.deinit(runtime.alloc);
@@ -49641,4 +49768,176 @@ test "sparse cleanup guards preserve cached coverage and retire empty inline sou
     var result = try db.search(a, .{ .index_name = "vector", .query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1}, .k = 10 } }, .return_mode = .chunk, .limit = 10 });
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+}
+
+test "sparse cleanup guards route coverage linearly across independent indexes" {
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const inventory = @import("../artifact_inventory.zig");
+    const a = std.testing.allocator;
+    const Count = struct {
+        var original_begin: *const fn (Allocator, *anyopaque) anyerror!backend_erased.Batch = undefined;
+        var original_get: *const fn (*anyopaque, []const u8) anyerror![]const u8 = undefined;
+        var batch_vtable: backend_erased.Batch.VTable = undefined;
+        var reads: usize = 0;
+        fn begin(alloc: Allocator, ptr: *anyopaque) anyerror!backend_erased.Batch {
+            var batch = try original_begin(alloc, ptr);
+            batch_vtable = batch.vtable.*;
+            original_get = batch.vtable.get;
+            batch_vtable.get = get;
+            batch.vtable = &batch_vtable;
+            return batch;
+        }
+        fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
+            if (std.mem.eql(u8, key, inventory.local_key)) reads += 1;
+            return original_get(ptr, key);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/coverage-scaling", .{tmp.sub_path});
+    defer a.free(path);
+    var db = try db_mod.DB.open(a, path, .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    var names: [8][]u8 = undefined;
+    var keys: [8][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (0..initialized) |i| {
+        a.free(names[i]);
+        a.free(keys[i]);
+    };
+    for (0..8) |i| {
+        names[i] = try std.fmt.allocPrint(a, "vector-{d}", .{i});
+        keys[i] = try std.fmt.allocPrint(a, "doc-{d}", .{i});
+        initialized += 1;
+        try db.addIndex(.{ .name = names[i], .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\"}}" });
+        try db.batch(.{ .writes = &.{.{ .key = keys[i], .value = "{\"body\":\"stable\"}" }}, .sync_level = .write });
+    }
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    var pin = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer pin.release();
+    const original_vtable = runtime.store.vtable;
+    var store_vtable = original_vtable.*;
+    Count.original_begin = store_vtable.begin_batch;
+    store_vtable.begin_batch = Count.begin;
+    runtime.store.vtable = &store_vtable;
+    defer runtime.store.vtable = original_vtable;
+    var measured: [2]usize = undefined;
+    for ([_]usize{ 4, 8 }, 0..) |count, pass| {
+        var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
+        defer window.deinit();
+        for (0..count) |i| {
+            var request = for (pin.plan().generated_templates) |candidate| {
+                if (candidate.kind == .sparse_embedding and std.mem.eql(u8, candidate.index_name, names[i])) break candidate;
+            } else return error.TestUnexpectedResult;
+            request.doc_key = keys[i];
+            const primary = try documentSourceStoreKeyAlloc(runtime, keys[i]);
+            defer runtime.alloc.free(primary);
+            const raw = try db.core.store.get(a, primary);
+            defer a.free(raw);
+            try appendEmbeddingSourceGuard(runtime, &window, request, primary, sourceRecordDigest(raw));
+            try queueDerivedCoverageProduced(runtime, &window, request, &.{names[i]});
+        }
+        Count.reads = 0;
+        try applyCoverageOutcomeTransitionsGuarded(runtime, window.coverage_transitions.items, window.source_guards.items);
+        measured[pass] = Count.reads;
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 4, 8 }, &measured);
+    // Many documents in one index share one catalog check, while retaining
+    // a distinct source/epoch check for every document.
+    {
+        var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
+        defer window.deinit();
+        var request = for (pin.plan().generated_templates) |candidate| {
+            if (candidate.kind == .sparse_embedding and std.mem.eql(u8, candidate.index_name, names[0])) break candidate;
+        } else return error.TestUnexpectedResult;
+        for (keys) |key| {
+            request.doc_key = key;
+            const primary = try documentSourceStoreKeyAlloc(runtime, key);
+            defer runtime.alloc.free(primary);
+            const raw = try db.core.store.get(a, primary);
+            defer a.free(raw);
+            try appendEmbeddingSourceGuard(runtime, &window, request, primary, sourceRecordDigest(raw));
+            try queueDerivedCoverageProduced(runtime, &window, request, &.{names[0]});
+        }
+        Count.reads = 0;
+        try applyCoverageOutcomeTransitionsGuarded(runtime, window.coverage_transitions.items, window.source_guards.items);
+        try std.testing.expectEqual(@as(usize, 1), Count.reads);
+    }
+    {
+        var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
+        defer window.deinit();
+        for (0..2) |i| {
+            var request = for (pin.plan().generated_templates) |candidate| {
+                if (candidate.kind == .sparse_embedding and std.mem.eql(u8, candidate.index_name, names[i])) break candidate;
+            } else return error.TestUnexpectedResult;
+            request.doc_key = keys[i];
+            const primary = try documentSourceStoreKeyAlloc(runtime, keys[i]);
+            defer runtime.alloc.free(primary);
+            const raw = try db.core.store.get(a, primary);
+            defer a.free(raw);
+            try appendEmbeddingSourceGuard(runtime, &window, request, primary, sourceRecordDigest(raw));
+            try queueDerivedCoverageProduced(runtime, &window, request, &.{names[i]});
+        }
+        try db.batch(.{ .writes = &.{.{ .key = keys[0], .value = "{\"body\":\"replacement\"}" }}, .sync_level = .write });
+        // An unrelated stale guard cannot invalidate this index's current
+        // coverage. Its own source still rejects stale coverage under writer.
+        Count.reads = 0;
+        try applyCoverageOutcomeTransitionsGuarded(runtime, window.coverage_transitions.items[1..2], window.source_guards.items);
+        try std.testing.expectEqual(@as(usize, 1), Count.reads);
+        try std.testing.expectError(error.EnrichmentSourceChanged, applyCoverageOutcomeTransitionsGuarded(runtime, window.coverage_transitions.items[0..1], window.source_guards.items));
+    }
+}
+
+test "sparse cleanup guards coverage routing owns allocation failures and producer fan in" {
+    const Harness = struct {
+        fn guard(document: []const u8, producer: []const u8, sequence: u64) GeneratedSourceGuard {
+            return .{ .key = "source", .expected_digest = @splat(2), .document_key = document, .source_sequence = sequence, .embedding = .{ .name = producer, .generation = 0, .catalog_digest = @splat(1) } };
+        }
+        fn run(a: Allocator) !void {
+            const guards = [_]GeneratedSourceGuard{
+                guard("doc", "A", 1), guard("doc", "B", 1),
+                guard("doc", "A", 2), guard("other", "A", 1),
+            };
+            var fan_in: std.StringHashMapUnmanaged(void) = .empty;
+            defer clearCoverageEmbeddingNames(a, &fan_in);
+            try addCoverageEmbeddingName(a, &fan_in, "A");
+            try addCoverageEmbeddingName(a, &fan_in, "B");
+            // Same-name queueing never adds another owner for its key.
+            try addCoverageEmbeddingName(a, &fan_in, "A");
+            var single: std.StringHashMapUnmanaged(void) = .empty;
+            defer clearCoverageEmbeddingNames(a, &single);
+            try addCoverageEmbeddingName(a, &single, "A");
+            var index = try CoverageGuardIndex.init(a, &guards);
+            defer index.deinit(a);
+            var transition = CoverageOutcomeTransition{
+                .index_name = @constCast("index"),
+                .generation = 1,
+                .source_sequence = 1,
+                .outcome = .produced,
+                .marker_key = @constCast("marker"),
+                .counter_keys = undefined,
+                .guard_document = @constCast("doc"),
+                .embedding_names = fan_in,
+            };
+            const first = try index.forTransitions(a, &.{ transition, transition }, &guards, 0);
+            try std.testing.expectEqual(@as(usize, 2), first.len);
+            for (first) |selected| {
+                try std.testing.expectEqualStrings("doc", selected.document_key.?);
+                try std.testing.expectEqual(@as(u64, 1), selected.source_sequence);
+            }
+            transition.source_sequence = 2;
+            transition.embedding_names = single;
+            const latest = try index.forTransitions(a, &.{transition}, &guards, 1);
+            try std.testing.expectEqual(@as(usize, 1), latest.len);
+            try std.testing.expectEqual(@as(u64, 2), latest[0].source_sequence);
+            transition.guard_document = @constCast("other");
+            transition.source_sequence = 1;
+            const other = try index.forTransitions(a, &.{transition}, &guards, 2);
+            try std.testing.expectEqual(@as(usize, 1), other.len);
+            try std.testing.expectEqualStrings("other", other[0].document_key.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

@@ -6961,6 +6961,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "full_index reuses unchanged",
             "paper evaluation producer upgrades require explicit reprocess",
             "paper evaluation rejects superseded A completion",
+            "document extraction pins provider generation",
+            "document extraction unit chunks embed in provider batches",
             "dense enrichment skips unchanged",
             "sparse enrichment skips unchanged source hash",
             "synchronous sparse reuse binds resolved revisions",

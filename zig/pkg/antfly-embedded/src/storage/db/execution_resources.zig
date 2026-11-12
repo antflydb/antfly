@@ -1396,6 +1396,7 @@ pub fn freeDocumentExtractionUnitDescriptors(alloc: Allocator, descriptors: []Do
 }
 
 pub const PendingDocumentUnitDenseChunkEmbedding = struct {
+    generation: ?embedder_mod.DenseEmbedder.TextGeneration = null,
     reprocess_generation: ?u64 = null,
     embedding_name: []const u8,
     source_field: []const u8,
@@ -1418,6 +1419,7 @@ pub const PendingDocumentUnitDenseChunkEmbedding = struct {
 };
 
 pub const PendingDocumentUnitSparseChunkEmbedding = struct {
+    revision: ??[32]u8 = null,
     reprocess_generation: ?u64 = null,
     embedding_name: []const u8,
     producer_json: []const u8,
@@ -1868,6 +1870,22 @@ pub const GeneratedEmbeddingMemo = struct {
         errdefer self.alloc.free(owned);
         try self.sparse_revisions.put(self.alloc, owned, revision);
         return revision;
+    }
+
+    /// One final check after every producer has finished, before preparation
+    /// transfers its artifacts to the source commit. Never perform provider
+    /// discovery while holding the storage writer or apply lock.
+    pub fn validateRevisions(self: *@This(), dense_provider: ?embedder_mod.DenseEmbedder, sparse_provider: ?embedder_mod.SparseEmbedder) !void {
+        var dense_generations = self.generations.iterator();
+        while (dense_generations.next()) |entry| {
+            const provider = dense_provider orelse return error.MissingDenseEmbedder;
+            try provider.requireTextGeneration(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
+        }
+        var sparse_generations = self.sparse_revisions.iterator();
+        while (sparse_generations.next()) |entry| {
+            const provider = sparse_provider orelse return error.MissingSparseEmbedder;
+            try provider.requireRevision(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
+        }
     }
 
     pub fn keyAtRevision(base: Key, revision: ?[32]u8) Key {
