@@ -13,14 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Steps 1 and 2 of `docs/design/lite-performance/lite-single-commit-write-path.md`
-//! §8: the shared mmap region (§8.1), the writer lock (§8.2), and the
-//! reader table (§8.3). Liveness/recovery (§8.4) lands in the next step;
-//! the migration/deletion of `inode_lock.zig`, `writer_queue.zig`,
-//! `reader_epochs.zig`, `ReaderCoordinator`, and the rest of §8.7's table
-//! happens only once §8.4 exists to replace what they still rely on (a
-//! dead reader's never-cleared pin, a dead writer's held lock). Until then
-//! this module is additive and unreferenced by existing callers.
+//! Steps 1 through 3 of `docs/design/lite-performance/lite-single-commit-write-path.md`
+//! §8: the shared mmap region (§8.1), the writer lock (§8.2), the reader
+//! table (§8.3), and liveness/recovery (§8.4). §8.7's migration table is
+//! now underway on the reader side: `reader_epochs.zig` is deleted,
+//! `reader_coordinator.zig`'s `Coordinator` claims and pins a slot here
+//! per reader instead of writing a file marker, and `native.zig`'s
+//! `acquireReaderFence`/`acquireEpochReuseLock` read this region directly.
+//! The writer-lane/fairness rows of the same table are a separate,
+//! concurrently landing migration (`writer_queue.zig`, `PathWriterLock`'s
+//! writer-side constructors) -- not this file's own scope.
 //!
 //! One `<db>.aflite-lock` file, memory-mapped `MAP_SHARED` by every process
 //! with the database open (SQLite's `-shm`, LMDB's `lock.mdb`). The steady,
@@ -152,15 +154,19 @@ const ReaderSlot = extern struct {
     /// The `commit_sequence` this reader will not let the writer reclaim
     /// pages behind. 0 means "not currently pinned" (sequence numbers
     /// start above 0), written once per pin by the slot's own owner,
-    /// cleared to 0 on unpin.
+    /// cleared to 0 on unpin. Every reader pins this one, regardless of
+    /// whether it also retains metadata (matching `native.zig`'s
+    /// `minimum_reader_sequence`, the broader of its two frontiers).
     pinned_sequence: std.atomic.Value(u64),
-    /// Pads the slot to 32 bytes (the compiler already inserts 4 bytes
-    /// between `owner` and `generation` for `generation`'s 8-byte
-    /// alignment, so 8 explicit bytes here, not 12, reaches 32) and
-    /// leaves room for a second pin (metadata vs. data, matching
-    /// `minimum_reader_sequence` vs. `minimum_metadata_reader_sequence`
-    /// in native.zig today) without another format bump.
-    _reserved: [8]u8 = @splat(0),
+    /// A second, narrower pin: set in addition to `pinned_sequence` only
+    /// by a reader that also retains allocator/recovery metadata pages
+    /// (a full graph scan, snapshot, or indexed-reclamation reader with
+    /// `metadata = true` -- matching `native.zig`'s
+    /// `minimum_metadata_reader_sequence`). 0 means "no metadata
+    /// retention from this slot"; a plain data-only reader never touches
+    /// this field. Exactly fills what was reserved padding before this
+    /// field existed, so no format bump was needed to add it.
+    metadata_pinned_sequence: std.atomic.Value(u64),
 };
 
 const reader_slot_bytes = 32;
@@ -1268,6 +1274,7 @@ pub const Region = struct {
             if (slot.owner.cmpxchgStrong(0, pid, .acquire, .monotonic) == null) {
                 slot.generation = packHolder(pid, self.own_liveness_slot);
                 slot.pinned_sequence.store(0, .monotonic);
+                slot.metadata_pinned_sequence.store(0, .monotonic);
                 return @intCast(i);
             }
         }
@@ -1282,6 +1289,7 @@ pub const Region = struct {
             if (slot.owner.cmpxchgStrong(owner, pid, .acquire, .monotonic) == null) {
                 slot.generation = packHolder(pid, self.own_liveness_slot);
                 slot.pinned_sequence.store(0, .monotonic);
+                slot.metadata_pinned_sequence.store(0, .monotonic);
                 return @intCast(i);
             }
         }
@@ -1330,19 +1338,51 @@ pub const Region = struct {
         self.readerSlots()[slot_index].pinned_sequence.store(0, .release);
     }
 
+    /// The narrower, metadata-only pin (`ReaderSlot.metadata_pinned_sequence`):
+    /// set in addition to `pinReader`, never instead of it, by a reader
+    /// that also retains allocator/recovery metadata pages (a full graph
+    /// scan, snapshot, or indexed-reclamation reader opened with
+    /// `metadata = true`). Matches `native.zig`'s
+    /// `minimum_metadata_reader_sequence` frontier.
+    pub fn pinMetadataReader(self: *Region, slot_index: u32, sequence: u64) void {
+        self.readerSlots()[slot_index].metadata_pinned_sequence.store(sequence, .release);
+    }
+
+    /// Clears the pin recorded by `pinMetadataReader`, without releasing
+    /// the slot or touching the data pin from `pinReader`.
+    pub fn unpinMetadataReader(self: *Region, slot_index: u32) void {
+        self.readerSlots()[slot_index].metadata_pinned_sequence.store(0, .release);
+    }
+
     /// Frees a slot claimed by `claimReaderSlot` for reuse, and wakes
     /// anyone parked in `claimReaderSlotWait` on exhaustion. Callers must
-    /// unpin first; this clears the pin defensively anyway so a slot
+    /// unpin first; this clears both pins defensively anyway so a slot
     /// released while still (incorrectly) pinned never blocks
-    /// `minimumPinnedSequence` after release.
+    /// `minimumPinnedSequence`/`minimumMetadataPinnedSequence` after
+    /// release.
     pub fn releaseReaderSlot(self: *Region, slot_index: u32) void {
         const slot = &self.readerSlots()[slot_index];
         slot.pinned_sequence.store(0, .monotonic);
+        slot.metadata_pinned_sequence.store(0, .monotonic);
         slot.generation = 0;
         slot.owner.store(0, .release);
         const hdr = self.header();
         _ = hdr.reader_slot_released.fetchAdd(1, .release);
         futexWakeShared(&hdr.reader_slot_released.raw);
+    }
+
+    /// Whether `slot_index` (a `claimReaderSlot` return value, not a
+    /// liveness slot) currently has a live owner: `false` for a free slot
+    /// and for one whose recorded holder the byte-range liveness probe
+    /// proves dead (the same check `minimumPinnedSequence`'s own sweep
+    /// uses internally, exposed here for a caller -- e.g. a reader-side
+    /// migration step -- that needs to ask about one specific slot
+    /// without running a full frontier scan).
+    pub fn isReaderSlotLive(self: *const Region, slot_index: u32) bool {
+        const slot = &self.readerSlots()[slot_index];
+        const owner = slot.owner.load(.acquire);
+        if (owner == 0) return false;
+        return !self.isSlotDead(holderLivenessSlot(slot.generation));
     }
 
     /// §8.3's writer-side reuse-frontier scan, replacing
@@ -1351,11 +1391,13 @@ pub const Region = struct {
     /// no reader is currently pinned. "Live" here is just `owner != 0`;
     /// step 3's per-slot liveness byte-range probe (§8.4) replaces that
     /// with a real death check so a crashed reader's never-cleared pin
-    /// cannot block reclamation forever -- until then, a process that
-    /// dies while pinned leaks its pin here, same as it would in
-    /// `reader_epochs.zig` today without a sweep. Nothing calls this from
-    /// a real write path yet (§8.7's migration is a later step); it is
-    /// exercised only by this file's own tests.
+    /// cannot block reclamation forever. This is `native.zig`'s broader
+    /// frontier (`reuseFrontier`'s `minimum_reader_sequence` input,
+    /// protecting every pinned reader regardless of whether it also
+    /// retains metadata); see `minimumMetadataPinnedSequence` for the
+    /// narrower one. Name and semantics are relied on by more than one
+    /// caller (page reclamation here, log-record retention elsewhere) --
+    /// keep both stable.
     pub fn minimumPinnedSequence(self: *Region) ?u64 {
         var min: ?u64 = null;
         for (self.readerSlots()) |*slot| {
@@ -1369,6 +1411,7 @@ pub const Region = struct {
             // ever does), never on a reader's own pin/unpin path.
             if (self.isSlotDead(holderLivenessSlot(slot.generation))) {
                 slot.pinned_sequence.store(0, .monotonic);
+                slot.metadata_pinned_sequence.store(0, .monotonic);
                 slot.generation = 0;
                 slot.owner.store(0, .release);
                 const hdr = self.header();
@@ -1377,6 +1420,30 @@ pub const Region = struct {
                 continue;
             }
             const seq = slot.pinned_sequence.load(.acquire);
+            if (seq == 0) continue;
+            if (min == null or seq < min.?) min = seq;
+        }
+        return min;
+    }
+
+    /// The narrower companion to `minimumPinnedSequence`: the minimum
+    /// `metadata_pinned_sequence` over every slot with a live owner *and*
+    /// a nonzero metadata pin, or `null` if no reader currently retains
+    /// metadata. Matches `native.zig`'s `metadataReuseFrontier`'s
+    /// `minimum_metadata_reader_sequence` input. Dead-slot reclamation is
+    /// `minimumPinnedSequence`'s job (it runs on every writer-side
+    /// frontier check and this one is always called alongside it in
+    /// practice); this scan only reads, so calling this alone without
+    /// also calling `minimumPinnedSequence` leaves a dead reader's
+    /// metadata pin uncollected until the next data-frontier scan reaps
+    /// it.
+    pub fn minimumMetadataPinnedSequence(self: *Region) ?u64 {
+        var min: ?u64 = null;
+        for (self.readerSlots()) |*slot| {
+            const owner = slot.owner.load(.acquire);
+            if (owner == 0) continue;
+            if (self.isSlotDead(holderLivenessSlot(slot.generation))) continue;
+            const seq = slot.metadata_pinned_sequence.load(.acquire);
             if (seq == 0) continue;
             if (min == null or seq < min.?) min = seq;
         }
@@ -1841,6 +1908,51 @@ test "shared lock region: reader slots claim, pin, and release round-trip" {
     // A released slot is claimable again.
     const slot_c = try region.claimReaderSlot(300);
     try std.testing.expectEqual(slot_a, slot_c);
+}
+
+test "shared lock region: metadata pin is independent of the data pin and isReaderSlotLive reflects ownership" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-readers-metadata.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var region = try Region.openSized(a, io, db_path, 4);
+    defer region.close();
+
+    try std.testing.expectEqual(@as(?u64, null), region.minimumPinnedSequence());
+    try std.testing.expectEqual(@as(?u64, null), region.minimumMetadataPinnedSequence());
+
+    // A plain reader: pins the data frontier only.
+    const plain = try region.claimReaderSlot(100);
+    try std.testing.expect(region.isReaderSlotLive(plain));
+    region.pinReader(plain, 40);
+    try std.testing.expectEqual(@as(?u64, 40), region.minimumPinnedSequence());
+    try std.testing.expectEqual(@as(?u64, null), region.minimumMetadataPinnedSequence());
+
+    // A full/metadata reader: pins both, at a different (older) sequence.
+    const full = try region.claimReaderSlot(200);
+    region.pinReader(full, 25);
+    region.pinMetadataReader(full, 25);
+    try std.testing.expectEqual(@as(?u64, 25), region.minimumPinnedSequence());
+    try std.testing.expectEqual(@as(?u64, 25), region.minimumMetadataPinnedSequence());
+
+    // Unpinning the metadata-only side leaves the data pin (and the
+    // plain reader's own pin) untouched.
+    region.unpinMetadataReader(full);
+    try std.testing.expectEqual(@as(?u64, 25), region.minimumPinnedSequence());
+    try std.testing.expectEqual(@as(?u64, null), region.minimumMetadataPinnedSequence());
+
+    region.releaseReaderSlot(full);
+    try std.testing.expect(!region.isReaderSlotLive(full));
+    try std.testing.expectEqual(@as(?u64, 40), region.minimumPinnedSequence());
+
+    region.releaseReaderSlot(plain);
+    try std.testing.expect(!region.isReaderSlotLive(plain));
+    try std.testing.expectEqual(@as(?u64, null), region.minimumPinnedSequence());
 }
 
 test "shared lock region: reader slots exhaust and report ReadersExhausted" {

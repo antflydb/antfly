@@ -3440,7 +3440,13 @@ pub const Connection = struct {
                 const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
                 if (remaining <= 0) return error.FileBusy;
                 if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| hook.notify(hook.ptr);
-                if (native.waitPathLockWithIo(alloc, self.owner.path_lock_io.io(), self.path, h.liteOpenModeCanWrite(self.options.open_mode), deadline)) |held| return self.owner.withReadRegistrationBatch(held) else |wait_err| switch (wait_err) {
+                // Reader admission: migrated off the kernel's blocking
+                // `.shared` wait queue onto `fairReaderLockWithIo` (region-
+                // backed retry, kernel wait only as that function's own
+                // fallback when the region is unusable) -- see that
+                // function's own doc comment for why a reader's wait isn't
+                // simply the writer side's FIFO-ticket wait reused.
+                if (native.fairReaderLockWithIo(alloc, self.owner.path_lock_io.io(), self.path, deadline)) |held| return self.owner.withReadRegistrationBatch(held) else |wait_err| switch (wait_err) {
                     // Sidecar-free read-only snapshots retain their inode
                     // authority. Resource-limited executors retain bounded
                     // polling rather than making the deadline unbounded.
@@ -6138,23 +6144,11 @@ test "capi native allocator proof issue1431 physical maintenance releases detach
             } else self.calls += 1;
             const during_replay = root.maintenance_publication != null;
             const store = root.owned_lite_backend.?.native_docstore.?;
-            const file = std.Io.Dir.cwd().openFile(h.handleLockIo(), store.file.path, .{
-                .mode = .read_write,
-                .lock = .exclusive,
-                .lock_nonblocking = true,
-            }) catch |err| {
-                self.failure = err;
+            const region = store.file.regionForInode() orelse {
+                self.failure = error.IndexReplaySnapshotNotFenced;
                 return;
             };
-            defer file.close(h.handleLockIo());
-            const epochs = @import("../storage/lite/reader_epochs.zig").scan(alloc, h.handleLockIo(), store.file.path, store.file.header.reader_epoch_namespace, (file.stat(h.handleLockIo()) catch |err| {
-                self.failure = err;
-                return;
-            }).inode) catch |err| {
-                self.failure = err;
-                return;
-            };
-            if (during_replay != (epochs.data != null)) self.failure = error.IndexReplaySnapshotNotFenced;
+            if (during_replay != (region.minimumPinnedSequence() != null)) self.failure = error.IndexReplaySnapshotNotFenced;
         }
     };
     var probe: Probe = .{};
