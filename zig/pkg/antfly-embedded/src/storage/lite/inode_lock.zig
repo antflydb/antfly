@@ -320,11 +320,65 @@ pub const Entry = struct {
     /// instance on this inode -- not just the one that committed -- can
     /// read it): the most recently committed `commit_sequence`, used to
     /// detect a writer instance operating against a stale base (an old
-    /// generation/header it never refreshed). Not populated or read by
-    /// this module itself; reserved here, next to `reader_pins`, so the
-    /// two in-process additions don't collide on the struct layout.
+    /// generation/header it never refreshed). Populated under the
+    /// publishing commit's own exclusion (`NativeFile.publishCheckpoint`);
+    /// read lock-free via a monotonic compare, never regressed by an older
+    /// commit's publish racing a newer one. See
+    /// `publishCommittedSequence`/`committedSequence` below.
     last_committed_sequence: std.atomic.Value(u64) = .init(0),
+    /// Defense in depth, not a lock: the `NativeFile` instance (as
+    /// `@intFromPtr`, 0 for none yet) that most recently began a
+    /// transaction against this inode, claimed by `NativeFile
+    /// .beginTransaction` right after it refreshes a stale base and
+    /// checked back by `NativeFile.publishCheckpoint`'s own backstop
+    /// assertion. The actual exclusivity invariant -- at most one writer
+    /// between begin and publish -- is the writer-lease admission gate in
+    /// capi/lite_connection.zig (`WriterLane`/`Owner`); this field only
+    /// observes whether that invariant held, by recording the latest
+    /// claimant and letting a later publish notice if a *different*
+    /// instance has since begun its own transaction before this one
+    /// reached publish. Not itself synchronizing anything: a true
+    /// violation can still slip past this check in the other interleaving
+    /// (the second instance's own publish lands first, observing itself as
+    /// the latest claimant), so this is a backstop that fails loud in the
+    /// common case, not a proof of correctness.
+    active_writer: std.atomic.Value(usize) = .init(0),
 };
+
+/// Claims `file_ptr` (the caller's own `@intFromPtr(self)`) as this
+/// inode's most recent transaction claimant. See `active_writer`'s own
+/// doc comment; called once per `NativeFile.beginTransaction`.
+pub fn claimActiveWriter(entry: *Entry, file_ptr: usize) void {
+    entry.active_writer.store(file_ptr, .release);
+}
+
+/// Panics if a *different*, nonzero claimant has since begun its own
+/// transaction on this inode. See `active_writer`'s own doc comment for
+/// why this is a backstop, not a lock.
+pub fn assertActiveWriter(entry: *Entry, file_ptr: usize) void {
+    const current = entry.active_writer.load(.acquire);
+    if (current != 0 and current != file_ptr) {
+        std.debug.panic("lite: NativeFile publishing without holding the writer lease (self=0x{x} active_writer=0x{x})", .{ file_ptr, current });
+    }
+}
+
+/// Publishes `sequence` as this inode's own latest known-durable commit,
+/// monotonically: a concurrent publish of an older sequence (e.g. a stale
+/// writer that is only now discovering/reporting what it already knew)
+/// never regresses a newer one already recorded. Called once per durable
+/// checkpoint publish, from the publishing `NativeFile` itself.
+pub fn publishCommittedSequence(entry: *Entry, sequence: u64) void {
+    var current = entry.last_committed_sequence.load(.monotonic);
+    while (sequence > current) {
+        current = entry.last_committed_sequence.cmpxchgWeak(current, sequence, .monotonic, .monotonic) orelse return;
+    }
+}
+
+/// This inode's latest known-durable commit sequence in this process (0 if
+/// nothing has published yet). See `publishCommittedSequence`.
+pub fn committedSequence(entry: *Entry) u64 {
+    return entry.last_committed_sequence.load(.monotonic);
+}
 
 /// One live reader's pinned sequence(s), registered in `Entry.reader_pins`.
 /// Mirrors `shared_lock_region.Region`'s own data/metadata split so a

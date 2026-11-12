@@ -22,6 +22,7 @@ const h = @import("handles.zig");
 const api = @import("db.zig");
 const std = h.std;
 const native = h.lite_backend.native;
+const inode_lock = @import("../storage/lite/inode_lock.zig");
 const antfly_platform = @import("antfly_platform");
 const alloc = std.heap.c_allocator;
 
@@ -1055,10 +1056,10 @@ pub const Demand = packed struct(u8) {
 /// a durable tip. See `checkin`'s doc comment for why the foreign check
 /// uses `PathWriterLock.othersWaitingAcrossProcesses`, not the plain
 /// `othersWaiting`: this process's own maintenance worker competes for the
-/// same kernel lease through the same file-based fair queue as a
-/// genuinely foreign waiter, and the two are indistinguishable from
-/// `othersWaiting` alone -- `othersWaitingAcrossProcesses` tells them
-/// apart by the process id `writer_queue` now stamps on every ticket.
+/// same kernel lease through the same region ticket ring as a genuinely
+/// foreign waiter, and the two are indistinguishable from `othersWaiting`
+/// alone -- `othersWaitingAcrossProcesses` tells them apart by the
+/// process id the region's own ticket ring stamps on every ticket.
 ///
 /// At most one writer is ever "checked out" of the lane at a time
 /// (`checked_out`): `checkout`/`checkin` replace *when* the kernel lease
@@ -1271,11 +1272,29 @@ pub const WriterLane = struct {
     /// generation moved on since; leave it alone and let the ordinary
     /// path decide) is taken.
     pub fn takeParkedForStore(self: *WriterLane, connection: *Connection) ?native.PathWriterLock {
+        return self.takeParkedForRoot(connection.owner.current);
+    }
+
+    /// Like `takeParkedForStore`, for a caller with no `*Connection` of
+    /// its own to check -- `Owner.acquireMaintenancePathLeaseAssumeLocked`
+    /// -- just the owner's own current root, which is exactly what
+    /// `takeParkedForStore` ultimately compares `last_root` against
+    /// anyway (`connection.owner.current`). Without this,
+    /// `acquireMaintenancePathLeaseAssumeLocked` had no way to reclaim a
+    /// lease this same lane already parked for this same process after a
+    /// foreground write -- see that function's own doc comment for the
+    /// region-mode version of the self-deadlock `takeParkedForStore`
+    /// itself already exists to prevent on the regular write path: with
+    /// nothing else running to ever trigger `checkin`'s own release
+    /// condition, a fresh region-backed acquisition attempt waits on a
+    /// `writer_holder` this exact process is never going to let go of on
+    /// its own, for the whole of the caller's own budget.
+    pub fn takeParkedForRoot(self: *WriterLane, current_root: ?*h.Handle) ?native.PathWriterLock {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const lease = self.parked orelse return null;
-        if (self.last_root == null or self.last_root != connection.owner.current) return null;
+        if (self.last_root == null or self.last_root != current_root) return null;
         self.parked = null;
         return lease;
     }
@@ -1995,12 +2014,48 @@ pub const Owner = struct {
     /// turns alongside foreground writers, otherwise a continuously occupied
     /// kernel queue prevents index replay from ever acquiring its lease.
     /// Reclamation and detached-proof reacquisition remain nonblocking.
+    ///
+    /// Checks `writer_lane.takeParkedForRoot` right after `takeRetained`,
+    /// before ever falling back to a fresh `fairWriterLockWithIo` call:
+    /// a foreground write just before this one leaves its own lease
+    /// *parked* on the lane (not released -- see `WriterLane.checkin`'s
+    /// own doc comment), and with no other process or in-process waiter
+    /// around to ever trigger that lane's release condition, a fresh
+    /// acquisition attempt here would wait out its own full budget on a
+    /// `writer_holder` this same process is already holding and has no
+    /// other reason to ever let go of -- the region-mode shape of the
+    /// same self-deadlock `takeParkedForStore` already guards the
+    /// regular write path against.
     fn acquireMaintenancePathLeaseAssumeLocked(self: *Owner) !native.PathWriterLock {
         if (self.stopping.load(.acquire)) return error.Canceled;
         const io = h.handleLockIo();
         const stats = &self.publication_stats.maintenance_lease;
         if (self.gate.mutex.takeRetained()) |held| {
             var lease = held;
+            stats.recordAcquired(.handoff, 0);
+            wal_trace.recordOp(.maintenance_lease_acquired);
+            lease.startHold(stats);
+            return self.withReadRegistrationBatch(lease);
+        }
+        if (self.writer_lane.takeParkedForRoot(self.current)) |held| {
+            var lease = held;
+            // The foreground write that parked this lease may have staged
+            // ride-along work (enrichment/catalog bookkeeping) still
+            // sitting undriven in the store's own group-commit queue --
+            // nobody drives a ride-along request but a foreground leader,
+            // the idle-flush timer, or this exact barrier (`store
+            // .ensureDurableForReuse`, really just `forceDrainDurable`).
+            // Drain it now, before this lease is handed to maintenance:
+            // without this, that write's own `Ticket.waitSequence` could
+            // still be parked waiting on it, and once its own bounded wait
+            // (`ride_along_idle_ns`) elapses it drives the group itself --
+            // directly mutating `self.file` with no regard for whoever
+            // currently holds the writer lease, racing maintenance's own
+            // concurrent use of the very same file. Draining here, while
+            // nothing else can be concurrently admitted (this call already
+            // holds the owner gate), resolves that write's ticket itself
+            // and leaves nothing for its own wait to ever need to drive.
+            if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
             stats.recordAcquired(.handoff, 0);
             wal_trace.recordOp(.maintenance_lease_acquired);
             lease.startHold(stats);
@@ -2021,7 +2076,7 @@ pub const Owner = struct {
             else => return err,
         };
         errdefer held.close();
-        stats.recordAcquired(if (held.queue_turn != null) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+        stats.recordAcquired(if (held.contended) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
         wal_trace.recordOp(.maintenance_lease_acquired);
         held.startHold(stats);
         if (self.stopping.load(.acquire)) return error.Canceled;
@@ -2030,9 +2085,27 @@ pub const Owner = struct {
 
     /// Caller holds the gate. Nonblocking: reuses a lease kept for a queued
     /// thread, otherwise refuses while another process is queued.
+    /// Checks `writer_lane.takeParkedForRoot` alongside `takeRetained`
+    /// before `tryFairWriterLockWithIo`'s own fresh, nonblocking attempt
+    /// -- see `acquireMaintenancePathLeaseAssumeLocked`'s own doc
+    /// comment for the self-deadlock this guards against. Less severe
+    /// here (a nonblocking attempt fails fast with `WouldBlock` rather
+    /// than hanging out a multi-second budget), but reusing the lane's
+    /// own already-parked lease is still strictly better than refusing a
+    /// reclamation turn that a lease sitting right there could serve.
     fn tryWriterLeaseAssumeLocked(self: *Owner) !native.PathWriterLock {
         const stats = &self.publication_stats.maintenance_lease;
         var lease = if (self.gate.mutex.takeRetained()) |held| blk: {
+            stats.recordAcquired(.handoff, 0);
+            break :blk held;
+        } else if (self.writer_lane.takeParkedForRoot(self.current)) |held| blk: {
+            // See `acquireMaintenancePathLeaseAssumeLocked`'s own doc
+            // comment: drain any ride-along work this lease's parking
+            // writer left undriven before handing it off, so that
+            // write's own `Ticket.waitSequence` never needs to drive the
+            // group itself while this call is concurrently using the
+            // same file.
+            if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
             stats.recordAcquired(.handoff, 0);
             break :blk held;
         } else blk: {
@@ -2266,7 +2339,23 @@ pub const Owner = struct {
         const file = &foreground.owned_lite_backend.?.native_docstore.?.file;
         if (self.maintenance_snapshot) |snapshot| {
             const captured = &snapshot.owned_lite_backend.?.native_docstore.?.file;
-            if ((!need_database or snapshot.db_live) and std.meta.eql(file.header, captured.header) and
+            // Header/inode equality alone is not enough: this snapshot is a
+            // separate NativeFile instance from `foreground`'s own, with its
+            // own in-memory allocator/ledger state, never updated by writes
+            // the *foreground* instance makes. Cross-check its own last-seen
+            // commit sequence against the per-inode registry's shared,
+            // process-wide latest -- published by every NativeFile instance
+            // on this inode after each durable commit (see
+            // `NativeFile.publishCommittedSequenceToInode`) -- so a snapshot
+            // another writer has since advanced past is never reused as
+            // though it were current: that is exactly the self-deadlock's
+            // physical-maintenance sibling, a maintenance reclaim staged
+            // against pages a later foreground commit already reused.
+            const captured_is_current = if (captured.inode_lock_ref.load(.acquire)) |entry|
+                captured.activeCheckpoint().commit_sequence >= inode_lock.committedSequence(entry)
+            else
+                true;
+            if (captured_is_current and (!need_database or snapshot.db_live) and std.meta.eql(file.header, captured.header) and
                 (try file.file.stat(file.runtime())).inode == (try captured.file.stat(captured.runtime())).inode)
             {
                 self.configureRetirementBudget(snapshot.owned_lite_backend.?.native_docstore.?);
@@ -3422,7 +3511,7 @@ pub const Connection = struct {
                 if (err == error.FileBusy) stats.recordBusy(@intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
                 return err;
             };
-            stats.recordAcquired(if (lease.queue_turn != null) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+            stats.recordAcquired(if (lease.contended) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
             lease.startHold(stats);
             return self.owner.withReadRegistrationBatch(lease);
         }

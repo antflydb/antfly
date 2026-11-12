@@ -27,27 +27,15 @@ const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const resource_manager_mod = @import("../resource_manager.zig");
 const maintenance = @import("../maintenance.zig");
-const writer_queue = @import("writer_queue.zig");
 const inode_lock = @import("inode_lock.zig");
 const redo_log = @import("redo_log.zig");
 const redo_overlay = @import("redo_overlay.zig");
-// Step 1 of docs/design/lite-performance/lite-single-commit-write-path.md
-// §8 (the shared mmap lock region replacing inode_lock.zig's flock
-// registry). Not yet called from anywhere below -- this import exists
-// only so its own tests are reachable from this root module, the same
-// convention `inode_lock`/`writer_queue` above already follow. Later
-// steps wire real callers in as §8.3/§8.4 land and §8.7's migration
-// begins.
+// docs/design/lite-performance/lite-single-commit-write-path.md §8: the
+// shared mmap lock region replacing `inode_lock.zig`'s flock registry and
+// (§8.7's migration) `writer_queue.zig`'s own file-based CLH ticket queue,
+// deleted once every constructor that used it moved onto the region's own
+// ticket ring.
 const shared_lock_region = @import("shared_lock_region.zig");
-// Zig's lazy container analysis never looks inside an `@import` whose
-// result is never referenced, so an unused top-level `const` alone (unlike
-// `inode_lock`/`writer_queue` above, both used extensively below) does not
-// reach its test blocks at all. This forces that analysis so the step-1
-// region/writer-lock tests are discoverable from this module; delete once
-// a later step gives this module a real, referencing caller.
-comptime {
-    _ = shared_lock_region;
-}
 const wal_trace = @import("../write_amplification_trace.zig");
 pub const allocator_v4 = @import("allocator_v4.zig");
 
@@ -4547,34 +4535,35 @@ pub const PathWriterLock = struct {
     /// Admission owns this scope. Closing/yielding the kernel lease drops all
     /// idle anchors; escaped readers retain independent marker references.
     reader_registration_batch: ?ReaderCoordinator.RegistrationBatch = null,
-    /// FIFO turn held while this lease is open. Released after the kernel
-    /// lease so the next queued writer finds the sidecar free.
-    queue_turn: ?writer_queue.Turn = null,
-    /// Set instead of `queue_turn` when the lease was taken with the queue idle.
-    queue_watch: ?writer_queue.Watch = null,
-    /// §8.2's shared mmap lock region, set by `fairWriterLockWithIo` (and,
-    /// as later steps migrate them, the other constructors) in place of
-    /// `queue_turn`/`queue_watch`. Heap-allocated (`std.heap.page_allocator`,
-    /// matching `inode_lock.Entry.region`'s own convention) rather than
-    /// stored by value, because unlike `inode_lock.Entry` (always accessed
-    /// through one `*Entry`, never copied) a `PathWriterLock` value is
-    /// copied and moved pervasively by its own callers (`var lease = held;`,
-    /// `self.retained = lease.*;`) -- a `Region` copied that way would let
-    /// two independent values both believe they own the one mapping/fd and
-    /// both try to tear it down.
+    /// §8.2's shared mmap lock region, set by whichever of this type's own
+    /// six constructors could use it -- `null` for a lease taken through
+    /// the single plain-flock fallback (§8.6: the region unusable for this
+    /// path, or `lockWriterPath`'s own CLI path, which never attempts the
+    /// region at all -- see its own doc comment). Heap-allocated
+    /// (`std.heap.page_allocator`, matching `inode_lock.Entry.region`'s own
+    /// convention) rather than stored by value, because unlike
+    /// `inode_lock.Entry` (always accessed through one `*Entry`, never
+    /// copied) a `PathWriterLock` value is copied and moved pervasively by
+    /// its own callers (`var lease = held;`, `self.retained = lease.*;`) --
+    /// a `Region` copied that way would let two independent values both
+    /// believe they own the one mapping/fd and both try to tear it down.
     ///
-    /// During this transitional step the region's own `writer_holder` CAS
-    /// is *not yet* the real safety authority: it only decides fairness
-    /// order among the constructors already migrated onto it (today, just
-    /// `fairWriterLockWithIo`), the same narrow role `writer_queue.Queue`'s
-    /// own ticket/turn played. The sidecar `flock` (`file` above) remains
-    /// the actual mutual-exclusion mechanism every constructor -- migrated
-    /// or not -- still takes, so a caller on the old path and a caller on
-    /// the new one still exclude each other correctly. Only once every
-    /// constructor (and every other remaining flock caller) has moved onto
-    /// the region does a later step retire the flock itself and let the
-    /// region's CAS become the real authority.
+    /// The region's own `writer_holder` CAS is *not* this lease's safety
+    /// authority by itself: the sidecar `flock` (`file` above), taken by
+    /// every constructor (region-backed or plain-flock fallback alike), is
+    /// what every caller actually excludes against, so a region-backed
+    /// lease and a plain-flock fallback lease on the same file still
+    /// correctly exclude each other. The region's CAS only decides
+    /// *fairness order* among the constructors that use it.
     region: ?*shared_lock_region.Region = null,
+    /// Whether `fairWriterLockWithIo` took a real region ticket to get
+    /// this lease rather than winning the ticketless fast path -- the
+    /// same `.queued` vs `.uncontended` admission-stats distinction
+    /// `writer_queue.zig`'s own `queue_turn` (a real turn) versus
+    /// `queue_watch` (an idle-queue bypass) used to carry before this
+    /// design moved off it. `false` for every other constructor (never
+    /// set by them).
+    contended: bool = false,
     /// When the kernel lease was first taken; kept across in-process handoffs.
     acquired_ns: i96 = 0,
     /// Where `close` records this holder's hold time. Cleared on handoff
@@ -4598,31 +4587,25 @@ pub const PathWriterLock = struct {
     }
 
     /// Whether a writer in another process has queued behind this lease.
-    /// Unknown (no queue) answers true so callers release instead of keeping it.
+    /// Unknown (no region -- the single plain-flock fallback, §8.6) answers
+    /// true so callers release instead of keeping it.
     pub fn othersWaiting(self: *const PathWriterLock) bool {
         if (self.region) |region| return region.othersWaiting();
-        const io = self.borrowed_io orelse return true;
-        if (self.queue_turn) |*turn| return turn.hasSuccessor(io);
-        if (self.queue_watch) |*watch| return watch.hasArrivals(io);
         return true;
     }
 
     /// Like `othersWaiting`, but true only for a waiter in a genuinely
-    /// different *process* -- see `writer_queue.Queue.
-    /// foreignTicketsIssuedSince`. Unlike `othersWaiting`, this process's
-    /// own background maintenance worker (or any other same-process
-    /// caller that reaches the queue through a path other than the one
-    /// holding this lease) never counts, since it registers a ticket
-    /// tagged with this same process's id. Callers that would otherwise
-    /// treat their own maintenance work as a hostile waiter -- starving it
-    /// by never releasing, since it only ever shows up as "someone is
-    /// queued" and never actually goes away on its own -- use this
-    /// instead.
+    /// different *process* -- see `Region.othersWaitingAcrossProcesses`.
+    /// Unlike `othersWaiting`, this process's own background maintenance
+    /// worker (or any other same-process caller that reaches the region
+    /// through a path other than the one holding this lease) never
+    /// counts, since its own ticket is tagged with this same process's
+    /// id. Callers that would otherwise treat their own maintenance work
+    /// as a hostile waiter -- starving it by never releasing, since it
+    /// only ever shows up as "someone is queued" and never actually goes
+    /// away on its own -- use this instead.
     pub fn othersWaitingAcrossProcesses(self: *const PathWriterLock, own_pid: u32) bool {
         if (self.region) |region| return region.othersWaitingAcrossProcesses(own_pid);
-        const io = self.borrowed_io orelse return true;
-        if (self.queue_turn) |*turn| return turn.hasForeignSuccessor(io, own_pid);
-        if (self.queue_watch) |*watch| return watch.hasForeignArrivals(io, own_pid);
         return true;
     }
 
@@ -4633,11 +4616,8 @@ pub const PathWriterLock = struct {
         // The hold ends when the descriptor (and its flock) is released, so
         // it covers reader-marker cleanup done under the lock, as handoffs do.
         self.endHold();
-        if (self.queue_turn) |*turn| turn.release(io);
-        if (self.queue_watch) |*watch| watch.release(io);
         if (self.region) |region| {
-            // Mirrors `turn.release(io)`'s own timing: held for this
-            // lease's whole lifetime, released only here.
+            // Released only here, held for this lease's whole lifetime.
             region.releaseWriter();
             region.close();
             std.heap.page_allocator.destroy(region);
@@ -6084,6 +6064,18 @@ pub const NativeFile = struct {
 
         const inode_entry = try inode_lock.open(io, path);
         errdefer inode_lock.unref(inode_entry, io);
+        // Eagerly establish (or attach to an already-cached) this inode's
+        // shared lock region here, at open time, instead of leaving its
+        // one-time create/validate cost (`Region.openSized`) to land
+        // lazily inside whichever call happens to be first to need it --
+        // which, for a writer, can be the first page-reusing commit
+        // (`acquireEpochReuseLock` -> `regionForInode`), landing region
+        // setup work inside a commit's own fault window. Every error is
+        // swallowed exactly like `regionForInode` already does: a region
+        // that can't be set up here just means every later caller's own
+        // region-mode fallback engages instead, never a reason to fail
+        // this open.
+        _ = inode_lock.ensureRegion(inode_entry, io) catch {};
 
         // Every read-only open used to ask `openDataFile` to take its
         // `.shared` kernel lock atomically at open, on its own fd, for
@@ -6671,6 +6663,10 @@ pub const NativeFile = struct {
         // create.
         const inode_entry = try inode_lock.open(io, path);
         errdefer inode_lock.unref(inode_entry, io);
+        // See the matching comment in `openWithRuntime`: set the region up
+        // eagerly here too, so a freshly created file never defers that
+        // one-time cost into its first page-reusing commit either.
+        _ = inode_lock.ensureRegion(inode_entry, io) catch {};
 
         var result = NativeFile{
             .allocator = allocator,
@@ -6788,6 +6784,51 @@ pub const NativeFile = struct {
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
         self.namespace_directory_cache = .empty;
         self.header = header;
+    }
+
+    /// The real fix for the stale-writer corruption (`UnexpectedNativePageKind`
+    /// seen under sustained concurrent Lite load): a second `NativeFile`
+    /// instance on the same inode in this process -- most commonly a
+    /// maintenance turn's own detached snapshot (`refreshMaintenanceSnapshot`),
+    /// but potentially a writer-lease handoff's receiving instance too -- can
+    /// fall behind another instance's commits and still go on to allocate or
+    /// reuse pages out of its own now-stale free map. By the time
+    /// `publishCheckpoint`'s own backstop assertion would catch that, the
+    /// damage (a page another commit already made live has been reused and
+    /// overwritten) is already done. The fix is to catch it here instead,
+    /// before this instance gains the right to allocate or reuse anything:
+    /// every entry point that leads to `pageAllocatorFromFreeMap`/
+    /// `pageAllocatorFromFreeMapWithProof` for an ordinary write
+    /// (`beginTransaction`, which `reclaimPagesImpl` also funnels through)
+    /// or for vacuum (`vacuumWithCancel`) calls this first.
+    ///
+    /// If this instance's own base (its currently active checkpoint) is
+    /// behind the inode registry's shared, process-wide latest known-durable
+    /// sequence, refresh in place: re-read the header and checkpoint slots
+    /// from disk (cheap -- the same file's pages are already in the OS page
+    /// cache even for an unsynced ride-along commit) and pick the active
+    /// checkpoint exactly as a fresh open would, then reuse
+    /// `adoptIndexPublicationHeader`'s cache/ledger invalidation to rebind
+    /// this instance to it, exactly as a borrowed index writer rebinds to
+    /// its owner's newest header. Never truncates: unlike `open`'s own
+    /// recovery, this is not resolving a crash, so a rejected candidate's
+    /// tail is left alone for whichever instance still needs it.
+    fn refreshIfWriterBaseStale(self: *NativeFile) !void {
+        const entry = self.inode_lock_ref.load(.acquire) orelse return;
+        const latest = inode_lock.committedSequence(entry);
+        const base = self.activeCheckpoint().commit_sequence;
+        if (base >= latest) return;
+        const io = self.runtime();
+        var header_bytes: [header_size]u8 = undefined;
+        try readHeaderExactAt(self.file, io, &header_bytes);
+        var header = try decodeHeader(&header_bytes);
+        const file_size = (try self.file.stat(io)).size;
+        header.checkpoints = loadCheckpointSlots(self.file, io, header.page_size, file_size);
+        const recovered = try recoverActiveCheckpoint(self.file, io, header, file_size, false);
+        header.active_checkpoint = recovered.index;
+        const new_sequence = header.checkpoints[header.active_checkpoint].commit_sequence;
+        std.log.debug("lite: NativeFile instance refreshed a stale writer base (path={s} ptr={*} old_base={d} new_base={d} registry_latest={d})", .{ self.path, self, base, new_sequence, latest });
+        try self.adoptIndexPublicationHeader(header);
     }
 
     /// Carry pending lineage across identical runtime generations, or inherit
@@ -12068,6 +12109,7 @@ pub const NativeFile = struct {
         // on the same path in an `externally_locked` setup).
         const data_lock = try self.acquireInodeLock(.exclusive, false, false, "vacuumWithCancel");
         defer data_lock.release(self.runtimeIo());
+        try self.refreshIfWriterBaseStale();
         // Replaces the old namespace-directory scan: a live pin in the
         // region's reader table (any reader, indexed or not -- the region
         // doesn't distinguish) refuses the vacuum rather than rewriting
@@ -14414,6 +14456,8 @@ pub const NativeFile = struct {
         // `reconcilePublicationUncertainty`. Only a disk that is still
         // failing (or an inconsistent latch) falls through to the refusal.
         if (self.checkpoint_publication_uncertain) try self.reconcilePublicationUncertainty();
+        try self.refreshIfWriterBaseStale();
+        if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.claimActiveWriter(entry, @intFromPtr(self));
         self.transaction_header = self.header;
         self.artifact_lease_transaction = false;
         self.allocator_certificate_staged = false;
@@ -14949,7 +14993,49 @@ pub const NativeFile = struct {
     /// would then re-verify a stale entry list an unrelated, possibly
     /// already-overwritten commit wrote. `false` resets all four to the
     /// safe presynced default before anything else.
+    /// Publishes this handle's own just-durable commit sequence to the
+    /// per-inode registry entry (shared, in this process, by every other
+    /// `NativeFile` instance on the same inode), so any of them can tell
+    /// whether its own in-memory header/allocator state is stale relative
+    /// to what another instance already committed -- the writer-side twin
+    /// of the on-disk stale-base check. A no-op if this handle never
+    /// registered with the registry (e.g. a bare test construction).
+    fn publishCommittedSequenceToInode(self: *NativeFile) void {
+        if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.publishCommittedSequence(entry, self.activeCheckpoint().commit_sequence);
+    }
+
     fn publishCheckpoint(self: *NativeFile, proposed: CheckpointSlot, manifest_prepared: bool, hooks: ?SyncLockHooks) !void {
+        // Backstop only: the real fix is `refreshIfWriterBaseStale`, called
+        // from every entry point that gains the right to allocate or reuse
+        // a page (`beginTransaction`, which `reclaimPagesImpl` also funnels
+        // through, and `vacuumWithCancel`) *before* any allocation happens.
+        // By the time a stale instance reaches publication, it has already
+        // reused and overwritten pages out of its own stale free map --
+        // refusing the publish here is too late to prevent the corruption,
+        // only to detect that it already happened. This must never fire;
+        // if it does, something upstream failed to refresh (or a new path
+        // reaches `publishCheckpoint` without going through one of the
+        // guarded entry points above), and that is a hard bug, not a
+        // transient condition to retry around. Panics rather than
+        // returning a catchable error, so it can never be silently
+        // swallowed by a broad catch anywhere between here and a test
+        // harness.
+        if (self.transaction_header == null) {
+            if (self.inode_lock_ref.load(.acquire)) |entry| {
+                // Second backstop: the writer-lease admission gate
+                // (`WriterLane`/`Owner`, capi/lite_connection.zig) is
+                // supposed to guarantee at most one claimant between
+                // `beginTransaction` and here. See `active_writer`'s own
+                // doc comment in inode_lock.zig for exactly what this
+                // does and does not prove.
+                inode_lock.assertActiveWriter(entry, @intFromPtr(self));
+                const base = self.activeCheckpoint().commit_sequence;
+                const latest = inode_lock.committedSequence(entry);
+                if (base < latest) {
+                    std.debug.panic("lite: stale writer base reached publishCheckpoint (path={s} base={d} latest={d} proposed_seq={d})", .{ self.path, base, latest, proposed.commit_sequence });
+                }
+            }
+        }
         var checkpoint = proposed;
         if (!manifest_prepared) {
             checkpoint.presynced = true;
@@ -15018,6 +15104,7 @@ pub const NativeFile = struct {
                 state.released_data_pages = 0;
                 state.retired_inline_bytes = 0;
             }
+            self.publishCommittedSequenceToInode();
             return;
         }
         const next_slot: u8 = if (self.header.active_checkpoint == 0) 1 else 0;
@@ -15089,6 +15176,7 @@ pub const NativeFile = struct {
             state.released_data_pages = 0;
             state.retired_inline_bytes = 0;
         }
+        self.publishCommittedSequenceToInode();
     }
 
     fn notifyPublication(self: *NativeFile) void {
@@ -15596,19 +15684,20 @@ pub fn create(io: std.Io, path: []const u8) !void {
     try fs_paths.syncDirPortable(io, std.fs.path.dirname(create_target) orelse ".");
 }
 
-/// Deliberately not migrated onto the region: this owns a fresh `io_impl`
-/// (CLI backup/export/import's "no caller-supplied `Io`" path), and a
+/// Deliberately stays on the single plain-flock fallback (§8.6) rather
+/// than ever attempting the region: this owns a fresh `io_impl` (CLI
+/// backup/export/import's "no caller-supplied `Io`" path), and a
 /// `Region` caches whatever `Io` opened it (`Region.io`, used later by
 /// `close`) for that handle's whole lifetime -- but `PathWriterLock`
 /// values, `io_impl` included, are copied/moved pervasively by their own
 /// callers (see `PathWriterLock.region`'s own doc comment), which would
 /// leave a `Region` opened here pointing at a stale address the moment
 /// this function's own `io_impl` local gets copied into the value this
-/// returns. `lockWriterPathWithIo`, migrated below, has no such problem:
-/// its `io` is always borrowed from a caller who owns their own `Io`
-/// instance stably, never a freshly-created local about to move. A CLI
-/// single-shot nonblocking attempt has little to gain from the region's
-/// own fairness anyway.
+/// returns. `lockWriterPathWithIo` has no such problem: its `io` is
+/// always borrowed from a caller who owns their own `Io` instance
+/// stably, never a freshly-created local about to move. A CLI single-
+/// shot nonblocking attempt has little to gain from the region's own
+/// fairness anyway.
 pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
     var io_impl = threaded_io_limits.initService(allocator);
     errdefer io_impl.deinit();
@@ -15701,40 +15790,39 @@ pub fn waitPathLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, wr
 }
 
 /// FIFO cross-process writer admission. Fairness order is decided by
-/// `shared_lock_region`'s own ticket (§8.2), not `writer_queue` -- the
-/// first of this design's six constructors to migrate onto it. The sidecar
-/// `flock`, taken after the region grants this lease its turn, is still the
-/// *actual* safety authority: the other five constructors haven't moved
-/// onto the region yet, so it alone is what every caller, old path or new,
-/// still excludes against (see `PathWriterLock.region`'s own doc comment).
-/// When nobody is queued, an uncontended writer skips the ticket entirely.
-/// An expired deadline still permits that immediate acquisition. `wait_io`
+/// `shared_lock_region`'s own ticket (§8.2). The sidecar `flock`, taken
+/// after the region grants this lease its turn, is still the *actual*
+/// safety authority (see `PathWriterLock.region`'s own doc comment), so
+/// a lease taken through this path and one taken through the single
+/// plain-flock fallback below still correctly exclude each other. When
+/// nobody is queued, an uncontended writer skips the ticket entirely. An
+/// expired deadline still permits that immediate acquisition. `wait_io`
 /// must be able to run a concurrent kernel wait.
 ///
-/// Falls back to `fairWriterLockLegacy` (today's `writer_queue`-based
-/// implementation, unchanged) whenever the region itself can't be used --
-/// the same set of conditions that already sent the old implementation to
-/// `plainWriterLockUntil`, plus the region's own "can't use it here"
-/// errors. §8.6's own dedicated fallback flag (detected once at open and
-/// recorded on `inode_lock.Entry`, not re-probed on every acquire) is a
-/// later step; this is a narrower, call-by-call version of the same idea.
+/// Falls back to the single plain-flock path (§8.6: no FIFO fairness, as
+/// SQLite behaves on NFS) whenever the region itself can't be used --
+/// the same set of conditions `plainWriterLockUntil` itself already
+/// treats as "no region here" for its own internal wait, plus the
+/// region's own "can't use it here" errors. That fallback is simply
+/// calling `plainWriterLockUntil` directly, with no ticket taken at
+/// all, since a lease it returns already blocks on the real sidecar
+/// lock the same way a ticket-won lease's own second half does.
 pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
     const pid = antfly_platform.process.currentId() orelse 0;
-    // A read-only or otherwise uncooperative filesystem (the same
-    // conditions that already send the legacy implementation to
-    // `plainWriterLockUntil`), proven corruption, or exhausted liveness
-    // slots fall back to the proven legacy path rather than surfacing a
-    // region-specific error to callers that have never had to handle one.
-    // Anything else (notably `OutOfMemory`) propagates instead of being
-    // swallowed into a fallback that would likely fail the same way. See
+    // A read-only or otherwise uncooperative filesystem, proven
+    // corruption, or exhausted liveness slots fall back to the single
+    // plain-flock path rather than surfacing a region-specific error to
+    // callers that have never had to handle one. Anything else (notably
+    // `OutOfMemory`) propagates instead of being swallowed into a
+    // fallback that would likely fail the same way. See
     // `inode_lock.isRegionUnusable`'s own doc comment: every migrated
     // caller, writer or reader side, shares this one check.
     var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
-        if (inode_lock.isRegionUnusable(err)) return fairWriterLockLegacy(allocator, io, wait_io, path, deadline_ns);
+        if (inode_lock.isRegionUnusable(err)) return plainWriterLockUntil(allocator, io, wait_io, path, deadline_ns);
         return err;
     };
     errdefer region.close();
-    region.acquireWriterFairBounded(wait_io, pid, .{ .nanoseconds = deadline_ns }) catch |err| switch (err) {
+    const contended = region.acquireWriterFairBounded(wait_io, pid, .{ .nanoseconds = deadline_ns }) catch |err| switch (err) {
         error.Timeout => return error.FileBusy,
         error.Canceled => return error.Canceled,
     };
@@ -15751,71 +15839,24 @@ pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, p
     const owned_region = try std.heap.page_allocator.create(shared_lock_region.Region);
     owned_region.* = region;
     lease.region = owned_region;
-    lease.acquired_ns = std.Io.Clock.awake.now(io).nanoseconds;
-    return lease;
-}
-
-/// Today's `writer_queue`-based FIFO cross-process writer admission,
-/// unchanged -- `fairWriterLockWithIo`'s own fallback for when the region
-/// can't be used (see its doc comment).
-fn fairWriterLockLegacy(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
-    const lock_path = try writerLockPathAlloc(allocator, io, path);
-    defer allocator.free(lock_path);
-    var queue = writer_queue.Queue.open(allocator, io, lock_path) catch |err| switch (err) {
-        // Without a writable queue directory there is nobody to be fair to;
-        // keep the plain kernel wait. The queue name always fits when the
-        // sidecar's does; a full path at the platform limit still falls back.
-        error.AccessDenied, error.ReadOnlyFileSystem, error.PermissionDenied, error.NameTooLong => return plainWriterLockUntil(allocator, io, wait_io, path, deadline_ns),
-        else => return err,
-    };
-    var queue_owned = true;
-    defer if (queue_owned) queue.close(io);
-
-    var tail = try queue.lockTail(wait_io, deadline_ns);
-    var tail_held = true;
-    defer if (tail_held) tail.release(io);
-    if (try queue.isIdle(io, &tail)) {
-        // Holding the tail means no ticket can be issued ahead of us.
-        if (acquireWriterLock(allocator, io, path)) |held| {
-            queue_owned = false;
-            return .{
-                .io_impl = undefined,
-                .borrowed_io = io,
-                .file = held.file,
-                .queue_watch = .{ .queue = queue, .mark = tail.next },
-                .acquired_ns = std.Io.Clock.awake.now(io).nanoseconds,
-            };
-        } else |err| if (err != error.WouldBlock and err != error.FileBusy) return err;
-    }
-    // A zero or spent budget may only take an uncontended lease.
-    if (deadline_ns - std.Io.Clock.awake.now(io).nanoseconds <= 0) return error.FileBusy;
-    var ticket = try queue.enqueue(io, &tail);
-    tail.release(io);
-    tail_held = false;
-
-    try queue.awaitTurn(wait_io, &ticket, deadline_ns);
-    var turn: writer_queue.Turn = .{ .queue = queue, .ticket = ticket };
-    queue_owned = false;
-    errdefer turn.release(io);
-    // Our turn: only readers or a writer that bypassed the queue can still
-    // hold the sidecar, and only one queued writer ever waits here.
-    var lease = try plainWriterLockUntil(allocator, io, wait_io, path, deadline_ns);
-    lease.queue_turn = turn;
+    lease.contended = contended;
     lease.acquired_ns = std.Io.Clock.awake.now(io).nanoseconds;
     return lease;
 }
 
 /// Nonblocking writer acquisition that never jumps the FIFO: returns
 /// `error.WouldBlock` while any writer is queued or holds a turn. §8.2's
-/// "try" mode (`region.tryAcquireWriterFair`), the second of this
-/// design's six constructors to migrate (after `fairWriterLockWithIo`);
-/// falls back to the unchanged `writer_queue`-based implementation
-/// (renamed `tryFairWriterLockLegacy`) when the region can't be used, the
-/// same `inode_lock.isRegionUnusable` check every migrated caller shares.
+/// "try" mode (`region.tryAcquireWriterFair`). Falls back to
+/// `lockWriterPathWithIo` (the single plain-flock fallback's own
+/// nonblocking attempt, §8.6) when the region can't be used, the same
+/// `inode_lock.isRegionUnusable` check every migrated caller shares --
+/// that call already jumps straight to a bare nonblocking kernel attempt
+/// when it finds the region unusable too, so there is nothing further
+/// for this function's own fallback to add.
 pub fn tryFairWriterLockWithIo(allocator: Allocator, io: std.Io, path: []const u8) !PathWriterLock {
     const pid = antfly_platform.process.currentId() orelse 0;
     var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
-        if (inode_lock.isRegionUnusable(err)) return tryFairWriterLockLegacy(allocator, io, path);
+        if (inode_lock.isRegionUnusable(err)) return lockWriterPathWithIo(allocator, io, path);
         return err;
     };
     if (!region.tryAcquireWriterFair(pid)) {
@@ -15835,23 +15876,6 @@ pub fn tryFairWriterLockWithIo(allocator: Allocator, io: std.Io, path: []const u
         .region = owned_region,
         .acquired_ns = std.Io.Clock.awake.now(io).nanoseconds,
     };
-}
-
-/// Today's `writer_queue`-based nonblocking try, unchanged --
-/// `tryFairWriterLockWithIo`'s own fallback for when the region can't be
-/// used (see its doc comment).
-fn tryFairWriterLockLegacy(allocator: Allocator, io: std.Io, path: []const u8) !PathWriterLock {
-    const lock_path = try writerLockPathAlloc(allocator, io, path);
-    defer allocator.free(lock_path);
-    var queue = writer_queue.Queue.open(allocator, io, lock_path) catch |err| switch (err) {
-        error.AccessDenied, error.ReadOnlyFileSystem, error.PermissionDenied, error.NameTooLong => return lockWriterPathWithIo(allocator, io, path),
-        else => return err,
-    };
-    defer queue.close(io);
-    var tail = try queue.tryLockTail(io);
-    defer tail.release(io);
-    if (!try queue.isIdle(io, &tail)) return error.WouldBlock;
-    return .{ .io_impl = undefined, .borrowed_io = io, .file = (try acquireWriterLock(allocator, io, path)).file, .acquired_ns = std.Io.Clock.awake.now(io).nanoseconds };
 }
 
 const PathRegionForWait = struct { entry: *inode_lock.Entry, region: *shared_lock_region.Region };
@@ -15875,24 +15899,23 @@ fn pathRegionForWait(io: std.Io, path: []const u8) !PathRegionForWait {
     return .{ .entry = entry, .region = region };
 }
 
+/// The region-based wait when one is available; otherwise (region
+/// unusable, or not yet applicable -- the region is genuinely optional
+/// here, unlike `fairWriterLockWithIo`'s own ticket) the single plain-
+/// flock fallback's own OS-lock-queue wait (`waitPathLockWithIo`), §8.6.
+/// Every caller of this function -- region-backed or not -- ends up
+/// here for the one, real, authoritative kernel lease.
 fn plainWriterLockUntil(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
-    // `null` when the region can't be used here -- `inode_lock.open`'s
-    // own `statFile` on the *data* file (not the sidecar `acquireWriterLock`
-    // below creates on demand) can fail with `FileNotFound` on a caller's
-    // first-ever acquire, before that data file exists yet, which is not
-    // the "this filesystem/region can't be used at all" condition
-    // `inode_lock.isRegionUnusable` means -- falls back to the legacy
-    // OS-lock-queue wait below either way. Anything else (notably
-    // `OutOfMemory`) propagates instead of being swallowed into a
-    // fallback that would likely fail the same way, the same posture
-    // every other migrated constructor's own `isRegionUnusable` check
-    // takes.
-    const cached: ?PathRegionForWait = blk: {
-        break :blk pathRegionForWait(wait_io, path) catch |err| {
-            if (err != error.FileNotFound and !inode_lock.isRegionUnusable(err)) return err;
-            break :blk null;
-        };
-    };
+    // Set up lazily, on the first retry only -- never on a warm,
+    // uncontended call that wins `acquireWriterLock` below on its very
+    // first attempt. An earlier version of this call set this up
+    // unconditionally, up front, which added `inode_lock.open`'s own
+    // `statFile` syscall to every single acquisition, uncontended or
+    // not; that silently cost this design's own "0 syscalls on a warm
+    // write" property and tightened enough margin on a few busy-timeout
+    // tests to make them flake.
+    var cached: ?PathRegionForWait = null;
+    var cache_attempted = false;
     defer if (cached) |c| inode_lock.unref(c.entry, wait_io);
 
     var backoff_ns: i96 = 50 * std.time.ns_per_us;
@@ -15901,6 +15924,28 @@ fn plainWriterLockUntil(allocator: Allocator, io: std.Io, wait_io: std.Io, path:
             return .{ .io_impl = undefined, .borrowed_io = io, .file = held.file };
         } else |err| if (err != error.WouldBlock and err != error.FileBusy) return err;
         if (deadline_ns - std.Io.Clock.awake.now(io).nanoseconds <= 0) return error.FileBusy;
+        if (!cache_attempted) {
+            cache_attempted = true;
+            // `null` when the region can't be used here --
+            // `inode_lock.open`'s own `statFile` on the *data* file (not
+            // the sidecar `acquireWriterLock` above creates on demand)
+            // can fail with `FileNotFound` on a caller's first-ever
+            // acquire, before that data file exists yet, which is not
+            // the "this filesystem/region can't be used at all"
+            // condition `inode_lock.isRegionUnusable` means -- falls
+            // back to the single plain-flock path's own OS-lock-queue
+            // wait below either way. Anything else (notably
+            // `OutOfMemory`) propagates instead of being swallowed into
+            // a fallback that would likely fail the same way, the same
+            // posture every other migrated constructor's own
+            // `isRegionUnusable` check takes.
+            cached = blk: {
+                break :blk pathRegionForWait(wait_io, path) catch |err| {
+                    if (err != error.FileNotFound and !inode_lock.isRegionUnusable(err)) return err;
+                    break :blk null;
+                };
+            };
+        }
         if (cached) |c| {
             // A real wake signal (or a short internal re-check step, not
             // a dumb poll) on the region's own futex -- loop straight

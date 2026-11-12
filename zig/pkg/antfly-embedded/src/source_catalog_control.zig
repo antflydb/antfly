@@ -240,6 +240,7 @@ pub const storage_backup_bundle_io = @import("storage/backup_bundle_io.zig");
 pub const storage_backup_codec = @import("storage/backup_codec.zig");
 pub const storage_backup_restore = @import("storage/backup_restore.zig");
 pub const storage_byte_range = @import("storage/byte_range.zig");
+pub const storage_commit_participant = @import("storage/commit_participant.zig");
 pub const storage_coordinated_ttl = @import("storage/coordinated_ttl.zig");
 pub const storage_coverage_identity = @import("storage/coverage_identity.zig");
 pub const storage_db_aggregations = @import("storage/db/aggregations.zig");
@@ -449,6 +450,7 @@ pub const storage_db_primary_effect = @import("storage/db/primary_effect.zig");
 pub const storage_db_promotion_runtime = @import("storage/db/promotion_runtime.zig");
 pub const storage_db_publication = @import("storage/db/publication.zig");
 pub const storage_db_query_control_contract = @import("storage/db/query/control_contract.zig");
+pub const storage_db_query_cypher_projection = @import("storage/db/query/cypher_projection.zig");
 pub const storage_db_query_graph_exec = @import("storage/db/query/graph_exec.zig");
 pub const storage_db_query_json_view = @import("storage/db/query/json_view.zig");
 pub const storage_db_query_native_array = @import("storage/db/query/native_array.zig");
@@ -577,7 +579,6 @@ pub const storage_lite_index_storage = @import("storage/lite/index_storage.zig")
 pub const storage_lite_ledger_digest = @import("storage/lite/ledger_digest.zig");
 pub const storage_lite_mod = @import("storage/lite/mod.zig");
 pub const storage_lite_path_lock_wait = @import("storage/lite/path_lock_wait.zig");
-pub const storage_lite_writer_queue = @import("storage/lite/writer_queue.zig");
 pub const storage_lite_native = @import("storage/lite/native.zig");
 pub const storage_lite_native_catalog_sink = @import("storage/lite/native_catalog_sink.zig");
 pub const storage_lite_paths = @import("storage/lite/paths.zig");
@@ -589,6 +590,7 @@ pub const storage_lite_metadata_pool = @import("storage/lite/metadata_pool.zig")
 pub const storage_prepared_score_plan = @import("storage/prepared_score_plan.zig");
 pub const storage_prepared_score_request = @import("storage/prepared_score_request.zig");
 pub const storage_lite_reclamation = @import("storage/lite/reclamation.zig");
+pub const storage_lite_redo_log = @import("storage/lite/redo_log.zig");
 pub const storage_lite_secret_store = @import("storage/lite/secret_store.zig");
 pub const storage_lite_snapshot_test = @import("storage/lite/snapshot_test.zig");
 pub const storage_local_query_controls = @import("storage/query_controls.zig");
@@ -632,6 +634,7 @@ pub const storage_object_storage = @import("storage/object_storage.zig");
 pub const storage_persistent = @import("storage/persistent.zig");
 pub const storage_persistent_sim_fixture = @import("storage/persistent_sim_fixture.zig");
 pub const storage_portable_backup = @import("storage/portable_backup.zig");
+pub const storage_embedded_graph_catalog = @import("storage/embedded_graph_catalog.zig");
 pub const storage_portable_source_verifier = @import("storage/portable_source_verifier.zig");
 pub const storage_portable_wal = @import("storage/portable_wal.zig");
 pub const storage_posting_refresh_progress = @import("storage/posting_refresh_progress.zig");
@@ -889,11 +892,7 @@ pub const storage_source_value_identity = @import("storage/source_value_identity
 
 pub const storage_db_mutation_plan = @import("storage/db/mutation_plan.zig");
 
-pub const storage_db_query_cypher_projection = @import("storage/db/query/cypher_projection.zig");
-
 pub const storage_db_transform_read_plan = @import("storage/db/transform_read_plan.zig");
-
-pub const storage_embedded_graph_catalog = @import("storage/embedded_graph_catalog.zig");
 
 pub const storage_read_session_contract = @import("storage/read_session_contract.zig");
 
