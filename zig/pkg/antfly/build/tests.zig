@@ -6506,6 +6506,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db graph indexed admission reuses compressed membership and honors cancellation and memory",
         "graph committed intents survive canceled durability fences",
         "graph.query.",
+        "prefix-only pattern hops run without a document evaluator",
+        "batch prefix filtering bypasses document evaluation and query filters fail explicitly",
         "index maintenance VOPR regression exact replay",
         // This bounded smoke shares the storage compilation with its unit coverage.
         "db graph metric runtime background coordinator and worker pool loops publish pagerank",

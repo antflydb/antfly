@@ -241,6 +241,7 @@ pub const Client = struct {
     io: std.Io,
     create_json: []u8,
     initial_content_security: ?[]u8 = null,
+    worker_executable: ?[]u8 = null,
     content_security_source: bridge.ContentSecuritySource = .{},
     environment: std.process.Environ.Map,
     mutex: std.Io.Mutex = .init,
@@ -288,7 +289,7 @@ pub const Client = struct {
         const initial_security = if (context.content_security_json.slice()) |bytes| try alloc.dupe(u8, bytes) else null;
         errdefer if (initial_security) |bytes| alloc.free(bytes);
         if (initial_security) |bytes| if (bytes.len > rpc.max_auxiliary_bytes) return error.BodyTooLarge;
-        const settings = try std.json.parseFromSliceLeaky(struct { worker_environment: []const EnvironmentEntry = &.{} }, arena.allocator(), context.runtime_config_json.slice(), .{ .ignore_unknown_fields = true });
+        const settings = try std.json.parseFromSliceLeaky(struct { worker_environment: []const EnvironmentEntry = &.{}, worker_executable: ?[]const u8 = null }, arena.allocator(), context.runtime_config_json.slice(), .{ .ignore_unknown_fields = true });
         var environment = std.process.Environ.Map.init(alloc);
         errdefer environment.deinit();
         // This child uses RPC as its lifeline, not the separate inference-run
@@ -298,8 +299,10 @@ pub const Client = struct {
                 std.mem.eql(u8, entry.name, "ANTFLY_INFERENCE_SUPERVISOR_LIFELINE")) continue;
             try environment.put(entry.name, entry.value);
         }
+        const worker_executable = if (settings.worker_executable) |path| try alloc.dupe(u8, path) else null;
+        errdefer if (worker_executable) |path| alloc.free(path);
         const self = try alloc.create(Client);
-        self.* = .{ .alloc = alloc, .io = io, .create_json = json, .initial_content_security = initial_security, .environment = environment, .content_security_source = context.content_security_source };
+        self.* = .{ .alloc = alloc, .io = io, .create_json = json, .worker_executable = worker_executable, .initial_content_security = initial_security, .environment = environment, .content_security_source = context.content_security_source };
         return self;
     }
 
@@ -319,6 +322,7 @@ pub const Client = struct {
         if (self.worker) |worker| worker.destroy();
         if (self.budget) |budget| budget.release_context(budget.context);
         self.alloc.free(self.create_json);
+        if (self.worker_executable) |path| self.alloc.free(path);
         if (self.initial_content_security) |bytes| self.alloc.free(bytes);
         self.environment.deinit();
         self.alloc.destroy(self);
@@ -335,7 +339,7 @@ pub const Client = struct {
         if (self.budget == null) return error.ResourceOwnerNotConfigured;
         const worker = try self.alloc.create(Worker);
         errdefer self.alloc.destroy(worker);
-        const executable = try resolveWorkerExecutable(self.alloc, self.io);
+        const executable = try resolveWorkerExecutable(self.alloc, self.io, self.worker_executable);
         defer self.alloc.free(executable);
         const child = std.process.spawn(self.io, .{
             .argv = &.{ executable, "inference", "_worker" },
@@ -483,23 +487,30 @@ fn findOnPathAlloc(alloc: std.mem.Allocator, io: std.Io, name: []const u8) !?[]u
 /// (`<exe> inference _worker`, host-owned and replaceable so a crashing GPU
 /// driver call or unabortable native session load cannot take the caller
 /// down with it -- see `BackendRuntime.hasUninterruptibleCalls`). The
-/// `antfly` CLI binary re-execs itself, which is correct: `argv[0]` names the
-/// `antfly` binary the user launched. A library host (libantfly linked into a
-/// Go test binary, `examples/antfly-docs-knowledge-base`, or any other consumer) has no such
-/// self: its `argv[0]` is the host binary, not an `antfly` executable that
+/// `antfly` CLI binary explicitly supplies its OS executable path. A library
+/// host (libantfly linked into a Go test binary or another application) has no
+/// such self: its `argv[0]` is the host binary, not an `antfly` executable that
 /// understands `inference _worker`. Resolution order:
 ///
 ///  1. `ANTFLY_INFERENCE_WORKER`, an explicit override naming the worker
 ///     executable directly.
-///  2. The image this code was loaded from, via `dladdr`: for the statically
-///     linked `antfly` binary this resolves to itself (unchanged behavior);
-///     for a shared `libantfly`, it resolves to the `.dylib`/`.so`, next to
-///     which we look for a sibling antfly binary.
-///  3. An antfly binary on `PATH`.
-fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
-    if (platform.env.getenvSlice(worker_executable_env)) |override| {
+///  2. A CLI-owned executable path, resolved by the standalone launcher using
+///     the OS API (/proc/self/exe on Linux), independent of argv[0] and PATH.
+///  3. The image containing this code via dladdr, or a sibling antfly next to
+///     libantfly. Embedding hosts never implicitly re-exec themselves.
+///  4. An antfly binary on PATH.
+fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io, configured: ?[]const u8) ![]u8 {
+    return resolveWorkerExecutableWithOverride(alloc, io, configured, platform.env.getenvSlice(worker_executable_env));
+}
+
+fn resolveWorkerExecutableWithOverride(alloc: std.mem.Allocator, io: std.Io, configured: ?[]const u8, override_path: ?[]const u8) ![]u8 {
+    if (override_path) |override| {
         if (override.len == 0) return error.InferenceWorkerExecutableNotConfigured;
         return alloc.dupe(u8, override);
+    }
+    if (configured) |path| {
+        if (path.len == 0) return error.InferenceWorkerExecutableNotConfigured;
+        return alloc.dupe(u8, path);
     }
     if (selfImagePathAlloc(alloc)) |self_path| {
         defer alloc.free(self_path);
@@ -1491,4 +1502,16 @@ test "inference worker checkpoint upload feeds incremental HTTP reads and recove
     try std.testing.expectEqual(@as(u64, 100123), std.mem.readInt(u64, recovery.view().body[0..8], .little));
     try std.testing.expect(!fixture.parent.closed.load(.acquire));
     try std.testing.expect(!fixture.child.closed.load(.acquire));
+}
+
+test "worker discovery prefers the CLI OS path and preserves explicit overrides" {
+    const alloc = std.testing.allocator;
+    const configured = "/off-path/renamed-antfly";
+    const path = try resolveWorkerExecutableWithOverride(alloc, std.testing.io, configured, null);
+    defer alloc.free(path);
+    try std.testing.expectEqualStrings(configured, path);
+    const overridden = try resolveWorkerExecutableWithOverride(alloc, std.testing.io, configured, "/explicit/antfly");
+    defer alloc.free(overridden);
+    try std.testing.expectEqualStrings("/explicit/antfly", overridden);
+    try std.testing.expectError(error.InferenceWorkerExecutableNotConfigured, resolveWorkerExecutableWithOverride(alloc, std.testing.io, configured, ""));
 }

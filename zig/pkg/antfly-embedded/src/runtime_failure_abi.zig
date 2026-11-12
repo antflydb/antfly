@@ -871,6 +871,7 @@ pub const Status = enum(u32) {
     cypher_write_union_unsupported = 911,
     cypher_invalid_regex = 912,
     storage_owner_admission_pending = 913,
+    unsupported_node_filter_query = 914,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
