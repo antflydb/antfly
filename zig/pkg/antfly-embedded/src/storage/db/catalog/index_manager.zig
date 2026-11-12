@@ -6099,6 +6099,8 @@ pub const IndexManager = struct {
         /// Per-row planning only substitutes the document identity and removes
         /// consumers already satisfied by explicit/direct vectors.
         generated_templates: []enrichment_types.GeneratedEnrichmentRequest,
+        /// Constant-time publication membership, compiled once per catalog.
+        generated_definitions: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
         /// Catalog-wide completion requirements include projections and
         /// resolver/promotion work that never appears in the provider queue.
         completion_plan: ?@import("../artifact_completion_plan.zig").Plan = null,
@@ -6118,6 +6120,7 @@ pub const IndexManager = struct {
             if (self.group_sources) |*plan| plan.deinit();
             if (self.completion_plan) |*plan| plan.deinit();
             if (self.artifact_catalogs) |*catalogs| catalogs.deinit(self.alloc);
+            self.generated_definitions.deinit(self.alloc);
             for (self.text_fields) |field| self.alloc.free(field);
             if (self.text_fields.len != 0) self.alloc.free(self.text_fields);
             for (self.dense_fields) |field| {
@@ -6684,6 +6687,9 @@ pub const IndexManager = struct {
             errdefer alloc.free(identity);
             try external_spaces.put(alloc, name, identity);
         }
+        var generated_definitions: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+        errdefer generated_definitions.deinit(alloc);
+        for (generated_templates) |template| try generated_definitions.put(alloc, @import("../artifact_producer_input.zig").definitionDigest(template), {});
         return .{
             .alloc = alloc,
             .generation = self.writePlanGeneration(),
@@ -6700,6 +6706,7 @@ pub const IndexManager = struct {
             .sparse_fields = sparse_fields,
             .graph_fields = graph_fields,
             .generated_templates = generated_templates,
+            .generated_definitions = generated_definitions,
             .group_sources = group_sources,
             .completion_plan = completion_plan,
             .chunk_dependents = chunk_dependents,

@@ -1794,6 +1794,7 @@ pub const GeneratedEmbeddingMemo = struct {
         producer_json: []const u8,
         execution_json: []const u8,
         expected_dims: u32,
+        reprocess_generation: u64,
         source: []const u8,
     ) Key {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1804,12 +1805,50 @@ pub const GeneratedEmbeddingMemo = struct {
             hasher.update(&length_buf);
             hasher.update(part);
         }
+        var epoch_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &epoch_buf, reprocess_generation, .little);
+        hasher.update(&epoch_buf);
         var dims_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &dims_buf, expected_dims, .little);
         hasher.update(&dims_buf);
         var digest: Key = undefined;
         hasher.final(&digest);
         return digest;
+    }
+
+    /// Forced results are document-owned: deletion/recreation can reset the
+    /// numeric epoch. Ordinary writes retain cross-row deduplication.
+    pub fn keyForRequest(alloc: Allocator, store: anytype, request: enrichment_types.GeneratedEnrichmentRequest, source: []const u8, forced: bool) !Key {
+        const base = key(request.kind, @import("enrichment/enrichment_types.zig").requestEmbeddingName(request), request.producer_json, request.execution_json, if (request.kind == .sparse_embedding) 0 else request.expected_dims, request.reprocess_generation, source);
+        if (!forced) return base;
+        const identity = @import("doc_identity.zig");
+        var read = try store.beginProbeTxn();
+        defer read.abort();
+        var stamp: u64 = 0;
+        var tag: u8 = 0;
+        if (try identity.lookupOrdinalTxn(alloc, &read, request.doc_key)) |ordinal| {
+            const state = (try identity.lookupStateTxn(&read, ordinal)) orelse return error.InvalidDocIdentity;
+            if (!state.isLive()) return error.EnrichmentSourceChanged;
+            stamp = state.created_generation;
+            tag = 1;
+        } else {
+            const revisions = @import("../document_mutation_revision.zig");
+            const document = try revisions.keyForDocumentAlloc(alloc, request.doc_key);
+            stamp = try revisions.load(&read, document);
+        }
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("synchronous-forced-document-v1");
+        hash.update(&base);
+        hash.update(&.{tag});
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, stamp, .little);
+        hash.update(&encoded);
+        std.mem.writeInt(u64, &encoded, request.doc_key.len, .little);
+        hash.update(&encoded);
+        hash.update(request.doc_key);
+        var result: Key = undefined;
+        hash.final(&result);
+        return result;
     }
 
     /// One immutable provider lease per model per synchronous preparation.

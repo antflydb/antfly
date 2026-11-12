@@ -52576,36 +52576,36 @@ test "generated memo reuses only source matched typed embedding artifacts" {
         .expected_dims = 3,
         .producer_json = "producer-v1",
     };
-    const key_value = GeneratedEmbeddingMemo.key(.dense_embedding, "model", request.producer_json, "", 3, "alpha");
+    const key_value = GeneratedEmbeddingMemo.key(.dense_embedding, "model", request.producer_json, "", 3, request.reprocess_generation, "alpha");
     const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, request.doc_key, "model");
     defer alloc.free(artifact_key);
-    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
+    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value, false));
     const hash = enrichment_artifact_codec.hashEmbeddingSource("alpha", request.producer_json);
     const dense = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, hash, &.{ 1, 2, 3 });
     defer alloc.free(dense);
     try db.core.store.put(artifact_key, dense);
     // Ordinary/forced generation must not silently become cache reuse.
-    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
+    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value, false));
     memo.reuse_stored_artifacts = true;
-    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "changed", key_value));
+    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "changed", key_value, false));
     request.expected_dims = 2;
-    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
+    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value, false));
     request.expected_dims = 3;
     request.producer_json = "producer-v2";
-    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
+    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value, false));
     request.producer_json = "producer-v1";
-    try std.testing.expect(try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
+    try std.testing.expect(try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value, false));
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3 }, memo.dense.get(key_value).?);
     request.kind = .sparse_embedding;
-    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
+    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value, false));
     const sparse = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, hash, &.{ 2, 9 }, &.{ 0.25, 1.5 });
     defer alloc.free(sparse);
     try db.core.store.put(artifact_key, sparse);
-    try std.testing.expect(try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
+    try std.testing.expect(try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value, false));
     try std.testing.expectEqualSlices(u32, &.{ 2, 9 }, memo.sparse.get(key_value).?.indices);
     try std.testing.expectEqualSlices(f32, &.{ 0.25, 1.5 }, memo.sparse.get(key_value).?.values);
     try db.core.store.put(artifact_key, "corrupt");
-    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value));
+    try std.testing.expect(!try prewarmGeneratedMemoFromArtifact(&db, &memo, request, "alpha", key_value, false));
 }
 
 const prepareGeneratedEnrichments = local_mutation.prepareGeneratedEnrichments;
@@ -64740,13 +64740,13 @@ test "generated document embeddings batch across rows and memoize retry work" {
     var memo = GeneratedEmbeddingMemo.init(alloc);
     defer memo.deinit();
     const request = types.BatchRequest{ .writes = &writes };
-    try prewarmGeneratedDenseMemo(&db, request, &extracted, .all, &plan, &memo);
+    try prewarmGeneratedDenseMemo(&db, request, &extracted, .all, &plan, &memo, &.{});
     try std.testing.expectEqual(@as(usize, 1), probe.batch_calls);
     try std.testing.expectEqual(@as(usize, 2), probe.items);
     try std.testing.expectEqual(@as(usize, 2), memo.dense.count());
 
     // The same semantic request on an optimistic retry performs no provider IO.
-    try prewarmGeneratedDenseMemo(&db, request, &extracted, .all, &plan, &memo);
+    try prewarmGeneratedDenseMemo(&db, request, &extracted, .all, &plan, &memo, &.{});
     try std.testing.expectEqual(@as(usize, 1), probe.batch_calls);
 }
 
@@ -99595,11 +99595,15 @@ test "db paper evaluation rejects superseded A completion after producer A B A r
     // Include first execution, an existing epoch, and a repeated epoch; both
     // model replacement alone plus reprocess and rollback must fence old work.
     for ([_]bool{ false, true }) |sparse| for ([_]usize{ 0, 1, 2 }) |initial_reprocesses| for ([_]bool{ false, true }) |rollback| {
-        try testSupersededEmbeddingCompletion(sparse, initial_reprocesses, rollback);
+        try testSupersededEmbeddingCompletion(sparse, initial_reprocesses, rollback, false, false, false);
     };
 }
 
-fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, rollback: bool) !void {
+test "db paper evaluation rejects superseded A completion through synchronous preparation retry" {
+    try testSupersededEmbeddingCompletion(false, 1, true, true, false, false);
+}
+
+fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, rollback: bool, synchronous: bool, relational: bool, recreate: bool) !void {
     const a = std.testing.allocator;
     const Probe = struct {
         db: ?*DB = null,
@@ -99607,6 +99611,7 @@ fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, r
         hold_at: usize,
         rollback: bool,
         sparse: bool,
+        recreate: bool,
         fn config(model_b: bool, is_sparse: bool) types.EnrichmentConfig {
             return .{ .name = "vectors", .kind = .embedding, .field = "body", .expected_dims = if (is_sparse) 0 else 3, .producer_json = if (model_b) "{\"version\":1,\"provider\":\"antfly\",\"model\":\"B\",\"dimensions\":3}" else "{\"version\":1,\"provider\":\"antfly\",\"model\":\"A\",\"dimensions\":3}" };
         }
@@ -99640,6 +99645,11 @@ fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, r
             if (self.calls == self.hold_at) {
                 // Make replacements durable while the old provider call is
                 // held. Both A incarnations deliberately share a revision.
+                if (self.recreate) {
+                    try self.db.?.batch(.{ .deletes = &.{"doc"}, .sync_level = .write });
+                    try self.db.?.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged source\"}" }}, .sync_level = .write });
+                    return alloc.dupe(f32, &.{ 1, 0, 0 });
+                }
                 _ = try self.db.?.upsertEnrichment(config(true, self.sparse));
                 try std.testing.expect(try self.db.?.reprocessDocumentArtifact(alloc, "doc", "vectors"));
                 if (self.rollback) {
@@ -99661,22 +99671,39 @@ fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, r
     };
     var directory = try TestDirectory.init("late-A-generation");
     defer directory.cleanup();
-    var probe = Probe{ .hold_at = initial_reprocesses + 1, .rollback = rollback, .sparse = sparse };
+    var probe = Probe{ .hold_at = initial_reprocesses + 1, .rollback = rollback, .sparse = sparse, .recreate = recreate };
     var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "late-A", .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 1, .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .capabilities_fn = Probe.caps }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.embedSparse, .cache_revision_fn = Probe.revision } } });
     defer db.close();
     probe.db = &db;
+    if (relational) try db.setSchemaJson(a,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"},"metadata":{"type":"integer"}},"additionalProperties":false}}}}
+    );
     try db.addEnrichment(Probe.config(false, sparse));
     try db.addIndex(.{ .name = "semantic", .kind = if (sparse) .sparse_vector else .dense_vector, .config_json = if (sparse) "{\"field\":\"embedding\",\"sources\":[{\"artifact\":\"vectors\"}]}" else "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"sources\":[{\"artifact\":\"vectors\"}],\"publication_policy\":\"atomic\"}" });
-    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged source\"}" }}, .sync_level = .write });
-    try db.runUntilIdle();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged source\"}" }}, .sync_level = if (relational) .enrichments else .write });
+    if (!relational) try db.runUntilIdle();
     for (0..initial_reprocesses) |_| {
-        try std.testing.expect(try db.reprocessDocumentArtifact(a, "doc", "vectors"));
-        try db.runUntilIdle();
+        if (relational) {
+            // Exercise row prewarming and its source commit directly. Index
+            // idle/native-posting publication is a separate lifecycle boundary.
+            const value = (try db.get(a, "doc")) orelse return error.TestUnexpectedResult;
+            defer a.free(value);
+            try db.batchInternal(.{ .writes = &.{.{ .key = "doc", .value = value }}, .sync_level = .enrichments }, null, .{ .force_generated_artifact_names = &.{"vectors"}, .wait_for_sync_level = false });
+        } else {
+            try std.testing.expect(if (synchronous) try db.reprocessDocumentArtifactWithCompletionWait(a, "doc", "vectors", true) else try db.reprocessDocumentArtifact(a, "doc", "vectors"));
+            try db.runUntilIdle();
+        }
     }
-    try std.testing.expect(probe.calls > probe.hold_at);
     try probe.requireFresh(a);
-    const expected_epoch: u64 = @intCast(initial_reprocesses + 1 + @as(usize, @intFromBool(rollback)));
+    try std.testing.expect(probe.calls > probe.hold_at);
+    const expected_epoch: u64 = if (recreate) 1 else @intCast(initial_reprocesses + 1 + @as(usize, @intFromBool(rollback)));
     try std.testing.expectEqual(expected_epoch, try enrichment_runtime_mod.embeddingReprocessGeneration(db.enrichment_runtime.?, "doc", "vectors"));
+    if (relational) {
+        const before_metadata = probe.calls;
+        try db.batchInternal(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged source\",\"metadata\":1}" }}, .sync_level = .enrichments }, null, .{ .wait_for_sync_level = false });
+        try std.testing.expectEqual(before_metadata, probe.calls);
+        return;
+    }
     var result = try db.search(a, .{ .index_name = "semantic", .query = if (sparse) .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1}, .k = 1 } } else .{ .dense_knn = .{ .vector = &.{ 0, 1, 0 }, .k = 1 } }, .limit = 1, .search_effort = 1 });
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
@@ -99688,7 +99715,7 @@ fn testSupersededEmbeddingCompletion(sparse: bool, initial_reprocesses: usize, r
     try std.testing.expectEqual(calls, probe.calls);
     // Mapping replacement without another forced pass retains the clock,
     // while the producer config still invalidates the old retained hash.
-    _ = try db.upsertEnrichment(Probe.config(rollback, sparse));
+    _ = try db.upsertEnrichment(Probe.config(if (recreate) true else rollback, sparse));
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged source\",\"metadata\":2}" }}, .sync_level = .full_index });
     try db.runUntilIdle();
     try std.testing.expect(probe.calls > calls);
@@ -153081,4 +153108,76 @@ test "leann lazy recovery retries operational setup failures and releases perman
         try std.testing.expectEqual(@as(usize, 1), rejected.attempts);
         try std.testing.expectEqual(@as(usize, 1), rejected.releases);
     }
+}
+
+test "db paper evaluation rejects superseded A completion through synchronous sparse preparation retry" {
+    try testSupersededEmbeddingCompletion(true, 1, true, true, false, false);
+}
+
+test "db paper evaluation rejects superseded A completion after a newer producer definition commits" {
+    for ([_]bool{ false, true }) |replace_definition| try testProducerDefinitionPublication(replace_definition);
+}
+
+fn testProducerDefinitionPublication(replace_definition: bool) !void {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        replace_definition: bool,
+        db: ?*DB = null,
+        calls: usize = 0,
+        fn config(new: bool) types.EnrichmentConfig {
+            return .{ .name = "vectors", .kind = .embedding, .field = "body", .template = if (new) "new {{body}}" else "old {{body}}", .expected_dims = 3, .producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"stable\",\"dimensions\":3}" };
+        }
+        fn caps(_: *anyopaque, _: Allocator, _: []const u8) !@import("antfly_inference_work").InferenceCapabilities {
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(1) };
+        }
+        fn requireFresh(self: *@This(), alloc: Allocator) !void {
+            const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "vectors");
+            defer alloc.free(key);
+            const value = try self.db.?.core.store.get(alloc, key);
+            defer alloc.free(value);
+            const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, value);
+            defer alloc.free(vector);
+            if (vector[0] != 0) return error.ObsoleteDefinitionCompletionPublished;
+        }
+        fn embed(raw: *anyopaque, alloc: Allocator, _: []const u8, text: []const u8, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 1) {
+                try std.testing.expect(std.mem.startsWith(u8, text, "old "));
+                if (!self.replace_definition) {
+                    try self.db.?.addIndex(.{ .name = "unrelated", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+                    return alloc.dupe(f32, &.{ 0, 1, 0 });
+                }
+                _ = try self.db.?.upsertEnrichment(config(true));
+                try self.db.?.batchInternal(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged source\"}" }}, .sync_level = .enrichments }, null, .{ .wait_for_sync_level = false });
+                try self.requireFresh(alloc);
+                return alloc.dupe(f32, &.{ 1, 0, 0 });
+            }
+            try std.testing.expect(std.mem.startsWith(u8, text, "new "));
+            if (self.calls > 2) try self.requireFresh(alloc);
+            return alloc.dupe(f32, &.{ 0, 1, 0 });
+        }
+    };
+    var directory = try TestDirectory.init("late-definition");
+    defer directory.cleanup();
+    var probe = Probe{ .replace_definition = replace_definition };
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "late-definition", .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 1, .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .capabilities_fn = Probe.caps } } });
+    defer db.close();
+    probe.db = &db;
+    try db.addEnrichment(Probe.config(false));
+    try db.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"sources\":[{\"artifact\":\"vectors\"}]}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged source\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try probe.requireFresh(a);
+    if (!replace_definition) try std.testing.expectEqual(@as(usize, 1), probe.calls);
+}
+
+test "db paper evaluation rejects superseded A completion through relational preparation retries" {
+    try testSupersededEmbeddingCompletion(false, 1, true, true, true, false);
+    try testSupersededEmbeddingCompletion(true, 1, true, true, true, false);
+}
+
+test "db paper evaluation rejects superseded A completion across synchronous source resurrection" {
+    try testSupersededEmbeddingCompletion(false, 1, false, true, false, true);
+    try testSupersededEmbeddingCompletion(true, 1, false, true, false, true);
 }

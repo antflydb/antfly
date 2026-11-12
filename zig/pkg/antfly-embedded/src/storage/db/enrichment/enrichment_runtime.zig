@@ -31436,9 +31436,10 @@ fn embeddingPublicationBatchItems() usize {
 const EmbeddingGenerationGuard = struct {
     artifact_name: []const u8,
     generation: u64,
+    definition: [32]u8,
 
     fn fromRequest(request: enrichment_types.GeneratedEnrichmentRequest) @This() {
-        return .{ .artifact_name = requestEmbeddingName(request), .generation = request.reprocess_generation };
+        return .{ .artifact_name = requestEmbeddingName(request), .generation = request.reprocess_generation, .definition = producer_input.definitionDigest(request) };
     }
 };
 
@@ -31544,7 +31545,42 @@ fn enqueueProducerArtifact(runtime: *EnrichmentRuntime, token: *const producer_i
     return error.ArtifactPublicationPending;
 }
 
-fn embeddingSourceStillCurrent(alloc: Allocator, txn: anytype, write: GuardedEmbeddingWrite) !bool {
+const SourceAuthorityRepairs = struct {
+    const revisions = @import("../../document_mutation_revision.zig");
+    const Entry = struct { key: []const u8, content: revisions.Content };
+    entries: [2]Entry = undefined,
+    len: usize = 0,
+
+    fn capture(self: *@This(), txn: anytype, key: []const u8, raw: []const u8, digest: [32]u8) !void {
+        if (!internal_keys.isStoredDocumentRowKey(key)) return;
+        std.debug.assert(self.len < self.entries.len);
+        self.entries[self.len] = .{ .key = key, .content = .{ .revision = try revisions.load(txn, revisions.keyForPhysical(key).?), .bytes = raw.len, .kind = key[key.len - 1], .digest = digest } };
+        self.len += 1;
+    }
+
+    fn stage(self: *const @This(), txn: anytype) !void {
+        for (self.entries[0..self.len]) |entry| _ = try revisions.stageContent(txn, entry.key, entry.content);
+    }
+};
+
+fn embeddingSourceAuthority(txn: anytype, key: []const u8) !?@import("../../document_mutation_revision.zig").Content {
+    return @import("../../document_mutation_revision.zig").loadContent(txn, key) catch |err| switch (err) {
+        error.InvalidDocumentContentAuthority => null,
+        else => return err,
+    };
+}
+
+fn embeddingParentCurrent(txn: anytype, parent: []const u8, repairs: ?*SourceAuthorityRepairs) !bool {
+    if (try embeddingSourceAuthority(txn, parent) != null) return true;
+    const raw = txn.get(parent) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (repairs) |out| try out.capture(txn, parent, raw, sourceRecordDigest(raw));
+    return true;
+}
+
+fn embeddingSourceStillCurrent(alloc: Allocator, txn: anytype, write: GuardedEmbeddingWrite, repairs: ?*SourceAuthorityRepairs) !bool {
     const guard = write.generation_guard;
     @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, txn, write.doc_key, guard.artifact_name, guard.generation) catch |err| switch (err) {
         error.EnrichmentSourceChanged => return false,
@@ -31560,26 +31596,37 @@ fn embeddingSourceStillCurrent(alloc: Allocator, txn: anytype, write: GuardedEmb
             if (!state.isLive() or state.created_generation > write.source_sequence) return false;
         }
     }
-    if (write.parent_key) |key| {
-        _ = txn.get(key) catch |err| switch (err) {
-            error.NotFound => return false,
-            else => return err,
-        };
+    if (try embeddingSourceAuthority(txn, write.source_key)) |proof| {
+        if (!std.mem.eql(u8, &proof.digest, &write.source_digest)) return false;
+        if (write.parent_key) |parent| if (!std.mem.eql(u8, parent, write.source_key) and !try embeddingParentCurrent(txn, parent, repairs)) return false;
+        return true;
     }
+    // Legacy sources acquire their bounded witness in the same transaction
+    // as the first accepted output. Later chunks never rehash that parent.
+    if (write.parent_key) |parent| if (!std.mem.eql(u8, parent, write.source_key) and !try embeddingParentCurrent(txn, parent, repairs)) return false;
     const raw = txn.get(write.source_key) catch |err| switch (err) {
         error.NotFound => return false,
         else => return err,
     };
-    return std.mem.eql(u8, &sourceRecordDigest(raw), &write.source_digest);
+    const digest = sourceRecordDigest(raw);
+    if (!std.mem.eql(u8, &digest, &write.source_digest)) return false;
+    if (repairs) |out| try out.capture(txn, write.source_key, raw, digest);
+    return true;
 }
 
-fn storeGuardedEmbeddingsTxn(runtime: *EnrichmentRuntime, txn: anytype, writes: []const GuardedEmbeddingWrite, accepted: []bool) !void {
+fn storeGuardedEmbeddingsTxn(runtime: *EnrichmentRuntime, txn: anytype, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, writes: []const GuardedEmbeddingWrite, accepted: []bool) !void {
     // Check against the write snapshot, before preparation or counter updates.
     // Process counters with each put so duplicate keys do not inflate counts.
     @memset(accepted, false);
+    // The lease was acquired before opening the writer. Validate against the
+    // exact durable catalog snapshot, without taking catalog locks in a txn.
+    if (!plan.matchesArtifactInventory(try @import("../artifact_inventory.zig").catalogs(txn))) return error.EnrichmentSourceChanged;
     for (writes, 0..) |write, i| {
+        if (!plan.generated_definitions.contains(write.generation_guard.definition)) continue;
         try @import("../artifact_publication.zig").requireLegacyMaterialization(txn, write.key);
-        if (!try embeddingSourceStillCurrent(runtime.alloc, txn, write)) continue;
+        var repairs = SourceAuthorityRepairs{};
+        if (!try embeddingSourceStillCurrent(runtime.alloc, txn, write, &repairs)) continue;
+        try repairs.stage(txn);
         const pair = KVPair{ .key = write.key, .value = write.value };
         try updateDenseArtifactTargetCountersTxn(runtime, txn, &.{pair}, &.{});
         try txn.put(write.key, write.value);
@@ -31611,6 +31658,8 @@ fn storeGuardedEmbeddings(runtime: *EnrichmentRuntime, writes: []const GuardedEm
         return;
     }
     for (writes) |write| if (write.ordered_input != null) return error.ArtifactCatalogDrift;
+    var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
     if (runtime.generated_publication != null) {
         var publication_store = try RuntimePublicationStore.init(runtime);
         defer publication_store.deinit();
@@ -31618,16 +31667,16 @@ fn storeGuardedEmbeddings(runtime: *EnrichmentRuntime, writes: []const GuardedEm
         errdefer txn.abort();
         const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
         try validateRuntimeStoreWriteFenceTxn(runtime, &txn, fence);
-        return storeGuardedEmbeddingsTxn(runtime, &txn, writes, accepted);
+        return storeGuardedEmbeddingsTxn(runtime, &txn, plan.plan(), writes, accepted);
     }
     if (runtime.artifact_store) |store| {
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        return storeGuardedEmbeddingsTxn(runtime, &txn, writes, accepted);
+        return storeGuardedEmbeddingsTxn(runtime, &txn, plan.plan(), writes, accepted);
     }
     var txn = try runtime.store.beginWrite();
     errdefer txn.abort();
-    return storeGuardedEmbeddingsTxn(runtime, &txn, writes, accepted);
+    return storeGuardedEmbeddingsTxn(runtime, &txn, plan.plan(), writes, accepted);
 }
 
 fn storeGuardedEmbeddingsWithRetry(runtime: *EnrichmentRuntime, writes: []const GuardedEmbeddingWrite, accepted: []bool) !void {
@@ -49042,6 +49091,7 @@ test "sparse chunk ownership survives mixed publication and failure after accept
     var db = try db_mod.DB.open(a, path, .{ .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
     try db.setSchemaJson(a, "{}");
+    try db.addIndex(.{ .name = "vector", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"artifact_name\":\"chunks\",\"chunk_size\":4},\"execution\":{\"embedding\":{\"batch_items\":8}}}" });
     try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"source\"}" }}, .sync_level = .write });
     var harness = Harness{};
     const provider = embedder_mod.SparseEmbedder{ .ptr = &harness, .sparse_embed_fn = Harness.embed };
@@ -49066,7 +49116,15 @@ test "sparse chunk ownership survives mixed publication and failure after accept
         };
         initialized += 1;
     }
-    var request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .sparse_embedding, .index_name = "vector", .embedding_name = "model", .artifact_name = "chunks", .doc_key = "doc", .source_field = "text", .execution_json = "{\"batch_items\":8}" };
+    var pin = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer pin.release();
+    var request = for (pin.plan().generated_templates) |candidate| {
+        if (candidate.kind == .sparse_embedding) break candidate;
+    } else return error.TestUnexpectedResult;
+    request.doc_key = "doc";
+    // Keep the actual catalog execution contract so publication membership
+    // and ownership cleanup are exercised together.
+
     const result = try buildChunkSparseEmbeddingsFromSources(runtime, request, provider, &.{}, sources, null);
     defer {
         for (result) |row| freeDerivedSparseEmbedding(runtime.alloc, row);
@@ -49075,7 +49133,7 @@ test "sparse chunk ownership survives mixed publication and failure after accept
     try std.testing.expectEqual(@as(usize, count / 2), result.len);
     try std.testing.expectEqual(@as(usize, count), harness.calls);
     for (sources, 0..) |source, i| {
-        const key = try embeddingArtifactKey(runtime, source.key, "model");
+        const key = try embeddingArtifactKey(runtime, source.key, requestEmbeddingName(request));
         defer runtime.alloc.free(key);
         const value = try storeGetOptionalAllocWithRetry(runtime, key);
         defer if (value) |bytes| runtime.alloc.free(bytes);
@@ -49084,7 +49142,11 @@ test "sparse chunk ownership survives mixed publication and failure after accept
     // Fail in the next batch after ownership of the first eight keys moved
     // into results. Untransferred, rejected, cached and accepted keys all have
     // exactly one owner, including errors after partially durable publication.
-    request.embedding_name = "failure-model";
+    request.reprocess_generation = 1;
+    const intent = @import("../artifact_reprocess_intent.zig");
+    const intent_key = try intent.embeddingKeyAlloc(a, "doc", requestEmbeddingName(request));
+    defer a.free(intent_key);
+    try db.core.store.put(intent_key, &intent.encode(request.producer_json, 1));
     harness.calls = 0;
     harness.fail_at = 9;
     try std.testing.expectError(error.OutOfMemory, buildChunkSparseEmbeddingsFromSources(runtime, request, provider, &.{}, sources[0..24], null));
@@ -49096,4 +49158,87 @@ test "sparse chunk ownership survives mixed publication and failure after accept
         runtime.alloc.free(recovered);
     }
     try std.testing.expectEqual(@as(usize, 16), harness.calls);
+}
+
+test "embedding publication verifies large parents using bounded content authority" {
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const revisions = @import("../../document_mutation_revision.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/large-parent-witness", .{tmp.sub_path});
+    defer a.free(path);
+    var db = try db_mod.DB.open(a, path, .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try db.setSchemaJson(a, "{}");
+    const body = try a.alloc(u8, 1024 * 1024);
+    defer a.free(body);
+    @memset(body, 'a');
+    const document = try std.fmt.allocPrint(a, "{{\"body\":\"{s}\"}}", .{body});
+    defer a.free(document);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = document }}, .sync_level = .write });
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    const primary = try internal_keys.documentKeyAlloc(a, "doc");
+    defer a.free(primary);
+    const raw = try db.core.store.get(a, primary);
+    defer a.free(raw);
+    try std.testing.expect(raw.len >= body.len);
+    var read = try db.core.store.beginReadTxn();
+    var read_open = true;
+    defer if (read_open) read.abort();
+    const content_key = revisions.contentKey(revisions.keyForPhysical(primary).?);
+    const old_proof = (try read.get(&content_key))[0..49].*;
+    const Counting = struct {
+        inner: *@TypeOf(read),
+        parent: []const u8,
+        parent_reads: usize = 0,
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            if (std.mem.eql(u8, key, self.parent)) self.parent_reads += 1;
+            return self.inner.get(key);
+        }
+    };
+    var counted = Counting{ .inner = &read, .parent = primary };
+    const write = GuardedEmbeddingWrite{ .key = "unused", .value = "unused", .source_key = primary, .source_digest = sourceRecordDigest(raw), .parent_key = primary, .doc_key = "doc", .source_sequence = 0, .generation_guard = EmbeddingGenerationGuard.fromRequest(.{ .kind = .sparse_embedding, .index_name = "vector", .embedding_name = "model", .doc_key = "doc", .source_field = "body" }) };
+    for (0..1024) |_| try std.testing.expect(try embeddingSourceStillCurrent(runtime.alloc, &counted, write, null));
+    try std.testing.expectEqual(@as(usize, 0), counted.parent_reads);
+    read.abort();
+    read_open = false;
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"new source\"}" }}, .sync_level = .write });
+    read = try db.core.store.beginReadTxn();
+    read_open = true;
+    try std.testing.expect(!try embeddingSourceStillCurrent(runtime.alloc, &counted, write, null));
+    try std.testing.expectEqual(@as(usize, 0), counted.parent_reads);
+    read.abort();
+    read_open = false;
+    // A stale certificate from an earlier writer must fall back to current
+    // source bytes, rather than trusting an obsolete matching digest.
+    try db.core.store.put(&content_key, &old_proof);
+    read = try db.core.store.beginReadTxn();
+    read_open = true;
+    try std.testing.expect(!try embeddingSourceStillCurrent(runtime.alloc, &counted, write, null));
+    try std.testing.expectEqual(@as(usize, 1), counted.parent_reads);
+    read.abort();
+    read_open = false;
+    // Publication repairs even malformed disposable metadata using source
+    // bytes checked under the writer; the next 1024 checks stay bounded.
+    try db.core.store.put(&content_key, "malformed");
+    const current = try db.core.store.get(a, primary);
+    defer a.free(current);
+    var fresh = write;
+    fresh.source_digest = sourceRecordDigest(current);
+    {
+        var writer = try db.core.store.beginWriteTxn();
+        errdefer writer.abort();
+        var repairs = SourceAuthorityRepairs{};
+        try std.testing.expect(try embeddingSourceStillCurrent(runtime.alloc, &writer, fresh, &repairs));
+        try std.testing.expectEqual(@as(usize, 1), repairs.len);
+        try repairs.stage(&writer);
+        try writer.commit();
+    }
+    read = try db.core.store.beginReadTxn();
+    read_open = true;
+    counted.parent_reads = 0;
+    for (0..1024) |_| try std.testing.expect(try embeddingSourceStillCurrent(runtime.alloc, &counted, fresh, null));
+    try std.testing.expectEqual(@as(usize, 0), counted.parent_reads);
 }

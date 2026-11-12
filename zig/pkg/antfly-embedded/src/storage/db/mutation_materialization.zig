@@ -6348,19 +6348,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
-            const memo_key = GeneratedEmbeddingMemo.keyAtRevision(GeneratedEmbeddingMemo.key(
-                .dense_embedding,
-                embedding_name,
-                request.producer_json,
-                request.execution_json,
-                request.expected_dims,
-                source_text.?,
-            ), generation.revision);
+            const memo_key = GeneratedEmbeddingMemo.keyAtRevision(try GeneratedEmbeddingMemo.keyForRequest(alloc, db.core.*.store, request, source_text.?, !skip_unchanged_artifacts), generation.revision);
             // Document tables build their generated plan under apply rather than in
             // relational prewarm. Use the same persisted-cache admission in either
             // path before falling back to the external provider.
             if (memo) |cache_memo| if (!cache_memo.dense.contains(memo_key)) {
-                _ = try prewarmGeneratedMemoFromArtifact(db, cache_memo, request, source_text.?, memo_key);
+                _ = try prewarmGeneratedMemoFromArtifact(db, cache_memo, request, source_text.?, memo_key, skip_unchanged_artifacts);
             };
             var uncached_vector: ?[]f32 = null;
             defer if (uncached_vector) |owned| alloc.free(owned);
@@ -7038,16 +7031,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
-            const memo_key = GeneratedEmbeddingMemo.keyAtRevision(GeneratedEmbeddingMemo.key(
-                .sparse_embedding,
-                embedding_name,
-                request.producer_json,
-                request.execution_json,
-                0,
-                source_text.?,
-            ), revision);
+            const memo_key = GeneratedEmbeddingMemo.keyAtRevision(try GeneratedEmbeddingMemo.keyForRequest(alloc, db.core.*.store, request, source_text.?, !reuse_unchanged), revision);
             if (memo) |cache_memo| if (!cache_memo.sparse.contains(memo_key)) {
-                _ = try prewarmGeneratedMemoFromArtifact(db, cache_memo, request, source_text.?, memo_key);
+                _ = try prewarmGeneratedMemoFromArtifact(db, cache_memo, request, source_text.?, memo_key, reuse_unchanged);
             };
             var uncached_sparse: ?embedder_mod.SparseEmbedding = null;
             defer if (uncached_sparse) |*owned| owned.deinit(alloc);

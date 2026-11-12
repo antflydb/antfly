@@ -237,10 +237,16 @@ pub const RepairQueue = struct {
     }
 };
 
-fn stageContent(txn: anytype, physical: []const u8, content: Content) !bool {
+/// Install a source digest verified by the caller under its pinned snapshot.
+/// Writer publication must retain the captured revision through this check.
+pub fn stageContent(txn: anytype, physical: []const u8, content: Content) !bool {
     const key = keyForPhysical(physical) orelse return error.InvalidArgument;
     if (try load(txn, key) != content.revision or !try txn.contains(physical)) return false;
-    if (try loadContent(txn, physical) != null) return false;
+    const existing = loadContent(txn, physical) catch |err| switch (err) {
+        error.InvalidDocumentContentAuthority => null,
+        else => return err,
+    };
+    if (existing != null) return false;
     try txn.put(&contentKey(key), &encodeContent(content));
     return true;
 }

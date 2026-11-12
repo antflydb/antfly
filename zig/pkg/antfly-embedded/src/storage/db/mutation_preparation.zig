@@ -886,6 +886,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return plan;
         }
 
+        fn embeddingTargetGeneration(self: anytype, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, force: []const []const u8) !u64 {
+            const intent = @import("artifact_reprocess_intent.zig");
+            const key = try intent.embeddingKeyAlloc(alloc, request.doc_key, requestEmbeddingName(request));
+            defer alloc.free(key);
+            const raw = self.core.*.store.get(alloc, key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            defer if (raw) |bytes| alloc.free(bytes);
+            const current = if (raw) |bytes| try intent.generation(bytes) else 0;
+            return if (containsName(force, requestEmbeddingName(request))) std.math.add(u64, current, 1) catch error.ResourceLimitExceeded else current;
+        }
+
         pub fn prepareGeneratedEnrichments(
             self: anytype,
             alloc: Allocator,
@@ -903,9 +916,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 null;
             defer if (fallback_write_plan) |*view| view.release();
+            // Bind every prewarmed result to the target resolved before any
+            // provider call. The same memo survives optimistic retries, while
+            // epochs may advance during the preceding attempt.
+            if (preplanned) |plan| for (plan.rows) |row| {
+                for (row.requests) |*request| {
+                    if (request.kind != .dense_embedding and request.kind != .sparse_embedding) continue;
+                    request.reprocess_generation = try embeddingTargetGeneration(self, alloc, request.*, force_generated_artifact_names);
+                }
+            };
             if (preplanned) |plan| if (generated_memo) |memo| {
-                try prewarmGeneratedDenseMemo(self, req, extracted, precompute_mode, plan, memo);
-                try prewarmGeneratedSparseMemo(self, req, extracted, precompute_mode, plan, memo);
+                try prewarmGeneratedDenseMemo(self, req, extracted, precompute_mode, plan, memo, force_generated_artifact_names);
+                try prewarmGeneratedSparseMemo(self, req, extracted, precompute_mode, plan, memo, force_generated_artifact_names);
             };
 
             var artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
@@ -993,14 +1015,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     const intent = @import("artifact_reprocess_intent.zig");
                     const key = try intent.embeddingKeyAlloc(alloc, request.doc_key, requestEmbeddingName(request.*));
                     defer alloc.free(key);
-                    const old = self.core.*.store.get(alloc, key) catch |err| switch (err) {
-                        error.NotFound => null,
-                        else => return err,
-                    };
-                    defer if (old) |raw| alloc.free(raw);
-                    request.reprocess_generation = if (old) |raw| try intent.generation(raw) else 0;
+                    if (preplanned == null) request.reprocess_generation = try embeddingTargetGeneration(self, alloc, request.*, force_generated_artifact_names);
                     if (containsName(force_generated_artifact_names, requestEmbeddingName(request.*))) {
-                        request.reprocess_generation = std.math.add(u64, request.reprocess_generation, 1) catch return error.ResourceLimitExceeded;
                         const encoded = intent.encode(request.producer_json, request.reprocess_generation);
                         const owned_key = try alloc.dupe(u8, key);
                         errdefer alloc.free(owned_key);
@@ -1281,6 +1297,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             precompute_mode: GeneratedPrecomputeMode,
             plan: *const GeneratedBatchWritePlan,
             memo: *GeneratedEmbeddingMemo,
+            force_names: []const []const u8,
         ) !void {
             const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
             const embedder = runtime.config.dense_embedder orelse return;
@@ -1316,20 +1333,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     var text_owned = true;
                     errdefer if (text_owned) memo.alloc.free(text);
                     const generation = try memo.generation(embedder, requestEmbeddingName(request));
-                    const key_value = GeneratedEmbeddingMemo.keyAtRevision(GeneratedEmbeddingMemo.key(
-                        .dense_embedding,
-                        requestEmbeddingName(request),
-                        request.producer_json,
-                        request.execution_json,
-                        request.expected_dims,
-                        text,
-                    ), generation.revision);
+                    const forced = containsName(force_names, requestArtifactName(request)) or containsName(force_names, requestEmbeddingName(request));
+                    const key_value = GeneratedEmbeddingMemo.keyAtRevision(try GeneratedEmbeddingMemo.keyForRequest(memo.alloc, self.core.*.store, request, text, forced), generation.revision);
                     if (memo.dense.contains(key_value) or pending.contains(key_value)) {
                         memo.alloc.free(text);
                         text_owned = false;
                         continue;
                     }
-                    if (try prewarmGeneratedMemoFromArtifact(self, memo, request, text, key_value)) {
+                    if (try prewarmGeneratedMemoFromArtifact(self, memo, request, text, key_value, !forced)) {
                         memo.alloc.free(text);
                         text_owned = false;
                         continue;
@@ -1369,8 +1380,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             request: enrichment_types.GeneratedEnrichmentRequest,
             text: []const u8,
             key_value: GeneratedEmbeddingMemo.Key,
+            reuse_unchanged: bool,
         ) !bool {
-            if (!memo.reuse_stored_artifacts) return false;
+            if (!memo.reuse_stored_artifacts and !reuse_unchanged) return false;
             const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(memo.alloc, request.doc_key, requestEmbeddingName(request));
             defer memo.alloc.free(artifact_key);
             const raw = S.ownerField(self, "core").*.store.get(memo.alloc, artifact_key) catch |err| switch (err) {
@@ -1428,6 +1440,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             precompute_mode: GeneratedPrecomputeMode,
             plan: *const GeneratedBatchWritePlan,
             memo: *GeneratedEmbeddingMemo,
+            force_names: []const []const u8,
         ) !void {
             const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
             const embedder = runtime.config.sparse_embedder orelse return;
@@ -1462,20 +1475,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     var text_owned = true;
                     errdefer if (text_owned) memo.alloc.free(text);
                     const revision = try memo.sparseRevision(embedder, requestEmbeddingName(request));
-                    const key_value = GeneratedEmbeddingMemo.keyAtRevision(GeneratedEmbeddingMemo.key(
-                        .sparse_embedding,
-                        requestEmbeddingName(request),
-                        request.producer_json,
-                        request.execution_json,
-                        0,
-                        text,
-                    ), revision);
+                    const forced = containsName(force_names, requestArtifactName(request)) or containsName(force_names, requestEmbeddingName(request));
+                    const key_value = GeneratedEmbeddingMemo.keyAtRevision(try GeneratedEmbeddingMemo.keyForRequest(memo.alloc, self.core.*.store, request, text, forced), revision);
                     if (memo.sparse.contains(key_value) or pending.contains(key_value)) {
                         memo.alloc.free(text);
                         text_owned = false;
                         continue;
                     }
-                    if (try prewarmGeneratedMemoFromArtifact(self, memo, request, text, key_value)) {
+                    if (try prewarmGeneratedMemoFromArtifact(self, memo, request, text, key_value, !forced)) {
                         memo.alloc.free(text);
                         text_owned = false;
                         continue;
