@@ -6497,6 +6497,29 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
 
 // Both runtime adapters share traversal and ownership rules. Only NotFound
 // means exhaustion; failed reads and malformed keys must reach replay workers.
+// Regression: this used to scan via `read.openCursor()` -> `docstore.Cursor`,
+// which merges only `Txn.pending_tree` (a write transaction's own
+// in-flight, uncommitted mutations) -- never `NativeFile`'s redo-log
+// overlay (`SharedRedoOverlay`/`redoOverlayEntry`), which is a wholly
+// separate, cross-commit mechanism `Cursor` has no knowledge of at all.
+// A read-only `Txn` (exactly what this function opens) has an empty
+// `pending_tree`, so that merge contributed nothing either way: every
+// replay-journal entry still sitting in the redo overlay (committed, but
+// not yet folded into a real page by `checkpointRedoLog`) was invisible
+// to this scan, even though the identical key is visible to an ordinary
+// point `get()` on the very same, uncrashed handle (`redoOverlayEntry`
+// checks the overlay first). Found via `storage.lite.crash_consistency_test`'s
+// "crash sweep: full text synchronous visibility" failing even on
+// `[uncrashed run]`s with no fault injected at all: `sync_level: .full_text`'s
+// derived-index catch-up pass discovers "what changed" by calling this
+// function, so a commit logged but not yet checkpointed was never indexed,
+// even though `batch()` had already returned success for it. Fixed by
+// routing the scan through `NativeFile.forEachDocumentKeyInRangeMerged`
+// (native.zig), which merges the redo overlay with the real B-tree the
+// same way `snapshotDocumentsWithPrefixAtCheckpointAlloc` already does for
+// its own scan -- the mechanism `OverlayScanState`'s own doc comment says
+// belongs on "every path that enumerates keys, not just point lookups",
+// which this path never got.
 fn forEachReplayLaneRaw(
     store: *Store,
     prefix: []const u8,
@@ -6512,28 +6535,35 @@ fn forEachReplayLaneRaw(
         error.NotFound => return error.ReplayIndexUnavailable,
         else => return err,
     };
-    var cursor = try read.openCursor();
-    defer cursor.close();
-    const lower = internal_keys.replayRangeLower(kind, from_sequence);
-    const upper = internal_keys.replayRangeUpper(kind);
-    cursor.setUpperBound(&upper);
-    var stats = backend_types.ReplayLaneIterationStats{ .scan_batches = 1 };
-    var entry = cursor.seekAtOrAfter(&lower) catch |err| switch (err) {
-        error.NotFound => return stats,
-        else => return err,
+    const lower_logical = internal_keys.replayRangeLower(kind, from_sequence);
+    const kind_prefix_logical = lower_logical[0..2];
+    const allocator = store.allocator;
+    const physical_prefix = try read.prefixedKey(kind_prefix_logical);
+    defer if (prefix.len > 0) allocator.free(physical_prefix);
+    const physical_lower = try read.prefixedKey(&lower_logical);
+    defer if (prefix.len > 0) allocator.free(physical_lower);
+    const file = try read.readFile();
+
+    const Context = struct {
+        prefix_len: usize,
+        kind: u8,
+        inner_ctx: *anyopaque,
+        inner_callback: backend_erased.Store.ReplayCallback,
+        stats: backend_types.ReplayLaneIterationStats = .{ .scan_batches = 1 },
+
+        fn handle(ptr: *anyopaque, physical_key: []const u8, value: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const logical_key = physical_key[self.prefix_len..];
+            const sequence = internal_keys.parseReplayEntrySequence(logical_key, self.kind) orelse return error.InvalidReplayEntryKey;
+            try self.inner_callback(self.inner_ctx, sequence, value);
+            self.stats.scanned_entries += 1;
+            self.stats.matched_entries += 1;
+            self.stats.last_sequence = sequence;
+        }
     };
-    while (true) {
-        const sequence = internal_keys.parseReplayEntrySequence(entry.key, kind) orelse return error.InvalidReplayEntryKey;
-        try callback(context, sequence, entry.value);
-        stats.scanned_entries += 1;
-        stats.matched_entries += 1;
-        stats.last_sequence = sequence;
-        if (max_entries != 0 and stats.matched_entries >= max_entries) return stats;
-        entry = cursor.next() catch |err| switch (err) {
-            error.NotFound => return stats,
-            else => return err,
-        };
-    }
+    var ctx = Context{ .prefix_len = prefix.len, .kind = kind, .inner_ctx = context, .inner_callback = callback };
+    _ = try file.forEachDocumentKeyInRangeMerged(allocator, read.checkpoint, physical_prefix, physical_lower, max_entries, &ctx, Context.handle);
+    return ctx.stats;
 }
 
 const ReplayLaneFilterStop = error{ReplayLaneFilterStop};
