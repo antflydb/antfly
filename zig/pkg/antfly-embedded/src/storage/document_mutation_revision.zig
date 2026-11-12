@@ -428,6 +428,13 @@ pub const Capture = struct {
 
     pub fn touch(self: *Capture, alloc: std.mem.Allocator, physical_key: []const u8) !void {
         const key = keyForPhysical(physical_key) orelse return;
+        try self.touchKeyed(alloc, key);
+    }
+
+    /// Record a single already-hashed physical key once. Call sites that have
+    /// already paid for `keyForPhysical` (the SHA-256 over the document
+    /// prefix) pass its result here instead of letting `touch` recompute it.
+    fn touchKeyed(self: *Capture, alloc: std.mem.Allocator, key: Key) !void {
         if (self.staged or self.poisoned) return error.RetainedEffectsTransactionFailed;
         errdefer self.poisoned = true;
         const entry = try self.documents.getOrPut(alloc, key);
@@ -437,48 +444,54 @@ pub const Capture = struct {
     /// Hash primary bytes once at the common physical writer boundary. The
     /// fixed map entry coalesces repeated writes and retains no document body.
     pub fn touchValue(self: *Capture, alloc: std.mem.Allocator, physical: []const u8, value: ?[]const u8) !void {
-        return self.touchValuePrepared(alloc, physical, value, null);
+        return self.touchValuePreparedKeyed(alloc, keyForPhysical(physical), physical, value, null);
     }
 
     /// The writer's snapshot qualifies prior metadata before any primary write.
     /// Fresh/unsupported rows require no primary-body read. Repeated writes use
     /// this transaction's most recent publication rather than the older snapshot.
+    ///
+    /// `keyForPhysical` hashes the document prefix with SHA-256; it is computed
+    /// once here and threaded through the `touchValuePrepared*` fallbacks below
+    /// instead of being re-derived at each of them (previously up to 4 hashes
+    /// for one ordinary write).
     pub fn touchValueWithReader(self: *Capture, alloc: std.mem.Allocator, reader: anytype, physical: []const u8, value: ?[]const u8) !void {
-        try self.touch(alloc, physical);
+        const key_opt = keyForPhysical(physical);
+        if (key_opt) |key| try self.touchKeyed(alloc, key);
         if (!keys.isStoredDocumentRowKey(physical) or value == null or value.?.len < projection.minimum_bytes)
-            return self.touchValuePrepared(alloc, physical, value, null);
-        const key = keyForPhysical(physical).?;
+            return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
+        const key = key_opt.?;
         const entry = self.documents.getPtr(key).?;
-        if (entry.* != .unchanged) return self.touchValuePrepared(alloc, physical, value, null);
+        if (entry.* != .unchanged) return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
         errdefer self.poisoned = true;
         const previous_proof = loadContent(reader, physical) catch |err| switch (err) {
             error.InvalidDocumentContentAuthority, error.InvalidDocumentMutationRevision => null,
             else => return err,
         };
-        const proof = previous_proof orelse return self.touchValuePrepared(alloc, physical, value, null);
-        if (proof.bytes < projection.minimum_bytes) return self.touchValuePrepared(alloc, physical, value, null);
+        const proof = previous_proof orelse return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
+        if (proof.bytes < projection.minimum_bytes) return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
         var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
         defer arena.deinit();
         const scratch = arena.allocator();
         const raw_directory = reader.get(&projection.keyForRevision(key)) catch |err| {
-            if (err == error.NotFound) return self.touchValuePrepared(alloc, physical, value, null);
+            if (err == error.NotFound) return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
             return err;
         };
-        if (raw_directory.len > projection.maximum_bytes) return self.touchValuePrepared(alloc, physical, value, null);
-        if (!std.mem.startsWith(u8, raw_directory, "DPD2")) return self.touchValuePrepared(alloc, physical, value, null);
+        if (raw_directory.len > projection.maximum_bytes) return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
+        if (!std.mem.startsWith(u8, raw_directory, "DPD2")) return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
         const directory = try scratch.dupe(u8, raw_directory);
         const raw_certificate = reader.get(&value_identity.keyForRevision(key)) catch |err| {
-            if (err == error.NotFound) return self.touchValuePrepared(alloc, physical, value, null);
+            if (err == error.NotFound) return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
             return err;
         };
-        if (raw_certificate.len > value_identity.maximum_bytes) return self.touchValuePrepared(alloc, physical, value, null);
-        return self.touchValuePrepared(alloc, physical, value, .{ .bytes = proof.bytes, .kind = proof.kind, .digest = proof.digest, .directory = directory, .identities = raw_certificate });
+        if (raw_certificate.len > value_identity.maximum_bytes) return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, null);
+        return self.touchValuePreparedKeyed(alloc, key_opt, physical, value, .{ .bytes = proof.bytes, .kind = proof.kind, .digest = proof.digest, .directory = directory, .identities = raw_certificate });
     }
 
-    fn touchValuePrepared(self: *Capture, alloc: std.mem.Allocator, physical: []const u8, value: ?[]const u8, prior: ?value_identity.Prior) !void {
-        try self.touch(alloc, physical);
+    fn touchValuePreparedKeyed(self: *Capture, alloc: std.mem.Allocator, key_opt: ?Key, physical: []const u8, value: ?[]const u8, prior: ?value_identity.Prior) !void {
+        if (key_opt) |key| try self.touchKeyed(alloc, key);
         if (!keys.isStoredDocumentRowKey(physical)) return;
-        const entry = self.documents.getPtr(keyForPhysical(physical).?).?;
+        const entry = self.documents.getPtr(key_opt.?).?;
         errdefer self.poisoned = true;
         const next: Change = if (value) |bytes| blk: {
             var digest: [32]u8 = undefined;

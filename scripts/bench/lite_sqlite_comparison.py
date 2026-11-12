@@ -157,9 +157,16 @@ def worker_main(config, worker, ready, start, begin, stop, results):
         else:
             af = sdk(config["library"])
             db = af.open(config["path"], no_sync=False, busy_timeout=TIMEOUT)
+            batch_path = config["batch_path"]
 
-            def write(document_key, document, request):
-                db.batch_json(request)
+            if batch_path == "wire":
+
+                def write(document_key, document, request):
+                    db.batch_wire(request)
+            else:
+
+                def write(document_key, document, request):
+                    db.batch_json(request)
 
             busy = (af.BusyError,)
         ready.put({"worker": worker, "ready": True})
@@ -173,15 +180,24 @@ def worker_main(config, worker, ready, start, begin, stop, results):
             document_key = key(worker, sequence)
             value = payload(worker, sequence)
             document = encoded(value)
-            request = (
-                '{"inserts":{'
-                + encoded(document_key)
-                + ":"
-                + document
-                + '},"sync_level":'
-                + encoded("full_index" if config["indexed"] else "write")
-                + "}"
-            )
+            sync_level = "full_index" if config["indexed"] else "write"
+            if config["engine"] != "sqlite" and config["batch_path"] == "wire":
+                # Built outside the timed section, matching the JSON request
+                # string below: only the engine's batch-apply cost is timed,
+                # not request encoding.
+                request = af.encode_batch_wire(
+                    [(document_key, document.encode("utf-8"))], sync_level
+                )
+            else:
+                request = (
+                    '{"inserts":{'
+                    + encoded(document_key)
+                    + ":"
+                    + document
+                    + '},"sync_level":'
+                    + encoded(sync_level)
+                    + "}"
+                )
             began = time.perf_counter_ns()
             try:
                 write(document_key, document, request)
@@ -419,6 +435,7 @@ def run_case(config):
     elapsed = max(row["ended"] for row in rows) - min(row["started"] for row in rows)
     result = {
         "engine": config["engine"],
+        "batch_path": config.get("batch_path"),
         "indexed": config["indexed"],
         "workers": config["workers"],
         "seconds_requested": config["seconds"],
@@ -459,6 +476,15 @@ def main():
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument(
         "--engine", choices=["both", "sqlite", "antfly"], default="both"
+    )
+    parser.add_argument(
+        "--batch-path",
+        choices=["both", "json", "wire"],
+        default="both",
+        help="For the antfly engine: request encoding to measure. 'json' is "
+        "antfly_db_batch_json (JSON object); 'wire' is antfly_db_batch_wire "
+        "(the length-prefixed binary format); 'both' measures each as a "
+        "separate case. No effect on the sqlite engine.",
     )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--source-commit", default="unspecified")
@@ -534,63 +560,81 @@ def main():
                     if args.engine != "both":
                         engines = [args.engine]
                     for engine in engines:
-                        assert (
-                            hashlib.file_digest(
-                                library.open("rb"), "sha256"
-                            ).hexdigest()
-                            == library_sha
+                        # Only the antfly engine has a batch_path choice
+                        # (JSON vs the binary wire format); sqlite's write
+                        # path doesn't change. "both" measures json and wire
+                        # as two separate cases in the same round.
+                        batch_paths = (
+                            [None]
+                            if engine == "sqlite"
+                            else (
+                                ["json", "wire"]
+                                if args.batch_path == "both"
+                                else [args.batch_path]
+                            )
                         )
-                        assert (
-                            hashlib.file_digest(
-                                Path(__file__).open("rb"), "sha256"
-                            ).hexdigest()
-                            == script_sha
-                        )
-                        report["current_case"] = {
-                            "engine": engine,
-                            "indexed": indexed,
-                            "workers": workers,
-                            "round": ordinal,
-                        }
-                        save()
-                        # See run_case's compiler_contamination_samples: on a
-                        # shared dev host this is routinely nonzero from
-                        # other agents' builds. Record it rather than
-                        # blocking the run; load_average plus the
-                        # within-round SQLite-vs-Lite ratio are the signal.
-                        report["current_case"]["pre_run_compiler_processes"] = len(
-                            compiler_processes()
-                        )
-                        suffix = "aflite" if engine == "antfly" else "db"
-                        config = {
-                            "engine": engine,
-                            "path": args.directory / (engine + "." + suffix),
-                            "indexed": indexed,
-                            "library": str(library),
-                            "workers": workers,
-                            "seconds": args.seconds,
-                            "smoke": args.smoke,
-                        }
-                        result = run_case(config)
-                        result["round"] = ordinal
-                        assert (
-                            hashlib.file_digest(
-                                library.open("rb"), "sha256"
-                            ).hexdigest()
-                            == library_sha
-                        )
-                        report["cases"].append(result)
-                        save()
-                        print(
-                            json.dumps(
-                                {
-                                    k: v
-                                    for k, v in result.items()
-                                    if k not in ["per_worker", "verification"]
-                                }
-                            ),
-                            flush=True,
-                        )
+                        for batch_path in batch_paths:
+                            assert (
+                                hashlib.file_digest(
+                                    library.open("rb"), "sha256"
+                                ).hexdigest()
+                                == library_sha
+                            )
+                            assert (
+                                hashlib.file_digest(
+                                    Path(__file__).open("rb"), "sha256"
+                                ).hexdigest()
+                                == script_sha
+                            )
+                            report["current_case"] = {
+                                "engine": engine,
+                                "batch_path": batch_path,
+                                "indexed": indexed,
+                                "workers": workers,
+                                "round": ordinal,
+                            }
+                            save()
+                            # See run_case's compiler_contamination_samples: on a
+                            # shared dev host this is routinely nonzero from
+                            # other agents' builds. Record it rather than
+                            # blocking the run; load_average plus the
+                            # within-round SQLite-vs-Lite ratio are the signal.
+                            report["current_case"]["pre_run_compiler_processes"] = len(
+                                compiler_processes()
+                            )
+                            suffix = "aflite" if engine == "antfly" else "db"
+                            path_tag = f"-{batch_path}" if batch_path else ""
+                            config = {
+                                "engine": engine,
+                                "batch_path": batch_path,
+                                "path": args.directory
+                                / (engine + path_tag + "." + suffix),
+                                "indexed": indexed,
+                                "library": str(library),
+                                "workers": workers,
+                                "seconds": args.seconds,
+                                "smoke": args.smoke,
+                            }
+                            result = run_case(config)
+                            result["round"] = ordinal
+                            assert (
+                                hashlib.file_digest(
+                                    library.open("rb"), "sha256"
+                                ).hexdigest()
+                                == library_sha
+                            )
+                            report["cases"].append(result)
+                            save()
+                            print(
+                                json.dumps(
+                                    {
+                                        k: v
+                                        for k, v in result.items()
+                                        if k not in ["per_worker", "verification"]
+                                    }
+                                ),
+                                flush=True,
+                            )
         report.update(
             status="passed",
             qualified=not args.smoke
