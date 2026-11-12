@@ -116,6 +116,7 @@ const InferenceRuntimeConfig = struct {
     audio_readers: []const @import("antfly_transcribing").NamedConfig = &.{},
     embedded_enabled: bool = true,
     /// Environment forwarded only when a server host launches its worker.
+    worker_executable: ?[]const u8 = null,
     worker_environment: []const worker_runtime.EnvironmentEntry = &.{},
     resources: inference.platform.resource_policy.Resources = .{},
     generation_batching: inference.platform.inference_settings.GenerationBatching = .{},

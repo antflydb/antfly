@@ -17158,6 +17158,7 @@ pub const Node = struct {
                 self.defaultGenerationLimits(target_backend_class),
             ),
         );
+        var admission_limit_exceeded: ?runtime.tier.memory.AdmissionAmounts.LimitExceeded = null;
         var admission_requests: [2]model_manager_mod.GenerationAdmissionRequest = undefined;
         admission_requests[0] = .{
             .session = model.session,
@@ -17165,6 +17166,7 @@ pub const Node = struct {
                 .backend_class = target_backend_class,
                 .limits = target_admission_limits,
                 .amounts = .fromEstimate(resource_estimate),
+                .limit_exceeded = &admission_limit_exceeded,
             },
         };
         const native_resume = if (native_transfer) |transfer| transfer.resume_request != null else false;
@@ -17194,6 +17196,7 @@ pub const Node = struct {
                         ),
                     ),
                     .amounts = .fromEstimate(estimate),
+                    .limit_exceeded = &admission_limit_exceeded,
                 },
             };
             break :blk 2;
@@ -17251,10 +17254,21 @@ pub const Node = struct {
             admission_requests[0..admission_request_count],
         ) catch |err| {
             if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
+            if (err == error.ResourceLimitExceeded) {
+                if (admission_limit_exceeded) |exceeded| return ctx.status(400).json(.{
+                    .@"error" = "MODEL_RESOURCE_LIMIT",
+                    .message = "request and required model residency exceed the configured inference budget",
+                    .budget = @tagName(exceeded.limit),
+                    .required_bytes = exceeded.requested_bytes,
+                    .limit_bytes = exceeded.limit_bytes,
+                    .retryable = false,
+                });
+            }
             return switch (err) {
                 error.ResourceLimitExceeded => ctx.status(400).json(.{
                     .@"error" = "MODEL_RESOURCE_LIMIT",
                     .message = "request exceeds the configured inference resource budget",
+                    .retryable = false,
                 }),
                 // Ownership configuration errors should have failed startup before
                 // request surfaces were published. Keep the HTTP boundary total so
@@ -41568,6 +41582,13 @@ test "dense partial result cleanup owns every allocation exactly once" {
 test "audio embedding asset guard releases admission on early failure" {
     var model: model_manager_mod.LoadedModel = undefined;
     model.managed_publication = null;
+    model.admission_residency = .{};
+    model.resource_lease = null;
+    model.tokenizer_resource_lease = null;
+    model.whisper_prompt_admission = null;
+    model.vision_resource_lease = null;
+    model.text_projection_resource_lease = null;
+    model.visual_projection_resource_lease = null;
     model.embedding_session_lock = .unlocked;
     model.audio_session = null;
     model.audio_projection = null;

@@ -54,14 +54,8 @@ pub const AdmittedAllocator = struct {
     fn reserve(self: *@This(), amount: usize) !?memory.AdmissionLease {
         if (self.admit) |callback| return try callback(self.admission_context.?, amount);
         const session = self.session orelse return error.ResourceLimitExceeded;
-        // Separate chunk leases still belong to one request. Its own retained
-        // bytes cannot turn an intrinsically oversized request into contention.
-        if (session.run_admission) |admission| {
-            const owned = std.math.add(usize, self.reserved_bytes, self.prepaid_host_bytes) catch return error.ResourceLimitExceeded;
-            const total = std.math.add(usize, owned, amount) catch return error.ResourceLimitExceeded;
-            try admission.validateOwnedHostScratch(total);
-        }
-        return (try session.admitHostPreprocess(amount)).lease;
+        const owned = std.math.add(usize, self.reserved_bytes, self.prepaid_host_bytes) catch return error.ResourceLimitExceeded;
+        return (try session.admitHostPreprocessOwned(amount, owned)).lease;
     }
 
     /// Execution borrows this permit's workspace. On exit, adopt its lease
@@ -417,4 +411,23 @@ test "admission prepaid workspace grows only its deficit and rolls back failed s
     a.free(payload);
     scope.deinit();
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "admitted allocator admission includes cumulative growth and resident weights" {
+    var controller = memory.AdmissionController{};
+    const limits = memory.Limits{ .host_limit_bytes = 100 * 1024 };
+    var weights = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 90 * 1024 }, false);
+    defer weights.release();
+    const session = sessions.Session{ .ptr = &controller, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = limits, .static_workspace_bytes = 0, .required_residency = weights.amounts, .check_live_memory = false } };
+    var owner = AdmittedAllocator{ .backing = std.testing.allocator, .session = session };
+    defer owner.deinit();
+    const alloc = owner.allocator();
+    const first = try alloc.alloc(u8, 6 * 1024);
+    @memset(first, 17);
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 6 * 1024));
+    try std.testing.expectEqual(error.ResourceLimitExceeded, owner.admission_error.?);
+    try std.testing.expectEqual(@as(u8, 17), first[0]);
+    alloc.free(first);
+    try owner.trim();
+    try std.testing.expectEqualDeep(weights.amounts, controller.snapshot());
 }
