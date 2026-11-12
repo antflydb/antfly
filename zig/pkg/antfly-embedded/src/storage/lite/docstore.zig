@@ -372,6 +372,7 @@ test "lite reclamation retries reuse estimates and reassess changed roots when a
     store.maintenance_policy = try reclamation.Policy.init(.{ .page_reuse = false, .assessment_bytes = 4096, .minimum_reclaim_bytes = 32 * 4096, .disk_headroom_bytes = 4096, .capacity_probe = .{ .context = &probe, .available = Probe.available } });
     try store.maintainOnce(false);
     const checkpoint = store.file.activeCheckpoint();
+    const committed_before = store.file.committedSequence();
     for (0..5) |_| {
         try std.testing.expectEqual(reclamation.State.deferred, store.maintenance_policy.status.state);
         const retry = store.maintenance_policy.status.state == .deferred or store.maintenance_policy.status.state == .failed;
@@ -397,7 +398,14 @@ test "lite reclamation retries reuse estimates and reassess changed roots when a
         try store.maintainOnce(true);
     }
     try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
-    try std.testing.expect(!std.meta.eql(checkpoint, store.file.activeCheckpoint()));
+    // A commit happened (and advanced) -- the semantic question this
+    // assertion means to ask. `activeCheckpoint()` alone does not
+    // answer it for a redo-log file: a commit that only appends to the
+    // log never moves the physical checkpoint slot at all
+    // (`checkpointRedoLog`, not every commit, does that). `committedSequence`
+    // (the log's own latest durable record in redo mode) is what
+    // actually advances here.
+    try std.testing.expect(committed_before != store.file.committedSequence());
     store.assessment_cache.?.revalidate_at = .zero;
     try store.maintainOnce(true);
     try std.testing.expectEqual(@as(u64, 2), store.maintenance_policy.status.assessment_count);
@@ -1196,7 +1204,19 @@ test "lite reclamation budget rejects a mutation before exhausting capacity" {
     const path = try testPath(alloc, tmp, "reclamation-budget.aflite");
     defer alloc.free(path);
     const limit = 64 * 4096;
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false, .max_storage_bytes = limit } });
+    // §9 (redo + indexed reclamation): gated under redo -- a diverting
+    // commit advances `checkpoint.page_count` on its own, directly, for
+    // its external value chain (`NativeFile.pageAllocatorForDivertingCommit`),
+    // and `checkpointRedoLog`'s own automatic, opportunistic trigger
+    // (`maybeAutoCheckpointRedoLog`, called right after this file's
+    // *own* commit already durably published) can itself hit this exact
+    // budget. That combination exposed two bugs now fixed: the free
+    // map's decode no longer requires `covered_page_count ==
+    // checkpoint.page_count` for a redo-log file (`decodeFreeMapAlloc`'s
+    // `allow_behind`), and `maybeAutoCheckpointRedoLog`'s own failure no
+    // longer retroactively fails a commit that already durably
+    // published before that opportunistic checkpoint ever ran.
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .use_redo_log = true, .reclamation = .{ .page_reuse = false, .enabled = false, .max_storage_bytes = limit } });
     defer store.close();
     var value: [8192]u8 = @splat('a');
     var accepted: usize = 0;
@@ -3738,11 +3758,16 @@ pub const Store = struct {
     /// This had no caller before the regression-B invariant below, so this
     /// bug (returning the ride-along-advanced sequence, never the durable
     /// one) was latent rather than itself the cause of any observed loss.
+    ///
+    /// Delegates to `NativeFile.committedSequence`, which also handles the
+    /// redo-log case this doc comment's own `durable_header` reasoning
+    /// does not cover on its own: a redo-log commit's durability comes
+    /// from the log, not from `self.header`/`durable_header` at all (see
+    /// that function's own doc comment).
     pub fn durableSequence(self: *Store) u64 {
         lockStore(self);
         defer self.mutex.unlock();
-        if (self.file.durable_header) |durable| return durable.checkpoints[durable.active_checkpoint].commit_sequence;
-        return self.file.activeCheckpoint().commit_sequence;
+        return self.file.committedSequence();
     }
 
     const MutationBatch = struct {

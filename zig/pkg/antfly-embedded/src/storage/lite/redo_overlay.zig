@@ -157,6 +157,37 @@ pub const SharedRedoOverlay = struct {
         return try allocator.dupe(u8, bytes);
     }
 
+    /// One staged page, fully owned, returned by `takeAllPagesAlloc`.
+    pub const OwnedPage = struct {
+        page_id: u64,
+        bytes: []u8,
+    };
+
+    /// Removes and returns every currently staged page, fully owned (not
+    /// a copy -- the map no longer references `bytes` after this call,
+    /// ownership transfers to the caller). For the undiverted fallback
+    /// (`NativeFile.publishCheckpoint`'s own comment): a commit whose own
+    /// diverted content is page-shaped only (no accompanying logical
+    /// mutation -- a bare commit's own document-index/free-map/namespace
+    /// pages, not just the external-value-chain case `pending`'s own doc
+    /// comment originally anticipated) has nothing `checkpointRedoLog`'s
+    /// logical-heads fold would ever "absorb," so the caller flushes
+    /// these directly to their real page_id locations instead. Unlike
+    /// `maps`' pin-aware `reclaim`, a page has no "older version some
+    /// reader might still need" to preserve -- once durably written to
+    /// its real location, the overlay's own copy is immediately
+    /// redundant, so this clears unconditionally, pins or not.
+    pub fn takeAllPagesAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io) ![]OwnedPage {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var list = try std.ArrayListUnmanaged(OwnedPage).initCapacity(allocator, self.pages.count());
+        errdefer list.deinit(allocator);
+        var it = self.pages.iterator();
+        while (it.next()) |kv| list.appendAssumeCapacity(.{ .page_id = kv.key_ptr.*, .bytes = kv.value_ptr.* });
+        self.pages.clearRetainingCapacity();
+        return try list.toOwnedSlice(allocator);
+    }
+
     /// Drops every staged page, once a checkpoint has folded them all
     /// into real, physical pages -- but only when no pin is live. Unlike
     /// `maps`' per-version `reclaim`, this is whole-overlay, not

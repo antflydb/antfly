@@ -944,6 +944,77 @@ fn runPrimaryUpdateDelete(allocator: Allocator, path: []const u8, io: std.Io, ch
     try file.deleteDocument("key");
 }
 
+/// §9 (redo + indexed reclamation): redo-log commit and indexed page
+/// reclamation combined -- the combination `NativeFile.createWithRedoLog`
+/// and `docstore.Store.createWithOptions` both refused outright before
+/// this design's work. Every `putDocument` here runs inside its own
+/// explicit `beginTransaction`/`commitTransaction` (a *bare* commit --
+/// no open transaction -- never diverts at all: `putDocumentBatch`
+/// only logs logically when `stagingTransaction()` is true, matching
+/// every existing redo-log test's own convention, e.g. "lite redo log
+/// commit stages pages without a physical pwrite and recovers after
+/// reopen"), so each one is a diverting commit (logged, not built); the
+/// first `checkpointRedoLog` call is what actually builds the three
+/// documents' real pages, and the second is what supersedes (and
+/// retires) them when the same keys are overwritten -- so this
+/// scenario, swept at every sync/write barrier inside both calls,
+/// directly exercises checkpointRedoLog's own real build +
+/// `persistAllocator` + `drainRetirement` + checkpoint-publish sequence,
+/// the one path this design adds that the existing redo-log tests
+/// (indexed_reclamation always false there) never reach -- "crash
+/// mid-checkpoint" and "crash during the retirement work a checkpoint's
+/// own real build does inline" (§9.7 items 4 and 7 of the design doc).
+///
+/// Deliberately only two checkpoints: `checkpointRedoLog`'s own
+/// transaction already reaches `pageAllocatorFromFreeMapWithProof`'s
+/// indexed branch exactly like any other real commit, so its inline,
+/// foreground `drainRetirement` call already exercises the completion
+/// path for a backlog this small -- no separate `reclaimPages` call or
+/// extra round is needed to reach it.
+fn runRedoIndexedCheckpointReclaim(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    var file = try native.NativeFile.createWithRedoLog(allocator, io, path, .{ .indexed_reclamation = true }, native.NativeFile.default_redo_log_capacity_bytes);
+    defer file.close();
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "r-doc-0", .before = null, .after = "r-doc-0-v1" }} });
+    try file.beginTransaction();
+    try file.putDocument("r-doc-0", "r-doc-0-v1");
+    try file.commitTransaction();
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "r-doc-1", .before = null, .after = "r-doc-1-v1" }} });
+    try file.beginTransaction();
+    try file.putDocument("r-doc-1", "r-doc-1-v1");
+    try file.commitTransaction();
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "r-doc-2", .before = null, .after = "r-doc-2-v1" }} });
+    try file.beginTransaction();
+    try file.putDocument("r-doc-2", "r-doc-2-v1");
+    try file.commitTransaction();
+
+    // Builds real pages for the three documents above -- the first point
+    // this scenario's sweep can crash mid-checkpoint.
+    try file.checkpointRedoLog();
+
+    // Diverted/logged against the checkpoint just published: overwriting
+    // these keys again is what gives the *next* checkpoint something to
+    // retire (the v1 pages it supersedes), rather than only ever
+    // allocating fresh ones.
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "r-doc-0", .before = "r-doc-0-v1", .after = "r-doc-0-v2" }} });
+    try file.beginTransaction();
+    try file.putDocument("r-doc-0", "r-doc-0-v2");
+    try file.commitTransaction();
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "r-doc-1", .before = "r-doc-1-v1", .after = "r-doc-1-v2" }} });
+    try file.beginTransaction();
+    try file.putDocument("r-doc-1", "r-doc-1-v2");
+    try file.commitTransaction();
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "r-doc-2", .before = "r-doc-2-v1", .after = "r-doc-2-v2" }} });
+    try file.beginTransaction();
+    try file.putDocument("r-doc-2", "r-doc-2-v2");
+    try file.commitTransaction();
+
+    // Builds real pages for the overwrites and retires the v1 pages they
+    // superseded -- the second (and main) point this scenario's sweep can
+    // crash mid-checkpoint, mid-retire, or mid-publish.
+    try file.checkpointRedoLog();
+}
+
 /// Fixed, fully comptime-known (writer, round) interleaving: 4 logical
 /// writers each committing 3 sequential rounds, writer-major order. Every
 /// key/value pair is a comptime string so `Checkpoint.expectations` below
@@ -1518,6 +1589,12 @@ test "crash sweep: primary update then delete" {
 
 test "crash sweep: deterministic concurrent writers" {
     var report = try runCrashSweep(std.testing.allocator, .{ .name = "deterministic-concurrent-writers", .run = runDeterministicConcurrentWriters }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep: redo log checkpoint with indexed reclamation retires pages" {
+    var report = try runCrashSweep(std.testing.allocator, .{ .name = "redo-indexed-checkpoint-reclaim", .run = runRedoIndexedCheckpointReclaim }, .{});
     defer report.deinit();
     try reportFailures(&report);
 }

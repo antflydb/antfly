@@ -6385,20 +6385,53 @@ pub const NativeFile = struct {
             checkpoint.free_map_root_page = try pages.allocate();
             checkpoint.page_count = pages.next_page_id;
             try pages.flush();
+            // `persistAllocator` -> `State.preparePersist` retires the
+            // ledger's previous root page (`state.root_page`, the old
+            // free_map_root_page) stamped with `self.publicationEpoch()`
+            // -- `self.header.checkpoints[active].commit_sequence + 1`,
+            // read from `self.header` as it stands right now, since this
+            // runs outside any transaction (`self.transaction_header` is
+            // null). That epoch is a promise that the checkpoint which
+            // ends up containing the retirement carries at least that
+            // sequence number. Capture it before `self.header` changes
+            // and stamp the checkpoint we are about to publish with it,
+            // or `validateIndexedOwnership`'s "every pending retirement's
+            // epoch is already covered by its own checkpoint" invariant
+            // sees an epoch one past a checkpoint stuck at the old,
+            // unchanged sequence (see "crash sweep: redo log checkpoint
+            // with indexed reclamation retires pages").
+            const epoch = self.publicationEpoch();
             try self.persistAllocator(&pages, &checkpoint);
+            checkpoint.commit_sequence = epoch;
         } else {
             checkpoint.page_count += log_pages;
         }
+        self.header.checkpoints = .{ checkpoint, checkpoint };
+        self.header.redo_log_offset = offset;
+        self.header.redo_log_capacity = capacity;
+
+        // Both checkpoint slots and the header are written here, but
+        // deliberately synced *once*, together: a crash before that one
+        // sync leaves every write below unsynced, which `power_loss`
+        // modeling in the crash-sim harness can drop in full, reverting
+        // the file to exactly its pre-call state -- not a redo-log file
+        // yet, safe to retry `enableRedoLog` again from scratch. Two
+        // separate syncs (slots, then header) used to leave a window
+        // where the checkpoint slot (and, for an indexed file, the
+        // ledger `persistAllocator` just durably wrote) already reserves
+        // the log region's page-id span while the header's own
+        // `redo_log_capacity` is still durably 0 -- a combination
+        // `check()`'s indexed-allocator validation has no way to
+        // reconcile (nothing on disk says "these reserved-but-unreachable
+        // pages belong to a redo log, not a hole"), surfacing as
+        // `invalid_allocator` on exactly that crash window, reproducibly,
+        // with no crash-sim power loss involved at all (see "crash sweep:
+        // redo log checkpoint with indexed reclamation retires pages").
         var slot_buf: [max_page_size]u8 = undefined;
         const slot_page = slot_buf[0..page_size];
         encodeCheckpointSlotPage(slot_page, checkpoint);
         try self.file.writePositionalAll(io, slot_page, slotPhysicalPage(0) * page_size);
         try self.file.writePositionalAll(io, slot_page, slotPhysicalPage(1) * page_size);
-        if (!self.no_sync) try self.file.sync(io);
-        self.header.checkpoints = .{ checkpoint, checkpoint };
-
-        self.header.redo_log_offset = offset;
-        self.header.redo_log_capacity = capacity;
         var header_buf: [header_size]u8 = undefined;
         encodeHeader(&header_buf, self.header);
         try self.file.writePositionalAll(io, &header_buf, 0);
@@ -6454,7 +6487,9 @@ pub const NativeFile = struct {
         // open must fail rather than silently serve a truncated view of
         // acknowledged work.
         if (outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
-        if (meta_ctx.compact) |compact| self.header.checkpoints[self.header.active_checkpoint] = compact.toCheckpointSlot();
+        if (meta_ctx.compact) |compact| {
+            self.header.checkpoints[self.header.active_checkpoint] = compact.toCheckpointSlot();
+        }
         self.manifest_commits_enabled = false;
 
         const entry = self.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
@@ -6541,6 +6576,26 @@ pub const NativeFile = struct {
         // so `has_logical_work == false` implies there is no pending page
         // work either.
         if (!has_logical_work) return;
+
+        // Flush every still-staged page (external value chains) directly
+        // to its real location before the logical fold below: a
+        // reference to one of these from a folded head (`external_value_root_page`)
+        // only stores the page_id, never re-derives or re-writes the
+        // page's own bytes, so without this explicit flush the
+        // referenced page would stay parked in the overlay forever
+        // (`maybeClearPages`, called after this function's own commit,
+        // assumes every staged page has *already* been folded into a
+        // real, physical one by this point -- this is what actually
+        // makes that assumption true, rather than relying on the
+        // logical fold to do it incidentally, which it never did).
+        {
+            const pages = try redo.shared.takeAllPagesAlloc(std.heap.page_allocator, io);
+            defer std.heap.page_allocator.free(pages);
+            for (pages) |p| {
+                defer std.heap.page_allocator.free(p.bytes);
+                try self.file.writePositionalAll(io, p.bytes, p.page_id * @as(u64, self.header.page_size));
+            }
+        }
 
         // Disables every diversion point (`PageWriteBatch.flushCount`,
         // `flushTransactionWrites`'s logical-mutation branch,
@@ -7074,6 +7129,33 @@ pub const NativeFile = struct {
 
     pub fn activeCheckpoint(self: *const NativeFile) CheckpointSlot {
         return self.header.checkpoints[self.header.active_checkpoint];
+    }
+
+    /// The logical commit sequence: whether a commit has happened, or
+    /// advanced, independent of whether its own physical checkpoint slot
+    /// page or redo-log record has actually landed on disk yet. Use this
+    /// wherever code (or a test) means "did a commit happen, or
+    /// advance" -- not `activeCheckpoint().commit_sequence` directly,
+    /// which only answers a physical-layout question (and, for a
+    /// redo-log file, may not move at all for a commit that only
+    /// appended to the log: `checkpointRedoLog`, not every commit, is
+    /// what advances the physical checkpoint slot there).
+    ///
+    /// In redo-log mode this is `self.redo.?.durable_sequence` -- the
+    /// log's own latest durable (appended and synced) record, which is
+    /// what actually advances on every synced commit. Otherwise this
+    /// mirrors `Store.durableSequence`'s own distinction between a
+    /// ride-along-advanced `activeCheckpoint()` and the actually-durable
+    /// `durable_header`: `commitTransactionWithDurability`'s
+    /// `deferred_publication` branch writes `next` straight into
+    /// `self.header.checkpoints[active]` with no sync at all, leaving
+    /// `durable_header` holding the last checkpoint that *was* actually
+    /// synced -- whenever `durable_header` is set, that, not the
+    /// ride-along-advanced `activeCheckpoint()`, is the durable sequence.
+    pub fn committedSequence(self: *const NativeFile) u64 {
+        if (self.redo) |redo| return redo.durable_sequence;
+        if (self.durable_header) |durable| return durable.checkpoints[durable.active_checkpoint].commit_sequence;
+        return self.activeCheckpoint().commit_sequence;
     }
 
     /// Rebind a borrowed index writer after its owner has verified the inode,
@@ -13811,7 +13893,7 @@ pub const NativeFile = struct {
 
         const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
         defer self.allocator.free(payload);
-        const free_map = try decodeFreeMapAlloc(self.allocator, payload, checkpoint.page_count);
+        const free_map = try decodeFreeMapAlloc(self.allocator, payload, checkpoint.page_count, self.header.redo_log_capacity != 0);
         return free_map.free_pages;
     }
 
@@ -14181,7 +14263,7 @@ pub const NativeFile = struct {
 
         const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
         defer self.allocator.free(payload);
-        const free_map = try decodeFreeMapAlloc(self.allocator, payload, checkpoint.page_count);
+        const free_map = try decodeFreeMapAlloc(self.allocator, payload, checkpoint.page_count, self.header.redo_log_capacity != 0);
         defer self.allocator.free(free_map.free_pages);
 
         for (free_map.free_pages) |page_id| {
@@ -15222,8 +15304,49 @@ pub const NativeFile = struct {
                     // `next` on top of what the checkpoint already
                     // published.
                     if (redo.pendingRecordLen() > redo.writer.remaining()) {
-                        try self.checkpointRedoLog();
-                        return;
+                        if (redo.logical_pending.items.len != 0) {
+                            // This commit diverted logical mutations, so
+                            // `checkpointRedoLog`'s own fold (over
+                            // `redo.shared`, which the same
+                            // `appendLogicalMutation` call already
+                            // populated) genuinely covers them: once it
+                            // returns, this commit is already durable as
+                            // part of the checkpoint it just published,
+                            // and nothing is left to log. Clearing
+                            // `logical_pending`/`pending` here matters --
+                            // `checkpointRedoLog` has no knowledge of
+                            // them, only of `redo.shared`, so skipping
+                            // this would leave them staged forever,
+                            // growing unboundedly across every later
+                            // commit.
+                            try self.checkpointRedoLog();
+                            redo.logical_pending.clearRetainingCapacity();
+                            redo.pending.clearRetainingCapacity();
+                            return;
+                        }
+                        // Page-shaped only (or nothing of this commit's
+                        // own -- either way, safe to flush unconditionally):
+                        // a bare commit's own real pages (document index,
+                        // free map, namespace directory -- not just
+                        // external value chains) are diverted here too
+                        // (`PageWriteBatch.flushCount`), with no logical
+                        // mutation ever staged alongside them, so
+                        // `checkpointRedoLog`'s logical-heads fold has
+                        // nothing to "absorb" -- it operates on a wholly
+                        // separate checkpoint computation than this
+                        // commit's own already-correct `next`, and
+                        // calling it here would discard `next` instead of
+                        // publishing it. Flush the real pages directly
+                        // to their own locations instead, then fall
+                        // through to publish `next` exactly as this
+                        // ride-along branch always does.
+                        const pages = try redo.shared.takeAllPagesAlloc(std.heap.page_allocator, self.runtimeIo());
+                        defer std.heap.page_allocator.free(pages);
+                        for (pages) |p| {
+                            defer std.heap.page_allocator.free(p.bytes);
+                            try self.file.writePositionalAll(self.runtimeIo(), p.bytes, p.page_id * @as(u64, self.header.page_size));
+                        }
+                        redo.pending.clearRetainingCapacity();
                     }
                 }
                 const was_durable_header_null = self.durable_header == null;
@@ -15278,11 +15401,28 @@ pub const NativeFile = struct {
     /// synchronously, rather than the log filling out from under it.
     /// Moving this onto an async/idle/owner-only trigger is follow-up
     /// work; it does not change this function's own correctness.
+    ///
+    /// Every caller reaches this *after* its own commit has already
+    /// durably published (`publishCheckpoint`, just above either call
+    /// site) -- unlike `publishCheckpoint`'s own preemptive branch, where
+    /// running a real checkpoint instead of a log append is the only way
+    /// that specific commit completes at all, nothing here is required
+    /// for the commit that got us this far: it is purely opportunistic
+    /// backpressure for whichever commit hits the log next. A failure --
+    /// `error.LiteStorageBudgetExceeded` reached indexed_reclamation's
+    /// checkpoint-time page work the moment this design let real
+    /// page/allocator work defer to `checkpointRedoLog`, same as a
+    /// transient disk-space or I/O error -- must never retroactively turn
+    /// an already-durable write into a failure the caller then (wrongly)
+    /// aborts. Swallowed exactly like the idle-timer trigger
+    /// (`Store.maybeCheckpointRedoLogOnIdleTurn`) swallows the same call:
+    /// the log is simply left a little fuller than ideal, for that timer
+    /// or a future commit crossing this same bound to retry.
     fn maybeAutoCheckpointRedoLog(self: *NativeFile) anyerror!void {
         const redo: *RedoCommitState = if (self.redo) |*r| r else return;
         if (redo.checkpointing) return;
         if (redo.writer.remaining() >= redo.writer.capacity / 4) return;
-        try self.checkpointRedoLog();
+        self.checkpointRedoLog() catch {};
     }
 
     /// WS1(b) single-fsync commits. A first attempt measured a
@@ -15529,24 +15669,56 @@ pub const NativeFile = struct {
             // A log-full condition must be decided before anything is
             // appended, never discovered as a failed, partial append
             // (`error.LogFull`, surfacing as the far less specific
-            // `error.OutcomeUnknown` below). This commit's own mutations
-            // are already staged in `redo.shared` -- `flushTransactionWrites`'s
-            // diversion loop ran before this function was ever called --
-            // so `checkpointRedoLog`'s own fold necessarily covers them
-            // too: once it returns, this commit is already durable as
-            // part of the checkpoint it just published, and there is
-            // nothing left to log. Return immediately in that case,
-            // rather than also appending (and republishing `checkpoint`,
-            // now stale relative to what `checkpointRedoLog` already
-            // wrote) on top of it. If `checkpointRedoLog` itself fails
-            // (e.g. no disk space left to allocate the real pages it
-            // needs), that error propagates unchanged: `redo.shared`/
-            // `redo.writer` are untouched by a failed checkpoint attempt,
-            // so the log is left intact and the caller sees a clean,
-            // pre-decision error instead of a torn append.
+            // `error.OutcomeUnknown` below).
             if (redo.pendingRecordLen() > redo.writer.remaining()) {
-                try self.checkpointRedoLog();
-                return;
+                if (redo.logical_pending.items.len != 0) {
+                    // This commit diverted logical mutations, already
+                    // staged in `redo.shared` (the same
+                    // `appendLogicalMutation` call that built
+                    // `logical_pending` populated it too, inside
+                    // `flushTransactionWrites`, before this function was
+                    // ever called) -- so `checkpointRedoLog`'s own fold
+                    // genuinely covers them: once it returns, this
+                    // commit is already durable as part of the
+                    // checkpoint it just published, and there is nothing
+                    // left to log. Clearing `logical_pending`/`pending`
+                    // matters here: `checkpointRedoLog` has no knowledge
+                    // of them, only of `redo.shared`, so skipping this
+                    // would leave them staged forever, growing
+                    // unboundedly across every later commit. If
+                    // `checkpointRedoLog` itself fails (e.g. no disk
+                    // space to allocate the real pages it needs), that
+                    // error propagates unchanged: `redo.shared`/
+                    // `redo.writer` are untouched by a failed checkpoint
+                    // attempt, so the log stays intact and the caller
+                    // sees a clean, pre-decision error, never a torn
+                    // append.
+                    try self.checkpointRedoLog();
+                    redo.logical_pending.clearRetainingCapacity();
+                    redo.pending.clearRetainingCapacity();
+                    return;
+                }
+                // Page-shaped only (or nothing of this commit's own --
+                // either way, safe to flush unconditionally): a bare
+                // commit's own real pages (document index, free map,
+                // namespace directory -- not just external value
+                // chains) are diverted here too (`PageWriteBatch.
+                // flushCount`), with no logical mutation ever staged
+                // alongside them, so `checkpointRedoLog`'s logical-heads
+                // fold has nothing to "absorb" -- it is a wholly
+                // separate checkpoint computation from this commit's own
+                // already-correct `checkpoint`, and calling it here
+                // would discard `checkpoint` (never publish it) instead.
+                // Flush the real pages directly to their own locations
+                // instead, then fall through to publish `checkpoint`
+                // exactly as this function always does.
+                const pages = try redo.shared.takeAllPagesAlloc(std.heap.page_allocator, self.runtimeIo());
+                defer std.heap.page_allocator.free(pages);
+                for (pages) |p| {
+                    defer std.heap.page_allocator.free(p.bytes);
+                    try self.file.writePositionalAll(self.runtimeIo(), p.bytes, p.page_id * @as(u64, self.header.page_size));
+                }
+                redo.pending.clearRetainingCapacity();
             }
             // §9.1/§9.3: the on-disk checkpoint slot is untouched here --
             // it still names the last real checkpoint (build step (d) is
@@ -17949,13 +18121,29 @@ fn encodeFreeMapAlloc(allocator: Allocator, page_size: u32, covered_page_count: 
     return payload;
 }
 
-fn decodeFreeMapAlloc(allocator: Allocator, raw: []const u8, checkpoint_page_count: u64) !FreeMap {
+/// `allow_behind` is for a redo-log file only: a diverting commit (§9)
+/// advances `checkpoint.page_count` on its own, directly, to hand out
+/// fresh page ids for external value chains (`pageAllocatorForDivertingCommit`)
+/// without ever touching this free map -- that is the entire point of
+/// deferring real page/allocator work to `checkpointRedoLog`'s own
+/// batched build. So between two real checkpoints, `checkpoint.page_count`
+/// legitimately runs ahead of the free map's own `covered_page_count`;
+/// every page in that gap is one a diverting commit already claimed and
+/// wrote for real, never reachable through this free map, which is
+/// exactly how an already-allocated (non-free) page behaves here anyway.
+/// A free map that claims to cover *more* than the checkpoint's own
+/// page_count is a different story -- that is always invalid, redo or
+/// not, since no page beyond page_count exists yet for anything to be
+/// free within.
+fn decodeFreeMapAlloc(allocator: Allocator, raw: []const u8, checkpoint_page_count: u64, allow_behind: bool) !FreeMap {
     if (raw.len < free_map_header_size) return error.TruncatedNativeFreeMap;
     const version = std.mem.readInt(u32, raw[0..4], .little);
     if (version != free_map_format_version) return error.InvalidNativeFreeMap;
     const free_page_count = std.mem.readInt(u32, raw[4..8], .little);
     const covered_page_count = std.mem.readInt(u64, raw[8..16], .little);
-    if (covered_page_count != checkpoint_page_count) return error.InvalidNativeFreeMap;
+    if (if (allow_behind) covered_page_count > checkpoint_page_count else covered_page_count != checkpoint_page_count) {
+        return error.InvalidNativeFreeMap;
+    }
     const expected_len = free_map_header_size + @as(usize, free_page_count) * 8;
     if (raw.len != expected_len) return error.InvalidNativeFreeMap;
 
