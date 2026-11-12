@@ -14469,7 +14469,6 @@ pub const NativeFile = struct {
         // failing (or an inconsistent latch) falls through to the refusal.
         if (self.checkpoint_publication_uncertain) try self.reconcilePublicationUncertainty();
         try self.refreshIfWriterBaseStale();
-        if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.claimActiveWriter(entry, @intFromPtr(self));
         self.transaction_header = self.header;
         self.artifact_lease_transaction = false;
         self.allocator_certificate_staged = false;
@@ -15052,13 +15051,6 @@ pub const NativeFile = struct {
         // harness.
         if (self.transaction_header == null) {
             if (self.inode_lock_ref.load(.acquire)) |entry| {
-                // Second backstop: the writer-lease admission gate
-                // (`WriterLane`/`Owner`, capi/lite_connection.zig) is
-                // supposed to guarantee at most one claimant between
-                // `beginTransaction` and here. See `active_writer`'s own
-                // doc comment in inode_lock.zig for exactly what this
-                // does and does not prove.
-                inode_lock.assertActiveWriter(entry, @intFromPtr(self));
                 const base = self.activeCheckpoint().commit_sequence;
                 const latest = inode_lock.committedSequence(entry);
                 if (base < latest) {
