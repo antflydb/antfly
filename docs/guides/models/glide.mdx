@@ -1,0 +1,91 @@
+---
+title: GLiDE typed decisions
+description: Serve Fastino GLiDE decision checkpoints through the typed decision API
+---
+
+[GLiDE](https://huggingface.co/fastino/GLiDE-0.4B) is a family of Fastino
+decision models. Given an input and typed questions, a GLiDE checkpoint returns a
+probability for every option of every question from one forward pass per
+question. It reads a 255-way decision readout and generates no text. Antfly serves GLiDE
+checkpoints natively through `/ai/v1/decisions` using the
+model-independent [typed decision contract](../../reference/decisions.md). They
+appear under deciders in model discovery.
+
+## Supported checkpoints
+
+| Checkpoint | Backbone | Prompt length | Longer prompts |
+| --- | --- | --- | --- |
+| `fastino/GLiDE-0.4B` | ModernBERT (Ettin) encoder, bidirectional | 7,999 tokens | Keeps the first 1,024 tokens and the end (question and options) |
+| `fastino/GLiDE-0.8B` | Qwen3.5 text backbone, non-causal full attention | 40,000 tokens | Rejected with HTTP 413 |
+
+Antfly recognizes a GLiDE directory from its `decision_config.json` (format 1,
+prompt format `quick-empty-think-medium-v1`) and `readout.safetensors`. The
+backbone in `config.json` must match the declared backbone. Download a
+checkpoint into the models directory; no conversion is needed:
+
+```sh
+hf download fastino/GLiDE-0.4B --local-dir ./models/GLiDE-0.4B
+antfly inference decisions ./models --request decision.json --backend metal
+```
+
+Text-only bf16 safetensors checkpoints are supported. NVFP4 checkpoints, looped
+variants and image inputs are rejected. Metal is the qualified backend for both
+checkpoints. GLiDE-0.4B also runs on the native CPU backend; GLiDE-0.8B is
+Metal-only, and loading it on another backend fails instead of serving it.
+
+GLiDE weights are licensed under the Fastino Community License, not Apache 2.0.
+Commercial use requires displaying "Built with Fastino GLiDE", and production
+commercial use by an entity with more than US$10 million in annual revenue requires
+a separate commercial agreement with Fastino. Read the checkpoint's `LICENSE`
+before deploying.
+
+## Request mapping
+
+GLiDE prompts are built exactly as the reference `glide` package builds them, with
+one prompt per (input, question). Prompt text and token ids are byte-identical to
+the reference. Public questions map to GLiDE options as follows:
+
+| Public question | GLiDE options |
+| --- | --- |
+| `choice` | `choices` in order. `(A) value: description`; a choice without a description renders `(A) value`. |
+| `predicate` | `(A) true: Yes`, `(B) false: No`. `probability` is p(true). |
+| `score` | `levels` in order as options `0`..`n-1`. The level text is `label: description` when both are given and differ, otherwise the label. A label that only repeats its index (`"0"`, `"1"`, ...) shows just the description. |
+
+The answer distribution is a softmax over the question's options of the readout
+logits, scaled by the checkpoint temperature. Answers use the typed decision
+response: `choice` and its probabilities, the expected zero-based `score` and
+labeled probabilities, and the predicate's true `probability`. `confidence` is
+the normalized inverse entropy of the distribution.
+
+Predicates always use the default option text `true: Yes` and `false: No`. The
+reference's own request format can replace that text (for example
+`"criteria": {"true": "Yes, there is a compliance risk", "false": "No compliance risk"}`).
+The public contract has no field for it, so put that wording into the predicate's
+`instructions`. The prompt then differs from a reference request that uses custom
+option text, and so do the probabilities. The reference format also accepts a JSON
+value as the state; to reproduce its prompt, send Python's
+`json.dumps(state, ensure_ascii=False)` rendering as the input string.
+It also accepts instructions given as objects. Embedding options,
+`multi_choice`, choice `examples`, `model_identity` and `long_document`
+windowing are rejected for GLiDE.
+
+## Batching and limits
+
+All prompts of a request (inputs × questions) are tokenized before execution,
+sorted by length and run in right-padded micro-batches of at most 16,384 padded
+tokens (the reference rule). Every micro-batch is admitted against the model's
+memory limits before it runs and is split further when it does not fit. Token
+`usage` counts every prompt's tokens, including the special tokens and
+after truncation.
+
+The public limits still apply: 128 inputs, 64 questions and 2–64 choices or
+levels per request.
+
+## Validation
+
+Prompt text and token ids are compared byte for byte with captures from the
+reference package. The captures cover both checkpoints, inputs up to 5,129 tokens,
+truncated encoder prompts and whitespace runs. For eight reference requests
+translated to the public contract, Metal answers match the reference's CPU FP32
+probabilities to within 1e-6 (0.4B) and 6e-6 (0.8B), with the same top
+answer for every question.

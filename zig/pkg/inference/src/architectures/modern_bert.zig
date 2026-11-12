@@ -256,6 +256,7 @@ fn preplanMetalModernBertEncoder(
                 // (Laya-large 3.1x, OpenDecider-nano 1.4x on M4 Max); BF16
                 // weights are expanded to F32 for it.
                 .prefer_f32_mps_fallback = !prefer_f16_mps and !platform.env.getenvBool("TERMITE_METAL_DISABLE_MODERNBERT_F32_MPS"),
+                .glide_f16_tensor_ops = config.glide.f16_linears,
             }))) return false;
         }
     }
@@ -328,7 +329,31 @@ pub fn forwardCT(
     try validateConfig(config);
     const total = std.math.mul(usize, batch, seq_len) catch return error.InvalidInputShape;
     if (batch == 0 or seq_len == 0 or seq_len > config.max_position_embeddings or input_ids.len != total or attention_mask.len != total) return error.InvalidInputShape;
-    return forwardImpl(cb, allocator, config, input_ids, attention_mask, batch, seq_len, null, null, null);
+    return forwardImpl(cb, allocator, config, input_ids, attention_mask, batch, seq_len, null, null, null, null);
+}
+
+/// The final-norm hidden state of one token per row: `readout_index[b]` is
+/// the row-local index (a real token) of row `b`. Returns `[batch, hidden]`.
+/// On the row-segment path the last layer runs its queries, output
+/// projection and MLP for those rows only; keys and values still span every
+/// token, so the rows equal the matching rows of `forwardCT`.
+pub fn forwardReadoutCT(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+    readout_index: []const i64,
+) !CT {
+    try validateConfig(config);
+    const total = std.math.mul(usize, batch, seq_len) catch return error.InvalidInputShape;
+    if (batch == 0 or seq_len == 0 or seq_len > config.max_position_embeddings or input_ids.len != total or attention_mask.len != total or readout_index.len != batch) return error.InvalidInputShape;
+    for (readout_index, 0..) |index, row| {
+        if (index < 0 or index >= @as(i64, @intCast(seq_len)) or attention_mask[row * seq_len + @as(usize, @intCast(index))] == 0) return error.InvalidInputShape;
+    }
+    return forwardImpl(cb, allocator, config, input_ids, attention_mask, batch, seq_len, null, null, null, readout_index);
 }
 
 /// One tree-packed row (see pipelines/laya_tree.zig), attended through
@@ -381,7 +406,7 @@ pub fn forwardPackedCT(
     const mask = try allocator.alloc(i64, seq_len);
     defer allocator.free(mask);
     @memset(mask, 1);
-    return forwardImpl(cb, allocator, config, input_ids, mask, 1, seq_len, packed_row, null, null);
+    return forwardImpl(cb, allocator, config, input_ids, mask, 1, seq_len, packed_row, null, null, null);
 }
 
 /// Cached trunk rows for a branch-only packed forward: per encoder layer,
@@ -428,7 +453,7 @@ pub fn forwardBranchesCT(
     const mask = try allocator.alloc(i64, seq_len);
     defer allocator.free(mask);
     @memset(mask, 1);
-    return forwardImpl(cb, allocator, config, branch_ids, mask, 1, seq_len, packed_row, branches, null);
+    return forwardImpl(cb, allocator, config, branch_ids, mask, 1, seq_len, packed_row, branches, null, null);
 }
 
 /// The unpacked encoder forward at logical positions `first_position..`,
@@ -463,7 +488,7 @@ pub fn forwardCapturingCT(
         k.* = @intCast(first_position + i);
         ranges[6 * i ..][0..6].* = .{ 0, @intCast(n), 0, 0, 0, 0 };
     }
-    return forwardImpl(cb, allocator, config, input_ids, mask, 1, n, .{ .positions = positions, .ranges = ranges, .key_positions = key_positions }, null, capture);
+    return forwardImpl(cb, allocator, config, input_ids, mask, 1, n, .{ .positions = positions, .ranges = ranges, .key_positions = key_positions }, null, capture, null);
 }
 
 fn forwardImpl(
@@ -477,6 +502,9 @@ fn forwardImpl(
     packed_row: ?Packed,
     branches: ?Branches,
     capture: ?Capture,
+    /// Row-local readout token per row (`forwardReadoutCT`); the result is
+    /// then `[batch, hidden]`.
+    readout: ?[]const i64,
 ) !CT {
     const trace = MetalTrace.init(cb);
     const zero_bias: ?CT = if (config.checkpoint_layout == .huggingface_fused_qkv_no_bias)
@@ -519,6 +547,14 @@ fn forwardImpl(
         null;
     defer if (row_segments) |rows| rows.deinit(allocator);
 
+    // Compact rows of the readout tokens; the last layer then runs for them only.
+    const readout_rows: ?[]u32 = if (readout) |indices| if (row_segments) |rows| blk: {
+        const ids = try allocator.alloc(u32, indices.len);
+        for (ids, indices, 0..) |*id, index, row| id.* = @intCast(rows.restore[row * seq_len + @as(usize, @intCast(index))]);
+        break :blk ids;
+    } else null else null;
+    defer if (readout_rows) |ids| allocator.free(ids);
+
     // One request-owned position upload, retained across all encoder layers.
     // No cross-request cache or new synchronization boundary is introduced.
     const fusion_positions: ?CT = if (cb.kind() == .metal and !config.rope_interleaved and
@@ -541,23 +577,26 @@ fn forwardImpl(
         const layer_started_ns = trace.now();
         const layer_started = trace.snapshot(cb);
         try cb.checkExecutionControl();
-        const new_hidden = try encoderLayer(
-            cb,
-            allocator,
-            config,
-            hidden,
-            attention_mask,
-            batch,
-            seq_len,
-            layer_idx,
-            zero_bias,
-            resident_slots,
-            if (packed_row) |row| row.at(layer_idx) else null,
-            branches,
-            capture,
-            row_segments,
-            fusion_positions,
-        );
+        const new_hidden = if (readout_rows != null and layer_idx + 1 == config.num_hidden_layers)
+            try encoderLayerReadout(cb, allocator, config, hidden, layer_idx, zero_bias, resident_slots, row_segments.?, fusion_positions, readout_rows.?)
+        else
+            try encoderLayer(
+                cb,
+                allocator,
+                config,
+                hidden,
+                attention_mask,
+                batch,
+                seq_len,
+                layer_idx,
+                zero_bias,
+                resident_slots,
+                if (packed_row) |row| row.at(layer_idx) else null,
+                branches,
+                capture,
+                row_segments,
+                fusion_positions,
+            );
         cb.free(hidden);
         hidden = new_hidden;
         if (trace.per_layer and encoder_frame_active) {
@@ -571,7 +610,8 @@ fn forwardImpl(
             if (layer_idx + 1 < config.num_hidden_layers)
                 encoder_frame_active = try cb.decoderRuntimeBeginFrame();
         } else if (cb.execution_control != null and encoder_frame_active and
-            (layer_idx + 1) % 2 == 0 and layer_idx + 1 < config.num_hidden_layers)
+            (layer_idx + 1) % 2 == 0 and layer_idx + 1 < config.num_hidden_layers and
+            batch * seq_len >= config.glide.single_frame_below_tokens)
         {
             try cb.decoderRuntimeSubmitAndWaitFrame();
             encoder_frame_active = false;
@@ -595,17 +635,37 @@ fn forwardImpl(
     };
     cb.free(hidden);
     hidden = normed_final;
-    if (row_segments) |rows| {
+    if (readout_rows == null) if (row_segments) |rows| {
         const padded = try cb.embeddingLookup(hidden, rows.restore, rows.restore.len, @intCast(config.hidden_size));
         cb.free(hidden);
         hidden = padded;
-    }
+    };
     if (encoder_frame_active) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
         encoder_frame_active = false;
     }
     try cb.checkExecutionControl();
     trace.emitAggregate(cb, if (row_segments) |rows| rows.tokens else batch * seq_len, @intCast(config.num_hidden_layers));
+    if (readout != null and readout_rows == null) {
+        // Padded `[batch * seq_len, hidden]` result: gather the readout rows.
+        const indices = readout.?;
+        const hidden_size: usize = @intCast(config.hidden_size);
+        const row_ids = try allocator.alloc(u32, batch);
+        defer allocator.free(row_ids);
+        const fallback_ids = try allocator.alloc(i64, batch);
+        defer allocator.free(fallback_ids);
+        for (indices, row_ids, fallback_ids, 0..) |index, *row_id, *fallback, row| {
+            const global = row * seq_len + @as(usize, @intCast(index));
+            row_id.* = std.math.cast(u32, global) orelse return error.InvalidInputShape;
+            fallback.* = @intCast(global);
+        }
+        const gathered = if (try cb.takeRows(hidden, row_ids, batch, hidden_size)) |rows|
+            rows
+        else
+            try cb.embeddingLookup(hidden, fallback_ids, batch, hidden_size);
+        cb.free(hidden);
+        return gathered;
+    }
     return hidden;
 }
 
@@ -663,7 +723,6 @@ fn encoderLayer(
     const H: usize = @intCast(config.hidden_size);
     const num_heads: usize = @intCast(config.num_attention_heads);
     const head_dim = H / num_heads;
-    const intermediate: usize = @intCast(config.intermediate_size);
     // A branch-only forward projects just the branch rows; attention still
     // spans the cached trunk rows that precede them.
     const prefix_rows: usize = if (branches) |b| b.prefix_rows else 0;
@@ -748,6 +807,8 @@ fn encoderLayer(
             .keys = total,
             .num_heads = num_heads,
             .head_dim = head_dim,
+            .row_spans = if (config.glide.f16_row_attention) rows.spans else null,
+            .f16_row_flash = config.glide.f16_row_attention,
         })
     else fallback: {
         // For local layers build a sliding-window additive attention bias.
@@ -780,6 +841,112 @@ fn encoderLayer(
         );
     };
     defer cb.free(attn_out);
+    return finishLayer(cb, config, hidden, attn_out, layer_idx, total, zero_bias, resident_slots);
+}
+
+/// The last encoder layer for `readout_rows` only (compact row ids): every
+/// token still contributes keys and values, but the queries, the output
+/// projection, both residuals and the MLP run for the readout rows. Returns
+/// `[readout_rows.len, hidden]`, equal to those rows of `encoderLayer`.
+fn encoderLayerReadout(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    layer_idx: usize,
+    zero_bias: ?CT,
+    resident_slots: bool,
+    rows: RowSegments,
+    fusion_positions: ?CT,
+    readout_rows: []const u32,
+) !CT {
+    const H: usize = @intCast(config.hidden_size);
+    const num_heads: usize = @intCast(config.num_attention_heads);
+    const head_dim = H / num_heads;
+    const total = rows.tokens;
+    const count = readout_rows.len;
+    const is_global = (layer_idx % @as(usize, @intCast(config.global_attn_every_n_layers))) == 0;
+    const rope_theta = if (is_global) config.global_rope_theta else config.local_rope_theta;
+    var name_buf: [256]u8 = undefined;
+
+    const identity_attn_norm = config.checkpoint_layout == .huggingface_fused_qkv_no_bias and layer_idx == 0;
+    const normed_attn = if (identity_attn_norm) hidden else blk: {
+        if (try slottedLayerNorm(cb, hidden, if (resident_slots) modernBertNormSlot(layer_idx, .attention) else null, config)) |normed| break :blk normed;
+        const attn_ln_w = try getLayerWeight(cb, layer_idx, "attn_norm.weight", &name_buf);
+        defer cb.free(attn_ln_w);
+        if (zero_bias) |bias| break :blk try cb.layerNorm(hidden, attn_ln_w, bias, H, config.layer_norm_eps);
+        const attn_ln_b = try getLayerWeight(cb, layer_idx, "attn_norm.bias", &name_buf);
+        defer cb.free(attn_ln_b);
+        break :blk try cb.layerNorm(hidden, attn_ln_w, attn_ln_b, H, config.layer_norm_eps);
+    };
+    defer if (!identity_attn_norm) cb.free(normed_attn);
+
+    const qkv = try projectQkv(
+        cb,
+        config,
+        normed_attn,
+        layer_idx,
+        total,
+        H,
+        if (resident_slots) modernBertLinearSlot(layer_idx, .qkv) else null,
+        null,
+        fusion_positions,
+        rope_theta,
+        &name_buf,
+    );
+    defer cb.free(qkv.q);
+    defer cb.free(qkv.k);
+    defer cb.free(qkv.v);
+    const Q = if (qkv.rotated) qkv.q else try ropeAtPositions(cb, allocator, qkv.q, rows.rope_positions, num_heads, head_dim, rope_theta, config.rope_interleaved);
+    defer if (!qkv.rotated) cb.free(Q);
+    const K = if (qkv.rotated) qkv.k else try ropeAtPositions(cb, allocator, qkv.k, rows.rope_positions, num_heads, head_dim, rope_theta, config.rope_interleaved);
+    defer if (!qkv.rotated) cb.free(K);
+
+    const ranges = try allocator.alloc(u32, count * 6);
+    defer allocator.free(ranges);
+    const query_positions = try allocator.alloc(i32, count);
+    defer allocator.free(query_positions);
+    const row_ids = try allocator.alloc(i64, count);
+    defer allocator.free(row_ids);
+    for (readout_rows, 0..) |row, i| {
+        if (row >= total) return error.InvalidInputShape;
+        ranges[i * 6 ..][0..6].* = rows.ranges[row * 6 ..][0..6].*;
+        query_positions[i] = rows.positions[row];
+        row_ids[i] = row;
+    }
+    const q_rows = if (try cb.takeRows(Q, readout_rows, count, H)) |taken| taken else try cb.embeddingLookup(Q, row_ids, count, H);
+    defer cb.free(q_rows);
+    const attn_out = try cb.segmentAttention(allocator, q_rows, K, qkv.v, &.{
+        .ranges = ranges,
+        .query_positions = query_positions,
+        .key_positions = rows.positions,
+        .window = if (is_global) std.math.maxInt(u32) else config.local_attention_window / 2,
+        .queries = count,
+        .keys = total,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+    });
+    defer cb.free(attn_out);
+    const hidden_rows = if (try cb.takeRows(hidden, readout_rows, count, H)) |taken| taken else try cb.embeddingLookup(hidden, row_ids, count, H);
+    defer cb.free(hidden_rows);
+    return finishLayer(cb, config, hidden_rows, attn_out, layer_idx, count, zero_bias, resident_slots);
+}
+
+/// The output projection, both residuals and the GeGLU MLP of one layer over
+/// `total` rows of `hidden` and its attention output `attn_out`.
+fn finishLayer(
+    cb: *const ComputeBackend,
+    config: Config,
+    hidden: CT,
+    attn_out: CT,
+    layer_idx: usize,
+    total: usize,
+    zero_bias: ?CT,
+    resident_slots: bool,
+) !CT {
+    const H: usize = @intCast(config.hidden_size);
+    const intermediate: usize = @intCast(config.intermediate_size);
+    var name_buf: [256]u8 = undefined;
 
     // Output projection
     const attn_proj = try projectAttentionOutput(
@@ -826,18 +993,48 @@ fn encoderLayer(
     const Wo_w = try getLayerWeight(cb, layer_idx, "mlp.Wo.weight", &name_buf);
     defer cb.free(Wo_w);
 
-    const ffn_out = try geGluFfn(
-        cb,
-        normed_ffn,
-        Wi_w,
-        Wo_w,
-        total,
-        H,
-        intermediate,
-        config.checkpoint_layout == .huggingface_fused_qkv_no_bias,
-        if (resident_slots) modernBertLinearSlot(layer_idx, .ffn_in) else null,
-        if (resident_slots) modernBertLinearSlot(layer_idx, .ffn_out) else null,
-    );
+    // GLiDE: the whole MLP block (half-internal GeGLU projection, down
+    // projection and residual) in one Metal call, else the fused GeGLU
+    // projection alone.
+    const glide_mlp = config.glide.f16_linears and resident_slots and cb.kind() == .metal and
+        config.checkpoint_layout == .huggingface_fused_qkv_no_bias;
+    if (glide_mlp) {
+        if (try cb.decoderRuntimeApplyLinear(&.{
+            .slot = modernBertLinearSlot(layer_idx, .ffn_in),
+            .input = normed_ffn,
+            .in_dim = H,
+            .out_dim = 2 * intermediate,
+            .glide_geglu_exact = true,
+            .glide_down_slot = modernBertLinearSlot(layer_idx, .ffn_out),
+            .glide_residual = hidden_after_attn,
+        })) |block| return block;
+    }
+    const glide_activated: ?CT = if (glide_mlp)
+        try cb.decoderRuntimeApplyLinear(&.{
+            .slot = modernBertLinearSlot(layer_idx, .ffn_in),
+            .input = normed_ffn,
+            .in_dim = H,
+            .out_dim = 2 * intermediate,
+            .glide_geglu_exact = true,
+        })
+    else
+        null;
+    defer if (glide_activated) |activated| cb.free(activated);
+    const ffn_out = if (glide_activated) |activated|
+        try linearNoBiasWithSlot(cb, activated, Wo_w, total, intermediate, H, modernBertLinearSlot(layer_idx, .ffn_out))
+    else
+        try geGluFfn(
+            cb,
+            normed_ffn,
+            Wi_w,
+            Wo_w,
+            total,
+            H,
+            intermediate,
+            config.checkpoint_layout == .huggingface_fused_qkv_no_bias,
+            if (resident_slots) modernBertLinearSlot(layer_idx, .ffn_in) else null,
+            if (resident_slots) modernBertLinearSlot(layer_idx, .ffn_out) else null,
+        );
     defer cb.free(ffn_out);
 
     // Residual: add FFN output to post-attention hidden state
@@ -1149,8 +1346,11 @@ const RowSegments = struct {
     positions: []i32,
     rope_positions: []i64,
     restore: []i64,
+    /// Per row: `[start, len]` of its compact tokens.
+    spans: []u32,
 
     fn deinit(self: RowSegments, allocator: std.mem.Allocator) void {
+        allocator.free(self.spans);
         allocator.free(self.ids);
         allocator.free(self.ranges);
         allocator.free(self.positions);
@@ -1180,11 +1380,14 @@ fn rowSegments(allocator: std.mem.Allocator, input_ids: []const i64, attention_m
     const rope_positions = try allocator.alloc(i64, tokens);
     errdefer allocator.free(rope_positions);
     const restore = try allocator.alloc(i64, batch * seq_len);
+    errdefer allocator.free(restore);
+    const spans = try allocator.alloc(u32, batch * 2);
     @memset(ranges, 0);
     var offset: usize = 0;
     for (0..batch) |row| {
         const mask = attention_mask[row * seq_len ..][0..seq_len];
         const len = std.mem.indexOfScalar(i64, mask, 0) orelse seq_len;
+        spans[row * 2 ..][0..2].* = .{ @intCast(offset), @intCast(len) };
         for (0..seq_len) |i| {
             restore[row * seq_len + i] = @intCast(offset + if (i < len) i else 0);
             if (i >= len) continue;
@@ -1196,7 +1399,7 @@ fn rowSegments(allocator: std.mem.Allocator, input_ids: []const i64, attention_m
         }
         offset += len;
     }
-    return .{ .tokens = tokens, .ids = ids, .ranges = ranges, .positions = positions, .rope_positions = rope_positions, .restore = restore };
+    return .{ .tokens = tokens, .ids = ids, .ranges = ranges, .positions = positions, .rope_positions = rope_positions, .restore = restore, .spans = spans };
 }
 
 fn metalRowSegmentsEnabled() bool {

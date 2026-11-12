@@ -16,6 +16,13 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **GLiDE typed decisions** — Fastino `GLiDE-0.4B` and `GLiDE-0.8B` checkpoints
+  serve through `/ai/v1/decisions` and appear under deciders, loaded from their
+  Hugging Face download unchanged. Both run natively on Metal and the 0.4B also
+  runs on CPU; prompts and token ids match the Python reference byte for byte.
+  On an M4, requests run 1.3–2× (0.4B) and 2.1–4.8× (0.8B) faster than
+  Python transformers. See the [GLiDE guide](docs/guides/models/glide.mdx).
+
 - **Cascade agreement guards** — later decider stages can require matching votes
   before acceptance. Disagreed or unverified checks abstain, preserve raw evidence
   and usage, and remain REVIEW during resolver replay. Enabled guards fence older

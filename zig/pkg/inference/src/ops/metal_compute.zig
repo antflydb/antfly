@@ -2562,6 +2562,62 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return try self.ctFromOwnedMetalTensor(output);
     }
 
+    /// GLiDE packed Gated-DeltaNet core over rows concatenated without
+    /// padding: every row starts from a zero history, convolution taps stop at
+    /// row boundaries, and all rows share one dispatch per stage. `meta` holds
+    /// each token's row position followed by every row's (start, length).
+    /// Returns null when the device lacks the kernels or a binding is misaligned.
+    pub fn glidePackedCore(cb: *const ops.ComputeBackend, request: anytype) !?CT {
+        if (cb.kind() != .metal or request.dim != 128 or request.value_dim != 128 or request.conv_kernel != 4 or request.eps != 1e-6) return null;
+        if (request.tokens == 0 or request.rows == 0 or request.key_heads == 0 or request.value_heads % request.key_heads != 0 or
+            request.meta.len != request.tokens + request.rows * 2) return error.InvalidTensorShape;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const raw = self.provider_impl.raw_decode_runtime orelse return null;
+        if (metal_runtime_mod.termite_metal_decode_runtime_glide_core_available(raw) == 0) return null;
+        const runtime: *anyopaque = @ptrCast(raw);
+        const tokens = request.tokens;
+        const channels = (request.key_heads * 2 + request.value_heads) * 128;
+        const width = request.value_heads * 128;
+        var weights: [4]MetalTensor = undefined;
+        var weight_count: usize = 0;
+        defer for (weights[0..weight_count]) |*tensor| tensor.deinit();
+        for ([_]CT{ request.conv_weight, request.a_log, request.dt_bias, request.norm_weight }) |input| {
+            weights[weight_count] = try self.qwen35SideWeight(cb, input);
+            weight_count += 1;
+        }
+        var mixed = try self.ownedDeviceMetalTensorFromCt(request.mixed);
+        defer mixed.deinit();
+        var z = try self.ownedDeviceMetalTensorFromCt(request.z);
+        defer z.deinit();
+        var beta = try self.ownedDeviceMetalTensorFromCt(request.beta);
+        defer beta.deinit();
+        var a = try self.ownedDeviceMetalTensorFromCt(request.a);
+        defer a.deinit();
+        var conv = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, tokens * channels * 4, .private, &.{ @intCast(tokens), @intCast(channels) });
+        defer conv.deinit();
+        var gates = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, tokens * request.value_heads * 2 * 4, .private, &.{ @intCast(tokens), @intCast(request.value_heads * 2) });
+        defer gates.deinit();
+        var core = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, tokens * width * 4, .private, &.{ @intCast(tokens), @intCast(width) });
+        defer core.deinit();
+        var output = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, tokens * width * 4, .private, &.{ @intCast(tokens), @intCast(width) });
+        errdefer output.deinit();
+        const tensors = [_]*const MetalTensor{ &mixed, &weights[0], &beta, &a, &weights[1], &weights[2], &z, &weights[3], &conv, &gates, &core, &output };
+        var handles: [12]?*anyopaque = undefined;
+        var offsets: [12]usize = undefined;
+        for (tensors, &handles, &offsets) |tensor, *handle, *offset| {
+            if (!tensor.isDevice() or tensor.dtype != .f32) return error.UnsupportedTensorType;
+            handle.* = tensor.deviceHandle();
+            offset.* = tensor.deviceByteOffset();
+        }
+        const rc = metal_runtime_mod.termite_metal_decode_runtime_glide_core_packed(raw, &handles, &offsets, request.meta.ptr, tokens, request.rows, request.key_heads, request.value_heads);
+        if (rc == -3 or rc == -5) {
+            output.deinit();
+            return null;
+        }
+        if (rc != 0) return error.GlideMetalCoreFailed;
+        return try self.ctFromOwnedMetalTensor(output);
+    }
+
     pub fn beginQwen35LinearBatch(cb: *const ops.ComputeBackend, rows: usize) !bool {
         if (cb.kind() != .metal or getenvBool("TERMITE_METAL_DISABLE_QWEN35_RECURRENT_CORE")) return false;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
@@ -15044,6 +15100,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             else => return err,
         };
         defer v.deinit();
+        if (request.f16_row_flash) if (request.row_spans) |spans| {
+            if (try metal_runtime.decoderRuntimeGlideRowAttentionF32Device(self.provider_impl, q, k, v, spans, request)) |output|
+                return try self.ctFromOwnedMetalTensor(output);
+        };
         const output = (try metal_runtime.decoderRuntimeSegmentAttentionF32Device(self.provider_impl, q, k, v, request)) orelse return null;
         return try self.ctFromOwnedMetalTensor(output);
     }
@@ -35828,6 +35888,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .prefer_f16_mps_fallback = request.prefer_f16_mps_fallback,
             .prefer_f32_mps_fallback = request.prefer_f32_mps_fallback,
             .require_preferred_dense_precision = request.require_preferred_dense_precision,
+            .glide_f16_tensor_ops = request.glide_f16_tensor_ops,
             .dense_f32_slot_storage = f32_storage,
             .dense_bf16_bytes = dense_bf16_bytes,
             .dense_f16_bytes = dense_f16_bytes,
@@ -35855,12 +35916,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer input.deinit();
         var linear_input = try retainedLinearInputView(&input, request.in_dim);
         defer linear_input.deinit();
+        var glide_residual: ?MetalTensor = if (request.glide_residual) |residual| try self.ownedDeviceMetalTensorFromCt(residual) else null;
+        defer if (glide_residual) |*residual| residual.deinit();
         var tensor = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
             .slot = request.slot,
             .input = linear_input,
             .in_dim = request.in_dim,
             .out_dim = request.out_dim,
             .use_transformed_lm_head = request.use_transformed_lm_head,
+            .glide_geglu_exact = request.glide_geglu_exact,
+            .glide_down_slot = request.glide_down_slot,
+            .glide_residual = glide_residual,
         })) orelse return null;
         errdefer tensor.deinit();
         return self.ctFromOwnedMetalTensor(tensor);

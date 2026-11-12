@@ -7876,6 +7876,17 @@ pub const ModelManager = struct {
         return try model.manifest.clone(allocator);
     }
 
+    /// Warm GLiDE decisions reuse the loaded generation's manifest instead of
+    /// re-reading the checkpoint sidecars on every request. Execution pins and
+    /// verifies its own generation independently.
+    pub fn copyCachedGlideManifestWithControl(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8, control: InferenceExecutionControl) !?manifest_mod.ModelManifest {
+        var handle = (try self.acquireCachedFromDirWithControl(model_dir, control)) orelse return null;
+        defer handle.release();
+        const model = handle.get();
+        if (!model.manifest.glide_declared) return null;
+        return try model.manifest.clone(allocator);
+    }
+
     /// Request admission may reuse the selected immutable generator's metadata.
     /// Clone under a short cache pin so invalid requests and slow media uploads
     /// do not prevent eviction or recovery. Execution rechecks its own manifest.
@@ -9964,9 +9975,10 @@ pub const ModelManager = struct {
         // Embedding checkpoints can ship their decoder backbone's chat
         // template, but embedding execution never uses it. Qwen rerankers use
         // their explicit scoring templates instead of this general chat path.
+        // GLiDE decision prompts use a fixed wrapper (pipelines/glide_prompt.zig).
         var chat_template_failed = false;
         const needs_chat_template = man.model_type != .embedder and
-            !man.isQwen3TextReranker() and !man.isQwen3VlReranker();
+            !man.isQwen3TextReranker() and !man.isQwen3VlReranker() and !man.glide_declared;
         const chat_template_source: ?[]const u8 = if (man.isLightOnOcr3())
             lightonocr3_reader.chat_template
         else
@@ -12196,13 +12208,15 @@ fn loadSessionForPreferredBackendsWithArtifacts(
     // MissingRequiredWeights, and callers were being told the file did not exist.
     var first_err: ?anyerror = null;
     var laya_resident_attempted = false;
-    const laya_packed = man.hasCapability("typed_decisions") and session_factory.isPackedLayaModel(manager.allocator, construction_root);
+    // GLiDE checkpoints also grant typed_decisions; only Laya has resident kernels.
+    const laya_candidate = man.hasCapability("typed_decisions") and !man.glide_declared;
+    const laya_packed = laya_candidate and session_factory.isPackedLayaModel(manager.allocator, construction_root);
     for (effective_backends) |backend| {
         if (source_session_manager.gliner_cuda_precision != null and backend != .cuda) continue;
         // Once opted-in Metal residency is attempted, preserve its actionable
         // admission/load error rather than silently publishing a CPU session.
         if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
-        if (backend == .metal and man.hasCapability("typed_decisions") and !laya_packed and @import("../ops/laya_metal.zig").enabled()) laya_resident_attempted = true;
+        if (backend == .metal and laya_candidate and !laya_packed and @import("../ops/laya_metal.zig").enabled()) laya_resident_attempted = true;
         if (control) |active| try active.check();
         if (modelBackendIsUnhealthy(manager, model_dir, backend)) {
             rememberPreferredLoadError(&first_err, error.ModelBackendUnhealthy);

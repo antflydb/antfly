@@ -11736,9 +11736,18 @@ pub const Node = struct {
         // listing validation. Execution still requires the live artifact identity.
         resolved_path: []const u8,
     };
+    /// GLiDE decisions reuse the extraction admission, lease and bounded
+    /// request heap; only decideJsonWithAdmission creates this after model
+    /// resolution and listing validation.
+    const DecideGlideInput = struct {
+        request: @import("antfly_decisions").Request,
+        selected: ResolvedModel,
+        max_input_tokens: ?usize,
+    };
     const ExtractionV2Input = union(enum) {
         json: []const u8,
         decide_span: DecideSpanInput,
+        decide_glide: DecideGlideInput,
         // An origin marker owned by the legacy HTTP upgrade; never a wire field.
         legacy_classification_json: []const u8,
         typed: struct {
@@ -11814,7 +11823,7 @@ pub const Node = struct {
         const control: ?InferenceExecutionControl = self.extractionExecutionControl(supplied_control);
         if (control) |active| try active.check();
         const serialized: ?[]u8 = switch (input) {
-            .json, .legacy_classification_json, .decide_span => null,
+            .json, .legacy_classification_json, .decide_span, .decide_glide => null,
             .typed => |typed| blk: {
                 observer.emit(.{ .phase = .parsing });
                 if (typed.request.attachments.len != 0) return error.UnsupportedExtractionInput;
@@ -11826,7 +11835,7 @@ pub const Node = struct {
             .json => |bytes| bytes,
             .legacy_classification_json => |bytes| bytes,
             .typed => serialized.?,
-            .decide_span => "",
+            .decide_span, .decide_glide => "",
         };
         observer.emit(.{ .phase = .admission });
         switch (admission_owner) {
@@ -11857,16 +11866,17 @@ pub const Node = struct {
         const scratch = allocation_failure.allocator(&bounded);
         defer std.debug.assert(bounded.live == 0);
         const resolved_span_selection = switch (input) {
-            .json, .legacy_classification_json, .decide_span => null,
+            .json, .legacy_classification_json, .decide_span, .decide_glide => null,
             .typed => |typed| typed.resolved_span_selection,
         };
         const classification_compatibility: ClassificationCompatibility = switch (input) {
-            .json, .decide_span => .none,
+            .json, .decide_span, .decide_glide => .none,
             .legacy_classification_json => .legacy_extraction,
             .typed => |typed| typed.classification_compatibility,
         };
         const json = (switch (input) {
             .decide_span => |decision| self.extractDecideSpanInMemory(scratch, decision, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure),
+            .decide_glide => |decision| self.decideGlideInMemory(scratch, decision, control, failure, observer),
             else => self.extractV2InMemory(scratch, request_json, resolved_span_selection, classification_compatibility, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure, decision_execution),
         }) catch |err| return allocation_failure.translate(err);
         defer scratch.free(json);
@@ -11929,6 +11939,55 @@ pub const Node = struct {
         if (listing.embedding_style != .embedding_gemma2) return null;
         _ = response_limit;
         return error.UnsupportedExtractionModel;
+    }
+
+    /// GLiDE: one readout forward per (input, question) prompt, batched under
+    /// the reference padded-token budget (pipelines/glide.zig), presented with
+    /// the shared typed-decision response.
+    fn decideGlideInMemory(
+        self: *Node,
+        scratch: std.mem.Allocator,
+        decision: DecideGlideInput,
+        control: ?InferenceExecutionControl,
+        failure: *extraction_v2.FailureContext,
+        observer: metrics_mod.extraction.observation.Observer,
+    ) ![]u8 {
+        const glide_pipeline = @import("../pipelines/glide.zig");
+        const decision_api = @import("antfly_decisions");
+        glide_pipeline.trace.mark("extraction admission+lease");
+        observer.emit(.{ .phase = .parsing });
+        var arena = std.heap.ArenaAllocator.init(scratch);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const request = decision.request;
+        const questions = try glide_pipeline.prompt.questionsFromPublic(a, request);
+        const states = try a.alloc([]const u8, request.items.len);
+        var input_bytes: usize = 0;
+        for (states, request.items) |*state, item| {
+            state.* = item.input;
+            input_bytes +|= item.input.len;
+        }
+        observer.emit(.{ .parsed = .{ .items = states.len, .input_bytes = input_bytes } });
+        failure.* = .{ .stage = "model" };
+        observer.emit(.{ .phase = .model });
+        const effective = self.bindModelSelection(decision.selected, control);
+        try effective.check();
+        var handle = try self.model_manager.acquireFromDirWithControl(decision.selected.path, effective);
+        defer handle.release();
+        const loaded = handle.get();
+        const head = session_factory.getGlideHead(loaded.session) orelse return error.UnsupportedDecideModel;
+        const mutex = loaded.targetInferenceExecutionMutex();
+        if (mutex) |lock| try effective.lock(lock);
+        defer if (mutex) |lock| lock.unlock();
+        glide_pipeline.trace.mark("acquire model");
+        observer.emit(.{ .phase = .tokenizing });
+        const result = try glide_pipeline.execute(a, scratch, loaded.session, loaded.getTokenizer(), &head.config, states, questions, effective, .{ .max_input_tokens = decision.max_input_tokens });
+        const json = try glide_pipeline.prompt.decisionsJson(a, questions, states.len, result.probabilities, result.prompt_tokens);
+        // GLiDE answers share Laya's complete-distribution `decisions` rows.
+        const response = try decision_api.trainedResponse(a, request, json, .laya);
+        try effective.check();
+        glide_pipeline.trace.mark("present");
+        return scratch.dupe(u8, response);
     }
 
     fn extractDecideSpanInMemory(
@@ -24831,6 +24890,8 @@ pub const Node = struct {
     }
 
     fn decideJsonWithAdmission(self: *Node, allocator: std.mem.Allocator, request_json: []const u8, owner: ExtractionAdmissionOwner, control: ?InferenceExecutionControl) ![]u8 {
+        const glide_trace = @import("../pipelines/glide.zig").trace;
+        glide_trace.begin();
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -24846,14 +24907,21 @@ pub const Node = struct {
         };
         const public_request = try decision_api.parseValue(a, envelope);
         const request = public_request.inner;
+        glide_trace.mark("parse");
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(a, null, &owned_io);
         const selected = try self.resolveRequestModelSelection(a, io, request.model, "deciders");
         const path = selected.path;
         const selected_control = self.bindModelSelection(selected, control);
-        var manifest = try self.loadBoundManifest(a, path, true, selected_control);
+        glide_trace.mark("resolve model");
+        // A warm GLiDE model already holds this generation's manifest.
+        var manifest = if (try self.model_manager.copyCachedGlideManifestWithControl(a, path, selected_control)) |cached|
+            cached
+        else
+            try self.loadBoundManifest(a, path, true, selected_control);
         defer manifest.deinit();
+        glide_trace.mark("manifest");
         if (manifest.embedding_style == .embedding_gemma2) {
             if (request.long_document.mode == .window) return error.UnsupportedDecisionWindowing;
             return self.decideEmbeddingSimilarity(allocator, a, path, public_request, selected_control);
@@ -24861,6 +24929,27 @@ pub const Node = struct {
         if (request.model_identity != null) return error.UnsupportedDecideModel;
         for (public_request.policies) |policy| if (policy.embedding_configured or policy.kind == .multi_choice) return error.UnsupportedDecideModel;
         for (request.questions) |question| for (question.examples) |examples| if (examples.len != 0) return error.UnsupportedDecideModel;
+        if (manifest.glide_declared) {
+            // GLiDE truncates (encoder) or rejects (decoder) long prompts itself.
+            if (request.long_document.mode == .window) return error.UnsupportedDecisionWindowing;
+            const glide_input = try decision_api.extractionValue(a, public_request, .laya);
+            const contract = try resolvedInferenceExecutorContract(self, "decide", &manifest);
+            var max_labels: usize = 0;
+            for (request.questions) |question| max_labels = @max(max_labels, question.labels.len);
+            const texts = try a.alloc([]const u8, public_request.items.len);
+            for (public_request.items, texts) |item, *text| text.* = item.input;
+            try validateTextExecutorInvocation(contract, texts.len, texts, 0, 0, max_labels, glide_input.schema_bytes);
+            glide_trace.mark("contract");
+            var failure = extraction_v2.FailureContext{};
+            var extraction = try self.extractV2WithAdmission(a, .{ .decide_glide = .{
+                .request = public_request,
+                .selected = selected,
+                .max_input_tokens = contract.batch.max_input_tokens_per_item,
+            } }, owner, selected_control, &failure, null, "decide");
+            defer extraction.deinit();
+            glide_trace.mark("admission teardown");
+            return allocator.dupe(u8, extraction.json);
+        }
         const decision_contract = decideExecutionContract(manifest) orelse return error.UnsupportedDecideModel;
         const extraction_input = try decision_api.extractionValue(a, public_request, decision_contract);
         const contract = try resolvedInferenceExecutorContract(self, "decide", &manifest);
@@ -25569,6 +25658,23 @@ pub const Node = struct {
             error.AmbiguousModelIdentifier,
             => requestModelResolutionError(ctx, err),
             error.UnsupportedDecideModel => ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) }),
+            // A GLiDE decoder prompt over the checkpoint's context (the
+            // reference's request error); encoder prompts are truncated.
+            error.GlidePromptTooLong => ctx.status(413).json(.{ .@"error" = "REQUEST_TOO_LARGE", .message = "prompt exceeds the model's maximum context length" }),
+            error.InvalidGlideQuestion, error.InvalidGlideRequest => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+            error.UnsupportedGlideBackbone,
+            error.UnsupportedGlideDecisionConfig,
+            error.UnsupportedGlidePromptFormat,
+            error.UnsupportedGlideLoopedCheckpoint,
+            error.UnsupportedGlideAttentionMode,
+            error.UnsupportedGlidePooling,
+            error.InvalidGlideDecisionConfig,
+            error.InvalidGlideReadout,
+            error.GlideReadoutNotFound,
+            error.GlideDecisionConfigNotFound,
+            error.UnsupportedGlideCheckpoint,
+            error.GlideDecoderRequiresMetal,
+            => ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) }),
             else => extractionV2FailureResponse(ctx, err, .{}),
         };
     }
@@ -29193,7 +29299,7 @@ fn manifestMatchesModelListingTask(
     if (std.mem.eql(u8, task, "readers") and isGenerativeReadModel(manifest)) return true;
     if (std.mem.eql(u8, task, "extractors") and (manifest.laya_declared or manifest.embedding_style == .embedding_gemma2)) return false;
     if (std.mem.eql(u8, task, "deciders") and manifest.embedding_style != .embedding_gemma2 and
-        !manifest.laya_declared and
+        !manifest.laya_declared and !manifest.glide_declared and
         !(manifest.gliner_architecture == .span and manifest.gliner_span_declared)) return false;
     return taskMatchesModelListing(
         task,
@@ -37065,6 +37171,24 @@ test "decider listing requires a registered decision architecture" {
     manifest.gliner_architecture = .span;
     manifest.gliner_span_declared = true;
     try std.testing.expect(manifestMatchesModelListingTask("deciders", "extractor", &manifest));
+}
+
+test "GLiDE checkpoints list only as deciders" {
+    var tasks = [_][]const u8{"decide"};
+    var capabilities = [_][]const u8{"typed_decisions"};
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .classifier,
+        .tasks = &tasks,
+        .capabilities = &capabilities,
+        .glide_declared = true,
+        .glide_backbone = .encoder,
+    };
+    try std.testing.expect(manifestMatchesModelListingTask("deciders", "classifier", &manifest));
+    try std.testing.expect(!manifestMatchesModelListingTask("extractors", "classifier", &manifest));
+    try std.testing.expect(!manifestMatchesModelListingTask("classifiers", "classifier", &manifest));
+    // GLiDE routes before the typed-span/boundary/Laya execution contracts.
+    try std.testing.expect(decideExecutionContract(manifest) == null);
 }
 
 test "classification extraction applies top-k to single-label and threshold to multi-label taxonomies" {
