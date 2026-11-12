@@ -6264,18 +6264,27 @@ pub const NativeFile = struct {
         return file;
     }
 
-    /// Default log region size for a newly created redo-log file (point 3:
-    /// redo-log becomes the default commit path for new, non-indexed
-    /// files). Sized to hold several thousand small commits (the §9.8 gate
+    /// Default log region size for a newly created redo-log file. Reserved
+    /// eagerly, in full, at creation (`enableRedoLog`'s own `setLength`) --
+    /// real physical file size from byte zero, not amortized content --
+    /// so this is a direct, unconditional floor on every redo-log file's
+    /// footprint, independent of how much (or little) it ever actually
+    /// stores. 512 KiB holds several hundred small commits (the §9.8 gate
     /// target is ~1.2 KB durable bytes per primary-only write) before the
     /// synchronous 25%-remaining backpressure check
-    /// (`maybeAutoCheckpointRedoLog`) forces a checkpoint -- large enough
-    /// that an ordinary write-rate workload checkpoints on the owner's
-    /// background/idle turn (step 4) under normal conditions, not on this
-    /// synchronous path. No prior sizing precedent exists in this codebase
-    /// to inherit; this is a fresh, deliberately generous default, not a
-    /// measured optimum.
-    pub const default_redo_log_capacity_bytes: u64 = 8 * 1024 * 1024;
+    /// (`maybeAutoCheckpointRedoLog`) forces a checkpoint -- comfortably
+    /// more than the background idle/threshold checkpointer (§9.4b) needs
+    /// to drain it under normal conditions -- while staying well under
+    /// footprint bounds existing reclamation tests already assert on
+    /// (e.g. "lite reclamation writable reopen services debt..." asserts
+    /// peak file size stays under 2 MiB across repeated small-write/
+    /// reclaim cycles; the first version of this constant, 8 MiB, blew
+    /// through that on its own, before a single document was written).
+    /// `docstore.Store.createWithOptions` scales this down further under
+    /// a small configured `max_storage_bytes`, but never scales it up --
+    /// no prior sizing precedent exists in this codebase to inherit, so
+    /// this is a deliberately modest default, not a measured optimum.
+    pub const default_redo_log_capacity_bytes: u64 = 512 * 1024;
 
     /// Upgrades a freshly bootstrapped, ordinary (non-indexed) file to the
     /// redo-log format in place: reserves `redo_log_capacity_bytes`
@@ -6963,7 +6972,36 @@ pub const NativeFile = struct {
         });
         errdefer reader.close();
         const inode = (try reader.file.stat(reader.runtime())).inode;
-        if ((self.durable_header == null and !std.meta.eql(self.header, reader.header)) or inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentWaitCanceled;
+        // §9.7a: a redo-log file's *inactive* checkpoint slot is never
+        // synchronized once `enableRedoLog` bootstraps it -- ordinary
+        // diverted commits and `publishCheckpoint`'s own redo branch only
+        // ever touch `checkpoints[active_checkpoint]`; the other slot's
+        // in-memory copy here (inherited from file-creation's bootstrap)
+        // and whatever a fresh reopen actually decodes from that slot's
+        // never-rewritten physical page can legitimately disagree with no
+        // semantic change at all (confirmed: the only field that ever
+        // differed in practice was that slot's stale `page_count`). A
+        // byte-for-byte `std.meta.eql(self.header, reader.header)` would
+        // treat that as "something changed concurrently" and wrongly
+        // refuse this snapshot. For a redo-log file, compare the fields
+        // that actually carry meaning instead -- `active_checkpoint`
+        // (also covers the case where a real `checkpointRedoLog` commit
+        // *did* run and legitimately flip slots) and the active slot's
+        // own content, which is the only slot a redo-log file ever
+        // publishes through. Every other field (`indexed_reclamation`,
+        // `redo_log_offset`/`capacity`, etc.) is immutable for the file's
+        // lifetime once set, so comparing just these two is equivalent to
+        // the full comparison for everything that can actually change.
+        // The legacy (non-redo) path is untouched: both slots stay in
+        // sync there (every commit alternates and rewrites them), so the
+        // strict full-header comparison was never spuriously tripped and
+        // must stay exactly as strict.
+        const headers_equivalent = if (self.redo != null)
+            self.header.active_checkpoint == reader.header.active_checkpoint and
+                std.meta.eql(self.header.checkpoints[self.header.active_checkpoint], reader.header.checkpoints[reader.header.active_checkpoint])
+        else
+            std.meta.eql(self.header, reader.header);
+        if ((self.durable_header == null and !headers_equivalent) or inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentWaitCanceled;
         reader.header = self.header;
         if (coordinated) {
             // Same self-conflict `acquireReaderFence` guards against:
@@ -14527,6 +14565,19 @@ pub const NativeFile = struct {
         // lock to release around its sync.
         if (!manifest_prepared) try self.syncIfRequired(null);
         try self.publishCheckpoint(next.*, manifest_prepared, null);
+        // A bare commit never diverts (putDocumentBatch's bare-commit
+        // branch calls this directly, without going through
+        // flushTransactionWrites's diversion check at all), so it always
+        // logs its own ride-along record on a redo-log file regardless --
+        // but unlike commitTransactionWithDurability, nothing was ever
+        // calling the same 25%-remaining backstop for it. A workload that
+        // only ever issues bare commits (several existing tests call
+        // putDocument directly on NativeFile, bypassing Store entirely)
+        // would otherwise never checkpoint and eventually hit
+        // error.LogFull. Harmless to check unconditionally: a no-op
+        // whenever self.redo is null or the log isn't actually close to
+        // full.
+        try self.maybeAutoCheckpointRedoLog();
     }
 
     pub fn commitTransactionWithDurability(self: *NativeFile, durable: bool, hooks: ?SyncLockHooks) !void {
