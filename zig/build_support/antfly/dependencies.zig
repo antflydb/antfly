@@ -934,6 +934,9 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     hf_tokenizer_tests.root_module.addImport("antfly_platform", platform_mod);
     hf_tokenizer_tests.root_module.addImport("antfly_grapheme", regex_mod.import_table.get("antfly_grapheme").?);
     const run_hf_tokenizer_tests = b.addRunArtifact(hf_tokenizer_tests);
+    // Fixture paths are relative to the Zig build root, regardless of the
+    // directory invoking `zig build --build-file`.
+    run_hf_tokenizer_tests.setCwd(b.path("."));
     const hf_tokenizer_test_step = b.step(
         "lib-tokenizer-test",
         "Run Hugging Face tokenizer tests",
