@@ -3010,8 +3010,26 @@ pub const CatalogCursor = struct {
     done: bool = false,
     immediate_children_only: bool = false,
     start_after: ?[]const u8 = null,
+    /// §9.3a revised: the redo-log logical_overlay root this scan merges
+    /// in, so an uncheckpointed put/delete is visible to -- and a
+    /// deleted-in-the-overlay key is never surfaced by -- every catalog
+    /// scan, not only point lookups. `null` for a cursor over a root the
+    /// overlay never covers (there is none today; kept optional so a
+    /// future caller over a root outside TransactionWrites.Root's three
+    /// has a documented, explicit opt-out rather than a silent mismatch).
+    overlay_root: ?TransactionWrites.Root = null,
+    overlay: NativeFile.OverlayScanState = .{ .allocator = undefined },
+    overlay_started: bool = false,
+    /// The tree's own already-fetched candidate, held here whenever the
+    /// overlay's smaller key wins a comparison without a tie: the
+    /// underlying `index` cursor's position has already advanced past it,
+    /// so losing track of it here would silently skip it forever, not
+    /// just defer it. Checked before ever asking `index` for a fresh one.
+    pending_tree: ?DocumentIndexEntry = null,
 
     pub fn deinit(self: *CatalogCursor) void {
+        if (self.pending_tree) |*p| p.deinit(self.index.file.allocator);
+        self.overlay.deinit();
         self.records.deinit(self.index.file.allocator);
         self.index.deinit();
         self.* = undefined;
@@ -3021,19 +3039,69 @@ pub const CatalogCursor = struct {
         const file = self.index.file;
         const key = (try self.next()) orelse return null;
         defer file.allocator.free(key.key);
-        const entry = try decodeCatalogEntry(try self.records.read(file, file.allocator, self.index.checkpoint, key.page_id, .catalog));
+        const entry = if (key.page_id == 0)
+            (file.redoOverlayEntry(self.overlay_root.?, self.index.checkpoint, key.key) orelse return error.InvalidNativeRedoRecord)
+        else
+            try decodeCatalogEntry(try self.records.read(file, file.allocator, self.index.checkpoint, key.page_id, .catalog));
         const value = try file.catalogEntryValueAtCheckpointAlloc(allocator, entry, self.index.checkpoint);
         errdefer allocator.free(value);
         return .{ .key = try allocator.dupe(u8, key.key), .value = value };
     }
 
-    /// The caller owns the returned key, allocated with the native file allocator.
+    /// The caller owns the returned key, allocated with the native file
+    /// allocator. `page_id == 0` means the key's live value is in the
+    /// redo-log overlay, not on any page yet -- see `overlay_root`.
     pub fn next(self: *CatalogCursor) !?OwnedCatalogKey {
         if (self.done) return null;
         const file = self.index.file;
-        var candidate = if (self.started) try self.index.next() else if (self.start_after) |key| try self.index.seekAtOrAfter(key, true) else try self.index.seekAtOrAfter(self.prefix, false);
-        self.started = true;
-        while (candidate) |owned| {
+        if (!self.overlay_started) {
+            self.overlay_started = true;
+            if (self.start_after) |key| while (self.overlay.peek()) |k| {
+                if (std.mem.order(u8, k, key) != .gt) self.overlay.consumeIfEqual(k) else break;
+            };
+        }
+        while (true) {
+            const candidate = self.pending_tree orelse blk: {
+                self.pending_tree = null;
+                const fetched = if (self.started) try self.index.next() else if (self.start_after) |key| try self.index.seekAtOrAfter(key, true) else try self.index.seekAtOrAfter(self.prefix, false);
+                self.started = true;
+                break :blk fetched;
+            };
+            self.pending_tree = null;
+            // Merge-join: the smallest of the tree's current candidate key
+            // and the overlay's smallest remaining key wins. A tie means
+            // the overlay supersedes the tree's own (now-stale) entry for
+            // that exact key -- consume both, keep only the overlay's.
+            const overlay_key = self.overlay.peek();
+            const tree_key: ?[]const u8 = if (candidate) |c| c.key else null;
+            const take_overlay = overlay_key != null and (tree_key == null or std.mem.order(u8, overlay_key.?, tree_key.?) != .gt);
+            if (take_overlay) {
+                const key = overlay_key.?;
+                if (!std.mem.startsWith(u8, key, self.prefix)) {
+                    // Past the prefix range entirely (overlay keys are
+                    // sorted, so nothing later in it can match either).
+                    self.overlay.index = self.overlay.keys.len;
+                    self.pending_tree = candidate;
+                    continue;
+                }
+                if (self.immediate_children_only and std.mem.indexOfScalar(u8, key[self.prefix.len..], '/') != null) {
+                    _ = self.overlay.takeFront();
+                    self.pending_tree = candidate;
+                    continue;
+                }
+                const entry = file.redoOverlayEntry(self.overlay_root.?, self.index.checkpoint, key) orelse return error.InvalidNativeRedoRecord;
+                const tied = tree_key != null and std.mem.eql(u8, tree_key.?, key);
+                if (tied) {
+                    var owned = candidate.?;
+                    owned.deinit(file.allocator);
+                } else {
+                    self.pending_tree = candidate;
+                }
+                _ = self.overlay.takeFront();
+                if (entry.is_delete) continue;
+                return .{ .key = try file.allocator.dupe(u8, key), .page_id = 0 };
+            }
+            const owned = candidate orelse break;
             var entry = owned;
             defer entry.deinit(file.allocator);
             if (!std.mem.startsWith(u8, entry.key, self.prefix)) break;
@@ -3045,16 +3113,13 @@ pub const CatalogCursor = struct {
                     const bound = try file.allocator.dupe(u8, entry.key[0 .. self.prefix.len + slash + 1]);
                     defer file.allocator.free(bound);
                     bound[bound.len - 1] += 1;
-                    candidate = try self.index.seekAtOrAfter(bound, false);
+                    self.pending_tree = try self.index.seekAtOrAfter(bound, false);
                     continue;
                 }
             }
             const record = try decodeCatalogEntry(try self.records.read(file, file.allocator, self.index.checkpoint, entry.document_page_id, .catalog));
             if (!std.mem.eql(u8, entry.key, record.key)) return error.InvalidDocumentIndex;
-            if (record.is_delete) {
-                candidate = try self.index.next();
-                continue;
-            }
+            if (record.is_delete) continue;
             const key = entry.key;
             entry.key = &.{};
             return .{ .key = key, .page_id = entry.document_page_id };
@@ -4259,10 +4324,21 @@ fn decodeLogicalMutationsPayload(allocator: Allocator, payload: []const u8, over
         errdefer allocator.free(decoded.value);
         const owned_key = try allocator.dupe(u8, key);
         errdefer allocator.free(owned_key);
-        if (try overlay[root].fetchPut(allocator, owned_key, decoded)) |old| {
-            allocator.free(old.key);
-            allocator.free(old.value.value);
+        // Not `fetchPut` -- see `appendLogicalMutation`'s matching comment:
+        // it only overwrites `value_ptr.*` on a match, never `key_ptr.*`,
+        // so treating its returned "old" key as separately freeable frees
+        // the map's own still-live key. Replaying a log whose range covers
+        // more than one record for the same key (an ordinary put-then-
+        // overwrite or put-then-delete before the next checkpoint, ahead
+        // of a reopen) hits this on every recovery, not just rarely.
+        const gop = try overlay[root].getOrPut(allocator, owned_key);
+        if (gop.found_existing) {
+            allocator.free(owned_key);
+            allocator.free(gop.value_ptr.value);
+        } else {
+            gop.key_ptr.* = owned_key;
         }
+        gop.value_ptr.* = decoded;
     }
 }
 
@@ -4367,10 +4443,22 @@ const RedoCommitState = struct {
         errdefer allocator.free(decoded.value);
         const owned_key = try allocator.dupe(u8, m.key);
         errdefer allocator.free(owned_key);
-        if (try self.logical_overlay[root].fetchPut(allocator, owned_key, decoded)) |old| {
-            allocator.free(old.key);
-            allocator.free(old.value.value);
+        // Not `fetchPut`: on a match it only overwrites `value_ptr.*`, never
+        // `key_ptr.*` (see std.hash_map's `fetchPutContext`), so treating
+        // its returned "old" key as a separate, freeable allocation frees
+        // the map's own still-live key -- a double free waiting to happen
+        // the next time this same key is replaced again, or when this
+        // overlay is iterated/deinited. `getOrPut` makes the same
+        // distinction explicit: only store `owned_key` into the map when
+        // there wasn't already an equal key living there to keep.
+        const gop = try self.logical_overlay[root].getOrPut(allocator, owned_key);
+        if (gop.found_existing) {
+            allocator.free(owned_key);
+            allocator.free(gop.value_ptr.value);
+        } else {
+            gop.key_ptr.* = owned_key;
         }
+        gop.value_ptr.* = decoded;
     }
 
     /// Records one page-shaped write for the in-flight transaction (see
@@ -6094,7 +6182,10 @@ pub const NativeFile = struct {
             // the two, so there is no longer a reason to branch on it
             // here either.
             if (opts.reader_coordinator) |coordinator| {
-                const region = inode_lock.ensureRegion(inode_entry, io) catch null;
+                const region = inode_lock.ensureRegion(inode_entry, io) catch |err| region_blk: {
+                    if (!inode_lock.isRegionUnusable(err)) return err;
+                    break :region_blk null;
+                };
                 result.reader_fence = try coordinator.registerFull(file, region, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint());
             }
             errdefer if (result.reader_fence) |fence| opts.reader_coordinator.?.unregister(fence);
@@ -6154,6 +6245,32 @@ pub const NativeFile = struct {
         try file.enableRedoLog(redo_log_capacity_bytes);
         return file;
     }
+
+    /// `createWithRedoLog`'s owned-io counterpart, for every caller that
+    /// (like plain `createWithOptions`) has no `std.Io` of its own to lend
+    /// and expects this file to own and manage its own runtime. Point 3's
+    /// default-for-new-files policy (docstore.zig's `Store.createWithOptions`)
+    /// needs this: it is reached whenever a caller passes no `opts.io`.
+    pub fn createWithRedoLogOwnedIo(allocator: Allocator, path: []const u8, opts: CreateOptions, redo_log_capacity_bytes: u64) !NativeFile {
+        std.debug.assert(!opts.indexed_reclamation);
+        var file = try createWithOptions(allocator, path, opts);
+        errdefer file.close();
+        try file.enableRedoLog(redo_log_capacity_bytes);
+        return file;
+    }
+
+    /// Default log region size for a newly created redo-log file (point 3:
+    /// redo-log becomes the default commit path for new, non-indexed
+    /// files). Sized to hold several thousand small commits (the §9.8 gate
+    /// target is ~1.2 KB durable bytes per primary-only write) before the
+    /// synchronous 25%-remaining backpressure check
+    /// (`maybeAutoCheckpointRedoLog`) forces a checkpoint -- large enough
+    /// that an ordinary write-rate workload checkpoints on the owner's
+    /// background/idle turn (step 4) under normal conditions, not on this
+    /// synchronous path. No prior sizing precedent exists in this codebase
+    /// to inherit; this is a fresh, deliberately generous default, not a
+    /// measured optimum.
+    pub const default_redo_log_capacity_bytes: u64 = 8 * 1024 * 1024;
 
     /// Upgrades a freshly bootstrapped, ordinary (non-indexed) file to the
     /// redo-log format in place: reserves `redo_log_capacity_bytes`
@@ -6861,7 +6978,7 @@ pub const NativeFile = struct {
             // A full-graph snapshot reader always retains metadata, region
             // slot or not -- `registerFull` handles both uniformly now,
             // regardless of `indexed_reclamation`.
-            reader.reader_fence = try self.reader_coordinator.?.registerFull(reader.file, self.regionForInode(), inode, reader.metadataReuseFrontier(), self.headerFingerprint());
+            reader.reader_fence = try self.reader_coordinator.?.registerFull(reader.file, try self.regionForInode(), inode, reader.metadataReuseFrontier(), self.headerFingerprint());
         }
         return reader;
     }
@@ -7131,17 +7248,19 @@ pub const NativeFile = struct {
     /// The shared lock region for this inode's registry entry, or `null`
     /// when there is no entry at all (a standalone/`externally_locked`-free
     /// file never registered, which has no registry `Entry` to carry a
-    /// region on) or the region itself cannot be used right now. Every
-    /// reader-fence/epoch-reuse caller treats a `null` region the same way:
-    /// fall back to inode-only kernel fencing, never fail the whole open or
-    /// commit over it. Interim posture before this file's own fallback
-    /// detection (migration row 5) distinguishes "genuinely unusable" from
-    /// "transient failure" here -- every error from `ensureRegion` is
-    /// treated as "no region" for now, which is always safe (never wrong,
-    /// only ever more conservative than necessary).
-    pub fn regionForInode(self: *NativeFile) ?*shared_lock_region.Region {
+    /// region on) or the region itself is genuinely unusable right now
+    /// (`inode_lock.isRegionUnusable`, the same check the writer side
+    /// shares) -- every reader-fence/epoch-reuse caller treats a `null`
+    /// region the same way: fall back to inode-only kernel fencing, never
+    /// fail the whole open or commit over it. Any other error (notably
+    /// `OutOfMemory`) propagates instead of being swallowed into a
+    /// fallback that would likely fail the same way.
+    pub fn regionForInode(self: *NativeFile) !?*shared_lock_region.Region {
         const entry = self.inode_lock_ref.load(.acquire) orelse return null;
-        return inode_lock.ensureRegion(entry, self.runtime()) catch null;
+        return inode_lock.ensureRegion(entry, self.runtime()) catch |err| {
+            if (inode_lock.isRegionUnusable(err)) return null;
+            return err;
+        };
     }
 
     /// Read-generation locks join the same-owner frontier only while
@@ -7173,7 +7292,7 @@ pub const NativeFile = struct {
         // below still blocks this process's own exclusive reuse either
         // way).
         if (self.reader_coordinator) |coordinator| {
-            self.reader_fence = try coordinator.registerEpoch(self.file, self.regionForInode(), (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint(), false);
+            self.reader_fence = try coordinator.registerEpoch(self.file, try self.regionForInode(), (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint(), false);
         }
         errdefer if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
         // Only a fence that actually got a live region slot (`Fence
@@ -7244,7 +7363,7 @@ pub const NativeFile = struct {
         // `epoch_window` at its already-cleared `null`, which
         // `reuseFrontier`/`metadataReuseFrontier` already treat as "no
         // additional frontier from this source."
-        if (self.regionForInode()) |region| self.epoch_window = .{ .data = region.minimumPinnedSequence(), .metadata = region.minimumMetadataPinnedSequence() };
+        if (try self.regionForInode()) |region| self.epoch_window = .{ .data = region.minimumPinnedSequence(), .metadata = region.minimumMetadataPinnedSequence() };
         return handle;
     }
     fn beginReaderWindow(self: *NativeFile) !bool {
@@ -7254,7 +7373,7 @@ pub const NativeFile = struct {
             return true;
         }
         const inode = (try self.file.stat(self.runtime())).inode;
-        const frontier = coordinator.beginWithMetadata(inode, self.headerFingerprint(), self.free_pages_verified, self.regionForInode());
+        const frontier = coordinator.beginWithMetadata(inode, self.headerFingerprint(), self.free_pages_verified, try self.regionForInode());
         errdefer coordinator.end();
         self.reader_window_previous_frontier = self.minimum_reader_sequence;
         if (frontier.data) |sequence| self.minimum_reader_sequence = @min(self.minimum_reader_sequence orelse sequence, sequence);
@@ -8237,7 +8356,7 @@ pub const NativeFile = struct {
             };
             const live = try self.liveStats(cancel);
             var valid = report;
-            valid.record_count = records;
+            valid.record_count = records + self.redoOverlayEntryCount();
             valid.live_file_count = live.record_count;
             valid.live_bytes = live.bytes;
             valid.live_accounting = live.accounting;
@@ -8288,7 +8407,7 @@ pub const NativeFile = struct {
 
         var valid = report;
         _ = document_index_pages;
-        valid.record_count = catalog_records + index_catalog_records + document_records;
+        valid.record_count = catalog_records + index_catalog_records + document_records + self.redoOverlayEntryCount();
         valid.live_file_count = live.record_count;
         valid.live_bytes = live.bytes;
         valid.live_accounting = live.accounting;
@@ -9260,6 +9379,15 @@ pub const NativeFile = struct {
     /// Resolve an immutable artifact once. A generation/checkpoint pin must
     /// outlive this descriptor; only small inline values require owned bytes.
     pub fn openIndexValue(self: *NativeFile, allocator: Allocator, key: []const u8, checkpoint: CheckpointSlot) !IndexValue {
+        // §9.3a: artifact leases resolve their external-value pointer through
+        // here (artifact_source.zig's Registry.open/Capture.apply), so this
+        // must see redo-log-diverted index-root entries, not just the real
+        // tree -- same rule as getCatalogRecordFromRootAtCheckpointAlloc.
+        if (self.redoOverlayEntry(.index, checkpoint, key)) |entry| {
+            if (entry.is_delete) return error.FileNotFound;
+            if (entry.external_value_root_page != 0) return .{ .root = entry.external_value_root_page, .length = entry.external_value_len };
+            return .{ .root = 0, .length = entry.value.len, .inline_bytes = try allocator.dupe(u8, entry.value) };
+        }
         const page_id = (try self.lookupCatalogPage(checkpoint, .index, key)) orelse return error.FileNotFound;
         var reader: ValuePageReader = undefined;
         reader.init();
@@ -9501,7 +9629,10 @@ pub const NativeFile = struct {
         const roots = try self.readCatalogRoots(catalogRootPage(checkpoint, root), checkpoint);
         var indexed = checkpoint;
         indexed.document_index_root_page = roots.index;
-        return .{ .index = DocumentIndexCursor.init(self, indexed), .prefix = prefix };
+        const overlay_root: TransactionWrites.Root = if (root == .metadata) .metadata else .index;
+        var overlay = try OverlayScanState.initForPrefix(self.allocator, self, overlay_root, checkpoint, prefix);
+        errdefer overlay.deinit();
+        return .{ .index = DocumentIndexCursor.init(self, indexed), .prefix = prefix, .overlay_root = overlay_root, .overlay = overlay };
     }
 
     fn snapshotCatalogRecordsFromRootAlloc(self: *NativeFile, allocator: Allocator, root: CatalogRoot) ![]OwnedCatalogRecord {
@@ -9644,9 +9775,17 @@ pub const NativeFile = struct {
         kind: PageKind,
         started: bool = false,
         records: RecordPageReader = .{},
+        /// §9.3a revised: see CatalogCursor's own fields of the same name.
+        overlay_root: TransactionWrites.Root,
+        overlay: OverlayScanState,
+        pending_tree: ?DocumentIndexEntry = null,
 
         fn init(file: *NativeFile, source: LiveRecordSource) !LiveRecordCursor {
             var checkpoint = try file.materializeTransactionCheckpoint();
+            const overlay_root: TransactionWrites.Root = switch (source) {
+                .catalog => |root| if (root == .metadata) .metadata else .index,
+                .documents => .documents,
+            };
             const kind: PageKind = switch (source) {
                 .catalog => |root| blk: {
                     const roots = try file.readCatalogRoots(catalogRootPage(checkpoint, root), checkpoint);
@@ -9655,10 +9794,14 @@ pub const NativeFile = struct {
                 },
                 .documents => .document,
             };
-            return .{ .index = DocumentIndexCursor.init(file, checkpoint), .kind = kind };
+            var overlay = try OverlayScanState.initForPrefix(file.allocator, file, overlay_root, checkpoint, "");
+            errdefer overlay.deinit();
+            return .{ .index = DocumentIndexCursor.init(file, checkpoint), .kind = kind, .overlay_root = overlay_root, .overlay = overlay };
         }
 
         pub fn deinit(self: *LiveRecordCursor) void {
+            if (self.pending_tree) |*p| p.deinit(self.index.file.allocator);
+            self.overlay.deinit();
             self.records.deinit(self.index.file.allocator);
             self.index.deinit();
         }
@@ -9667,8 +9810,35 @@ pub const NativeFile = struct {
             const file = self.index.file;
             while (true) {
                 if (cancel) |token| try token.check();
-                var indexed = (if (self.started) try self.index.next() else try self.index.first()) orelse return null;
-                self.started = true;
+                const candidate = self.pending_tree orelse blk: {
+                    const fetched = if (self.started) try self.index.next() else try self.index.first();
+                    self.started = true;
+                    break :blk fetched;
+                };
+                self.pending_tree = null;
+
+                // Merge-join against the overlay, same rule as
+                // CatalogCursor.next(): smaller key wins, a tie means the
+                // overlay supersedes the tree's own stale entry.
+                const overlay_key = self.overlay.peek();
+                const tree_key: ?[]const u8 = if (candidate) |c| c.key else null;
+                const take_overlay = overlay_key != null and (tree_key == null or std.mem.order(u8, overlay_key.?, tree_key.?) != .gt);
+                if (take_overlay) {
+                    const key = overlay_key.?;
+                    const entry = file.redoOverlayEntry(self.overlay_root, self.index.checkpoint, key) orelse return error.InvalidNativeRedoRecord;
+                    const tied = tree_key != null and std.mem.eql(u8, tree_key.?, key);
+                    if (tied) {
+                        var owned = candidate.?;
+                        owned.deinit(file.allocator);
+                    } else {
+                        self.pending_tree = candidate;
+                    }
+                    _ = self.overlay.takeFront();
+                    if (entry.is_delete) continue;
+                    return entry;
+                }
+
+                var indexed = candidate orelse return null;
                 defer indexed.deinit(file.allocator);
                 const payload = try self.records.read(file, file.allocator, self.index.checkpoint, indexed.document_page_id, self.kind);
                 const entry = if (self.kind == .catalog) try decodeCatalogEntry(payload) else blk: {
@@ -10995,10 +11165,33 @@ pub const NativeFile = struct {
                 current = try cursor.seekAtOrAfter(successor[0..end], false);
                 continue;
             }
+            // §9.3a revised: the overlay, not the on-disk record, is
+            // authoritative for this key's liveness whenever it has a
+            // mutation for it -- a newer delete must not be masked by a
+            // stale live on-disk entry, and a newer (re-)put must not be
+            // masked by a stale on-disk tombstone.
+            if (self.redoOverlayEntry(.documents, checkpoint, owned.key)) |overlay_entry| {
+                if (!overlay_entry.is_delete) return true;
+                current = try cursor.next();
+                continue;
+            }
             const entry = try decodeDocumentEntry(try records.read(self, self.allocator, checkpoint, owned.document_page_id, .document));
             if (!std.mem.eql(u8, entry.key, owned.key)) return error.InvalidDocumentIndex;
             if (!entry.is_delete) return true;
             current = try cursor.next();
+        }
+        // The tree has no live record outside the prefix. The overlay
+        // might still have one: a document inserted (or moved outside the
+        // prefix) since the last checkpoint, never yet reflected in the
+        // tree at all, so the scan above never visited its key.
+        if (self.redo) |*redo| {
+            if (checkpoint.commit_sequence == self.activeCheckpoint().commit_sequence) {
+                var it = redo.logical_overlay[@backingInt(TransactionWrites.Root.documents)].iterator();
+                while (it.next()) |kv| {
+                    if (std.mem.startsWith(u8, kv.key_ptr.*, excluded_prefix)) continue;
+                    if (!kv.value_ptr.is_delete) return true;
+                }
+            }
         }
         return false;
     }
@@ -11026,17 +11219,74 @@ pub const NativeFile = struct {
         defer references.deinit(self.allocator);
         var cursor = DocumentIndexCursor.initWithKeyAllocator(self, checkpoint, allocator);
         defer cursor.deinit();
-        var current = if (prefix.len == 0) try cursor.first() else try cursor.seekAtOrAfter(prefix, false);
-        while (current) |indexed| {
-            var owned = indexed;
-            defer owned.deinit(allocator);
-            if (!std.mem.startsWith(u8, indexed.key, prefix)) break;
+        // §9.3a revised: merge the redo-log logical_overlay's own
+        // uncheckpointed document mutations into this scan, in key order,
+        // the same way a point `getDocumentAtCheckpointAlloc` already
+        // does. `overlay_live_sentinel` marks a result already fully
+        // materialized from the overlay (no page to read for it), kept
+        // through the later tombstone-compaction filter below (which
+        // already treats a *real* `0` reference as "drop this one") but
+        // skipped by the batch-read loop that follows it.
+        const overlay_live_sentinel = std.math.maxInt(u64);
+        var overlay = try OverlayScanState.initForPrefix(self.allocator, self, .documents, checkpoint, prefix);
+        defer overlay.deinit();
+        var pending_tree: ?DocumentIndexEntry = if (prefix.len == 0) try cursor.first() else try cursor.seekAtOrAfter(prefix, false);
+        errdefer if (pending_tree) |*p| p.deinit(allocator);
+        while (true) {
+            if (pending_tree != null and !std.mem.startsWith(u8, pending_tree.?.key, prefix)) {
+                // Past the prefix on the tree side; sorted, so nothing
+                // later from the tree can match either. Any remaining
+                // overlay keys were already filtered to the prefix at
+                // construction, so the loop below still finds them.
+                var owned = pending_tree.?;
+                owned.deinit(allocator);
+                pending_tree = null;
+            }
+            const overlay_key = overlay.peek();
+            const tree_key: ?[]const u8 = if (pending_tree) |t| t.key else null;
+            const take_overlay = overlay_key != null and (tree_key == null or std.mem.order(u8, overlay_key.?, tree_key.?) != .gt);
+            if (take_overlay) {
+                const key = overlay_key.?;
+                const entry = self.redoOverlayEntry(.documents, checkpoint, key) orelse return error.InvalidNativeRedoRecord;
+                if (tree_key != null and std.mem.eql(u8, tree_key.?, key)) {
+                    var owned = pending_tree.?;
+                    owned.deinit(allocator);
+                    // Null out pending_tree itself (not just the local copy)
+                    // before calling cursor.next(): the top errdefer reads
+                    // the real pending_tree variable, so if cursor.next()
+                    // fails below, it must not see the just-freed key again.
+                    pending_tree = null;
+                    pending_tree = try cursor.next();
+                }
+                _ = overlay.takeFront();
+                if (!entry.is_delete) {
+                    const value = if (entry.external_value_root_page != 0)
+                        try self.readValuePagesAtCheckpointAlloc(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint)
+                    else
+                        try allocator.dupe(u8, entry.value);
+                    errdefer allocator.free(value);
+                    const owned_key = try allocator.dupe(u8, key);
+                    errdefer allocator.free(owned_key);
+                    try docs.ensureUnusedCapacity(allocator, 1);
+                    try references.ensureUnusedCapacity(self.allocator, 1);
+                    docs.appendAssumeCapacity(.{ .key = owned_key, .value = value });
+                    references.appendAssumeCapacity(overlay_live_sentinel);
+                }
+                continue;
+            }
+            const indexed = pending_tree orelse break;
             try docs.ensureUnusedCapacity(allocator, 1);
             try references.ensureUnusedCapacity(self.allocator, 1);
-            docs.appendAssumeCapacity(.{ .key = owned.key, .value = &.{} });
+            docs.appendAssumeCapacity(.{ .key = indexed.key, .value = &.{} });
             references.appendAssumeCapacity(indexed.document_page_id);
-            owned.key = &.{}; // Transfer caller-allocated ownership exactly once.
-            current = try cursor.next();
+            // Transfer ownership of the key into docs.items *before* calling
+            // cursor.next(): pending_tree (not the local `indexed` copy) is
+            // what the top errdefer at this function's entry points at, so
+            // if cursor.next() fails below, pending_tree must no longer
+            // reference a key docs.items already owns -- otherwise both
+            // errdefers free the same allocation.
+            if (pending_tree) |*p| p.key = &.{};
+            pending_tree = try cursor.next();
         }
         // Materialization already retains every result. One reference per live
         // index entry lets us read each packed record page once, even after
@@ -11058,6 +11308,9 @@ pub const NativeFile = struct {
         var window = RecordReadWindow{};
         defer window.deinit(self.allocator);
         for (docs.items, references.items, 0..) |*doc, *reference, position| {
+            // Already fully materialized from the overlay above -- no
+            // page to read, nothing to decode.
+            if (reference.* == std.math.maxInt(u64)) continue;
             const ahead = if (records.page_id == physicalPage(reference.*) or window.contains(self, physicalPage(reference.*))) 1 else recordRunAhead(references.items, null, position);
             const entry = try decodeDocumentEntry(try records.readWithWindow(true, &window, self, self.allocator, checkpoint, reference.*, .document, ahead));
             if (!std.mem.eql(u8, entry.key, doc.key)) return error.InvalidDocumentIndex;
@@ -11714,7 +11967,7 @@ pub const NativeFile = struct {
         // region's reader table (any reader, indexed or not -- the region
         // doesn't distinguish) refuses the vacuum rather than rewriting
         // pages a reader may still need.
-        if (self.regionForInode()) |region| if (region.minimumPinnedSequence() != null) return error.WouldBlock;
+        if (try self.regionForInode()) |region| if (region.minimumPinnedSequence() != null) return error.WouldBlock;
         var image = try self.prepareVacuum(cancel);
         defer image.deinit();
         try self.publishVacuum(&image);
@@ -13637,6 +13890,96 @@ pub const NativeFile = struct {
         return .{ .previous_page = 0, .key = key, .value = e.value, .is_delete = e.is_delete, .external_value_root_page = e.external_value_root_page, .external_value_len = e.external_value_len };
     }
 
+    /// §9.3d/`check()`: the number of keys currently staged only in the
+    /// redo-log overlay (uncheckpointed), across all three roots, for the
+    /// *active* checkpoint. `check()`'s `record_count` is a raw physical
+    /// page/chain count that predates redo-log mode and already double-
+    /// counts historical/tombstoned revisions by design (see its own
+    /// doc comment); without this, a redo-log commit that only writes
+    /// into the overlay (never allocating a page) could make
+    /// `record_count` *undercount* `live_file_count` -- a new, narrower
+    /// invariant break this restores rather than attempting to make
+    /// `record_count` itself overlay-aware (a much bigger semantic change
+    /// for every existing, non-redo caller of `check()`).
+    fn redoOverlayEntryCount(self: *NativeFile) u64 {
+        const redo = self.redo orelse return 0;
+        var total: u64 = 0;
+        for (redo.logical_overlay) |map| total += map.count();
+        return total;
+    }
+
+    /// A sorted snapshot of one root's redo-log logical_overlay keys
+    /// restricted to a prefix, for merging into a tree-ordered scan
+    /// (§9.3a, revised for scans/iterators: every path that enumerates
+    /// keys, not just point lookups, must see committed-but-not-yet-
+    /// checkpointed mutations, and must never surface a key the overlay
+    /// has deleted or superseded). `takeFront`/`takeIfEqual` consume keys
+    /// in ascending order; materializing a taken key's *value* still goes
+    /// through `redoOverlayEntry` (or an equivalent direct lookup) by
+    /// callers, exactly like a point read -- this type only orders the
+    /// keys, it does not duplicate value storage.
+    ///
+    /// `peek`+consume (rather than returning values directly) lets a
+    /// caller's own tree-side loop decide, key by key, whether the tree's
+    /// or the overlay's candidate comes first in a standard merge-join,
+    /// without this type needing to know anything about the tree side.
+    const OverlayScanState = struct {
+        keys: [][]const u8 = &.{},
+        index: usize = 0,
+        allocator: Allocator,
+
+        /// Empty (not an error) for a non-redo file, or for a checkpoint
+        /// other than the current one: a deliberately pinned, older
+        /// snapshot must never see mutations the overlay only reflects
+        /// for the *current* generation.
+        fn initForPrefix(allocator: Allocator, file: *NativeFile, root: TransactionWrites.Root, checkpoint: CheckpointSlot, prefix: []const u8) !OverlayScanState {
+            const empty: OverlayScanState = .{ .allocator = allocator };
+            const redo = file.redo orelse return empty;
+            if (checkpoint.commit_sequence != file.activeCheckpoint().commit_sequence) return empty;
+            const map = &redo.logical_overlay[@backingInt(root)];
+            var list = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer list.deinit(allocator);
+            var it = map.keyIterator();
+            while (it.next()) |k| {
+                if (std.mem.startsWith(u8, k.*, prefix)) try list.append(allocator, k.*);
+            }
+            const keys = try list.toOwnedSlice(allocator);
+            std.mem.sort([]const u8, keys, {}, struct {
+                fn less(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.order(u8, a, b) == .lt;
+                }
+            }.less);
+            return .{ .keys = keys, .allocator = allocator };
+        }
+
+        fn deinit(self: *OverlayScanState) void {
+            self.allocator.free(self.keys);
+            self.* = undefined;
+        }
+
+        /// The smallest remaining key, without consuming it.
+        fn peek(self: *const OverlayScanState) ?[]const u8 {
+            if (self.index >= self.keys.len) return null;
+            return self.keys[self.index];
+        }
+
+        /// Consumes and returns the smallest remaining key.
+        fn takeFront(self: *OverlayScanState) ?[]const u8 {
+            if (self.index >= self.keys.len) return null;
+            const k = self.keys[self.index];
+            self.index += 1;
+            return k;
+        }
+
+        /// If the smallest remaining key equals `key`, consumes it --
+        /// used when the tree side's own candidate collides with the
+        /// overlay's, so the tree's stale value for that key is never
+        /// also visited on a later step.
+        fn consumeIfEqual(self: *OverlayScanState, key: []const u8) void {
+            if (self.index < self.keys.len and std.mem.eql(u8, self.keys[self.index], key)) self.index += 1;
+        }
+    };
+
     fn stageMutation(self: *NativeFile, root: TransactionWrites.Root, mutation: CatalogMutation, options: WriteOptions) !void {
         if (self.artifact_lease_transaction and (root != .metadata or !std.mem.startsWith(u8, mutation.key, artifact_lease_key_prefix)))
             return error.InvalidArtifactLeaseMutation;
@@ -14750,6 +15093,27 @@ pub const NativeFile = struct {
         const retired_header = self.header;
         self.header = prepared.header;
         prepared.header = retired_header;
+        // §9.3a/§9.4: `prepared` (built by `prepareVacuum`) never carries a
+        // redo-log region of its own -- its header's `redo_log_capacity` is
+        // always 0 -- but the live `self.redo`, if this file had one, still
+        // points its `writer` at the *old* file's fd and byte offsets,
+        // which the swap above just moved into `prepared.file` (about to be
+        // closed by this call's caller) and which no longer correspond to
+        // anything in the compacted file either way. Drop it so this
+        // handle's commit behavior matches the header it just adopted;
+        // uncheckpointed overlay content is not lost by this, because
+        // every committed mutation already reached the compacted file
+        // through `copyVacuumCatalogRecords`/`copyVacuumDocumentRecords`'s
+        // overlay-aware `LiveRecordCursor`/`OverlayScanState` scans.
+        if (self.redo) |*redo| {
+            redo.deinit(self.allocator);
+            self.redo = null;
+            // `enableRedoLog` turned this off when the file first became a
+            // redo-log file (log-based durability replaces manifest-based);
+            // the compacted file has no log region, so ordinary
+            // manifest-commit durability is the correct mode for it again.
+            self.manifest_commits_enabled = true;
+        }
         self.invalidateLedger();
         prepared.invalidateLedger();
         self.durable_header = null;
@@ -15444,45 +15808,66 @@ pub fn lockReaderPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
 
 /// `acquirePathLeaseAssumeLocked`'s reader-admission wait, migrated off the
 /// kernel's blocking `.shared` lock queue (`waitPathLockWithIo(...,
-/// writer=false, ...)`), the last reader path still parked there. Unlike
-/// `fairWriterLockWithIo`, this is *not* a FIFO-ticket wait: a reader
-/// needs no ordering against other readers, and the region has no
-/// general "a writer released" signal a non-ticket-holding waiter can
-/// correctly wait on today -- `writer_release_epoch` is bumped and woken
-/// by `releaseWriter` only when a writer ticket is already queued (§8.2's
-/// own FIFO mechanism), never on an uncontended release, so a reader
-/// parked on it could wait past a release that had no queued ticket to
-/// wake it for. Until the region grows a dedicated release-notification
-/// word some non-ticket waiter can use (a design question for whoever
-/// extends §8.2, not resolved here), this retries its own non-blocking
-/// `lockReaderPathWithIo` attempt on a short bounded backoff instead of
-/// parking in the kernel's wait queue at all -- still removes the
-/// kernel-level block, at the cost of a capped poll interval rather than
-/// an instant wake. Falls back to the legacy blocking wait entirely when
-/// the region itself can't be used (`inode_lock.isRegionUnusable`), the
-/// same posture `fairWriterLockWithIo` already takes for its own callers;
-/// this function never attaches the opened region to the returned lease
-/// (`PathWriterLock.region` is writer-only -- `close()` unconditionally
-/// calls `releaseWriter()` on it whenever set, which a reader must never
-/// trigger), it only probes usability.
+/// writer=false, ...)`), the last reader path still parked there.
+///
+/// A reader's admission at this layer does not need exclusion from a
+/// writer at all: the store is copy-on-write (a commit never mutates a
+/// page an already-pinned reader can see; it lands on a fresh
+/// checkpoint slot/pages instead), and every real caller of this path --
+/// plain reads, status/index-list, and the `.maintain`-access snapshot
+/// copy -- only ever treats the returned lease as an admission
+/// throttle/reference, never as a signal that "no writer is mid-commit"
+/// (confirmed by tracing every caller: none inspects writer state
+/// through this lease, and the one place that genuinely needs real
+/// cross-process writer exclusion, `replaceWithPreparedGeneration`'s
+/// generation swap, already gets it independently through
+/// `enterMaintenanceWriter`/`tryWriterLeaseAssumeLocked`'s own exclusive
+/// re-acquisition, unrelated to this gate). The kernel `.shared`-vs-
+/// `.exclusive` wait this replaces was a holdover from flock's own
+/// semantics being the only coordination mechanism available before the
+/// region existed, not a correctness requirement.
+///
+/// So in region mode this never waits at all: open the region (to prove
+/// it's usable), and succeed immediately with no kernel lock -- `file =
+/// null` on the returned lease, nothing to release on `close()`. It does
+/// not claim or pin a region reader slot either: there is no commit
+/// generation to protect yet at this point (the caller hasn't opened the
+/// `NativeFile`, let alone read a header), so a slot held for this
+/// lease's -- potentially long-lived, re-admitted-per-query -- lifetime
+/// would consume one of the region's fixed 1024 slots for no protective
+/// effect, risking exhaustion for genuinely pinned NativeFile-level
+/// readers. The actual safety guarantee (pinning a real commit sequence)
+/// is `NativeFile.acquireReaderFence`'s job, already region-backed, once
+/// a real generation exists to pin. `PathWriterLock` has no field to
+/// stash a claimed slot index on for later release even if one were
+/// wanted here, and `.region` is writer-only (`close()` unconditionally
+/// calls `releaseWriter()` on it whenever set) -- not something a reader
+/// lease may ever populate.
+///
+/// Falls back to exactly the pre-migration two-step dance (one
+/// non-blocking `lockReaderPathWithIo` try, then one real blocking
+/// `waitPathLockWithIo`) entirely when the region itself can't be used
+/// (`inode_lock.isRegionUnusable`), the same posture `fairWriterLockWithIo`
+/// already takes for its own callers -- `lockReaderPathWithIo`'s kernel
+/// `.shared` lock remains the correctness authority there, unchanged,
+/// including `waitPathLockWithIo`'s own `error.FileNotFound`/
+/// `error.ConcurrencyUnavailable` cases, which this propagates rather
+/// than retrying itself: `acquirePathLeaseAssumeLocked`'s own outer loop
+/// already retries the whole admission attempt after those, and
+/// duplicating that retry here would just nest two copies of the same
+/// backoff.
 pub fn fairReaderLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
-    {
-        var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
-            if (inode_lock.isRegionUnusable(err)) return waitPathLockWithIo(allocator, io, path, false, deadline_ns);
-            return err;
-        };
-        region.close();
-    }
-    var backoff_ns: i96 = 50 * std.time.ns_per_us;
-    while (true) {
-        if (lockReaderPathWithIo(allocator, io, path)) |held| return held else |err| {
-            if (err != error.WouldBlock and err != error.FileBusy) return err;
+    var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
+        if (inode_lock.isRegionUnusable(err)) {
+            return lockReaderPathWithIo(allocator, io, path) catch |lock_err| {
+                if (lock_err != error.WouldBlock and lock_err != error.FileBusy) return lock_err;
+                return waitPathLockWithIo(allocator, io, path, false, deadline_ns);
+            };
         }
-        const remaining = deadline_ns - std.Io.Clock.awake.now(io).nanoseconds;
-        if (remaining <= 0) return error.FileBusy;
-        try io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake);
-        backoff_ns = @min(backoff_ns * 2, 4 * std.time.ns_per_ms);
-    }
+        return err;
+    };
+    region.close();
+    return .{ .io_impl = undefined, .borrowed_io = io, .file = null };
 }
 
 fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode, wait_for_reader_lock: bool) !LockFile {
@@ -25921,7 +26306,7 @@ test "lite reader registration path lease close retains only escaped snapshot pr
     lease.close();
     held = false;
     try std.testing.expectEqual(@as(usize, 0), coordinator.registration_batches);
-    const region = reader.regionForInode().?;
+    const region = (try reader.regionForInode()).?;
     try std.testing.expect(region.minimumMetadataPinnedSequence() != null);
     reader.close();
     reader_open = false;
@@ -25933,7 +26318,7 @@ test "lite reader registration path lease close retains only escaped snapshot pr
     // pinned," rather than reading a dangling `region`.
     var probe = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
     defer probe.close();
-    try std.testing.expectEqual(@as(?u64, null), probe.regionForInode().?.minimumMetadataPinnedSequence());
+    try std.testing.expectEqual(@as(?u64, null), (try probe.regionForInode()).?.minimumMetadataPinnedSequence());
 }
 
 /// Blocks (via `poll`, a portable sleep with no extra syscall declared just
@@ -26015,7 +26400,7 @@ test "lite reader fence across a forked child: writer withholds pages the child 
         // before this child claims anything through the inherited region,
         // the same ordering `shared_lock_region.zig`'s own fork tests use.
         var reader = NativeFile.openWithIo(a, io, path, .{ .read_only = true }) catch crossProcessParkForever();
-        const region = reader.regionForInode() orelse crossProcessParkForever();
+        const region = (reader.regionForInode() catch crossProcessParkForever()) orelse crossProcessParkForever();
         region.reclaimLivenessAfterFork() catch crossProcessParkForever();
         var child_coordinator = ReaderCoordinator.init(a, io);
         reader.reader_coordinator = &child_coordinator;
@@ -26038,7 +26423,7 @@ test "lite reader fence across a forked child: writer withholds pages the child 
     // cross-process pin, not just kernel-lock fencing.
     try std.testing.expectEqual(@as(u8, 1), report[0]);
 
-    const region = writer.regionForInode().?;
+    const region = (try writer.regionForInode()).?;
     try std.testing.expect(region.minimumPinnedSequence() != null);
     const before = (try writer.allocatorStats()).?.reused_pages;
     value[0] = 'b';
@@ -26063,7 +26448,7 @@ test "lite reader fence across a forked child: writer withholds pages the child 
     try std.testing.expect((try writer.check()).valid);
 }
 
-test "lite fairReaderLockWithIo succeeds immediately when uncontended and gives up at its own deadline when a writer holds the lease" {
+test "lite fairReaderLockWithIo never waits on a writer in region mode, uncontended or not" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -26074,18 +26459,60 @@ test "lite fairReaderLockWithIo succeeds immediately when uncontended and gives 
         var file = try NativeFile.createWithIo(a, io, path, .{ .no_sync = true });
         file.close();
     }
-    // Uncontended: the first `lockReaderPathWithIo` attempt inside
-    // `fairReaderLockWithIo` must succeed outright, never reaching its own
-    // backoff loop.
+    const short_deadline = std.Io.Clock.awake.now(io).nanoseconds + 2 * std.time.ns_per_s;
+    // Uncontended: succeeds immediately, no kernel lock taken at all --
+    // `lease.file == null` is the direct evidence (a kernel-lock-backed
+    // lease, the fallback path's own shape, always has a non-null file).
+    {
+        var lease = try fairReaderLockWithIo(a, io, path, short_deadline);
+        try std.testing.expect(lease.file == null);
+        lease.close();
+    }
+    // Contended: a writer holds the real exclusive sidecar lease the
+    // whole time. A reader admitted through the region needs no
+    // exclusion from it at all (copy-on-write; the actual safety
+    // guarantee is NativeFile.acquireReaderFence's pin, not this gate),
+    // so this must still succeed immediately -- never wait, let alone
+    // give up at the deadline.
+    var writer_lease = try lockWriterPathWithIo(a, io, path);
+    defer writer_lease.close();
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    const deadline = started + 150 * std.time.ns_per_ms;
+    var lease = try fairReaderLockWithIo(a, io, path, deadline);
+    try std.testing.expect(lease.file == null);
+    lease.close();
+    const elapsed = std.Io.Clock.awake.now(io).nanoseconds - started;
+    try std.testing.expect(elapsed < 50 * std.time.ns_per_ms);
+}
+
+test "lite fairReaderLockWithIo falls back to the legacy blocking wait when the region is unusable" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A filename long enough that the region's own sidecar
+    // (`<path>.aflite-lock`) exceeds the platform's single-component
+    // limit, same trigger as the reader-fence alias test -- the data
+    // file itself opens fine, only the region is unusable.
+    var name: [250]u8 = @splat('f');
+    @memcpy(name[243..], ".aflite");
+    const path = try testPath(a, tmp, &name);
+    defer a.free(path);
+    {
+        var file = try NativeFile.createWithIo(a, io, path, .{ .no_sync = true });
+        file.close();
+    }
+    // Uncontended: the legacy kernel-lock path still succeeds outright.
     {
         const deadline = std.Io.Clock.awake.now(io).nanoseconds + 2 * std.time.ns_per_s;
         var lease = try fairReaderLockWithIo(a, io, path, deadline);
+        try std.testing.expect(lease.file != null);
         lease.close();
     }
     // Contended: a writer holds the lease for longer than this call's own
-    // deadline, so it must actually wait (not fail on the first attempt)
-    // and then give up right around the deadline -- not instantly, and
-    // not hung past it either.
+    // deadline, so the legacy fallback must actually wait (not fail on
+    // the first attempt) and give up right around the deadline -- not
+    // instantly, and not hung past it either.
     var writer_lease = try lockWriterPathWithIo(a, io, path);
     defer writer_lease.close();
     const started = std.Io.Clock.awake.now(io).nanoseconds;
@@ -26853,4 +27280,292 @@ test "lite redo log checkpoints automatically once the log nears its capacity" {
         defer a.free(got);
         try std.testing.expectEqualStrings(&value_buf, got);
     }
+}
+
+test "lite redo log document scan merges the overlay across put, overwrite, delete and a checkpoint boundary" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-scan-documents.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer file.close();
+
+    // alpha/beta/gamma land through the overlay (no checkpoint yet).
+    try file.beginTransaction();
+    try file.putDocument("alpha", "one");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("beta", "two");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("gamma", "three");
+    try file.commitTransaction();
+
+    {
+        const docs = try file.snapshotDocumentsAlloc(a);
+        defer {
+            for (docs) |d| {
+                a.free(d.key);
+                a.free(d.value);
+            }
+            a.free(docs);
+        }
+        try std.testing.expectEqual(@as(usize, 3), docs.len);
+        try std.testing.expectEqualStrings("alpha", docs[0].key);
+        try std.testing.expectEqualStrings("one", docs[0].value);
+        try std.testing.expectEqualStrings("beta", docs[1].key);
+        try std.testing.expectEqualStrings("two", docs[1].value);
+        try std.testing.expectEqualStrings("gamma", docs[2].key);
+        try std.testing.expectEqualStrings("three", docs[2].value);
+    }
+
+    // Checkpoint: alpha/beta/gamma move into the real tree. The scan must
+    // see exactly the same results, now page-sourced instead of
+    // overlay-sourced.
+    try file.checkpointRedoLog();
+    {
+        const docs = try file.snapshotDocumentsAlloc(a);
+        defer {
+            for (docs) |d| {
+                a.free(d.key);
+                a.free(d.value);
+            }
+            a.free(docs);
+        }
+        try std.testing.expectEqual(@as(usize, 3), docs.len);
+    }
+
+    // Overwrite beta and delete gamma (both now overlay-only mutations
+    // against tree-resident keys); insert delta (overlay-only, brand new).
+    try file.beginTransaction();
+    try file.putDocument("beta", "two-updated");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.deleteDocument("gamma");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("delta", "four");
+    try file.commitTransaction();
+
+    const docs = try file.snapshotDocumentsAlloc(a);
+    defer {
+        for (docs) |d| {
+            a.free(d.key);
+            a.free(d.value);
+        }
+        a.free(docs);
+    }
+    try std.testing.expectEqual(@as(usize, 3), docs.len);
+    try std.testing.expectEqualStrings("alpha", docs[0].key);
+    try std.testing.expectEqualStrings("one", docs[0].value);
+    try std.testing.expectEqualStrings("beta", docs[1].key);
+    try std.testing.expectEqualStrings("two-updated", docs[1].value);
+    try std.testing.expectEqualStrings("delta", docs[2].key);
+    try std.testing.expectEqualStrings("four", docs[2].value);
+
+    // "gamma" must not appear: the overlay's delete must suppress the
+    // tree's own (now stale) live entry, not just fail to add a new one.
+    for (docs) |d| try std.testing.expect(!std.mem.eql(u8, d.key, "gamma"));
+
+    // A prefix scan must apply the same merge.
+    const prefixed = try file.snapshotDocumentsWithPrefixAlloc(a, "b");
+    defer {
+        for (prefixed) |d| {
+            a.free(d.key);
+            a.free(d.value);
+        }
+        a.free(prefixed);
+    }
+    try std.testing.expectEqual(@as(usize, 1), prefixed.len);
+    try std.testing.expectEqualStrings("beta", prefixed[0].key);
+    try std.testing.expectEqualStrings("two-updated", prefixed[0].value);
+
+    // `hasLiveDocumentOutsidePrefix` must also see the overlay in both
+    // directions: alpha/beta/delta all live outside the "gamma" prefix.
+    try std.testing.expect(try file.hasLiveDocumentOutsidePrefix(file.activeCheckpoint(), "gamma"));
+    // Excluding everything but "a" (alpha) and "g" (gamma, now deleted)
+    // leaves beta/delta outside -- still true.
+    try std.testing.expect(try file.hasLiveDocumentOutsidePrefix(file.activeCheckpoint(), "al"));
+}
+
+test "lite redo log catalog cursor merges the overlay across put, overwrite, delete and a checkpoint boundary" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-scan-catalog.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer file.close();
+
+    // `putCatalogRecord` wrapped in an explicit transaction, matching how
+    // every production caller reaches it (docstore.zig's own group commit
+    // always transacts) -- an un-transacted "bare commit" bypasses
+    // `flushTransactionWrites`'s diversion entirely and is a separate,
+    // not-yet-handled gap, not something this test is about.
+    try file.beginTransaction();
+    try file.putCatalogRecord("k/alpha", "one");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putCatalogRecord("k/beta", "two");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putCatalogRecord("k/gamma", "three");
+    try file.commitTransaction();
+
+    const assertScan = struct {
+        fn run(f: *NativeFile, alloc: Allocator, expected_keys: []const []const u8, expected_values: []const []const u8) !void {
+            var cursor = try f.metadataCatalogCursor(f.activeCheckpoint(), "k/");
+            defer cursor.deinit();
+            var i: usize = 0;
+            while (try cursor.nextRecordAlloc(alloc)) |record| {
+                defer {
+                    alloc.free(record.key);
+                    alloc.free(record.value);
+                }
+                try std.testing.expect(i < expected_keys.len);
+                try std.testing.expectEqualStrings(expected_keys[i], record.key);
+                try std.testing.expectEqualStrings(expected_values[i], record.value);
+                i += 1;
+            }
+            try std.testing.expectEqual(expected_keys.len, i);
+        }
+    }.run;
+
+    try assertScan(&file, a, &.{ "k/alpha", "k/beta", "k/gamma" }, &.{ "one", "two", "three" });
+
+    // Checkpoint: same records, now tree-resident.
+    try file.checkpointRedoLog();
+    try assertScan(&file, a, &.{ "k/alpha", "k/beta", "k/gamma" }, &.{ "one", "two", "three" });
+
+    // Overwrite beta, delete gamma, insert delta -- all overlay-only.
+    try file.beginTransaction();
+    try file.putCatalogRecord("k/beta", "two-updated");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.deleteCatalogRecord("k/gamma");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putCatalogRecord("k/delta", "four");
+    try file.commitTransaction();
+
+    try assertScan(&file, a, &.{ "k/alpha", "k/beta", "k/delta" }, &.{ "one", "two-updated", "four" });
+}
+
+test "lite redo log vacuum captures uncheckpointed overlay and demotes the file rather than corrupting it" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-vacuum.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+
+    try file.beginTransaction();
+    try file.putDocument("doc:live", "small");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("doc:gone", "deleted");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.deleteDocument("doc:gone");
+    try file.commitTransaction();
+
+    // Nothing checkpointed yet: both the live document and the
+    // tombstone are overlay-only (`logical_overlay`), never reflected in
+    // the physical tree at all.
+    try std.testing.expect(file.redo.?.logical_overlay[@backingInt(TransactionWrites.Root.documents)].count() > 0);
+
+    const vacuumed = try file.vacuum();
+    _ = vacuumed;
+
+    // §9.4a: `prepareVacuum`'s compacted file never reserves a redo-log
+    // region, so a live handle's stale `redo.writer` (still pointing at
+    // the *old* file's fd/offsets after the swap) must not survive --
+    // otherwise the next commit would divert into a log region that
+    // does not exist in the new file, corrupting whatever bytes happen
+    // to sit at that offset instead. Confirm the demotion is complete
+    // and consistent, not just that nothing crashed.
+    try std.testing.expect(file.redo == null);
+    try std.testing.expectEqual(@as(u64, 0), file.header.redo_log_capacity);
+    try std.testing.expect(file.manifest_commits_enabled);
+
+    // The vacuum's own copy loop (`LiveRecordCursor`/`OverlayScanState`)
+    // must have already merged that uncheckpointed overlay into the
+    // compacted file: the live document survives, the deleted one does
+    // not, even though neither was ever checkpointed before vacuum ran.
+    const live = (try file.getDocumentAlloc(a, "doc:live")).?;
+    defer a.free(live);
+    try std.testing.expectEqualStrings("small", live);
+    try std.testing.expectEqual(@as(?[]u8, null), try file.getDocumentAlloc(a, "doc:gone"));
+
+    // A plain commit on the now-demoted (non-redo) file must work
+    // through the ordinary copy-on-write path, not the diversion logic.
+    try file.beginTransaction();
+    try file.putDocument("doc:after", "fresh");
+    try file.commitTransaction();
+    const after = (try file.getDocumentAlloc(a, "doc:after")).?;
+    defer a.free(after);
+    try std.testing.expectEqualStrings("fresh", after);
+
+    file.close();
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    try std.testing.expect(reopened.redo == null);
+    const live_reopened = (try reopened.getDocumentAlloc(a, "doc:live")).?;
+    defer a.free(live_reopened);
+    try std.testing.expectEqualStrings("small", live_reopened);
+    const after_reopened = (try reopened.getDocumentAlloc(a, "doc:after")).?;
+    defer a.free(after_reopened);
+    try std.testing.expectEqualStrings("fresh", after_reopened);
+}
+
+test "lite redo log openIndexValue (artifact lease resolution) sees an uncheckpointed overlay entry" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-openindexvalue.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer file.close();
+
+    // Artifact leases (artifact_source.zig's Registry.open/Capture.apply)
+    // resolve their external-value pointer through `openIndexValue`
+    // directly, not through the `getCatalogRecordFromRootAtCheckpoint*`
+    // family -- it needs its own overlay check (§9.3a).
+    try file.beginTransaction();
+    try file.putIndexCatalogRecord("artifact:small", "inline-bytes");
+    try file.commitTransaction();
+
+    const checkpoint = file.activeCheckpoint();
+    var small = try file.openIndexValue(a, "artifact:small", checkpoint);
+    defer small.deinit(a);
+    try std.testing.expectEqual(@as(u64, 0), small.root);
+    try std.testing.expectEqualStrings("inline-bytes", small.inline_bytes);
+
+    // Deleting it (still uncheckpointed) must also be visible as gone,
+    // not resolve stale/missing-entirely through the real tree.
+    try file.beginTransaction();
+    try file.deleteIndexCatalogRecord("artifact:small");
+    try file.commitTransaction();
+    try std.testing.expectError(error.FileNotFound, file.openIndexValue(a, "artifact:small", file.activeCheckpoint()));
+
+    // A large (external-page-chain) value exercises the non-inline branch.
+    const large_value = try a.alloc(u8, default_page_size * 3);
+    defer a.free(large_value);
+    @memset(large_value, 'y');
+    try file.beginTransaction();
+    try file.putIndexCatalogRecord("artifact:large", large_value);
+    try file.commitTransaction();
+    var large = try file.openIndexValue(a, "artifact:large", file.activeCheckpoint());
+    defer large.deinit(a);
+    try std.testing.expect(large.root != 0);
+    try std.testing.expectEqual(large_value.len, large.length);
+    const read_back = try a.alloc(u8, large.length);
+    defer a.free(read_back);
+    try file.readIndexValueInto(large, 0, read_back, file.activeCheckpoint());
+    try std.testing.expectEqualSlices(u8, large_value, read_back);
 }

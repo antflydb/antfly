@@ -1298,6 +1298,195 @@ table before liveness/recovery; this design's cross-process piece
 with them, so it is extending a finished primitive rather than racing
 its own construction -- hence "tell me before (c)."
 
+### 9.3c Scan and iterator paths: merged overlay cursors
+
+Point gets alone are not enough: every range scan, prefix scan, or
+ordered cursor over a redo-log file's metadata/index/documents roots
+must also merge the in-process overlay, in the same key order, gated
+on the same pinned-checkpoint check `redoOverlayEntry` already uses. A
+scan that misses an overlay put, or returns an overlay-deleted key, is
+a correctness bug, not a performance gap.
+
+`OverlayScanState` (native.zig, nested in `NativeFile`) builds, once
+per cursor construction, a sorted snapshot of one root's
+`logical_overlay` keys restricted to the scan's prefix (borrowed key
+slices, no copies -- safe because nothing mutates the map for a
+cursor's lifetime: no commit runs concurrently with a cursor's use on
+the same handle). `CatalogCursor.next()`, `LiveRecordCursor.next()`,
+`hasLiveDocumentOutsidePrefix`, and
+`snapshotDocumentsWithPrefixAtCheckpointAlloc` each run the same
+merge-join: compare the overlay's next key against the tree cursor's
+next key, take the smaller, and on a tie let the overlay (always the
+newer state) supersede the tree's stale entry, consuming both.
+`metadataCatalogCursor`/`indexCatalogCursor`/
+`indexCatalogDirectoryCursor` all build on `catalogCursor`, so they
+inherit this for free.
+
+Two bugs surfaced building this, both caught and fixed with regression
+tests, not just by inspection:
+
+1. **Lost tree-side lookahead on ownership transfer.** When a
+   merge-join holds the tree cursor's already-fetched candidate across
+   loop iterations (so a tie, or an out-of-order overlay key, doesn't
+   silently skip it), the candidate's owned key must be detached from
+   the lookahead slot *before* the next fallible call (typically
+   `cursor.next()`), not after. `CatalogCursor`/`LiveRecordCursor` null
+   their lookahead field immediately after reading it, before doing
+   anything fallible, which is correct.
+   `snapshotDocumentsWithPrefixAtCheckpointAlloc`'s equivalent
+   lookahead did not: it mutated a *local copy* of the entry rather
+   than the actual `pending_tree` variable the function's own
+   top-level `errdefer` reads, so a failure in the immediately
+   following `cursor.next()` call double-freed a key already
+   transferred into (and counted in) the result list. Fixed at both of
+   that function's ownership-transfer sites.
+2. **`fetchPut` does not update the key on a match.**
+   `RedoCommitState.appendLogicalMutation` used
+   `logical_overlay[root].fetchPut(allocator, owned_key, decoded)` to
+   both insert and replace entries, and freed the returned `old.key`
+   on a match. `std.HashMapUnmanaged.fetchPutContext` only overwrites
+   `value_ptr.*`, never `key_ptr.*`, when it finds an existing match --
+   so `old.key` *is* the key still live in the map, and freeing it
+   corrupts the overlay the moment the same key is written a second
+   time within one uncheckpointed generation (an ordinary
+   put-then-overwrite or put-then-delete, not an edge case). Fixed by
+   switching to `getOrPut` and only storing the new key when there
+   wasn't already one to keep, matching the stdlib's own idiom for
+   this situation. This was a live memory-corruption bug that predates
+   the scan work; it would have corrupted the first production
+   workload that updated the same document twice before a checkpoint.
+
+New tests (native.zig): `"lite redo log document scan merges the
+overlay across put, overwrite, delete and a checkpoint boundary"`,
+`"...catalog cursor merges the overlay..."`, `"...vacuum captures
+uncheckpointed overlay and demotes the file rather than corrupting
+it"`, `"...openIndexValue (artifact lease resolution) sees an
+uncheckpointed overlay entry"`.
+
+### 9.3d Per-subsystem redo-log audit
+
+For every subsystem that touches native.zig's three roots, the
+decision is one of: it already reads/writes exclusively through the
+overlay-aware point-get/cursor family above; it must force a
+checkpoint first; or it is explicitly out of scope today. Audited:
+
+- **Full-text, dense (HBC), sparse, graph** (`backend.zig`'s
+  `.native_catalog` registrations, `native_catalog_sink.zig`,
+  `native_catalog_backend.zig`): all four route through
+  `native_catalog_backend.Backend`, which keeps its own in-process
+  ordered-tree mirror, seeded once at `Backend.init()` via the
+  overlay-aware `indexCatalogCursor`, and thereafter commits through
+  `putIndexCatalogBatch` -- the same `TransactionWrites`/
+  `logical_overlay` staging path as every other root. **Works through
+  the merged paths already.** `index_storage.zig`'s virtual-filesystem
+  reads for these four delegate to the already-patched
+  `getIndexCatalogRecord*`/`indexCatalogCursor`/
+  `indexCatalogDirectoryCursor` family.
+- **Algebraic indexes** (`storage/db/algebraic/`): no direct
+  `native.zig` access at all -- durable state goes through DocStore's
+  own primary `RuntimeStore`/`Txn` path (the `.documents`/metadata
+  point-get and scan family). **Works through the merged paths
+  already.**
+- **Artifact leases** (`artifact_source.zig`): writes stage ordinary
+  catalog mutations (already diverted automatically). Reads resolved
+  their external-value pointer through `NativeFile.openIndexValue`,
+  which called `lookupCatalogPage` directly with no overlay check -- a
+  real, live gap (`Registry.open`/`Capture.apply` call it on every
+  lease, not dead code). **Fixed**: `openIndexValue` now checks
+  `redoOverlayEntry(.index, ...)` first, matching its sibling
+  functions. This also forecloses a second, currently-unreachable use
+  of the same gap in `persistent.zig`'s mmap `SegmentFileStore` path
+  (dead today because Lite always configures `main_backend =
+  .native_catalog` for text/dense/sparse/graph, but would have been
+  live if that ever changes).
+- **Vacuum**: `copyVacuumCatalogRecords`/`copyVacuumDocumentRecords`
+  already scan via the overlay-aware `LiveRecordCursor`, so the
+  compacted file's *content* correctly includes uncheckpointed overlay
+  state without forcing a checkpoint first. But `prepareVacuum`'s
+  compacted header never reserved a redo-log region, and
+  `replaceWithPreparedGeneration` never reset the live handle's
+  `self.redo`/`self.manifest_commits_enabled` to match -- so vacuuming
+  a redo-log file left `self.redo.writer` pointing at the old file's
+  now-swapped-away fd and stale byte offsets, and the next commit
+  would have diverted into a log region that no longer existed,
+  corrupting the compacted file. **Fixed, by explicit demotion**:
+  vacuum now clears `self.redo` (freeing the overlay, safe because
+  every entry already reached the compacted file through the scan
+  above) and restores `self.manifest_commits_enabled = true` after a
+  successful publish. **Decision**: vacuum intentionally demotes a
+  redo-log file to an ordinary (non-redo) file rather than preserving
+  or re-reserving a log region in the rebuilt layout -- re-enabling
+  redo-log mode after a vacuum requires an explicit, separate
+  `enableRedoLog` call (not implemented). This is a known, deliberate
+  limitation, not a correctness gap. Regression test: `"...vacuum
+  captures uncheckpointed overlay and demotes the file rather than
+  corrupting it"`.
+- **Backup and restore**: the seal mechanism
+  (`native_backup_seal.zig`, `native_backup.zig`,
+  `backup_bundle_io.zig`/`backup_bundle.zig`) is byte/file-level
+  (hardlinks plus bounded copies), opaque to page/catalog structure
+  and to "redo" entirely. Since the log region lives inside the single
+  file's own bytes, a byte-level copy captures it along with
+  everything else, and `openWithRuntime`/`openWithIo` unconditionally
+  run `recoverRedoLog` whenever the decoded header carries a non-zero
+  `redo_log_capacity`, regardless of how the file arrived at that
+  path. **Works by construction**, not via the overlay-aware paths --
+  nothing to force-checkpoint for correctness. Open, not yet resolved:
+  whether the backup-pin/seal quiesce point freezes writers before its
+  stat+copy or merely races a live writer the same way crash recovery
+  does (if the latter, no worse than what `recoverRedoLog` already
+  tolerates, but unverified for this specific case); and whether to
+  offer an optional forced checkpoint before sealing purely to make the
+  captured image replay-free for tooling that doesn't understand the
+  redo-log wire format (an optimization, not a requirement).
+- **Split**: Lite's native single-file store has no shard/range split
+  machinery of its own; the `split`-named B-tree-node-overflow handling
+  inside `IndexEditor` is an unrelated concept. Real range/shard split
+  lives in `storage/lsm_backend.zig`, a separate SST-based engine that
+  never constructs a `NativeFile`. **Not applicable.**
+- **`check()`**: the existing `checkpointPrefixSize`/`truncated_file`
+  guard (page_count vs. physical file size) already catches, bluntly,
+  any uncheckpointed commit that allocated new pages (external-value
+  chains, the one page-shaped exception the diversion still makes) --
+  a known, already-documented limitation. Newly found: `liveStats()`
+  (feeding `live_file_count`/`live_bytes`/`compact_size`/
+  `reclaimable_bytes` into `CheckReport`) *is* overlay-aware via
+  `LiveRecordCursor`, while `record_count` comes from a raw,
+  non-overlay-aware tree walk -- so a redo-log commit that only
+  overwrites/deletes existing keys (no new pages, so the truncation
+  guard never fires) produces an internally inconsistent
+  `CheckReport` (`record_count` stale, `live_bytes`/`live_file_count`
+  current) rather than a hard failure. **Documented, not yet fixed**:
+  `check()` needs its own explicit decision -- skip/flag when
+  `self.redo != null` and the overlay is non-empty, or make
+  `record_count` overlay-aware too -- before redo-log becomes the
+  default; tracked as follow-up for step 3.
+
+This resolves point 2 in full except for the two explicitly open items
+above (backup/restore quiesce-ordering verification, and `check()`'s
+`record_count`/`liveStats` inconsistency), both documented decisions to
+revisit, not blockers left unexamined. `check()`'s inconsistency is
+fixed as part of point 3 below (`NativeFile.redoOverlayEntryCount`,
+added into `record_count` in both the indexed and non-indexed branches
+of `checkAtFileSizeWithCancel`).
+
+### 9.3e A second occurrence of the same key-ownership bug, in replay
+
+`appendLogicalMutation`'s `fetchPut`-vs-`getOrPut` fix (§9.3c) has a
+sibling: `decodeLogicalMutationsPayload`, the function `recoverRedoLog`
+uses to rebuild `logical_overlay` from the log on open, had the
+identical bug (`fetchPut`, then freeing its returned "old" key as if
+it were a separate allocation from the map's own live key). It did not
+surface until point 3's work below actually exercised recovery against
+a log whose replayed range covers more than one record for the same
+key -- an ordinary put-then-overwrite or put-then-delete before the
+next checkpoint, same trigger as the original bug, just on the replay
+path instead of the live-commit path. Found via `docstore.zig`'s own
+`performVacuum`, which opens a fresh read-only `NativeFile` on the same
+path (triggering `recoverRedoLog` independently of the live handle);
+closing it then double-freed. Fixed the same way: `getOrPut`, storing
+the new key only when there wasn't already one to keep.
+
 ### 9.4 Background checkpointer: batched, owner-only, ride-along
 
 The checkpointer turns a batch of log records into tree pages,
@@ -1372,6 +1561,52 @@ background checkpointer (§9.4) calls instead of something a commit
 calls inline. No change to `State`'s in-memory shape or its public
 `retain`/`release`/`allocate` API (§ survey Part A.4) is needed; only
 where `persist()`'s bytes land changes.
+
+#### 9.4b Step 4, as implemented: riding the existing idle-flush timer
+
+The synchronous 25%-remaining check inside `commitTransactionWithDurability`
+(`maybeAutoCheckpointRedoLog`) is kept exactly as designed above --
+backpressure for a writer that outruns everything else, never the
+primary trigger. The primary trigger is now `docstore.zig`'s
+`rideAlongFlushLoop`: the same background thread/timer §3.2a's
+ride-along idle-flush barrier already runs (wakes every
+`ride_along_idle_ns`, default 50ms), extended with a second,
+independent check (`maybeCheckpointRedoLogOnIdleTurn`) on every wake,
+regardless of whether the ride-along branch found anything to flush.
+Reusing this loop rather than adding a new thread/timer was deliberate:
+it already exists, already wakes on a sensible cadence, and already
+has the right shape (a periodic tick that's free to be a no-op).
+
+Two triggers, both checked on every wake:
+
+- **Idle**: any non-empty `logical_overlay` (any root) reaching this
+  point has gone at least one full `ride_along_idle_ns` tick with
+  nothing else pressing enough to wake the loop sooner, so checkpointing
+  it now is cheap and bounds the staleness a reopen would have to replay
+  to at most one tick.
+- **Threshold**: the log's own byte capacity past the halfway point
+  (`redo.writer.remaining() < redo.writer.capacity / 2`), checked
+  independently of the overlay's *entry* count -- a commit's external-
+  value pages consume log bytes without necessarily adding many logical
+  entries, so the two signals can disagree, and either one alone
+  triggers the same checkpoint.
+
+Starting the loop: `ensureRideAlongFlushStarted` used to run lazily,
+only on a file's first `stageRideAlong` call -- a workload that never
+rides along (every commit durable and synchronous) would never start
+it, leaving only the 25%-remaining backpressure path ever checkpointing.
+The fix is **not** to start it eagerly inside `createWithOptions`/
+`openWithOptions`: both return `Store` by value, so a thread spawned
+there against `&result` captures a pointer to a stack temporary that
+goes stale the instant the caller's own copy of the returned value
+settles at a different address (found by reproducing it: a real crash,
+`@cmpxchgStrong` reading a corrupted `Io.Event` from freed/reused
+memory, the first time a test exercised this against a stable
+non-redo-log baseline). Instead, `applyMutationGroup` -- always called
+through the caller's own long-lived `*Store`, never a temporary --
+starts the loop lazily on a file's first real commit, for a redo-log
+file specifically. A file with zero commits ever has nothing to
+checkpoint regardless, so this loses nothing a workload would need.
 
 ### 9.5 Recovery: last durable checkpoint plus a validated log prefix
 
@@ -1490,6 +1725,59 @@ crash_consistency_test.zig:3235-3263), which must keep not firing:
    retirement," with checkpoint ride-along commits substituted for
    merge/retirement, to catch the same class of idle-flush-timer
    starvation bug §7.1 found, in the new code path.
+
+### 9.7a Point 3: threading the option, and holding back the default
+
+The option is threaded the whole way: `capi/db.zig`'s
+`HostLiteOpenOptions`/`LiteResolvedOpenOptions` (`use_redo_log: ?bool`,
+plus `page_reuse: ?bool` since redo-log and indexed reclamation remain
+mutually exclusive) -> `backend.zig`'s `CreateOptions` ->
+`docstore.zig`'s `CreateOptions.use_redo_log` -> `NativeFile.createWithRedoLog`/
+the new owned-io counterpart `createWithRedoLogOwnedIo` (needed because
+`docstore.Store.createWithOptions` has an `opts.io == null` path
+`createWithRedoLog` itself can't serve -- it requires a caller-supplied
+`std.Io`). `null` (unset) and explicit `false` both mean legacy;
+explicit `true` alongside `page_reuse` (which defaults to `true`) is a
+caller error, not a silent downgrade. Default capacity:
+`NativeFile.default_redo_log_capacity_bytes` (8 MiB) -- no prior
+sizing precedent existed in this codebase to inherit; this is a fresh,
+deliberately generous choice, not a measured optimum.
+
+**The default itself is not flipped to redo-log for every new file**,
+despite that being point 3's original ask. Flipping it and running the
+existing suite surfaced 13 failures in `storage.lite.docstore.test`'s
+reclamation/replay/maintenance tests alone (page-growth-based
+assessment heuristics, vacuum/replay-cleanup code that assumes a
+commit's pages are already physically on disk by the time retirement
+or replay logic looks at them, allocation-failure-injection tests whose
+expected failure point shifts with the allocation pattern) -- none of
+which §9.3d's audit covered, because they are not "does this subsystem
+read/write through the overlay-aware paths" questions at all, but
+"does this subsystem's own timing/sizing assumptions survive a commit
+that defers its physical page build" questions, a different audit this
+pass did not have time to run to completion. Opt-in (`use_redo_log =
+true`) is fully supported, covered by the same native.zig/crash-sim
+tests as the legacy path, and already demonstrated end-to-end through
+the real capi seam by the harness mode below. Only the production
+*default* stays legacy until that second audit happens; flipping it
+blind was exactly the risk this whole revision's review process (the
+logical-mutation rewrite, the overlay/scan merge-join, two
+`fetchPut`-vs-`getOrPut` memory-corruption bugs) was already right to
+be cautious about once.
+
+The CPU harness (`write_amplification_cpu_bench_test.zig`) gained a
+`redo: bool` parameter threaded through `Fixture.open`/
+`measureSingleWriter`/`measureConcurrent`, with every pre-existing call
+site passing `false` explicitly (so the long-calibrated "ceilings" test
+keeps measuring exactly what it always measured, unaffected by the
+option existing at all) and a new `"lite write amplification cpu redo
+vs legacy"` test measuring both side by side through the real capi
+seam. Measured end-to-end (updates=128, text_bytes=1024): legacy
+pwrite/write=12.41, pread/write=9.69, syscalls/write=23.09; redo
+pwrite/write=2.07, pread/write=0.43, syscalls/write=3.52 -- the same
+order-of-magnitude win native.zig's own direct measurement showed,
+confirmed surviving the full capi -> backend.zig -> docstore.zig ->
+native.zig path, not just the native.zig layer.
 
 ### 9.8 Gates (from step (c) on)
 

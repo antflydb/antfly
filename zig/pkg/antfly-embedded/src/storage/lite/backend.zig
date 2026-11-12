@@ -94,6 +94,8 @@ pub const CreateOptions = struct {
     io: ?std.Io = null,
     /// See `docstore.Store.ride_along_idle_ns`'s own doc comment.
     ride_along_idle_ns: ?u64 = null,
+    /// See `docstore.Store.CreateOptions.use_redo_log`'s own doc comment.
+    use_redo_log: ?bool = null,
 };
 
 pub fn isAflitePath(path: []const u8) bool {
@@ -803,6 +805,7 @@ fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOp
         .writer_lock_marker = opts.writer_lock_marker,
         .io = opts.io,
         .ride_along_idle_ns = opts.ride_along_idle_ns,
+        .use_redo_log = opts.use_redo_log,
     });
     return try initNativeSingleFile(allocator, initial_store, owned_resource_manager);
 }

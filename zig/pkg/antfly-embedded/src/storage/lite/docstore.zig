@@ -1457,6 +1457,30 @@ pub const CreateOptions = struct {
     io: ?std.Io = null,
     /// See `OpenOptions.ride_along_idle_ns`.
     ride_along_idle_ns: ?u64 = null,
+    /// docs/design/lite-performance/lite-single-commit-write-path.md §9,
+    /// point 3. `null` (the current default) is the legacy copy-on-write
+    /// commit path. `true` opts a new, non-page-reuse file into redo-log
+    /// (an error alongside `reclamation.page_reuse`, which combines with
+    /// it unvalidated -- `native.NativeFile.createWithRedoLog`'s own
+    /// assert); `false` is the same as the default, spelled out.
+    ///
+    /// Not yet flipped to default-on for every new file, despite that
+    /// being point 3's original ask: doing so surfaced 13 failures across
+    /// `storage.lite.docstore.test`'s reclamation/replay/maintenance
+    /// suites alone (reclamation's page-growth-based assessment heuristics,
+    /// vacuum/replay-cleanup's assumption that a commit's pages are already
+    /// physically written by the time retirement/replay code looks at
+    /// them, allocation-failure-injection tests whose expected failure
+    /// point shifts along with the allocation pattern) -- none audited or
+    /// adapted for a commit that defers its physical build to the next
+    /// checkpoint. Flipping the default before that audit risks shipping
+    /// exactly the kind of regression this design's own review process
+    /// already caught once (the logical-mutation rewrite, the overlay/scan
+    /// merge-join, and the two `fetchPut`-vs-`getOrPut` memory-corruption
+    /// fixes this same pass also found). Opt-in via `true` is fully
+    /// supported and gated by the same crash-sim/native coverage as the
+    /// legacy path; only the *default* is being held back.
+    use_redo_log: ?bool = null,
 };
 
 const MutationRequest = struct {
@@ -1878,7 +1902,18 @@ pub const Store = struct {
             .writer_lock_marker = opts.writer_lock_marker,
             .indexed_reclamation = opts.reclamation.page_reuse,
         };
-        var file = if (opts.io) |io|
+        // Point 3: redo-log is opt-in for now (see `CreateOptions.use_redo_log`'s
+        // doc comment for why the default stays legacy copy-on-write). An
+        // explicit `true` alongside page reuse is a caller error, not a
+        // silent fallback.
+        if (opts.use_redo_log == true and native_opts.indexed_reclamation) return error.InvalidArgument;
+        const use_redo_log = (opts.use_redo_log orelse false) and !native_opts.indexed_reclamation;
+        var file = if (use_redo_log)
+            (if (opts.io) |io|
+                try native.NativeFile.createWithRedoLog(allocator, io, path, native_opts, native.NativeFile.default_redo_log_capacity_bytes)
+            else
+                try native.NativeFile.createWithRedoLogOwnedIo(allocator, path, native_opts, native.NativeFile.default_redo_log_capacity_bytes))
+        else if (opts.io) |io|
             try native.NativeFile.createWithIo(allocator, io, path, native_opts)
         else
             try native.NativeFile.createWithOptions(allocator, path, native_opts);
@@ -2772,7 +2807,7 @@ pub const Store = struct {
         }
         status.allocator_work = self.file.allocator_work;
         if (self.file.reader_coordinator) |coordinator| {
-            const readers = coordinator.readerStats((try self.file.file.stat(self.file.runtime())).inode, self.file.regionForInode());
+            const readers = coordinator.readerStats((try self.file.file.stat(self.file.runtime())).inode, try self.file.regionForInode());
             status.coordinated_reader_count = readers.count;
             status.poisoned_coordinated_readers = readers.poisoned;
             status.oldest_coordinated_reader_age_ms = readers.oldest_age_ms;
@@ -3464,21 +3499,75 @@ pub const Store = struct {
             } }) catch {};
             self.ride_along_wake.reset();
             if (self.ride_along_flush_cancel.requested.load(.acquire)) break;
-            self.commit_mutex.lockUncancelable(io);
-            const last_ns = self.ride_along_last_enqueue_ns;
-            const pending = self.ride_along_pending_count > 0;
-            self.commit_mutex.unlock(io);
-            if (!pending) continue;
-            const now = std.Io.Clock.awake.now(io).nanoseconds;
-            if (now -| last_ns < @as(i96, @intCast(self.ride_along_idle_ns))) continue; // not idle long enough; re-check on the next wake.
-            // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): tag
-            // this background thread's own forced flush so it attributes to
-            // `.ride_along_flush`, not the unattributed `.other` bucket --
-            // see the doc comment on that Stage tag.
-            const flush_scope = wal_trace.scope(.ride_along_flush);
-            defer flush_scope.end();
-            self.forceDrainDurable();
+            ride_along: {
+                self.commit_mutex.lockUncancelable(io);
+                const last_ns = self.ride_along_last_enqueue_ns;
+                const pending = self.ride_along_pending_count > 0;
+                self.commit_mutex.unlock(io);
+                if (!pending) break :ride_along;
+                const now = std.Io.Clock.awake.now(io).nanoseconds;
+                if (now -| last_ns < @as(i96, @intCast(self.ride_along_idle_ns))) break :ride_along; // not idle long enough; re-check on the next wake.
+                // lite-single-commit-write-path.md §3.2a/§3.3c (task 4): tag
+                // this background thread's own forced flush so it attributes to
+                // `.ride_along_flush`, not the unattributed `.other` bucket --
+                // see the doc comment on that Stage tag.
+                const flush_scope = wal_trace.scope(.ride_along_flush);
+                defer flush_scope.end();
+                self.forceDrainDurable();
+            }
+            // §9.4 (revised, step 4): same wake, independent of the
+            // ride-along check above -- a workload with no ride-along
+            // commits at all must still get its redo-log overlay
+            // checkpointed on this timer, not only via the synchronous
+            // 25%-remaining backpressure path inside
+            // `commitTransactionWithDurability`. Two triggers: idle (this
+            // wake fired with nothing else due, i.e. the ride-along branch
+            // above found no pending work, or found work but it wasn't
+            // idle long enough yet -- either way, if the log has ANY
+            // uncheckpointed content, clear it opportunistically on this
+            // periodic tick) and threshold (the log has crossed a lower,
+            // opportunistic bound well before the emergency backpressure
+            // would fire, regardless of idle state).
+            self.maybeCheckpointRedoLogOnIdleTurn();
         }
+    }
+
+    /// Step 4's background trigger, called from `rideAlongFlushLoop`'s
+    /// periodic wake (every `ride_along_idle_ns`, started eagerly for any
+    /// redo-log file -- see `openWithOptions`/`createWithOptions`).
+    /// `lockStoreExclusive` because `checkpointRedoLog` opens and commits a
+    /// real native transaction on `self.file` -- same requirement as
+    /// `maintainOnceWithCancel`'s retirement/reclaim step, which this
+    /// mirrors.
+    fn maybeCheckpointRedoLogOnIdleTurn(self: *Store) void {
+        if (self.read_only) return;
+        if (self.writer_admission) |admission| admission.enter(admission.ptr, .allocator_service) catch return;
+        defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
+        lockStoreExclusive(self);
+        defer self.mutex.unlock();
+        if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return;
+        const redo = self.file.redo orelse return;
+        if (redo.checkpointing) return;
+        var overlay_entries: u64 = 0;
+        for (redo.logical_overlay) |map| overlay_entries += map.count();
+        // Idle: this call only happens on `rideAlongFlushLoop`'s own
+        // periodic wake, which already implies nothing more pressing woke
+        // it sooner -- any non-empty overlay reaching this point has had at
+        // least one full `ride_along_idle_ns` tick with no other reason to
+        // run, so it is cheap to clear opportunistically rather than
+        // leaving it to grow (and the next reopen's replay to cover)
+        // indefinitely.
+        const has_overlay_work = overlay_entries != 0 or redo.overlay.count() != 0;
+        // Threshold: byte usage past the halfway point, well before the
+        // emergency 25%-remaining backpressure (`maybeAutoCheckpointRedoLog`)
+        // would ever fire. Checked independently of `has_overlay_work`: a
+        // commit's own external-value pages count against the log's *byte*
+        // capacity, a different axis than the logical_overlay *entry*
+        // count above, so this catches a byte-heavy-but-entry-light backlog
+        // the entry count alone would not flag.
+        const threshold_due = redo.writer.remaining() < redo.writer.capacity / 2;
+        if (!has_overlay_work and !threshold_due) return;
+        self.file.checkpointRedoLog() catch |err| self.recordMaintenanceError(err);
     }
 
     /// Enqueue `plan` and return a ticket resolved once its group is durable.
@@ -3730,6 +3819,19 @@ pub const Store = struct {
     /// `force_durable` makes this group durable regardless of any member's
     /// own `durable` flag; see `driveMutationCoordinator`.
     fn applyMutationGroup(self: *Store, head: *MutationRequest, force_durable: bool) !void {
+        // §9.4 (revised, step 4): start the background idle/threshold
+        // checkpoint turn (`rideAlongFlushLoop`, extended to also drive
+        // `maybeCheckpointRedoLogOnIdleTurn`) the first time this file
+        // actually commits anything, for a redo-log file -- not eagerly at
+        // `Store` construction: `createWithOptions`/`openWithOptions`
+        // return `Store` by value, so a thread spawned there against `&result`
+        // would capture a pointer to a stack temporary that goes stale the
+        // moment the caller's own copy settles at a different address.
+        // `self` here is always the caller's own long-lived pointer, so
+        // this is the earliest safe point. A file with no commits ever has
+        // nothing to checkpoint either way, so starting this lazily, on
+        // first write, loses nothing a workload would otherwise need.
+        if (!self.ride_along_flush_started.load(.acquire) and self.file.redo != null) self.ensureRideAlongFlushStarted();
         var index_only = true;
         var artifact_lease_only = true;
         var member: ?*MutationRequest = head;
@@ -8251,6 +8353,54 @@ test "lite ride-along idle-flush timer alone makes N ride-alongs durable with ex
     defer read.abort();
     try std.testing.expectEqualStrings("rode along", try read.get("idle-ride1"));
     try std.testing.expectEqualStrings("rode along", try read.get("idle-ride2"));
+}
+
+test "lite redo-log idle-flush timer checkpoints an uncheckpointed overlay without a foreground checkpoint call" {
+    // §9.4b (step 4, as implemented): `rideAlongFlushLoop`'s own periodic
+    // wake also drives `maybeCheckpointRedoLogOnIdleTurn`, independent of
+    // whether anything rode along. A durable, redo-log commit leaves its
+    // mutation sitting only in `NativeFile.redo`'s in-process overlay;
+    // nothing in this test ever calls `checkpointRedoLog` directly -- the
+    // background timer alone must clear it within one `ride_along_idle_ns`
+    // tick, the same bound the ride-along idle-flush barrier above gets.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "redo-idle-checkpoint.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .use_redo_log = true, .reclamation = .{ .page_reuse = false } });
+    defer store.close();
+    store.ride_along_idle_ns = 20 * std.time.ns_per_ms;
+
+    const Context = struct {
+        fn apply(_: *anyopaque, file: *native.NativeFile) !void {
+            try file.putDocument("idle-checkpoint-doc", "landed via redo log");
+        }
+    };
+    var ctx: u8 = 0;
+    try store.submitMutation(&ctx, Context.apply);
+    try std.testing.expect(store.file.redo != null);
+
+    const hasOverlayWork = struct {
+        fn run(s: *Store) bool {
+            const redo = s.file.redo orelse return false;
+            for (redo.logical_overlay) |map| if (map.count() != 0) return true;
+            return redo.overlay.count() != 0;
+        }
+    }.run;
+    try std.testing.expect(hasOverlayWork(&store));
+
+    const deadline_ns = antfly_platform.time.monotonicNs() +| (10 * std.time.ns_per_s);
+    while (hasOverlayWork(&store)) {
+        if (antfly_platform.time.monotonicNs() >= deadline_ns) return error.IdleCheckpointNeverFired;
+        std.Thread.yield() catch {};
+    }
+
+    // The document must still read back correctly once the background
+    // checkpoint has turned its overlay entry into a real page.
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("landed via redo log", try read.get("idle-checkpoint-doc"));
 }
 
 test "lite ride-along undurable-bytes threshold triggers exactly 1 sync" {
