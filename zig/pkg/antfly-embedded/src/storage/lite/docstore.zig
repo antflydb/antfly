@@ -8355,6 +8355,54 @@ test "lite ride-along idle-flush timer alone makes N ride-alongs durable with ex
     try std.testing.expectEqualStrings("rode along", try read.get("idle-ride2"));
 }
 
+test "lite redo-log idle-flush timer checkpoints an uncheckpointed overlay without a foreground checkpoint call" {
+    // §9.4b (step 4, as implemented): `rideAlongFlushLoop`'s own periodic
+    // wake also drives `maybeCheckpointRedoLogOnIdleTurn`, independent of
+    // whether anything rode along. A durable, redo-log commit leaves its
+    // mutation sitting only in `NativeFile.redo`'s in-process overlay;
+    // nothing in this test ever calls `checkpointRedoLog` directly -- the
+    // background timer alone must clear it within one `ride_along_idle_ns`
+    // tick, the same bound the ride-along idle-flush barrier above gets.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "redo-idle-checkpoint.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .use_redo_log = true, .reclamation = .{ .page_reuse = false } });
+    defer store.close();
+    store.ride_along_idle_ns = 20 * std.time.ns_per_ms;
+
+    const Context = struct {
+        fn apply(_: *anyopaque, file: *native.NativeFile) !void {
+            try file.putDocument("idle-checkpoint-doc", "landed via redo log");
+        }
+    };
+    var ctx: u8 = 0;
+    try store.submitMutation(&ctx, Context.apply);
+    try std.testing.expect(store.file.redo != null);
+
+    const hasOverlayWork = struct {
+        fn run(s: *Store) bool {
+            const redo = s.file.redo orelse return false;
+            for (redo.logical_overlay) |map| if (map.count() != 0) return true;
+            return redo.overlay.count() != 0;
+        }
+    }.run;
+    try std.testing.expect(hasOverlayWork(&store));
+
+    const deadline_ns = antfly_platform.time.monotonicNs() +| (10 * std.time.ns_per_s);
+    while (hasOverlayWork(&store)) {
+        if (antfly_platform.time.monotonicNs() >= deadline_ns) return error.IdleCheckpointNeverFired;
+        std.Thread.yield() catch {};
+    }
+
+    // The document must still read back correctly once the background
+    // checkpoint has turned its overlay entry into a real page.
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("landed via redo log", try read.get("idle-checkpoint-doc"));
+}
+
 test "lite ride-along undurable-bytes threshold triggers exactly 1 sync" {
     // Barrier in `stageRideAlong` itself (the byte-threshold check right
     // after enqueueing): crossing `ride_along_byte_threshold` must force a
