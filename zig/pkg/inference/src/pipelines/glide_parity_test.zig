@@ -116,7 +116,7 @@ test "GLiDE encoder wrap truncates head and tail around special tokens" {
     const tokenizer = try hf.HfTokenizer.loadFromBytes(gpa, json);
     const tok = tokenizer.tokenizer();
     defer tok.deinitTokenizer();
-    var config = glide.DecisionConfig{ .backbone = .encoder, .pooling = .last, .max_len = 7, .trunc_head = 2, .temperature = 1, .model_name = "", .codes = &.{}, .render_tokenizer = "" };
+    var config = glide.DecisionConfig{ .backbone = .encoder, .pooling = .last, .max_len = 7, .trunc_head = 2, .temperature = 1, .codes = &.{} };
     const short = try prompt.encode(gpa, tok, &config, "a b c");
     defer gpa.free(short);
     try std.testing.expectEqualSlices(i32, &.{ 0, 2, 3, 4, 1 }, short);

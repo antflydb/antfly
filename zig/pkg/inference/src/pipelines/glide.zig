@@ -43,8 +43,13 @@ pub const trace = glide.trace;
 
 pub const Options = struct {
     token_budget: usize = default_token_budget,
-    /// Per-prompt token ceiling from the resolved executor contract.
+    /// Per-prompt token ceiling from the resolved executor contract. As for
+    /// Laya, it bounds the model's input sequence: the rendered prompt
+    /// (input, instructions and options), after encoder truncation.
     max_input_tokens: ?usize = null,
+    /// Native forwards allocate their activations from the caller's bounded
+    /// heap; micro-batches whose planned workspace exceeds this are split.
+    max_workspace_bytes: ?usize = null,
 };
 
 pub const Result = struct {
@@ -67,8 +72,50 @@ pub fn promptBytes(codes: []const []const u8, state: []const u8, question: promp
 
 const Prepared = struct { ids: []i32 };
 
+/// Rendered and tokenized prompts, length-ordered for micro-batching. The
+/// prepared ids and ordering live in `scratch` (a freeing allocator, so
+/// tokenizer temporaries are returned as each prompt is encoded); the host
+/// preprocessing permit stays held until `deinit`.
+pub const Plan = struct {
+    scratch: std.mem.Allocator,
+    permit: sessions.RunPermit,
+    prepared: []Prepared,
+    prepared_count: usize = 0,
+    order: []usize,
+    lengths: []usize,
+    /// Owned by the caller's result allocator `a`.
+    item_tokens: []usize,
+    prompt_tokens: usize = 0,
+    retained: usize,
+    /// Right-padding token id for micro-batches.
+    pad: i64,
+
+    pub fn deinit(self: *Plan) void {
+        for (self.prepared[0..self.prepared_count]) |entry| self.scratch.free(entry.ids);
+        self.scratch.free(self.prepared);
+        self.scratch.free(self.order);
+        self.scratch.free(self.lengths);
+        self.permit.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Host bytes that stay resident from tokenization until the response:
+/// every prompt's ids (each token is at least one byte of rendered text),
+/// the ordering arrays, and each prompt's option distribution.
+pub fn retainedHostBytes(config: *const glide.DecisionConfig, states: []const []const u8, questions: []const prompt.Question) usize {
+    const total = states.len *| questions.len;
+    var retained: usize = total *| (@sizeOf(Prepared) + 2 * @sizeOf(usize) + @sizeOf([]const f64));
+    retained +|= states.len *| @sizeOf(usize);
+    for (states) |state| for (questions) |question| {
+        retained +|= @min(promptBytes(config.codes, state, question) + 2, config.max_len) *| @sizeOf(i32);
+        retained +|= question.options.len *| @sizeOf(f64);
+    };
+    return retained;
+}
+
 /// Allocations of the result belong to `a` (normally a request arena).
-/// `scratch` backs tensors and model temporaries.
+/// `scratch` backs prompts, tensors and model temporaries.
 pub fn execute(
     a: std.mem.Allocator,
     scratch: std.mem.Allocator,
@@ -80,60 +127,107 @@ pub fn execute(
     control: ?Control,
     options: Options,
 ) !Result {
+    var plan = try prepare(a, scratch, session, tok, config, states, questions, control, options);
+    defer plan.deinit();
+    return run(a, scratch, session, &plan, config, questions, control, options);
+}
+
+/// Render and tokenize every prompt under a host preprocessing permit. This
+/// needs no execution lock, so callers prepare before serializing on the
+/// model.
+pub fn prepare(
+    a: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    session: Session,
+    tok: Tokenizer,
+    config: *const glide.DecisionConfig,
+    states: []const []const u8,
+    questions: []const prompt.Question,
+    control: ?Control,
+    options: Options,
+) !Plan {
     if (states.len == 0 or questions.len == 0) return error.InvalidGlideRequest;
     for (questions) |question| if (question.options.len == 0 or question.options.len > glide.max_options or question.options.len > config.codes.len) return error.InvalidGlideQuestion;
     const total = std.math.mul(usize, states.len, questions.len) catch return error.ExtractionRequestLimitExceeded;
 
-    // Host residency for every prompt's ids (each token is at least one
-    // byte of rendered text) plus one rendered prompt at a time.
-    var retained: usize = total * (@sizeOf(Prepared) + @sizeOf(usize));
+    // Retained host bytes plus one rendered prompt and its tokenizer
+    // temporaries at a time.
+    const retained = retainedHostBytes(config, states, questions);
     var largest_text: usize = 0;
     for (states) |state| for (questions) |question| {
-        const bytes = promptBytes(config.codes, state, question);
-        largest_text = @max(largest_text, bytes);
-        retained +|= @min(bytes + 2, config.max_len) * @sizeOf(i32);
+        largest_text = @max(largest_text, promptBytes(config.codes, state, question));
     };
     var permit = try session.admitHostPreprocess(retained +| largest_text *| 6);
-    defer permit.deinit();
+    errdefer permit.deinit();
     trace.mark("pipeline host admission");
 
-    // Render and tokenize everything before any execution permit.
-    const prepared = try a.alloc(Prepared, total);
-    defer a.free(prepared);
-    var prepared_count: usize = 0;
-    defer for (prepared[0..prepared_count]) |entry| a.free(entry.ids);
+    const prepared = try scratch.alloc(Prepared, total);
+    errdefer scratch.free(prepared);
+    const order = try scratch.alloc(usize, total);
+    errdefer scratch.free(order);
+    const lengths = try scratch.alloc(usize, total);
+    errdefer scratch.free(lengths);
     const item_tokens = try a.alloc(usize, states.len);
+    errdefer a.free(item_tokens);
     @memset(item_tokens, 0);
-    var prompt_tokens: usize = 0;
+    var plan = Plan{
+        .scratch = scratch,
+        .permit = permit,
+        .prepared = prepared,
+        .order = order,
+        .lengths = lengths,
+        .item_tokens = item_tokens,
+        .retained = retained,
+        .pad = blk: {
+            const special = tok.specialTokens();
+            break :blk if (special.pad_id >= 0) special.pad_id else 0;
+        },
+    };
+    errdefer for (plan.prepared[0..plan.prepared_count]) |entry| scratch.free(entry.ids);
+
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(scratch);
     for (states, 0..) |state, item| for (questions) |question| {
         if (control) |active| try active.check();
         text.clearRetainingCapacity();
         try prompt.renderInto(scratch, &text, config.codes, state, question);
-        const ids = try prompt.encode(a, tok, config, text.items);
-        prepared[prepared_count] = .{ .ids = ids };
-        prepared_count += 1;
+        const ids = try prompt.encode(scratch, tok, config, text.items);
+        plan.prepared[plan.prepared_count] = .{ .ids = ids };
+        plan.prepared_count += 1;
         if (options.max_input_tokens) |limit| if (ids.len > limit) return error.InferenceInputTokensExceeded;
         item_tokens[item] += ids.len;
-        prompt_tokens += ids.len;
+        plan.prompt_tokens += ids.len;
     };
     text.clearAndFree(scratch);
     trace.mark("render+tokenize");
 
-    // Stable ascending length order, then budgeted micro-batches.
-    const order = try a.alloc(usize, total);
-    defer a.free(order);
+    // Stable ascending length order for budgeted micro-batches.
     for (order, 0..) |*index, i| index.* = i;
     std.sort.pdq(usize, order, @as([]const Prepared, prepared), struct {
         fn less(rows: []const Prepared, l: usize, r: usize) bool {
             return if (rows[l].ids.len == rows[r].ids.len) l < r else rows[l].ids.len < rows[r].ids.len;
         }
     }.less);
-
-    const lengths = try a.alloc(usize, total);
-    defer a.free(lengths);
     for (lengths, order) |*len, row| len.* = prepared[row].ids.len;
+    return plan;
+}
+
+/// Run a prepared plan's micro-batches. Callers serialize this on the model.
+pub fn run(
+    a: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    session: Session,
+    plan: *const Plan,
+    config: *const glide.DecisionConfig,
+    questions: []const prompt.Question,
+    control: ?Control,
+    options: Options,
+) !Result {
+    const prepared = plan.prepared[0..plan.prepared_count];
+    const order = plan.order;
+    const lengths = plan.lengths;
+    const retained = plan.retained;
+    const total = prepared.len;
 
     const probabilities = try a.alloc([]const f64, total);
     @memset(probabilities, &.{});
@@ -141,10 +235,6 @@ pub fn execute(
         for (probabilities) |values| if (values.len != 0) a.free(values);
         a.free(probabilities);
     }
-    const pad: i64 = blk: {
-        const special = tok.specialTokens();
-        break :blk if (special.pad_id >= 0) special.pad_id else 0;
-    };
     var chunks: usize = 0;
     var padded: usize = 0;
     var start: usize = 0;
@@ -152,11 +242,11 @@ pub fn execute(
         if (control) |active| try active.check();
         const end = prompt.microBatchEnd(lengths, start, options.token_budget, max_batch_rows);
         trace.mark("chunk plan");
-        var admitted = try admitChunk(session, prepared, order[start..end], retained);
+        var admitted = try admitChunk(session, prepared, order[start..end], retained, options.max_workspace_bytes);
         defer admitted.permit.deinit();
         trace.mark("chunk admission");
         const rows = order[start..][0..admitted.count];
-        try runChunk(a, scratch, &admitted.permit, config, prepared, rows, questions, pad, probabilities, control);
+        try runChunk(a, scratch, &admitted.permit, config, prepared, rows, questions, plan.pad, probabilities, control);
         chunks += 1;
         padded += rows.len * prepared[rows[rows.len - 1]].ids.len;
         start += admitted.count;
@@ -164,8 +254,8 @@ pub fn execute(
     if (control) |active| try active.check();
     return .{
         .probabilities = probabilities,
-        .item_tokens = item_tokens,
-        .prompt_tokens = prompt_tokens,
+        .item_tokens = plan.item_tokens,
+        .prompt_tokens = plan.prompt_tokens,
         .execution_chunks = chunks,
         .padded_tokens = padded,
     };
@@ -189,10 +279,21 @@ fn chunkPlan(session: Session, prepared: []const Prepared, rows: []const usize, 
 }
 
 /// Admit the largest prefix of `rows` (ascending length) that fits; halve on
-/// capacity errors before any forward has started.
-fn admitChunk(session: Session, prepared: []const Prepared, rows: []const usize, retained: usize) !AdmittedChunk {
+/// capacity errors before any forward has started. With a workspace limit
+/// (native forwards allocate activations on the caller's bounded heap), the
+/// planned workspace of every micro-batch must also stay under it.
+fn admitChunk(session: Session, prepared: []const Prepared, rows: []const usize, retained: usize, max_workspace_bytes: ?usize) !AdmittedChunk {
     var count = rows.len;
-    while (count > 1 and !try session.fitsRun(try chunkPlan(session, prepared, rows[0..count], retained))) count = (count + 1) / 2;
+    while (true) {
+        const request = try chunkPlan(session, prepared, rows[0..count], retained);
+        const over_workspace = if (max_workspace_bytes) |limit| request.workspace_bytes > limit else false;
+        if (!over_workspace and try session.fitsRun(request)) break;
+        if (count == 1) {
+            if (over_workspace) return error.ResourceLimitExceeded;
+            break;
+        }
+        count = (count + 1) / 2;
+    }
     while (true) {
         const permit = session.admit(try chunkPlan(session, prepared, rows[0..count], retained)) catch |err| {
             if ((err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable) or count == 1) return err;

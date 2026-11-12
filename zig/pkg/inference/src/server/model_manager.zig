@@ -108,6 +108,16 @@ const ComponentConstruction = struct {
         }
         if (man.nativeCompanionPath()) |path| try self.artifacts().verifyPath(path);
         if (adapter) |selected| try self.artifacts().verifyPath(selected.weights);
+        // GLiDE heads read their readout and decision config beside
+        // config.json during construction; authenticate them like weights.
+        if (man.glide_declared) if (man.config_path) |config| if (std.fs.path.dirname(config)) |root| {
+            const glide_mod = @import("../models/glide.zig");
+            for ([_][]const u8{ glide_mod.readout_file, glide_mod.decision_config_file }) |name| {
+                const path = try std.fs.path.join(self.artifacts().allocator, &.{ root, name });
+                defer self.artifacts().allocator.free(path);
+                try self.artifacts().verifyPath(path);
+            }
+        };
     }
     fn finish(self: *ComponentConstruction) !void {
         try self.artifacts().verify();
@@ -6813,6 +6823,21 @@ pub const ModelManager = struct {
         return backends.clampPhysicalMemoryLimits(.cuda, limits, self.process_memory_limit_bytes);
     }
 
+    /// A session run denied for capacity does not evict idle models the way a
+    /// load admission does. A model can load into a domain with only a few
+    /// bytes to spare and then have its every run denied while an idle model
+    /// stays resident. Reclaim one idle (handle-free, unpinned) model or cache
+    /// for a caller about to retry its run; false when nothing is reclaimable.
+    pub fn reclaimIdleForRun(self: *ModelManager, backend: backends.BackendType) bool {
+        spinLock(&self.eviction_lock);
+        defer self.eviction_lock.unlock();
+        const pressure: runtime.tier.memory.AdmissionPressure = if (backend == .native)
+            .{ .domain_host = .cpu }
+        else
+            .{ .domain_backend = .gpu };
+        return self.reclaimOneForAdmission(pressure);
+    }
+
     fn acquireAmountsWithEviction(
         self: *ModelManager,
         backend_class: runtime.tier.memory.BackendClass,
@@ -7869,21 +7894,36 @@ pub const ModelManager = struct {
     }
 
     pub fn copyCachedEmbeddingGemma2ManifestWithControl(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8, control: InferenceExecutionControl) !?manifest_mod.ModelManifest {
-        var handle = (try self.acquireCachedFromDirWithControl(model_dir, control)) orelse return null;
-        defer handle.release();
-        const model = handle.get();
-        if (model.manifest.embedding_style != .embedding_gemma2) return null;
-        return try model.manifest.clone(allocator);
+        return self.copyCachedManifestWhere(allocator, model_dir, control, struct {
+            fn matches(man: *const manifest_mod.ModelManifest) bool {
+                return man.embedding_style == .embedding_gemma2;
+            }
+        }.matches);
     }
 
     /// Warm GLiDE decisions reuse the loaded generation's manifest instead of
     /// re-reading the checkpoint sidecars on every request. Execution pins and
     /// verifies its own generation independently.
     pub fn copyCachedGlideManifestWithControl(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8, control: InferenceExecutionControl) !?manifest_mod.ModelManifest {
+        return self.copyCachedManifestWhere(allocator, model_dir, control, struct {
+            fn matches(man: *const manifest_mod.ModelManifest) bool {
+                return man.glide_declared;
+            }
+        }.matches);
+    }
+
+    /// Clone a warm model's manifest under a short cache pin when it matches.
+    fn copyCachedManifestWhere(
+        self: *ModelManager,
+        allocator: std.mem.Allocator,
+        model_dir: []const u8,
+        control: InferenceExecutionControl,
+        comptime matches: fn (*const manifest_mod.ModelManifest) bool,
+    ) !?manifest_mod.ModelManifest {
         var handle = (try self.acquireCachedFromDirWithControl(model_dir, control)) orelse return null;
         defer handle.release();
         const model = handle.get();
-        if (!model.manifest.glide_declared) return null;
+        if (!matches(&model.manifest)) return null;
         return try model.manifest.clone(allocator);
     }
 
@@ -7895,11 +7935,11 @@ pub const ModelManager = struct {
     }
 
     pub fn copyCachedGenerationManifestWithControl(self: *ModelManager, allocator: std.mem.Allocator, model_dir: []const u8, control: InferenceExecutionControl) !?manifest_mod.ModelManifest {
-        var handle = (try self.acquireCachedFromDirWithControl(model_dir, control)) orelse return null;
-        defer handle.release();
-        const model = handle.get();
-        if (model.manifest.model_type != .generator) return null;
-        return try model.manifest.clone(allocator);
+        return self.copyCachedManifestWhere(allocator, model_dir, control, struct {
+            fn matches(man: *const manifest_mod.ModelManifest) bool {
+                return man.model_type == .generator;
+            }
+        }.matches);
     }
 
     /// Pin one handle for every currently published model. Callers may release
@@ -12237,6 +12277,12 @@ fn loadSessionForPreferredBackendsWithArtifacts(
             backend != .metal and backend != .cuda)
         {
             rememberPreferredLoadError(&first_err, error.A4bRequiresGpu);
+            continue;
+        }
+        // GLiDE decoders are Metal-only. Skip other backends before artifact
+        // verification and load admission reserve their weights.
+        if (man.glide_declared and man.glide_backbone == .decoder and backend != .metal) {
+            rememberPreferredLoadError(&first_err, error.GlideDecoderRequiresMetal);
             continue;
         }
         if (source_session_manager.kernel_jit.mode.failClosed() and

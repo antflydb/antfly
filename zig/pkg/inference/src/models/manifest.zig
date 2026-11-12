@@ -300,7 +300,11 @@ pub const listing_compatibility_sidecars = [_][]const u8{
     "config_sentence_transformers.json",
     "processor_config.json",
     "tokenizer_config.json",
+    // GLiDE detection: the readout's presence, the decision config, and the
+    // NVFP4 marker that makes a checkpoint unsupported.
     glide.decision_config_file,
+    glide.readout_file,
+    "quant_config.json",
 };
 
 /// Resolved model configuration loaded from a model directory.

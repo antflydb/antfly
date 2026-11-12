@@ -83,7 +83,10 @@ memory limits before it runs and is split further when it does not fit. Token
 after truncation.
 
 The public limits still apply: 128 inputs, 64 questions and 2–64 choices or
-levels per request.
+levels per request. As for Laya, a configured per-item input token limit
+(`max_input_tokens_per_item`) applies to each rendered prompt, which includes
+the question's instructions and options, after the 0.4B's head and tail
+truncation.
 
 The decoder checkpoints accept prompts up to 40,000 tokens, but each prompt's
 planned workspace must also fit the server's scratch budget. The default budget
@@ -101,6 +104,11 @@ Longer prompts return `400 MODEL_RESOURCE_LIMIT`. Raise the budget with
 needs about 8 GiB (0.8B) or 11 GiB (2B). The live-memory check still applies, so
 the machine must also have that memory free.
 
+GLiDE-2B's resident weights also occupy most of the GPU memory domain on a 16 GB
+Mac (4.8 GB by default), which leaves about 0.8 GB for a forward's workspace.
+Longer GLiDE-2B prompts there also need `--backend-budget-mb`, for example
+`--backend-budget-mb 6144 --scratch-budget-mb 2048` for a 5,000-token prompt.
+
 ## Validation
 
 Prompt text and token ids are compared byte for byte with captures from the
@@ -109,4 +117,5 @@ tokens, truncated encoder prompts and whitespace runs. For eight reference reque
 translated to the public contract, Metal answers match the reference's CPU FP32
 probabilities to within 1e-6 (0.4B), 7e-6 (0.8B) and 6e-6 (2B), with the same
 top answer for every question. The 5,129-token GLiDE-2B request was run with
-`--scratch-budget-mb 2048`; the default 16 GB Mac budget rejects it.
+`--backend-budget-mb 6144 --scratch-budget-mb 2048`; the default 16 GB Mac
+budgets reject it.

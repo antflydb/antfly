@@ -64,20 +64,7 @@ pub fn readoutHidden(
 }
 
 fn gatherRows(cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, hidden: ops.CT, hidden_size: usize, seq_len: usize, readout_index: []const i64) ![]f32 {
-    const batch = readout_index.len;
-    const row_ids = try allocator.alloc(u32, batch);
-    defer allocator.free(row_ids);
-    const fallback_ids = try allocator.alloc(i64, batch);
-    defer allocator.free(fallback_ids);
-    for (readout_index, row_ids, fallback_ids, 0..) |index, *row_id, *fallback, row| {
-        const global = row * seq_len + @as(usize, @intCast(index));
-        row_id.* = std.math.cast(u32, global) orelse return error.InvalidInputShape;
-        fallback.* = @intCast(global);
-    }
-    const gathered = if (try cb.takeRows(hidden, row_ids, batch, hidden_size)) |value|
-        value
-    else
-        try cb.embeddingLookup(hidden, fallback_ids, batch, hidden_size);
+    const gathered = try modern_bert.gatherPaddedReadoutRows(cb, allocator, hidden, seq_len, hidden_size, readout_index);
     defer cb.free(gathered);
     return cb.toFloat32(gathered, allocator);
 }

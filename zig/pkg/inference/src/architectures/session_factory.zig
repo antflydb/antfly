@@ -748,22 +748,26 @@ pub fn layaResidentLoadAmounts(mf: manifest_mod.ModelManifest, source_bytes: usi
     return .{ .peak = peak, .resident = resident };
 }
 
+/// Backend allowance for a GLiDE decoder beyond its mapped weights: the small
+/// F32 tensors (norms, conv, gates), the shared zero bias, pipelines and
+/// staging.
+const glide_decoder_prepared_bytes: usize = 256 * 1024 * 1024;
+
 /// GLiDE decoder checkpoints execute their BF16 projections directly from the
-/// mapped safetensors pages (no-copy Metal buffers). The lazy tier cache keeps
-/// those pages as host-resident weights, so the model reserves them as host
-/// weight bytes; charging them as backend weights too would make the first
-/// request buy the same pages again through cache credits. The backend share
-/// covers the small F32 tensors (norms, conv, gates), the shared zero bias,
-/// pipelines and staging. Measured on GLiDE-2B: 3.76 GB mapped weights and an
-/// 810 MB physical footprint including 5k-token activations.
+/// mapped safetensors pages (no-copy Metal buffers), so the model owns its
+/// weights once, as backend weight bytes (the GPU domain's view of resident
+/// Metal weights), plus the prepared allowance. The lazy tier cache keeps the
+/// mapped pages on its host tier; `configureSharedCacheAdmissionForSession`
+/// lends it that ownership so the first request does not buy the same pages
+/// again through cache credits. Measured on GLiDE-2B: 3.76 GB mapped weights
+/// and an 810 MB physical footprint including 5k-token activations.
 pub fn glideDecoderResidentLoadAmounts(mf: manifest_mod.ModelManifest, source_bytes: usize) !?GlinerBoundaryResidentLoadAmounts {
     if (comptime !build_options.enable_metal) return null;
     if (!mf.glide_declared or mf.glide_unsupported or mf.glide_backbone != .decoder or mf.usesGgufWeights()) return null;
     const metadata: usize = 64 * 1024 * 1024;
-    const prepared: usize = 256 * 1024 * 1024;
     const resident = runtime.tier.memory.AdmissionAmounts{
-        .host_weight_bytes = try std.math.add(usize, source_bytes, metadata),
-        .backend_weight_bytes = prepared,
+        .host_weight_bytes = metadata,
+        .backend_weight_bytes = try std.math.add(usize, source_bytes, glide_decoder_prepared_bytes),
     };
     var peak = resident;
     peak.host_scratch_bytes = 4 * 1024 * 1024;
@@ -1021,6 +1025,9 @@ fn createNativeSessionForCudaUpload(
 
     // Detect architecture from config.json
     var arch_config = try detectArchitecture(allocator, model_path, mf);
+    // Reject Metal-only GLiDE decoders (also on the CUDA upload path) before
+    // opening the tensor store or loading any weights.
+    try requireGlideBackend(mf, .native);
     // Determine weight prefix for the native backend (strip from source tensor names)
     var store = try tensor_store_mod.openFromManifest(allocator, mf);
     var store_owned = true;
@@ -2689,6 +2696,7 @@ fn createGpuHostedSessionWithTaskOverride(
     var arch_config = try detectArchitecture(allocator, model_path, mf);
     if (arch_config == .embedding_gemma2 and backend_type != .metal) return error.UnsupportedEmbeddingGemma2Backend;
     if (arch_config == .gliner_boundary and backend_type != .metal) return error.UnsupportedGlinerBoundaryBackend;
+    try requireGlideBackend(mf, backend_type);
     var boundary_identity: ?boundary_bundle.Identity = null;
     var gliner_decision_identity: ?gliner_decide_qualification.Identity = null;
     // BGE-M3 publishes an F32 checkpoint and its dense embedding contract is
@@ -6131,13 +6139,19 @@ fn lightOnOcr4bBudgetPolicy(
         else => false,
     };
     if (!qualified) return null;
-    return residentBf16WeightsBudgetPolicy(model_weight_bytes);
+    return residentBf16WeightsBudgetPolicy(model_weight_bytes, gib(1));
 }
 
 /// GLiDE decoder checkpoints keep every projection resident, like the
 /// LightOnOCR-3 4B bundle that shares their Qwen3.5 backbone. GLiDE-2B's
 /// 3.8 GB of BF16 weights exceed the generic Metal weight cache on a 16 GB
 /// machine, so every decoder checkpoint is charged its exact weight bytes.
+/// Their resident weights are backend bytes (`glideDecoderResidentLoadAmounts`).
+/// The floor keeps LightOn's 1 GiB of backend headroom for forward workspace:
+/// a larger floor lets a decoder load beside other resident models without
+/// evicting them, and run admission (which does not evict) then starves its
+/// own forwards. Longer prompts than that headroom admits need an explicit
+/// `--backend-budget-mb`.
 fn glideDecoderBudgetPolicy(
     model_weight_bytes: u64,
     manifest: manifest_mod.ModelManifest,
@@ -6150,15 +6164,16 @@ fn glideDecoderBudgetPolicy(
         else => false,
     };
     if (!qwen35) return null;
-    return residentBf16WeightsBudgetPolicy(model_weight_bytes);
+    return residentBf16WeightsBudgetPolicy(model_weight_bytes, gib(1));
 }
 
 /// Mapped BF16 source on the host tier plus prepared GPU weights on the
-/// backend tier, with headroom for norms, staging and the readout.
-fn residentBf16WeightsBudgetPolicy(model_weight_bytes: u64) GpuHostedBudgetPolicy {
+/// backend tier, with `backend_headroom` for norms, staging, the readout and
+/// forward workspace.
+fn residentBf16WeightsBudgetPolicy(model_weight_bytes: u64, backend_headroom: usize) GpuHostedBudgetPolicy {
     const weights: usize = @intCast(@min(model_weight_bytes, std.math.maxInt(usize)));
     const host = weights +| mib(256);
-    const device = weights +| gib(1);
+    const device = weights +| backend_headroom;
     var context = defaultPlanContextForBackend(.gpu);
     context.host_budget_bytes = @max(context.host_budget_bytes, host);
     context.backend_budget_bytes = @max(context.backend_budget_bytes, device);
@@ -10195,11 +10210,26 @@ pub fn configureSharedCacheAdmissionForSession(
         controller,
         backend_class,
         limits,
-        .{
-            .host_limit_bytes = resident.host_weight_bytes,
-            .backend_limit_bytes = resident.backend_weight_bytes,
-        },
+        sharedCacheBaseline(self, resident),
     );
+}
+
+/// The model lease's resident ownership that the session's tier cache may use
+/// without buying credits. A GLiDE decoder owns its mapped weights as backend
+/// bytes (see `glideDecoderResidentLoadAmounts`), but the lazy cache loads
+/// those mapped pages on its host tier, so that share is lent to the host
+/// baseline: the weights are counted once, in the GPU domain.
+fn sharedCacheBaseline(self: *const ArchSession, resident: runtime.tier.memory.AdmissionAmounts) runtime.tier.cache.Budget {
+    var baseline = runtime.tier.cache.Budget{
+        .host_limit_bytes = resident.host_weight_bytes,
+        .backend_limit_bytes = resident.backend_weight_bytes,
+    };
+    if (self.glide_head != null and self.backend_type == .metal and self.arch_config == .gpt) {
+        const mapped = resident.backend_weight_bytes -| glide_decoder_prepared_bytes;
+        baseline.host_limit_bytes +|= mapped;
+        baseline.backend_limit_bytes -= mapped;
+    }
+    return baseline;
 }
 
 /// Exact admission ownership held by a session's tier cache above the model
@@ -10425,14 +10455,20 @@ fn archRunWithControl(
     return archRunImpl(ptr, inputs, allocator, control);
 }
 
+/// The Qwen3.5 GLiDE decoder (bidirectional full attention + packed
+/// Gated-DeltaNet) is implemented for Metal only. Constructors call this
+/// before loading weights so backend selection moves on cheaply, instead of
+/// loading a checkpoint (or publishing a session whose every run fails). The
+/// ModernBERT encoder runs on every backend.
+fn requireGlideBackend(mf: manifest_mod.ModelManifest, backend: BackendType) !void {
+    if (!mf.glide_declared) return;
+    if (mf.glide_unsupported) return error.UnsupportedGlideCheckpoint;
+    if (mf.glide_backbone == .decoder and backend != .metal) return error.GlideDecoderRequiresMetal;
+}
+
 fn loadGlideHead(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest, model_path: []const u8, arch_config: ArchConfig, backend: BackendType) !?*glide_mod.Head {
     if (!mf.glide_declared) return null;
-    if (mf.glide_unsupported) return error.UnsupportedGlideCheckpoint;
-    // The Qwen3.5 GLiDE decoder (bidirectional full attention + packed
-    // Gated-DeltaNet) is implemented for Metal only. Fail at load so backend
-    // selection can move on, instead of publishing a session whose every run
-    // fails. The ModernBERT encoder runs on every backend.
-    if (mf.glide_backbone == .decoder and backend != .metal) return error.GlideDecoderRequiresMetal;
+    try requireGlideBackend(mf, backend);
     const hidden_size: usize = switch (arch_config) {
         .modern_bert => |cfg| if (mf.glide_backbone == .encoder) cfg.hidden_size else return error.UnsupportedGlideBackbone,
         .gpt => |cfg| if (mf.glide_backbone == .decoder and cfg.isQwen35()) cfg.hidden_size else return error.UnsupportedGlideBackbone,
@@ -13157,6 +13193,8 @@ test "GLiDE decoder budget charges the checkpoint's resident weights" {
     const policy = glideDecoderBudgetPolicy(weight_bytes, manifest, .{ .gpt = cfg }).?;
     try std.testing.expect(policy.shared_cache_floor.host_limit_bytes > weight_bytes);
     try std.testing.expect(policy.shared_cache_floor.backend_limit_bytes > weight_bytes);
+    // Backend-resident weights keep forward-workspace headroom beside them.
+    try std.testing.expect(policy.budget_floor.backend_limit_bytes >= weight_bytes + 1024 * 1024 * 1024);
     try std.testing.expect(!policy.prefer_f32_dense_tensors);
     var encoder = manifest;
     encoder.glide_backbone = .encoder;
@@ -13169,7 +13207,7 @@ test "GLiDE decoder budget charges the checkpoint's resident weights" {
     try std.testing.expect(glideDecoderBudgetPolicy(weight_bytes, plain, .{ .gpt = cfg }) == null);
 }
 
-test "GLiDE decoder load reserves mapped weights on the host tier only" {
+test "GLiDE decoder load owns its mapped weights once, as backend bytes" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     const manifest = manifest_mod.ModelManifest{
         .allocator = std.testing.allocator,
@@ -13180,11 +13218,12 @@ test "GLiDE decoder load reserves mapped weights on the host tier only" {
     };
     const source_bytes: usize = 3_763_000_000;
     const amounts = (try glideDecoderResidentLoadAmounts(manifest, source_bytes)).?;
-    // The lazy cache's host baseline covers every mapped projection, so the
-    // first request needs no cache credit for them.
-    try std.testing.expect(amounts.resident.host_weight_bytes >= source_bytes);
-    try std.testing.expect(amounts.resident.backend_weight_bytes < source_bytes / 4);
-    try std.testing.expect(amounts.peak.host_weight_bytes >= amounts.resident.host_weight_bytes);
+    // The GPU domain owns the mapped projections (plus the prepared
+    // allowance); the host tier holds only metadata, so a resident encoder's
+    // host weights and a decoder fit side by side.
+    try std.testing.expect(amounts.resident.backend_weight_bytes >= source_bytes);
+    try std.testing.expect(amounts.resident.host_weight_bytes < source_bytes / 16);
+    try std.testing.expect(amounts.peak.backend_weight_bytes >= amounts.resident.backend_weight_bytes);
     var encoder = manifest;
     encoder.glide_backbone = .encoder;
     try std.testing.expect((try glideDecoderResidentLoadAmounts(encoder, source_bytes)) == null);

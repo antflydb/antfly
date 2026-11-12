@@ -648,25 +648,31 @@ fn forwardImpl(
     trace.emitAggregate(cb, if (row_segments) |rows| rows.tokens else batch * seq_len, @intCast(config.num_hidden_layers));
     if (readout != null and readout_rows == null) {
         // Padded `[batch * seq_len, hidden]` result: gather the readout rows.
-        const indices = readout.?;
-        const hidden_size: usize = @intCast(config.hidden_size);
-        const row_ids = try allocator.alloc(u32, batch);
-        defer allocator.free(row_ids);
-        const fallback_ids = try allocator.alloc(i64, batch);
-        defer allocator.free(fallback_ids);
-        for (indices, row_ids, fallback_ids, 0..) |index, *row_id, *fallback, row| {
-            const global = row * seq_len + @as(usize, @intCast(index));
-            row_id.* = std.math.cast(u32, global) orelse return error.InvalidInputShape;
-            fallback.* = @intCast(global);
-        }
-        const gathered = if (try cb.takeRows(hidden, row_ids, batch, hidden_size)) |rows|
-            rows
-        else
-            try cb.embeddingLookup(hidden, fallback_ids, batch, hidden_size);
+        const gathered = try gatherPaddedReadoutRows(cb, allocator, hidden, seq_len, @intCast(config.hidden_size), readout.?);
         cb.free(hidden);
         return gathered;
     }
     return hidden;
+}
+
+/// Gather each row's readout position from a padded `[batch * seq_len,
+/// hidden]` tensor (`readout_index[row]` is row-local): `takeRows` where the
+/// backend has it, else an embedding lookup over the flattened rows.
+pub fn gatherPaddedReadoutRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, hidden: CT, seq_len: usize, hidden_size: usize, readout_index: []const i64) !CT {
+    const batch = readout_index.len;
+    const row_ids = try allocator.alloc(u32, batch);
+    defer allocator.free(row_ids);
+    const fallback_ids = try allocator.alloc(i64, batch);
+    defer allocator.free(fallback_ids);
+    for (readout_index, row_ids, fallback_ids, 0..) |index, *row_id, *fallback, row| {
+        const global = row * seq_len + @as(usize, @intCast(index));
+        row_id.* = std.math.cast(u32, global) orelse return error.InvalidInputShape;
+        fallback.* = @intCast(global);
+    }
+    return if (try cb.takeRows(hidden, row_ids, batch, hidden_size)) |rows|
+        rows
+    else
+        try cb.embeddingLookup(hidden, fallback_ids, batch, hidden_size);
 }
 
 // ---------------------------------------------------------------------------
@@ -987,15 +993,9 @@ fn finishLayer(
         try cb.layerNorm(hidden_after_attn, mlp_ln_w, mlp_ln_b, H, config.layer_norm_eps);
     defer cb.free(normed_ffn);
 
-    // GeGLU feed-forward (Wi and Wo both have no bias in ModernBERT's MLP)
-    const Wi_w = try getLayerWeight(cb, layer_idx, "mlp.Wi.weight", &name_buf);
-    defer cb.free(Wi_w);
-    const Wo_w = try getLayerWeight(cb, layer_idx, "mlp.Wo.weight", &name_buf);
-    defer cb.free(Wo_w);
-
     // GLiDE: the whole MLP block (half-internal GeGLU projection, down
-    // projection and residual) in one Metal call, else the fused GeGLU
-    // projection alone.
+    // projection and residual) in one Metal call from the resident slots, else
+    // the fused GeGLU projection alone.
     const glide_mlp = config.glide.f16_linears and resident_slots and cb.kind() == .metal and
         config.checkpoint_layout == .huggingface_fused_qkv_no_bias;
     if (glide_mlp) {
@@ -1009,6 +1009,13 @@ fn finishLayer(
             .glide_residual = hidden_after_attn,
         })) |block| return block;
     }
+
+    // GeGLU feed-forward (Wi and Wo both have no bias in ModernBERT's MLP).
+    // Fetched only for the paths below; the fused block uses resident slots.
+    const Wi_w = try getLayerWeight(cb, layer_idx, "mlp.Wi.weight", &name_buf);
+    defer cb.free(Wi_w);
+    const Wo_w = try getLayerWeight(cb, layer_idx, "mlp.Wo.weight", &name_buf);
+    defer cb.free(Wo_w);
     const glide_activated: ?CT = if (glide_mlp)
         try cb.decoderRuntimeApplyLinear(&.{
             .slot = modernBertLinearSlot(layer_idx, .ffn_in),

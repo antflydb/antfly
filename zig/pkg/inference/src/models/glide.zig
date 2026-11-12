@@ -77,18 +77,14 @@ pub const DecisionConfig = struct {
     /// Encoder truncation keeps this many head tokens plus the tail.
     trunc_head: usize,
     temperature: f64,
-    /// Owned. Empty when the checkpoint does not name itself.
-    model_name: []const u8,
     /// Owned option codes ("A".."Z", "AA", ...), exactly `max_options`.
+    /// (`model_name` and the encoder's `render_tokenizer` are not used: the
+    /// prompt renderer produces the reference text directly.)
     codes: []const []const u8,
-    /// Owned; encoder checkpoints render prompt text with this tokenizer dir.
-    render_tokenizer: []const u8,
 
     pub fn deinit(self: *DecisionConfig, allocator: std.mem.Allocator) void {
         for (self.codes) |code| allocator.free(code);
         allocator.free(self.codes);
-        allocator.free(self.model_name);
-        allocator.free(self.render_tokenizer);
         self.* = undefined;
     }
 
@@ -196,33 +192,14 @@ pub fn parseDecisionConfig(allocator: std.mem.Allocator, json_bytes: []const u8)
         codes[index] = try allocator.dupe(u8, code);
         filled += 1;
     }
-    const model_name = try allocator.dupe(u8, if (obj.get("model_name")) |v| switch (v) {
-        .string => |s| s,
-        else => return error.InvalidGlideDecisionConfig,
-    } else "");
-    errdefer allocator.free(model_name);
-    const render_tokenizer = try allocator.dupe(u8, if (obj.get("render_tokenizer")) |v| switch (v) {
-        .string => |s| s,
-        else => return error.InvalidGlideDecisionConfig,
-    } else if (backbone == .encoder) "render_tokenizer" else "");
     return .{
         .backbone = backbone,
         .pooling = pooling,
         .max_len = max_len,
         .trunc_head = trunc_head,
         .temperature = temperature,
-        .model_name = model_name,
         .codes = codes,
-        .render_tokenizer = render_tokenizer,
     };
-}
-
-/// A directory is a GLiDE checkpoint when both decision sidecars exist and the
-/// decision config declares the 255-code GLiDE label set.
-pub fn declaredInDir(allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    var config = loadDecisionConfig(allocator, model_dir) catch return false;
-    config.deinit(allocator);
-    return c_file.fileExistsInDir(allocator, model_dir, readout_file);
 }
 
 pub fn loadDecisionConfig(allocator: std.mem.Allocator, model_dir: []const u8) !DecisionConfig {
@@ -337,12 +314,12 @@ test "GLiDE decision config parses encoder and decoder checkpoints" {
     try std.testing.expectEqual(Backbone.encoder, encoder.backbone);
     try std.testing.expectEqual(@as(usize, 7999), encoder.max_len);
     try std.testing.expectEqual(@as(usize, 98), try encoder.readoutIndex(100));
-    try std.testing.expectEqualStrings("glide-0.4b", encoder.model_name);
     try std.testing.expectEqualStrings("AA", encoder.codes[26]);
 
+    // Descriptive fields the runtime does not use never reject a checkpoint.
     const decoder_json = try std.fmt.allocPrint(allocator,
         \\{{"format_version": 1, "attention_mode": "noncausal_full_attention", "pooling": "last",
-        \\ "prompt_format": "quick-empty-think-medium-v1", "codes": {s}, "temperature": 1.0, "model_name": "glide-0.8b"}}
+        \\ "prompt_format": "quick-empty-think-medium-v1", "codes": {s}, "temperature": 1.0, "model_name": 8}}
     , .{codes_json.items});
     defer allocator.free(decoder_json);
     var decoder = try parseDecisionConfig(allocator, decoder_json);

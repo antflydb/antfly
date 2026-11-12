@@ -2953,6 +2953,9 @@ fn addCompatibilityManifestFacts(
         @intFromBool(man.hasIncompleteClipclapGgufBundle()),
         @intFromBool(man.hasIncompleteFlorence2GgufBundle()),
         @intFromBool(man.isClipclapGgufBundle()),
+        @intFromBool(man.glide_declared),
+        @intFromBool(man.glide_unsupported),
+        @backingInt(man.glide_backbone),
     });
 }
 
@@ -11876,7 +11879,7 @@ pub const Node = struct {
         };
         const json = (switch (input) {
             .decide_span => |decision| self.extractDecideSpanInMemory(scratch, decision, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure),
-            .decide_glide => |decision| self.decideGlideInMemory(scratch, decision, control, failure, observer),
+            .decide_glide => |decision| self.decideGlideInMemory(scratch, decision, control, failure, observer, working_bytes),
             else => self.extractV2InMemory(scratch, request_json, resolved_span_selection, classification_compatibility, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure, decision_execution),
         }) catch |err| return allocation_failure.translate(err);
         defer scratch.free(json);
@@ -11951,6 +11954,7 @@ pub const Node = struct {
         control: ?InferenceExecutionControl,
         failure: *extraction_v2.FailureContext,
         observer: metrics_mod.extraction.observation.Observer,
+        working_bytes: usize,
     ) ![]u8 {
         const glide_pipeline = @import("../pipelines/glide.zig");
         const decision_api = @import("antfly_decisions");
@@ -11976,12 +11980,37 @@ pub const Node = struct {
         defer handle.release();
         const loaded = handle.get();
         const head = session_factory.getGlideHead(loaded.session) orelse return error.UnsupportedDecideModel;
-        const mutex = loaded.targetInferenceExecutionMutex();
-        if (mutex) |lock| try effective.lock(lock);
-        defer if (mutex) |lock| lock.unlock();
         glide_pipeline.trace.mark("acquire model");
+        const options = glide_pipeline.Options{
+            .max_input_tokens = decision.max_input_tokens,
+            // Native forwards allocate their activations on the bounded
+            // request heap. Leave half of it for prompts and results (as
+            // Laya does) and split micro-batches before allocating tensors.
+            .max_workspace_bytes = if (loaded.session.backend() == .native) working_bytes / 2 else null,
+        };
+        // Rendering and tokenization need no execution lock; only the
+        // forwards serialize on the model.
+        failure.* = .{ .stage = "tokenizing" };
         observer.emit(.{ .phase = .tokenizing });
-        const result = try glide_pipeline.execute(a, scratch, loaded.session, loaded.getTokenizer(), &head.config, states, questions, effective, .{ .max_input_tokens = decision.max_input_tokens });
+        var plan = try glide_pipeline.prepare(a, scratch, loaded.session, loaded.getTokenizer(), &head.config, states, questions, effective, options);
+        defer plan.deinit();
+        failure.* = .{ .stage = "execution" };
+        observer.emit(.{ .phase = .execution });
+        const result = blk: {
+            const mutex = loaded.targetInferenceExecutionMutex();
+            if (mutex) |lock| try effective.lock(lock);
+            defer if (mutex) |lock| lock.unlock();
+            while (true) {
+                break :blk glide_pipeline.run(a, scratch, loaded.session, &plan, &head.config, questions, effective, options) catch |err| {
+                    // Run admission does not evict idle models; this model is
+                    // pinned by `handle`, so reclaim another and retry.
+                    if (err == error.ResourceTemporarilyUnavailable and self.model_manager.reclaimIdleForRun(loaded.session.backend())) continue;
+                    return err;
+                };
+            }
+        };
+        failure.* = .{ .stage = "serializing" };
+        observer.emit(.{ .phase = .serializing });
         const json = try glide_pipeline.prompt.decisionsJson(a, questions, states.len, result.probabilities, result.prompt_tokens);
         // GLiDE answers share Laya's complete-distribution `decisions` rows.
         const response = try decision_api.trainedResponse(a, request, json, .laya);
