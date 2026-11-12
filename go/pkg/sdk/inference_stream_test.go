@@ -181,3 +181,67 @@ func TestInferenceClientGenerateStreamHonorsContextCancellation(t *testing.T) {
 	})
 	assert.ErrorIs(t, err, context.Canceled)
 }
+
+func TestInferenceClientGenerateStreamPreservesPermanentBudgetDetails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: error\ndata: {\"error\":\"MODEL_RESOURCE_LIMIT\",\"message\":\"working set exceeds host budget\",\"retryable\":false,\"budget\":\"host\",\"required_bytes\":110,\"limit_bytes\":100}\n\n")
+	}))
+	defer server.Close()
+	client, err := NewInferenceClient(server.URL, server.Client())
+	require.NoError(t, err)
+	err = client.GenerateStream(context.Background(), oapi.InferenceGenerateRequest{Model: "test"}, func(oapi.InferenceGenerateChunk) error {
+		t.Fatal("error event must not yield a chunk")
+		return nil
+	})
+	var failure *InferenceAPIError
+	require.ErrorAs(t, err, &failure)
+	assert.Equal(t, http.StatusOK, failure.StatusCode)
+	assert.Equal(t, "MODEL_RESOURCE_LIMIT", failure.Code)
+	require.NotNil(t, failure.Retryable)
+	assert.False(t, *failure.Retryable)
+	assert.Equal(t, "host", failure.Budget)
+	require.NotNil(t, failure.RequiredBytes)
+	require.NotNil(t, failure.LimitBytes)
+	assert.Equal(t, uint64(110), *failure.RequiredBytes)
+	assert.Equal(t, uint64(100), *failure.LimitBytes)
+}
+
+func TestInferenceClientGenerateStreamAcceptsLegacyError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: error\ndata: legacy failure\n\n")
+	}))
+	defer server.Close()
+	client, err := NewInferenceClient(server.URL, server.Client())
+	require.NoError(t, err)
+	err = client.GenerateStream(context.Background(), oapi.InferenceGenerateRequest{Model: "test"}, func(oapi.InferenceGenerateChunk) error { return nil })
+	require.EqualError(t, err, "generation stream failed: legacy failure")
+}
+
+func TestInferenceErrorDiagnosticRanges(t *testing.T) {
+	for _, value := range []string{"9223372036854775807", "9223372036854775808", "18446744073709551615", "18446744073709551616", "-1", "1.5", `"invalid"`} {
+		t.Run(value, func(t *testing.T) {
+			body := []byte(`{"error":"MODEL_RESOURCE_LIMIT","retryable":false,"required_bytes":` + value + `,"limit_bytes":100}`)
+			payload := decodeInferenceError(body)
+			var apiError *InferenceAPIError
+			if !errors.As(inferenceResponseError(http.StatusBadRequest, body), &apiError) || apiError.Code != "MODEL_RESOURCE_LIMIT" || apiError.Retryable == nil || *apiError.Retryable {
+				t.Fatalf("HTTP lost classification: %+v", apiError)
+			}
+			if payload == nil || payload.Error != "MODEL_RESOURCE_LIMIT" || payload.Retryable == nil || *payload.Retryable {
+				t.Fatalf("lost classification: %+v", payload)
+			}
+			if payload.LimitBytes == nil || *payload.LimitBytes != 100 {
+				t.Fatalf("lost valid limit: %+v", payload)
+			}
+			var expected uint64
+			valid := json.Unmarshal([]byte(value), &expected) == nil
+			if valid && (payload.RequiredBytes == nil || *payload.RequiredBytes != expected) {
+				t.Fatalf("lost unsigned count: %+v", payload)
+			}
+			if !valid && payload.RequiredBytes != nil {
+				t.Fatalf("accepted invalid count: %+v", payload)
+			}
+		})
+	}
+}

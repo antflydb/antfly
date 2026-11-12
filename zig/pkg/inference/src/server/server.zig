@@ -159,22 +159,29 @@ const AdmissionFailureScope = struct {
     }
 };
 
-fn modelResourceLimitResponse(ctx: *httpx.Context) !httpx.Response {
+const InferenceBudgetFailurePayload = struct {
+    @"error": []const u8 = "MODEL_RESOURCE_LIMIT",
+    message: []const u8 = "request resource plan exceeds the configured inference budget",
+    retryable: bool = false,
+    budget: ?[]const u8 = null,
+    required_bytes: ?usize = null,
+    limit_bytes: ?usize = null,
+};
+
+fn modelResourceLimitPayload(ctx: *const httpx.Context) InferenceBudgetFailurePayload {
     if (httpAdmissionFailure(ctx)) |failure| {
-        if (failure.snapshot()) |exceeded| return ctx.status(400).json(.{
-            .@"error" = "MODEL_RESOURCE_LIMIT",
+        if (failure.snapshot()) |exceeded| return .{
             .message = "request and required model residency exceed the configured inference budget",
             .budget = @tagName(exceeded.limit),
             .required_bytes = exceeded.requested_bytes,
             .limit_bytes = exceeded.limit_bytes,
-            .retryable = false,
-        });
+        };
     }
-    return ctx.status(400).json(.{
-        .@"error" = "MODEL_RESOURCE_LIMIT",
-        .message = "request resource plan exceeds the configured inference budget",
-        .retryable = false,
-    });
+    return .{};
+}
+
+fn modelResourceLimitResponse(ctx: *httpx.Context) !httpx.Response {
+    return ctx.status(400).openApiJson(modelResourceLimitPayload(ctx));
 }
 
 fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExecutionControl {
@@ -20497,7 +20504,7 @@ pub const Node = struct {
                 if (cuda_profile_session) |sess| session_factory.drainCudaProfile(sess);
             }
             // Try to send an error event before closing
-            writeGenerationStreamError(&writer, err);
+            writeGenerationStreamError(ctx, &writer, err);
             writer.close() catch {};
             return ctx.response.build();
         };
@@ -23577,7 +23584,7 @@ pub const Node = struct {
                 cleanup_cache_key,
                 execution_control,
             ) catch |err| {
-                writeGenerationStreamError(&writer, err);
+                writeGenerationStreamError(ctx, &writer, err);
                 writer.close() catch {};
                 return ctx.response.build();
             };
@@ -23588,7 +23595,7 @@ pub const Node = struct {
                 return ctx.response.build();
             }
             const cleaned = normalizeDirectDictationOutput(ctx.allocator, generated) catch |err| {
-                writeGenerationStreamError(&writer, err);
+                writeGenerationStreamError(ctx, &writer, err);
                 writer.close() catch {};
                 return ctx.response.build();
             };
@@ -43223,10 +43230,23 @@ fn writeInternalStreamError(
     writer.writeEvent("error", internalErrorMessage(stage, err)) catch {};
 }
 
-fn writeGenerationStreamError(writer: *httpx.Context.StreamWriter, err: anyerror) void {
+fn writeGenerationStreamError(ctx: *httpx.Context, writer: *httpx.Context.StreamWriter, err: anyerror) void {
+    if (err == error.MemoryBudgetExceeded and !builtin.is_test)
+        std.log.warn("generation memory admission denied during streaming", .{});
+    if (err == error.ResourceLimitExceeded or err == error.MemoryBudgetExceeded) {
+        // Headers may already be committed. Preserve the HTTP error contract
+        // in the terminal event, without allocating during memory pressure.
+        var buffer: [1024]u8 = undefined;
+        var json = std.Io.Writer.fixed(&buffer);
+        const payload = if (err == error.ResourceLimitExceeded) modelResourceLimitPayload(ctx) else InferenceBudgetFailurePayload{
+            .@"error" = "MEMORY_BUDGET_EXCEEDED",
+            .message = memory_budget_exceeded_message,
+        };
+        std.json.Stringify.value(payload, .{ .emit_null_optional_fields = false }, &json) catch return;
+        writer.writeEvent("error", json.buffered()) catch {};
+        return;
+    }
     if (generationRequestFailure(err)) |failure| {
-        if (err == error.MemoryBudgetExceeded and !builtin.is_test)
-            std.log.warn("generation memory admission denied during streaming", .{});
         writer.writeEvent("error", failure.message) catch {};
         return;
     }
@@ -52309,4 +52329,55 @@ test "admission HTTP diagnostics preserve lazy load preprocessing and nested req
     defer busy.deinit();
     try std.testing.expectEqual(@as(u16, 503), busy.status.code);
     try std.testing.expect(std.mem.indexOf(u8, busy.body.?, "required_bytes") == null);
+}
+
+test "streaming admission emits structured terminal budget details without allocation" {
+    const Capture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        fn start(_: ?*anyopaque, _: u16, _: []const u8, _: *const httpx.Headers) !void {}
+        fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+        fn close(_: ?*anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var failure = AdmissionFailureScope{};
+    try failure.bind(&ctx);
+    defer failure.unbind(&ctx);
+    failure.failure.record(.{ .limit = .host, .requested_bytes = 110, .limit_bytes = 100 });
+    var capture = Capture{};
+    defer capture.bytes.deinit(a);
+    var writer = httpx.Context.StreamWriter{ .h1_sock = null, .h2_writer = null, .delegate = .{ .ptr = &capture, .start = Capture.start, .write = Capture.write, .close = Capture.close } };
+    // The error serializer must work when request allocations are exhausted.
+    ctx.allocator = std.testing.failing_allocator;
+    writeGenerationStreamError(&ctx, &writer, error.ResourceLimitExceeded);
+    ctx.allocator = a;
+    try std.testing.expect(std.mem.startsWith(u8, capture.bytes.items, "event: error\ndata: {"));
+    try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "[DONE]") == null);
+    const data_start = std.mem.indexOf(u8, capture.bytes.items, "data: ").? + 6;
+    const data_end = std.mem.indexOfPos(u8, capture.bytes.items, data_start, "\n\n").?;
+    const parsed = try std.json.parseFromSlice(InferenceBudgetFailurePayload, a, capture.bytes.items[data_start..data_end], .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", parsed.value.@"error");
+    try std.testing.expect(!parsed.value.retryable);
+    try std.testing.expectEqualStrings("host", parsed.value.budget.?);
+    try std.testing.expectEqual(@as(usize, 110), parsed.value.required_bytes.?);
+    try std.testing.expectEqual(@as(usize, 100), parsed.value.limit_bytes.?);
+    capture.bytes.clearRetainingCapacity();
+    failure.failure.record(null);
+    writeGenerationStreamError(&ctx, &writer, error.ResourceLimitExceeded);
+    try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "required_bytes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "\"retryable\":false") != null);
+    capture.bytes.clearRetainingCapacity();
+    writeGenerationStreamError(&ctx, &writer, error.MemoryBudgetExceeded);
+    try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "\"error\":\"MEMORY_BUDGET_EXCEEDED\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "\"retryable\":false") != null);
+    capture.bytes.clearRetainingCapacity();
+    writeGenerationStreamError(&ctx, &writer, error.PromptTooLong);
+    try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "prompt exceeds") != null);
 }

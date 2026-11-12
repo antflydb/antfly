@@ -875,3 +875,65 @@ def test_generated_dictation_binary_body_preserves_wire_content_type() -> None:
     assert request["headers"]["Content-Type"] == "application/vnd.antfly.attachments.v1"
     assert request["content"] is payload
     assert "json" not in request
+
+
+def test_generate_stream_preserves_permanent_budget_details_and_closes() -> None:
+    payload = {
+        "error": "MODEL_RESOURCE_LIMIT",
+        "message": "working set exceeds host budget",
+        "retryable": False,
+        "budget": "host",
+        "required_bytes": 110,
+        "limit_bytes": 100,
+    }
+    stream = ChunkStream([f"event: error\ndata: {json.dumps(payload)}\n\n".encode()])
+    client = AntflyClient("http://test")
+    install_transport(
+        client,
+        httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                stream=stream,
+            )
+        ),
+    )
+    with pytest.raises(InferenceAPIError) as caught:
+        with client.generate_stream(generation_request()) as chunks:
+            list(chunks)
+    assert caught.value.status_code == 200
+    assert caught.value.code == "MODEL_RESOURCE_LIMIT"
+    assert caught.value.retryable is False
+    assert caught.value.budget == "host"
+    assert caught.value.required_bytes == 110
+    assert caught.value.limit_bytes == 100
+    assert stream.closed
+
+
+def test_generate_stream_accepts_legacy_plain_text_failure() -> None:
+    client = AntflyClient("http://test")
+    install_transport(
+        client,
+        httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content=b"event: error\ndata: legacy failure\n\n",
+            )
+        ),
+    )
+    with pytest.raises(AntflyException, match="generation stream failed: legacy failure"):
+        with client.generate_stream(generation_request()) as chunks:
+            list(chunks)
+
+
+def test_inference_error_preserves_positional_constructor():
+    from antfly.client_generated.models.inference_error import InferenceError
+    from antfly.client_generated.types import UNSET
+
+    error = InferenceError("ERROR", "message", UNSET, False, UNSET, 3, "decode")
+    assert error.input_index == 3
+    assert error.stage == "decode"
+    assert error.budget is UNSET
+    assert error.required_bytes is UNSET
+    assert error.limit_bytes is UNSET
