@@ -30057,6 +30057,7 @@ fn flushChunkedDenseItems(
             .parent_key = parent_key,
             .doc_key = item.parent_doc_key,
             .source_sequence = item.request.sequence,
+            .generation_guard = EmbeddingGenerationGuard.fromRequest(item.request),
         };
         initialized_writes += 1;
     }
@@ -30293,8 +30294,11 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
 // Bind newly embedded retained text to the actual provider generation, so a
 // durable acceptance can be reused without depending on the parent's old model.
 pub fn retainedTextEmbeddingHashAtRevision(request: enrichment_types.GeneratedEnrichmentRequest, text: []const u8, revision: ?[32]u8) u64 {
-    const base = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, request.producer_json, request.reprocess_generation);
-    return embeddingIdentityAtRevision(base, revision);
+    return hashEmbeddingSourceAtRevision(text, request.producer_json, request.reprocess_generation, revision);
+}
+
+pub fn hashEmbeddingSourceAtRevision(text: []const u8, producer_json: []const u8, reprocess_generation: u64, revision: ?[32]u8) u64 {
+    return embeddingIdentityAtRevision(enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, producer_json, reprocess_generation), revision);
 }
 
 fn embeddingIdentityAtRevision(base: u64, revision: ?[32]u8) u64 {
@@ -30994,6 +30998,7 @@ fn flushMaterializedSparseChunkSources(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
     sparse_embedder: embedder_mod.SparseEmbedder,
+    revision: ?[32]u8,
     consumer_indexes: []const []const u8,
     sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
     window: *GeneratedReplayWindow,
@@ -31001,7 +31006,7 @@ fn flushMaterializedSparseChunkSources(
     if (sources.items.len == 0) return;
     defer clearChunkEmbeddingSourceList(runtime.alloc, sources);
 
-    const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, consumer_indexes, sources.items);
+    const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, consumer_indexes, sources.items, revision);
     defer {
         for (chunk_embeddings) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
         if (chunk_embeddings.len > 0) runtime.alloc.free(chunk_embeddings);
@@ -31049,6 +31054,7 @@ fn processMaterializedChunkSparseRequest(
     window: *GeneratedReplayWindow,
 ) !void {
     if (try processOrderedChunkVectorRequest(runtime, request, null, sparse_embedder, consumer_indexes)) return;
+    const revision = try sparse_embedder.captureRevision(runtime.alloc, embedding_artifact_name);
     const max_window_items = generatedReplayWindowItems();
     const max_batch_items = effectiveRequestEmbedBatchItems(runtime, request);
     const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, request);
@@ -31116,6 +31122,7 @@ fn processMaterializedChunkSparseRequest(
             request: enrichment_types.GeneratedEnrichmentRequest,
             prefix: []const u8,
             embedding_artifact_name: []const u8,
+            revision: ?[32]u8,
             sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
             cached_items: *std.ArrayListUnmanaged(CachedChunkDenseWindowItem),
             batch_source_bytes: *usize,
@@ -31132,7 +31139,7 @@ fn processMaterializedChunkSparseRequest(
                 const text = (try chunkPayloadTextAlloc(ctx.runtime.alloc, value, ctx.request.source_field)) orelse return .@"continue";
                 var text_owned = true;
                 errdefer if (text_owned) ctx.runtime.alloc.free(text);
-                const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, ctx.request.producer_json, ctx.request.reprocess_generation);
+                const source_hash = retainedTextEmbeddingHashAtRevision(ctx.request, text, ctx.revision);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(ctx.runtime.alloc, key, ctx.embedding_artifact_name);
                 var embedding_key_owned = true;
                 errdefer if (embedding_key_owned) ctx.runtime.alloc.free(embedding_key);
@@ -31148,6 +31155,7 @@ fn processMaterializedChunkSparseRequest(
                     try ctx.sources.append(ctx.runtime.alloc, .{
                         .key = try ctx.runtime.alloc.dupe(u8, key),
                         .text = text,
+                        .source_record_digest = sourceRecordDigest(value),
                     });
                     text_owned = false;
                     ctx.batch_source_bytes.* += text.len;
@@ -31170,6 +31178,7 @@ fn processMaterializedChunkSparseRequest(
             .request = request,
             .prefix = prefix,
             .embedding_artifact_name = embedding_artifact_name,
+            .revision = revision,
             .sources = &sources,
             .cached_items = &cached_items,
             .batch_source_bytes = &batch_source_bytes,
@@ -31178,8 +31187,9 @@ fn processMaterializedChunkSparseRequest(
         };
         try backend_scan.scanWithContext(&runtime.store, lower, upper_bound, .{}, &collect, Collect.scan);
 
+        try sparse_embedder.requireRevision(runtime.alloc, embedding_artifact_name, revision);
         try processCachedChunkSparseItems(runtime, request, consumer_indexes, window, &cached_items, max_window_items);
-        try flushMaterializedSparseChunkSources(runtime, request, sparse_embedder, consumer_indexes, &sources, window);
+        try flushMaterializedSparseChunkSources(runtime, request, sparse_embedder, revision, consumer_indexes, &sources, window);
         try flushGeneratedReplayWindowIfNeeded(runtime, window, max_window_items);
         batch_source_bytes = 0;
 
@@ -31385,6 +31395,7 @@ fn flushPlainDenseItems(
             .source_digest = item.source_record_digest,
             .doc_key = item.request.doc_key,
             .source_sequence = item.request.sequence,
+            .generation_guard = EmbeddingGenerationGuard.fromRequest(item.request),
             .ordered_input = if (item.producer_input) |*token| token else null,
         };
         initialized += 1;
@@ -31422,6 +31433,16 @@ fn embeddingPublicationBatchItems() usize {
     return std.math.clamp(count, 1, 256);
 }
 
+const EmbeddingGenerationGuard = struct {
+    artifact_name: []const u8,
+    producer_json: []const u8,
+    generation: u64,
+
+    fn fromRequest(request: enrichment_types.GeneratedEnrichmentRequest) @This() {
+        return .{ .artifact_name = requestEmbeddingName(request), .producer_json = request.producer_json, .generation = request.reprocess_generation };
+    }
+};
+
 const GuardedEmbeddingWrite = struct {
     key: []const u8,
     value: []const u8,
@@ -31430,6 +31451,7 @@ const GuardedEmbeddingWrite = struct {
     parent_key: ?[]const u8 = null,
     doc_key: []const u8,
     source_sequence: u64,
+    generation_guard: EmbeddingGenerationGuard,
     ordered_input: ?*const producer_input.Token = null,
     kind: enrichment_artifact_codec.Kind = .dense_embedding,
 };
@@ -31524,6 +31546,11 @@ fn enqueueProducerArtifact(runtime: *EnrichmentRuntime, token: *const producer_i
 }
 
 fn embeddingSourceStillCurrent(alloc: Allocator, txn: anytype, write: GuardedEmbeddingWrite) !bool {
+    const guard = write.generation_guard;
+    @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, txn, write.doc_key, guard.artifact_name, guard.producer_json, guard.generation) catch |err| switch (err) {
+        error.EnrichmentSourceChanged => return false,
+        else => return err,
+    };
     // DB document identities use the same replay sequence as the request.
     // Content equality alone cannot fence a delete/recreate with identical
     // bytes: that cycle advances the identity's created_generation.
@@ -34451,6 +34478,7 @@ fn processDenseTemplateParts(
         .source_hash = source_hash,
         .source_record_digest = source_digest,
         .source_sequence = request.sequence,
+        .generation_guard = EmbeddingGenerationGuard.fromRequest(request),
         .vector = vector,
         .ordered_input = input,
         .text_input = partsAreText(parts) and locally_replayable,
@@ -34572,6 +34600,7 @@ fn processDenseEmbedding(
         .source_hash = source_hash,
         .source_record_digest = sourceRecordDigest(raw),
         .source_sequence = request.sequence,
+        .generation_guard = EmbeddingGenerationGuard.fromRequest(request),
         .vector = vector,
         .ordered_input = if (input) |*token| token else null,
         // Prepared as plain text: re-embedding renders the same text.
@@ -34620,7 +34649,8 @@ fn processSparseEmbedding(
             return;
         }
 
-        const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, consumer_indexes, source_set.sources);
+        const chunk_revision = try sparse_embedder.captureRevision(runtime.alloc, embedding_artifact_name);
+        const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, consumer_indexes, source_set.sources, chunk_revision);
         defer {
             for (chunk_embeddings) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
             runtime.alloc.free(chunk_embeddings);
@@ -34703,6 +34733,7 @@ fn processSparseEmbedding(
         .source_digest = sourceRecordDigest(raw),
         .doc_key = request.doc_key,
         .source_sequence = request.sequence,
+        .generation_guard = EmbeddingGenerationGuard.fromRequest(request),
         .kind = .sparse_embedding,
     }}, &accepted);
     if (!accepted[0]) return;
@@ -34848,10 +34879,13 @@ fn buildChunkSparseEmbeddingsFromSources(
     sparse_embedder: embedder_mod.SparseEmbedder,
     consumer_indexes: []const []const u8,
     sources: []const ChunkEmbeddingSource,
+    revision: ?[32]u8,
 ) ![]derived_types.DerivedSparseEmbeddingWrite {
     if (sources.len == 0) return try runtime.alloc.alloc(derived_types.DerivedSparseEmbeddingWrite, 0);
     for (sources) |source| if (source.metadata != null and source.text.len == 0) return error.IncompatibleChunkEmbeddingTarget;
 
+    const embedding_name = requestEmbeddingName(request);
+    try sparse_embedder.requireRevision(runtime.alloc, embedding_name, revision);
     var embeddings = std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite).empty;
     errdefer {
         for (embeddings.items) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
@@ -34860,6 +34894,8 @@ fn buildChunkSparseEmbeddingsFromSources(
     var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
     defer chunk_texts.deinit(runtime.alloc);
     var chunk_keys = std.ArrayListUnmanaged([]u8).empty;
+    var source_indexes = std.ArrayListUnmanaged(usize).empty;
+    defer source_indexes.deinit(runtime.alloc);
     var chunk_hashes = std.ArrayListUnmanaged(u64).empty;
     defer chunk_hashes.deinit(runtime.alloc);
     errdefer {
@@ -34869,11 +34905,11 @@ fn buildChunkSparseEmbeddingsFromSources(
         chunk_keys.deinit(runtime.alloc);
     }
 
-    for (sources) |source| {
+    for (sources, 0..) |source, source_index| {
         const chunk_key = try runtime.alloc.dupe(u8, source.key);
         var chunk_key_owned = true;
         errdefer if (chunk_key_owned) runtime.alloc.free(chunk_key);
-        const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
+        const source_hash = retainedTextEmbeddingHashAtRevision(request, source.text, revision);
         const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, requestEmbeddingName(request));
         defer runtime.alloc.free(embedding_key);
         if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
@@ -34895,10 +34931,14 @@ fn buildChunkSparseEmbeddingsFromSources(
         try chunk_texts.append(runtime.alloc, source.text);
         try chunk_keys.append(runtime.alloc, chunk_key);
         try chunk_hashes.append(runtime.alloc, source_hash);
+        try source_indexes.append(runtime.alloc, source_index);
         chunk_key_owned = false;
     }
 
-    if (chunk_texts.items.len == 0) return try embeddings.toOwnedSlice(runtime.alloc);
+    if (chunk_texts.items.len == 0) {
+        try sparse_embedder.requireRevision(runtime.alloc, embedding_name, revision);
+        return try embeddings.toOwnedSlice(runtime.alloc);
+    }
 
     const max_batch_items = effectiveRequestEmbedBatchItems(runtime, request);
     const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, request);
@@ -34909,6 +34949,7 @@ fn buildChunkSparseEmbeddingsFromSources(
         const batch_keys = chunk_keys.items[start..end];
         const batch_hashes = chunk_hashes.items[start..end];
         const batch_stats = textBatchByteStats(batch_texts);
+        try sparse_embedder.requireRevision(runtime.alloc, embedding_name, revision);
         noteEmbedBatchStarted(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
         const embed_started_ns = runtime.clock.nowRealtimeNs();
         const sparse_batch = embedSparseBatchWithRetry(sparse_embedder, runtime, requestEmbeddingName(request), batch_texts) catch |err| {
@@ -34916,6 +34957,10 @@ fn buildChunkSparseEmbeddingsFromSources(
             return err;
         };
         errdefer embedder_mod.freeSparseEmbeddingBatch(runtime.alloc, sparse_batch);
+        sparse_embedder.requireRevision(runtime.alloc, embedding_name, revision) catch |err| {
+            noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+            return err;
+        };
         if (sparse_batch.len != batch_keys.len) {
             noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             return error.InvalidEmbeddingResponse;
@@ -34923,12 +34968,16 @@ fn buildChunkSparseEmbeddingsFromSources(
         noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
         defer finishActivePostprocess(runtime);
 
-        for (batch_keys, batch_hashes, sparse_batch) |chunk_key, source_hash, sparse| {
-            try writeSparseEmbeddingArtifact(runtime, chunk_key, requestEmbeddingName(request), source_hash, sparse.indices, sparse.values);
+        for (batch_keys, batch_hashes, sparse_batch, source_indexes.items[start..end]) |chunk_key, source_hash, sparse, source_index| {
+            if (!try writeSparseEmbeddingArtifact(runtime, request, sources[source_index], source_hash, sparse.indices, sparse.values)) continue;
+            const index_name = try runtime.alloc.dupe(u8, request.index_name);
+            errdefer runtime.alloc.free(index_name);
+            const artifact_key = try embeddingArtifactKey(runtime, chunk_key, requestEmbeddingName(request));
+            errdefer runtime.alloc.free(artifact_key);
             try embeddings.append(runtime.alloc, .{
-                .index_name = try runtime.alloc.dupe(u8, request.index_name),
+                .index_name = index_name,
                 .doc_key = chunk_key,
-                .artifact_key = try embeddingArtifactKey(runtime, chunk_key, requestEmbeddingName(request)),
+                .artifact_key = artifact_key,
                 .indices = &.{},
                 .values = &.{},
             });
@@ -34936,9 +34985,10 @@ fn buildChunkSparseEmbeddingsFromSources(
         embedder_mod.freeSparseEmbeddingBatch(runtime.alloc, sparse_batch);
         start = end;
     }
+    const result = try embeddings.toOwnedSlice(runtime.alloc);
+    for (chunk_keys.items) |key| if (!sparseEmbeddingsOwnDocKey(result, key)) runtime.alloc.free(key);
     chunk_keys.deinit(runtime.alloc);
-
-    return try embeddings.toOwnedSlice(runtime.alloc);
+    return result;
 }
 
 fn requestArtifactName(request: enrichment_types.GeneratedEnrichmentRequest) []const u8 {
@@ -35064,6 +35114,7 @@ const EmbeddingArtifactWrite = struct {
     source_hash: ?u64 = null,
     source_record_digest: [32]u8,
     source_sequence: u64,
+    generation_guard: EmbeddingGenerationGuard,
     vector: []const f32,
     ordered_input: ?*const producer_input.Token = null,
     /// See `Flags.text_input`.
@@ -35095,25 +35146,38 @@ fn writeEmbeddingArtifact(runtime: *EnrichmentRuntime, write: EmbeddingArtifactW
         .source_digest = write.source_record_digest,
         .doc_key = write.parent_doc_key,
         .source_sequence = write.source_sequence,
+        .generation_guard = write.generation_guard,
     }}, &accepted);
     return accepted[0];
 }
 
 fn writeSparseEmbeddingArtifact(
     runtime: *EnrichmentRuntime,
-    base_key: []const u8,
-    artifact_name: []const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    source: ChunkEmbeddingSource,
     source_hash: u64,
     indices: []const u32,
     values: []const f32,
-) !void {
-    const key = try embeddingArtifactKey(runtime, base_key, artifact_name);
+) !bool {
+    const key = try embeddingArtifactKey(runtime, source.key, requestEmbeddingName(request));
     defer runtime.alloc.free(key);
     const payload = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(runtime.alloc, source_hash, indices, values);
     defer runtime.alloc.free(payload);
-
-    try storePutWithRetry(runtime, key, payload);
-    recordArtifactBytes(runtime, .sparse_embedding, payload.len);
+    const parent_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
+    defer runtime.alloc.free(parent_key);
+    var accepted: [1]bool = undefined;
+    try storeGuardedEmbeddingsWithRetry(runtime, &.{.{
+        .key = key,
+        .value = payload,
+        .source_key = if (source.source_record_is_parent) parent_key else source.key,
+        .source_digest = source.source_record_digest orelse return error.MissingChunkSourceFence,
+        .parent_key = parent_key,
+        .doc_key = request.doc_key,
+        .source_sequence = request.sequence,
+        .generation_guard = EmbeddingGenerationGuard.fromRequest(request),
+        .kind = .sparse_embedding,
+    }}, &accepted);
+    return accepted[0];
 }
 
 fn publishDeletedKeys(runtime: *EnrichmentRuntime, deleted_keys: []const []const u8) !void {

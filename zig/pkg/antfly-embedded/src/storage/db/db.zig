@@ -96980,6 +96980,83 @@ fn testSparseSourceHashReuse(sync_level: types.SyncLevel) !void {
     try std.testing.expectEqual(stats.enrichment.sparse_artifact_bytes_written, stats.enrichment.artifact_bytes_written);
 }
 
+test "db synchronous sparse reuse binds resolved revisions across write modes and chunks" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        revision: u8 = 1,
+        calls: usize = 0,
+        flip_after_capture: bool = false,
+        flip_during_call: bool = false,
+        fn capture(raw: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const revision = self.revision;
+            if (self.flip_after_capture) {
+                self.flip_after_capture = false;
+                self.revision += 1;
+            }
+            return @as([32]u8, @splat(revision));
+        }
+        fn embed(raw: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const indices = try alloc.dupe(u32, &.{self.revision});
+            errdefer alloc.free(indices);
+            const values = try alloc.dupe(f32, &.{1});
+            if (self.flip_during_call) {
+                self.flip_during_call = false;
+                self.revision += 1;
+            }
+            return .{ .indices = indices, .values = values };
+        }
+    };
+    const Source = enum { document, inline_chunks, materialized_chunks };
+    for ([_]types.SyncLevel{ .enrichments, .full_index }) |sync_level| for ([_]Source{ .document, .inline_chunks, .materialized_chunks }) |source_kind| {
+        const chunked = source_kind != .document;
+        var directory = try TestDirectory.init("sparse-revision-reuse");
+        defer directory.cleanup();
+        var probe = Probe{};
+        var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "sparse-revisions", .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.embed, .cache_revision_fn = Probe.capture } } });
+        defer db.close();
+        if (source_kind == .materialized_chunks) {
+            try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 4 });
+            try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "text", .source_artifact_name = "chunks" });
+        }
+        try db.addIndex(.{ .name = "sparse", .kind = .sparse_vector, .config_json = if (source_kind == .materialized_chunks)
+            "{\"field\":\"sparse_embedding\",\"sources\":[{\"artifact\":\"model\"}]}"
+        else if (chunked)
+            "{\"field\":\"sparse_embedding\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"artifact_name\":\"chunks\",\"chunk_size\":4,\"chunk_overlap\":0}}"
+        else
+            "{\"field\":\"sparse_embedding\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\"}}" });
+        // Async production and synchronous reuse must agree on the same hash.
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"one two three four five six seven eight\",\"metadata\":0}" }}, .sync_level = .write });
+        try db.runUntilIdle();
+        const first_calls = probe.calls;
+        try std.testing.expect(first_calls > 0);
+        if (chunked) try std.testing.expect(first_calls > 1);
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"one two three four five six seven eight\",\"metadata\":1}" }}, .sync_level = sync_level });
+        try db.runUntilIdle();
+        try std.testing.expectEqual(first_calls, probe.calls);
+        probe.revision = 2;
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"one two three four five six seven eight\",\"metadata\":2}" }}, .sync_level = sync_level });
+        try db.runUntilIdle();
+        try std.testing.expect(probe.calls > first_calls);
+        var result = try db.search(a, .{ .index_name = "sparse", .query = .{ .sparse_knn = .{ .indices = &.{2}, .values = &.{1}, .k = 1 } }, .limit = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqualStrings("doc", result.hits[0].id);
+        const before_races = probe.calls;
+        probe.flip_after_capture = true;
+        try std.testing.expectError(error.EnrichmentSourceChanged, db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"one two three four five six seven eight\",\"metadata\":3}" }}, .sync_level = sync_level }));
+        try std.testing.expectEqual(before_races, probe.calls);
+        probe.revision = 2;
+        probe.flip_during_call = true;
+        try std.testing.expectError(error.EnrichmentSourceChanged, db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"changed source\",\"metadata\":4}" }}, .sync_level = sync_level }));
+        const source = (try db.get(a, "doc")) orelse return error.TestUnexpectedResult;
+        defer a.free(source);
+        try std.testing.expectEqualStrings("{\"body\":\"one two three four five six seven eight\",\"metadata\":2}", source);
+    };
+}
+
 test "db chunked sparse enrichment skips unchanged chunks and deletes stale sparse artifacts" {
     const alloc = std.testing.allocator;
 
@@ -99418,6 +99495,29 @@ test "db paper evaluation producer upgrades require explicit reprocess and async
             try std.testing.expectEqualSlices(f32, expected, vector);
             return (try enrichment_artifact_codec.sourceHash(bytes)).?;
         }
+        fn querySpace(alloc: Allocator, database: *DB, expected: [3][3]f32) !void {
+            for ([_][3]f32{ .{ 1, 0, 1 }, .{ 0, 1, 1 } }) |query| {
+                var result = try database.search(alloc, .{ .index_name = "semantic", .query = .{ .dense_knn = .{ .vector = &query, .k = 3 } }, .limit = 3, .search_effort = 1 });
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 3), result.hits.len);
+                var seen: [3]bool = @splat(false);
+                for (result.hits) |hit| {
+                    const index: usize = if (std.mem.eql(u8, hit.id, "doc:a")) 0 else if (std.mem.eql(u8, hit.id, "doc:b")) 1 else if (std.mem.eql(u8, hit.id, "doc:c")) 2 else return error.TestUnexpectedResult;
+                    try std.testing.expect(!seen[index]);
+                    seen[index] = true;
+                    var dot: f64 = 0;
+                    var query_norm: f64 = 0;
+                    var row_norm: f64 = 0;
+                    for (query, expected[index]) |q, v| {
+                        dot += @as(f64, q) * v;
+                        query_norm += @as(f64, q) * q;
+                        row_norm += @as(f64, v) * v;
+                    }
+                    const cosine: f32 = @floatCast(dot / @sqrt(query_norm * row_norm));
+                    try std.testing.expectApproxEqAbs(cosine, hit.score orelse return error.TestUnexpectedResult, 0.00001);
+                }
+            }
+        }
         fn reprocess(alloc: Allocator, database: *DB) !void {
             var cursor: ?[]u8 = null;
             defer if (cursor) |value| alloc.free(value);
@@ -99450,9 +99550,10 @@ test "db paper evaluation producer upgrades require explicit reprocess and async
     var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "paper-contract", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .capabilities_fn = Probe.caps } } });
     defer db.close();
     try db.addEnrichment(Probe.config(1));
-    try db.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"sources\":[{\"artifact\":\"vectors\"}],\"publication_policy\":\"atomic\"}" });
+    try db.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"sources\":[{\"artifact\":\"vectors\"}],\"publication_policy\":\"atomic\"}" });
     try db.batch(.{ .writes = &.{ .{ .key = "doc:a", .value = "{\"body\":\"original\"}" }, .{ .key = "doc:b", .value = "{\"body\":\"original\"}" }, .{ .key = "doc:c", .value = "{\"body\":\"original\"}" } }, .sync_level = .full_index });
     const first_a_hash = try Probe.check(a, &db, "doc:a", &.{ 1, 0, 1 });
+    try Probe.querySpace(a, &db, .{ .{ 1, 0, 1 }, .{ 1, 0, 1 }, .{ 1, 0, 1 } });
     probe.revision = 2;
     _ = try db.upsertEnrichment(Probe.config(2));
     try db.runUntilIdle();
@@ -99462,18 +99563,24 @@ test "db paper evaluation producer upgrades require explicit reprocess and async
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"original\",\"metadata\":1}" }}, .sync_level = .full_index });
     _ = try Probe.check(a, &db, "doc:a", &.{ 0, 1, 1 });
     _ = try Probe.check(a, &db, "doc:b", &.{ 1, 0, 1 });
+    // Negative control: the serving oracle must observe the mixed old/new space.
+    try Probe.querySpace(a, &db, .{ .{ 0, 1, 1 }, .{ 1, 0, 1 }, .{ 1, 0, 1 } });
     try Probe.reprocess(a, &db);
     for ([_][]const u8{ "doc:a", "doc:b", "doc:c" }) |key| _ = try Probe.check(a, &db, key, &.{ 0, 1, 1 });
+    try Probe.querySpace(a, &db, .{ .{ 0, 1, 1 }, .{ 0, 1, 1 }, .{ 0, 1, 1 } });
     probe.revision = 1;
     _ = try db.upsertEnrichment(Probe.config(1));
     try Probe.reprocess(a, &db);
     const new_a_hash = try Probe.check(a, &db, "doc:a", &.{ 1, 0, 1 });
     try std.testing.expect(first_a_hash != new_a_hash);
+    try Probe.querySpace(a, &db, .{ .{ 1, 0, 1 }, .{ 1, 0, 1 }, .{ 1, 0, 1 } });
     // An acknowledged async source write can still expose the prior vector.
     try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"changed\"}" }}, .sync_level = .write });
     _ = try Probe.check(a, &db, "doc:a", &.{ 1, 0, 1 });
+    try Probe.querySpace(a, &db, .{ .{ 1, 0, 1 }, .{ 1, 0, 1 }, .{ 1, 0, 1 } });
     try db.runUntilIdle();
     _ = try Probe.check(a, &db, "doc:a", &.{ 1, 0, 2 });
+    try Probe.querySpace(a, &db, .{ .{ 1, 0, 2 }, .{ 1, 0, 1 }, .{ 1, 0, 1 } });
     // Model-gated writes must fail before publishing the new primary source.
     probe.fail = true;
     try std.testing.expectError(error.PermanentPromptFailure, db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"rejected\"}" }}, .sync_level = .enrichments }));
@@ -99481,6 +99588,68 @@ test "db paper evaluation producer upgrades require explicit reprocess and async
     defer a.free(source);
     try std.testing.expectEqualStrings("{\"body\":\"changed\"}", source);
     _ = try Probe.check(a, &db, "doc:a", &.{ 1, 0, 2 });
+    try Probe.querySpace(a, &db, .{ .{ 1, 0, 2 }, .{ 1, 0, 1 }, .{ 1, 0, 1 } });
+}
+
+test "db paper evaluation rejects superseded A completion after producer A B A reprocessing" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        db: ?*DB = null,
+        calls: usize = 0,
+        fn config(model_b: bool) types.EnrichmentConfig {
+            return .{ .name = "vectors", .kind = .embedding, .field = "body", .expected_dims = 3, .producer_json = if (model_b) "{\"version\":1,\"provider\":\"antfly\",\"model\":\"B\",\"dimensions\":3}" else "{\"version\":1,\"provider\":\"antfly\",\"model\":\"A\",\"dimensions\":3}" };
+        }
+        fn caps(_: *anyopaque, _: Allocator, _: []const u8) !@import("antfly_inference_work").InferenceCapabilities {
+            // Both A incarnations have the same model revision. Publication
+            // must distinguish their reprocess/catalog generations as well.
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(1) };
+        }
+        fn embed(raw: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const database = self.db.?;
+            if (self.calls == 1) {
+                // Hold the old-A response at the real provider boundary while
+                // both replacement/reprocess requests become durable.
+                _ = try database.upsertEnrichment(config(true));
+                try std.testing.expect(try database.reprocessDocumentArtifact(alloc, "doc", "vectors"));
+                _ = try database.upsertEnrichment(config(false));
+                try std.testing.expect(try database.reprocessDocumentArtifact(alloc, "doc", "vectors"));
+                return alloc.dupe(f32, &.{ 1, 0, 0 });
+            }
+            const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "vectors");
+            defer alloc.free(key);
+            // There was no prior published vector. An old-A completion at this
+            // canonical key would be a newly accepted obsolete result.
+            const existing = database.core.store.get(alloc, key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            defer if (existing) |bytes| alloc.free(bytes);
+            if (existing) |bytes| {
+                const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, bytes);
+                defer alloc.free(vector);
+                if (vector[0] != 0) return error.ObsoleteACompletionPublished;
+            }
+            return alloc.dupe(f32, &.{ 0, 1, 0 });
+        }
+    };
+    var directory = try TestDirectory.init("late-A-generation");
+    defer directory.cleanup();
+    var probe = Probe{};
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "late-A", .inline_retry_max_attempts = 1, .worker_retry_max_attempts = 1, .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .capabilities_fn = Probe.caps } } });
+    defer db.close();
+    probe.db = &db;
+    try db.addEnrichment(Probe.config(false));
+    try db.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"sources\":[{\"artifact\":\"vectors\"}],\"publication_policy\":\"atomic\"}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"unchanged source\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expect(probe.calls >= 2);
+    var result = try db.search(a, .{ .index_name = "semantic", .query = .{ .dense_knn = .{ .vector = &.{ 0, 1, 0 }, .k = 1 } }, .limit = 1, .search_effort = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc", result.hits[0].id);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), result.hits[0].score orelse return error.TestUnexpectedResult, 0.00001);
 }
 
 test "db templated dense backfill batches rendered text and preserves media" {

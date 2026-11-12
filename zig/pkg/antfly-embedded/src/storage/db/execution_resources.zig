@@ -1743,6 +1743,7 @@ pub const GeneratedDenseMemoJob = struct {
 };
 
 pub const GeneratedSparseMemoJob = struct {
+    revision: ?[32]u8 = null,
     key: GeneratedEmbeddingMemo.Key,
     text: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -1762,6 +1763,7 @@ pub const GeneratedEmbeddingMemo = struct {
     dense: std.AutoHashMapUnmanaged(Key, []f32) = .empty,
     generations: std.StringHashMapUnmanaged(embedder_mod.DenseEmbedder.TextGeneration) = .empty,
     sparse: std.AutoHashMapUnmanaged(Key, SparseValue) = .empty,
+    sparse_revisions: std.StringHashMapUnmanaged(?[32]u8) = .empty,
 
     pub fn init(alloc: Allocator) GeneratedEmbeddingMemo {
         return .{ .alloc = alloc };
@@ -1771,6 +1773,9 @@ pub const GeneratedEmbeddingMemo = struct {
         var names = self.generations.keyIterator();
         while (names.next()) |name| self.alloc.free(name.*);
         self.generations.deinit(self.alloc);
+        var sparse_names = self.sparse_revisions.keyIterator();
+        while (sparse_names.next()) |name| self.alloc.free(name.*);
+        self.sparse_revisions.deinit(self.alloc);
         var dense_values = self.dense.valueIterator();
         while (dense_values.next()) |vector| self.alloc.free(vector.*);
         self.dense.deinit(self.alloc);
@@ -1815,6 +1820,15 @@ pub const GeneratedEmbeddingMemo = struct {
         errdefer self.alloc.free(owned);
         try self.generations.put(self.alloc, owned, captured);
         return captured;
+    }
+
+    pub fn sparseRevision(self: *@This(), provider: embedder_mod.SparseEmbedder, name: []const u8) !?[32]u8 {
+        if (self.sparse_revisions.get(name)) |revision| return revision;
+        const revision = try provider.captureRevision(self.alloc, name);
+        const owned = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned);
+        try self.sparse_revisions.put(self.alloc, owned, revision);
+        return revision;
     }
 
     pub fn keyAtRevision(base: Key, revision: ?[32]u8) Key {
