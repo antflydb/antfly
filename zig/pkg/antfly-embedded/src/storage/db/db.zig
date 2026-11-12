@@ -153222,6 +153222,14 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
             }
             return rows;
         }
+        fn denseControlled(raw: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, dims: u32, context: @import("antfly_inference_execution_context").RequestContext) ![]const []const f32 {
+            try context.check();
+            return denseBatch(raw, a, name, texts, dims);
+        }
+        fn sparseControlled(raw: *anyopaque, a: Allocator, name: []const u8, texts: []const []const u8, context: @import("antfly_inference_execution_context").RequestContext) ![]embedder_mod.SparseEmbedding {
+            try context.check();
+            return sparseBatch(raw, a, name, texts);
+        }
         fn sparseBatch(raw: *anyopaque, a: Allocator, _: []const u8, texts: []const []const u8) ![]embedder_mod.SparseEmbedding {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
@@ -153261,7 +153269,7 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
     var db = try DB.open(alloc, directory.path(), .{
         .start_optional_runtime_workers = false,
         .start_index_workers = false,
-        .enrichment = .{ .owner_id = "document-generation", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.dense, .dense_embed_batch_fn = Probe.denseBatch, .capabilities_fn = Probe.caps, .foreground_bounded = true }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.sparseOne, .sparse_embed_batch_fn = Probe.sparseBatch, .cache_revision_fn = Probe.revisionFn, .foreground_bounded = true } },
+        .enrichment = .{ .owner_id = "document-generation", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.dense, .dense_embed_batch_fn = Probe.denseBatch, .dense_embed_batch_with_context_fn = Probe.denseControlled, .capabilities_fn = Probe.caps, .foreground_bounded = true }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.sparseOne, .sparse_embed_batch_fn = Probe.sparseBatch, .sparse_embed_batch_with_context_fn = Probe.sparseControlled, .cache_revision_fn = Probe.revisionFn, .foreground_bounded = true } },
     });
     defer db.close();
     try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
