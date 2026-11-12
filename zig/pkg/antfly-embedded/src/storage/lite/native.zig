@@ -4462,6 +4462,18 @@ const RedoCommitState = struct {
         self.logical_pending.clearRetainingCapacity();
         self.pending.clearRetainingCapacity();
     }
+
+    /// The exact byte length `appendRecord` would write right now for the
+    /// currently staged `logical_pending`/`pending`, including the
+    /// redo-log's own record framing (`redo_log.header_len`) -- callers
+    /// check this against `self.writer.remaining()` *before* calling
+    /// `appendRecord`, so a log that cannot fit this record is caught
+    /// before anything is written, never surfacing as a failed, partial
+    /// append (`error.LogFull`, which `publishCheckpoint` would otherwise
+    /// report as the much less specific `error.OutcomeUnknown`).
+    fn pendingRecordLen(self: *const RedoCommitState) u64 {
+        return redo_log.header_len + CompactCheckpoint.encoded_size + 4 + self.logical_pending.items.len + self.pending.items.len;
+    }
 };
 
 pub const LockMode = enum {
@@ -6402,7 +6414,7 @@ pub const NativeFile = struct {
     /// it as a clean end rather than failing closed. See "lite redo log
     /// checkpoint recovers cleanly from a crash between the new slot and
     /// log-zeroing" for the exercised scenario.
-    pub fn checkpointRedoLog(self: *NativeFile) !void {
+    pub fn checkpointRedoLog(self: *NativeFile) anyerror!void {
         const redo: *RedoCommitState = if (self.redo) |*r| r else return error.InvalidTransactionState;
         const io = self.runtimeIo();
         const has_logical_work = for (0..3) |root_idx| {
@@ -14723,6 +14735,24 @@ pub const NativeFile = struct {
             // durability barrier. Readers on this handle see the new roots;
             // reopening after a crash sees the previous complete checkpoint.
             if (changed) {
+                if (self.redo) |*redo| {
+                    // Same preemptive check as `publishCheckpoint`'s own
+                    // redo branch (see that comment for the full
+                    // reasoning): this ride-along commit's own mutations
+                    // are already staged in `redo.shared`
+                    // (`flushTransactionWrites`'s diversion loop ran
+                    // before this function was called), so if the log
+                    // cannot fit this record, run a real checkpoint
+                    // instead -- it already covers this commit -- and
+                    // skip every bit of this ride-along's own bookkeeping
+                    // below entirely, rather than layering a now-stale
+                    // `next` on top of what the checkpoint already
+                    // published.
+                    if (redo.pendingRecordLen() > redo.writer.remaining()) {
+                        try self.checkpointRedoLog();
+                        return;
+                    }
+                }
                 const was_durable_header_null = self.durable_header == null;
                 if (self.durable_header == null) self.durable_header = previous;
                 self.header.checkpoints[self.header.active_checkpoint] = next;
@@ -14970,6 +15000,28 @@ pub const NativeFile = struct {
         }
         if (self.redo != null and !self.redo.?.checkpointing) {
             const redo = &self.redo.?;
+            // A log-full condition must be decided before anything is
+            // appended, never discovered as a failed, partial append
+            // (`error.LogFull`, surfacing as the far less specific
+            // `error.OutcomeUnknown` below). This commit's own mutations
+            // are already staged in `redo.shared` -- `flushTransactionWrites`'s
+            // diversion loop ran before this function was ever called --
+            // so `checkpointRedoLog`'s own fold necessarily covers them
+            // too: once it returns, this commit is already durable as
+            // part of the checkpoint it just published, and there is
+            // nothing left to log. Return immediately in that case,
+            // rather than also appending (and republishing `checkpoint`,
+            // now stale relative to what `checkpointRedoLog` already
+            // wrote) on top of it. If `checkpointRedoLog` itself fails
+            // (e.g. no disk space left to allocate the real pages it
+            // needs), that error propagates unchanged: `redo.shared`/
+            // `redo.writer` are untouched by a failed checkpoint attempt,
+            // so the log is left intact and the caller sees a clean,
+            // pre-decision error instead of a torn append.
+            if (redo.pendingRecordLen() > redo.writer.remaining()) {
+                try self.checkpointRedoLog();
+                return;
+            }
             // §9.1/§9.3: the on-disk checkpoint slot is untouched here --
             // it still names the last real checkpoint (build step (d) is
             // the only thing that ever advances it for a redo-log file).
@@ -14987,9 +15039,11 @@ pub const NativeFile = struct {
             // redo-log file's recovery path (`recoverRedoLog`) already
             // tolerates a torn or absent tail on the *next* open, which is
             // this design's answer to the same failure instead. A failed
-            // append/sync here still reports `OutcomeUnknown`, so callers
-            // (`Store`'s reconciliation) treat this commit exactly as
-            // uncertain as the v8/v9 path would.
+            // sync (not append -- that can no longer fail with `LogFull`
+            // here, per the preemptive check above) still reports
+            // `OutcomeUnknown`, so callers (`Store`'s reconciliation)
+            // treat this commit exactly as uncertain as the v8/v9 path
+            // would.
             self.publication_in_flight = true;
             defer self.publication_in_flight = false;
             (blk: {
