@@ -546,6 +546,50 @@ pub fn isRegionUnusable(err: anyerror) bool {
 var registry_mutex: Io.Mutex = .init;
 var registry: std.AutoHashMapUnmanaged(Io.File.INode, *Entry) = .empty;
 
+/// Resolves `path` to an absolute, symlink-resolved path, so everything
+/// keyed off the result -- `Entry.path`, and `shared_lock_region`'s own
+/// `<path>.aflite-lock` sidecar derived from it -- stays correct no matter
+/// what the process's current directory is later changed to, and so that
+/// two different relative or symlinked spellings of the same file resolve
+/// to the *same* string. `ensureRegion`'s lazy reopen (after `rebind`, or
+/// after the region closes and a later caller reopens it) uses whatever
+/// is cached in `Entry.path` at whatever later moment it happens to run,
+/// with no opportunity to re-derive "where this file originally was" from
+/// a relative string at that point -- so canonicalizing once, here, at
+/// `open`/`rebind` time, while the caller's own cwd is still the one that
+/// made the relative spelling meaningful, is the only point this can
+/// happen correctly. Mirrors #1650's `root_identity.zig` fix and
+/// `native.zig`'s own `writerLockPathAlloc`: an existing file (the only
+/// case `open`/`rebind` ever actually hit -- both call sites resolve a
+/// data file already renamed into its final place) resolves directly;
+/// the missing-file fallback (parent directory through an open handle,
+/// basename joined back on) is kept only for robustness.
+fn canonicalPathAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
+    if (Io.Dir.cwd().realPathFileAlloc(io, path, allocator)) |resolved| {
+        // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8`,
+        // over-allocated by one byte for the terminator. `Entry.path`'s
+        // own field type is a plain `[]const u8`, with no sentinel, so
+        // storing the sentinel slice directly and freeing it later under
+        // that plain type would ask the allocator to free one byte fewer
+        // than was actually allocated (caught by `SafeAllocator` as a
+        // size mismatch). Re-dupe into a plain `[]u8` sized to exactly
+        // `.len` and free the sentinel original here, under its own
+        // matching type, instead.
+        defer allocator.free(resolved);
+        return try allocator.dupe(u8, resolved);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    const dirname = std.fs.path.dirname(path) orelse ".";
+    const basename = std.fs.path.basename(path);
+    var parent = try Io.Dir.cwd().openDir(io, dirname, .{});
+    defer parent.close(io);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const parent_len = try parent.realPath(io, &buf);
+    return try std.fs.path.join(allocator, &.{ buf[0..parent_len], basename });
+}
+
 /// Resolves `path`'s current inode and returns this process's shared
 /// `Entry` for it (creating it on first use), with one reference already
 /// counted. Call once per NativeFile, at open/create time; release with
@@ -554,21 +598,22 @@ var registry: std.AutoHashMapUnmanaged(Io.File.INode, *Entry) = .empty;
 /// with a rebind such as `replaceWithPreparedGeneration`'s) -- there is
 /// nothing else to wrap it in.
 pub fn open(io: Io, path: []const u8) !*Entry {
-    const inode = (try Io.Dir.cwd().statFile(io, path, .{})).inode;
+    const page = std.heap.page_allocator;
+    const canonical_path = try canonicalPathAlloc(page, io, path);
+    errdefer page.free(canonical_path);
+    const inode = (try Io.Dir.cwd().statFile(io, canonical_path, .{})).inode;
     registry_mutex.lockUncancelable(io);
     defer registry_mutex.unlock(io);
     if (registry.get(inode)) |entry| {
+        page.free(canonical_path);
         entry.mutex.lockUncancelable(io);
         entry.refs += 1;
         entry.mutex.unlock(io);
         return entry;
     }
-    const page = std.heap.page_allocator;
-    const owned_path = try page.dupe(u8, path);
-    errdefer page.free(owned_path);
     const entry = try page.create(Entry);
     errdefer page.destroy(entry);
-    entry.* = .{ .inode = inode, .path = owned_path, .refs = 1 };
+    entry.* = .{ .inode = inode, .path = canonical_path, .refs = 1 };
     try registry.put(page, inode, entry);
     return entry;
 }
@@ -856,7 +901,13 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
 /// against `new_path`, exactly mirroring `ensureFd`'s own lazy-reopen shape.
 pub fn rebind(entry: *Entry, io: Io, new_path: []const u8) !void {
     const page = std.heap.page_allocator;
-    const owned = try page.dupe(u8, new_path);
+    // Canonicalize here too, for the exact reason `open` does: the next
+    // `ensureRegion` reopens lazily, at some later and otherwise
+    // unconstrained point, against whatever is cached in `entry.path` --
+    // so it must already be an absolute, symlink-resolved path by the
+    // time this call returns, not a relative spelling that depended on
+    // this call's own cwd.
+    const owned = try canonicalPathAlloc(page, io, new_path);
     entry.mutex.lockUncancelable(io);
     defer entry.mutex.unlock(io);
     page.free(entry.path);
@@ -1016,4 +1067,85 @@ test "rebind closes an already-open region instead of carrying it across the pat
     const own_pid: u32 = @bitCast(std.c.getpid());
     region_after_rebind.acquireWriter(own_pid);
     region_after_rebind.releaseWriter();
+}
+
+// The bug this guards against: `open`/`rebind` used to cache whatever
+// path string the caller gave them verbatim. A *relative* one resolved
+// correctly at that moment, but `ensureRegion`'s own reopen after a
+// `rebind` is lazy -- it can run arbitrarily later, against whatever the
+// process's current directory happens to be *then*, not whatever it was
+// when the relative spelling was still meaningful. Canonicalizing to an
+// absolute path at `open`/`rebind` time (this file's own fix) closes
+// that window: the sidecar this test's second `ensureRegion` reopens
+// must still be the one next to the data file's real location, even
+// after an intervening cwd change landed it somewhere else entirely.
+test "ensureRegion's lazy reopen after rebind uses the original directory, not a later cwd" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    const original_cwd = try Io.Dir.cwd().realPathFileAlloc(io, ".", a);
+    defer a.free(original_cwd);
+    var restored = false;
+    defer if (!restored) std.process.setCurrentPath(io, original_cwd) catch {};
+
+    var data_tmp = std.testing.tmpDir(.{});
+    defer data_tmp.cleanup();
+    var data_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir_len = try data_tmp.dir.realPath(io, &data_buf);
+    const data_dir = try a.dupe(u8, data_buf[0..data_dir_len]);
+    defer a.free(data_dir);
+
+    var elsewhere_tmp = std.testing.tmpDir(.{});
+    defer elsewhere_tmp.cleanup();
+    var elsewhere_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const elsewhere_dir_len = try elsewhere_tmp.dir.realPath(io, &elsewhere_buf);
+    const elsewhere_dir = try a.dupe(u8, elsewhere_buf[0..elsewhere_dir_len]);
+    defer a.free(elsewhere_dir);
+
+    try std.process.setCurrentPath(io, data_dir);
+    {
+        const f = try Io.Dir.cwd().createFile(io, "old.data", .{});
+        f.close(io);
+    }
+    {
+        const f = try Io.Dir.cwd().createFile(io, "new.data", .{});
+        f.close(io);
+    }
+
+    // Opened, and `rebind` called, with relative spellings -- both while
+    // cwd is still `data_dir`, the directory those spellings actually
+    // mean.
+    const entry = try open(io, "old.data");
+    defer unref(entry, io);
+    {
+        const region = try ensureRegion(entry, io);
+        const own_pid: u32 = @bitCast(std.c.getpid());
+        region.acquireWriter(own_pid);
+        region.releaseWriter();
+    }
+    try rebind(entry, io, "new.data");
+    try std.testing.expect(entry.region == null);
+
+    // Move cwd somewhere else entirely before the lazy reopen runs.
+    try std.process.setCurrentPath(io, elsewhere_dir);
+
+    const region_after_cwd_change = try ensureRegion(entry, io);
+    const own_pid: u32 = @bitCast(std.c.getpid());
+    region_after_cwd_change.acquireWriter(own_pid);
+    region_after_cwd_change.releaseWriter();
+
+    // The sidecar must have landed next to `new.data` in its own
+    // directory, addressed absolutely -- never relative to whatever cwd
+    // is right now.
+    const expected_sidecar = try std.fmt.allocPrint(a, "{s}/new.data.aflite-lock", .{data_dir});
+    defer a.free(expected_sidecar);
+    try Io.Dir.accessAbsolute(io, expected_sidecar, .{});
+
+    // And nothing leaked into `elsewhere_dir`, the cwd the reopen
+    // actually ran under.
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, "new.data.aflite-lock", .{}));
+
+    try std.process.setCurrentPath(io, original_cwd);
+    restored = true;
 }
