@@ -1688,11 +1688,44 @@ pub const WriterAdmission = struct {
 /// reader-release or maintenance work each time it drops the owner mutex.
 /// Keep the existing bounded-spin/yield policy without allocating wait nodes
 /// or depending on a foreign executor's futex namespace.
+const publication_mutex_owner_tracking = std.debug.runtime_safety;
+
 const PublicationMutex = struct {
     next_ticket: std.atomic.Value(u64) = .init(0),
     serving_ticket: std.atomic.Value(u64) = .init(0),
+    /// Debug-only re-entrancy guard. This is a cooperative, ticketed
+    /// yield-spin (`platform_sync.lockYielding`), not a hard OS mutex: a
+    /// caller that re-enters `lock()` from the same thread that already
+    /// holds it does not deadlock in the usual sense -- it spins
+    /// forever, since the nested call's own ticket can never become
+    /// "next" while the ticket ahead of it (this same call's own,
+    /// still-unreleased hold) never advances either. That shape made a
+    /// real bug (`maybeCheckpointRedoLogOnIdleTurn` calling
+    /// `recordMaintenanceError`, which locks this same mutex, from
+    /// inside its own already-locked `lockStoreExclusive` span) look
+    /// like host-contention slowness instead of a hang -- CPU time kept
+    /// climbing on repeated yield/retry syscalls, never progressing.
+    /// Recording the owning thread here turns that into an immediate,
+    /// diagnosable panic instead.
+    /// `std.math.maxInt(u64)` means "unowned" -- `std.atomic.Value` needs
+    /// a type with a guaranteed in-memory representation, which a
+    /// non-pointer optional (`?std.Thread.Id`) does not have, so a
+    /// sentinel stands in for `null` instead. `std.Thread.Id` is `u64`
+    /// on the platforms this runs on; widen if that ever changes.
+    owner: if (publication_mutex_owner_tracking) std.atomic.Value(u64) else void = if (publication_mutex_owner_tracking) .init(no_owner) else {},
+
+    const no_owner: u64 = std.math.maxInt(u64);
+
+    fn assertNotOwnedByCurrentThread(self: *@This()) void {
+        if (!publication_mutex_owner_tracking) return;
+        const owner = self.owner.load(.acquire);
+        if (owner != no_owner and owner == @as(u64, std.Thread.getCurrentId())) {
+            std.debug.panic("PublicationMutex re-entered by the same thread that already holds it -- this mutex is a cooperative ticketed spin, not reentrant; a nested lock() from here would spin forever instead of deadlocking cleanly", .{});
+        }
+    }
 
     pub fn lock(self: *@This()) void {
+        self.assertNotOwnedByCurrentThread();
         const Turn = struct {
             serving: *std.atomic.Value(u64),
             ticket: u64,
@@ -1702,14 +1735,18 @@ const PublicationMutex = struct {
         };
         var turn = Turn{ .serving = &self.serving_ticket, .ticket = self.next_ticket.fetchAdd(1, .monotonic) };
         platform_sync.lockYielding(&turn);
+        if (publication_mutex_owner_tracking) self.owner.store(@as(u64, std.Thread.getCurrentId()), .release);
     }
 
     pub fn tryLock(self: *@This()) bool {
         const serving = self.serving_ticket.load(.acquire);
-        return self.next_ticket.cmpxchgStrong(serving, serving +% 1, .monotonic, .monotonic) == null;
+        const acquired = self.next_ticket.cmpxchgStrong(serving, serving +% 1, .monotonic, .monotonic) == null;
+        if (acquired and publication_mutex_owner_tracking) self.owner.store(@as(u64, std.Thread.getCurrentId()), .release);
+        return acquired;
     }
 
     pub fn unlock(self: *@This()) void {
+        if (publication_mutex_owner_tracking) self.owner.store(no_owner, .release);
         _ = self.serving_ticket.fetchAdd(1, .release);
     }
 };
@@ -2812,6 +2849,25 @@ pub const Store = struct {
     fn recordMaintenanceError(self: *Store, err: anyerror) void {
         lockStore(self);
         defer self.mutex.unlock();
+        self.recordMaintenanceErrorAssumeLocked(err);
+    }
+
+    /// `recordMaintenanceError`'s own body, for a caller that already
+    /// holds `self.mutex` (`maybeCheckpointRedoLogOnIdleTurn`, which runs
+    /// its whole body under `lockStoreExclusive` -- the *same* mutex
+    /// `lockStore` locks, not a separate one, per `lockStore`/
+    /// `lockStoreExclusive`'s own doc comments). Calling `recordMaintenanceError`
+    /// itself from there would try to lock `self.mutex` a second time from
+    /// the same thread while already holding it -- not a hard deadlock on
+    /// this cooperative, ticketed mutex, but an unbounded spin: the
+    /// nested call's own ticket can never become "next" while the ticket
+    /// ahead of it (this same call's own, still-unreleased hold) never
+    /// advances either. Observed exactly this way under a crash-sweep run
+    /// once `checkpointRedoLog` first failed from that call site with
+    /// redo as the default (the ride-along idle timer is the only path
+    /// that ever reaches a real failure there in ordinary operation,
+    /// which is why this was never hit before).
+    fn recordMaintenanceErrorAssumeLocked(self: *Store, err: anyerror) void {
         const status = &self.maintenance_policy.status;
         status.last_error = @errorName(err);
         status.reason = switch (err) {
@@ -3795,7 +3851,10 @@ pub const Store = struct {
         // the entry count alone would not flag.
         const threshold_due = redo.writer.remaining() < redo.writer.capacity / 2;
         if (!has_overlay_work and !threshold_due) return;
-        self.file.checkpointRedoLog() catch |err| self.recordMaintenanceError(err);
+        // AssumeLocked: this whole function runs under `lockStoreExclusive`
+        // above, which locks the same `self.mutex` `recordMaintenanceError`
+        // itself would try to lock -- see that function's own comment.
+        self.file.checkpointRedoLog() catch |err| self.recordMaintenanceErrorAssumeLocked(err);
     }
 
     /// Enqueue `plan` and return a ticket resolved once its group is durable.
@@ -8635,6 +8694,97 @@ test "lite redo-log idle-flush timer checkpoints an uncheckpointed overlay witho
     var read = try store.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("landed via redo log", try read.get("idle-checkpoint-doc"));
+}
+
+// Regression: `maybeCheckpointRedoLogOnIdleTurn` ran its whole body under
+// `lockStoreExclusive` and, on a `checkpointRedoLog` failure, called
+// `recordMaintenanceError` -- which locks that same mutex a second time
+// from the same thread. `PublicationMutex` is a cooperative ticketed
+// yield-spin, not a hard OS mutex, so this never crashed: it just spun
+// forever (the nested call's ticket could never become "next" while the
+// ticket ahead of it -- this same call's own unreleased hold -- never
+// advanced either), observed live as a crash-sweep run hanging indefinitely
+// once a close-induced `error.OutcomeUnknown` first reached this exact path
+// under redo-as-default. Forces that failure directly via
+// `test_fail_checkpoint_redo_log` rather than reproducing the crash-sweep's
+// own timing, and bounds every step that could have hung under the bug by
+// a deadline, mirroring "lite closing a store with only ride-along work
+// (no foreground write) does not hang"'s own pattern.
+test "lite idle-turn checkpoint failure records the error without deadlocking the store mutex" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "idle-checkpoint-failure.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .use_redo_log = true, .reclamation = .{ .page_reuse = false } });
+    var store_open = true;
+    defer if (store_open) store.close();
+    store.ride_along_idle_ns = 10 * std.time.ns_per_ms;
+
+    const Context = struct {
+        fn apply(_: *anyopaque, file: *native.NativeFile) !void {
+            try file.putDocument("idle-failure-doc", "staged before the forced failure");
+        }
+    };
+    var ctx: u8 = 0;
+    try store.submitMutation(&ctx, Context.apply);
+    try std.testing.expect(store.file.redo != null);
+    store.file.test_fail_checkpoint_redo_log = error.SimulatedRedoCheckpointFailure;
+
+    // The idle-flush task's own periodic wake must reach
+    // `maybeCheckpointRedoLogOnIdleTurn`, hit the forced failure, and
+    // record it -- all without the pre-fix self-deadlock ever blocking
+    // this read of `maintenance_policy.status` forever (that status is
+    // itself only ever written under the same `self.mutex`, so a stuck
+    // mutex would make this loop spin past its own deadline exactly like
+    // the real hang did).
+    const deadline_ns = antfly_platform.time.monotonicNs() +| (10 * std.time.ns_per_s);
+    while (store.maintenance_policy.status.last_error == null) {
+        if (antfly_platform.time.monotonicNs() >= deadline_ns) return error.MaintenanceErrorNeverRecorded;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expectEqualStrings(@errorName(error.SimulatedRedoCheckpointFailure), store.maintenance_policy.status.last_error.?);
+    try std.testing.expectEqual(reclamation.Reason.maintenance_error, store.maintenance_policy.status.reason);
+    try std.testing.expectEqual(reclamation.State.failed, store.maintenance_policy.status.state);
+
+    // The store must still take new writes and close normally -- a stuck
+    // `self.mutex` would hang both, exactly as it hung the crash sweep.
+    const Closer = struct {
+        store: *Store,
+        done: std.atomic.Value(bool) = .init(false),
+        result: anyerror!void = {},
+        fn run(self: *@This()) void {
+            self.result = self.commitAndClose();
+            self.done.store(true, .release);
+        }
+        fn commitAndClose(self: *@This()) !void {
+            var write = try self.store.beginWrite();
+            errdefer write.abort();
+            try write.put("idle-failure-doc-2", "committed after the forced failure");
+            try write.commit();
+            self.store.close();
+        }
+    };
+    var closer: Closer = .{ .store = &store };
+    const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    const close_deadline_ns = antfly_platform.time.monotonicNs() +| (10 * std.time.ns_per_s);
+    while (!closer.done.load(.acquire)) {
+        if (antfly_platform.time.monotonicNs() >= close_deadline_ns) {
+            thread.detach();
+            return error.CommitOrCloseHangDetected;
+        }
+        std.Thread.yield() catch {};
+    }
+    thread.join();
+    store_open = false;
+    try closer.result;
+
+    var reopened = try Store.open(alloc, path, true);
+    defer reopened.close();
+    var read = try reopened.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("staged before the forced failure", try read.get("idle-failure-doc"));
+    try std.testing.expectEqualStrings("committed after the forced failure", try read.get("idle-failure-doc-2"));
 }
 
 test "lite ride-along ticket resolves within the idle window even if the idle-flush task never starts" {
