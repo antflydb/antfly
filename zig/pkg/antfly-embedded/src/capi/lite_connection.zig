@@ -3440,7 +3440,13 @@ pub const Connection = struct {
                 const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
                 if (remaining <= 0) return error.FileBusy;
                 if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| hook.notify(hook.ptr);
-                if (native.waitPathLockWithIo(alloc, self.owner.path_lock_io.io(), self.path, h.liteOpenModeCanWrite(self.options.open_mode), deadline)) |held| return self.owner.withReadRegistrationBatch(held) else |wait_err| switch (wait_err) {
+                // Reader admission: migrated off the kernel's blocking
+                // `.shared` wait queue onto `fairReaderLockWithIo` (region-
+                // backed retry, kernel wait only as that function's own
+                // fallback when the region is unusable) -- see that
+                // function's own doc comment for why a reader's wait isn't
+                // simply the writer side's FIFO-ticket wait reused.
+                if (native.fairReaderLockWithIo(alloc, self.owner.path_lock_io.io(), self.path, deadline)) |held| return self.owner.withReadRegistrationBatch(held) else |wait_err| switch (wait_err) {
                     // Sidecar-free read-only snapshots retain their inode
                     // authority. Resource-limited executors retain bounded
                     // polling rather than making the deadline unbounded.

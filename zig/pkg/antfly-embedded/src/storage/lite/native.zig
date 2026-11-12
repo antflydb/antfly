@@ -14515,6 +14515,49 @@ pub fn lockReaderPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
     return .{ .io_impl = undefined, .borrowed_io = io, .file = file };
 }
 
+/// `acquirePathLeaseAssumeLocked`'s reader-admission wait, migrated off the
+/// kernel's blocking `.shared` lock queue (`waitPathLockWithIo(...,
+/// writer=false, ...)`), the last reader path still parked there. Unlike
+/// `fairWriterLockWithIo`, this is *not* a FIFO-ticket wait: a reader
+/// needs no ordering against other readers, and the region has no
+/// general "a writer released" signal a non-ticket-holding waiter can
+/// correctly wait on today -- `writer_release_epoch` is bumped and woken
+/// by `releaseWriter` only when a writer ticket is already queued (§8.2's
+/// own FIFO mechanism), never on an uncontended release, so a reader
+/// parked on it could wait past a release that had no queued ticket to
+/// wake it for. Until the region grows a dedicated release-notification
+/// word some non-ticket waiter can use (a design question for whoever
+/// extends §8.2, not resolved here), this retries its own non-blocking
+/// `lockReaderPathWithIo` attempt on a short bounded backoff instead of
+/// parking in the kernel's wait queue at all -- still removes the
+/// kernel-level block, at the cost of a capped poll interval rather than
+/// an instant wake. Falls back to the legacy blocking wait entirely when
+/// the region itself can't be used (`inode_lock.isRegionUnusable`), the
+/// same posture `fairWriterLockWithIo` already takes for its own callers;
+/// this function never attaches the opened region to the returned lease
+/// (`PathWriterLock.region` is writer-only -- `close()` unconditionally
+/// calls `releaseWriter()` on it whenever set, which a reader must never
+/// trigger), it only probes usability.
+pub fn fairReaderLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
+    {
+        var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
+            if (inode_lock.isRegionUnusable(err)) return waitPathLockWithIo(allocator, io, path, false, deadline_ns);
+            return err;
+        };
+        region.close();
+    }
+    var backoff_ns: i96 = 50 * std.time.ns_per_us;
+    while (true) {
+        if (lockReaderPathWithIo(allocator, io, path)) |held| return held else |err| {
+            if (err != error.WouldBlock and err != error.FileBusy) return err;
+        }
+        const remaining = deadline_ns - std.Io.Clock.awake.now(io).nanoseconds;
+        if (remaining <= 0) return error.FileBusy;
+        try io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake);
+        backoff_ns = @min(backoff_ns * 2, 4 * std.time.ns_per_ms);
+    }
+}
+
 fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode, wait_for_reader_lock: bool) !LockFile {
     const file = std.Io.Dir.cwd().openFile(io, path, .{
         .mode = if (lock_mode != .writer) .read_only else .read_write,
@@ -25077,6 +25120,39 @@ test "lite reader fence across a forked child: writer withholds pages the child 
     for (0..80) |_| try writer.putDocument("doc", &value);
     try std.testing.expect((try writer.allocatorStats()).?.reused_pages > before);
     try std.testing.expect((try writer.check()).valid);
+}
+
+test "lite fairReaderLockWithIo succeeds immediately when uncontended and gives up at its own deadline when a writer holds the lease" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "fair-reader-admission.aflite");
+    defer a.free(path);
+    {
+        var file = try NativeFile.createWithIo(a, io, path, .{ .no_sync = true });
+        file.close();
+    }
+    // Uncontended: the first `lockReaderPathWithIo` attempt inside
+    // `fairReaderLockWithIo` must succeed outright, never reaching its own
+    // backoff loop.
+    {
+        const deadline = std.Io.Clock.awake.now(io).nanoseconds + 2 * std.time.ns_per_s;
+        var lease = try fairReaderLockWithIo(a, io, path, deadline);
+        lease.close();
+    }
+    // Contended: a writer holds the lease for longer than this call's own
+    // deadline, so it must actually wait (not fail on the first attempt)
+    // and then give up right around the deadline -- not instantly, and
+    // not hung past it either.
+    var writer_lease = try lockWriterPathWithIo(a, io, path);
+    defer writer_lease.close();
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    const deadline = started + 150 * std.time.ns_per_ms;
+    try std.testing.expectError(error.FileBusy, fairReaderLockWithIo(a, io, path, deadline));
+    const elapsed = std.Io.Clock.awake.now(io).nanoseconds - started;
+    try std.testing.expect(elapsed >= 100 * std.time.ns_per_ms);
+    try std.testing.expect(elapsed < 2 * std.time.ns_per_s);
 }
 
 test "lite logical generations preserve runtime identity beyond recovery slots" {
