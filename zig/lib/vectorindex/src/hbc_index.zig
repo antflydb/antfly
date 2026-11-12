@@ -11669,6 +11669,7 @@ pub fn batchInsertWithMetadataTxnOptions(
     var centroid_cache: [16]RelocationCentroidCache = @splat(.{});
     defer for (&centroid_cache) |*entry| entry.deinit(self.alloc);
     for (items) |item| {
+        if (comptime @hasDecl(childType(@TypeOf(self)), "checkConstruction")) try self.checkConstruction();
         var route: ?MutationRoute = null;
         self.write_profile.insert_calls += 1;
         const effective_transformed = blk: {
@@ -11744,6 +11745,7 @@ pub fn batchInsertWithMetadataTxnOptions(
     }
 
     for (deferred_leaf_centroid_deltas.items) |entry| {
+        if (comptime @hasDecl(childType(@TypeOf(self)), "checkConstruction")) try self.checkConstruction();
         // A missing previous version already schedules this leaf for a single
         // final reconstruction. Do not save it twice or apply a partial delta.
         if (std.mem.indexOfScalar(u64, deferred_recompute_leaf_ids.items, entry.leaf_id) != null) continue;
@@ -11767,6 +11769,7 @@ pub fn batchInsertWithMetadataTxnOptions(
     }
 
     for (deferred_recompute_leaf_ids.items) |leaf_id| {
+        if (comptime @hasDecl(childType(@TypeOf(self)), "checkConstruction")) try self.checkConstruction();
         var leaf = loadNode(self, txn, leaf_id) catch |err| {
             if (isNotFoundGeneric(err)) continue;
             return err;
@@ -11787,6 +11790,7 @@ pub fn batchInsertWithMetadataTxnOptions(
     var refreshed_parents = std.ArrayListUnmanaged(u64).empty;
     defer refreshed_parents.deinit(self.alloc);
     for (deferred_ancestor_centroid_refresh_ids.items) |leaf_id| {
+        if (comptime @hasDecl(childType(@TypeOf(self)), "checkConstruction")) try self.checkConstruction();
         var leaf = loadNode(self, txn, leaf_id) catch |err| {
             if (isNotFoundGeneric(err)) continue;
             return err;

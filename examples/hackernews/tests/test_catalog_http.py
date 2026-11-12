@@ -449,7 +449,7 @@ def test_external_maintenance_controller_protocol_and_restart(tmp_path, provider
 @pytest.mark.parametrize("mode", ["managed", "rest"])
 @pytest.mark.parametrize("native_rows", [False, True, "delete_first", "overlay"])
 def test_native_catalog_file_commit_read_and_restart(
-    tmp_path, mode, native_rows, maintenance_provider=None
+    tmp_path, mode, native_rows, maintenance_provider=None, restart_mode="graceful"
 ):
     binary = os.environ.get("ANTFLY_NATIVE_BINARY")
     if not binary:
@@ -613,7 +613,10 @@ def test_native_catalog_file_commit_read_and_restart(
         pytest.fail("daemon did not start")
 
     def stop():
-        process.terminate()
+        if restart_mode == "crash":
+            process.kill()
+        else:
+            process.terminate()
         try:
             process.wait(20)
         except subprocess.TimeoutExpired:
@@ -1127,8 +1130,40 @@ def test_native_catalog_file_commit_read_and_restart(
                     "fields": ["amount"],
                     "limit": 10,
                 }
+                vector_qualification = []
                 for vector_request in (dense_request, sparse_request):
+                    first_started = time.monotonic()
                     vector_result = call("POST", "/tables/hn/query", vector_request)
+                    first_seconds = time.monotonic() - first_started
+                    warm_started = time.monotonic()
+                    warm_result = call("POST", "/tables/hn/query", vector_request)
+                    warm_seconds = time.monotonic() - warm_started
+                    warm_hits = warm_result.get("responses", [warm_result])[0]["hits"][
+                        "hits"
+                    ]
+                    assert sorted(hit["_source"]["amount"] for hit in warm_hits) == [
+                        1,
+                        3,
+                        4,
+                    ], warm_result
+                    vector_qualification.append(
+                        {
+                            "index": vector_request["indexes"][0],
+                            "first_vector_query_after_restart_seconds": first_seconds,
+                            "repeat_query_seconds": warm_seconds,
+                        }
+                    )
+                    (tmp_path / "vector-recovery-qualification.json").write_text(
+                        json.dumps(
+                            {
+                                "restart_mode": restart_mode,
+                                "fixture": "local managed HN accepted overlay; functional qualification",
+                                "requests": vector_qualification,
+                            },
+                            indent=2,
+                        )
+                        + "\n"
+                    )
                     vector_hits = vector_result.get("responses", [vector_result])[0][
                         "hits"
                     ]["hits"]

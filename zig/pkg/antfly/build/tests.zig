@@ -3354,6 +3354,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("lake-text-frontier-test", "Verify metadata-only global admission, score bounds, ties and bounded profile aggregation")
         .dependOn(&addFilteredTestRunArtifact(b, text_frontier_tests).step);
+    const recent_native_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_recent_native_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, recent_native_mod, true, true);
+    const recent_native_tests = b.addTest(.{
+        .root_module = recent_native_mod,
+        .filters = &.{"external lake bounded WAL native"},
+        .max_rss = 8 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lake-recent-native-test", "Verify cooperative recent dense/sparse construction cancellation")
+        .dependOn(&addFilteredTestRunArtifact(b, recent_native_tests).step);
     const filtered_topk_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_filtered_topk_test_root.zig"),
         .target = target,
