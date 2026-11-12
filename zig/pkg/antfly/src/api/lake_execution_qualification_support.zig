@@ -25,6 +25,7 @@ pub const State = struct {
     owned: ?[]u8 = null,
     now_ms: u64 = 101,
     checkpoints: usize = 0,
+    checkpoint_path: ?[]const u8 = null,
     interrupt_after_bulk_source: bool = false,
     interrupt_at_bulk_receipt: ?usize = null,
     bulk_receipts: usize = 0,
@@ -36,6 +37,13 @@ pub const State = struct {
     }
     pub fn set(self: *@This(), bytes: []const u8) !void {
         const owned = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(owned);
+        if (self.checkpoint_path) |path| {
+            const temporary = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
+            defer self.allocator.free(temporary);
+            try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = temporary, .data = bytes });
+            try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), path, self.io);
+        }
         if (self.owned) |old| self.allocator.free(old);
         self.owned = owned;
         self.table.lake_index_catalog_json = owned;

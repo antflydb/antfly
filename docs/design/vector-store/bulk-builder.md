@@ -183,6 +183,16 @@ second corpus copy. A completed-clustering receipt replaces the source-phase wor
 the private native projection checkpoint. Recovery opens a fresh overlay and
 reuses the verified identity/input census from the same catalog checkpoint.
 
+The fused source handoff runs after identity workers have joined. Its checkpoint
+publication must acquire the same bounded I/O capability as ordinary index jobs;
+otherwise the 256 KiB immutable source chunks serialize over remote round trips.
+It preserves an existing caller capability, joins every upload before returning,
+and restores the prior capability on success, cancellation and failure. Disabled
+I/O lanes, insufficient CPU-lane capacity and unknown allocator headroom retain
+the required-inline fallback. This changes scheduling, not the receipt format or
+publication fence. Local-to-GCS qualification and its measurement limits are
+recorded separately from the filesystem construction benchmark.
+
 These receipts live in the catalog's separate `construction` field. They never
 satisfy a serving declaration, and final publication rejects a nonempty
 construction set. Saving uses the active lease and catalog fence. Both ordinary
@@ -649,3 +659,25 @@ and configured admission; it is not a high-dimensional recall comparison.
 Generate the input with `zig/bench/vectors/prepare_identity_stress.py` (requires
 PyArrow), then run the operation probe with `ANTFLY_LAKE_BULK_DIMS=4` and
 `ANTFLY_LAKE_BULK_INPUT_BYTES=536870912`.
+
+
+## Object-store source handoff qualification
+
+A local macOS probe against GCS exposed serial uploads at the fused source
+handoff after identity workers had joined. Borrowing the existing bounded I/O
+scheduler for that quiescent checkpoint reduced a 100K source-receipt phase
+from 359.5 to 127.7 seconds and native construction from 599.6 to 374.7 seconds.
+Both builds reused all 315.5 MB of sealed exact-vector source runs. Dense and
+source allocator peaks were unchanged, and separately reopened publications
+matched the fixed ten-query recall oracle exactly. These are single-pair WAN
+observations on a shared workstation. The original attempt's recall was stopped;
+a separate reopen qualified its retained publication, so there is no paired
+complete child-wall comparison. The [GCS qualification report](../../../zig/bench/vectors/GCS_BULK_QUALIFICATION.md)
+records timer boundaries, hashes, diagnostic overlap and incomplete attempts.
+
+The same diagnostic found that established fresh-index fragment preparation can
+spend substantial time on remote identity-tree lookups before vector insertion.
+A 100K comparison was censored after 20 minutes in that phase. It does not supply
+a completed insertion latency or justify a numerical speedup claim. Future work
+should qualify a bounded streaming join or batched translation design against
+this cost, preserving logical identity and exact physical-row oracle mapping.

@@ -206,6 +206,25 @@ pub const Stage = struct {
         var bytes: u64 = self.allowance *| 3;
         const budget: files.OutputBudget = .{ .generation = &bytes };
         var generation: files.Root = .{ .version = 2, .domain = self.store.upload_scope.?.domain };
+        // Identity reduction has joined its workers before this quiescent
+        // handoff. Unlike an index job, the fused stage otherwise has no I/O
+        // capability, forcing every source chunk through required-inline PUTs.
+        // Reuse the ordinary bounded publication scheduler and preserve any
+        // caller-owned capability. All upload children drain synchronously.
+        var execution: local.sql_parallel_scheduler.Execution = .{
+            .scheduler = if (provider.source.scanner.shared_reader) |reader| reader.scheduler else local.sql_parallel_scheduler.global(),
+            .bytes = 8 * 1024 * 1024,
+            .checkpoint = .{ .ptr = self, .check = checkCensus },
+        };
+        defer execution.pause();
+        var phase: stores.ExecutionIo = .{ .execution = &execution, .io = self.io };
+        const previous_phase = self.store.io_phase;
+        // A disabled or smaller CPU lane must keep required-inline progress;
+        // finish() must never wait for an impossible workspace reservation.
+        if (previous_phase == null and execution.scheduler.max_workers != 0 and
+            execution.scheduler.max_bytes >= execution.bytes)
+            self.store.io_phase = phase.capability();
+        defer self.store.io_phase = previous_phase;
         if (provider.bulk_checkpoints) {
             generation = try files.publishCheckpointPaged(self.a, &checkpoint, generation, "vectors/", self.store, self.token, budget, null);
             generation = try work.publishPartition(self.a, self.store, checkpoint.storage, generation, self.spool_path, partition, self.token, budget, true);
