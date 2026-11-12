@@ -47,7 +47,18 @@ const Io = std.Io;
 const antfly_platform = @import("antfly_platform");
 
 const magic: [8]u8 = "AFLLOCK1".*;
-const format_version: u32 = 1;
+// v2: the ticket ring's own owner word widened from 64 to 128 bits (a
+// packed `(tag, owner)` pair instead of just `owner`), closing a window
+// where a ticket could be taken (`writer_ticket_tail` advanced) before
+// its owner was recorded -- a crash in that window left the ticket
+// permanently unresolvable (its ring slot read as "never claimed"
+// rather than "claimed by a now-dead process", so no liveness slot was
+// ever known to probe). See `packTicketSlot`'s own doc comment for the
+// new layout and `Region.tryClaimTicket`'s for the claim protocol this
+// enables. A v1 region is simply rebuilt (the file is a disposable
+// locking aid, not a migrated artifact), same as any other
+// magic/version mismatch.
+const format_version: u32 = 2;
 
 /// Fixed size of the header itself. The header's own `region_bytes` and
 /// `max_readers` fields (not this constant) are the source of truth for
@@ -237,6 +248,25 @@ fn holderPid(word: u64) u32 {
 
 fn holderLivenessSlot(word: u64) u32 {
     return @truncate(word >> 32);
+}
+
+/// Packs a ticket ring slot: `tag` (the claiming ticket's own absolute
+/// number, offset by one -- see `ticketSlots`'s own doc comment for why
+/// zero must stay reserved for "nobody has ever claimed this slot") in
+/// the upper 64 bits, `owner` (`packHolder`'s own pid/liveness-slot
+/// encoding) in the lower 64. A 128-bit word so claiming a ticket number
+/// and publishing its owner is one atomic CAS, not two separate writes
+/// with a window between them.
+fn packTicketSlot(tag: u64, owner: u64) u128 {
+    return (@as(u128, tag) << 64) | @as(u128, owner);
+}
+
+fn ticketSlotTag(word: u128) u64 {
+    return @truncate(word >> 64);
+}
+
+fn ticketSlotOwner(word: u128) u64 {
+    return @truncate(word);
 }
 
 /// True when mmap or the shared-futex self-test is unavailable and callers
@@ -520,22 +550,22 @@ pub const Region = struct {
         return @ptrCast(@alignCast(self.mapping.ptr));
     }
 
-    /// Byte offset of ticket ring slot `ticket % max_readers`'s owner
-    /// word (packed `pid`/liveness-slot, `packHolder`'s own encoding),
-    /// immediately after the reader slot array -- 8-byte aligned for any
-    /// `max_readers` value, since the reader slot array's own size is
-    /// always a multiple of 8. See `ticketOwnerPids`'s own doc comment
-    /// for what this is for.
+    /// Byte offset of ticket ring slot `ticket % max_readers`'s own
+    /// packed (tag, owner) word (`packTicketSlot`'s own encoding),
+    /// immediately after the reader slot array -- 16-byte aligned for
+    /// any `max_readers` value, since both `header_bytes` and
+    /// `reader_slot_bytes` are themselves multiples of 16. See
+    /// `ticketSlots`'s own doc comment for what this ring is for.
     fn ticketOwnerOffset(max_readers: u32) usize {
         return header_bytes + @as(usize, max_readers) * reader_slot_bytes;
     }
 
     /// Byte offset of liveness slot `slot_index`'s dedicated byte,
-    /// immediately after the ticket owner ring (§8.1's "M*1 process
-    /// liveness bytes, one per slot"). Content is never read or written;
-    /// the byte exists purely as an `fcntl` lock target.
+    /// immediately after the ticket ring (§8.1's "M*1 process liveness
+    /// bytes, one per slot"). Content is never read or written; the
+    /// byte exists purely as an `fcntl` lock target.
     fn livenessByteOffset(max_readers: u32, slot_index: u32) i64 {
-        return @as(i64, @intCast(ticketOwnerOffset(max_readers))) + @as(i64, max_readers) * 8 + @as(i64, slot_index);
+        return @as(i64, @intCast(ticketOwnerOffset(max_readers))) + @as(i64, max_readers) * 16 + @as(i64, slot_index);
     }
 
     /// Byte offset of ticket `ticket`'s abandonment flag, in a fixed ring
@@ -718,7 +748,10 @@ pub const Region = struct {
             try ensureNoLivePeer(raw_fd, &existing_raw, size);
         }
         if (need_init) {
-            const region_bytes = header_bytes + @as(u64, max_readers) * (reader_slot_bytes + 10);
+            // Per-slot overhead: the reader slot itself, the ticket
+            // ring's own 16-byte (tag, owner) word (`packTicketSlot`),
+            // one liveness byte, and one abandonment-flag byte.
+            const region_bytes = header_bytes + @as(u64, max_readers) * (reader_slot_bytes + 18);
             // Rebuild from a clean slate: a corrupt region's leftover
             // reader-slot/liveness bytes are never trusted either, only
             // the header's own validity was checked above. `setLength(0)`
@@ -792,7 +825,7 @@ pub const Region = struct {
         if (claimed_max_readers == 0 or claimed_max_readers > max_sane_readers) {
             return RegionError.RegionCorrupt;
         }
-        const implied_bytes = header_bytes + @as(u64, claimed_max_readers) * (reader_slot_bytes + 10);
+        const implied_bytes = header_bytes + @as(u64, claimed_max_readers) * (reader_slot_bytes + 18);
         if (implied_bytes > actual_file_bytes) {
             // The claimed slot count doesn't even fit the file's actual
             // size -- the header is corrupt enough that this count can't
@@ -914,11 +947,20 @@ pub const Region = struct {
         // needs a *bounded* step at all now, not a true indefinite park.
         var backoff_ms: u32 = ring_full_backoff_initial_ms;
         const my_ticket: u32 = while (true) {
-            if (self.ringHasRoom()) break @truncate(hdr.writer_ticket_tail.fetchAdd(1, .monotonic));
-            countedRawFutexWaitShared(&hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), backoff_ms);
-            backoff_ms = @min(backoff_ms * 2, ring_full_backoff_max_ms);
+            if (!self.ringHasRoom()) {
+                countedRawFutexWaitShared(&hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), backoff_ms);
+                backoff_ms = @min(backoff_ms * 2, ring_full_backoff_max_ms);
+                continue;
+            }
+            // `tryClaimTicket` publishes the owner atomically with the
+            // ticket number itself -- see its own doc comment. A `null`
+            // result resolves itself quickly (a live contender publishes
+            // within a couple of instructions; a dead one is cleared by
+            // this same call), so retrying immediately with a freshly
+            // read `tail` is deliberate, not a missing backoff.
+            const t = hdr.writer_ticket_tail.load(.monotonic);
+            if (self.tryClaimTicket(t, pid)) |ticket| break ticket;
         };
-        self.ticketOwnerPids()[my_ticket % hdr.max_readers].store(packHolder(pid, self.own_liveness_slot), .release);
         while (true) {
             const head = hdr.writer_ticket_head.load(.acquire);
             if (head == my_ticket) break;
@@ -989,13 +1031,19 @@ pub const Region = struct {
         const head = hdr.writer_ticket_head.load(.monotonic);
         const tail: u32 = @truncate(hdr.writer_ticket_tail.load(.monotonic));
         if (head == tail) return false;
-        const owners = self.ticketOwnerPids();
+        const slots = self.ticketSlots();
         const flags = self.ticketAbandonedFlags();
         var t = head;
         while (t != tail) : (t +%= 1) {
             const idx = t % hdr.max_readers;
             if (flags[idx].load(.acquire) != 0) continue;
-            const owner = owners[idx].load(.acquire);
+            const owner = ticketSlotOwner(slots[idx].load(.acquire));
+            // `0`: this exact ring index is mid-transition (its own
+            // claimant is between `tryClaimTicket`'s own two steps, or a
+            // resolver just cleared it and hasn't advanced `head` past it
+            // yet) -- not a foreign waiter to report either way; whoever
+            // is transitioning it will finish the job.
+            if (owner == 0) continue;
             if (holderPid(owner) == own_pid) continue;
             if (self.isSlotDead(holderLivenessSlot(owner))) continue;
             return true;
@@ -1038,11 +1086,19 @@ pub const Region = struct {
         const hdr = self.header();
         if (hdr.writer_ticket_head.load(.monotonic) == @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))) and self.tryAcquireWriter(pid)) return;
         const my_ticket: u32 = while (true) {
-            if (self.ringHasRoom()) break @truncate(hdr.writer_ticket_tail.fetchAdd(1, .monotonic));
+            if (!self.ringHasRoom()) {
+                if (Io.Clock.now(.awake, io).compare(.gte, deadline)) return error.Timeout;
+                countedFutexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), deadline) catch return error.Canceled;
+                continue;
+            }
+            // See `acquireWriter`'s own identical claim loop:
+            // `tryClaimTicket` publishes the owner atomically with the
+            // ticket number, so a `null` result just means retry with a
+            // freshly read `tail`, not a wait.
+            const t = hdr.writer_ticket_tail.load(.monotonic);
+            if (self.tryClaimTicket(t, pid)) |ticket| break ticket;
             if (Io.Clock.now(.awake, io).compare(.gte, deadline)) return error.Timeout;
-            countedFutexWaitSharedBounded(io, &hdr.writer_ticket_head.raw, hdr.writer_ticket_head.load(.monotonic), deadline) catch return error.Canceled;
         };
-        self.ticketOwnerPids()[my_ticket % hdr.max_readers].store(packHolder(pid, self.own_liveness_slot), .release);
         while (true) {
             const head = hdr.writer_ticket_head.load(.acquire);
             if (head == my_ticket) break;
@@ -1138,20 +1194,38 @@ pub const Region = struct {
     /// in the meantime. See `tryHelpDeadTicketAt`'s own doc comment.
     const dead_ticket_check_step_ms: u32 = 50;
 
-    /// `true` (and clears the abandonment flag, if that is why) when
-    /// ticket `ticket` is already resolved one way or another -- either
-    /// explicitly abandoned, or its recorded owner is provably dead --
-    /// without this call itself needing to own or win it.
+    /// `true` (and clears the abandonment flag and the ticket's own ring
+    /// slot, if that is why -- freeing this exact ring index for a
+    /// future generation, same as a real winner's own ticket gets
+    /// cleared in `advanceHeadPastAbandoned`) when ticket `ticket` is
+    /// already resolved one way or another -- either explicitly
+    /// abandoned, or its recorded owner is provably dead -- without this
+    /// call itself needing to own or win it.
+    ///
+    /// A ring slot read as genuinely empty (`owner == 0`) here -- not
+    /// just "not yet this call's concern" -- answers `false`: it means
+    /// some other, concurrent caller (this same ticket's own real
+    /// claimant publishing it, or another helper that already resolved
+    /// it) is actively transitioning this exact slot, so there is
+    /// nothing for *this* call to do; whoever is responsible will finish
+    /// the job.
     fn ticketResolvedWithoutOwning(self: *Region, ticket: u32) bool {
         const hdr = self.header();
         const idx = ticket % hdr.max_readers;
         const flags = self.ticketAbandonedFlags();
+        const slots = self.ticketSlots();
         if (flags[idx].load(.acquire) != 0) {
             flags[idx].store(0, .monotonic);
+            slots[idx].store(0, .release);
             return true;
         }
-        const owner = self.ticketOwnerPids()[idx].load(.acquire);
-        return owner != 0 and self.isSlotDead(holderLivenessSlot(owner));
+        const existing = slots[idx].load(.acquire);
+        const owner = ticketSlotOwner(existing);
+        if (owner != 0 and self.isSlotDead(holderLivenessSlot(owner))) {
+            slots[idx].store(0, .release);
+            return true;
+        }
+        return false;
     }
 
     /// Called by a waiter stuck making no progress on `head` (any phase,
@@ -1194,11 +1268,16 @@ pub const Region = struct {
 
     /// After winning ticket `my_ticket`'s CAS, or voluntarily stepping
     /// aside for it (`acquireWriterFairBounded`'s own phase-2 timeout),
-    /// advances `head` past it and delegates to `continueSkippingFrom`
-    /// for anything immediately following that is also already
-    /// resolved.
+    /// clears this now-resolved ticket's own ring slot (freeing this
+    /// exact ring index for a future generation, the same cleanup
+    /// `ticketResolvedWithoutOwning` does for a ticket resolved the
+    /// *other* way), advances `head` past it, and delegates to
+    /// `continueSkippingFrom` for anything immediately following that is
+    /// also already resolved.
     fn advanceHeadPastAbandoned(self: *Region) void {
         const hdr = self.header();
+        const my_ticket = hdr.writer_ticket_head.load(.monotonic);
+        self.ticketSlots()[my_ticket % hdr.max_readers].store(0, .release);
         const new_head = hdr.writer_ticket_head.fetchAdd(1, .release) +% 1;
         self.continueSkippingFrom(new_head);
     }
@@ -1283,9 +1362,25 @@ pub const Region = struct {
         return base[0..max_readers];
     }
 
-    /// A ring of `max_readers` packed owner words (`packHolder`'s own
-    /// `(pid, liveness_slot)` encoding), one per `ticket % max_readers`,
-    /// written when a ticket is taken and read for two purposes:
+    /// A ring of `max_readers` packed `(tag, owner)` words
+    /// (`packTicketSlot`'s own encoding; `owner` is `packHolder`'s own
+    /// `(pid, liveness_slot)` encoding), one per `ticket % max_readers`.
+    /// `0` means genuinely empty -- nobody has ever claimed this
+    /// generation of the slot -- which is why `tag` is stored as the
+    /// claiming ticket's own number *plus one*: ticket 0 would otherwise
+    /// be indistinguishable from empty.
+    ///
+    /// Claimed atomically with the ticket number itself
+    /// (`tryClaimTicket`'s own doc comment has the full protocol) --
+    /// deliberately not a plain `store` after `writer_ticket_tail`'s own
+    /// `fetchAdd` the way this worked before v2 of this format: that left
+    /// a window where a ticket existed (tail already advanced) but its
+    /// owner wasn't recorded yet, and a crash in that exact window left
+    /// the ring slot permanently unresolvable (read as "never claimed"
+    /// rather than "claimed by a now-dead process", so no liveness slot
+    /// was ever known to probe).
+    ///
+    /// Read for two purposes, both via `ticketSlotOwner`:
     ///
     /// 1. `othersWaitingAcrossProcesses` -- telling a genuinely foreign
     ///    waiter apart from this same process's own other caller (its
@@ -1297,10 +1392,69 @@ pub const Region = struct {
     ///    `tryHelpDeadTicketAt`'s own doc comment for the full case this
     ///    closes (a `kill -9` of a queued waiter, in either phase, that
     ///    never gets the chance to mark its own abandonment).
-    fn ticketOwnerPids(self: *const Region) []std.atomic.Value(u64) {
+    ///
+    /// Cleared back to `0` once a ticket resolves one way or another
+    /// (`ticketResolvedWithoutOwning`'s own doc comment), freeing this
+    /// exact ring index for a future generation to claim.
+    fn ticketSlots(self: *const Region) []std.atomic.Value(u128) {
         const max_readers = self.header().max_readers;
-        const base: [*]std.atomic.Value(u64) = @ptrCast(@alignCast(self.mapping.ptr + ticketOwnerOffset(max_readers)));
+        const base: [*]std.atomic.Value(u128) = @ptrCast(@alignCast(self.mapping.ptr + ticketOwnerOffset(max_readers)));
         return base[0..max_readers];
+    }
+
+    /// Non-blocking attempt at the two confirming steps of a ticket
+    /// claim for the speculative tail value `t` this caller already
+    /// read: §8.2's own fix for the ownerless-ticket window
+    /// `ticketSlots`'s own doc comment describes.
+    ///
+    /// 1. CAS `ticketSlots()[t % max_readers]` from empty (`0`) to this
+    ///    process's own claim (`packTicketSlot(t +% 1, ...)`). Losing
+    ///    this means the slot is occupied -- either a live concurrent
+    ///    claimant racing for this *exact* `t` (another process read the
+    ///    same `writer_ticket_tail` value before either of us advanced
+    ///    it) or a dead one that crashed between this step and the next.
+    ///    Tells the two apart by tag: only a slot whose own tag matches
+    ///    `t +% 1` is this exact ticket's own contested claim (anything
+    ///    else is a different ticket number's own leftover, not this
+    ///    call's concern); if the owner is dead, clears the slot so a
+    ///    caller's own retry (from the top, with a fresh `t`) can win it
+    ///    -- it does not retry the claim itself.
+    /// 2. CAS `writer_ticket_tail` from `t` to `t +% 1`. Losing this
+    ///    means some other process's own step 2 already advanced it
+    ///    (this call only reaches here after *winning* step 1 for `t`,
+    ///    so a concurrent claimant for this exact `t` must have lost
+    ///    step 1 and cannot be the reason; this is instead a genuinely
+    ///    different ticket's own tail advance racing ahead, meaning `t`
+    ///    itself is now stale): undoes this call's own step 1 (stores
+    ///    the slot back to empty) so a retry with a fresh `t` can use
+    ///    this same ring index again once it's genuinely free.
+    ///
+    /// Returns the ticket number (always `t` itself, truncated to
+    /// `u32` like every other ticket number in this file) on success,
+    /// `null` on either failure above -- the caller should back off
+    /// briefly (this is expected to resolve in at most a few retries:
+    /// a live contender publishes within a couple of instructions, a
+    /// dead one gets cleared on this same call) and retry the whole
+    /// claim with a freshly read `t`.
+    fn tryClaimTicket(self: *Region, t: u64, pid: u32) ?u32 {
+        const hdr = self.header();
+        const idx: u32 = @intCast(t % @as(u64, hdr.max_readers));
+        const slots = self.ticketSlots();
+        const want = packTicketSlot(t +% 1, packHolder(pid, self.own_liveness_slot));
+        if (slots[idx].cmpxchgStrong(0, want, .acq_rel, .monotonic)) |existing| {
+            if (ticketSlotTag(existing) == t +% 1) {
+                const owner = ticketSlotOwner(existing);
+                if (self.isSlotDead(holderLivenessSlot(owner))) {
+                    _ = slots[idx].cmpxchgStrong(existing, 0, .acq_rel, .monotonic);
+                }
+            }
+            return null;
+        }
+        if (hdr.writer_ticket_tail.cmpxchgStrong(t, t +% 1, .monotonic, .monotonic) != null) {
+            slots[idx].store(0, .release);
+            return null;
+        }
+        return @truncate(t);
     }
 
     /// LMDB calls the same condition (a fixed `maxreaders` table with no
