@@ -26,6 +26,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import selectors
 import shutil
 import signal
 import subprocess
@@ -69,7 +70,28 @@ def check_object(value, expected):
         raise ValueError("remote source differs from hash-verified input")
 
 
-def upload(bucket, prefix, name, path, expected, framed, log_path):
+def terminate_group(process):
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        # The leader can exit before descendants that ignore SIGTERM. Drain
+        # the owned group even when waiting for its leader already succeeded.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def upload(bucket, prefix, name, path, expected, framed, log_path, *, timeout=1800):
     # Never retain another raw corpus just to remove the filesystem envelope.
     argv = [
         "gcloud",
@@ -85,22 +107,42 @@ def upload(bucket, prefix, name, path, expected, framed, log_path):
             stream.seek(84)
         hashed = hashlib.sha256()
         process = subprocess.Popen(
-            argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=upload_log
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=upload_log,
+            start_new_session=True,
         )
+        deadline = time.monotonic() + timeout
         try:
-            while chunk := stream.read(8 * 1024 * 1024):
-                hashed.update(chunk)
-                process.stdin.write(chunk)
+            os.set_blocking(process.stdin.fileno(), False)
+            with selectors.DefaultSelector() as ready:
+                ready.register(process.stdin, selectors.EVENT_WRITE)
+                while chunk := stream.read(8 * 1024 * 1024):
+                    hashed.update(chunk)
+                    pending = memoryview(chunk)
+                    while pending:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not ready.select(remaining):
+                            raise subprocess.TimeoutExpired(argv, timeout)
+                        try:
+                            written = os.write(process.stdin.fileno(), pending)
+                        except BlockingIOError:
+                            continue
+                        pending = pending[written:]
             process.stdin.close()
-            process.wait(timeout=1800)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            process.wait(timeout=remaining)
             if process.returncode:
                 raise RuntimeError("source upload failed")
             if hashed.hexdigest() != expected["sha256"]:
                 raise ValueError("source changed during upload")
         finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
+            if not process.stdin.closed:
+                process.stdin.close()
+            terminate_group(process)
 
 
 def main():
@@ -129,6 +171,8 @@ def main():
     )
     p.add_argument("--timeout", type=int, default=7200)
     args = p.parse_args()
+    if args.interrupt and args.reopen_from:
+        p.error("receipt interruption and verification-only reopen are separate cases")
     if args.interrupt and args.variant != "optimized":
         p.error("construction receipts require the optimized builder")
     if not 60 <= args.timeout <= 10800:
@@ -259,12 +303,7 @@ def main():
         try:
             process.wait(timeout=args.timeout)
         except BaseException:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+            terminate_group(process)
             raise
         finally:
             report["wall_seconds"] = time.monotonic() - start

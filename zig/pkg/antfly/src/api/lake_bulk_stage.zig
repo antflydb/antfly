@@ -211,20 +211,9 @@ pub const Stage = struct {
         // capability, forcing every source chunk through required-inline PUTs.
         // Reuse the ordinary bounded publication scheduler and preserve any
         // caller-owned capability. All upload children drain synchronously.
-        var execution: local.sql_parallel_scheduler.Execution = .{
-            .scheduler = if (provider.source.scanner.shared_reader) |reader| reader.scheduler else local.sql_parallel_scheduler.global(),
-            .bytes = 8 * 1024 * 1024,
-            .checkpoint = .{ .ptr = self, .check = checkCensus },
-        };
-        defer execution.pause();
-        var phase: stores.ExecutionIo = .{ .execution = &execution, .io = self.io };
-        const previous_phase = self.store.io_phase;
-        // A disabled or smaller CPU lane must keep required-inline progress;
-        // finish() must never wait for an impossible workspace reservation.
-        if (previous_phase == null and execution.scheduler.max_workers != 0 and
-            execution.scheduler.max_bytes >= execution.bytes)
-            self.store.io_phase = phase.capability();
-        defer self.store.io_phase = previous_phase;
+        var publication_io: stores.PublicationIo = .{};
+        publication_io.install(&self.store.io_phase, self.io, if (provider.source.scanner.shared_reader) |reader| reader.scheduler else local.sql_parallel_scheduler.global(), .{ .ptr = self, .check = checkCensus });
+        defer publication_io.deinit();
         if (provider.bulk_checkpoints) {
             generation = try files.publishCheckpointPaged(self.a, &checkpoint, generation, "vectors/", self.store, self.token, budget, null);
             generation = try work.publishPartition(self.a, self.store, checkpoint.storage, generation, self.spool_path, partition, self.token, budget, true);

@@ -188,9 +188,15 @@ publication must acquire the same bounded I/O capability as ordinary index jobs;
 otherwise the 256 KiB immutable source chunks serialize over remote round trips.
 It preserves an existing caller capability, joins every upload before returning,
 and restores the prior capability on success, cancellation and failure. Disabled
-I/O lanes, insufficient CPU-lane capacity and unknown allocator headroom retain
+I/O lanes, insufficient CPU-lane capacity, busy admission and unknown allocator headroom retain
 the required-inline fallback. This changes scheduling, not the receipt format or
-publication fence. Local-to-GCS qualification and its measurement limits are
+publication fence. A stack-owned publication scope first tries CPU admission
+against the scheduler's usable CPU budget, after its I/O reserve. It never waits
+for an impossible or nested CPU reservation. Source, completed-tree and final
+dense checkpoints share this scope; inherited capabilities remain borrowed.
+Every upload wave yields CPU admission, drains all children and restores CPU
+admission before returning; scope cleanup releases it on success and failure.
+Local-to-GCS qualification and its measurement limits are
 recorded separately from the filesystem construction benchmark.
 
 These receipts live in the catalog's separate `construction` field. They never
@@ -678,6 +684,21 @@ records timer boundaries, hashes, diagnostic overlap and incomplete attempts.
 The same diagnostic found that established fresh-index fragment preparation can
 spend substantial time on remote identity-tree lookups before vector insertion.
 A 100K comparison was censored after 20 minutes in that phase. It does not supply
-a completed insertion latency or justify a numerical speedup claim. Future work
-should qualify a bounded streaming join or batched translation design against
-this cost, preserving logical identity and exact physical-row oracle mapping.
+a completed insertion latency or justify a numerical speedup claim.
+
+Broad uncaptured fragment preparation now merge-joins current and fragment
+identity maps in verified ID order. It checks equal IDs, value evidence and row
+counts, externally sorts 16-byte physical coordinates into a private translation
+tree, and rejects duplicate physical coordinates by checking the reduced count.
+Physical files resolve once through the authenticated dictionary. Payload tiles
+then batch-seek only the local tree, rather than seeking both remote identity
+maps for every tile. The existing captured-payload adoption path keeps its
+verified-ID join and does not pay for this extra map.
+
+The translation map shares the spool's 64 MiB workspace and configured spill
+quota. All temporary pages remain private and are deleted when capture finishes;
+they never change a publication format or enter its GC closure. Quota pressure
+can still decline the optional spool and use the existing required gather path.
+This converts repeated random cloud navigation into sequential remote scans plus
+bounded local sorting and seeks. Read-count comparisons and remote timing must
+be reported separately; neither establishes a full managed-table import rate.

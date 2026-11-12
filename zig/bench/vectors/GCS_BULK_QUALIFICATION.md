@@ -109,3 +109,53 @@ repeatedly translating physical rows through remote identity-tree pages and a
 bulk-versus-incremental speedup. The probe oracle must translate logical fragment
 hits back through the authenticated per-index coordinate space before consulting
 the physical-row truth; raw fragment ordinals are not physical Parquet ordinals.
+
+
+## Review hardening
+
+Publication scopes now check usable CPU capacity after the I/O reserve and use
+nonwaiting admission. Disabled, undersized or busy schedulers keep inline
+progress. The same scope covers source receipts, completed-tree receipts and
+final dense publication. Native checks cover a scheduler with only 8 MiB total
+memory, disabled lanes, busy admission, nested inheritance, failed uploads and
+cancellation while resuming CPU admission.
+
+Uploads have a whole-transfer deadline, including blocked stdin writes. The
+controller terminates the upload's process group and reaps it on timeout. Local
+source verification and upload remain outside measured construction time.
+
+Receipt tests require the requested source/tree phase, bind the saved catalog to
+the exact emitted manifest and require the resumed builder to accept that same
+receipt. The native dense builder must consume zero new input rows on resume and must not repeat the fused
+source handoff. Completed-tree resume must perform zero clustering calls and emit
+no new clustering work record. These checks prove reuse as well as successful
+reopen; they remain graceful phase-boundary process restarts, not power-loss tests.
+
+The review validation build overlaps the frozen 1M scale observation. That run
+must not be used as a controlled throughput comparison. Fresh timing comparisons
+use frozen revised binaries after compilation and tests finish.
+
+
+The [review measurements](gcs_bulk_review_results.json) retain the native and
+offline test results. An 8,192-row shuffled-coordinate fixture needed 52 remote
+navigation reads with the sequential join versus 857 with the previous tiled
+lookup strategy and its 16-page/2 MiB cache. These instrumented page-store reads
+are not full HTTP request counts. Both use the same authenticated input trees;
+the map checks preserve IDs, value evidence and physical-to-logical coordinates.
+
+The frozen 1M attempt failed with `UnexpectedEof` after 1,362.012 seconds of child
+wall time, before saving a construction receipt. It supplies neither a completed
+native time nor recall qualification. The error name alone does not localize the
+cause. The probe now emits completed phase counters on build failures, and the
+harness retains them even when qualification fails. Any retry is a separate
+attempt and must not replace this failed record.
+
+
+Both strict GCS receipt checks passed on a synthetic 1,024-row, 768d fixture.
+Separate resume processes accepted the exact saved source/tree manifests and
+consumed zero new dense input rows. Source resume clustered once; completed-tree
+resume clustered zero times and emitted no clustering work record. Both reopened
+and returned 197/200 oracle hits at all five widths. Cache collection overlapped
+these correctness checks; their elapsed times are not performance evidence. The
+final native build passed 87/87 steps, with 27 tests passed, one guarded S3 test
+skipped, and no failures or leaks. All 18 Python regression tests passed.

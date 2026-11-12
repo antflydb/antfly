@@ -46,6 +46,52 @@ def network():
     )
 
 
+def parse_records(text):
+    records = {}
+    for line in text.splitlines():
+        if line.startswith("PARQUET_BULK_") and " {" in line:
+            key, value = line.split(" ", 1)
+            records.setdefault(key, []).append(json.loads(value))
+    return records
+
+
+def validate_interruption(cfg, row, text, catalog):
+    phase = "source" if cfg["interrupt"] == 1 else "tree"
+    records = parse_records(text)
+    receipts = records.get("PARQUET_BULK_RECEIPT", [])
+    expected_phases = ["source"] if phase == "source" else ["source", "tree"]
+    construction = (catalog.get("checkpoint") or {}).get("construction", [])
+    if (
+        row["exit_code"] == 0
+        or "Cancelled" not in text
+        or [receipt["phase"] for receipt in receipts] != expected_phases
+        or len(construction) != 1
+        or receipts[-1]["name"] != "emb"
+        or receipts[-1]["rows"] != cfg["rows"]
+        or construction[0]["name"] != receipts[-1]["name"]
+        or construction[0]["manifest"]["artifact_id"] != receipts[-1]["manifest"]
+    ):
+        raise RuntimeError("interruption did not retain the requested receipt phase")
+    return receipts[-1]
+
+
+def validate_resume(records, receipt):
+    if records.get("PARQUET_BULK_RESUME") != [receipt]:
+        raise RuntimeError("resume did not accept the exact retained receipt")
+    if records.get("PARQUET_BULK_INPUT") != [dict(rows=0, resumed=True)]:
+        raise RuntimeError("resume replayed source input")
+    phases = records["PARQUET_BULK_PHASES"][0]
+    calls = dict(zip(phases["names"], phases["calls"]))
+    expected_clusters = 0 if receipt["phase"] == "tree" else 1
+    if (
+        calls.get("dense_cluster") != expected_clusters
+        or calls.get("bulk_tee") != 0
+        or calls.get("bulk_receipt") != 0
+        or (receipt["phase"] == "tree" and records.get("PARQUET_BULK_WORK"))
+    ):
+        raise RuntimeError("resume repeated completed construction work")
+
+
 def main():
     cfg = json.loads(Path(sys.argv[1]).read_text())
     token = "" if cfg.get("auth") == "adc" else sys.stdin.readline(65537).strip()
@@ -149,6 +195,7 @@ def main():
 
     sampler = threading.Thread(target=sample_disk, daemon=True)
     sampler.start()
+    retained_receipt = None
     for stage in (
         ["reopen"]
         if cfg.get("reopen_catalog")
@@ -189,14 +236,12 @@ def main():
         text = (root / (stage + ".log")).read_text()
         if token and token in text:
             raise RuntimeError("credential appeared in child log")
+        row["records"] = parse_records(text)
+        atomic(root / "result.json", report)
         if stage == "interrupt":
             catalog = json.loads((root / "catalog.json").read_text())
-            if (
-                child.returncode == 0
-                or "Cancelled" not in text
-                or not catalog.get("checkpoint", {}).get("construction")
-            ):
-                raise RuntimeError("interruption did not retain construction receipt")
+            retained_receipt = validate_interruption(cfg, row, text, catalog)
+            row["retained_receipt"] = retained_receipt
             row["retained_catalog_sha256"] = hashlib.sha256(
                 (root / "catalog.json").read_bytes()
             ).hexdigest()
@@ -210,11 +255,6 @@ def main():
             raise RuntimeError("build/reopen verification failed")
         row["native_ns"] = int(match[2])
         row["checkpoints"] = int(match[3])
-        row["records"] = {}
-        for line in text.splitlines():
-            if line.startswith("PARQUET_BULK_") and " {" in line:
-                key, value = line.split(" ", 1)
-                row["records"].setdefault(key, []).append(json.loads(value))
         from bench_bulk_pipeline import validate_recall
 
         truth = json.loads((Path(cfg["recall"]) / "prepare.json").read_text())
@@ -244,6 +284,8 @@ def main():
             for key in ("dense_allocator_peak_bytes", "source_allocator_peak_bytes")
         ):
             raise RuntimeError("missing memory evidence or private quota exceeded")
+        if stage == "resume":
+            validate_resume(records, retained_receipt)
         if cfg["variant"] != "incremental":
             source = records.get("PARQUET_BULK_SOURCE", [])
             if (

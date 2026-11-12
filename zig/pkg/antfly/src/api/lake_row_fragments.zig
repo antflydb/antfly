@@ -1304,12 +1304,28 @@ const Spool = struct {
         var write_bytes: u64 = 0;
         var pages = self.owner.pageStore(&read_bytes, &write_bytes);
         pages.artifacts = store;
-        var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store(), .max_bytes = 2 * 1024 * 1024 };
-        defer cache.deinit();
-        var root = self.owner.root;
-        root.indexes = self.owner.space;
-        root.reused = &.{};
-        var resolver: identity.Reader = .{ .root = root, .pages = &pages, .cache = &cache };
+        pages.read_phase = store.io_phase;
+        // Join verified ID streams once. The private map has 16-byte physical
+        // keys and logical values, under this spool's existing memory/disk cap.
+        var translation: @import("../serverless/graph_segment/page_store.zig").PrivatePages = .{ .manager = &self.manager, .domain = self.owner.root.domain, .attempt = store.upload_scope.?.attempt, .phase = store.io_phase };
+        defer translation.deinit();
+        const translation_store = try @import("../serverless/graph_segment/page_store.zig").PrivatePages.beginRun(&translation);
+        const translation_root = try @import("lake_row_coordinate_join.zig").build(a, &self.manager, self.owner.root.current, self.owner.space, pages.store(), translation_store);
+        var physical_slots: std.StringHashMapUnmanaged(u32) = .empty;
+        defer physical_slots.deinit(a);
+        // Resolve each physical file dictionary proof once, rather than once
+        // per tile. Support legacy spaces whose reverse dictionary is absent.
+        var files = try tree.Cursor.init(a, pages.store(), self.owner.root.current.files, "", null);
+        defer files.deinit();
+        while (try files.next()) |file| {
+            if (file.key.len != 4 or file.value.len == 0 or file.value.len > 4096) return error.InvalidLogicalRowIdentity;
+            const slot = std.mem.readInt(u32, file.key[0..4], .big);
+            if (slot >= self.owner.root.current.file_count) return error.InvalidLogicalRowIdentity;
+            const name = try out.dupe(u8, file.value);
+            const entry = try physical_slots.getOrPut(a, name);
+            if (entry.found_existing) return error.InvalidLogicalRowIdentity;
+            entry.value_ptr.* = slot;
+        }
         var cluster = @import("lake_row_payloads.zig").Cluster.init(a, &self.manager, columns.len);
         defer cluster.deinit();
         var bound = false;
@@ -1332,20 +1348,27 @@ const Spool = struct {
                 var tile = std.heap.ArenaAllocator.init(a);
                 defer tile.deinit();
                 const ta = tile.allocator();
-                var translating = try store.beginIo(1);
-                defer translating.abort();
-                const references = try ta.alloc(rows.RowRef, end - begin);
-                for (references, begin..) |*ref, row| ref.* = batch.rowRef(row);
-                const logical = resolver.translateMany(ta, references, false) catch |err| return translating.failed(err);
-                try translating.finish();
+                const keys_ = try ta.alloc([16]u8, end - begin);
+                const pointers = try ta.alloc([]const u8, end - begin);
+                for (keys_, pointers, begin..) |*key, *pointer, row| {
+                    const ref = batch.rowRef(row);
+                    if (ref != .external or !std.mem.eql(u8, ref.external.source_id, self.owner.root.current.source) or !std.mem.eql(u8, ref.external.snapshot_id, self.owner.root.current.snapshot)) return error.ExternalLakeSnapshotMismatch;
+                    const slot = physical_slots.get(ref.external.file_id) orelse return error.InvalidLogicalRowIdentity;
+                    key.* = (identity.logical.Coordinate{ .file = slot, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }).encode();
+                    pointer.* = key;
+                }
+                const logical = try tree.lookupMany(ta, translation_store, translation_root, pointers);
                 var selected: [256]usize = undefined;
                 var coordinates: [256]identity.logical.Coordinate = undefined;
                 var count: usize = 0;
-                for (logical, begin..) |row, physical| {
-                    const file = self.positions.get(row.coordinate.file) orelse return error.InvalidLogicalRowIdentity;
+                for (logical, begin..) |entry, physical| {
+                    const row = entry orelse return error.InvalidLogicalRowIdentity;
+                    if (row.value.len != 16) return error.InvalidLogicalRowIdentity;
+                    const coordinate = try identity.logical.Coordinate.decode(row.value);
+                    const file = self.positions.get(coordinate.file) orelse return error.InvalidLogicalRowIdentity;
                     if (!self.needed[file]) continue;
                     selected[count] = physical;
-                    coordinates[count] = row.coordinate;
+                    coordinates[count] = coordinate;
                     count += 1;
                 }
                 const keys = try ta.alloc([]const u8, count);
@@ -1363,6 +1386,11 @@ const Spool = struct {
         }
         try cluster.finish(&self.payloads, &edits);
         self.route_root = try edits.finish(null);
+        var expected: u64 = 0;
+        for (self.needed, self.owner.fragments) |needed, fragment| if (needed) {
+            expected += fragment.count;
+        };
+        if ((if (self.route_root) |ref| ref.records else 0) != expected) return error.InvalidLogicalRowIdentity;
         self.routes.phase = null;
     }
     /// Merge the verified ID stream with captured offsets; sort only final routes.
@@ -1578,12 +1606,10 @@ pub fn prepareCapturedSpool(self: *Build, provider: *Provider, store: *stores.Ar
     spool.routes = .{ .manager = &spool.manager, .domain = self.root.domain, .attempt = self.store.upload_scope.?.attempt };
     spool.payloads = try Spool.spill.JoinPayloads.init(&spool.manager);
     spool.initialized = true;
-    var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = scheduler, .bytes = 8 * 1024 * 1024, .checkpoint = .{ .ptr = self, .check = Build.check } };
-    defer execution.pause();
-    try execution.enter(self.context.io.?);
-    var io: stores.ExecutionIo = .{ .execution = &execution, .io = self.context.io.? };
     var backend = store.*;
-    backend.io_phase = io.capability();
+    var publication_io: stores.PublicationIo = .{};
+    publication_io.install(&backend.io_phase, self.context.io.?, scheduler, .{ .ptr = self, .check = Build.check });
+    defer publication_io.deinit();
     spool.routes.phase = backend.io_phase;
     const captured: anyerror!void = if (capture) |value| spool.adopt(value, &backend) else spool.scanCapture(provider, &backend);
     captured catch |err| {
@@ -2788,4 +2814,9 @@ test "external lake logical fragments capture reuses scratch and encodes identic
     try std.testing.expectEqual(hashes[0].final(), hashes[1].final());
     try std.testing.expect(capacity[1] * 100 < capacity[0]);
     std.debug.print("CAPTURE_TUPLES rows={d} prior_arena_bytes={d} reusable_arena_bytes={d} prior_ns={d} direct_ns={d} checksum={d}\n", .{ count, capacity[0], capacity[1], times[0], times[1], hashes[0].final() });
+}
+
+test "external lake execution broad fragment routing preserves random and ordered physical hydration" {
+    try broadSpoolScenario(false, false, true, false);
+    try broadSpoolScenario(false, false, false, true);
 }

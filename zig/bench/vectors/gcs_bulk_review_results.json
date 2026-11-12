@@ -1,0 +1,688 @@
+{
+  "version": 1,
+  "date": "2026-11-12",
+  "coordinate_join": {
+    "fixture": "8192 rows with shuffled physical coordinates, noncompact verified ID maps, existing 16-page/2MiB point cache",
+    "sequential_remote_navigation_reads": 52,
+    "tiled_remote_navigation_reads": 857,
+    "measurement": "instrumented page-store reads, not HTTP request counts or end-to-end timings",
+    "equal_membership_and_values": true,
+    "tests": [
+      "exact coordinate mapping",
+      "changed value evidence rejected",
+      "row-count mismatch rejected",
+      "duplicate physical coordinate rejected",
+      "random and ordered physical hydration"
+    ]
+  },
+  "native_validation": {
+    "passed": 27,
+    "skipped": 1,
+    "failed": 0,
+    "leaked": 0,
+    "skip": "guarded S3-compatible service test",
+    "build_steps_succeeded": 87,
+    "build_steps_total": 87
+  },
+  "offline_harness_validation": {
+    "passed": 5,
+    "tests": [
+      "stalled stdin whole-transfer deadline and process reap",
+      "framed source payload fidelity",
+      "early consumer failure reap",
+      "exact phase and manifest",
+      "input replay and repeated-clustering rejection"
+    ]
+  },
+  "one_m_frozen_attempt": {
+    "status": "failed",
+    "error": "UnexpectedEof",
+    "cause": "not localized; do not infer a transport defect from the error name",
+    "qualified": false,
+    "completed_native_time_available": false,
+    "constructor_receipt_saved": false,
+    "diagnostic_overlap": "review validation build overlaps tail of this run; not controlled throughput evidence",
+    "binary_sha256": "e6c319d7f53eaefd61b06d6d2da369ebd9b175231df95f108e51b77a107b2c20",
+    "source_binding": {
+      "bytes": 3131995162,
+      "sha256": "de6b84eb08fc5203a56eef619970a14f5cae08d0a0ae0bcd23b8058d7045f381",
+      "fixture": null
+    },
+    "source_generations": [
+      {
+        "name": "bulk-qualification/20261112-cohere-1m-de6b84eb/source/train.parquet",
+        "generation": "1794501154064110"
+      }
+    ],
+    "attempts": [
+      {
+        "stage": "build",
+        "exit_code": 1,
+        "wall_ns": 1362011545042,
+        "user_seconds": 63.070122,
+        "system_seconds": 16.852435,
+        "peak_rss_bytes": 181092352,
+        "pod_network_bytes": null
+      }
+    ]
+  },
+  "remote_receipt_validation": {
+    "measurement": "synthetic 1024-row 768d fixture; two oracle queries; correctness only, GC overlapped",
+    "source": {
+      "bytes": 2909639,
+      "sha256": "ba7d594e891a07c2be47ebdac6fc81f5c952b983f8f66578ff94eb6b78593422",
+      "prefix": "bulk-qualification/20261112-review-fallback-ba7d594e/source"
+    },
+    "source_generation": "1794509503506737",
+    "binary_sha256": "f5234d868c4fac4047845569f2518a21d16ac0e7526e6441b5cc47de8cbcea38",
+    "worker_sha256": "d89a4a9ae77adda92cb4b2e0e4162544f3d9a36a369fb84e3acd604237213ccc",
+    "cases": [
+      {
+        "phase": 1,
+        "qualified": true,
+        "attempts": [
+          {
+            "stage": "interrupt",
+            "exit_code": 1,
+            "wall_ns": 9890983333,
+            "user_seconds": 0.096117,
+            "system_seconds": 0.081782,
+            "peak_rss_bytes": 44777472,
+            "pod_network_bytes": null,
+            "records": {
+              "PARQUET_BULK_BUILD_MODE": [
+                {
+                  "caller": "fast",
+                  "caller_value": 1,
+                  "provider": 1,
+                  "provider_is_test": false
+                }
+              ],
+              "PARQUET_BULK_RECEIPT": [
+                {
+                  "name": "emb",
+                  "manifest": "sha256:7fef84c373103c756347d401779acca65eeee91afd8e134621362f986774a631:graph:d12dd68ac55e6485bf5a0adea11f61116fef654989bb4ed3f896639a1fecbb2b:000000000000000118aca98954d8e656",
+                  "phase": "source",
+                  "rows": 1024
+                }
+              ],
+              "PARQUET_BULK_FAILURE_PHASES": [
+                {
+                  "error_name": "Cancelled",
+                  "cause": null,
+                  "elapsed_ns": 8843070000,
+                  "names": [
+                    "identity",
+                    "fragments",
+                    "spool",
+                    "aggregate",
+                    "ordered",
+                    "text",
+                    "sparse",
+                    "dense",
+                    "bulk_tee",
+                    "bulk_receipt",
+                    "dense_ingest",
+                    "dense_cluster",
+                    "dense_checkpoint",
+                    "dense_upload"
+                  ],
+                  "ns": [
+                    3794143000,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    2413000,
+                    3567565000,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "calls": [
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    1,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0
+                  ]
+                }
+              ]
+            },
+            "retained_receipt": {
+              "name": "emb",
+              "manifest": "sha256:7fef84c373103c756347d401779acca65eeee91afd8e134621362f986774a631:graph:d12dd68ac55e6485bf5a0adea11f61116fef654989bb4ed3f896639a1fecbb2b:000000000000000118aca98954d8e656",
+              "phase": "source",
+              "rows": 1024
+            },
+            "retained_catalog_sha256": "7ce5f8698cc70e91b1d5ef5d1ebeeff8418604bde5f5d32b03d57c72221e571c"
+          },
+          {
+            "stage": "resume",
+            "exit_code": 0,
+            "wall_ns": 24167223458,
+            "user_seconds": 0.08659299999999999,
+            "system_seconds": 0.117016,
+            "peak_rss_bytes": 53510144,
+            "pod_network_bytes": null,
+            "records": {
+              "PARQUET_BULK_BUILD_MODE": [
+                {
+                  "caller": "fast",
+                  "caller_value": 1,
+                  "provider": 1,
+                  "provider_is_test": false
+                }
+              ],
+              "PARQUET_BULK_RESUME": [
+                {
+                  "name": "emb",
+                  "manifest": "sha256:7fef84c373103c756347d401779acca65eeee91afd8e134621362f986774a631:graph:d12dd68ac55e6485bf5a0adea11f61116fef654989bb4ed3f896639a1fecbb2b:000000000000000118aca98954d8e656",
+                  "phase": "source",
+                  "rows": 1024
+                }
+              ],
+              "PARQUET_BULK_INPUT": [
+                {
+                  "rows": 0,
+                  "resumed": true
+                }
+              ],
+              "PARQUET_BULK_WORK": [
+                {
+                  "identity_census_verified": true,
+                  "identity_read_bytes": 0,
+                  "identity_written_bytes": 12288,
+                  "identity_merge_inputs": 0,
+                  "projection_cache_peak_bytes": 3316035,
+                  "owned_index_count": 0,
+                  "partition_bytes": 0,
+                  "partition_read_bytes": 3258368,
+                  "compact_rows": 0,
+                  "projection_commit_ns": 2461000,
+                  "save_node_ns": 0,
+                  "update_parent_ns": 0,
+                  "update_parent_calls": 0,
+                  "training_ns": 2396000,
+                  "routing_ns": 2049000,
+                  "allocator_peak_bytes": 9673578
+                }
+              ],
+              "PARQUET_BULK_PROJECTION": [
+                {
+                  "runs": 2,
+                  "bytes": 412293
+                }
+              ],
+              "PARQUET_BULK_RECEIPT": [
+                {
+                  "name": "emb",
+                  "manifest": "sha256:21d499f4e76b30a5015b6d0d1b206dc62bf4a7e78a82e77f4b4e2611b8a2a112:graph:d12dd68ac55e6485bf5a0adea11f61116fef654989bb4ed3f896639a1fecbb2b:000000000000000118aca98954d8e656",
+                  "phase": "tree",
+                  "rows": 1024
+                }
+              ],
+              "PARQUET_BULK_SOURCE": [
+                {
+                  "runs": 1,
+                  "reused_runs": 1,
+                  "reused_bytes": 3231301,
+                  "new_bytes": 0
+                }
+              ],
+              "PARQUET_BULK_MEMORY": [
+                {
+                  "dense_allocator_peak_bytes": 9673578,
+                  "source_allocator_peak_bytes": 0,
+                  "max_vector_allocator_peak_bytes": 9673578
+                }
+              ],
+              "PARQUET_BULK_PHASES": [
+                {
+                  "names": [
+                    "identity",
+                    "fragments",
+                    "spool",
+                    "aggregate",
+                    "ordered",
+                    "text",
+                    "sparse",
+                    "dense",
+                    "bulk_tee",
+                    "bulk_receipt",
+                    "dense_ingest",
+                    "dense_cluster",
+                    "dense_checkpoint",
+                    "dense_upload"
+                  ],
+                  "ns": [
+                    97220000,
+                    0,
+                    0,
+                    11000,
+                    41000,
+                    72000,
+                    33000,
+                    12407103000,
+                    0,
+                    0,
+                    0,
+                    12174000,
+                    3246000,
+                    1898029000
+                  ],
+                  "calls": [
+                    1,
+                    0,
+                    0,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    0,
+                    1,
+                    1,
+                    1,
+                    1
+                  ]
+                }
+              ],
+              "PARQUET_BULK_RECALL": [
+                {
+                  "queries": 2,
+                  "probes": 512,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 550629000
+                },
+                {
+                  "queries": 2,
+                  "probes": 1024,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 4643000
+                },
+                {
+                  "queries": 2,
+                  "probes": 2048,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 4445000
+                },
+                {
+                  "queries": 2,
+                  "probes": 4096,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 4497000
+                },
+                {
+                  "queries": 2,
+                  "probes": 8192,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 4867000
+                }
+              ],
+              "PARQUET_BULK_SERVING_CACHE": [
+                {
+                  "hits": 0,
+                  "misses": 50,
+                  "stored_bytes": 3633118,
+                  "protected_stored_bytes": 3633118,
+                  "evictions": 0,
+                  "disk_unavailable": null,
+                  "disk_init_attempts": 1,
+                  "disk_init_failures": 0,
+                  "disk_hits": 0,
+                  "mapping_hits": 0,
+                  "disk_bytes": 0,
+                  "provider_reads": 25,
+                  "provider_bytes": 3633118,
+                  "completed_queries": 0,
+                  "query_total_ns": 0,
+                  "query_publication_ns": 0,
+                  "query_search_ns": 0,
+                  "query_hydration_ns": 0,
+                  "query_delivery_ns": 0
+                }
+              ]
+            },
+            "native_ns": 18084342000,
+            "checkpoints": 1
+          }
+        ]
+      },
+      {
+        "phase": 2,
+        "qualified": true,
+        "attempts": [
+          {
+            "stage": "interrupt",
+            "exit_code": 1,
+            "wall_ns": 11902509250,
+            "user_seconds": 0.103006,
+            "system_seconds": 0.081454,
+            "peak_rss_bytes": 46628864,
+            "pod_network_bytes": null,
+            "records": {
+              "PARQUET_BULK_BUILD_MODE": [
+                {
+                  "caller": "fast",
+                  "caller_value": 1,
+                  "provider": 1,
+                  "provider_is_test": false
+                }
+              ],
+              "PARQUET_BULK_RECEIPT": [
+                {
+                  "name": "emb",
+                  "manifest": "sha256:9342f1ee8761cafebd0afabebab836bc8bbe285e175876d2ac768adbc585fc7f:graph:60d091a1174172028bf1a14d05c3bf427a3e3d8ee8b42d89c0fded6847387662:0000000000000001e542565954abfca0",
+                  "phase": "source",
+                  "rows": 1024
+                },
+                {
+                  "name": "emb",
+                  "manifest": "sha256:0575adc9c6e640a525372cc8c8c01432c68a632a883dde7b902ef837d0e57ee5:graph:60d091a1174172028bf1a14d05c3bf427a3e3d8ee8b42d89c0fded6847387662:0000000000000001e542565954abfca0",
+                  "phase": "tree",
+                  "rows": 1024
+                }
+              ],
+              "PARQUET_BULK_INPUT": [
+                {
+                  "rows": 0,
+                  "resumed": true
+                }
+              ],
+              "PARQUET_BULK_WORK": [
+                {
+                  "identity_census_verified": true,
+                  "identity_read_bytes": 0,
+                  "identity_written_bytes": 12288,
+                  "identity_merge_inputs": 0,
+                  "projection_cache_peak_bytes": 685,
+                  "owned_index_count": 0,
+                  "partition_bytes": 0,
+                  "partition_read_bytes": 3258368,
+                  "compact_rows": 0,
+                  "projection_commit_ns": 2177000,
+                  "save_node_ns": 0,
+                  "update_parent_ns": 0,
+                  "update_parent_calls": 0,
+                  "training_ns": 2277000,
+                  "routing_ns": 2020000,
+                  "allocator_peak_bytes": 6307503
+                }
+              ],
+              "PARQUET_BULK_PROJECTION": [
+                {
+                  "runs": 3,
+                  "bytes": 412861
+                }
+              ],
+              "PARQUET_BULK_FAILURE_PHASES": [
+                {
+                  "error_name": "Cancelled",
+                  "cause": null,
+                  "elapsed_ns": 11585116000,
+                  "names": [
+                    "identity",
+                    "fragments",
+                    "spool",
+                    "aggregate",
+                    "ordered",
+                    "text",
+                    "sparse",
+                    "dense",
+                    "bulk_tee",
+                    "bulk_receipt",
+                    "dense_ingest",
+                    "dense_cluster",
+                    "dense_checkpoint",
+                    "dense_upload"
+                  ],
+                  "ns": [
+                    4040013000,
+                    0,
+                    0,
+                    3000,
+                    30000,
+                    38000,
+                    10000,
+                    2590834000,
+                    2224000,
+                    3557278000,
+                    1000,
+                    11059000,
+                    0,
+                    0
+                  ],
+                  "calls": [
+                    1,
+                    0,
+                    0,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    0
+                  ]
+                }
+              ]
+            },
+            "retained_receipt": {
+              "name": "emb",
+              "manifest": "sha256:0575adc9c6e640a525372cc8c8c01432c68a632a883dde7b902ef837d0e57ee5:graph:60d091a1174172028bf1a14d05c3bf427a3e3d8ee8b42d89c0fded6847387662:0000000000000001e542565954abfca0",
+              "phase": "tree",
+              "rows": 1024
+            },
+            "retained_catalog_sha256": "5e9fb26d7bcce9c59dd24db908a363fad3bc65abf3a31afe9d2f8d9cfce73b38"
+          },
+          {
+            "stage": "resume",
+            "exit_code": 0,
+            "wall_ns": 17901274292,
+            "user_seconds": 0.057609,
+            "system_seconds": 0.066143,
+            "peak_rss_bytes": 50561024,
+            "pod_network_bytes": null,
+            "records": {
+              "PARQUET_BULK_BUILD_MODE": [
+                {
+                  "caller": "fast",
+                  "caller_value": 1,
+                  "provider": 1,
+                  "provider_is_test": false
+                }
+              ],
+              "PARQUET_BULK_RESUME": [
+                {
+                  "name": "emb",
+                  "manifest": "sha256:0575adc9c6e640a525372cc8c8c01432c68a632a883dde7b902ef837d0e57ee5:graph:60d091a1174172028bf1a14d05c3bf427a3e3d8ee8b42d89c0fded6847387662:0000000000000001e542565954abfca0",
+                  "phase": "tree",
+                  "rows": 1024
+                }
+              ],
+              "PARQUET_BULK_INPUT": [
+                {
+                  "rows": 0,
+                  "resumed": true
+                }
+              ],
+              "PARQUET_BULK_SOURCE": [
+                {
+                  "runs": 1,
+                  "reused_runs": 1,
+                  "reused_bytes": 3231301,
+                  "new_bytes": 0
+                }
+              ],
+              "PARQUET_BULK_MEMORY": [
+                {
+                  "dense_allocator_peak_bytes": 758214,
+                  "source_allocator_peak_bytes": 0,
+                  "max_vector_allocator_peak_bytes": 758214
+                }
+              ],
+              "PARQUET_BULK_PHASES": [
+                {
+                  "names": [
+                    "identity",
+                    "fragments",
+                    "spool",
+                    "aggregate",
+                    "ordered",
+                    "text",
+                    "sparse",
+                    "dense",
+                    "bulk_tee",
+                    "bulk_receipt",
+                    "dense_ingest",
+                    "dense_cluster",
+                    "dense_checkpoint",
+                    "dense_upload"
+                  ],
+                  "ns": [
+                    116657000,
+                    0,
+                    0,
+                    3000,
+                    37000,
+                    46000,
+                    10000,
+                    4330232000,
+                    0,
+                    0,
+                    2000,
+                    0,
+                    327936000,
+                    1940056000
+                  ],
+                  "calls": [
+                    1,
+                    0,
+                    0,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    0,
+                    1,
+                    0,
+                    1,
+                    1
+                  ]
+                }
+              ],
+              "PARQUET_BULK_RECALL": [
+                {
+                  "queries": 2,
+                  "probes": 512,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 712933000
+                },
+                {
+                  "queries": 2,
+                  "probes": 1024,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 4613000
+                },
+                {
+                  "queries": 2,
+                  "probes": 2048,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 4338000
+                },
+                {
+                  "queries": 2,
+                  "probes": 4096,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 4344000
+                },
+                {
+                  "queries": 2,
+                  "probes": 8192,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 4245000
+                }
+              ],
+              "PARQUET_BULK_SERVING_CACHE": [
+                {
+                  "hits": 0,
+                  "misses": 50,
+                  "stored_bytes": 3633097,
+                  "protected_stored_bytes": 3633097,
+                  "evictions": 0,
+                  "disk_unavailable": null,
+                  "disk_init_attempts": 1,
+                  "disk_init_failures": 0,
+                  "disk_hits": 0,
+                  "mapping_hits": 0,
+                  "disk_bytes": 0,
+                  "provider_reads": 25,
+                  "provider_bytes": 3633097,
+                  "completed_queries": 0,
+                  "query_total_ns": 0,
+                  "query_publication_ns": 0,
+                  "query_search_ns": 0,
+                  "query_hydration_ns": 0,
+                  "query_delivery_ns": 0
+                }
+              ]
+            },
+            "native_ns": 10537623000,
+            "checkpoints": 0
+          }
+        ]
+      }
+    ]
+  }
+}

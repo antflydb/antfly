@@ -290,13 +290,18 @@ fn runParquet(io: std.Io, uri: []const u8) !void {
     } else try state.set(pending);
     var cause: ?anyerror = null;
     const started = @import("antfly_platform").time.monotonicNs();
-    const result = if (reopen_only) try a.dupe(u8, state.table.lake_index_catalog_json) else try @import("lake_execution_native_client.zig").build(a, io, state.table, source_options, try store.executionDescriptor(), context, .none, state.clock(), state.lease(), null, .{
+    const result = if (reopen_only) try a.dupe(u8, state.table.lake_index_catalog_json) else @import("lake_execution_native_client.zig").build(a, io, state.table, source_options, try store.executionDescriptor(), context, .none, state.clock(), state.lease(), null, .{
         .identity_spill_bytes = if (std.c.getenv("ANTFLY_LAKE_BULK_IDENTITY_SPILL_BYTES")) |value| try std.fmt.parseUnsigned(u64, std.mem.span(value), 10) else 1024 * 1024 * 1024,
         .bulk_prebind_parents = if (std.c.getenv("ANTFLY_LAKE_BULK_PREBIND")) |flag| !std.mem.eql(u8, std.mem.span(flag), "0") else true,
         .bulk_compact_partitions = if (std.c.getenv("ANTFLY_LAKE_BULK_COMPACT")) |flag| !std.mem.eql(u8, std.mem.span(flag), "0") else false,
         .fuse_bulk_identity = if (std.c.getenv("ANTFLY_LAKE_BULK_FUSED")) |flag| !std.mem.eql(u8, std.mem.span(flag), "0") else true,
         .bulk_source_checkpoints = if (std.c.getenv("ANTFLY_LAKE_BULK_CHECKPOINT")) |flag| !std.mem.eql(u8, std.mem.span(flag), "0") else true,
-    }, .{}, &cause);
+    }, .{}, &cause) catch |err| {
+        const failure = try std.json.Stringify.valueAlloc(a, .{ .error_name = @errorName(err), .cause = if (cause) |value| @errorName(value) else null, .elapsed_ns = @import("antfly_platform").time.monotonicNs() - started, .names = metrics.names ++ metrics.bulk_names, .ns = bulkPhaseTimes(false), .calls = bulkPhaseTimes(true) }, .{});
+        defer a.free(failure);
+        std.debug.print("PARQUET_BULK_FAILURE_PHASES {s}\n", .{failure});
+        return err;
+    };
     defer a.free(result);
     try state.set(result);
     const elapsed = if (reopen_only) 0 else @import("antfly_platform").time.monotonicNs() - started;
