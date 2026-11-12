@@ -217,13 +217,20 @@ pub const StopReason = enum {
 };
 
 pub const ReplayOutcome = struct {
-    /// Number of records accepted into the valid prefix.
+    /// Number of records passed to `on_record` -- i.e. records in the
+    /// valid prefix that were *not* superseded by `start_after_sequence`.
+    /// A superseded record is still part of the valid prefix (counted in
+    /// `valid_bytes`, required to pass every structural check), it is
+    /// just not re-delivered to the caller, since the checkpoint it names
+    /// already reflects it.
     valid_count: u64,
     /// Bytes consumed by the valid prefix, relative to `base_offset` --
-    /// where a `Writer` should resume appending.
+    /// where a `Writer` should resume appending. Includes any leading
+    /// superseded records' own bytes (they are not re-validated bytes to
+    /// discard, just records the caller doesn't need delivered again).
     valid_bytes: u64,
-    /// The last valid record's sequence, or the baseline passed in if no
-    /// record was replayed.
+    /// The last valid record's sequence (superseded or not), or the
+    /// baseline passed in if no record was replayed.
     last_sequence: ?u64,
     stop_reason: StopReason,
 };
@@ -237,14 +244,47 @@ pub const ReplayError = File.ReadPositionalError || Allocator.Error;
 pub const Callback = *const fn (ctx: ?*anyopaque, record: RecordView) anyerror!void;
 
 /// Replays the valid prefix of `[base_offset, base_offset + capacity)`,
-/// calling `on_record` (if given) for each valid record in order, and
-/// stopping at the first torn or invalid record (§9.5).
+/// calling `on_record` (if given) for each valid, non-superseded record in
+/// order, and stopping at the first torn or invalid record (§9.5). A
+/// record whose sequence is covered by `start_after_sequence` is skipped
+/// (not delivered to `on_record`, not counted in `valid_count`) but still
+/// structurally validated (magic/version/length/CRC) and still advances
+/// the scan -- so a leading run of such superseded records does not stop
+/// the scan early, and genuinely new records physically following them
+/// (left behind when a checkpoint landed but the log's stale prefix
+/// hasn't been zeroed/reset yet -- see §9.3b's gated reclaim) are still
+/// found and delivered.
 ///
 /// `start_after_sequence`, if given, is the last sequence already covered
-/// by a durable checkpoint (or `null` for a fresh/empty region): the first
-/// replayed record must have exactly `start_after_sequence + 1`, enforcing
-/// continuity against the checkpoint baseline the same way continuity is
-/// enforced between records.
+/// by a durable checkpoint (or `null` for a fresh/empty region). Sequence
+/// continuity is enforced in two different ways depending on where a
+/// record falls:
+///
+/// - **Among superseded records** (sequence `<= start_after_sequence`,
+///   including the very first one scanned): not enforced at all, not even
+///   "monotonic." A real checkpoint commit consumes its own
+///   `commit_sequence` without ever appending a log record for it
+///   (`native.zig`'s `checkpointRedoLog`, its `checkpointing = true`
+///   branch), and §9.3b's gated reclaim can leave more than one such gap
+///   physically present at once if reclaim stayed deferred across several
+///   checkpoints behind a slow pinned reader. This is safe to tolerate,
+///   not just convenient: a superseded record is never delivered, so a
+///   gap among them has no observable effect -- the real checkpoint that
+///   makes them superseded already carries the authoritative state for
+///   everything up to the baseline.
+/// - **At the transition into genuinely new records** (the first record
+///   whose sequence is `> start_after_sequence`, right after a superseded
+///   run, or the very first record scanned when none was superseded):
+///   must be strictly greater than the last record scanned (tolerating
+///   however many checkpoint-consumed gaps accumulated), *or*, when
+///   nothing has been superseded at all, must equal exactly
+///   `start_after_sequence + 1` (an unexplained gap here is real
+///   corruption, not a checkpoint artifact -- see "replay detects a
+///   sequence gap as corruption, not a torn tail").
+/// - **Among genuinely new records thereafter**: strict `+1`, since every
+///   one of them was actually logged by a live `Writer.append`, which
+///   always enforces `+1` for anything it accepts -- a missing one here
+///   is a real, unexplained gap.
 pub fn replay(
     allocator: Allocator,
     file: File,
@@ -258,6 +298,16 @@ pub fn replay(
     var pos: u64 = 0;
     var count: u64 = 0;
     var last_sequence = start_after_sequence;
+    // True once at least one superseded record has been scanned and we
+    // have not yet transitioned into genuinely new records. Continuity
+    // among superseded records is never checked (see below); this flag
+    // exists only to relax the *one* comparison right at the transition
+    // out of the superseded run, then switch back to strict `+1`
+    // continuity for everything after. Starts `false`: the very first
+    // record, if *not* superseded, still gets the ordinary strict check
+    // against the baseline (the ordinary "gap before anything superseded
+    // happened" corruption case).
+    var in_superseded_run = false;
     var payload_buf = std.ArrayList(u8).empty;
     defer payload_buf.deinit(allocator);
 
@@ -317,34 +367,70 @@ pub fn replay(
             return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
         }
 
-        if (pos == 0 and last_sequence != null and header.commit_sequence <= last_sequence.?) {
-            // Superseded, not corrupt: a structurally valid, correctly
-            // checksummed record whose sequence the checkpoint baseline
-            // already covers. This is exactly what a crash strictly
-            // between a checkpoint's new slot becoming durable and this
-            // log's own now-stale prefix being zeroed leaves behind (the
-            // checkpoint already reflects this record; only its bytes in
-            // the log are stale). Recognizable only at the very first
-            // record position (`pos == 0`, i.e. nothing has been accepted
-            // yet this replay): once any record has been accepted, a
-            // sequence that doesn't continue from it is a genuine break
-            // mid-stream, not a leftover generation, and still falls
-            // through to the ordinary corrupt-record check below.
-            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .end_of_region };
-        }
+        // Superseded, not corrupt: a structurally valid, correctly
+        // checksummed record whose sequence the checkpoint baseline
+        // (`start_after_sequence`, never mutated by this loop) already
+        // covers. This is exactly what a crash strictly between a
+        // checkpoint's new slot becoming durable and this log's own
+        // now-stale prefix being zeroed leaves behind (the checkpoint
+        // already reflects this record; only its bytes in the log are
+        // stale) -- and, since §9.3b's reclaim gates the physical zero on
+        // the region's minimum pinned sequence, not every superseded
+        // record is necessarily the *last* one in the region either: a
+        // superseded run can be followed by genuinely new records a
+        // pinned cross-process reader hasn't caught up to yet (see the
+        // test by that name). Checked against the *original* baseline,
+        // not `last_sequence` (which advances through superseded records
+        // too, for chain-continuity purposes), so a run of several
+        // leading superseded records is recognized throughout, not just
+        // at `pos == 0`.
+        const superseded = start_after_sequence != null and header.commit_sequence <= start_after_sequence.?;
 
-        if (last_sequence) |last| {
+        if (superseded) {
+            // No continuity check among superseded records at all, not
+            // even "monotonic": a real checkpoint commit consumes its own
+            // `commit_sequence` without ever appending a log record for
+            // it (`checkpointRedoLog`'s own `checkpointing` branch), so a
+            // superseded run can legitimately contain any number of gaps
+            // -- one per checkpoint that landed while reclaim stayed
+            // gated behind a pinned reader (§9.3b). This is safe, not
+            // just convenient: a superseded record is never delivered to
+            // `on_record`, so whether its neighbors in the superseded run
+            // are contiguous has no observable effect -- the real
+            // checkpoint that makes it superseded already carries the
+            // authoritative state for everything up to the baseline.
+            // Structural validity (magic/version/header_len, length,
+            // CRC) is still fully checked above, unconditionally.
+            in_superseded_run = true;
+        } else if (in_superseded_run) {
+            // The first genuinely new record right after a superseded
+            // run: only required to be strictly greater than whatever
+            // was last scanned, tolerating however many checkpoint-
+            // consumed-but-unlogged sequence numbers accumulated while
+            // reclaim was gated. Strict `+1` resumes from here on (the
+            // `else` branch below), since every record from here on was
+            // actually logged by a live `Writer.append`, which always
+            // enforces `+1` for anything it accepts.
+            if (last_sequence) |last| {
+                if (header.commit_sequence <= last) {
+                    return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
+                }
+            }
+            in_superseded_run = false;
+        } else if (last_sequence) |last| {
             if (header.commit_sequence != last + 1) {
                 return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
             }
         }
 
-        if (on_record) |cb| {
-            try cb(ctx, .{ .commit_sequence = header.commit_sequence, .payload = payload_buf.items });
+        if (!superseded) {
+            if (on_record) |cb| {
+                try cb(ctx, .{ .commit_sequence = header.commit_sequence, .payload = payload_buf.items });
+            }
+            count += 1;
         }
 
         pos += header_len + payload_len;
-        count += 1;
         last_sequence = header.commit_sequence;
     }
 }
@@ -480,6 +566,146 @@ test "replay resumes continuity from a checkpoint baseline" {
     const superseded = try replay(testing.allocator, region.file, io, 0, capacity, 12, null, null);
     try testing.expectEqual(@as(u64, 0), superseded.valid_count);
     try testing.expectEqual(StopReason.end_of_region, superseded.stop_reason);
+}
+
+test "a superseded run can be followed by genuinely new records" {
+    // §9.3b: the checkpointer's physical zero/reset of a log's stale
+    // prefix is gated on the region's minimum pinned sequence (a live
+    // cross-process reader may still need those bytes). While gated, the
+    // writer keeps appending *after* the stale prefix instead of
+    // resetting over it -- so a crash (or a lagging reader's own replay)
+    // can see a leading run of superseded records immediately followed
+    // by records the checkpoint does *not* yet cover. Both must survive
+    // the scan: the superseded ones skipped but not stopping it, the new
+    // ones delivered.
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    var writer = Writer.init(region.file, io, 0, capacity);
+    try writer.append(11, "a"); // superseded by baseline 12
+    try writer.append(12, "b"); // superseded by baseline 12 (the checkpoint's own record)
+    try writer.append(13, "c"); // genuinely new
+    try writer.append(14, "d"); // genuinely new
+    try writer.sync();
+
+    const Collected = struct {
+        sequences: std.ArrayList(u64) = .empty,
+        fn onRecord(ctx: ?*anyopaque, record: RecordView) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            try self.sequences.append(testing.allocator, record.commit_sequence);
+        }
+    };
+    var collected: Collected = .{};
+    defer collected.sequences.deinit(testing.allocator);
+
+    const outcome = try replay(testing.allocator, region.file, io, 0, capacity, 12, Collected.onRecord, &collected);
+    try testing.expectEqual(@as(u64, 2), outcome.valid_count);
+    try testing.expectEqual(StopReason.end_of_region, outcome.stop_reason);
+    try testing.expectEqual(@as(u64, 14), outcome.last_sequence.?);
+    try testing.expectEqualSlices(u64, &.{ 13, 14 }, collected.sequences.items);
+
+    // A baseline of 10 (nothing superseded) must still see all four,
+    // confirming the superseded classification -- not the scan itself --
+    // is what changed.
+    var collected_all: Collected = .{};
+    defer collected_all.sequences.deinit(testing.allocator);
+    const outcome_all = try replay(testing.allocator, region.file, io, 0, capacity, 10, Collected.onRecord, &collected_all);
+    try testing.expectEqual(@as(u64, 4), outcome_all.valid_count);
+    try testing.expectEqualSlices(u64, &.{ 11, 12, 13, 14 }, collected_all.sequences.items);
+}
+
+test "a gap among superseded records is tolerated -- a real checkpoint can consume a sequence without logging it" {
+    // Deliberate relaxation, not an oversight: a real checkpoint commit
+    // (`native.zig`'s `checkpointRedoLog`, `checkpointing = true` branch)
+    // consumes its own `commit_sequence` without ever appending a log
+    // record for it, and §9.3b's gated reclaim can leave more than one
+    // such checkpoint's worth of gap physically present in the log at
+    // once (reclaim stayed deferred across several checkpoints behind a
+    // slow pinned reader). A gap among records that are *all* superseded
+    // has no observable effect either way -- none of them is ever
+    // delivered to `on_record`, and the real checkpoint that makes them
+    // superseded already carries the authoritative state for everything
+    // up to the baseline -- so this is safe to tolerate rather than flag.
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    var writer = Writer.init(region.file, io, 0, capacity);
+    try writer.append(11, "a");
+    try writer.sync();
+    // Hand-write a record at sequence 13 (skipping 12) directly after
+    // it, bypassing the writer's own continuity check the same way
+    // "replay detects a sequence gap as corruption" does above --
+    // standing in for "checkpoint sequence 12 landed but was never
+    // logged."
+    var header_buf: [header_len]u8 = undefined;
+    const skip: RecordHeader = .{ .payload_len = 1, .commit_sequence = 13, .crc32 = Crc32.hash("b") };
+    skip.encode(&header_buf);
+    try region.file.writePositionalAll(io, &header_buf, writer.tail);
+    try region.file.writePositionalAll(io, "b", writer.tail + header_len);
+    try writer.file.sync(io);
+
+    // Baseline 20 makes both records superseded; the gap between 11 and
+    // 13 is tolerated, not corruption.
+    const outcome = try replay(testing.allocator, region.file, io, 0, capacity, 20, null, null);
+    try testing.expectEqual(@as(u64, 0), outcome.valid_count);
+    try testing.expectEqual(StopReason.end_of_region, outcome.stop_reason);
+}
+
+test "a superseded run followed by new records tolerates exactly the checkpoint's own consumed sequence, but still catches a real gap after the transition" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    var writer = Writer.init(region.file, io, 0, capacity);
+    try writer.append(2, "beta"); // superseded by baseline 3 (checkpoint's own consumed sequence)
+    try writer.sync();
+    // Sequence 3 (the checkpoint itself) is never logged -- the next
+    // physical record jumps straight to 4, tolerated as the one
+    // transition-point gap. `initAt` with `last_sequence = 3` stands in
+    // for what `checkpointRedoLog` does to its own live `redo.writer`
+    // when deferring reclaim: advance past the checkpoint's own
+    // consumed sequence without resetting `tail`.
+    writer = Writer.initAt(region.file, io, 0, capacity, writer.tail, 3);
+    try writer.append(4, "gamma");
+    try writer.sync();
+    const Collected = struct {
+        sequences: std.ArrayList(u64) = .empty,
+        fn onRecord(ctx: ?*anyopaque, record: RecordView) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            try self.sequences.append(testing.allocator, record.commit_sequence);
+        }
+    };
+    var collected: Collected = .{};
+    defer collected.sequences.deinit(testing.allocator);
+    const outcome = try replay(testing.allocator, region.file, io, 0, capacity, 3, Collected.onRecord, &collected);
+    try testing.expectEqual(@as(u64, 1), outcome.valid_count);
+    try testing.expectEqualSlices(u64, &.{4}, collected.sequences.items);
+    try testing.expectEqual(StopReason.end_of_region, outcome.stop_reason);
+
+    // But once past the transition, strict `+1` continuity resumes: a
+    // second, hand-written record that skips a sequence among the
+    // genuinely-new records *is* corruption.
+    var region2 = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region2.file, region2.path[0..region2.path_len]);
+    var writer2 = Writer.init(region2.file, io, 0, capacity);
+    try writer2.append(2, "beta");
+    writer2 = Writer.initAt(region2.file, io, 0, capacity, writer2.tail, 3);
+    try writer2.append(4, "gamma");
+    try writer2.sync();
+    var header_buf: [header_len]u8 = undefined;
+    const skip: RecordHeader = .{ .payload_len = 1, .commit_sequence = 6, .crc32 = Crc32.hash("d") };
+    skip.encode(&header_buf);
+    try region2.file.writePositionalAll(io, &header_buf, writer2.tail);
+    try region2.file.writePositionalAll(io, "d", writer2.tail + header_len);
+    try writer2.file.sync(io);
+    const outcome2 = try replay(testing.allocator, region2.file, io, 0, capacity, 3, null, null);
+    try testing.expectEqual(@as(u64, 1), outcome2.valid_count);
+    try testing.expectEqual(StopReason.corrupt_record, outcome2.stop_reason);
 }
 
 test "writer rejects out-of-order sequence" {

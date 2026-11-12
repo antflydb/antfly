@@ -1253,52 +1253,132 @@ see un-reclaimed pages today under the existing epoch/reuse-frontier
 rule (§3.1's "a page may be reused only if it is free in the last
 durable checkpoint and its retirement epoch is ≤ the durable epoch").
 
-### 9.3b Cross-process WAL index: `shared_lock_region.zig`
+### 9.3b Cross-process WAL index: `shared_lock_region.zig` (landed, build step (g))
 
 A reader in a different process cannot see this process's in-memory
 overlay, so it needs an equivalent signal in the one thing every
 process already maps: `shared_lock_region.zig`'s shared region
-(`<db>.aflite-lock`, mmap'd `MAP_SHARED`, shared_lock_region.zig:695).
-Add two atomics to `Header` (shared_lock_region.zig:62-132), parallel
-in shape to the existing `writer_release_epoch` futex word
-(shared_lock_region.zig:111-122):
+(`<db>.aflite-lock`, mmap'd `MAP_SHARED`). As implemented, this is a
+single consistent triple, not the two independently-read watermarks
+originally sketched above (the durable-only vs. tail-visibility
+distinction turned out not to matter in practice: every publish in
+this design runs strictly after the durable sync, never before, so
+there is only ever one watermark worth publishing):
 
-- `log_tail_sequence: Value(u64)` -- the highest `commit_sequence`
-  appended to the log (synced or not), stored by the writer right
-  after step 2/3 above, before the fsync returns to the caller;
-- `log_durable_sequence: Value(u64)` -- the highest `commit_sequence`
-  known durable (covered by a completed `syncData`), stored right
-  after step 3.
+```
+log_checkpoint_sequence: Value(u64)  -- "C", the on-disk checkpoint
+                                         sequence this log is currently
+                                         relative to (what a fresh
+                                         reopen's redo_log.replay would
+                                         use as start_after_sequence).
+                                         Advances only when a real
+                                         checkpoint lands
+                                         (checkpointRedoLog), never on
+                                         an ordinary commit.
+log_durable_sequence: Value(u64)     -- the highest commit_sequence
+                                         durably appended (synced).
+log_durable_offset: Value(u64)       -- byte offset, relative to the
+                                         log's own base_offset (read
+                                         directly from the data file's
+                                         own header -- never duplicated
+                                         here), of the durable end of
+                                         the log.
+log_generation: Value(u32)           -- a seqlock word guarding the
+                                         three fields above as one
+                                         consistent snapshot: bumped
+                                         odd before the three plain
+                                         stores, even after. A reader
+                                         retries (no syscall, a bounded
+                                         spin) whenever it observes an
+                                         odd generation or a generation
+                                         that changed between its two
+                                         reads of it.
+```
 
-A cross-process reader that wants durability-level visibility reads
-`log_durable_sequence`; one that is content with in-process-equivalent
-"committed, might still be lost in a crash" visibility (matching what
-an in-process overlay reader already sees before the next barrier)
-reads `log_tail_sequence`. Either way, the reader still has to fetch
-the actual redo bytes for any sequence beyond its last checkpointed
-view -- those live in the log region of the file itself, not in
-`shared_lock_region.zig` (the shared region carries the watermark, not
-the payload, keeping the region's fixed 64-byte header budget intact,
-shared_lock_region.zig:56). This is the direct cross-process analogue
-of SQLite's `-shm` WAL-index: a small, mapped, atomics-only summary of
-"how far the log goes," not a copy of the log.
+Growing `Header` from 64 to 96 bytes bumped `format_version` 2 -> 3
+(same "an old binary's region is simply rebuilt" policy every prior
+version bump already used; none of the new fields are covered by
+`header_checksum`, which only ever covered the *immutable* identity
+span, so this didn't change that function at all). `Region.publishLogState`/
+`Region.readLogState` are the writer-side publish and reader-side read,
+both pure atomic stores/loads into the already-mapped region -- no new
+syscall on the write path, exactly as required.
+
+**The hook.** `NativeFile.publishRedoLogState` reads `self.redo`'s
+current state and publishes it; called from exactly one place on the
+write path, `publishCheckpoint`'s redo branch, immediately after
+`redo.durable_sequence = checkpoint.commit_sequence` -- i.e. strictly
+after the append's own `sync()` already returned, never before, so a
+cross-process reader can never observe a record that isn't durable
+(the crash-sim scenario this guards: "crash between the log fsync and
+the watermark store," §9.7 point 3). Ride-along/deferred appends
+elsewhere in `commitTransactionWithDurability` are unsynced and
+correctly never call this hook at all -- their own eventual
+`durable=true` commit's call covers them, same as every other
+ride-along guarantee in this design. `checkpointRedoLog` also calls it
+once, at the end, after deciding whether reclaim could proceed (below).
 
 **Interaction with reader pins.** §8.3's reader-slot table
-(`ReaderSlot.pinned_sequence`, shared_lock_region.zig:140-163) already
-exists to let a writer's reuse-frontier scan know what it must not
-reclaim; it is currently unwired (`minimumPinnedSequence`'s own doc:
-"Nothing calls this from a real write path yet," shared_lock_region.zig
-:1283-1284). This design is the first real caller on both sides: a
-reader pins `pinned_sequence = log_tail_sequence` (or
-`log_durable_sequence`, depending on which visibility level it asked
-for) at open, and the checkpointer (§9.4) must not truncate any log
-record newer than `minimumPinnedSequence()` across live reader slots,
-exactly mirroring the page-reclamation rule §3.1 already states for
-checkpointed pages. §8's own migration order (§8.9) lands the reader
-table before liveness/recovery; this design's cross-process piece
-(build step (g)) should land *after* §8's steps 1-3, not interleaved
-with them, so it is extending a finished primitive rather than racing
-its own construction -- hence "tell me before (c)."
+(`ReaderSlot.pinned_sequence`) is the mechanism: a cross-process
+reader's `refreshCrossProcessRedoOverlay` claims a slot
+(`claimReaderSlot`) once, lazily, and pins it *before* reading anything
+new (`pinReader(slot, its own already-applied durable_sequence)`),
+reads the published triple, applies whatever is new via
+`redo_log.replay` + `redo_overlay.SharedRedoOverlay.decodeLogicalMutationsPayload`/
+`decodeRedoGroupPayload` (under a new `inode_lock.withRedoOverlayLock`,
+since those two decoders are deliberately unlocked and this call
+reaches them *after* the overlay already exists, unlike
+`ensureRedoOverlay`'s own first-population case), then advances its pin
+to match. `checkpointRedoLog`'s own log-prefix reclaim (§9.4 point 4)
+is gated on `minimumPinnedSequence()`: if a live cross-process reader
+is pinned below the checkpoint that just landed, the physical
+zero/reset of the log's stale prefix is deferred (not skipped forever)
+-- the real checkpoint still lands durably either way, only space
+reclamation waits. The writer keeps appending past the un-reclaimed
+prefix instead of resetting over it, which only works because
+`redo_log.replay`'s superseded-record handling (§9.2's module,
+generalized for this) tolerates a run of superseded records (including
+internal gaps -- see below) followed by genuinely new ones, not just a
+superseded run with nothing after it.
+
+**The consumed-but-unlogged sequence gap.** A real checkpoint commit
+(`checkpointRedoLog`'s own `checkpointing = true` branch) consumes one
+`commit_sequence` for itself without ever appending a log record for
+it (that branch disables the whole redo-append path for its one
+commit, going through the ordinary non-redo publish instead). Under
+the original always-reset design this was invisible (the log reset to
+empty immediately after, so the next record was simply the first thing
+in a fresh region). Once reclaim can be *deferred*, this gap becomes a
+real, recoverable artifact in the log's own bytes: `redo_log.replay`
+enforces strict `+1` continuity among genuinely new records and at the
+very first record when nothing precedes it, but *not* among superseded
+records (safe, since a gap there is unobservable -- nothing superseded
+is ever delivered) and only requires a transition-point record to be
+*greater* than whatever was last scanned (tolerating however many
+checkpoints' worth of consumed-but-unlogged sequences accumulated
+while reclaim stayed deferred). `checkpointRedoLog` mirrors this on the
+writer's own live `redo.writer`: when deferring, it advances
+`redo.writer`'s `last_sequence` to the new checkpoint's own
+`commit_sequence` (via `Writer.initAt` with the *same*, unreset `tail`)
+so the next ordinary commit's own append does not fail the writer's
+own continuity check.
+
+**Re-open semantics.** If the published `log_checkpoint_sequence` has
+advanced past what a cross-process reader's own `redo.checkpoint_sequence`
+reflects, the real on-disk checkpoint slot (roots, page_count,
+manifest -- not just a sequence number) has moved, and the reader must
+re-read it before anything else: `refreshCrossProcessRedoOverlay`
+reuses `loadCheckpointSlots`/`recoverActiveCheckpoint`/
+`adoptIndexPublicationHeader`, the exact same mechanism
+`refreshIfWriterBaseStale` already uses for the in-process stale-writer
+case, just triggered by the region's published watermark instead of
+`inode_lock.committedSequence`. Either way (checkpoint moved or not),
+once the overlay is caught up to the newly-read log bytes, the
+reader's own `self.header.checkpoints[active].commit_sequence` is
+bumped to the new `durable_sequence` -- the same "provisional, no real
+pages touched" trick an ordinary ongoing redo commit already applies
+to its own writer -- so `redoOverlayEntry`'s `checkpoint.commit_sequence`
+bound actually sees what this refresh just applied.
 
 ### 9.3c Scan and iterator paths: merged overlay cursors
 
