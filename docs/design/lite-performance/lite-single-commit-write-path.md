@@ -2000,31 +2000,90 @@ defers rewriting and resumes when capacity returns", "reclamation
 issue1431 canceled automatic rewrites retry without file growth" all
 pass now.
 
-Not yet fixed -- a different, deeper issue each, both now surfacing
-their *real* failure mode instead of a generic `OutcomeUnknown`:
-- "reclamation stale quota estimates expire after roots shrink" now
-  fails with `error.LiteStorageBudgetExceeded` instead. Writes 128 KiB
-  documents (so each commit's own record, not the log's small
-  budget-scaled capacity, is the relevant size) and derives its own
-  `max_storage_bytes` cap from a physical file size measured partway
-  through -- exactly the kind of timing assumption §9.7a's own "second
-  audit" paragraph already flagged as unaudited for redo-log mode (a
-  commit's physical footprint no longer lands at the same point in the
-  test's own timeline once checkpoints happen eagerly rather than per
-  commit).
-- "reclamation retries reuse estimates and reassess changed roots when
-  admitted" fails on `std.testing.expect(!std.meta.eql(checkpoint,
-  store.file.activeCheckpoint()))` -- it assumes any committed mutation
-  changes the active checkpoint slot, which is true for the legacy
-  path but not for a redo-log commit that only appends to the log
-  without ever running `checkpointRedoLog` (the whole point of
-  deferring the physical build). The same unaudited-assumption
-  category, not a new bug from this fix.
-- "reclamation budget rejects a mutation before exhausting capacity"'s
-  `error.InvalidNativeFreeMap` (expected `error.LiteStorageBudgetExceeded`)
-  is unchanged by this fix -- most likely free-map handling under redo
-  plus a budget, overlapping with (2)'s indexed-reclamation work rather
-  than this cluster.
+A deeper look at the remaining two found a real, separate bug, not an
+unaudited test assumption after all: diagnosed by instrumenting
+`commitTransactionWithDurability`/`publishCheckpoint`/`checkpointRedoLog`
+directly (temporary `std.debug.print` tracing, removed once the root
+cause was confirmed) against "reclamation retries reuse estimates and
+reassess changed roots when admitted" in isolation.
+
+**Root cause**: `PageWriteBatch.flushCount` diverts *every* page a
+redo-log file writes into `redo.pending`/`redo.shared.pages` whenever
+`self.redo != null and !checkpointing` -- not just external value
+chain pages, despite that function's own comment assuming so (true
+only for a *diverting* transactional commit, whose B-tree roots never
+become real pages at all; false for a **bare** commit, which always
+builds real document-index/free-map/namespace-directory pages
+directly, redo-log or not, and so always diverts them here). A bare
+commit never calls `appendLogicalMutation` (confirmed by reading
+`putDocumentBatch`'s own branches), so `redo.shared`'s three logical
+maps stay empty for it -- meaning `checkpointRedoLog`'s own
+precondition (`has_logical_work`, checking only those three maps) is
+`false`, and it no-ops, forever, no matter how many times it's called.
+The bare commit's own already-fully-computed `next`/`checkpoint`
+(correct `document_index_root_page` and all) was never examined by
+`checkpointRedoLog` at all -- it operates on a wholly separate
+computation, over logical heads, that has nothing to do with a bare
+commit's own tree rebuild.
+
+My first version of the LogFull fix (`checkpointRedoLog()` then
+`return`) made this far worse: when the preemptive check triggered for
+exactly this case, it called the perpetually-no-op `checkpointRedoLog`
+and then `return`ed, **discarding the bare commit's own `checkpoint`
+entirely** -- the real pages were parked in the overlay, the header
+was never updated to reference them, and the commit silently vanished
+(no error returned to the caller). Confirmed by direct tracing: across
+5 "doc"="changed" bare writes, `self.header`'s own `commit_sequence`
+stayed frozen at its pre-loop value every single time, while
+`redo.pending`'s staged bytes (freshly re-added each iteration, ~16 KB
+-- the diverted document-index/free-map pages) cycled between that
+value and zero (cleared by the fix's own cleanup, then immediately
+repopulated by the next bare commit's own, equally-discarded write).
+
+**Fix, in three parts**:
+1. `checkpointRedoLog`'s own precondition is still logical-only
+   (correct in isolation: a bare commit's page-shaped divert has no
+   logical counterpart to fold, so there is nothing *for it* to do),
+   but it now also explicitly flushes every still-staged page
+   (`SharedRedoOverlay.takeAllPagesAlloc`, new) directly to its real
+   location before the logical fold -- previously, a page referenced
+   by a folded head's `external_value_root_page` was never re-derived
+   or re-written by that fold either, so `maybeClearPages`'s own "a
+   checkpoint has already folded them all into real, physical pages"
+   assumption was never actually made true by anything; now it is.
+2. Both preemptive-check call sites (`publishCheckpoint`'s durable
+   branch, `commitTransactionWithDurability`'s ride-along branch) now
+   branch on `redo.logical_pending.items.len != 0`: non-zero means this
+   commit diverted logical content, genuinely covered by
+   `checkpointRedoLog`'s fold (unchanged from the first version of
+   this fix); zero means page-shaped only (every bare commit, by
+   construction) -- flush `redo.shared`'s staged pages directly via
+   `takeAllPagesAlloc` + `writePositionalAll`, clear `redo.pending`,
+   and *fall through* to the normal append/publish logic instead of
+   returning, so `checkpoint`/`next` -- already correct -- gets
+   published exactly as an undiverted commit's own would.
+3. A new `NativeFile.committedSequence()` (delegated to by `Store.
+   durableSequence`, which had the same `activeCheckpoint()`-alone gap
+   for the legacy ride-along case already): the logical commit
+   sequence, which actually advances on every durable commit --
+   `redo.durable_sequence` in redo mode, `durable_header`-aware
+   otherwise. "reclamation retries reuse estimates..." now asserts
+   against this instead of `activeCheckpoint()` directly (which a
+   redo-log commit that only logs, without ever running
+   `checkpointRedoLog`, correctly never moves).
+
+Both "stale quota estimates expire after roots shrink" and "retries
+reuse estimates and reassess changed roots when admitted" pass with
+just this fix -- the budget/physical-size-timing theory originally
+written here for the first was wrong; it was the same page-loss bug,
+not a separate quota-estimator gap, so no quota/budget-accounting
+change was needed after all.
+
+Only "reclamation budget rejects a mutation before exhausting
+capacity"'s `error.InvalidNativeFreeMap` (expected
+`error.LiteStorageBudgetExceeded`) remains, unchanged by this fix --
+most likely free-map handling under redo plus a budget, overlapping
+with (2)'s indexed-reclamation work rather than this cluster.
 
 Verified the fix itself does not regress already-landed work:
 `-Dtest-filter="redo"` (18/18) and `-Dtest-filter="reuse"` (235/235)

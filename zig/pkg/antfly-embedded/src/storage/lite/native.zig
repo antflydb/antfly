@@ -6547,6 +6547,26 @@ pub const NativeFile = struct {
         // work either.
         if (!has_logical_work) return;
 
+        // Flush every still-staged page (external value chains) directly
+        // to its real location before the logical fold below: a
+        // reference to one of these from a folded head (`external_value_root_page`)
+        // only stores the page_id, never re-derives or re-writes the
+        // page's own bytes, so without this explicit flush the
+        // referenced page would stay parked in the overlay forever
+        // (`maybeClearPages`, called after this function's own commit,
+        // assumes every staged page has *already* been folded into a
+        // real, physical one by this point -- this is what actually
+        // makes that assumption true, rather than relying on the
+        // logical fold to do it incidentally, which it never did).
+        {
+            const pages = try redo.shared.takeAllPagesAlloc(std.heap.page_allocator, io);
+            defer std.heap.page_allocator.free(pages);
+            for (pages) |p| {
+                defer std.heap.page_allocator.free(p.bytes);
+                try self.file.writePositionalAll(io, p.bytes, p.page_id * @as(u64, self.header.page_size));
+            }
+        }
+
         // Disables every diversion point (`PageWriteBatch.flushCount`,
         // `flushTransactionWrites`'s logical-mutation branch,
         // `commitTransactionWithDurability`, `publishCheckpoint`) for the
@@ -6901,6 +6921,33 @@ pub const NativeFile = struct {
 
     pub fn activeCheckpoint(self: *const NativeFile) CheckpointSlot {
         return self.header.checkpoints[self.header.active_checkpoint];
+    }
+
+    /// The logical commit sequence: whether a commit has happened, or
+    /// advanced, independent of whether its own physical checkpoint slot
+    /// page or redo-log record has actually landed on disk yet. Use this
+    /// wherever code (or a test) means "did a commit happen, or
+    /// advance" -- not `activeCheckpoint().commit_sequence` directly,
+    /// which only answers a physical-layout question (and, for a
+    /// redo-log file, may not move at all for a commit that only
+    /// appended to the log: `checkpointRedoLog`, not every commit, is
+    /// what advances the physical checkpoint slot there).
+    ///
+    /// In redo-log mode this is `self.redo.?.durable_sequence` -- the
+    /// log's own latest durable (appended and synced) record, which is
+    /// what actually advances on every synced commit. Otherwise this
+    /// mirrors `Store.durableSequence`'s own distinction between a
+    /// ride-along-advanced `activeCheckpoint()` and the actually-durable
+    /// `durable_header`: `commitTransactionWithDurability`'s
+    /// `deferred_publication` branch writes `next` straight into
+    /// `self.header.checkpoints[active]` with no sync at all, leaving
+    /// `durable_header` holding the last checkpoint that *was* actually
+    /// synced -- whenever `durable_header` is set, that, not the
+    /// ride-along-advanced `activeCheckpoint()`, is the durable sequence.
+    pub fn committedSequence(self: *const NativeFile) u64 {
+        if (self.redo) |redo| return redo.durable_sequence;
+        if (self.durable_header) |durable| return durable.checkpoints[durable.active_checkpoint].commit_sequence;
+        return self.activeCheckpoint().commit_sequence;
     }
 
     /// Rebind a borrowed index writer after its owner has verified the inode,
@@ -15011,8 +15058,49 @@ pub const NativeFile = struct {
                     // `next` on top of what the checkpoint already
                     // published.
                     if (redo.pendingRecordLen() > redo.writer.remaining()) {
-                        try self.checkpointRedoLog();
-                        return;
+                        if (redo.logical_pending.items.len != 0) {
+                            // This commit diverted logical mutations, so
+                            // `checkpointRedoLog`'s own fold (over
+                            // `redo.shared`, which the same
+                            // `appendLogicalMutation` call already
+                            // populated) genuinely covers them: once it
+                            // returns, this commit is already durable as
+                            // part of the checkpoint it just published,
+                            // and nothing is left to log. Clearing
+                            // `logical_pending`/`pending` here matters --
+                            // `checkpointRedoLog` has no knowledge of
+                            // them, only of `redo.shared`, so skipping
+                            // this would leave them staged forever,
+                            // growing unboundedly across every later
+                            // commit.
+                            try self.checkpointRedoLog();
+                            redo.logical_pending.clearRetainingCapacity();
+                            redo.pending.clearRetainingCapacity();
+                            return;
+                        }
+                        // Page-shaped only (or nothing of this commit's
+                        // own -- either way, safe to flush unconditionally):
+                        // a bare commit's own real pages (document index,
+                        // free map, namespace directory -- not just
+                        // external value chains) are diverted here too
+                        // (`PageWriteBatch.flushCount`), with no logical
+                        // mutation ever staged alongside them, so
+                        // `checkpointRedoLog`'s logical-heads fold has
+                        // nothing to "absorb" -- it operates on a wholly
+                        // separate checkpoint computation than this
+                        // commit's own already-correct `next`, and
+                        // calling it here would discard `next` instead of
+                        // publishing it. Flush the real pages directly
+                        // to their own locations instead, then fall
+                        // through to publish `next` exactly as this
+                        // ride-along branch always does.
+                        const pages = try redo.shared.takeAllPagesAlloc(std.heap.page_allocator, self.runtimeIo());
+                        defer std.heap.page_allocator.free(pages);
+                        for (pages) |p| {
+                            defer std.heap.page_allocator.free(p.bytes);
+                            try self.file.writePositionalAll(self.runtimeIo(), p.bytes, p.page_id * @as(u64, self.header.page_size));
+                        }
+                        redo.pending.clearRetainingCapacity();
                     }
                 }
                 const was_durable_header_null = self.durable_header == null;
@@ -15318,24 +15406,56 @@ pub const NativeFile = struct {
             // A log-full condition must be decided before anything is
             // appended, never discovered as a failed, partial append
             // (`error.LogFull`, surfacing as the far less specific
-            // `error.OutcomeUnknown` below). This commit's own mutations
-            // are already staged in `redo.shared` -- `flushTransactionWrites`'s
-            // diversion loop ran before this function was ever called --
-            // so `checkpointRedoLog`'s own fold necessarily covers them
-            // too: once it returns, this commit is already durable as
-            // part of the checkpoint it just published, and there is
-            // nothing left to log. Return immediately in that case,
-            // rather than also appending (and republishing `checkpoint`,
-            // now stale relative to what `checkpointRedoLog` already
-            // wrote) on top of it. If `checkpointRedoLog` itself fails
-            // (e.g. no disk space left to allocate the real pages it
-            // needs), that error propagates unchanged: `redo.shared`/
-            // `redo.writer` are untouched by a failed checkpoint attempt,
-            // so the log is left intact and the caller sees a clean,
-            // pre-decision error instead of a torn append.
+            // `error.OutcomeUnknown` below).
             if (redo.pendingRecordLen() > redo.writer.remaining()) {
-                try self.checkpointRedoLog();
-                return;
+                if (redo.logical_pending.items.len != 0) {
+                    // This commit diverted logical mutations, already
+                    // staged in `redo.shared` (the same
+                    // `appendLogicalMutation` call that built
+                    // `logical_pending` populated it too, inside
+                    // `flushTransactionWrites`, before this function was
+                    // ever called) -- so `checkpointRedoLog`'s own fold
+                    // genuinely covers them: once it returns, this
+                    // commit is already durable as part of the
+                    // checkpoint it just published, and there is nothing
+                    // left to log. Clearing `logical_pending`/`pending`
+                    // matters here: `checkpointRedoLog` has no knowledge
+                    // of them, only of `redo.shared`, so skipping this
+                    // would leave them staged forever, growing
+                    // unboundedly across every later commit. If
+                    // `checkpointRedoLog` itself fails (e.g. no disk
+                    // space to allocate the real pages it needs), that
+                    // error propagates unchanged: `redo.shared`/
+                    // `redo.writer` are untouched by a failed checkpoint
+                    // attempt, so the log stays intact and the caller
+                    // sees a clean, pre-decision error, never a torn
+                    // append.
+                    try self.checkpointRedoLog();
+                    redo.logical_pending.clearRetainingCapacity();
+                    redo.pending.clearRetainingCapacity();
+                    return;
+                }
+                // Page-shaped only (or nothing of this commit's own --
+                // either way, safe to flush unconditionally): a bare
+                // commit's own real pages (document index, free map,
+                // namespace directory -- not just external value
+                // chains) are diverted here too (`PageWriteBatch.
+                // flushCount`), with no logical mutation ever staged
+                // alongside them, so `checkpointRedoLog`'s logical-heads
+                // fold has nothing to "absorb" -- it is a wholly
+                // separate checkpoint computation from this commit's own
+                // already-correct `checkpoint`, and calling it here
+                // would discard `checkpoint` (never publish it) instead.
+                // Flush the real pages directly to their own locations
+                // instead, then fall through to publish `checkpoint`
+                // exactly as this function always does.
+                const pages = try redo.shared.takeAllPagesAlloc(std.heap.page_allocator, self.runtimeIo());
+                defer std.heap.page_allocator.free(pages);
+                for (pages) |p| {
+                    defer std.heap.page_allocator.free(p.bytes);
+                    try self.file.writePositionalAll(self.runtimeIo(), p.bytes, p.page_id * @as(u64, self.header.page_size));
+                }
+                redo.pending.clearRetainingCapacity();
             }
             // §9.1/§9.3: the on-disk checkpoint slot is untouched here --
             // it still names the last real checkpoint (build step (d) is
