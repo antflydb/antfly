@@ -352,11 +352,19 @@ def test_standalone_discovers_inference_worker_off_path(
         link = tmp_path / "server-off-path"
         link.symlink_to(binary)
         binary = link
-    monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
-    monkeypatch.delenv("ANTFLY_INFERENCE_WORKER", raising=False)
+
+    class OffPathServer(EmbeddedInferenceStandaloneServer):
+        def _start(self):
+            # Reserve ports with the harness's normal PATH first (macOS uses
+            # sysctl), then give only the server and its worker an empty PATH.
+            with monkeypatch.context() as child_env:
+                child_env.setenv("PATH", str(tmp_path / "empty-path"))
+                child_env.delenv("ANTFLY_INFERENCE_WORKER", raising=False)
+                super()._start()
+
     models_dir = tmp_path / "models"
     models_dir.mkdir()
-    server = EmbeddedInferenceStandaloneServer(str(binary), models_dir, "")
+    server = OffPathServer(str(binary), models_dir, "")
     try:
         assert server.proc is not None and server.proc.poll() is None
         assert (

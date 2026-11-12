@@ -5902,7 +5902,7 @@ test "prefix-only pattern hops run without a document evaluator" {
 }
 
 test "batch prefix filtering bypasses document evaluation and query filters fail explicitly" {
-    const refs = [_]node_identity.Ref{ .{ .key = "User:1:" }, .{ .key = "Other:2:" } };
+    const refs = [_]node_identity.Ref{ .{ .table = null, .key = "User:1:" }, .{ .table = null, .key = "Other:2:" } };
     for ([_]?FilterEvaluator{ null, .{} }) |evaluator| {
         const decisions = try evaluateNodeFiltersAlloc(std.testing.allocator, &refs, .{ .filter_prefix = "User:" }, evaluator);
         defer std.testing.allocator.free(decisions);
