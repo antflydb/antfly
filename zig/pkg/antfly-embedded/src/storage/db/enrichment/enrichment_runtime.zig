@@ -310,7 +310,41 @@ pub const GeneratedSourceGuard = struct {
     expected_digest: ?[32]u8,
     document_key: ?[]const u8 = null,
     source_sequence: u64 = 0,
+    embedding: ?struct {
+        name: []const u8,
+        generation: u64,
+        catalog_digest: [32]u8,
+    } = null,
 };
+
+/// Used by both replay publication and its separate coverage writer. Guards
+/// stay alive until both commits complete; neither may credit obsolete work.
+pub fn validateGeneratedSourceGuard(alloc: Allocator, txn: anytype, guard: GeneratedSourceGuard) !void {
+    if (guard.embedding) |embedding| {
+        try @import("../artifact_inventory.zig").requirePublicationDigest(txn, embedding.catalog_digest);
+        try @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, txn, guard.document_key.?, embedding.name, embedding.generation);
+    }
+    return validateGeneratedSourceRecord(alloc, txn, guard);
+}
+
+fn validateGeneratedSourceRecord(alloc: Allocator, txn: anytype, guard: GeneratedSourceGuard) !void {
+    if (guard.document_key) |doc_key| if (guard.source_sequence != 0) {
+        if (try @import("../doc_identity.zig").lookupOrdinalTxn(alloc, txn, doc_key)) |ordinal| {
+            const state = (try @import("../doc_identity.zig").lookupStateTxn(txn, ordinal)) orelse return error.InvalidDocIdentity;
+            if (!state.isLive() or state.created_generation > guard.source_sequence) return error.EnrichmentSourceChanged;
+        }
+    };
+    if (guard.expected_digest) |expected| if (try embeddingSourceAuthority(txn, guard.key)) |proof| {
+        if (!std.mem.eql(u8, &proof.digest, &expected)) return error.EnrichmentSourceChanged;
+        return;
+    };
+    const raw = txn.get(guard.key) catch |err| switch (err) {
+        error.NotFound => return if (guard.expected_digest == null) {} else error.EnrichmentSourceChanged,
+        else => return err,
+    };
+    const expected = guard.expected_digest orelse return error.EnrichmentSourceChanged;
+    if (!std.mem.eql(u8, &sourceRecordDigest(raw), &expected)) return error.EnrichmentSourceChanged;
+}
 
 pub const GeneratedRecordWriter = *const fn (
     ptr: *anyopaque,
@@ -630,7 +664,7 @@ const GeneratedReplayWindow = struct {
     publishing_indexes: std.ArrayListUnmanaged([]u8) = .empty,
 
     fn hasDerivedItems(self: *const @This()) bool {
-        return self.documents.items.len != 0 or
+        return self.source_guards.items.len != 0 or self.documents.items.len != 0 or
             self.deleted_keys.items.len != 0 or
             self.artifact_delete_keys.items.len != 0 or
             self.artifact_promotions.items.len != 0 or
@@ -690,6 +724,7 @@ const GeneratedReplayWindow = struct {
         self.artifact_delete_keys.deinit(self.alloc);
         for (self.source_guards.items) |guard| self.alloc.free(@constCast(guard.key));
         for (self.source_guards.items) |guard| if (guard.document_key) |key| self.alloc.free(@constCast(key));
+        for (self.source_guards.items) |guard| if (guard.embedding) |value| self.alloc.free(value.name);
         self.source_guards.deinit(self.alloc);
 
         for (self.artifact_promotions.items) |promotion| {
@@ -27441,6 +27476,7 @@ fn runtimeDocumentExtractionWindowBytes(window: *const GeneratedReplayWindow) us
     for (window.source_guards.items) |guard| {
         total = addUsizeSaturating(total, guard.key.len);
         if (guard.document_key) |key| total = addUsizeSaturating(total, key.len);
+        if (guard.embedding) |value| total = addUsizeSaturating(total, value.name.len);
     }
     for (window.artifact_promotions.items) |promotion| {
         total = addUsizeSaturating(total, promotion.staged_key.len);
@@ -28310,6 +28346,7 @@ fn publishRuntimeGraphMutations(runtime: anytype, window: *GeneratedReplayWindow
         for (window.source_guards.items[guard_start..]) |guard| {
             runtime.alloc.free(@constCast(guard.key));
             if (guard.document_key) |key| runtime.alloc.free(@constCast(key));
+            if (guard.embedding) |value| runtime.alloc.free(value.name);
         }
         window.source_guards.shrinkRetainingCapacity(guard_start);
         for (window.neighbor_refs.items[ref_start..]) |ref| {
@@ -31620,7 +31657,8 @@ fn storeGuardedEmbeddingsTxn(runtime: *EnrichmentRuntime, txn: anytype, plan: *c
     @memset(accepted, false);
     // The lease was acquired before opening the writer. Validate against the
     // exact durable catalog snapshot, without taking catalog locks in a txn.
-    if (!plan.matchesArtifactInventory(try @import("../artifact_inventory.zig").catalogs(txn))) return error.EnrichmentSourceChanged;
+    const catalog_digest = try plan.publicationCatalogDigest(txn);
+    try @import("../artifact_inventory.zig").requirePublicationDigest(txn, catalog_digest);
     for (writes, 0..) |write, i| {
         if (!plan.generated_definitions.contains(write.generation_guard.definition)) continue;
         try @import("../artifact_publication.zig").requireLegacyMaterialization(txn, write.key);
@@ -32266,6 +32304,9 @@ fn flushGeneratedReplayWindowWithIdentity(
     completed_failure_fingerprint: u64,
 ) !void {
     if (window.isEmpty()) return;
+    // A rejected append consumes its owned guards. Never leave transitions
+    // behind for a later coverage-only flush without those authorizations.
+    errdefer clearQueuedCoverageTransitions(runtime.alloc, &window.coverage_transitions, &window.coverage_transition_keys);
     const publication_timer = pipeline_metrics.start(.publication);
     defer publication_timer.finish();
 
@@ -32291,7 +32332,7 @@ fn flushGeneratedReplayWindowWithIdentity(
     const commit = try appendGeneratedBatchWithRetry(runtime, batch, artifact_promotions, artifact_delete_keys, source_guards);
     promotions_committed = true;
     recordArtifactBytes(runtime, .dense_embedding, commit.promoted_artifact_bytes);
-    try applyQueuedCoverageTransitionsAfterReplayAppend(runtime, window.coverage_transitions.items);
+    try applyCoverageOutcomeTransitionsGuarded(runtime, window.coverage_transitions.items, source_guards);
     clearQueuedCoverageTransitions(runtime.alloc, &window.coverage_transitions, &window.coverage_transition_keys);
     try rememberPublishedGeneratedBatch(runtime, batch);
     runtime.notify_fn(runtime.notify_ctx, commit.sequence);
@@ -32521,6 +32562,7 @@ fn freeGeneratedSourceGuards(alloc: Allocator, guards: []const GeneratedSourceGu
     for (guards) |guard| {
         alloc.free(@constCast(guard.key));
         if (guard.document_key) |key| alloc.free(@constCast(key));
+        if (guard.embedding) |value| alloc.free(value.name);
     }
     if (guards.len > 0) alloc.free(guards);
 }
@@ -32538,6 +32580,28 @@ fn appendGeneratedSourceGuard(
     const owned_doc_key = if (document_key) |doc_key| try runtime.alloc.dupe(u8, doc_key) else null;
     errdefer if (owned_doc_key) |doc_key| runtime.alloc.free(doc_key);
     try window.source_guards.append(runtime.alloc, .{ .key = owned_key, .expected_digest = expected_digest, .document_key = owned_doc_key, .source_sequence = source_sequence });
+}
+
+fn appendEmbeddingSourceGuard(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, request: enrichment_types.GeneratedEnrichmentRequest, source_key: []const u8, digest: ?[32]u8) !void {
+    var plan = try runtime.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    if (!plan.plan().generated_definitions.contains(producer_input.definitionDigest(request))) return error.EnrichmentSourceChanged;
+    var read = try runtime.store.beginProbe();
+    defer read.abort();
+    const catalog_digest = try plan.plan().publicationCatalogDigest(&read);
+    const name = try runtime.alloc.dupe(u8, requestEmbeddingName(request));
+    errdefer runtime.alloc.free(name);
+    const guard = GeneratedSourceGuard{ .key = source_key, .expected_digest = digest, .document_key = request.doc_key, .source_sequence = request.sequence, .embedding = .{ .name = name, .generation = request.reprocess_generation, .catalog_digest = catalog_digest } };
+    // The writer repeats these checks. Checking here also avoids queuing a
+    // known-obsolete request's cleanup or coverage into a shared window.
+    try @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(runtime.alloc, &read, request.doc_key, name, request.reprocess_generation);
+    // Read probes cannot repair a missing catalog witness. Source checks
+    // themselves only read; the writer installs legacy witnesses if needed.
+    var source_only = guard;
+    source_only.embedding = null;
+    try validateGeneratedSourceRecord(runtime.alloc, &read, source_only);
+    try appendGeneratedSourceGuard(runtime, window, source_key, digest, request.doc_key, request.sequence);
+    window.source_guards.items[window.source_guards.items.len - 1].embedding = guard.embedding;
 }
 
 fn currentRecordDigest(runtime: *EnrichmentRuntime, key: []const u8) !?[32]u8 {
@@ -32590,7 +32654,11 @@ fn mergeGuardedStaleEmbeddingDeletesIntoWindow(
     source_digest: ?[32]u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !void {
-    var source_guarded_in_window = false;
+    // Protect retirement by the same producer identity as vector publication.
+    // Artifact CAS guards below additionally fence replacement after enqueue.
+    if (stale.artifact_delete_keys.len > 0)
+        try appendEmbeddingSourceGuard(runtime, window, request, source_key, source_digest);
+    var source_guarded_in_window = true;
     for (stale.artifact_delete_keys) |key|
         try guardStaleEmbeddingDelete(runtime, window, source_key, source_digest, request, key, &source_guarded_in_window);
     try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, stale);
@@ -34690,10 +34758,13 @@ fn processSparseEmbedding(
         defer source_set.deinit(runtime.alloc);
 
         var stale_deletes = try deleteStaleChunkEmbeddingArtifacts(runtime, request.doc_key, chunk_artifact_name, embedding_artifact_name, source_set.desired_chunk_keys);
-        errdefer stale_deletes.deinit(runtime.alloc);
+        defer stale_deletes.deinit(runtime.alloc);
+        const source_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
+        defer runtime.alloc.free(source_key);
         if (source_set.sources.len == 0) {
+            try appendEmbeddingSourceGuard(runtime, window, request, source_key, source_set.source_record_digest);
             try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
-            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
+            try mergeGuardedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes, source_key, source_set.source_record_digest, request);
             return;
         }
 
@@ -34704,9 +34775,12 @@ fn processSparseEmbedding(
             runtime.alloc.free(chunk_embeddings);
         }
 
+        try appendEmbeddingSourceGuard(runtime, window, request, source_key, source_set.source_record_digest);
         if (chunk_embeddings.len == 0) {
-            try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
-            try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
+            // A current nonempty source with no new outputs is an all-cached
+            // pass. Rejected obsolete work failed the source guard above.
+            try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
+            try mergeGuardedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes, source_key, source_set.source_record_digest, request);
             return;
         }
 
@@ -34716,7 +34790,7 @@ fn processSparseEmbedding(
             for (expanded) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
             if (expanded.len > 0) runtime.alloc.free(expanded);
         }
-        try mergeOwnedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes);
+        try mergeGuardedStaleEmbeddingDeletesIntoWindow(runtime, window, &stale_deletes, source_key, source_set.source_record_digest, request);
         try appendOwnedSparseEmbeddingsToWindow(runtime, window, &expanded);
         return;
     }
@@ -34744,6 +34818,7 @@ fn processSparseEmbedding(
             defer runtime.alloc.free(key);
             return enqueueProducerArtifact(runtime, token, key, null);
         }
+        try appendEmbeddingSourceGuard(runtime, window, request, doc_store_key, sourceRecordDigest(raw));
         try markDerivedCoverageSkipped(runtime, window, request, consumer_indexes);
         return;
     };
@@ -34753,6 +34828,7 @@ fn processSparseEmbedding(
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
     if (input == null and try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
+        try appendEmbeddingSourceGuard(runtime, window, request, doc_store_key, sourceRecordDigest(raw));
         if (try appendCachedSparseEmbeddingToWindow(runtime, window, request.doc_key, artifact_key, consumer_indexes)) {
             try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
         }
@@ -34785,6 +34861,7 @@ fn processSparseEmbedding(
         .kind = .sparse_embedding,
     }}, &accepted);
     if (!accepted[0]) return;
+    try appendEmbeddingSourceGuard(runtime, window, request, doc_store_key, sourceRecordDigest(raw));
     try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
 
     var embeddings = try singleSparseEmbeddingForConsumers(runtime, request.doc_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
@@ -34926,6 +35003,7 @@ fn buildChunkSparseEmbeddingsFromSources(
     for (sources) |source| if (source.metadata != null and source.text.len == 0) return error.IncompatibleChunkEmbeddingTarget;
 
     const embedding_name = requestEmbeddingName(request);
+    const generation_guard = EmbeddingGenerationGuard.fromRequest(request);
     try sparse_embedder.requireRevision(runtime.alloc, embedding_name, revision);
     var embeddings = std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite).empty;
     errdefer {
@@ -35011,23 +35089,55 @@ fn buildChunkSparseEmbeddingsFromSources(
         noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
         defer finishActivePostprocess(runtime);
 
-        for (batch_keys, batch_hashes, sparse_batch, source_indexes.items[start..end]) |*owned_key, source_hash, sparse, source_index| {
-            const chunk_key = owned_key.*.?;
-            if (!try writeSparseEmbeddingArtifact(runtime, request, sources[source_index], source_hash, sparse.indices, sparse.values)) continue;
-            const index_name = try runtime.alloc.dupe(u8, request.index_name);
-            errdefer runtime.alloc.free(index_name);
-            const artifact_key = try embeddingArtifactKey(runtime, chunk_key, requestEmbeddingName(request));
-            errdefer runtime.alloc.free(artifact_key);
-            try embeddings.append(runtime.alloc, .{
-                .index_name = index_name,
-                .doc_key = chunk_key,
-                .artifact_key = artifact_key,
-                .indices = &.{},
-                .values = &.{},
-            });
-            // Ownership moves once. Remaining non-null slots are reclaimed
-            // on success and every failure path in a single linear pass.
-            owned_key.* = null;
+        var publication_start: usize = 0;
+        while (publication_start < sparse_batch.len) {
+            const publication_end = sparsePublicationBatchEnd(sparse_batch, publication_start);
+            const count = publication_end - publication_start;
+            var writes: [64]GuardedEmbeddingWrite = undefined;
+            var accepted: [64]bool = undefined;
+            var initialized: usize = 0;
+            defer for (writes[0..initialized]) |write| {
+                runtime.alloc.free(write.key);
+                runtime.alloc.free(write.value);
+            };
+            const parent_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
+            defer runtime.alloc.free(parent_key);
+            for (sparse_batch[publication_start..publication_end], publication_start..) |sparse, i| {
+                const source = sources[source_indexes.items[start + i]];
+                const source_digest = source.source_record_digest orelse return error.MissingChunkSourceFence;
+                const key = try embeddingArtifactKey(runtime, batch_keys[i].?, embedding_name);
+                errdefer runtime.alloc.free(key);
+                const payload = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(runtime.alloc, batch_hashes[i], sparse.indices, sparse.values);
+                writes[initialized] = .{
+                    .key = key,
+                    .value = payload,
+                    .source_key = if (source.source_record_is_parent) parent_key else source.key,
+                    .source_digest = source_digest,
+                    .parent_key = parent_key,
+                    .doc_key = request.doc_key,
+                    .source_sequence = request.sequence,
+                    .generation_guard = generation_guard,
+                    .kind = .sparse_embedding,
+                };
+                initialized += 1;
+            }
+            try storeGuardedEmbeddingsWithRetry(runtime, writes[0..count], accepted[0..count]);
+            for (writes[0..count], accepted[0..count], batch_keys[publication_start..publication_end]) |write, committed, *owned_key| {
+                if (!committed) continue;
+                const index_name = try runtime.alloc.dupe(u8, request.index_name);
+                errdefer runtime.alloc.free(index_name);
+                const artifact_key = try runtime.alloc.dupe(u8, write.key);
+                errdefer runtime.alloc.free(artifact_key);
+                try embeddings.append(runtime.alloc, .{
+                    .index_name = index_name,
+                    .doc_key = owned_key.*.?,
+                    .artifact_key = artifact_key,
+                    .indices = &.{},
+                    .values = &.{},
+                });
+                owned_key.* = null;
+            }
+            publication_start = publication_end;
         }
         embedder_mod.freeSparseEmbeddingBatch(runtime.alloc, sparse_batch);
         start = end;
@@ -35195,33 +35305,18 @@ fn writeEmbeddingArtifact(runtime: *EnrichmentRuntime, write: EmbeddingArtifactW
     return accepted[0];
 }
 
-fn writeSparseEmbeddingArtifact(
-    runtime: *EnrichmentRuntime,
-    request: enrichment_types.GeneratedEnrichmentRequest,
-    source: ChunkEmbeddingSource,
-    source_hash: u64,
-    indices: []const u32,
-    values: []const f32,
-) !bool {
-    const key = try embeddingArtifactKey(runtime, source.key, requestEmbeddingName(request));
-    defer runtime.alloc.free(key);
-    const payload = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(runtime.alloc, source_hash, indices, values);
-    defer runtime.alloc.free(payload);
-    const parent_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
-    defer runtime.alloc.free(parent_key);
-    var accepted: [1]bool = undefined;
-    try storeGuardedEmbeddingsWithRetry(runtime, &.{.{
-        .key = key,
-        .value = payload,
-        .source_key = if (source.source_record_is_parent) parent_key else source.key,
-        .source_digest = source.source_record_digest orelse return error.MissingChunkSourceFence,
-        .parent_key = parent_key,
-        .doc_key = request.doc_key,
-        .source_sequence = request.sequence,
-        .generation_guard = EmbeddingGenerationGuard.fromRequest(request),
-        .kind = .sparse_embedding,
-    }}, &accepted);
-    return accepted[0];
+/// Independent of provider input batching: bound writer hold time and encoded
+/// payload scratch by both output rows and sparse nonzero bytes. A single large
+/// output is admitted alone, preserving the provider's existing size contract.
+fn sparsePublicationBatchEnd(vectors: []const embedder_mod.SparseEmbedding, start: usize) usize {
+    var end = start;
+    var bytes: usize = 0;
+    while (end < vectors.len and end - start < 64) : (end += 1) {
+        const next_bytes = vectors[end].indices.len *| 8 +| 64;
+        if (end > start and bytes +| next_bytes > 4 * 1024 * 1024) break;
+        bytes +|= next_bytes;
+    }
+    return end;
 }
 
 fn publishDeletedKeys(runtime: *EnrichmentRuntime, deleted_keys: []const []const u8) !void {
@@ -37318,6 +37413,7 @@ fn chunkEmbeddingSourceSetForRequestWithProvider(runtime: *EnrichmentRuntime, al
     return .{
         .sources = sources,
         .desired_chunk_keys = keys,
+        .source_record_digest = source_record_digest,
     };
 }
 
@@ -38329,6 +38425,10 @@ fn lockCoverageFailureFence(runtime: *EnrichmentRuntime, transitions: []const Co
 }
 
 fn applyCoverageOutcomeTransitions(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition) !void {
+    return applyCoverageOutcomeTransitionsGuarded(runtime, transitions, &.{});
+}
+
+fn applyCoverageOutcomeTransitionsGuarded(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition, source_guards: []const GeneratedSourceGuard) !void {
     if (transitions.len == 0) return;
 
     const ordered = try runtime.alloc.dupe(CoverageOutcomeTransition, transitions);
@@ -38386,7 +38486,7 @@ fn applyCoverageOutcomeTransitions(runtime: *EnrichmentRuntime, transitions: []c
         if (retained > 0) {
             var local_coverage_guard = runtime.index_manager.lockLocalCoverage();
             defer local_coverage_guard.release();
-            applyCoverageOutcomeTransitionsForIndex(runtime, ordered[group_start .. group_start + retained]) catch |err| {
+            applyCoverageOutcomeTransitionsForIndexGuarded(runtime, ordered[group_start .. group_start + retained], source_guards) catch |err| {
                 if (failure_fence) |fence| fence.unlock();
                 apply_guard.unlock();
                 return err;
@@ -38399,9 +38499,13 @@ fn applyCoverageOutcomeTransitions(runtime: *EnrichmentRuntime, transitions: []c
 }
 
 fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition) !void {
+    return applyCoverageOutcomeTransitionsForIndexGuarded(runtime, transitions, &.{});
+}
+
+fn applyCoverageOutcomeTransitionsForIndexGuarded(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition, source_guards: []const GeneratedSourceGuard) !void {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        applyCurrentCoverageOutcomeTransitionsForIndex(runtime, transitions) catch |err| {
+        applyCurrentCoverageOutcomeTransitionsForIndex(runtime, transitions, source_guards) catch |err| {
             if (err == error.WriterLocked and attempt < writer_locked_retry_count) {
                 backoffWriterLockRetry();
                 continue;
@@ -38434,7 +38538,7 @@ fn coverageCounterInTxn(alloc: Allocator, txn: *backend_erased.Batch, transition
     return result;
 }
 
-fn applyCurrentCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition) !void {
+fn applyCurrentCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition, source_guards: []const GeneratedSourceGuard) !void {
     if (transitions.len == 0) return;
     try heartbeatEnrichmentLease(runtime);
     var publication_store = try RuntimePublicationStore.init(runtime);
@@ -38445,6 +38549,10 @@ fn applyCurrentCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, t
     var committed = false;
     defer if (!committed) batch.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
+    // Per-artifact CAS guards describe pre-replay values, some of which that
+    // replay intentionally deleted. Only producer/source guards survive into
+    // the independent coverage transaction.
+    for (source_guards) |guard| if (guard.embedding != null) try validateGeneratedSourceGuard(runtime.alloc, &batch, guard);
 
     var writes = std.ArrayListUnmanaged(KVPair).empty;
     defer writes.deinit(runtime.alloc);
@@ -38545,10 +38653,6 @@ fn applyCurrentCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, t
     } else if (skipped_delta < 0) {
         runtime.skipped_source_count -|= @intCast(-skipped_delta);
     }
-}
-
-fn applyQueuedCoverageTransitionsAfterReplayAppend(runtime: *EnrichmentRuntime, transitions: []const CoverageOutcomeTransition) !void {
-    try applyCoverageOutcomeTransitions(runtime, transitions);
 }
 
 test "coverage transition merge is sequence aware and failure dominant" {
@@ -49241,4 +49345,300 @@ test "embedding publication verifies large parents using bounded content authori
     counted.parent_reads = 0;
     for (0..1024) |_| try std.testing.expect(try embeddingSourceStillCurrent(runtime.alloc, &counted, fresh, null));
     try std.testing.expectEqual(@as(usize, 0), counted.parent_reads);
+}
+
+test "sparse chunk ownership survives mixed publication and rejects obsolete cleanup at both boundaries" {
+    for ([_]bool{ false, true }) |during_provider| try testSparseCleanupRace(during_provider);
+}
+
+fn testSparseCleanupRace(during_provider: bool) !void {
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const a = std.testing.allocator;
+    const Probe = struct {
+        db: ?*db_mod.DB = null,
+        replace: bool = false,
+        fn embed(ptr: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.replace) {
+                self.replace = false;
+                try self.db.?.batchInternal(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"ABCDEFGHIJKLMNOP\"}" }}, .sync_level = .enrichments }, null, .{ .wait_for_sync_level = false });
+            }
+            const indices = try alloc.dupe(u32, &.{1});
+            errdefer alloc.free(indices);
+            return .{ .indices = indices, .values = try alloc.dupe(f32, &.{1}) };
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/sparse-stale-cleanup", .{tmp.sub_path});
+    defer a.free(path);
+    var probe = Probe{};
+    const provider = embedder_mod.SparseEmbedder{ .ptr = &probe, .sparse_embed_fn = Probe.embed };
+    var db = try db_mod.DB.open(a, path, .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "cleanup-probe", .sparse_embedder = provider } });
+    defer db.close();
+    probe.db = &db;
+    try db.addIndex(.{ .name = "vector", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"artifact_name\":\"chunks\",\"chunk_size\":4}}" });
+    try db.batchInternal(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"abcdefghijklmnop\"}" }}, .sync_level = .enrichments }, null, .{ .wait_for_sync_level = false });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"zzzz\"}" }}, .sync_level = .write });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    var pin = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer pin.release();
+    var request = for (pin.plan().generated_templates) |candidate| {
+        if (candidate.kind == .sparse_embedding) break candidate;
+    } else return error.TestUnexpectedResult;
+    request.doc_key = "doc";
+    var cache: std.ArrayListUnmanaged(WorkerChunkCacheEntry) = .empty;
+    defer freeWorkerChunkCache(runtime.alloc, &cache);
+    var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
+    defer window.deinit();
+    if (during_provider) {
+        probe.replace = true;
+        try std.testing.expectError(error.EnrichmentSourceChanged, processSparseEmbedding(runtime, request, &cache, &window));
+        try std.testing.expect(!probe.replace);
+        try std.testing.expectEqual(@as(usize, 0), window.artifact_delete_keys.items.len);
+        try std.testing.expectEqual(@as(usize, 0), window.coverage_transitions.items.len);
+    } else {
+        try processSparseEmbedding(runtime, request, &cache, &window);
+        try std.testing.expect(window.artifact_delete_keys.items.len > 0);
+        try std.testing.expect(window.source_guards.items.len > 0);
+        try db.batchInternal(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"ABCDEFGHIJKLMNOP\"}" }}, .sync_level = .enrichments }, null, .{ .wait_for_sync_level = false });
+        // The coverage writer has its own transaction after replay publication.
+        try std.testing.expectError(error.EnrichmentSourceChanged, applyCoverageOutcomeTransitionsGuarded(runtime, window.coverage_transitions.items, window.source_guards.items));
+        try std.testing.expectError(error.EnrichmentSourceChanged, flushGeneratedReplayWindow(runtime, &window));
+        try std.testing.expectEqual(@as(usize, 0), window.coverage_transitions.items.len);
+        try flushGeneratedReplayWindow(runtime, &window);
+    }
+    // Every output of the newer long source survives the obsolete pass.
+    for (0..4) |ordinal| {
+        const chunk = try internal_keys.chunkArtifactKeyAlloc(a, "doc", "chunks", @intCast(ordinal));
+        defer a.free(chunk);
+        const key = try embeddingArtifactKey(runtime, chunk, requestEmbeddingName(request));
+        defer runtime.alloc.free(key);
+        const value = try db.core.store.get(a, key);
+        defer a.free(value);
+        var vector = try enrichment_artifact_codec.decodeSparseEmbeddingAlloc(a, value);
+        defer vector.deinit(a);
+        try std.testing.expectEqualSlices(u32, &.{1}, vector.indices);
+    }
+}
+
+test "embedding publication verifies bounded catalog authority and automatic writer invalidation" {
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const inventory = @import("../artifact_inventory.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/catalog-publication", .{tmp.sub_path});
+    defer a.free(path);
+    var db = try db_mod.DB.open(a, path, .{ .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    const large_template = try a.alloc(u8, 1024 * 1024);
+    defer a.free(large_template);
+    @memset(large_template, 'a');
+    try db.addEnrichment(.{ .name = "vectors", .kind = .embedding, .field = "body", .template = large_template, .expected_dims = 3 });
+    var pin = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer pin.release();
+    var read = try db.core.store.beginReadTxn();
+    const proof = (try read.get(inventory.local_key))[0..40].*;
+    read.abort();
+    const Counting = struct {
+        proof: [40]u8,
+        catalog_reads: usize = 0,
+        metadata_reads: usize = 0,
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            if (inventory.isCatalogKey(key)) {
+                self.catalog_reads += 1;
+                return error.UnexpectedCatalogBodyRead;
+            }
+            if (!std.mem.eql(u8, key, inventory.local_key)) return error.UnexpectedMetadataRead;
+            self.metadata_reads += 1;
+            return &self.proof;
+        }
+        pub fn put(_: *@This(), _: []const u8, _: []const u8) anyerror!void {
+            return error.UnexpectedMetadataWrite;
+        }
+    };
+    var counted = Counting{ .proof = proof };
+    for (0..1024) |_| {
+        const digest = try pin.plan().publicationCatalogDigest(&counted);
+        try inventory.requirePublicationDigest(&counted, digest);
+    }
+    try std.testing.expectEqual(@as(usize, 0), counted.catalog_reads);
+    try std.testing.expectEqual(@as(usize, 2048), counted.metadata_reads);
+    // Legacy stores repair a missing witness after validating current bytes
+    // under the writer. Malformed witnesses never authorize publication.
+    try db.core.store.delete(inventory.local_key);
+    {
+        var writer = try db.core.store.beginWriteTxn();
+        errdefer writer.abort();
+        const digest = try pin.plan().publicationCatalogDigest(&writer);
+        try inventory.requirePublicationDigest(&writer, digest);
+        try std.testing.expect(try inventory.publicationIdentity(&writer) != null);
+        try writer.commit();
+    }
+    try db.core.store.put(inventory.local_key, "malformed");
+    read = try db.core.store.beginReadTxn();
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, pin.plan().publicationCatalogDigest(&read));
+    read.abort();
+    try db.core.store.put(inventory.local_key, &proof);
+    // A catalog write cannot evade the fence by omitting inventory.refresh.
+    // Exercise both ordinary and batch writer boundaries, including abort.
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        try txn.put(inventory.enrichment_key, "[]");
+        txn.abort();
+    }
+    read = try db.core.store.beginReadTxn();
+    _ = try pin.plan().publicationCatalogDigest(&read);
+    read.abort();
+    try db.core.store.put(inventory.enrichment_key, "[]");
+    read = try db.core.store.beginReadTxn();
+    try std.testing.expectError(error.EnrichmentSourceChanged, pin.plan().publicationCatalogDigest(&read));
+    const changed = try inventory.local(&read);
+    read.abort();
+    try std.testing.expect(changed.epoch > std.mem.readInt(u64, proof[0..8], .little));
+    var batch = try db.core.store.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.delete(inventory.enrichment_key);
+    try batch.commit();
+    read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    const deleted = try inventory.local(&read);
+    try std.testing.expect(deleted.epoch > changed.epoch);
+}
+
+test "sparse publication bounds both row count and nonzero output bytes" {
+    const a = std.testing.allocator;
+    var rows: [130]embedder_mod.SparseEmbedding = @splat(.{ .indices = &.{}, .values = &.{} });
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start < rows.len) {
+        start = sparsePublicationBatchEnd(&rows, start);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
+    const large = try a.alloc(u32, 300 * 1024);
+    defer a.free(large);
+    for (rows[0..4]) |*row| row.indices = large;
+    try std.testing.expectEqual(@as(usize, 1), sparsePublicationBatchEnd(&rows, 0));
+    try std.testing.expectEqual(@as(usize, 2), sparsePublicationBatchEnd(&rows, 1));
+    // An individual output above the batch byte budget makes progress alone.
+    rows[0].indices = try a.alloc(u32, 600 * 1024);
+    defer a.free(rows[0].indices);
+    try std.testing.expectEqual(@as(usize, 1), sparsePublicationBatchEnd(&rows, 0));
+}
+
+test "sparse cleanup guards fence empty sources epochs definitions and source resurrection" {
+    const Mode = enum { empty, epoch, definition, resurrection };
+    for (std.meta.tags(Mode)) |mode| {
+        const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+        const identity = @import("../doc_identity.zig");
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/cleanup-guards", .{tmp.sub_path});
+        defer a.free(path);
+        var db = try db_mod.DB.open(a, path, .{ .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        const config = types.EnrichmentConfig{ .name = "vectors", .kind = .embedding, .field = "body", .expected_dims = 0 };
+        try db.addEnrichment(config);
+        try db.addIndex(.{ .name = "vector", .kind = .sparse_vector, .config_json = "{\"field\":\"embedding\",\"sources\":[{\"artifact\":\"vectors\"}]}" });
+        const source = if (mode == .empty) "{\"body\":\"\"}" else "{\"body\":\"stable\"}";
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = source }}, .sync_level = .write });
+        try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+        const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+        try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+        var pin = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer pin.release();
+        var request = for (pin.plan().generated_templates) |candidate| {
+            if (candidate.kind == .sparse_embedding) break candidate;
+        } else return error.TestUnexpectedResult;
+        request.doc_key = "doc";
+        var read = try db.core.store.beginReadTxn();
+        const ordinal = (try identity.lookupOrdinalTxn(a, &read, "doc")) orelse return error.TestUnexpectedResult;
+        request.sequence = (try identity.lookupStateTxn(&read, ordinal)).?.created_generation;
+        read.abort();
+        const primary = try documentSourceStoreKeyAlloc(runtime, "doc");
+        defer runtime.alloc.free(primary);
+        const raw = try db.core.store.get(a, primary);
+        defer a.free(raw);
+        var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
+        defer window.deinit();
+        try appendEmbeddingSourceGuard(runtime, &window, request, primary, sourceRecordDigest(raw));
+        if (mode == .empty) {
+            try markDerivedCoverageSkipped(runtime, &window, request, &.{"vector"});
+        } else try queueDerivedCoverageProduced(runtime, &window, request, &.{"vector"});
+        // The same guard accepts an unchanged source under the actual writer.
+        {
+            var writer = try db.core.store.beginWriteTxn();
+            defer writer.abort();
+            try validateGeneratedSourceGuard(a, &writer, window.source_guards.items[0]);
+        }
+        switch (mode) {
+            .empty => try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"new input\"}" }}, .sync_level = .write }),
+            .epoch => {
+                const intent = @import("../artifact_reprocess_intent.zig");
+                const key = try intent.embeddingKeyAlloc(a, "doc", "vectors");
+                defer a.free(key);
+                try db.core.store.put(key, &intent.encode(request.producer_json, 1));
+            },
+            .definition => {
+                var changed = config;
+                changed.template = "new {{body}}";
+                _ = try db.upsertEnrichment(changed);
+            },
+            .resurrection => {
+                try db.batch(.{ .deletes = &.{"doc"}, .sync_level = .write });
+                try db.batch(.{ .writes = &.{.{ .key = "doc", .value = source }}, .sync_level = .write });
+            },
+        }
+        try std.testing.expectError(error.EnrichmentSourceChanged, applyCoverageOutcomeTransitionsGuarded(runtime, window.coverage_transitions.items, window.source_guards.items));
+        try std.testing.expectError(error.EnrichmentSourceChanged, flushGeneratedReplayWindow(runtime, &window));
+    }
+}
+
+test "sparse cleanup guards preserve cached coverage and retire empty inline sources" {
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const a = std.testing.allocator;
+    const Probe = struct {
+        calls: usize = 0,
+        fn embed(ptr: *anyopaque, alloc: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const indices = try alloc.dupe(u32, &.{1});
+            errdefer alloc.free(indices);
+            return .{ .indices = indices, .values = try alloc.dupe(f32, &.{1}) };
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/sparse-empty-source", .{tmp.sub_path});
+    defer a.free(path);
+    var probe = Probe{};
+    var db = try db_mod.DB.open(a, path, .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "sparse-empty", .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.embed } } });
+    defer db.close();
+    try db.addIndex(.{ .name = "vector", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"artifact_name\":\"chunks\",\"chunk_size\":4}}" });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"abcdefghijklmnop\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expect(probe.calls > 0);
+    const before = probe.calls;
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"abcdefghijklmnop\",\"metadata\":1}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(before, probe.calls);
+    const generation = db.core.index_manager.coverageGenerationForIndex("vector").?;
+    const marker = try internal_keys.derivedCoverageOutcomeKeyAlloc(a, "vector", generation, "doc");
+    defer a.free(marker);
+    const produced = try db.core.store.get(a, marker);
+    defer a.free(produced);
+    try std.testing.expectEqualStrings("produced", produced);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"\"}" }}, .sync_level = .write });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(before, probe.calls);
+    const skipped = try db.core.store.get(a, marker);
+    defer a.free(skipped);
+    try std.testing.expectEqualStrings("skipped", skipped);
+    var result = try db.search(a, .{ .index_name = "vector", .query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1}, .k = 10 } }, .return_mode = .chunk, .limit = 10 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
 }

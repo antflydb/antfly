@@ -57339,28 +57339,7 @@ fn appendGeneratedBatchFromEnrichment(
             if (self.fence) |active_fence| if (active_fence.replay_generation) |generation|
                 try enrichment_state.validateReplayGenerationTxn(alloc, txn, enrichment_runtime_mod.scope_name, generation);
             try self.validateLease(alloc, txn);
-            for (self.source_guards) |guard| {
-                if (guard.document_key) |doc_key| {
-                    if (guard.source_sequence != 0) {
-                        if (try doc_identity.lookupOrdinalTxn(alloc, txn, doc_key)) |ordinal| {
-                            const state = (try doc_identity.lookupStateTxn(txn, ordinal)) orelse return error.InvalidDocIdentity;
-                            if (!state.isLive() or state.created_generation > guard.source_sequence)
-                                return error.EnrichmentSourceChanged;
-                        }
-                    }
-                }
-                const raw = txn.get(guard.key) catch |err| switch (err) {
-                    error.NotFound => {
-                        if (guard.expected_digest == null) continue;
-                        return error.EnrichmentSourceChanged;
-                    },
-                    else => return err,
-                };
-                const expected = guard.expected_digest orelse return error.EnrichmentSourceChanged;
-                var actual: [32]u8 = undefined;
-                std.crypto.hash.sha2.Sha256.hash(raw, &actual, .{});
-                if (!std.mem.eql(u8, &expected, &actual)) return error.EnrichmentSourceChanged;
-            }
+            for (self.source_guards) |guard| try enrichment_runtime_mod.validateGeneratedSourceGuard(alloc, txn, guard);
         }
 
         fn validateAtCommit(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) anyerror!void {
