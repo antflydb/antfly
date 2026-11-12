@@ -102,7 +102,10 @@ pub const RunAdmission = struct {
     backend_class: memory.BackendClass,
     limits: memory.Limits,
     static_workspace_bytes: usize,
+    /// Standalone managed sessions use their immutable load-lease baseline.
     required_residency: memory.AdmissionAmounts = .{},
+    /// Published LoadedModels bind all sessions to their live model-owned set.
+    residency_source: ?*memory.ResidencySource = null,
     backend_workspace_reserved: bool = false,
     model_profile: ModelProfile = .{},
     /// Serving sessions must retain the default live-memory pressure check.
@@ -143,17 +146,26 @@ pub const RunAdmission = struct {
         return self.acquireAmountsWithPressure(amounts, &pressure);
     }
 
+    pub fn requiredResidency(self: RunAdmission) memory.Residency {
+        return if (self.residency_source) |source| source.snapshot() else .fromAmounts(self.backend_class, self.required_residency);
+    }
+
     fn acquireAmountsWithPressure(self: RunAdmission, amounts: memory.AdmissionAmounts, pressure: *?memory.AdmissionPressure) !memory.AdmissionLease {
+        return self.acquireAmountsWithOwned(amounts, .{}, pressure);
+    }
+
+    fn acquireAmountsWithOwned(self: RunAdmission, amounts: memory.AdmissionAmounts, owned: memory.AdmissionAmounts, pressure: *?memory.AdmissionPressure) !memory.AdmissionLease {
         pressure.* = null;
         if (self.controller.consumeForcedRunDenialForTesting()) {
             std.log.warn("test-only forced inference run admission denial", .{});
             return error.ResourceTemporarilyUnavailable;
         }
+        const required = try self.requiredResidency().merge(.fromAmounts(self.backend_class, owned));
         return self.controller.tryAcquireRequestsWithPressure(&.{.{
             .backend_class = self.backend_class,
             .limits = self.limits,
             .amounts = amounts,
-            .required_residency = self.required_residency,
+            .required_residency = required,
         }}, self.check_live_memory, pressure) catch |err| {
             // Controller locks are released before inspecting OS memory or
             // emitting diagnostics. Sessions share the manager's sampler gate.
@@ -161,7 +173,7 @@ pub const RunAdmission = struct {
                 .backend_class = self.backend_class,
                 .limits = self.limits,
                 .amounts = amounts,
-                .required_residency = self.required_residency,
+                .required_residency = required,
             });
             return err;
         };
@@ -170,19 +182,16 @@ pub const RunAdmission = struct {
     /// Validate all host scratch already owned by one request before acquiring
     /// a delta. Independent leases must not hide its intrinsic policy limit.
     pub fn validateOwnedHostScratch(self: RunAdmission, bytes: usize) !void {
-        const amounts = memory.AdmissionAmounts{ .host_scratch_bytes = bytes };
-        const shared = self.controller.sharedLimitsSnapshot();
-        if ((amounts.firstLimitExceeded(self.limits) catch return error.ResourceLimitExceeded) != null or
-            (shared.host_limit_bytes != 0 and bytes > shared.host_limit_bytes) or
-            (shared.unified_limit_bytes != 0 and bytes > shared.unified_limit_bytes))
-        {
-            if (self.denial_observer) |observer| observer.record(observer.context, error.ResourceLimitExceeded, null, .{
-                .backend_class = self.backend_class,
-                .limits = self.limits,
-                .amounts = amounts,
-            });
-            return error.ResourceLimitExceeded;
-        }
+        const request = memory.AdmissionRequest{
+            .backend_class = self.backend_class,
+            .limits = self.limits,
+            .amounts = .{ .host_scratch_bytes = bytes },
+            .required_residency = self.requiredResidency(),
+        };
+        self.controller.validateRequests(&.{request}) catch |err| {
+            if (self.denial_observer) |observer| observer.record(observer.context, err, null, request);
+            return err;
+        };
     }
 
     fn estimateResidentAmounts(
@@ -1090,7 +1099,13 @@ pub const Session = struct {
         var uncredited = request;
         uncredited.pre_admitted_host_bytes = 0;
         const amounts = try admission.estimateRequest(uncredited, self.outputInfo());
-        return amounts.fitsLimits(admission.limits);
+        admission.controller.validateRequests(&.{.{
+            .backend_class = admission.backend_class,
+            .limits = admission.limits,
+            .amounts = amounts,
+            .required_residency = admission.requiredResidency(),
+        }}) catch return false;
+        return true;
     }
 
     /// Reserve tokenizer/preprocessing memory independently from the backend
@@ -1100,6 +1115,16 @@ pub const Session = struct {
     pub fn admitHostPreprocess(self: Session, host_scratch_bytes: usize) !RunPermit {
         var pressure: ?memory.AdmissionPressure = null;
         return self.admitHostPreprocessWithPressure(host_scratch_bytes, &pressure);
+    }
+
+    /// Grow one request's preprocessing reservation atomically. Existing owned
+    /// scratch affects feasibility only; only the new bytes are charged.
+    pub fn admitHostPreprocessOwned(self: Session, bytes: usize, owned_bytes: usize) !RunPermit {
+        var pressure: ?memory.AdmissionPressure = null;
+        return .{
+            .session = self,
+            .lease = if (self.run_admission) |admission| try admission.acquireAmountsWithOwned(.{ .host_scratch_bytes = bytes }, .{ .host_scratch_bytes = owned_bytes }, &pressure) else null,
+        };
     }
 
     /// Host-only preflight reports its denial constraint without estimating a
@@ -2297,4 +2322,34 @@ test "run admission observer preserves session refusal identity outside controll
     try std.testing.expectEqual(@as(?anyerror, error.ResourceTemporarilyUnavailable), observer.failure);
     try std.testing.expect(observer.pressure != null);
     try std.testing.expectEqual(@as(usize, 2), observer.calls);
+}
+
+test "cumulative preprocessing validates residency without treating other requests as permanent" {
+    var controller = memory.AdmissionController{};
+    const limits = memory.Limits{ .host_limit_bytes = 100 };
+    var weights = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 90 }, false);
+    defer weights.release();
+    const session = Session{ .ptr = &controller, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = limits, .static_workspace_bytes = 0, .required_residency = weights.amounts, .check_live_memory = false } };
+    var first = try session.admitHostPreprocess(6);
+    defer first.deinit();
+    try std.testing.expectError(error.ResourceLimitExceeded, session.run_admission.?.validateOwnedHostScratch(12));
+    try session.run_admission.?.validateOwnedHostScratch(6);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admitHostPreprocess(6));
+    try std.testing.expectEqual(@as(usize, 96), controller.snapshot().hostTotalBytes());
+}
+
+test "session admission planning includes residency without reserving memory" {
+    var controller = memory.AdmissionController{};
+    const limits = memory.Limits{ .host_limit_bytes = 100 };
+    var weights = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 90 }, false);
+    defer weights.release();
+    const Probe = struct {
+        fn outputs(_: *anyopaque) []const TensorInfo {
+            return &.{};
+        }
+    };
+    const session = Session{ .ptr = &controller, .vtable = &.{ .run = undefined, .inputInfo = undefined, .outputInfo = Probe.outputs, .backend = undefined, .close = undefined }, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = limits, .static_workspace_bytes = 0, .required_residency = weights.amounts, .check_live_memory = false } };
+    try std.testing.expect(try session.fitsRun(.{ .batch = 1, .sequence = 1, .input_bytes = 1, .output_bytes = 0, .workspace_bytes = 1, .workspace_planned = true }));
+    try std.testing.expect(!try session.fitsRun(.{ .batch = 1, .sequence = 1, .input_bytes = 2, .output_bytes = 1, .workspace_bytes = 1, .workspace_planned = true }));
+    try std.testing.expectEqualDeep(weights.amounts, controller.snapshot());
 }
