@@ -24,7 +24,7 @@ const native_abi = @import("antfly_runtime_abi").native_abi;
 const antfly_image = @import("antfly_image");
 
 // Retained document capabilities and incremental HTTP request-body reads.
-pub const abi_version: u32 = 34;
+pub const abi_version: u32 = 35;
 pub const DocumentStoreView = @import("antfly_runtime_abi").document_abi.View;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
@@ -91,6 +91,25 @@ pub const ProcessMemoryLimitProvenance = enum(u8) {
 /// Placement belongs to the calling surface, not to runtime JSON settings.
 pub const ExecutionHost = enum(c_int) { server = 0, embedded = 1 };
 
+/// Trusted owner callback; borrowed until inference destruction returns.
+/// Only copied JSON crosses a worker pipe, never this pointer or callbacks.
+pub const ContentSecuritySource = extern struct {
+    context: ?*anyopaque = null,
+    acquire: ?*const fn (?*anyopaque, *String) callconv(.c) Status = null,
+    release: ?*const fn (?*anyopaque, String) callconv(.c) void = null,
+
+    pub fn copy(self: ContentSecuritySource, alloc: std.mem.Allocator) !?[]u8 {
+        const acquire = self.acquire orelse return null;
+        const release = self.release orelse return error.InvalidArguments;
+        var bytes: String = undefined;
+        const status = acquire(self.context, &bytes);
+        if (!status.isOk()) return errorFromStatus(status);
+        defer release(self.context, bytes);
+        if (bytes.len > 1024 * 1024) return error.BodyTooLarge;
+        return try alloc.dupe(u8, bytes.slice());
+    }
+};
+
 pub const CreateContext = extern struct {
     abi_version: u32,
     struct_size: u32 = @sizeOf(@This()),
@@ -117,6 +136,7 @@ pub const CreateContext = extern struct {
     executor: native_abi.IoBorrow,
     out_handle: *?*anyopaque,
     execution_host: ExecutionHost = .server,
+    content_security_source: ContentSecuritySource = .{},
 };
 
 pub const ConfigureContext = extern struct {
@@ -300,6 +320,7 @@ pub const ProviderInvokeContext = extern struct {
     /// Appended in ABI v19 and extended in v20 with model/backend detail.
     progress: ProgressView = .{},
     document_store: DocumentStoreView = .{},
+    content_security_json: OptionalString = .{},
 };
 
 pub const RouteManifestEntry = extern struct {
@@ -329,6 +350,7 @@ pub const HttpHandleContext = extern struct {
     out_response_handle: *?*anyopaque,
     out_response: *http_abi.HttpResponseView,
     document_store: DocumentStoreView = .{},
+    content_security_json: OptionalString = .{},
 };
 
 pub const Capability = struct {
@@ -488,4 +510,38 @@ test "linked inference ABI rejects mismatched context and function-table prefixe
     table.struct_size = requiredFunctionTableSize(Capability.provider).?;
     try std.testing.expect(validFunctionTable(&table, Capability.provider));
     try std.testing.expect(!validFunctionTable(&table, 1 << 63));
+}
+
+test "content security snapshot copies retain request ownership and fail closed" {
+    const a = std.testing.allocator;
+    const Publisher = struct {
+        json: []const u8 = "{\"allowed_paths\":[\"/first\"]}",
+        failed: bool = false,
+        acquired: usize = 0,
+        released: usize = 0,
+        fn acquire(raw: ?*anyopaque, out: *String) callconv(.c) Status {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.failed) return statusFromError(error.ResourceTemporarilyUnavailable);
+            self.acquired += 1;
+            out.* = .init(self.json);
+            return .ok;
+        }
+        fn release(raw: ?*anyopaque, _: String) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.released += 1;
+        }
+    };
+    var publisher: Publisher = .{};
+    const source = ContentSecuritySource{ .context = &publisher, .acquire = Publisher.acquire, .release = Publisher.release };
+    const first = (try source.copy(a)).?;
+    defer a.free(first);
+    publisher.json = "{\"allowed_paths\":[]}";
+    const second = (try source.copy(a)).?;
+    defer a.free(second);
+    try std.testing.expectEqualStrings("{\"allowed_paths\":[\"/first\"]}", first);
+    try std.testing.expectEqualStrings(publisher.json, second);
+    try std.testing.expectEqual(publisher.acquired, publisher.released);
+    publisher.failed = true;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, source.copy(a));
+    try std.testing.expectEqual(publisher.acquired, publisher.released);
 }
