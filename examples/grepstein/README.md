@@ -775,13 +775,19 @@ audio MIME is inferred from the native format detector without decoding samples.
 
 Direct-URL transcription also reserves the downloader’s temporary body buffers,
 including compressed input and output-buffer growth. Body capacities are capped
-at `max_download_bytes`; the conservative collection bound is three times that
-limit. A separate 8 MiB transport quota covers TLS buffers, trust roots and HTTP
+at `max_download_bytes`. Gzip is decoded as bytes arrive, without retaining the
+encoded recording. Every gzip member is decoded and its CRC32/size verified;
+the encoded and decoded ceilings apply to the whole member sequence. Wrapped
+deflate checks its Adler-32 checksum and retains a bounded replay buffer for its zlib/raw
+format fallback, so the general admission bound remains three times the limit.
+A separate 8 MiB transport quota covers TLS buffers, trust roots and HTTP
 metadata. `DownloadContext.transport_memory_limit_bytes` configures that quota
 for library callers across HTTP, S3, GCS and pinned-range reads; exhaustion reports
 `DownloadTransportMemoryExceeded`. Detached bodies retain the caller allocator,
 while object-store credentials and connection state stay within the transport
-quota.
+quota. S3/GCS response bodies move through the SDK and downloader without copying
+when their allocator matches; allocator changes copy once into the destination
+and release the original only after success.
 
 Download and encoding peaks are separate phases, so admission uses their maximum
 without increasing the transcription response limit. Pre-acquired GCS recordings
@@ -801,3 +807,11 @@ HTTP trust loading and peer-certificate parsing use a scoped Zig 0.17
 certificate compatibility copy with checked DER lengths. Malformed or truncated
 CA certificates return a parse error and release partial allocations. Trust and
 hostname verification remain enabled.
+
+
+Transcription adapters reject negative, nonfinite and out-of-range provider
+timestamps instead of converting them into integer values. Vertex protobuf
+offsets are parsed as decimal seconds/nanoseconds with integer arithmetic and
+rounded to milliseconds. Constructor and result ownership is established before
+fallible field allocation; failed requests release partial segments, words,
+speakers and text, including when an invocation reaches its allocator ceiling.
