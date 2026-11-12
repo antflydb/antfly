@@ -6365,20 +6365,53 @@ pub const NativeFile = struct {
             checkpoint.free_map_root_page = try pages.allocate();
             checkpoint.page_count = pages.next_page_id;
             try pages.flush();
+            // `persistAllocator` -> `State.preparePersist` retires the
+            // ledger's previous root page (`state.root_page`, the old
+            // free_map_root_page) stamped with `self.publicationEpoch()`
+            // -- `self.header.checkpoints[active].commit_sequence + 1`,
+            // read from `self.header` as it stands right now, since this
+            // runs outside any transaction (`self.transaction_header` is
+            // null). That epoch is a promise that the checkpoint which
+            // ends up containing the retirement carries at least that
+            // sequence number. Capture it before `self.header` changes
+            // and stamp the checkpoint we are about to publish with it,
+            // or `validateIndexedOwnership`'s "every pending retirement's
+            // epoch is already covered by its own checkpoint" invariant
+            // sees an epoch one past a checkpoint stuck at the old,
+            // unchanged sequence (see "crash sweep: redo log checkpoint
+            // with indexed reclamation retires pages").
+            const epoch = self.publicationEpoch();
             try self.persistAllocator(&pages, &checkpoint);
+            checkpoint.commit_sequence = epoch;
         } else {
             checkpoint.page_count += log_pages;
         }
+        self.header.checkpoints = .{ checkpoint, checkpoint };
+        self.header.redo_log_offset = offset;
+        self.header.redo_log_capacity = capacity;
+
+        // Both checkpoint slots and the header are written here, but
+        // deliberately synced *once*, together: a crash before that one
+        // sync leaves every write below unsynced, which `power_loss`
+        // modeling in the crash-sim harness can drop in full, reverting
+        // the file to exactly its pre-call state -- not a redo-log file
+        // yet, safe to retry `enableRedoLog` again from scratch. Two
+        // separate syncs (slots, then header) used to leave a window
+        // where the checkpoint slot (and, for an indexed file, the
+        // ledger `persistAllocator` just durably wrote) already reserves
+        // the log region's page-id span while the header's own
+        // `redo_log_capacity` is still durably 0 -- a combination
+        // `check()`'s indexed-allocator validation has no way to
+        // reconcile (nothing on disk says "these reserved-but-unreachable
+        // pages belong to a redo log, not a hole"), surfacing as
+        // `invalid_allocator` on exactly that crash window, reproducibly,
+        // with no crash-sim power loss involved at all (see "crash sweep:
+        // redo log checkpoint with indexed reclamation retires pages").
         var slot_buf: [max_page_size]u8 = undefined;
         const slot_page = slot_buf[0..page_size];
         encodeCheckpointSlotPage(slot_page, checkpoint);
         try self.file.writePositionalAll(io, slot_page, slotPhysicalPage(0) * page_size);
         try self.file.writePositionalAll(io, slot_page, slotPhysicalPage(1) * page_size);
-        if (!self.no_sync) try self.file.sync(io);
-        self.header.checkpoints = .{ checkpoint, checkpoint };
-
-        self.header.redo_log_offset = offset;
-        self.header.redo_log_capacity = capacity;
         var header_buf: [header_size]u8 = undefined;
         encodeHeader(&header_buf, self.header);
         try self.file.writePositionalAll(io, &header_buf, 0);
@@ -6434,7 +6467,9 @@ pub const NativeFile = struct {
         // open must fail rather than silently serve a truncated view of
         // acknowledged work.
         if (outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
-        if (meta_ctx.compact) |compact| self.header.checkpoints[self.header.active_checkpoint] = compact.toCheckpointSlot();
+        if (meta_ctx.compact) |compact| {
+            self.header.checkpoints[self.header.active_checkpoint] = compact.toCheckpointSlot();
+        }
         self.manifest_commits_enabled = false;
 
         const entry = self.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
