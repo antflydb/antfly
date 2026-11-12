@@ -114,6 +114,47 @@ pub const Selection = struct {
         }
         return begin;
     }
+    /// Selected work, not all archive groups. Coordinates and bitmap blocks
+    /// share group boundaries so no lane decodes the same group twice.
+    pub const Groups = struct {
+        selection: Selection,
+        file: usize,
+        point: usize,
+        block: usize,
+        pub fn next(self: *Groups) ?u32 {
+            const points = self.selection.coordinates;
+            const blocks = self.selection.blocks;
+            const p = if (self.point < points.len and points[self.point].file == self.file) points[self.point].group else null;
+            const b = if (self.block < blocks.len and blocks[self.block].file == self.file) blocks[self.block].group else null;
+            const group = if (p) |value| if (b) |other| @min(value, other) else value else b orelse return null;
+            while (self.point < points.len and points[self.point].file == self.file and points[self.point].group == group) self.point += 1;
+            while (self.block < blocks.len and blocks[self.block].file == self.file and blocks[self.block].group == group) self.block += 1;
+            return group;
+        }
+    };
+    pub fn groups(self: Selection, file: usize) Groups {
+        return .{ .selection = self, .file = file, .point = self.lower(.{ .file = file, .group = 0, .row = 0 }), .block = self.blockLower(file, 0, 0) };
+    }
+    /// Borrowed inclusive group bounds avoid overflow at the largest ordinal.
+    pub fn groupWindow(self: Selection, file: usize, first: u32, last: u32) Selection {
+        const begin = self.lower(.{ .file = file, .group = first, .row = 0 });
+        var low = begin;
+        var high = self.coordinates.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const row = self.coordinates[mid];
+            if (row.file < file or (row.file == file and row.group <= last)) low = mid + 1 else high = mid;
+        }
+        const block_begin = self.blockLower(file, first, 0);
+        var block_end = block_begin;
+        var upper = self.blocks.len;
+        while (block_end < upper) {
+            const mid = block_end + (upper - block_end) / 2;
+            const block = self.blocks[mid];
+            if (block.file < file or (block.file == file and block.group <= last)) block_end = mid + 1 else upper = mid;
+        }
+        return .{ .coordinates = self.coordinates[begin..low], .blocks = self.blocks[block_begin..block_end] };
+    }
     pub fn fileMayMatch(self: Selection, file: usize) bool {
         const block = self.blockLower(file, 0, 0);
         if (block < self.blocks.len and self.blocks[block].file == file) return true;
@@ -167,4 +208,25 @@ test "external lake compressed selections seek across block and u32 boundaries" 
     try std.testing.expect(!selection.rangeMayMatch(0, 1, 8, 8));
     try std.testing.expect(selection.rangeMayMatch(0, 1, std.math.maxInt(u32), 2));
     try std.testing.expect(!selection.rangeMayMatch(0, 1, 8, (1 << 32) - 8));
+}
+
+test "external lake bounded window profiles group windows include bitmap-only groups and maximum ordinals" {
+    const a = std.testing.allocator;
+    var bitmap = @import("../../encoding/roaring.zig").RoaringBitmap.init(a);
+    defer bitmap.deinit();
+    try bitmap.add(7);
+    const last = std.math.maxInt(u32);
+    const coordinates = [_]Coordinate{ .{ .file = 0, .group = 0, .row = 1 }, .{ .file = 0, .group = last, .row = 2 }, .{ .file = 1, .group = 0, .row = 3 } };
+    const blocks = [_]Selection.Block{ .{ .file = 0, .group = 2, .high = 0, .rows = &bitmap }, .{ .file = 0, .group = last, .high = 1, .rows = &bitmap }, .{ .file = 1, .group = 0, .high = 0, .rows = &bitmap } };
+    const selection: Selection = .{ .coordinates = &coordinates, .blocks = &blocks };
+    var groups = selection.groups(0);
+    for ([_]u32{ 0, 2, last }) |expected| try std.testing.expectEqual(expected, groups.next().?);
+    try std.testing.expect(groups.next() == null);
+    const first = selection.groupWindow(0, 0, 2);
+    const final = selection.groupWindow(0, last, last);
+    try std.testing.expect(first.contains(0, 2, 7));
+    try std.testing.expect(!first.contains(0, last, 2));
+    try std.testing.expect(final.contains(0, last, 2));
+    try std.testing.expect(final.contains(0, last, (1 << 32) + 7));
+    try std.testing.expect(!final.fileMayMatch(1));
 }

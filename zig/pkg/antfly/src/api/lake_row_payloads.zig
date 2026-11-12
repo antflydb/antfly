@@ -153,13 +153,21 @@ pub const Cluster = struct {
                 return self_.input.cell(alloc, row, column);
             }
             fn physical(raw: *anyopaque, alloc: A, column: usize) !?local.sql_execution_batch.PhysicalColumn {
+                return physicalSelected(raw, alloc, column, null);
+            }
+            fn physicalSelected(raw: *anyopaque, alloc: A, column: usize, selected_rows: ?[]const usize) !?local.sql_execution_batch.PhysicalColumn {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
-                if (column == self_.input.width()) return .{ .vector = .{ .name = "_capture_bytes", .values = .{ .i64 = self_.sizes } }, .range = .{ .count = self_.sizes.len }, .kind = .integer };
-                return self_.input.physicalColumn(alloc, column);
+                if (column == self_.input.width()) {
+                    const values: local.sql_execution_batch.PhysicalColumn = .{ .vector = .{ .name = "_capture_bytes", .values = .{ .i64 = self_.sizes } }, .range = .{ .count = self_.sizes.len }, .kind = .integer };
+                    return if (selected_rows) |rows_| try values.select(alloc, rows_) else values;
+                }
+                // Spill appends often request one row. Forward that selection
+                // rather than rebuilding the entire captured batch per row.
+                return self_.input.physicalColumnSelected(alloc, column, selected_rows);
             }
         };
         var sized: Sized = .{ .input = try input.select(a, selected), .sizes = sizes };
-        const values: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &sized, .read = Sized.cell, .read_physical = Sized.physical, .count = selected.len, .width = source.len + 1 } };
+        const values: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &sized, .read = Sized.cell, .read_physical = Sized.physical, .read_physical_selected = Sized.physicalSelected, .count = selected.len, .width = source.len + 1 } };
         const datums = try a.alloc(Datum, keys.len);
         const order = try a.alloc([]const Datum, keys.len);
         const ordinals = try a.alloc(u64, keys.len);

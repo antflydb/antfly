@@ -137,6 +137,8 @@ pub const InferenceExecutionControl = struct {
     /// Trusted document allowance, consumed by every Whisper decode attempt.
     audio_output_token_limit: ?usize = null,
     document_store: @import("antfly_runtime_abi").document_abi.View = .{},
+    /// Trusted request-owned policy snapshot. Never parsed from public input.
+    content_security_json: ?[]const u8 = null,
     document_session: ?*@import("antfly_document_runs").Session = null,
     document_dispatch_meter: ?*@import("antfly_document_runs").DispatchMeter = null,
     /// Runtime used for cancellation monitors and other structured background

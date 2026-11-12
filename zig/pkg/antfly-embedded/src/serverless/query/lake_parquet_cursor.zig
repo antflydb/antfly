@@ -43,6 +43,10 @@ pub const Cursor = struct {
     shared_reader: ?*@import("lake_serving_cache.zig").Reader = null,
     scheduler: ?*@import("../../sql/parallel_scheduler.zig").Scheduler = null,
     speculative: bool = false,
+    /// Explicit winning-row hydration may amortize a small unindexed chunk's
+    /// first header with its payload. Ordinary scans keep conservative probes.
+    selected_hydration: bool = false,
+    navigation_prefetched: bool = false,
     dictionary_decodes: usize = 0,
     pages_decoded: usize = 0,
     output: std.heap.ArenaAllocator,
@@ -53,7 +57,18 @@ pub const Cursor = struct {
         select: ?*const fn (*anyopaque, types.ColumnBatch) anyerror![]const bool = null,
     };
     const VectorReader = @import("lake_parquet_vector.zig").Reader;
+    const HydrationChunk = struct {
+        parent: ranges.RangeLease,
+        refs: std.atomic.Value(usize) = .init(1),
+        fn release(raw: *anyopaque) void {
+            const held: *@This() = @ptrCast(@alignCast(raw));
+            if (held.refs.fetchSub(1, .acq_rel) != 1) return;
+            held.parent.release();
+            std.heap.smp_allocator.destroy(held);
+        }
+    };
     const Column = struct {
+        hydration_chunk: ?*HydrationChunk = null,
         vector: ?*VectorReader = null,
         credit: ?*Admission.Credit = null,
         dictionary_credit: ?*Admission.Credit = null,
@@ -143,6 +158,7 @@ pub const Cursor = struct {
             if (column.dictionary_lease) |lease| lease.release() else if (column.dictionary_owner) |owner| owner.release();
             if (column.credit) |credit| credit.release();
             if (column.dictionary_credit) |credit| credit.release();
+            if (column.hydration_chunk) |held| HydrationChunk.release(held);
         }
         self.admission.release();
         self.a.free(self.columns);
@@ -190,8 +206,9 @@ pub const Cursor = struct {
         }
         return .{ .ptr = owner, .release_fn = Owner.release, .retained_bytes = bytes };
     }
-    fn read(self: *Cursor, offset: u64, len: usize) !ranges.RangeLease {
+    fn read(self: *Cursor, column: *Column, offset: u64, len: usize) !ranges.RangeLease {
         const context: @import("lake_read_context.zig").Context = if (self.shared_reader) |reader| reader.context else .{};
+        if (try self.readHydrationInput(column, offset, len)) |lease| return lease;
         if (self.speculative) {
             if (!try self.admission.tryReserveInput(len, context)) return error.ConcurrencyUnavailable;
         } else try self.admission.reserveInput(len, context);
@@ -200,6 +217,42 @@ pub const Cursor = struct {
         errdefer lease.release();
         return self.admission.wrapInput(lease, len, context);
     }
+    fn readHydrationInput(self: *Cursor, column: *Column, offset: u64, len: usize) !?ranges.RangeLease {
+        if (!self.selected_hydration or self.shared_reader == null) return null;
+        const end = std.math.add(u64, offset, len) catch return error.InvalidParquetPage;
+        const budget = self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len);
+        // Each column has one decoder owner. Other workers inspect immutable
+        // chunk metadata only; they never read or write this owner's pin.
+        const eligible = for (self.columns[0..@min(4, self.columns.len)]) |*candidate| {
+            if (candidate == column) break true;
+        } else false;
+        if (!eligible) return null;
+        const chunk = column.chunk;
+        if (chunk.offset_index_offset != null or chunk.compressed_len == 0 or chunk.compressed_len > 1024 * 1024 or chunk.compressed_len > budget or offset < chunk.file_offset) return null;
+        const chunk_end = std.math.add(u64, chunk.file_offset, chunk.compressed_len) catch return error.InvalidParquetPage;
+        if (end > chunk_end) return null;
+        if (column.hydration_chunk == null) {
+            const context = self.shared_reader.?.context;
+            const length: usize = @intCast(chunk.compressed_len);
+            // Whole-chunk staging is optional. Required page-sized reads
+            // retain their usual progress path when the input quota is busy.
+            if (!try self.admission.tryReserveInput(length, context)) return null;
+            errdefer self.admission.releaseInput(length, context);
+            // Declining optional admission is a successful null return, so an
+            // errdefer cannot release an owner allocated before that decision.
+            const held = try std.heap.smp_allocator.create(HydrationChunk);
+            errdefer std.heap.smp_allocator.destroy(held);
+            const parent = try self.reader.readPlannedLease(std.heap.smp_allocator, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = chunk.file_offset, .len = chunk.compressed_len }, .purpose = .parquet_column_chunk });
+            errdefer parent.release();
+            held.* = .{ .parent = try self.admission.wrapInput(parent, length, context) };
+            column.hydration_chunk = held;
+        }
+        const held = column.hydration_chunk.?;
+        _ = held.refs.fetchAdd(1, .monotonic);
+        const first: usize = @intCast(offset - chunk.file_offset);
+        return .{ .bytes = held.parent.bytes[first..][0..len], .owner = .{ .shared = .{ .ptr = held, .release_fn = HydrationChunk.release } } };
+    }
+
     fn loadIndex(self: *Cursor, column: *Column) !void {
         if (column.index_loaded) return;
         column.index_loaded = true;
@@ -309,7 +362,7 @@ pub const Cursor = struct {
         probe: ?ranges.RangeLease = null,
     };
     fn completeFetch(self: *Cursor, column: *Column, prepared: PreparedFetch) !Fetched {
-        const lease = prepared.probe orelse try self.read(column.offset, prepared.len);
+        const lease = prepared.probe orelse try self.read(column, column.offset, prepared.len);
         errdefer lease.release();
         const parsed = prepared.parsed orelse try page.parsePageHeader(lease.bytes);
         if (prepared.indexed_rows) |rows| {
@@ -326,7 +379,21 @@ pub const Cursor = struct {
     }
     /// Discover bounded headers first. A large payload is fetched in a separate
     /// I/O phase admitted using its validated physical length, not query quotas.
+    fn releaseHydration(column: *Column) void {
+        if (column.hydration_chunk) |held| {
+            column.hydration_chunk = null;
+            HydrationChunk.release(held);
+        }
+    }
     fn prepareFetch(self: *Cursor, column: *Column) !?PreparedFetch {
+        const fetched = self.prepareFetchInner(column) catch |err| {
+            releaseHydration(column);
+            return err;
+        };
+        if (fetched == null) releaseHydration(column);
+        return fetched;
+    }
+    fn prepareFetchInner(self: *Cursor, column: *Column) !?PreparedFetch {
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
         while (column.offset < end) {
             if (column.directory) |directory| {
@@ -433,6 +500,9 @@ pub const Cursor = struct {
     }
 
     fn decodeFetched(self: *Cursor, column: *Column, fetched: Fetched) !bool {
+        // Decoding owns its output. A staged chunk must not pin the input
+        // quota while another column needs a larger required page.
+        defer releaseHydration(column);
         const parsed = fetched.parsed;
         const len = fetched.len;
         const end = fetched.end;
@@ -569,7 +639,7 @@ pub const Cursor = struct {
         if (column.first + count == self.group.row_count and column.offset != end) return error.ParquetRowGroupRowCountMismatch;
         return true;
     }
-    fn header(self: *Cursor, column: *const Column) !page.ParsedHeader {
+    fn header(self: *Cursor, column: *Column) !page.ParsedHeader {
         if (try self.cachedIndexedPage(column)) |lease| {
             defer lease.release();
             return lease.item.parquet_page_header.?;
@@ -622,7 +692,50 @@ pub const Cursor = struct {
         _ = try parquet.admitColumnMaterialization(count, 1, admission);
         return lease;
     }
-    fn headerRead(self: *Cursor, column: *const Column) !HeaderRead {
+    fn probeLimit(self: *const Cursor, column: *const Column) usize {
+        const lanes = @max(@as(usize, 1), @min(4, self.columns.len));
+        const budget = @max(@as(usize, 1), self.limits.max_input_bytes / lanes);
+        const reader = self.shared_reader orelse return 512;
+        if (reader.context.trace == null or reader.cache.max_bytes < 8 * 1024 * 1024) return 512;
+        // A footer supplies this length; cap amplification and transient input
+        // before scheduling. Large/multi-page chunks retain normal discovery.
+        const limit: usize = if (self.selected_hydration and column.chunk.compressed_len <= 256 * 1024) 256 * 1024 else 64 * 1024;
+        return @min(limit, budget);
+    }
+    fn prefetchNavigation(self: *Cursor) !void {
+        if (self.navigation_prefetched) return;
+        self.navigation_prefetched = true;
+        const reader = self.shared_reader orelse return;
+        var reads: [8]ranges.RangeRead = undefined;
+        var count: usize = 0;
+        const budget = self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len);
+        var remaining: usize = @min(self.limits.max_input_bytes, 4 * 1024 * 1024);
+        for (self.columns, 0..) |column, column_index| {
+            if (count == reads.len) break;
+            if (self.filter != null and !column.required) continue;
+            if (self.selected_hydration and column_index < 4 and column.chunk.compressed_len <= budget and column.chunk.offset_index_offset == null and column.chunk.compressed_len != 0 and
+                column.chunk.compressed_len <= 1024 * 1024 and column.chunk.compressed_len <= remaining)
+            {
+                // Winning-row projection knows its exact file/group already.
+                // Fetch small complete unindexed chunks together; otherwise
+                // each column pays a discovery round trip before its payload.
+                reads[count] = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.chunk.file_offset, .len = column.chunk.compressed_len }, .purpose = .parquet_column_chunk };
+                remaining -= column.chunk.compressed_len;
+                count += 1;
+                continue;
+            }
+            const offset = column.chunk.offset_index_offset orelse continue;
+            const length = column.chunk.offset_index_length orelse continue;
+            if (length > budget or length > remaining) continue;
+            remaining -= length;
+            reads[count] = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = length }, .purpose = .parquet_page_index };
+            count += 1;
+        }
+        // Batch all projected page locations before column workers discover
+        // their first survivor. Demand still validates every offset and header.
+        try reader.prefetch(reads[0..count]);
+    }
+    fn headerRead(self: *Cursor, column: *Column) !HeaderRead {
         if (self.limits.max_input_bytes == 0) return error.ParquetPageTooLarge;
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
         if (column.offset >= end) return error.InvalidParquetPage;
@@ -632,7 +745,7 @@ pub const Cursor = struct {
             // the directory before trusting either lengths or row ordinals.
             if (entry.len > end - column.offset) return error.InvalidParquetMetadata;
             if (entry.len > self.limits.max_input_bytes) return error.ParquetPageTooLarge;
-            const lease = try self.read(column.offset, entry.len);
+            const lease = try self.read(column, column.offset, entry.len);
             errdefer lease.release();
             const parsed = try page.parsePageHeader(lease.bytes);
             try parsed.header.validateResourceLimits();
@@ -641,14 +754,18 @@ pub const Cursor = struct {
             if (len != entry.len or parsed.header.value_count != entry.rows) return error.InvalidParquetMetadata;
             return .{ .parsed = parsed, .lease = lease };
         }
-        var probe_size: usize = @intCast(@min(end - column.offset, @min(self.limits.max_input_bytes, 512)));
+        // A serving request with bounded byte read-ahead can amortize its
+        // first header and following payload. Tiny probes force another GET
+        // even when the entire projected chunk fits in the admitted buffer.
+        const probe_limit = self.probeLimit(column);
+        var probe_size: usize = @intCast(@min(end - column.offset, @min(self.limits.max_input_bytes, probe_limit)));
         while (true) {
-            const probe_lease = try self.read(column.offset, probe_size);
+            const probe_lease = try self.read(column, column.offset, probe_size);
             errdefer probe_lease.release();
             const probe = probe_lease.bytes;
             const parsed = page.parsePageHeader(probe) catch |err| {
                 const next_size = @min(end - column.offset, @min(probe_size * 2, @min(self.limits.max_input_bytes, 64 * 1024)));
-                if (next_size == probe_size) return err;
+                if (next_size <= probe_size) return err;
                 probe_lease.release();
                 probe_size = @intCast(next_size);
                 continue;
@@ -690,7 +807,7 @@ pub const Cursor = struct {
         var reads: [8]ranges.RangeRead = undefined;
         var count: usize = 0;
         var planned: usize = 0;
-        for (self.columns) |*column| {
+        for (self.columns, 0..) |*column, column_index| {
             if (VectorReader.supports(column.chunk.logical_type)) continue;
             if (self.filter != null and !column.required) continue;
             if (planned == 4) break;
@@ -725,6 +842,9 @@ pub const Cursor = struct {
                     }
                 }
             } else {
+                if (self.selected_hydration and column_index < 4 and column.chunk.compressed_len != 0 and
+                    column.chunk.compressed_len <= 1024 * 1024 and
+                    column.chunk.compressed_len <= self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len)) continue;
                 const probe: ranges.RangeRead = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = @min(end - column.offset, 512) }, .purpose = .parquet_column_chunk };
                 try reader.prefetchPage(probe, end, limit);
             }
@@ -755,9 +875,10 @@ pub const Cursor = struct {
     }
     fn headerWorkspace(self: *Cursor, column: *const Column) usize {
         // Discovery performs no payload I/O for OffsetIndex ranges. Other
-        // headers probe at most 64 KiB; every larger payload is admitted later.
+        // Ordinary headers probe at most 64 KiB; selected small chunks can
+        // consume 256 KiB. Charge the actual policy before dispatch.
         const end = column.chunk.file_offset +| column.chunk.compressed_len;
-        const probe: usize = @intCast(@min(end -| column.offset, @min(self.limits.max_input_bytes, 64 * 1024)));
+        const probe: usize = @intCast(@min(end -| column.offset, @min(self.limits.max_input_bytes, @max(64 * 1024, self.probeLimit(column)))));
         const index: usize = if (column.index_loaded) 0 else @min(
             @as(usize, column.chunk.offset_index_length orelse 0) +| (column.chunk.column_index_length orelse 0),
             self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len),
@@ -830,15 +951,15 @@ pub const Cursor = struct {
         for (self.columns) |*column| {
             if ((!required_only or column.required) and column.first + column.count <= self.position) self.retire(column);
         }
-        // Required directory discovery retains its established caller path.
-        // Speculative discovery runs in the admitted I/O phase, using the
-        // heap-owned admission's locked backing allocator for retained state.
+        // Header workers discover independent page indexes under the same
+        // admitted I/O phase as page headers. Loading every index here first
+        // serialized cold columns before the parallel pipeline could start.
+        // The inline advance path still loads its own index when saturated.
         for (self.columns) |*column| {
             if (VectorReader.supports(column.chunk.logical_type)) {
                 if ((!required_only or column.required) and column.first + column.count <= self.position) try self.advanceVector(column);
                 continue;
             }
-            if (!self.speculative and (!required_only or column.required)) try self.loadIndex(column);
         }
         const io = if (self.shared_reader) |reader| reader.context.io else null;
         if (io == null or (self.columns.len < 2 and !self.speculative)) {
@@ -1137,6 +1258,9 @@ pub const Cursor = struct {
         return .{ .snapshot = binding.snapshot(), .external_span = .{ .first = first.external, .count = count }, .columns = vectors.items };
     }
     pub fn next(self: *Cursor) !?types.ColumnBatch {
+        self.prefetchNavigation() catch {
+            if (self.shared_reader) |reader| try reader.context.ensureActive();
+        };
         const end = @min(self.group.row_count, self.row_end orelse self.group.row_count);
         while (self.position < end) {
             _ = self.output.reset(.free_all);

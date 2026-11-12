@@ -19,15 +19,178 @@ const std = @import("std");
 const storage = @import("../../storage/object_storage.zig");
 const Allocator = std.mem.Allocator;
 
+/// Reservations include failures and concurrent workers. Retrying cannot turn
+/// a selective query into an unbounded speculative scan.
+pub const ReadAheadBudget = struct {
+    used: std.atomic.Value(u64) = .init(0),
+    failure_mutex: std.atomic.Mutex = .unlocked,
+    failures: [16]?[32]u8 = @splat(null),
+    failure_cursor: usize = 0,
+    pub fn hasFailure(self: *ReadAheadBudget, key: [32]u8) bool {
+        while (!self.failure_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.failure_mutex.unlock();
+        for (self.failures) |entry| if (entry) |value| if (std.mem.eql(u8, &value, &key)) return true;
+        return false;
+    }
+    pub fn recordFailure(self: *ReadAheadBudget, key: [32]u8) void {
+        while (!self.failure_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.failure_mutex.unlock();
+        for (&self.failures) |*entry| {
+            if (entry.*) |value| {
+                if (std.mem.eql(u8, &value, &key)) return;
+            } else {
+                entry.* = key;
+                return;
+            }
+        }
+        self.failures[self.failure_cursor] = key;
+        self.failure_cursor = (self.failure_cursor + 1) % self.failures.len;
+    }
+    pub fn reserve(self: *ReadAheadBudget, bytes: u64) bool {
+        const maximum = 8 * 1024 * 1024;
+        var used = self.used.load(.monotonic);
+        while (bytes <= maximum - used) {
+            if (self.used.cmpxchgWeak(used, used + bytes, .monotonic, .monotonic)) |observed| {
+                used = observed;
+            } else return true;
+        }
+        return false;
+    }
+};
+
+/// Request-owned, bounded diagnostics. Workers share atomics, never a request
+/// arena or a callback retained by a cache. Elapsed I/O sums may overlap.
+pub const IoTrace = struct {
+    pub const Snapshot = struct {
+        ram_hits: u64 = 0,
+        disk_hits: u64 = 0,
+        provider_reads: u64 = 0,
+        provider_bytes: u64 = 0,
+        provider_errors: u64 = 0,
+        provider_nanoseconds: u64 = 0,
+        peak_inflight: u64 = 0,
+        opening_nanoseconds: u64 = 0,
+        read_ahead_bytes: u64 = 0,
+        map_lookup_nanoseconds: u64 = 0,
+        map_provider_reads: u64 = 0,
+        map_provider_nanoseconds: u64 = 0,
+        map_locator_hits: u64 = 0,
+        prefetch_submitted: u64 = 0,
+        prefetch_declined: u64 = 0,
+        prefetch_queue_nanoseconds: u64 = 0,
+        navigation_provider_reads: u64 = 0,
+        navigation_provider_nanoseconds: u64 = 0,
+        payload_provider_reads: u64 = 0,
+        payload_provider_nanoseconds: u64 = 0,
+        cache_wait_nanoseconds: u64 = 0,
+        decoded_cache_hits: u64 = 0,
+        source_peak_inflight: u64 = 0,
+        hydration_lane_submitted: u64 = 0,
+        hydration_lane_declined: u64 = 0,
+        source_provider_reads: u64 = 0,
+        source_provider_bytes: u64 = 0,
+        source_provider_nanoseconds: u64 = 0,
+        source_provider_errors: u64 = 0,
+        pub fn add(self: *Snapshot, other: Snapshot) void {
+            inline for (@typeInfo(Snapshot).@"struct".field_names) |field| {
+                if (comptime std.mem.endsWith(u8, field, "peak_inflight")) @field(self, field) = @max(@field(self, field), @field(other, field)) else @field(self, field) +|= @field(other, field);
+            }
+        }
+        pub fn since(self: Snapshot, before: Snapshot) Snapshot {
+            var result: Snapshot = .{};
+            inline for (@typeInfo(Snapshot).@"struct".field_names) |field| @field(result, field) = if (comptime std.mem.endsWith(u8, field, "peak_inflight")) @field(self, field) else @field(self, field) -| @field(before, field);
+            return result;
+        }
+    };
+    const fields = @typeInfo(Snapshot).@"struct".field_names.len;
+    values: [fields]std.atomic.Value(u64) = @splat(.init(0)),
+    active: std.atomic.Value(u64) = .init(0),
+    source_active: std.atomic.Value(u64) = .init(0),
+    read_ahead_budget: ReadAheadBudget = .{},
+    /// Composed leaves/refills share their outer request's one allowance.
+    read_ahead_shared: ?*ReadAheadBudget = null,
+    pub fn readAheadFailed(self: *IoTrace, key: [32]u8) bool {
+        return (self.read_ahead_shared orelse &self.read_ahead_budget).hasFailure(key);
+    }
+    pub fn failReadAhead(self: *IoTrace, key: [32]u8) void {
+        (self.read_ahead_shared orelse &self.read_ahead_budget).recordFailure(key);
+    }
+    pub fn reserveReadAhead(self: *IoTrace, bytes: u64) bool {
+        const budget = self.read_ahead_shared orelse &self.read_ahead_budget;
+        if (!budget.reserve(bytes)) return false;
+        self.add("read_ahead_bytes", bytes);
+        return true;
+    }
+    pub fn add(self: *IoTrace, comptime field: []const u8, value: u64) void {
+        inline for (@typeInfo(Snapshot).@"struct".field_names, 0..) |name, i| if (comptime std.mem.eql(u8, field, name)) {
+            _ = self.values[i].fetchAdd(value, .monotonic);
+            return;
+        };
+        @compileError("unknown I/O trace counter");
+    }
+    pub fn snapshot(self: *const IoTrace) Snapshot {
+        var result: Snapshot = .{};
+        inline for (@typeInfo(Snapshot).@"struct".field_names, 0..) |field, i| @field(result, field) = self.values[i].load(.monotonic);
+        return result;
+    }
+    pub fn beginSource(self: *IoTrace) void {
+        const active = self.source_active.fetchAdd(1, .monotonic) + 1;
+        inline for (@typeInfo(Snapshot).@"struct".field_names, 0..) |field, i| if (comptime std.mem.eql(u8, field, "source_peak_inflight")) {
+            _ = self.values[i].fetchMax(active, .monotonic);
+        };
+    }
+    pub fn endSource(self: *IoTrace) void {
+        _ = self.source_active.fetchSub(1, .monotonic);
+    }
+    pub fn begin(self: *IoTrace) u64 {
+        const active = self.active.fetchAdd(1, .monotonic) + 1;
+        inline for (@typeInfo(Snapshot).@"struct".field_names, 0..) |field, i| if (comptime std.mem.eql(u8, field, "peak_inflight")) {
+            _ = self.values[i].fetchMax(active, .monotonic);
+        };
+        return @import("antfly_platform").time.monotonicNs();
+    }
+    pub fn end(self: *IoTrace, start: u64, requests: u64, bytes: u64, failed: bool) void {
+        self.endClass(start, requests, bytes, failed, .artifact);
+    }
+    pub fn endClass(self: *IoTrace, start: u64, requests: u64, bytes: u64, failed: bool, class: IoClass) void {
+        const elapsed = @import("antfly_platform").time.monotonicNs() -| start;
+        switch (class) {
+            .artifact => {},
+            .navigation => {
+                self.add("navigation_provider_reads", requests);
+                self.add("navigation_provider_nanoseconds", elapsed);
+            },
+            .payload => {
+                self.add("payload_provider_reads", requests);
+                self.add("payload_provider_nanoseconds", elapsed);
+            },
+        }
+        _ = self.active.fetchSub(1, .monotonic);
+        self.add("provider_reads", requests);
+        self.add("provider_bytes", bytes);
+        self.add("provider_errors", @intFromBool(failed));
+        self.add("provider_nanoseconds", @import("antfly_platform").time.monotonicNs() -| start);
+    }
+};
+
+pub const IoClass = enum { artifact, navigation, payload };
 pub const Context = struct {
+    io_class: IoClass = .artifact,
     io: ?std.Io = null,
     /// The owner has synchronized the construction allocator of every client
     /// used in this scope. Providers must separately advertise concurrency.
     parallel_object_io: bool = false,
+    trace: ?*IoTrace = null,
     deadline_ns: ?u64 = null,
     cancellation: ?storage.CancellationToken = null,
     checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
     additional_checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
+    /// Safe for transport polling, including a canceled child task. Lease
+    /// checkpoints may perform I/O and belong only on fallible read boundaries.
+    pub fn isCancelled(self: Context) bool {
+        if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return true;
+        return if (self.cancellation) |token| token.isCancelled() else false;
+    }
     pub fn ensureActive(self: Context) !void {
         // The scoped deadline remains precise when an in-flight transport
         // adapter reports that same expiration through a boolean callback.
@@ -54,8 +217,7 @@ pub const Store = struct {
     }
     fn canceled(raw: *const anyopaque) bool {
         const self: *const Store = @ptrCast(@alignCast(raw));
-        self.ensureActive() catch return true;
-        return false;
+        return self.context.isCancelled();
     }
     fn token(self: *Store) storage.CancellationToken {
         return .{ .ptr = self, .is_cancelled_fn = canceled };
@@ -91,9 +253,8 @@ pub const Store = struct {
             parent: ?storage.CancellationToken,
             fn canceled(raw_token: *const anyopaque) bool {
                 const value: *const @This() = @ptrCast(@alignCast(raw_token));
-                value.store.ensureActive() catch return true;
-                if (value.parent) |parent| parent.check() catch return true;
-                return false;
+                if (value.store.context.isCancelled()) return true;
+                return if (value.parent) |parent| parent.isCancelled() else false;
             }
         };
         const combined: Combined = .{ .store = self, .parent = options.cancellation };
@@ -179,4 +340,76 @@ test "external lake bounded window profiles deadline identity survives flattened
     try std.testing.expectError(error.DeadlineExceeded, expired.ensureActive());
     const canceled_context: Context = .{ .cancellation = expired.cancellation };
     try std.testing.expectError(error.Canceled, canceled_context.ensureActive());
+}
+
+test "external lake opening I/O traces separate request traffic and overlapping reads" {
+    var first: IoTrace = .{};
+    var second: IoTrace = .{};
+    const left = first.begin();
+    const right = first.begin();
+    first.end(left, 1, 12, false);
+    first.end(right, 1, 0, true);
+    first.add("disk_hits", 1);
+    const before = first.snapshot();
+    try std.testing.expectEqual(@as(u64, 2), before.peak_inflight);
+    try std.testing.expectEqual(@as(u64, 2), before.provider_reads);
+    try std.testing.expectEqual(@as(u64, 1), before.provider_errors);
+    try std.testing.expectEqual(@as(u64, 12), before.provider_bytes);
+    try std.testing.expectEqual(@as(u64, 0), second.snapshot().provider_reads);
+    first.add("ram_hits", 1);
+    const delta = first.snapshot().since(before);
+    try std.testing.expectEqual(@as(u64, 1), delta.ram_hits);
+    try std.testing.expectEqual(@as(u64, 0), delta.provider_reads);
+    var merged: IoTrace.Snapshot = .{};
+    merged.add(before);
+    merged.add(delta);
+    try std.testing.expectEqual(@as(u64, 2), merged.peak_inflight);
+}
+
+test "external lake read ahead reservations are bounded across retries and readers" {
+    var trace: IoTrace = .{};
+    for (0..8) |_| try std.testing.expect(trace.reserveReadAhead(1024 * 1024));
+    try std.testing.expect(!trace.reserveReadAhead(1));
+    try std.testing.expect(!trace.reserveReadAhead(std.math.maxInt(u64)));
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), trace.snapshot().read_ahead_bytes);
+    var fresh: IoTrace = .{};
+    try std.testing.expect(fresh.reserveReadAhead(1));
+    var shared: ReadAheadBudget = .{};
+    {
+        trace.read_ahead_shared = &shared;
+        fresh.read_ahead_shared = &shared;
+        try std.testing.expect(trace.reserveReadAhead(7 * 1024 * 1024));
+        try std.testing.expect(fresh.reserveReadAhead(1024 * 1024));
+        try std.testing.expect(!trace.reserveReadAhead(1));
+        try std.testing.expect(!fresh.reserveReadAhead(1));
+        trace.failReadAhead(@splat(42));
+        try std.testing.expect(fresh.readAheadFailed(@splat(42)));
+        var independent: IoTrace = .{};
+        try std.testing.expect(!independent.readAheadFailed(@splat(42)));
+    }
+}
+
+test "external lake read ahead transport polling never invokes fallible lease checkpoints" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var calls: usize = 0;
+    const Hook = struct {
+        fn check(raw: *anyopaque) !void {
+            const value: *usize = @ptrCast(@alignCast(raw));
+            value.* += 1;
+        }
+    };
+    const context: Context = .{ .checkpoint = .{ .ptr = &calls, .check = Hook.check } };
+    try std.testing.expect(!context.isCancelled());
+    var store: Store = .{ .base = memory.client(), .context = context, .extra_checkpoint = .{ .ptr = &calls, .check = Hook.check } };
+    try std.testing.expect(!Store.canceled(&store));
+    try std.testing.expectEqual(@as(usize, 0), calls);
+    try store.ensureActive();
+    try std.testing.expectEqual(@as(usize, 2), calls);
+    var expired = context;
+    expired.deadline_ns = 0;
+    try std.testing.expect(expired.isCancelled());
+    try std.testing.expectError(error.DeadlineExceeded, expired.ensureActive());
+    try std.testing.expectEqual(@as(usize, 2), calls);
 }

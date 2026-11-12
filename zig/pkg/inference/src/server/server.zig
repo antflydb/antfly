@@ -146,6 +146,7 @@ fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExec
         }
     };
     return .{
+        .content_security_json = if (ctx.getData("antfly.content_security_json")) |raw| @as(*const []const u8, @ptrCast(@alignCast(raw))).* else null,
         .http_request_admitted = true,
         .document_store = if (ctx.getData("antfly.document_store")) |raw| @as(*const @import("antfly_runtime_abi").document_abi.View, @ptrCast(@alignCast(raw))).* else .{},
         .io = ctx.io,
@@ -1900,8 +1901,25 @@ fn inferenceDownloadContext(context: *const InferenceDownloadRequestContext) !sc
             return false;
         }
     };
+    const Blocking = struct {
+        fn check(raw: *const anyopaque) !void {
+            const request: *const InferenceDownloadRequestContext = @ptrCast(@alignCast(raw));
+            try request.control.check();
+        }
+        fn enter(raw: *const anyopaque) !u64 {
+            const request: *const InferenceDownloadRequestContext = @ptrCast(@alignCast(raw));
+            const guard = try request.control.enterUninterruptible(.uninterruptible);
+            return guard.token;
+        }
+        fn leave(raw: *const anyopaque, token: u64) void {
+            const request: *const InferenceDownloadRequestContext = @ptrCast(@alignCast(raw));
+            var guard = execution_control_mod.UninterruptibleGuard{ .boundary = request.control.hard_cancellation, .token = token };
+            guard.deinit();
+        }
+    };
     return .{
         .io = context.io,
+        .blocking_io = .{ .context = context, .enter = Blocking.enter, .leave = Blocking.leave, .check = Blocking.check },
         .timeout_ms = try remainingInferenceDeadlineMs(context.control.deadline_ns, embedTimingNowNs()),
         .cancellation = .{
             .ptr = context,
@@ -4370,6 +4388,7 @@ const SileroWeightCache = struct {
 const HostCaches = struct {
     allocator: std.mem.Allocator,
     media_index_cache: @import("../pipelines/media_index_cache.zig").Cache = .{},
+    local_source_verifications: scraping.LocalVerificationCache = .{},
     silero_weights: SileroWeightCache = .{},
     silero_weights_lock: std.atomic.Mutex = .unlocked,
 
@@ -14678,9 +14697,15 @@ pub const Node = struct {
             defer transport_admission.deinit();
             var transport_bound = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = transport_admission.allocator(), .limit = try std.math.add(usize, 32 * 1024 * 1024, request.limits.remote_cache_bytes) };
             const transport_allocator = transport_bound.allocator();
-            var security = effectiveRequestContentSecurity(self);
+            var security_snapshot = if (control.content_security_json) |json| try std.json.parseFromSlice(scraping.ContentSecurityConfig, transport_allocator, json, .{}) else null;
+            defer if (security_snapshot) |*snapshot| snapshot.deinit();
+            var security = if (security_snapshot) |snapshot| defaultedRequestContentSecurity(snapshot.value) else effectiveRequestContentSecurity(self);
             const download_context = InferenceDownloadRequestContext{ .io = io, .control = control };
-            const remote = try scraping.PinnedRange.create(transport_allocator, try inferenceDownloadContext(&download_context), reference.uri, reference.version, if (reference.version_kind == .strong_etag) .strong_etag else .s3_version_id, reference.length, &security, if (self.config.s3_credentials) |*credentials| credentials else null, &.{});
+            const remote = try scraping.PinnedRange.createWithLocalCache(transport_allocator, try inferenceDownloadContext(&download_context), reference.uri, reference.version, switch (reference.version_kind) {
+                .strong_etag => .strong_etag,
+                .s3_version_id => .s3_version_id,
+                .file_sha256 => .file_sha256,
+            }, reference.length, &security, if (self.config.s3_credentials) |*credentials| credentials else null, &.{}, &self.host_caches.local_source_verifications);
             defer remote.destroy();
             const Range = struct {
                 fn read(raw: *anyopaque, offset: u64, out: []u8, check: media.source.Control) !usize {
@@ -14709,7 +14734,9 @@ pub const Node = struct {
             resolved.native_source = &source;
             resolved.native_transport_bytes = 0; // Transport allocations already own shared admission.
             resolved.source_version = reference.version;
-            return self.chunkAndEmbedAdmitted(a, io, control, resolved, target, sink);
+            const execution = try self.chunkAndEmbedAdmitted(a, io, control, resolved, target, sink);
+            try remote.validate();
+            return execution;
         }
         if (request.transcribe_boundary) return self.chunkTranscribeBoundary(a, io, control, request, target, sink);
         if (target.model.len == 0 or (target.dimensions != null and target.dimensions.? == 0)) return error.InvalidChunkModel;
@@ -42281,8 +42308,12 @@ test "multimodal rerank parser rejects invalid image data uris" {
 
 /// Decode a data URI (data:mime/type;base64,...) to raw bytes.
 fn effectiveRequestContentSecurity(self: *const Node) scraping.ContentSecurityConfig {
+    return defaultedRequestContentSecurity(self.config.content_security);
+}
+
+fn defaultedRequestContentSecurity(config: ?scraping.ContentSecurityConfig) scraping.ContentSecurityConfig {
     var effective = default_request_content_security;
-    const configured = self.config.content_security orelse return effective;
+    const configured = config orelse return effective;
     if (configured.allowed_hosts != null) effective.allowed_hosts = configured.allowed_hosts;
     if (configured.block_private_ips != null) effective.block_private_ips = configured.block_private_ips;
     if (configured.max_download_size_bytes != null) effective.max_download_size_bytes = configured.max_download_size_bytes;
@@ -47887,6 +47918,130 @@ test "context checkpoint HTTP errors distinguish stale revisions from corrupt pa
         try std.testing.expectEqualStrings(if (failure == error.StaleCheckpoint) "CONTEXT_CHECKPOINT_STALE_REVISION" else "CONTEXT_CHECKPOINT_MISMATCH", payload.value.@"error");
         try std.testing.expect(!payload.value.retryable);
     }
+}
+
+test "model aware media local source validates transport before model execution" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "media", .data = "0123456789" });
+    const path = try tmp.dir.realPathFileAlloc(io, "media", a);
+    defer a.free(path);
+    const uri = try std.fmt.allocPrint(a, "file://{s}", .{path});
+    defer a.free(uri);
+    const paths = [_][]u8{path};
+    var node = try Node.init(a, .{ .process_termination_available = true, .content_security = .{ .allowed_paths = &.{} } });
+    const allowed = try std.json.Stringify.valueAlloc(a, .{ .allowed_paths = paths }, .{});
+    defer a.free(allowed);
+    var control = InferenceExecutionControl{ .deadline_ns = platform.time.monotonicNs() + 60 * std.time.ns_per_s, .content_security_json = allowed };
+    defer node.deinit();
+    try node.attachIo(io);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("0123456789", &digest, .{});
+    const version = std.fmt.bytesToHex(digest, .lower);
+    const chunks = @import("../pipelines/media_chunking.zig");
+    var request = chunks.Request{ .input = .{ .source = .{ .uri = uri, .mime_type = "video/mp4", .version_kind = .file_sha256, .version = &version, .length = 10 } } };
+    const Discard = struct {
+        fn accept(_: *anyopaque, _: chunks.Item) !void {
+            return error.UnexpectedOutput;
+        }
+    };
+    const sink = chunks.Sink{ .context = &node, .accept = Discard.accept };
+    // An empty model is rejected only after the local transport is resolved.
+    try std.testing.expectError(error.InvalidChunkModel, node.chunkAndEmbedAdmitted(a, io, control, request, .{ .model = "" }, sink));
+    try std.testing.expectError(error.InvalidChunkModel, node.chunkAndEmbedAdmitted(a, io, control, request, .{ .model = "" }, sink));
+    try std.testing.expectEqual(@as(u64, 1), node.host_caches.local_source_verifications.hash_count.load(.monotonic));
+    request.input.source.version = "0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expectError(error.SourceVersionChanged, node.chunkAndEmbedAdmitted(a, io, control, request, .{ .model = "" }, sink));
+    request.input.source.version = &version;
+    control.content_security_json = "{\"allowed_paths\":[]}";
+    try std.testing.expectError(error.PathNotAllowed, node.chunkAndEmbedAdmitted(a, io, control, request, .{ .model = "" }, sink));
+    control.deadline_ns = 0;
+    try std.testing.expectError(error.Timeout, node.chunkAndEmbedAdmitted(a, io, control, request, .{ .model = "" }, sink));
+}
+
+test "model aware media local source completes paged WAV decoding replay and final mutation checks" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const chunks = @import("../pipelines/media_chunking.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const samples: [4096]f32 = @splat(0.125);
+    const encoded = try audio_mod.wav.encodeInterleaved(a, &samples, 1, .{ .audio_format = 3, .sample_rate = 16000, .bits_per_sample = 32 });
+    defer a.free(encoded);
+    try tmp.dir.writeFile(io, .{ .sub_path = "audio.wav", .data = encoded });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const uri = try std.fmt.allocPrint(a, "file://{s}/audio.wav", .{root});
+    defer a.free(uri);
+    const paths = [_][]u8{root};
+    var node = try Node.init(a, .{ .models_dir = root, .process_termination_available = true, .content_security = .{ .allowed_paths = &.{} } });
+    defer node.deinit();
+    try node.attachIo(io);
+    const policy = try std.json.Stringify.valueAlloc(a, .{ .allowed_paths = paths, .max_download_size_bytes = @as(u64, 1024) }, .{});
+    defer a.free(policy);
+    var control = InferenceExecutionControl{ .deadline_ns = platform.time.monotonicNs() + 60 * std.time.ns_per_s, .content_security_json = policy };
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(encoded, &hash, .{});
+    const version = std.fmt.bytesToHex(hash, .lower);
+    const targets = [_]lib_chunker.outputs.Target{.{ .name = "speech", .kind = .transcribe, .model = "fixture-transcriber" }};
+    const config = lib_chunker.outputs.Config{ .boundary_model = "speech", .targets = &targets };
+    // Use the production audio planner, decoder, admission, range transport,
+    // collectors and replay. Only the final model invocation is a deterministic
+    // consumer, so this qualification requires no downloaded weights.
+    const Consumer = struct {
+        consumers: MediaOutputExecution,
+        dir: std.Io.Dir,
+        mutate: bool = false,
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, payload: chunks.Payload, descriptor: lib_chunker.planning.Descriptor, _: ?chunks.EmbeddingContext, _: ?chunks.Output, _: ?anyerror, _: bool) ![]const lib_chunker.outputs.Result {
+            const owner: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+            const self: *@This() = @fieldParentPtr("consumers", owner);
+            try std.testing.expect(payload == .pcm and payload.pcm.samples.len != 0);
+            for (payload.pcm.samples) |sample| try std.testing.expectApproxEqAbs(@as(f32, 0.125), sample, 0.00001);
+            self.calls += 1;
+            const coordinates = descriptor.coordinates;
+            const spans = try alloc.alloc(lib_chunker.outputs.Span, 1);
+            spans[0] = .{ .text = "tone", .start_ns = coordinates.start_ns.?, .end_ns = coordinates.end_ns.? };
+            const results = try alloc.alloc(lib_chunker.outputs.Result, 1);
+            results[0] = .{ .name = "speech", .kind = .transcribe, .required = true, .model = "fixture-transcriber", .model_identity = &owner.resolved[0].identity, .model_revision = &owner.resolved[0].revision, .recipe_id = &owner.resolved[0].recipe_id, .start_ns = coordinates.start_ns, .end_ns = coordinates.end_ns, .status = .complete, .spans = spans };
+            if (self.mutate) try self.dir.writeFile(std.testing.io, .{ .sub_path = "audio.wav", .data = "changed" });
+            return results;
+        }
+    };
+    var consumer = Consumer{ .consumers = .{ .node = &node, .io = io, .control = control, .config = config, .initialized = 1 }, .dir = tmp.dir };
+    consumer.consumers.resolved[0] = .{ .path = "", .identity = @splat('a'), .revision = @splat('b'), .recipe_id = @splat('c') };
+    var request = chunks.Request{ .input = .{ .source = .{ .uri = uri, .mime_type = "audio/wav", .version = &version, .version_kind = .file_sha256, .length = encoded.len } }, .outputs = config, .output_executor = .{ .context = &consumer.consumers, .execute = Consumer.execute }, .transcribe_boundary = true, .audio_boundary = true, .needs_audio = true, .execute = false, .allow_partial = true, .max_chunks = 1, .include_content = true, .policy = .{ .window_ns = 50 * std.time.ns_per_ms, .step_ns = 50 * std.time.ns_per_ms } };
+    const target = chunk_response.Target{ .model = "fixture-transcriber", .task_type = "TRANSCRIBE" };
+    var first = try node.chunkModelPageDirect(a, io, control, request, target);
+    defer first.deinit(a);
+    try std.testing.expect(first.chunks.len == 1 and !first.complete);
+    try std.testing.expect(first.chunks[0].data.?.len > 1024);
+    var ordinal = first.covered_through_ordinal;
+    while (true) {
+        const cursor = try std.fmt.allocPrint(a, "{s}:{d}", .{ first.plan_id, ordinal });
+        defer a.free(cursor);
+        request.continuation = cursor;
+        var page = try node.chunkModelPageDirect(a, io, control, request, target);
+        defer page.deinit(a);
+        try std.testing.expectEqual(ordinal, page.start_ordinal);
+        try std.testing.expect(page.covered_through_ordinal > ordinal);
+        try std.testing.expectEqualStrings(first.plan_id, page.plan_id);
+        ordinal = page.covered_through_ordinal;
+        if (page.complete) break;
+    }
+    try std.testing.expect(consumer.calls > 1);
+    const replay = try node.replayModelChunkDirect(a, io, control, request, target, first.plan_id, first.source_fingerprint, 0);
+    defer lib_chunker.types.freeChunks(a, replay);
+    try std.testing.expectEqualDeep(first.chunks[0].metadata.?.descriptor.coordinates, replay[0].metadata.?.descriptor.coordinates);
+    try std.testing.expectEqual(@as(u64, 1), node.host_caches.local_source_verifications.hash_count.load(.monotonic));
+    control.content_security_json = "{\"allowed_paths\":[]}";
+    try std.testing.expectError(error.PathNotAllowed, node.chunkModelPageDirect(a, io, control, request, target));
+    control.content_security_json = policy;
+    request.continuation = null;
+    consumer.mutate = true;
+    try std.testing.expectError(error.SourceVersionChanged, node.chunkModelPageDirect(a, io, control, request, target));
 }
 
 test "model aware media borrowed PCM transcription rejects empty input before model work" {

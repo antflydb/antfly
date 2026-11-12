@@ -4476,6 +4476,7 @@ fn collectExperimentalPostingCompactionValues(
     generation: *ExperimentalPostingReadGeneration,
     latest: *ExperimentalPostingLatestValues,
     reconstructed_values: *std.ArrayListUnmanaged([]u8),
+    cancellation: ?@import("antfly_cancellation").CancellationToken,
 ) !void {
     try collectExperimentalPostingLatestValues(alloc, generation, latest);
     const root = experimentalPostingRootState(generation) orelse return error.Corrupted;
@@ -4484,6 +4485,7 @@ fn collectExperimentalPostingCompactionValues(
         segment_index -= 1;
         var entries = root.segments[segment_index].entries();
         while (try entries.next()) |entry| {
+            if (cancellation) |token| try token.check();
             const decoded = experimentalPostingWalKindFromSegment(entry.kind) orelse continue;
             const result = try latest.getOrPut(alloc, experimentalPostingValueKey(entry.id, decoded.kind));
             if (!result.found_existing) {
@@ -5243,6 +5245,9 @@ pub const HBCIndex = struct {
         };
     }
 
+    /// Borrowed only by private synchronous construction owners. close() joins
+    /// any native work before the owner may release this callback.
+    construction_cancellation: ?@import("antfly_cancellation").CancellationToken = null,
     alloc: Allocator,
     env_owner: EnvOwner,
     store: vectorindex_store.NamespaceStore,
@@ -10222,6 +10227,8 @@ pub const HBCIndex = struct {
         options: ExperimentalPostingStableGenerationOptions,
     ) !void {
         if (options.check != null and options.context == null) return error.InvalidArgument;
+        try self.checkConstruction();
+        var flattened = false;
         if (self.write_session_depth != 0) return error.ActiveWriteSession;
         if (self.experimental_posting_capture_enabled) return error.ExperimentalPostingCaptureAlreadyActive;
 
@@ -10234,11 +10241,16 @@ pub const HBCIndex = struct {
             // capture was needed while constructing the candidate.
             self.experimental_posting_sidecar_managed = true;
             _ = try self.publishExperimentalPostingCheckpointChecked(applied_sequence, options.check, options.context);
+            flattened = true;
         }
 
         if (options.flatten) {
-            _ = try self.requestExperimentalPostingFullCheckpointForReadiness();
-            _ = try self.finishExperimentalPostingCheckpointForReadiness();
+            if (options.check != null or self.construction_cancellation != null) {
+                if (!flattened) _ = try self.publishExperimentalPostingCheckpointChecked(applied_sequence, options.check, options.context);
+            } else {
+                _ = try self.requestExperimentalPostingFullCheckpointForReadiness();
+                _ = try self.finishExperimentalPostingCheckpointForReadiness();
+            }
         }
         // A non-flattening lifecycle fence must never join or discard an
         // opportunistic build. The builder retained an immutable generation
@@ -10251,6 +10263,7 @@ pub const HBCIndex = struct {
         }
         if (!self.experimentalPostingReadsEnabled()) return error.PostingWalMutationStoreUnavailable;
 
+        try self.checkConstruction();
         if (options.make_authoritative) {
             if (!self.experimental_posting_authority_transition_permitted and
                 !self.experimental_posting_wal_authoritative.load(.acquire))
@@ -12253,6 +12266,29 @@ pub const HBCIndex = struct {
     }
 
     fn publishExperimentalPostingCheckpointChecked(
+        self: *HBCIndex,
+        covered_source_sequence: u64,
+        check: ?*const fn (*anyopaque) anyerror!void,
+        context: ?*anyopaque,
+    ) !PostingCheckpointStats {
+        try self.checkConstruction();
+        if (check != null and context == null) return error.InvalidArgument;
+        const Checks = struct {
+            index: *HBCIndex,
+            callback: ?*const fn (*anyopaque) anyerror!void,
+            context: ?*anyopaque,
+            fn active(raw: *anyopaque) anyerror!void {
+                const self_checks: *@This() = @ptrCast(@alignCast(raw));
+                try self_checks.index.checkConstruction();
+                if (self_checks.callback) |callback| try callback(self_checks.context.?);
+            }
+        };
+        var checks: Checks = .{ .index = self, .callback = check, .context = context };
+        const checked = check != null or self.construction_cancellation != null;
+        return self.publishExperimentalPostingCheckpointWithChecks(covered_source_sequence, if (checked) Checks.active else null, if (checked) &checks else null);
+    }
+
+    fn publishExperimentalPostingCheckpointWithChecks(
         self: *HBCIndex,
         covered_source_sequence: u64,
         check: ?*const fn (*anyopaque) anyerror!void,
@@ -17570,7 +17606,11 @@ pub const HBCIndex = struct {
         try vectorindex_hbc_index.batchApplyOptions(self, writes, deletes, optionsWithBatchVectors(options, batch_vectors.erased()), nowNs, elapsedSince);
     }
 
+    pub fn checkConstruction(self: *HBCIndex) !void {
+        if (self.construction_cancellation) |token| try token.check();
+    }
     pub fn batchInsertWithMetadataOptions(self: *HBCIndex, items: []const BatchInsertItem, requested_options: BatchInsertOptions) !void {
+        try self.checkConstruction();
         if (self.leann) |store| return store.apply(items, &.{});
         var options = requested_options;
         if (self.hasExternalVectorLoader() and options.skip_vector_store and !options.assume_absent_ids)
@@ -25171,7 +25211,7 @@ test "immutable posting replacement patches resolve bounded chains and compact l
         for (reconstructed_values.items) |value| alloc.free(value);
         reconstructed_values.deinit(alloc);
     }
-    try collectExperimentalPostingCompactionValues(alloc, root, &compacted, &reconstructed_values);
+    try collectExperimentalPostingCompactionValues(alloc, root, &compacted, &reconstructed_values, null);
     try std.testing.expectEqualSlices(
         u8,
         &replacement_two,
@@ -36058,4 +36098,34 @@ test "spooled bulk identical tiny forced-spill partitions always shrink" {
         try std.testing.expect((try index.verifyTreeLinks()).consistent());
         try std.testing.expectEqual(@as(usize, 1), index.getWriteProfile().bulk_build_leaf_max_members);
     }
+}
+
+test "external lake bounded WAL native dense construction cancels within a mutation batch and before checkpoint publication" {
+    const a = std.testing.allocator;
+    var path: TestPath = .{};
+    const directory = path.init();
+    defer path.cleanup();
+    var index = try HBCIndex.openWithLsmOptions(a, directory, .{ .dims = 2, .leaf_size = 16, .branching_factor = 2 }, .{});
+    defer index.close();
+    const Probe = struct {
+        checks: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            if (self.checks >= 4) return error.Canceled;
+        }
+    };
+    var probe: Probe = .{};
+    index.construction_cancellation = .{ .ptr = &probe, .check_fn = Probe.check };
+    defer index.construction_cancellation = null;
+    const items = [_]BatchInsertItem{
+        .{ .vector_id = 1, .vector = &.{ 1, 0 }, .metadata = "one" },
+        .{ .vector_id = 2, .vector = &.{ 0, 1 }, .metadata = "two" },
+        .{ .vector_id = 3, .vector = &.{ 1, 1 }, .metadata = "three" },
+        .{ .vector_id = 4, .vector = &.{ 2, 1 }, .metadata = "four" },
+    };
+    try std.testing.expectError(error.Canceled, index.batchInsertWithMetadataOptions(&items, .{}));
+    try std.testing.expect(probe.checks >= 4);
+    try std.testing.expectError(error.Canceled, index.publishExperimentalPostingCheckpoint(0));
+    try std.testing.expectError(error.Canceled, index.finalizeExperimentalPostingGenerationAtAppliedSequence(0, .{}));
 }

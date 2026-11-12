@@ -23,6 +23,9 @@ const ObjectReader = @import("lake_object_reader.zig").ObjectStorageRangeReader;
 const Allocator = std.mem.Allocator;
 pub const Cache = struct {
     alloc: Allocator,
+    /// Optional demand history contains only immutable identities and offsets.
+    /// Credentials, leases and request capabilities never enter this cache.
+    text_demand: @import("lake_text_demand.zig").History = .{},
     decoded: @import("lake_decoded_cache.zig").Cache,
     /// Pinned tree paths must not evict compact planning metadata or prevent
     /// file-order admission. Navigation has independent bounded residency.
@@ -402,6 +405,7 @@ pub const Cache = struct {
         defer a.free(key);
         if (comptime @import("builtin").os.tag != .freestanding) if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |mapped| {
             self.recordRead(true, mapped.bytes.len);
+            if (context.trace) |trace| trace.add("disk_hits", 1);
             return .{ .mapped = mapped };
         };
         return .{ .heap = .{ .alloc = a, .bytes = try self.readImmutableKeyAlloc(a, key, length, digest, context, loader) } };
@@ -419,15 +423,18 @@ pub const Cache = struct {
         if (self.pin(key)) |pinned| {
             errdefer pinned.release();
             try context.ensureActive();
+            if (context.trace) |trace| trace.add("ram_hits", 1);
             return .{ .shared = pinned };
         }
         if (self.pinMapping(key)) |mapping| {
             errdefer mapping.release();
             try context.ensureActive();
+            if (context.trace) |trace| trace.add("ram_hits", 1);
             return .{ .mapping = mapping };
         }
         if (comptime @import("builtin").os.tag != .freestanding) if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |mapped| {
             self.recordRead(true, mapped.bytes.len);
+            if (context.trace) |trace| trace.add("disk_hits", 1);
             return self.admitMapping(key, mapped);
         };
         return null;
@@ -440,11 +447,13 @@ pub const Cache = struct {
         if (self.pin(key)) |pinned| {
             errdefer pinned.release();
             try context.ensureActive();
+            if (context.trace) |trace| trace.add("ram_hits", 1);
             return .{ .shared = pinned };
         }
         if (self.pinMapping(key)) |mapping| {
             errdefer mapping.release();
             try context.ensureActive();
+            if (context.trace) |trace| trace.add("ram_hits", 1);
             return .{ .mapping = mapping };
         }
         var lease = try self.readImmutableLease(a, scope, identity, length, digest, context, loader);
@@ -480,11 +489,13 @@ pub const Cache = struct {
         if (self.pin(key)) |value| {
             errdefer value.release();
             try context.ensureActive();
+            if (context.trace) |trace| trace.add("ram_hits", 1);
             return .{ .shared = value };
         }
         if (self.pinMapping(key)) |value| {
             errdefer value.release();
             try context.ensureActive();
+            if (context.trace) |trace| trace.add("ram_hits", 1);
             return .{ .mapping = value };
         }
         if (comptime @import("builtin").os.tag != .freestanding) if (self.persistentCache()) |disk| if (try disk.readMapped(a, key, length, digest, context)) |value| {
@@ -628,6 +639,7 @@ pub const Cache = struct {
 
     fn readImmutableKeyAlloc(self: *Cache, a: Allocator, key: []const u8, length: usize, digest: [32]u8, context: Context, loader: ImmutableLoader) ![]u8 {
         if (try self.lookup(a, key)) |bytes| {
+            if (context.trace) |trace| trace.add("ram_hits", 1);
             errdefer a.free(bytes);
             try context.ensureActive();
             return bytes;
@@ -640,6 +652,8 @@ pub const Cache = struct {
                 const waiting = claim.?;
                 claim = null;
                 {
+                    const wait_start = @import("antfly_platform").time.monotonicNs();
+                    defer if (context.trace) |trace| trace.add("cache_wait_nanoseconds", @import("antfly_platform").time.monotonicNs() -| wait_start);
                     defer self.finish(waiting, io);
                     while (!waiting.flight.event.isSet()) {
                         try context.ensureActive();
@@ -663,6 +677,7 @@ pub const Cache = struct {
                 errdefer a.free(bytes);
                 try context.ensureActive();
                 self.recordRead(true, bytes.len);
+                if (context.trace) |trace| trace.add("disk_hits", 1);
                 self.store(key, bytes) catch {};
                 return bytes;
             }
@@ -670,7 +685,15 @@ pub const Cache = struct {
             // immutable provider rather than failing from local disk damage.
             a.free(bytes);
         }
-        const bytes = try loader.load(loader.ptr, a);
+        const io_started = if (context.trace) |trace| trace.begin() else 0;
+        const bytes = loader.load(loader.ptr, a) catch |err| {
+            if (context.trace) |trace| trace.endClass(io_started, 1, 0, true, context.io_class);
+            return err;
+        };
+        if (context.trace) |trace| {
+            const traffic = if (loader.provider_read) |read| read(loader.ptr) else ProviderRead{ .requests = 1, .bytes = bytes.len };
+            trace.endClass(io_started, traffic.requests, traffic.bytes, false, context.io_class);
+        }
         errdefer a.free(bytes);
         try context.ensureActive();
         var actual: [32]u8 = undefined;
@@ -806,8 +829,7 @@ pub const Reader = struct {
         fn canceled(raw: *const anyopaque) bool {
             const self: *const Warm = @ptrCast(@alignCast(raw));
             if (self.cancelled.load(.acquire)) return true;
-            self.reader.context.ensureActive() catch return true;
-            return false;
+            return self.reader.context.isCancelled();
         }
     };
     cache: *Cache,
@@ -847,8 +869,10 @@ pub const Reader = struct {
                 members[length] = read;
                 length += 1;
             };
-            // Header/footer discovery retains its original interpretation.
-            const shared = length > 1 and envelope.purpose == .parquet_column_chunk;
+            // Page locations are opaque versioned ranges just like data.
+            // Publish member aliases, or demand would fetch every index again
+            // after the coalesced envelope completed.
+            const shared = length > 1 and (envelope.purpose == .parquet_column_chunk or envelope.purpose == .parquet_page_index);
             try self.prefetchImpl(&.{envelope}, null, 0, if (shared) members[0..length] else &.{});
         }
     }
@@ -962,7 +986,7 @@ pub const Reader = struct {
             const envelopes = try ranges.coalescePhysicalReadsAlloc(work.arena.allocator(), missing[0..count], .{ .max_range_bytes = 2 * 1024 * 1024 });
             for (envelopes) |envelope| {
                 const owner = try std.heap.page_allocator.create(Cache.Envelope);
-                const bytes = worker.base.parquetReader().readPlannedAlloc(std.heap.page_allocator, envelope) catch |err| {
+                const bytes = worker.readSource(std.heap.page_allocator, envelope) catch |err| {
                     std.heap.page_allocator.destroy(owner);
                     return err;
                 };
@@ -1098,7 +1122,170 @@ pub const Reader = struct {
             },
         }
     }
+    fn readSource(self: *Reader, alloc: Allocator, read: ranges.RangeRead) ![]u8 {
+        const started = @import("antfly_platform").time.monotonicNs();
+        var failed = true;
+        if (self.context.trace) |trace| trace.beginSource();
+        defer if (self.context.trace) |trace| {
+            trace.endSource();
+            trace.add("source_provider_reads", 1);
+            trace.add("source_provider_bytes", if (failed) 0 else read.range.len);
+            trace.add("source_provider_errors", @intFromBool(failed));
+            trace.add("source_provider_nanoseconds", @import("antfly_platform").time.monotonicNs() -| started);
+        };
+        const bytes = try self.base.parquetReader().readPlannedAlloc(alloc, read);
+        failed = false;
+        return bytes;
+    }
+    fn lookupRangeLease(self: *Reader, alloc: Allocator, read: ranges.RangeRead, key: []const u8) !?ranges.RangeLease {
+        if (self.cache.pin(key)) |lease| {
+            errdefer lease.release();
+            try self.context.ensureActive();
+            return lease;
+        }
+        if (comptime @import("builtin").os.tag != .freestanding) if (self.cache.persistentCache()) |disk| if (try disk.readAlloc(alloc, key, @intCast(read.range.len))) |bytes| {
+            errdefer alloc.free(bytes);
+            try self.context.ensureActive();
+            self.cache.recordRead(true, bytes.len);
+            self.cache.store(key, bytes) catch {};
+            if (self.cache.pin(key)) |lease| {
+                alloc.free(bytes);
+                return lease;
+            }
+            return .{ .bytes = bytes, .owner = .{ .allocation = alloc } };
+        };
+        return null;
+    }
+    /// Reuse version-qualified byte windows across header and payload reads.
+    /// Only demanded column data participates; footer/index semantics and exact
+    /// range fallback are preserved. Text and Parquet share the outer budget.
+    const WindowRead = struct {
+        reader: *Reader,
+        read: ranges.RangeRead,
+        stopped: std.atomic.Value(bool) = .init(false),
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.stopped.load(.acquire)) return true;
+            const context = self.reader.context;
+            if (context.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return true;
+            return if (context.cancellation) |token| token.isCancelled() else false;
+        }
+        fn run(self: *@This()) anyerror!ranges.RangeLease {
+            var worker: Reader = .{ .cache = self.reader.cache, .base = self.reader.base, .scope = self.reader.scope, .context = self.reader.context, .scheduler = self.reader.scheduler };
+            const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = canceled };
+            worker.context.cancellation = token;
+            worker.base.cancellation = token;
+            return readExactLease(&worker, std.heap.page_allocator, self.read) catch |err| {
+                try self.reader.context.ensureActive();
+                return err;
+            };
+        }
+    };
+    fn windowFailed(self: *Reader, trace: *@import("lake_read_context.zig").IoTrace, key: [32]u8, err: anyerror) !void {
+        try self.context.ensureActive();
+        if (err == error.Canceled or err == error.DeadlineExceeded) return err;
+        trace.failReadAhead(key);
+    }
+    fn readAheadLease(self: *Reader, alloc: Allocator, read: ranges.RangeRead) !?ranges.RangeLease {
+        const trace = self.context.trace orelse return null;
+        const window = 1024 * 1024;
+        if (read.purpose != .parquet_column_chunk or read.range.len == 0 or read.range.len > 2 * window or self.cache.max_bytes < 8 * window) return null;
+        const begin = read.range.offset / window * window;
+        const end = @min(read.object.byte_len, ((read.range.end() - 1) / window * window) +| window);
+        const span = end - begin;
+        // Never read beyond the authenticated object length. Every widened
+        // GET still enforces the exact version/ETag from this plan.
+        // For genuinely tiny files the entire authenticated object is one
+        // economical transfer, even when the first projected column is tiny.
+        const tiny_object = read.object.byte_len <= 64 * 1024;
+        if ((!tiny_object and span > read.range.len *| 16) or (begin == read.range.offset and span == read.range.len)) return null;
+        const admission = self.scheduler.reserveIo(@intCast(2 * span + read.range.len)) orelse return null;
+        defer admission.release();
+        var held: [3]?ranges.RangeLease = @splat(null);
+        defer for (held) |lease| if (lease) |value| value.release();
+        var work: [3]WindowRead = undefined;
+        var failure_keys: [3][32]u8 = undefined;
+        var tasks: [3]?Scheduling.Task(anyerror!ranges.RangeLease) = @splat(null);
+        defer if (self.context.io) |io| {
+            for (&work, &tasks) |*item, *task| if (task.*) |*active| {
+                item.stopped.store(true, .release);
+                if (active.cancel(io)) |lease| lease.release() else |_| {}
+                task.* = null;
+            };
+        };
+        var offset = begin;
+        var count: usize = 0;
+        while (offset < end) : (count += 1) {
+            var widened = read;
+            widened.range = .{ .offset = offset, .len = @min(window, end - offset) };
+            const key = try self.rangeKey(alloc, widened);
+            defer alloc.free(key);
+            std.crypto.hash.Blake3.hash(key, &failure_keys[count], .{});
+            if (try self.lookupRangeLease(alloc, widened, key)) |lease| {
+                held[count] = lease;
+            } else {
+                if (trace.readAheadFailed(failure_keys[count]) or !trace.reserveReadAhead(widened.range.len)) return null;
+                work[count] = .{ .reader = self, .read = widened };
+                if (self.context.parallel_object_io) if (self.context.io) |io| {
+                    tasks[count] = self.scheduler.submitIoTransient(io, 2 * window, WindowRead.run, .{&work[count]});
+                };
+                if (tasks[count] == null) held[count] = readExactLease(self, alloc, widened) catch |err| {
+                    try self.windowFailed(trace, failure_keys[count], err);
+                    return null;
+                };
+            }
+            offset += widened.range.len;
+        }
+        for (tasks[0..count], 0..) |*task, i| if (task.*) |*active| {
+            const outcome = active.await(self.context.io.?);
+            task.* = null;
+            held[i] = outcome catch |err| {
+                try self.windowFailed(trace, failure_keys[i], err);
+                return null;
+            };
+        };
+        try self.context.ensureActive();
+        if (count == 1 and held[0].?.owner == .shared) {
+            var lease = held[0].?;
+            const start: usize = @intCast(read.range.offset - begin);
+            lease.bytes = lease.bytes[start..][0..@intCast(read.range.len)];
+            held[0] = null;
+            return lease;
+        }
+        const bytes = try alloc.alloc(u8, @intCast(read.range.len));
+        errdefer alloc.free(bytes);
+        var copied: usize = 0;
+        for (held[0..count], 0..) |lease, i| {
+            const start = begin + i * window;
+            const from = @max(start, read.range.offset);
+            const to = @min(start + lease.?.bytes.len, read.range.end());
+            const length: usize = @intCast(to - from);
+            @memcpy(bytes[copied..][0..length], lease.?.bytes[@intCast(from - start)..][0..length]);
+            copied += length;
+        }
+        std.debug.assert(copied == bytes.len);
+        return .{ .bytes = bytes, .owner = .{ .allocation = alloc } };
+    }
     fn readLease(raw: *anyopaque, alloc: Allocator, read: ranges.RangeRead) !ranges.RangeLease {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        try self.context.ensureActive();
+        try read.validate();
+        const key = try self.rangeKey(alloc, read);
+        defer alloc.free(key);
+        // Prefer an existing exact disk entry before widening. Upgrades and
+        // range-only requests must retain their restart cache benefit.
+        if (try self.lookupRangeLease(alloc, read, key)) |lease| return lease;
+        // Coalesced prefetch registers exact member flights before dispatch.
+        // Join that work before widening to a different physical window; a
+        // second key would bypass deduplication and reread the same bytes.
+        while (!self.cache.mutex.tryLock()) std.atomic.spinLoopHint();
+        const already_loading = self.cache.flights.contains(key);
+        self.cache.mutex.unlock();
+        if (already_loading) return readExactLease(raw, alloc, read);
+        if (try self.readAheadLease(alloc, read)) |lease| return lease;
+        return readExactLease(raw, alloc, read);
+    }
+    fn readExactLease(raw: *anyopaque, alloc: Allocator, read: ranges.RangeRead) !ranges.RangeLease {
         const self: *Reader = @ptrCast(@alignCast(raw));
         try self.context.ensureActive();
         try read.validate();
@@ -1120,6 +1307,8 @@ pub const Reader = struct {
                 const waiting = claim.?;
                 claim = null;
                 {
+                    const wait_start = @import("antfly_platform").time.monotonicNs();
+                    defer if (self.context.trace) |trace| trace.add("cache_wait_nanoseconds", @import("antfly_platform").time.monotonicNs() -| wait_start);
                     defer self.cache.finish(waiting, io);
                     while (!waiting.flight.event.isSet()) {
                         try self.context.ensureActive();
@@ -1142,7 +1331,7 @@ pub const Reader = struct {
         // Disk corruption/missing entries are misses inside the persistent
         // cache; an allocation failure still belongs to this request.
         const disk_bytes = if (comptime @import("builtin").os.tag == .freestanding) null else if (self.cache.persistentCache()) |disk| try disk.readAlloc(alloc, key, std.math.cast(usize, read.range.len) orelse return error.LakeRowsScanBudgetExceeded) else null;
-        const bytes = disk_bytes orelse try self.base.parquetReader().readPlannedAlloc(alloc, read);
+        const bytes = disk_bytes orelse try self.readSource(alloc, read);
         self.cache.recordRead(disk_bytes != null, bytes.len);
         errdefer alloc.free(bytes);
         try self.context.ensureActive();
@@ -2021,7 +2210,7 @@ test "external lake verified slice admission retains denied ownership and copies
     try std.testing.expectError(error.ArtifactIntegrityMismatch, Cache.VerifiedBytes.authenticate("corrupt", digest));
 }
 
-test "external lake prefetch coalesces adjacent pages with shared bounded lease slices" {
+test "external lake bounded window profiles prefetch coalesces adjacent pages and locations with shared bounded lease slices" {
     const storage = @import("../../storage/object_storage.zig");
     const a = std.testing.allocator;
     var memory = storage.MemoryObjectStorage.init(a);
@@ -2044,39 +2233,42 @@ test "external lake prefetch coalesces adjacent pages with shared bounded lease 
     };
     var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
     provider.vtable.get_object = Provider.get;
-    var cache = Cache.initWithMemoryLimit(a, 64);
-    defer cache.deinit();
-    var scheduler: Reader.Scheduling.Scheduler = .{ .max_io_workers = 8, .max_bytes = 128 };
-    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable }), .scope = @splat(0), .context = .{ .io = std.testing.io }, .scheduler = &scheduler };
-    defer reader.drain(true);
-    const object: ranges.ObjectRef = .{ .bucket = "bucket", .key = "pages", .byte_len = 16, .version = .{ .etag = put.etag.? } };
-    const reads = [_]ranges.RangeRead{
-        .{ .object = object, .range = .{ .offset = 0, .len = 4 }, .purpose = .parquet_column_chunk },
-        .{ .object = object, .range = .{ .offset = 4, .len = 4 }, .purpose = .parquet_column_chunk },
-        // The gap is never fetched speculatively.
-        .{ .object = object, .range = .{ .offset = 12, .len = 4 }, .purpose = .parquet_column_chunk },
-    };
-    try reader.prefetch(&reads);
-    // Required reads wait on member flights, then borrow their exact slices.
-    const first = try Reader.readLease(&reader, a, reads[0]);
-    defer first.release();
-    const second = try Reader.readLease(&reader, a, reads[1]);
-    defer second.release();
-    reader.drain(false);
-    try std.testing.expectEqual(@as(usize, 2), provider.calls.load(.acquire));
-    try std.testing.expectEqualStrings("abcd", first.bytes);
-    try std.testing.expectEqualStrings("efgh", second.bytes);
-    try std.testing.expectEqual(@intFromPtr(first.bytes.ptr) + 4, @intFromPtr(second.bytes.ptr));
-    try std.testing.expect(cache.snapshot().stored_bytes <= cache.max_bytes);
-    // A hot envelope is not fetched again, and pinned slices survive pressure.
-    try reader.prefetch(&reads);
-    reader.drain(false);
-    cache.max_bytes = 16;
-    try cache.store("pressure", "0123456789abcdef");
-    try std.testing.expectEqualStrings("efgh", second.bytes);
-    try std.testing.expectEqual(@as(usize, 2), provider.calls.load(.acquire));
-    try std.testing.expectEqual(@as(usize, 0), cache.flights.count());
-    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    for ([_]ranges.RangePurpose{ .parquet_column_chunk, .parquet_page_index }) |purpose| {
+        provider.calls.store(0, .release);
+        var cache = Cache.initWithMemoryLimit(a, 64);
+        defer cache.deinit();
+        var scheduler: Reader.Scheduling.Scheduler = .{ .max_io_workers = 8, .max_bytes = 128 };
+        var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable }), .scope = @splat(0), .context = .{ .io = std.testing.io }, .scheduler = &scheduler };
+        defer reader.drain(true);
+        const object: ranges.ObjectRef = .{ .bucket = "bucket", .key = "pages", .byte_len = 16, .version = .{ .etag = put.etag.? } };
+        const reads = [_]ranges.RangeRead{
+            .{ .object = object, .range = .{ .offset = 0, .len = 4 }, .purpose = purpose },
+            .{ .object = object, .range = .{ .offset = 4, .len = 4 }, .purpose = purpose },
+            // The gap is never fetched speculatively.
+            .{ .object = object, .range = .{ .offset = 12, .len = 4 }, .purpose = purpose },
+        };
+        try reader.prefetch(&reads);
+        // Required reads wait on member flights, then borrow their exact slices.
+        const first = try Reader.readLease(&reader, a, reads[0]);
+        defer first.release();
+        const second = try Reader.readLease(&reader, a, reads[1]);
+        defer second.release();
+        reader.drain(false);
+        try std.testing.expectEqual(@as(usize, 2), provider.calls.load(.acquire));
+        try std.testing.expectEqualStrings("abcd", first.bytes);
+        try std.testing.expectEqualStrings("efgh", second.bytes);
+        try std.testing.expectEqual(@intFromPtr(first.bytes.ptr) + 4, @intFromPtr(second.bytes.ptr));
+        try std.testing.expect(cache.snapshot().stored_bytes <= cache.max_bytes);
+        // A hot envelope is not fetched again, and pinned slices survive pressure.
+        try reader.prefetch(&reads);
+        reader.drain(false);
+        cache.max_bytes = 16;
+        try cache.store("pressure", "0123456789abcdef");
+        try std.testing.expectEqualStrings("efgh", second.bytes);
+        try std.testing.expectEqual(@as(usize, 2), provider.calls.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), cache.flights.count());
+        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    }
 }
 
 test "external lake coalesced prefetch reuses persisted page entries after restart" {
@@ -2176,4 +2368,335 @@ test "external lake shared envelope charges once across alias eviction and pinne
     try cache.storeOwned("again", owner.bytes[0..4], owner);
     try std.testing.expectEqual(@as(usize, 8), cache.snapshot().stored_bytes);
     try std.testing.expectEqual(@as(usize, 1), owner.residents);
+}
+
+test "external lake source read ahead reuses pinned windows and fences versions budgets and admission" {
+    const a = std.testing.allocator;
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    const bytes = try a.alloc(u8, 3 * 1024 * 1024);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / 1024);
+    var put = try client.putObject("bucket", "data", bytes, .{});
+    defer put.deinit(a);
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    var trace: @import("lake_read_context.zig").IoTrace = .{};
+    var scheduler: Reader.Scheduling.Scheduler = .{};
+    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(client), .scope = @splat(6), .context = .{ .trace = &trace }, .scheduler = &scheduler };
+    var read: ranges.RangeRead = .{ .object = .{ .bucket = "bucket", .key = "data", .byte_len = bytes.len, .version = .{ .etag = put.etag.? } }, .range = .{ .offset = 1024, .len = 64 * 1024 }, .purpose = .parquet_column_chunk };
+    {
+        const lease = try reader.reader().readPlannedLease(a, read);
+        defer lease.release();
+        try std.testing.expectEqualSlices(u8, bytes[1024..][0 .. 64 * 1024], lease.bytes);
+    }
+    read.range = .{ .offset = 128 * 1024, .len = 256 * 1024 };
+    {
+        const lease = try reader.reader().readPlannedLease(a, read);
+        defer lease.release();
+        try std.testing.expectEqualSlices(u8, bytes[128 * 1024 ..][0 .. 256 * 1024], lease.bytes);
+    }
+    try std.testing.expectEqual(@as(u64, 1), trace.snapshot().source_provider_reads);
+    try std.testing.expectEqual(@as(u64, 1024 * 1024), trace.snapshot().source_provider_bytes);
+    // Cross-window payloads stitch verified ranges in order, reusing the first.
+    read.range = .{ .offset = 960 * 1024, .len = 128 * 1024 };
+    {
+        const lease = try reader.reader().readPlannedLease(a, read);
+        defer lease.release();
+        try std.testing.expectEqualSlices(u8, bytes[960 * 1024 ..][0 .. 128 * 1024], lease.bytes);
+    }
+    try std.testing.expectEqual(@as(u64, 2), trace.snapshot().source_provider_reads);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+    // Even a resident byte window cannot authorize a different ETag.
+    read.object.version.etag = "wrong-etag";
+    try std.testing.expectError(error.PreconditionFailed, reader.reader().readPlannedLease(a, read));
+    read.object.version.etag = put.etag.?;
+    // Exhausted outer budgets and node admission decline read-ahead and
+    // preserve the exact physical read rather than raising a query limit.
+    var exhausted: @import("lake_read_context.zig").IoTrace = .{};
+    try std.testing.expect(exhausted.reserveReadAhead(8 * 1024 * 1024));
+    reader.context.trace = &exhausted;
+    read.range = .{ .offset = 2 * 1024 * 1024, .len = 64 * 1024 };
+    const exact = try reader.reader().readPlannedLease(a, read);
+    exact.release();
+    try std.testing.expectEqual(@as(u64, 64 * 1024), exhausted.snapshot().source_provider_bytes);
+    reader.context.trace = &trace;
+    scheduler.max_io_bytes = 0;
+    read.range.offset += 64 * 1024;
+    const denied = try reader.reader().readPlannedLease(a, read);
+    denied.release();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    reader.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, reader.reader().readPlannedLease(a, read));
+}
+
+test "external lake source read ahead restores exact legacy and widened disk entries without provider reads" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/read-ahead", .{tmp.sub_path});
+    defer a.free(root);
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    const bytes = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / 1024);
+    var put = try client.putObject("bucket", "data", bytes, .{});
+    defer put.deinit(a);
+    const Provider = struct {
+        base: storage.ObjectStorage,
+        fail: bool = false,
+        vtable: storage.ObjectStorage.VTable,
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.ProviderUnavailable;
+            var base = self.base;
+            base.allocator = alloc;
+            return base.getObject(bucket, key, options);
+        }
+    };
+    var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+    provider.vtable.get_object = Provider.get;
+    const base = ObjectReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable });
+    var read: ranges.RangeRead = .{ .object = .{ .bucket = "bucket", .key = "data", .byte_len = bytes.len, .version = .{ .etag = put.etag.? } }, .range = .{ .offset = 1024, .len = 64 * 1024 }, .purpose = .parquet_column_chunk };
+    {
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        try cache.ensurePersistent(io, root, .{}, .{});
+        var reader: Reader = .{ .cache = &cache, .base = base, .scope = @splat(1), .context = .{ .io = io } };
+        const legacy = try reader.reader().readPlannedLease(a, read);
+        legacy.release();
+        var trace: @import("lake_read_context.zig").IoTrace = .{};
+        reader.context.trace = &trace;
+        var other = read;
+        other.range.offset = 256 * 1024;
+        const widened = try reader.reader().readPlannedLease(a, other);
+        widened.release();
+    }
+    provider.fail = true;
+    {
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        try cache.ensurePersistent(io, root, .{}, .{});
+        var trace: @import("lake_read_context.zig").IoTrace = .{};
+        var reader: Reader = .{ .cache = &cache, .base = base, .scope = @splat(1), .context = .{ .io = io, .trace = &trace } };
+        const legacy = try reader.reader().readPlannedLease(a, read);
+        legacy.release();
+        read.range = .{ .offset = 128 * 1024, .len = 256 * 1024 };
+        const widened = try reader.reader().readPlannedLease(a, read);
+        defer widened.release();
+        try std.testing.expectEqualSlices(u8, bytes[128 * 1024 ..][0 .. 256 * 1024], widened.bytes);
+        try std.testing.expectEqual(@as(u64, 0), trace.snapshot().source_provider_reads);
+        try std.testing.expectEqual(@as(u64, 0), trace.snapshot().read_ahead_bytes);
+        reader.scope = @splat(2);
+        try std.testing.expectError(error.ProviderUnavailable, reader.reader().readPlannedLease(a, read));
+    }
+}
+
+test "external lake source read ahead overlaps admitted windows and cancels before releasing their owners" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    const bytes = try a.alloc(u8, 3 * 1024 * 1024);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / 1024);
+    var put = try client.putObject("bucket", "data", bytes, .{});
+    defer put.deinit(a);
+    const Provider = struct {
+        base: storage.ObjectStorage,
+        calls: std.atomic.Value(usize) = .init(0),
+        entered: std.Io.Event = .unset,
+        gate: std.Io.Event = .unset,
+        vtable: storage.ObjectStorage.VTable,
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.calls.fetchAdd(1, .acq_rel) + 1 == 2) self.entered.set(std.testing.io);
+            try self.gate.wait(std.testing.io);
+            if (options.cancellation) |token| try token.check();
+            var base = self.base;
+            base.allocator = alloc;
+            return base.getObject(bucket, key, options);
+        }
+        fn run(reader: *Reader, read: ranges.RangeRead) anyerror!ranges.RangeLease {
+            return reader.reader().readPlannedLease(std.heap.page_allocator, read);
+        }
+    };
+    var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+    provider.vtable.get_object = Provider.get;
+    const base = ObjectReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable });
+    const read: ranges.RangeRead = .{ .object = .{ .bucket = "bucket", .key = "data", .byte_len = bytes.len, .version = .{ .etag = put.etag.? } }, .range = .{ .offset = 900 * 1024, .len = 256 * 1024 }, .purpose = .parquet_column_chunk };
+    for ([_]bool{ false, true }) |cancel| {
+        provider.calls.store(0, .release);
+        provider.entered.reset();
+        provider.gate.reset();
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        var trace: @import("lake_read_context.zig").IoTrace = .{};
+        var scheduler: Reader.Scheduling.Scheduler = .{};
+        var reader: Reader = .{ .cache = &cache, .base = base, .scope = @splat(1), .context = .{ .io = io, .trace = &trace, .parallel_object_io = true }, .scheduler = &scheduler };
+        var future = try io.concurrent(Provider.run, .{ &reader, read });
+        var joined = false;
+        defer if (!joined) {
+            if (future.cancel(io)) |lease| lease.release() else |_| {}
+        };
+        try provider.entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(10) } });
+        if (cancel) {
+            const result = future.cancel(io);
+            joined = true;
+            try std.testing.expectError(error.Canceled, result);
+        } else {
+            provider.gate.set(io);
+            const result = future.await(io);
+            joined = true;
+            const lease = try result;
+            defer lease.release();
+            try std.testing.expectEqualSlices(u8, bytes[900 * 1024 ..][0 .. 256 * 1024], lease.bytes);
+        }
+        try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    }
+}
+
+test "external lake source read ahead tiny files share one verified transfer across narrow columns" {
+    const a = std.testing.allocator;
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var bytes: [16 * 1024]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = @truncate(i / 1024);
+    var put = try client.putObject("bucket", "small", &bytes, .{});
+    defer put.deinit(a);
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    var trace: @import("lake_read_context.zig").IoTrace = .{};
+    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(client), .scope = @splat(8), .context = .{ .trace = &trace } };
+    var read: ranges.RangeRead = .{ .object = .{ .bucket = "bucket", .key = "small", .byte_len = bytes.len, .version = .{ .etag = put.etag.? } }, .range = .{ .offset = 0, .len = 32 }, .purpose = .parquet_column_chunk };
+    for ([_]u64{ 0, 8192, 16300 }) |offset| {
+        read.range.offset = offset;
+        const lease = try reader.reader().readPlannedLease(a, read);
+        defer lease.release();
+        try std.testing.expectEqualSlices(u8, bytes[@intCast(offset)..][0..32], lease.bytes);
+    }
+    try std.testing.expectEqual(@as(u64, 1), trace.snapshot().source_provider_reads);
+    try std.testing.expectEqual(@as(u64, bytes.len), trace.snapshot().source_provider_bytes);
+    try std.testing.expectEqual(@as(u64, bytes.len), trace.snapshot().read_ahead_bytes);
+}
+
+test "external lake source read ahead provider failures fall back once per request to authoritative exact reads" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    const bytes = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / 1024);
+    var put = try client.putObject("bucket", "data", bytes, .{});
+    defer put.deinit(a);
+    const Provider = struct {
+        base: storage.ObjectStorage,
+        wide: std.atomic.Value(usize) = .init(0),
+        vtable: storage.ObjectStorage.VTable,
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (options.range.?.length.? > 64 * 1024) {
+                _ = self.wide.fetchAdd(1, .monotonic);
+                return error.TestOptionalUnavailable;
+            }
+            var base = self.base;
+            base.allocator = alloc;
+            return base.getObject(bucket, key, options);
+        }
+    };
+    var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+    provider.vtable.get_object = Provider.get;
+    const base = ObjectReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable });
+    for ([_]bool{ false, true }) |parallel| {
+        provider.wide.store(0, .release);
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        var trace: @import("lake_read_context.zig").IoTrace = .{};
+        var scheduler: Reader.Scheduling.Scheduler = .{};
+        var reader: Reader = .{ .cache = &cache, .base = base, .scope = @splat(9), .context = .{ .io = io, .trace = &trace, .parallel_object_io = parallel }, .scheduler = &scheduler };
+        var read: ranges.RangeRead = .{ .object = .{ .bucket = "bucket", .key = "data", .byte_len = bytes.len, .version = .{ .etag = put.etag.? } }, .range = .{ .offset = 0, .len = 64 * 1024 }, .purpose = .parquet_column_chunk };
+        for ([_]u64{ 0, 128 * 1024 }) |offset| {
+            read.range.offset = offset;
+            const lease = try reader.reader().readPlannedLease(a, read);
+            defer lease.release();
+            try std.testing.expectEqualSlices(u8, bytes[@intCast(offset)..][0 .. 64 * 1024], lease.bytes);
+        }
+        try std.testing.expectEqual(@as(usize, 1), provider.wide.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 1), trace.snapshot().source_provider_errors);
+        try std.testing.expectEqual(@as(u64, 2 * 64 * 1024), trace.snapshot().source_provider_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    }
+}
+
+test "external lake exact prefetch flights prevent duplicate widened source reads" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    const bytes = try a.alloc(u8, 1024 * 1024);
+    defer a.free(bytes);
+    @memset(bytes, 'x');
+    @memcpy(bytes[0..4], "data");
+    var put = try client.putObject("bucket", "data", bytes, .{});
+    defer put.deinit(a);
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    var trace: @import("lake_read_context.zig").IoTrace = .{};
+    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(client), .scope = @splat(63), .context = .{ .io = io, .trace = &trace } };
+    const read: ranges.RangeRead = .{ .object = .{ .bucket = "bucket", .key = "data", .byte_len = bytes.len, .version = .{ .etag = put.etag.? } }, .range = .{ .offset = 0, .len = 4 }, .purpose = .parquet_column_chunk };
+    const key = try reader.rangeKey(a, read);
+    defer a.free(key);
+    const claim = (try cache.begin(key)).?;
+    var claimed = true;
+    defer if (claimed) cache.finish(claim, io);
+    const Task = struct {
+        fn run(owner: *Reader, wanted: ranges.RangeRead) !void {
+            const lease = try owner.reader().readPlannedLease(std.testing.allocator, wanted);
+            defer lease.release();
+            try std.testing.expectEqualStrings("data", lease.bytes);
+        }
+    };
+    var task = try io.concurrent(Task.run, .{ &reader, read });
+    defer _ = task.cancel(io) catch {};
+    const deadline = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s;
+    while (true) {
+        while (!cache.mutex.tryLock()) std.atomic.spinLoopHint();
+        const joined = claim.flight.refs > 1;
+        cache.mutex.unlock();
+        if (joined) break;
+        try std.testing.expectEqual(@as(u64, 0), trace.snapshot().source_provider_reads);
+        try std.testing.expect(@import("antfly_platform").time.monotonicNs() < deadline);
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try cache.store(key, "data");
+    cache.finish(claim, io);
+    claimed = false;
+    try task.await(io);
+    try std.testing.expectEqual(@as(u64, 0), trace.snapshot().source_provider_reads);
 }

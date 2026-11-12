@@ -38,6 +38,7 @@ const values = [_]anyerror{
     error.CloudGenerationStoreUnavailable,
     error.CommittedGraphMetricMaterializationRejected,
     error.CommittedRepairRequired,
+    error.ConcurrencyUnavailable,
     error.ConditionalCheckFailed,
     error.ConditionalIdempotentAppendUnsupported,
     error.ConditionalManifestDeletionUnsupported,
@@ -270,6 +271,7 @@ const values = [_]anyerror{
     error.PatternWitnessFound,
     error.PredicateRangeFound,
     error.PredicateRangeUnknown,
+    error.ProcessFdQuotaExceeded,
     error.ProviderGenerationUnavailable,
     error.PublicationFenceRequired,
     error.PublishedHeadManifestMissing,
@@ -278,6 +280,7 @@ const values = [_]anyerror{
     error.QueryCacheBudgetCannotBeEnforced,
     error.RelationalStorageUnavailable,
     error.RemoteMediaFetchFailed,
+    error.ResourceTemporarilyUnavailable,
     error.RetainedCutCollectionBound,
     error.SchemaVersionExhausted,
     error.ServingPackAdmissionDeclined,
@@ -287,6 +290,8 @@ const values = [_]anyerror{
     error.SparseSegmentNotFound,
     error.SparseSegmentTooLarge,
     error.StaleEnrichmentWithoutPublishedHead,
+    error.SystemFdQuotaExceeded,
+    error.SystemResources,
     error.TextSegmentNotFound,
     error.TextSegmentTooLarge,
     error.TransformSourceBudgetExceeded,
@@ -321,7 +326,12 @@ const values = [_]anyerror{
 };
 const names = blk: {
     var result: [values.len][]const u8 = undefined;
-    for (values, 0..) |value, i| result[i] = @errorName(value);
+    @setEvalBranchQuota(100_000);
+    for (values, 0..) |value, i| {
+        result[i] = @errorName(value);
+        if (i != 0 and std.mem.order(u8, result[i - 1], result[i]) != .lt)
+            @compileError("lake execution errors must be unique and sorted");
+    }
     break :blk result;
 };
 pub fn fromName(name: []const u8) anyerror {

@@ -121,6 +121,7 @@ def search_request(value):
         "fields": [
             "hn_id",
             "title",
+            "url",
             "author",
             "item_type",
             "points",

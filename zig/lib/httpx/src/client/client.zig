@@ -90,8 +90,79 @@ fn parsedResponseReusable(parser: *const Parser, req_method: types.Method) bool 
     return self_delimited and parser.headers.isKeepAlive(parser.version);
 }
 
+/// Shared admission for HTTP/1 clients using a dedicated bounded transport
+/// executor. Reserve the complete request task graph before submitting any
+/// watchdog or network work. Queueing does not occupy that executor's workers.
+/// The owner must drain every client before destroying this value or its I/O.
+pub const RequestLimit = extern struct {
+    capacity: u32,
+    active: u32 = 0,
+    max_bytes: u64 = 0,
+    active_bytes: u64 = 0,
+    demand_waiters: u32 = 0,
+    lock_word: u32 = 0,
+
+    fn lock(self: *RequestLimit) void {
+        while (@cmpxchgWeak(u32, &self.lock_word, 0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+    fn unlock(self: *RequestLimit) void {
+        @atomicStore(u32, &self.lock_word, 0, .release);
+    }
+    fn charge(self: *const RequestLimit, bytes: u64) u64 {
+        // A required oversized transfer runs alone under its caller's response
+        // limit. Ordinary transfers share the bounded in-flight allowance.
+        return if (self.max_bytes == 0) 0 else @min(bytes, self.max_bytes);
+    }
+    fn acquire(self: *RequestLimit, io: Io, deadline_ms: ?i64, cancellation: ?CancellationToken) !void {
+        return self.acquireBudget(io, deadline_ms, cancellation, 0, false);
+    }
+    fn acquireBudget(self: *RequestLimit, io: Io, deadline_ms: ?i64, cancellation: ?CancellationToken, bytes: u64, speculative: bool) !void {
+        return self.acquireBudgetWaiting(io, deadline_ms, cancellation, bytes, speculative, false);
+    }
+    fn acquireBudgetWaiting(self: *RequestLimit, io: Io, deadline_ms: ?i64, cancellation: ?CancellationToken, bytes: u64, speculative: bool, wait_for_speculation: bool) !void {
+        if (!speculative) _ = @atomicRmw(u32, &self.demand_waiters, .Add, 1, .acq_rel);
+        defer if (!speculative) {
+            _ = @atomicRmw(u32, &self.demand_waiters, .Sub, 1, .acq_rel);
+        };
+        while (true) {
+            try io.checkCancel();
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+            try ensureRequestDeadline(io, deadline_ms);
+            self.lock();
+            const slots = if (speculative) self.capacity -| 2 else self.capacity;
+            const blocked = speculative and @atomicLoad(u32, &self.demand_waiters, .acquire) != 0;
+            const charged = self.charge(bytes);
+            if (!blocked and self.active < slots and (self.max_bytes == 0 or charged <= self.max_bytes -| self.active_bytes)) {
+                _ = @atomicRmw(u32, &self.active, .Add, 1, .acq_rel);
+                self.active_bytes += charged;
+                self.unlock();
+                return;
+            }
+            self.unlock();
+            if ((speculative and (!wait_for_speculation or self.capacity <= 2)) or self.capacity == 0) return error.ConcurrencyUnavailable;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+    fn release(self: *RequestLimit) void {
+        self.releaseBudget(0);
+    }
+    fn releaseBudget(self: *RequestLimit, bytes: u64) void {
+        self.lock();
+        defer self.unlock();
+        const previous = @atomicRmw(u32, &self.active, .Sub, 1, .acq_rel);
+        std.debug.assert(previous != 0 and self.active_bytes >= self.charge(bytes));
+        self.active_bytes -= self.charge(bytes);
+    }
+};
+
 /// HTTP client configuration.
 pub const ClientConfig = struct {
+    request_limit: ?*RequestLimit = null,
+    query_request_limit: ?*RequestLimit = null,
+    speculative_io: bool = false,
+    /// An already admitted seed worker may wait outside the transport executor.
+    /// Demand still has priority and two reserved slots; ordinary hints decline.
+    wait_for_speculative_io: bool = false,
     attempt_observer: ?AttemptObserver = null,
     base_url: ?[]const u8 = null,
     timeouts: types.Timeouts = .{},
@@ -104,6 +175,9 @@ pub const ClientConfig = struct {
     /// ceiling but still bounded by max_response_size.
     max_error_response_size: ?usize = null,
     max_response_headers: usize = 256,
+    /// Optional separate allocation domain for HTTP/1 body collection,
+    /// including decompression fallback buffers. Must outlive returned bodies.
+    http1_response_body_allocator: ?Allocator = null,
     /// Default request lifetime for adapters whose provider interface does not
     /// expose per-call HTTP options. An explicit RequestOptions cancellation
     /// source takes precedence. The token is borrowed for the client's
@@ -651,6 +725,66 @@ test "busy H1 pool admission cancels before a socket exists" {
     try cancel.await(std.testing.io);
 }
 
+// A pooled peer can reset between checkout and timeout setup. Replace at most
+// one such connection before publishing the request socket. No headers, body,
+// output or attempt-cancellation pointer have been exposed at this point.
+fn acquirePreparedConnection(comptime Entry: type, pool: anytype, io: Io, host: []const u8, port: u16, deadline_ms: ?i64, interrupt: *const RequestInterrupt, recv_ms: u64, send_ms: u64) !*Entry {
+    var replaced = false;
+    while (true) {
+        const entry = try acquirePooledConnection(Entry, pool, io, host, port, deadline_ms, interrupt);
+        Client.applyTimeouts(&entry.socket, recv_ms, send_ms, deadline_ms) catch |err| {
+            pool.evictConnection(entry);
+            try io.checkCancel();
+            if (interrupt.isCancellationRequested()) return error.Cancelled;
+            try ensureRequestDeadline(io, deadline_ms);
+            if (err == error.ConnectionResetByPeer and !replaced) {
+                replaced = true;
+                continue;
+            }
+            return err;
+        };
+        return entry;
+    }
+}
+
+test "H1 reset pooled sockets reconnect before buffered and writer POST transmission" {
+    if (!@import("builtin").os.tag.isDarwin()) return error.SkipZigTest;
+    const TestServer = @import("../testing.zig").TestServer;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |streamed| {
+        var server = try TestServer.start(a, io, &.{.{ .method = .POST, .path = "/", .respond = .{ .body = "once" } }});
+        defer server.deinit();
+        var client = Client.initWithConfig(a, io, .{ .keep_alive = true });
+        defer client.deinit();
+        const stale = try client.pool.getConnection("127.0.0.1", server.port);
+        var peer = try server.listener.accept();
+        peer.socket.abortRequest();
+        peer.socket.close();
+        var byte: [1]u8 = undefined;
+        try std.testing.expectError(error.ConnectionResetByPeer, std.posix.read(stale.socket.handle, &byte));
+        // SO_ERROR was consumed by recv; timeout setup must still recognize
+        // the defunct socket instead of reporting an invalid option.
+        try std.testing.expectError(error.ConnectionResetByPeer, stale.socket.setRecvTimeout(25));
+        try std.testing.expectError(error.ConnectionResetByPeer, stale.socket.setSendTimeout(25));
+        client.pool.releaseConnection(stale);
+        var serving = try io.concurrent(TestServer.handleOne, .{&server});
+        defer serving.cancel(io) catch {};
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        const options: RequestOptions = .{ .body = "mutation", .max_retries = 0, .timeout_ms = 3000 };
+        var response = if (streamed)
+            try client.requestToWriter(.POST, server.baseUrl(), options, arrayListWriter(&out, a), null, null)
+        else
+            try client.request(.POST, server.baseUrl(), options);
+        defer response.deinit();
+        try serving.await(io);
+        try std.testing.expectEqualStrings("once", if (streamed) out.items else response.body.?);
+        try std.testing.expectEqualSlices(usize, &.{1}, server.route_hits);
+        try std.testing.expectEqual(@as(usize, 0), client.pool.active_count);
+    }
+}
+
 fn isSafeUnsentRetryError(err: anyerror) bool {
     return switch (err) {
         error.GoawayRefused,
@@ -1019,6 +1153,18 @@ pub const Client = struct {
         return self.config.max_response_size;
     }
 
+    /// Heap bytes needed by the buffered HTTP/1 body collector, excluding
+    /// response headers, connection state and caller-owned request buffers.
+    /// Both encoded and decoded bodies obey max_body_bytes. During decompression
+    /// the encoded buffer survives an output growth: encoded + old output + new
+    /// output. Derive capacities from the collector's actual ArrayList policy,
+    /// including alloc/copy/free fallback when the allocator cannot remap.
+    /// Collector capacity is capped at the enforced body limit.
+    pub fn bufferedResponseBodyPeakBytes(max_body_bytes: usize) error{Overflow}!usize {
+        if (max_body_bytes == 0) return 0;
+        return std.math.mul(usize, max_body_bytes, 3);
+    }
+
     /// Releases all allocated resources.
     pub fn deinit(self: *Self) void {
         self.shutdown();
@@ -1087,14 +1233,38 @@ pub const Client = struct {
         try self.interceptors.append(self.allocator, interceptor);
     }
 
+    fn transferBytes(self: *const Self, method: types.Method, request_options: RequestOptions) usize {
+        // HEAD has no response body, including on errors. Charging the default
+        // 100 MiB ceiling would monopolize a byte gate for a metadata probe.
+        const success = @min(request_options.max_response_size orelse self.config.max_response_size, self.config.max_response_size);
+        const response = if (method == .HEAD) 0 else @max(success, self.responseSizeLimitForStatus(success, 500));
+        // Unknown-length duplex uploads run exclusively under each configured
+        // byte allowance. Slot-only gates retain their normal concurrency.
+        if (request_options.body_stream != null) return std.math.maxInt(usize);
+        var body_bytes: usize = 0;
+        if (request_options.body) |body| body_bytes +|= body.len;
+        if (request_options.borrowed_body) |body| body_bytes +|= body.len;
+        if (request_options.json) |body| body_bytes +|= body.len;
+        if (request_options.borrowed_body_segments) |segments| for (segments) |body| {
+            body_bytes +|= body.len;
+        };
+        return response +| body_bytes;
+    }
+
     /// Makes an HTTP request.
     pub fn request(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions) !Response {
         const deadline_ms = requestDeadlineMs(self.io, reqOpts.timeout_ms orelse self.config.timeouts.request_ms);
         var lease = try self.request_gate.tryAcquire(self.io);
         defer lease.deinit();
+        var queued_cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation orelse self.config.request_cancellation };
+        const transfer_bytes = self.transferBytes(method, reqOpts);
+        if (self.config.query_request_limit) |limit| try limit.acquireBudgetWaiting(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io, self.config.wait_for_speculative_io);
+        defer if (self.config.query_request_limit) |limit| limit.releaseBudget(transfer_bytes);
+        if (self.config.request_limit) |limit| try limit.acquireBudgetWaiting(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io, self.config.wait_for_speculative_io);
+        defer if (self.config.request_limit) |limit| limit.releaseBudget(transfer_bytes);
         if (!self.config.cancel_in_flight_on_shutdown) return self.requestInternal(method, url, reqOpts, 0, deadline_ms);
 
-        var cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation };
+        var cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation orelse self.config.request_cancellation };
         var coordinated = reqOpts;
         coordinated.cancellation = cancellation.token();
         return self.requestInternal(method, url, coordinated, 0, deadline_ms);
@@ -1114,9 +1284,15 @@ pub const Client = struct {
         const deadline_ms = requestDeadlineMs(self.io, reqOpts.timeout_ms orelse self.config.timeouts.request_ms);
         var lease = try self.request_gate.tryAcquire(self.io);
         defer lease.deinit();
+        var queued_cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation orelse self.config.request_cancellation };
+        const transfer_bytes = self.transferBytes(method, reqOpts);
+        if (self.config.query_request_limit) |limit| try limit.acquireBudgetWaiting(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io, self.config.wait_for_speculative_io);
+        defer if (self.config.query_request_limit) |limit| limit.releaseBudget(transfer_bytes);
+        if (self.config.request_limit) |limit| try limit.acquireBudgetWaiting(self.io, deadline_ms, queued_cancellation.token(), transfer_bytes, self.config.speculative_io, self.config.wait_for_speculative_io);
+        defer if (self.config.request_limit) |limit| limit.releaseBudget(transfer_bytes);
         if (!self.config.cancel_in_flight_on_shutdown) return self.requestToWriterInternal(method, url, reqOpts, writer, progress_cb, progress_ctx, 0, deadline_ms);
 
-        var cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation };
+        var cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation orelse self.config.request_cancellation };
         var coordinated = reqOpts;
         coordinated.cancellation = cancellation.token();
         return self.requestToWriterInternal(method, url, coordinated, writer, progress_cb, progress_ctx, 0, deadline_ms);
@@ -2056,13 +2232,12 @@ pub const Client = struct {
 
         if (req.uri.isTls()) {
             if (self.config.keep_alive and self.config.address_filter == null) {
-                var tls_conn = try acquirePooledConnection(TlsConnection, &self.tls_pool, self.io, host, port, deadline_ms, interrupt);
+                var tls_conn = try acquirePreparedConnection(TlsConnection, &self.tls_pool, self.io, host, port, deadline_ms, interrupt, timeout_ms, write_timeout_ms);
                 var ok = false;
                 defer {
                     if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
                 }
 
-                try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
                 try interrupt.publish(&tls_conn.socket, self.io);
                 defer interrupt.clear(&tls_conn.socket, self.io);
                 errdefer if (interrupt.isCancellationRequested()) (&tls_conn.socket).abortRequest();
@@ -2080,13 +2255,12 @@ pub const Client = struct {
         }
 
         if (self.config.keep_alive and self.config.address_filter == null) {
-            var conn = try acquirePooledConnection(@import("pool.zig").Connection, &self.pool, self.io, host, port, deadline_ms, interrupt);
+            var conn = try acquirePreparedConnection(@import("pool.zig").Connection, &self.pool, self.io, host, port, deadline_ms, interrupt, timeout_ms, write_timeout_ms);
             var ok = false;
             defer {
                 if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
             }
 
-            try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
             try interrupt.publish(&conn.socket, self.io);
             defer interrupt.clear(&conn.socket, self.io);
             errdefer if (interrupt.isCancellationRequested()) (&conn.socket).abortRequest();
@@ -2161,13 +2335,12 @@ pub const Client = struct {
 
         if (req.uri.isTls()) {
             if (self.config.keep_alive and self.config.address_filter == null) {
-                var tls_conn = try acquirePooledConnection(TlsConnection, &self.tls_pool, self.io, host, port, deadline_ms, interrupt);
+                var tls_conn = try acquirePreparedConnection(TlsConnection, &self.tls_pool, self.io, host, port, deadline_ms, interrupt, timeout_ms, write_timeout_ms);
                 var ok = false;
                 defer {
                     if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
                 }
 
-                try applyTimeouts(&tls_conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
                 try interrupt.publish(&tls_conn.socket, self.io);
                 defer interrupt.clear(&tls_conn.socket, self.io);
                 errdefer if (interrupt.isCancellationRequested()) (&tls_conn.socket).abortRequest();
@@ -2184,13 +2357,12 @@ pub const Client = struct {
         }
 
         if (self.config.keep_alive and self.config.address_filter == null) {
-            var conn = try acquirePooledConnection(@import("pool.zig").Connection, &self.pool, self.io, host, port, deadline_ms, interrupt);
+            var conn = try acquirePreparedConnection(@import("pool.zig").Connection, &self.pool, self.io, host, port, deadline_ms, interrupt, timeout_ms, write_timeout_ms);
             var ok = false;
             defer {
                 if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
             }
 
-            try applyTimeouts(&conn.socket, timeout_ms, write_timeout_ms, deadline_ms);
             try interrupt.publish(&conn.socket, self.io);
             defer interrupt.clear(&conn.socket, self.io);
             errdefer if (interrupt.isCancellationRequested()) (&conn.socket).abortRequest();
@@ -3347,6 +3519,107 @@ pub const Client = struct {
         return cmf & 0x0f == 8 and cmf >> 4 <= 7 and header % 31 == 0;
     }
 
+    /// Bound encoded bytes independently of decoded output without retaining
+    /// the wire body. Probing one byte at the ceiling distinguishes exact EOF
+    /// from oversized input; the probe is never exposed to the decompressor.
+    const BoundedBodyReader = struct {
+        inner: *Io.Reader,
+        remaining: usize,
+        exceeded: bool = false,
+        reader_iface: Io.Reader,
+
+        fn init(inner: *Io.Reader, limit: usize, buffer: []u8) BoundedBodyReader {
+            return .{ .inner = inner, .remaining = limit, .reader_iface = .{ .vtable = &vtable, .buffer = buffer, .seek = 0, .end = 0 } };
+        }
+        fn checkLimit(self: *const BoundedBodyReader) !void {
+            if (self.exceeded) return error.ResponseTooLarge;
+        }
+        fn readVec(reader: *Io.Reader, buffers: [][]u8) Io.Reader.Error!usize {
+            const self: *BoundedBodyReader = @fieldParentPtr("reader_iface", reader);
+            // Reader.fill passes no caller buffers: writableVector supplies
+            // our internal buffer, whose newly read bytes must advance end.
+            var vector: [8][]u8 = undefined;
+            const count, const data_size = try reader.writableVector(&vector, buffers);
+            if (count == 0 or vector[0].len == 0) return 0;
+            if (self.remaining == 0) {
+                var probe: [1]u8 = undefined;
+                if (try readSomeOnce(self.inner, &probe) == 0) return error.EndOfStream;
+                self.exceeded = true;
+                return error.ReadFailed;
+            }
+            const n = try readSomeOnce(self.inner, vector[0][0..@min(vector[0].len, self.remaining)]);
+            if (n == 0) return error.EndOfStream;
+            self.remaining -= n;
+            if (n > data_size) {
+                reader.end += n - data_size;
+                return data_size;
+            }
+            return n;
+        }
+        const vtable = IoReaderHelpers.makeVTable(readVec);
+    };
+
+    const BoundedBodyListWriter = struct {
+        allocator: Allocator,
+        output: *std.ArrayListUnmanaged(u8),
+        limit: usize,
+        pub fn writeAll(self: @This(), bytes: []const u8) !void {
+            try appendBoundedBody(self.allocator, self.output, bytes, self.limit);
+        }
+    };
+
+    fn verifyContentFooter(hasher: *flate.Container.Hasher, metadata: flate.Container.Metadata) !void {
+        switch (hasher.*) {
+            .gzip => |*gzip| if (metadata.gzip.crc != gzip.crc.final() or metadata.gzip.count != gzip.count) return error.DecompressionFailed,
+            .zlib => |zlib| if (metadata.zlib.adler != zlib.adler) return error.DecompressionFailed,
+            .raw => {},
+        }
+    }
+
+    /// Decode every gzip member before reporting completion. Encoded-byte
+    /// accounting and HTTP framing belong to the bounded input adapter; this
+    /// helper owns the aggregate decoded ceiling and each member's integrity.
+    fn writeGzipMembers(input: *Io.Reader, writer: anytype, max_size: usize, progress_cb: ?WriterProgressCallback, progress_ctx: ?*anyopaque) !usize {
+        var total: usize = 0;
+        var members: usize = 0;
+        var window: [flate.max_window_len]u8 = undefined;
+        var output: [16 * 1024]u8 = undefined;
+        while (true) {
+            if (members != 0) {
+                // Common gzip producers pad with zeroes. Skip padding in
+                // buffered spans, while retaining the encoded input ceiling.
+                while (true) {
+                    const next = input.peekGreedy(1) catch |err| {
+                        if (err == error.EndOfStream) return total;
+                        return err;
+                    };
+                    if (next[0] != 0) break;
+                    input.toss(next.len - std.mem.trimStart(u8, next, "\x00").len);
+                }
+            }
+            var decoder = flate.Decompress.init(input, .gzip, &window);
+            var checksum = flate.Container.Hasher.init(.gzip);
+            while (true) {
+                const n = decoder.reader.readSliceShort(&output) catch return error.DecompressionFailed;
+                if (n == 0) break;
+                const next_total = try checkedResponseSize(total, n, max_size);
+                try writer.writeAll(output[0..n]);
+                checksum.update(output[0..n]);
+                total = next_total;
+                if (progress_cb) |cb| cb(.{ .bytes_written = @intCast(total), .total_bytes = null }, progress_ctx);
+            }
+            // std.flate exposes trailer values but does not verify them.
+            try verifyContentFooter(&checksum, decoder.container_metadata);
+            members += 1;
+        }
+    }
+
+    fn appendBoundedBody(a: Allocator, output: *std.ArrayListUnmanaged(u8), bytes: []const u8, limit: usize) !void {
+        const required = try checkedResponseSize(output.items.len, bytes.len, limit);
+        if (required > output.capacity) try output.ensureTotalCapacityPrecise(a, @min(limit, std.ArrayListUnmanaged(u8).growCapacity(required)));
+        output.appendSliceAssumeCapacity(bytes);
+    }
+
     fn appendDecompressed(
         allocator: Allocator,
         encoded: []const u8,
@@ -3358,6 +3631,7 @@ pub const Client = struct {
         var decompress_window: [flate.max_window_len]u8 = undefined;
         var decompressor = flate.Decompress.init(&encoded_reader, container, &decompress_window);
         var read_buf: [16 * 1024]u8 = undefined;
+        var checksum = flate.Container.Hasher.init(container);
 
         while (true) {
             const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
@@ -3366,8 +3640,10 @@ pub const Client = struct {
             };
             if (n == 0) break;
             _ = try checkedResponseSize(output.items.len, n, max_size);
-            try output.appendSlice(allocator, read_buf[0..n]);
+            try appendBoundedBody(allocator, output, read_buf[0..n], max_size);
+            checksum.update(read_buf[0..n]);
         }
+        try verifyContentFooter(&checksum, decompressor.container_metadata);
     }
 
     fn appendDeflateDecompressed(
@@ -3460,7 +3736,7 @@ pub const Client = struct {
             chunked_reader = ChunkedBodyReader.init(body_source, &chunked_buf);
             break :blk &chunked_reader.reader_iface;
         } else if (parser.content_length) |len| blk: {
-            if (len > std.math.maxInt(usize)) return error.ResponseTooLarge;
+            if (len > std.math.maxInt(usize) or len > max_response_size) return error.ResponseTooLarge;
             cl_reader = ContentLengthReader.init(body_source, @intCast(len), &cl_buf);
             break :blk &cl_reader.reader_iface;
         } else blk: {
@@ -3471,8 +3747,9 @@ pub const Client = struct {
         const close_delimited_body = !parser.chunked and parser.content_length == null;
 
         // --- Read from the chain into a single output buffer ---
+        const body_allocator = self.config.http1_response_body_allocator orelse self.allocator;
         var result = std.ArrayListUnmanaged(u8).empty;
-        errdefer result.deinit(self.allocator);
+        errdefer result.deinit(body_allocator);
         const max_size = max_response_size;
 
         // Pre-allocate hint: use content_length if known (and not compressed).
@@ -3480,16 +3757,26 @@ pub const Client = struct {
             if (parser.content_length) |len| {
                 if (len > max_size) return error.ResponseTooLarge;
                 if (len <= std.math.maxInt(usize)) {
-                    try result.ensureTotalCapacity(self.allocator, @intCast(len));
+                    try result.ensureTotalCapacityPrecise(body_allocator, @intCast(len));
                 }
             }
         }
 
         var read_buf: [16 * 1024]u8 = undefined;
 
-        if (content_coding) |coding| {
+        if (content_coding == .gzip) {
+            var encoded_buffer: [8192]u8 = undefined;
+            var encoded = BoundedBodyReader.init(framed_reader, max_size, &encoded_buffer);
+            const output = BoundedBodyListWriter{ .allocator = body_allocator, .output = &result, .limit = max_size };
+            _ = writeGzipMembers(&encoded.reader_iface, output, max_size, null, null) catch |err| {
+                try encoded.checkLimit();
+                if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
+                return err;
+            };
+        } else if (content_coding == .deflate) {
             var compressed = std.ArrayListUnmanaged(u8).empty;
-            defer compressed.deinit(self.allocator);
+            defer compressed.deinit(body_allocator);
 
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
@@ -3501,24 +3788,10 @@ pub const Client = struct {
                 };
                 if (n == 0) break;
                 _ = try checkedResponseSize(compressed.items.len, n, max_size);
-                try compressed.appendSlice(self.allocator, read_buf[0..n]);
+                try appendBoundedBody(body_allocator, &compressed, read_buf[0..n], max_size);
             }
 
-            switch (coding) {
-                .gzip => try appendDecompressed(
-                    self.allocator,
-                    compressed.items,
-                    .gzip,
-                    &result,
-                    max_size,
-                ),
-                .deflate => try appendDeflateDecompressed(
-                    self.allocator,
-                    compressed.items,
-                    &result,
-                    max_size,
-                ),
-            }
+            try appendDeflateDecompressed(body_allocator, compressed.items, &result, max_size);
         } else {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
@@ -3530,13 +3803,14 @@ pub const Client = struct {
                 };
                 if (n == 0) break;
                 _ = try checkedResponseSize(result.items.len, n, max_size);
-                try result.appendSlice(self.allocator, read_buf[0..n]);
+                try appendBoundedBody(body_allocator, &result, read_buf[0..n], max_size);
             }
         }
 
         if (result.items.len > 0) {
-            res.body = try result.toOwnedSlice(self.allocator);
+            res.body = try result.toOwnedSlice(body_allocator);
             res.body_owned = true;
+            res.body_allocator = body_allocator;
         }
 
         // Remove encoding/length headers when decompression was applied.
@@ -3598,7 +3872,7 @@ pub const Client = struct {
             break :blk &chunked_reader.reader_iface;
         } else if (parser.content_length) |len| blk: {
             if (len > std.math.maxInt(usize)) return error.ResponseTooLarge;
-            if (content_coding == null and len > max_response_size) return error.ResponseTooLarge;
+            if (len > max_response_size) return error.ResponseTooLarge;
             cl_reader = ContentLengthReader.init(body_source, @intCast(len), &cl_buf);
             break :blk &cl_reader.reader_iface;
         } else blk: {
@@ -3627,11 +3901,23 @@ pub const Client = struct {
                     max_response_size,
                 );
             }
-        } else if (content_coding) |coding| {
+        } else if (content_coding == .gzip) {
+            var encoded_buffer: [8192]u8 = undefined;
+            var encoded = BoundedBodyReader.init(framed_reader, max_response_size, &encoded_buffer);
+            written_total = writeGzipMembers(&encoded.reader_iface, writer, max_response_size, progress_cb, progress_ctx) catch |err| {
+                try encoded.checkLimit();
+                if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
+                return err;
+            };
+        } else if (content_coding == .deflate) {
+            var bounded_buffer: [8192]u8 = undefined;
+            var bounded = BoundedBodyReader.init(framed_reader, max_response_size, &bounded_buffer);
             var encoded_prefix: [2]u8 = undefined;
             var encoded_prefix_len: usize = 0;
             while (encoded_prefix_len < encoded_prefix.len) {
-                const n = readSomeOnce(framed_reader, encoded_prefix[encoded_prefix_len..]) catch |err| {
+                const n = readSomeOnce(&bounded.reader_iface, encoded_prefix[encoded_prefix_len..]) catch |err| {
+                    try bounded.checkLimit();
                     if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
                     try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
@@ -3645,15 +3931,17 @@ pub const Client = struct {
             var encoded_prefix_buffer: [8192]u8 = undefined;
             var encoded_reader = PrefixedReader.init(
                 encoded_prefix[0..encoded_prefix_len],
-                framed_reader,
+                &bounded.reader_iface,
                 &encoded_prefix_buffer,
             );
 
-            if (coding == .deflate and hasZlibHeader(encoded_prefix[0..encoded_prefix_len])) {
+            if (hasZlibHeader(encoded_prefix[0..encoded_prefix_len])) {
+                const body_allocator = self.config.http1_response_body_allocator orelse parser.allocator;
                 var encoded = std.ArrayListUnmanaged(u8).empty;
-                defer encoded.deinit(parser.allocator);
+                defer encoded.deinit(body_allocator);
                 while (true) {
                     const n = readSomeOnce(&encoded_reader.reader_iface, &read_buf) catch |err| {
+                        try bounded.checkLimit();
                         if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
                         try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                         if (err == error.EndOfStream) break;
@@ -3662,13 +3950,13 @@ pub const Client = struct {
                     };
                     if (n == 0) break;
                     _ = try checkedResponseSize(encoded.items.len, n, max_response_size);
-                    try encoded.appendSlice(parser.allocator, read_buf[0..n]);
+                    try appendBoundedBody(body_allocator, &encoded, read_buf[0..n], max_response_size);
                 }
 
                 var decoded = std.ArrayListUnmanaged(u8).empty;
-                defer decoded.deinit(parser.allocator);
+                defer decoded.deinit(body_allocator);
                 try appendDeflateDecompressed(
-                    parser.allocator,
+                    body_allocator,
                     encoded.items,
                     &decoded,
                     max_response_size,
@@ -3680,23 +3968,22 @@ pub const Client = struct {
                     .total_bytes = null,
                 }, progress_ctx);
             } else {
-                const container: flate.Container = switch (coding) {
-                    .gzip => .gzip,
-                    .deflate => .raw,
-                };
                 var decompress_window: [flate.max_window_len]u8 = undefined;
                 var decompressor = flate.Decompress.init(
                     &encoded_reader.reader_iface,
-                    container,
+                    .raw,
                     &decompress_window,
                 );
 
                 while (true) {
                     const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
+                        try bounded.checkLimit();
                         if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
                         try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
+                        // Only the decoder's EndOfStream proves the final
+                        // DEFLATE block completed. HTTP connection-close EOF
+                        // inside a block is ReadFailed, not codec completion.
                         if (err == error.EndOfStream) break;
-                        if (err == error.ReadFailed and close_delimited_body) break;
                         return error.DecompressionFailed;
                     };
                     if (n == 0) break;
@@ -3712,6 +3999,18 @@ pub const Client = struct {
                         .total_bytes = null,
                     }, progress_ctx);
                 }
+            }
+            // A raw decoder may finish before its HTTP body. Drain through
+            // the same counter, so padding cannot evade the encoded ceiling.
+            while (true) {
+                const n = readSomeOnce(&bounded.reader_iface, &read_buf) catch |err| {
+                    try bounded.checkLimit();
+                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
+                    if (err == error.EndOfStream) break;
+                    return err;
+                };
+                if (n == 0) break;
             }
         } else {
             while (true) {
@@ -3764,11 +4063,7 @@ pub const Client = struct {
         if (res.body) |body| {
             try writer.writeAll(body);
             if (progress_cb) |cb| cb(.{ .bytes_written = body.len, .total_bytes = res.contentLength() }, progress_ctx);
-            if (res.body_owned) {
-                res.allocator.free(body);
-                res.body_owned = false;
-            }
-            res.body = null;
+            res.releaseBody();
         }
     }
 
@@ -4773,55 +5068,36 @@ test "raw deflate fallback handles a valid zlib-looking prefix" {
     try std.testing.expectEqualSlices(u8, &expected, decoded.items);
 }
 
-const test_tls_cert_pem =
-    "-----BEGIN CERTIFICATE-----\n" ++
-    "MIIDCTCCAfGgAwIBAgIUGjCWCIDqTRw/vKwQVR5QhFvTtqswDQYJKoZIhvcNAQEL\n" ++
-    "BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDQwMTA1MzAzNFoXDTI2MDQw\n" ++
-    "MjA1MzAzNFowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF\n" ++
-    "AAOCAQ8AMIIBCgKCAQEAlcbhuVCGNinrY/u0i9CraIMPPbUUuidxw6oDcxU2dBmf\n" ++
-    "5dZgbMWIOM6ugs2bg0dVLld/epE3AKbK1O2wzmPtziyE+i+aUze1EddHgOm91bDc\n" ++
-    "jRE/Poy74X0Nh9kpqdG5JTgqrGU8HFWgVAZJ72cQTTHQrLG4V4cZUaklga2b3EWx\n" ++
-    "AtKuhn25aG3c5NO9gdZRJCs9YZ/q7WKX1xI0uwnJXrS54/e7uLgE2HnQZADXujCd\n" ++
-    "62fTUaa6NJBjqpYcrmsRT5RU0ZymJQB6megB8GiyAWAtvb0qP9LIyYDo0krW4Q6y\n" ++
-    "d4hKFktK6x2yMhsYb71085OiH5I1lvcPMimG3kEdQQIDAQABo1MwUTAdBgNVHQ4E\n" ++
-    "FgQU1ju/opd9LtCdJJgvwJIFyrUGCxwwHwYDVR0jBBgwFoAU1ju/opd9LtCdJJgv\n" ++
-    "wJIFyrUGCxwwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAeNEq\n" ++
-    "DCRtgQY3DXmIv4DBb6hef/5pULMwmb0Rsv5cQfExE0TLYT+m5jTPUbl34kyvFDew\n" ++
-    "IAL+6IQf1Wug8ohRPZPxtNFhf8LT+Z2DjfmX1+rMNRNKGeENbj7kDhOE0U7On+iH\n" ++
-    "mFtDm068CNlMtUO39BF8dYNFZLyTNPZagmoS+InUSVNwVKGop4TKeN1oHkiMBf9u\n" ++
-    "ZSLs84DHU59GbIgSJWBi5MihRgbpauZs/VhvfciLU9KlcwLY1XgbImFggSJdcyqm\n" ++
-    "7PlORVQMy2bnuImpzdGywVdMjH9ka7wuEuoXQOSAhMJvycfuY4jls7+abBrhlV/l\n" ++
-    "36+7YT0LzE5Z9pLwyA==\n" ++
-    "-----END CERTIFICATE-----\n";
+const test_tls_cert_pem = @embedFile("../tls/testdata/localhost-cert.pem");
 
 const test_tls_key_pem =
     "-----BEGIN PRIVATE KEY-----\n" ++
-    "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCVxuG5UIY2Ketj\n" ++
-    "+7SL0Ktogw89tRS6J3HDqgNzFTZ0GZ/l1mBsxYg4zq6CzZuDR1UuV396kTcApsrU\n" ++
-    "7bDOY+3OLIT6L5pTN7UR10eA6b3VsNyNET8+jLvhfQ2H2Smp0bklOCqsZTwcVaBU\n" ++
-    "BknvZxBNMdCssbhXhxlRqSWBrZvcRbEC0q6Gfblobdzk072B1lEkKz1hn+rtYpfX\n" ++
-    "EjS7CcletLnj97u4uATYedBkANe6MJ3rZ9NRpro0kGOqlhyuaxFPlFTRnKYlAHqZ\n" ++
-    "6AHwaLIBYC29vSo/0sjJgOjSStbhDrJ3iEoWS0rrHbIyGxhvvXTzk6IfkjWW9w8y\n" ++
-    "KYbeQR1BAgMBAAECggEAQsS7uJBwnDG4yUQamt+FohwWzcPtPwU5fmfKjOGOelg4\n" ++
-    "A047gxHV5bkha5c79dx1WSjRX/Lfaa9xKVXipUc/6lLHXv6cle92DUOCkTHiGiJz\n" ++
-    "V4GyR3CWivFj+ETzgUxIdJKi12Jz1w/G3t5E1HAGANutsmaxjndf7prwaOxbWGic\n" ++
-    "RCPwL5T/UTen6KknrMWASJSJFVhrjszvsbz6lea/EF9OrmmKSu8/NaQH+fOF5xix\n" ++
-    "pdRVCzkiFq9ox1R59k30hjMx2VJRRN53ErauMxWzogJVB7vrCxgdw3qxAr35tKTv\n" ++
-    "YRQBeCRDu0nDw05DBo+fMGN8Fe0f3tke7XiKk0sgvwKBgQDL2UMX74KIMjlSFvBE\n" ++
-    "6kgO3AJGwItxHnyUcpkUTpYyxGmZ8ZUAw8SG1CBBgBz9161gytTlyQcw0M779xUe\n" ++
-    "RXDaclhk8x1PDjnrjlX1WltOPc6f/Qafk1XvzHP5UGI65E2rGXRIrpejF/eiecoM\n" ++
-    "SD8TV9FuzBq3R8Te8XbeaCYsLwKBgQC8GEZukAft6x/OAVh6UIIOgzHCbYaklau7\n" ++
-    "7bj9NVQKEJRGABRYA/73J579r/stl3cybrRm0IfmzJk2QcBp/AaKTJF0MyiyMfRq\n" ++
-    "7LqQLtlJQFDYzqH4KAhjCBiUu7OeZV0SF7ds2EesH1EF+tmOHK8SeFbTTIQriy38\n" ++
-    "BfD/jZHBjwKBgGNYH6WTmRbM+zhxa2j6kGGFgSp//bUEOYyTCN1nqzVUmW5n2MkF\n" ++
-    "n0piKNIjIH3pVVqdnwHZZcK5kJYlBUq6ZtRe84tHHBqCAWI1/NhUz7ii0IcR5d9x\n" ++
-    "C2mRR1fSf/zZdKyU/CHLzKS0MoAhQIGZ1/uSScPofoCh3mUUYmzjbu8LAoGAXv+z\n" ++
-    "suuz1YpHSfiMA1reFQ5V92jx8/ZUAlqSb/CbPWoaOTCZFcsO3y13s5FKP0Ccxy/6\n" ++
-    "lWMFAKCdUTXsRJsxgnAhlpqwFy/7znU51NCUldaR/q5+R6OQeNQB9jzG/10aoKSx\n" ++
-    "05t4t4opleeYMZpzIdT9pUKkDooA86Tcj3WlBCkCgYAOJKlKAjp2ZwHQ/ktkX1hK\n" ++
-    "tHbXZMXM40RjrujdimrIJxK87o73jp1s6cIuuHpNCVN15rI30Eb0WGy7ER2J2q2T\n" ++
-    "Bk1Pw3B3fAHZpbU7U8YgKW1KTNU7zpOwZjPCTBh2f4jhwwN0Zk4iltu8D2y2KvsC\n" ++
-    "xm8hZP/ZhT5VKqRD/ot8fw==\n" ++
+    "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC2xcMBAlfPhDkC\n" ++
+    "hihgwtceX7qK0QNg5bIbbp8LpZwD0VVtrEboRgfiVDgepePt5gRSaYGXl4Qy6Miy\n" ++
+    "iK0vMigTNPSUCpYdPe0mnxx3tQpd/U38haVcx5GyBVCvBuYy6C8rVCMJg7Xl6OEf\n" ++
+    "CdhTJYkeSZKUc2fU/lZp5UANTHqFAr0zc0v35FhYNGE0nHsusvl2mfN8WDOJrt+6\n" ++
+    "ifdkyIktXltYRpZyFwc9QnS996N3hq5+BuAwouh4EbkiTcm3MpFgIC/hVwYw+zIo\n" ++
+    "gPXm4xcHsQYURbbMfOHdfoD5cCG5Lf324GOAxB+yAFzz0hQOC9LTtg659ihAJbBe\n" ++
+    "4WXo0sfRAgMBAAECggEBAKl7Goc+B/UKs96uTpTjN50XwZ/ljw90D0M2wc6IA/La\n" ++
+    "UzA+twW9oqPx2pQ42fGJAGr3IM9UFacriqda69S+2sBss3rvkiGNgfH1Su2J+BIN\n" ++
+    "yBooR52QBX8hRJ74c8+y08KG43J4Kt0FpHMmquz2+n4WVRDJLvgn3DOX/FwYleft\n" ++
+    "f+xoqta3DCFGtHZMF+tC+eGg+bsqzBMFMBAlda7jfF0t3ifXWzUusxd27/2wwhNb\n" ++
+    "3w/Z1mQ1j7QJ6SGYzN/NZ1Zwdb3YEycWaOsfJO37fTGpyIZIVBU8tQaj5lp4nLwW\n" ++
+    "UfV2A/oXsGHGagji6Sw70urIh/sycziJ0vCHW4Nj6dECgYEA30xjuj3gZELK9+uo\n" ++
+    "xSSQWzuox0MAH/FsLI/Ma1NeiZXVWIeTdvz4huF7Vdk3LXbQbZusLGEaywl9ky8z\n" ++
+    "Qy/zfoh4oQgxmmkg9xdT/BYAR/aZLBazxXgiP6px/kBFplwqQNNrBO/WJhdlkY3n\n" ++
+    "/kAwbTy6S2PX6Pal41+4VhFp55UCgYEA0YoHWGewuh87XGYYn+fKdjVnOBglpJ7Z\n" ++
+    "DJOdDnuBjLRx4fz4powKOa4Nf2IdG7Ti8lnfbyRVnqLlU8nN4F3T2wXTI9+yi5Fa\n" ++
+    "PtXHVvvsdpcaOgLBn3K0zC8tiGERv80sUnt0SPFWzmGgc+gciMSQbg8CY+2F9ljb\n" ++
+    "oczF4+OPoE0CgYEAgK79Ke9OyXjUj1t3v2T67BjNg0fRYpc2x9d27sL00EVQ1dwL\n" ++
+    "156hetmmwiqT6dd29jOoXUr4rdmiTJf+6tFPebQcEHEwZNQA82S2OahUMSSj0Qyk\n" ++
+    "PUCmPBp15xgTC3RBxWoRWp78wqbpGaC1+Yf0YH+GvLulSdQadZZMHQ2cAqECgYAI\n" ++
+    "424EVgGtI34FIV+SCOcRtJo4Su3t2b8jRW+4GY0ZRt4909lIV1BnufZgnOzXLAkk\n" ++
+    "dqN/t27aV9aag0j0Z4aBF/Io52hPe070s2TNT8psDWTTaSKFfPwmXSn1SwjRtgZX\n" ++
+    "SV1ZasNf5cxEnmf3dT8bLA/R5VV1abeHWYRbcl+5UQKBgFb7yLIfRKB20/pweq7K\n" ++
+    "AEdOYn36ga4pqau+KzCfrGSaDrmLeSsTv1HllbzMmFPvkii37jL5Atej9xgGCN6a\n" ++
+    "hUGD1Pe7h3tDx0LBYV5oGEuiVT9dR86tnDcGOvxpEFQ4yM1TZldx6yCOKxYLfKy3\n" ++
+    "JMeM5NYvCYUaVB1WBRw3p6jL\n" ++
     "-----END PRIVATE KEY-----\n";
 
 const python_tls_server_script =
@@ -4914,6 +5190,11 @@ const python_tls_chunked_compressed_server_script =
     "                )\n" ++
     "                tls_conn.sendall(format(len(payload), 'x').encode() + b'\\r\\n')\n" ++
     "                tls_conn.sendall(payload + b'\\r\\n0\\r\\n\\r\\n')\n" ++
+    "                try:\n" ++
+    "                    tls_conn.settimeout(2)\n" ++
+    "                    tls_conn.unwrap().close()\n" ++
+    "                except (ssl.SSLError, OSError):\n" ++
+    "                    pass\n" ++
     "                break\n" ++
     "        except ssl.SSLError:\n" ++
     "            continue\n" ++
@@ -5634,7 +5915,7 @@ test "writer H1 timeout evicts an interrupted pooled connection" {
     try std.testing.expectEqual(@as(usize, 0), client.pool.stats().total);
 }
 
-test "HTTPS client round trip via local TLS server" {
+test "HTTPS verified round trip preserves separate bounded transport and body ownership" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -5673,9 +5954,19 @@ test "HTTPS client round trip via local TLS server" {
     const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
     defer allocator.free(url);
 
-    var client = Client.initWithConfig(allocator, io, .{
+    const ca_path = try tmp.dir.realPathFileAlloc(io, "cert.pem", allocator);
+    defer allocator.free(ca_path);
+    const Quota = @import("../util/quota_allocator.zig").QuotaAllocator;
+    var overall = Quota{ .backing = allocator, .limit = (8 << 20) + try Client.bufferedResponseBodyPeakBytes(4096) };
+    defer std.debug.assert(overall.live == 0);
+    var quota = Quota{ .backing = overall.allocator(), .limit = 8 << 20 };
+    defer std.debug.assert(quota.live == 0);
+    var client = Client.initWithConfig(quota.allocator(), io, .{
+        .http1_response_body_allocator = overall.allocator(),
+        .max_response_size = 4096,
+        .tls_ca_file = ca_path,
         .keep_alive = false,
-        .verify_ssl = false,
+        .verify_ssl = true,
         .retry_policy = .{ .max_retries = 0 },
         .timeouts = .{ .request_ms = 2_000, .read_ms = 2_000, .write_ms = 2_000 },
     });
@@ -5735,9 +6026,12 @@ fn expectChunkedCompressedResponse(mode: []const u8, to_writer: bool) !void {
     const url = try std.fmt.allocPrint(allocator, "https://127.0.0.1:{d}/", .{port});
     defer allocator.free(url);
 
+    const ca_path = try tmp.dir.realPathFileAlloc(io, "cert.pem", allocator);
+    defer allocator.free(ca_path);
     var client = Client.initWithConfig(allocator, io, .{
         .keep_alive = false,
-        .verify_ssl = false,
+        .verify_ssl = true,
+        .tls_ca_file = ca_path,
         .retry_policy = .{ .max_retries = 0 },
         .timeouts = .{ .request_ms = 2_000, .read_ms = 2_000, .write_ms = 2_000 },
     });
@@ -5746,14 +6040,20 @@ fn expectChunkedCompressedResponse(mode: []const u8, to_writer: bool) !void {
     if (to_writer) {
         var out = std.ArrayListUnmanaged(u8).empty;
         defer out.deinit(allocator);
-        var resp = try client.getToWriter(url, .{}, arrayListWriter(&out, allocator), null, null);
+        var resp = client.getToWriter(url, .{}, arrayListWriter(&out, allocator), null, null) catch |err| {
+            std.debug.print("compressed HTTPS writer mode={s} error={s}\n", .{ mode, @errorName(err) });
+            return err;
+        };
         defer resp.deinit();
 
         try std.testing.expectEqual(@as(u16, 200), resp.status.code);
         try std.testing.expect(resp.body == null);
         try std.testing.expectEqualStrings("{\"ok\":true}\n", out.items);
     } else {
-        var resp = try getWithRetry(&client, io, url, 50);
+        var resp = getWithRetry(&client, io, url, 50) catch |err| {
+            std.debug.print("compressed HTTPS mode={s} error={s}\n", .{ mode, @errorName(err) });
+            return err;
+        };
         defer resp.deinit();
 
         try std.testing.expectEqual(@as(u16, 200), resp.status.code);
@@ -7030,4 +7330,374 @@ test "admitted transport H2 pre-send expiry retains the cached connection and tr
         try std.testing.expectEqual(@as(u32, 0), entry.h2.stream_manager.activeStreamCount());
         try std.testing.expectEqual(@as(u32, 1), entry.active_requests);
     }
+}
+
+test "request task admission shares whole-request capacity and releases before transport failure" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var limit: RequestLimit = .{ .capacity = 1 };
+    try limit.acquire(io, null, null);
+    var held = true;
+    defer if (held) limit.release();
+    var configured_cancel = std.atomic.Value(bool).init(false);
+    var client = Client.initWithConfig(a, io, .{ .request_cancellation = .fromAtomic(&configured_cancel), .request_limit = &limit, .retry_policy = .{ .max_retries = 0 } });
+    defer client.deinit();
+    const deadline = std.math.cast(i64, @divFloor(Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms)).? - 1;
+    try std.testing.expectError(error.Timeout, limit.acquire(io, deadline, null));
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, limit.acquire(io, null, .fromAtomic(&canceled)));
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &limit.active, .acquire));
+    try std.testing.expectError(error.Timeout, client.get("http://127.0.0.1:1/", .{ .timeout_ms = 1 }));
+    try std.testing.expectEqual(@as(usize, 0), client.activeRequestCount());
+    configured_cancel.store(true, .release);
+    try std.testing.expectError(error.Cancelled, client.get("http://127.0.0.1:1/", .{}));
+    configured_cancel.store(false, .release);
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(a);
+    try std.testing.expectError(error.Timeout, client.getToWriter("http://127.0.0.1:1/", .{ .timeout_ms = 1 }, arrayListWriter(&bytes, a), null, null));
+    try std.testing.expectEqual(@as(usize, 0), bytes.items.len);
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &limit.active, .acquire));
+    limit.release();
+    held = false;
+    // With a grant, an invalid URL fails before sending. Both buffered and
+    // streamed calls must return their shared slot on this path.
+    _ = client.get("invalid://", .{}) catch {};
+    try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &limit.active, .acquire));
+    _ = client.getToWriter("invalid://", .{}, arrayListWriter(&bytes, a), null, null) catch {};
+    try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &limit.active, .acquire));
+}
+
+test "request task admission cancels queued clients on shutdown and recovers shared capacity" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var limit: RequestLimit = .{ .capacity = 1 };
+    try limit.acquire(io, null, null);
+    var client = Client.initWithConfig(a, io, .{ .request_limit = &limit });
+    defer client.deinit();
+    const Task = struct {
+        fn run(c: *Client) !void {
+            var response = try c.get("http://127.0.0.1:1/", .{});
+            response.deinit();
+        }
+    };
+    var pending = try io.concurrent(Task.run, .{&client});
+    defer _ = pending.cancel(io) catch {};
+    while (client.activeRequestCount() == 0) try io.sleep(.fromMilliseconds(1), .awake);
+    client.beginShutdown();
+    try std.testing.expectError(error.Cancelled, pending.await(io));
+    client.drainShutdown();
+    try std.testing.expectEqual(@as(usize, 0), client.activeRequestCount());
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &limit.active, .acquire));
+    limit.release();
+    try limit.acquire(io, null, null);
+    limit.release();
+}
+
+test "request task admission keeps transport independent of a fully occupied caller executor" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const TestServer = @import("../testing.zig").TestServer;
+    var server = try TestServer.start(a, io, &.{.{ .path = "/ready", .respond = .{ .body = "ready" } }});
+    defer server.deinit();
+    var callers = Io.Threaded.init(a, .{ .async_limit = .nothing, .concurrent_limit = .limited(4) });
+    defer callers.deinit();
+    var transport = Io.Threaded.init(a, .{ .async_limit = .nothing, .concurrent_limit = .limited(32) });
+    defer transport.deinit();
+    var limit: RequestLimit = .{ .capacity = 4 };
+    var entered = std.atomic.Value(u32).init(0);
+    const url = try std.fmt.allocPrint(a, "{s}/ready", .{server.baseUrl()});
+    defer a.free(url);
+    const Task = struct {
+        fn serve(ts: *TestServer) !void {
+            for (0..4) |_| try ts.handleOne();
+        }
+        fn fetch(caller_io: Io, transport_io: Io, budget: *RequestLimit, count: *std.atomic.Value(u32), endpoint: []const u8) anyerror!void {
+            _ = count.fetchAdd(1, .acq_rel);
+            while (count.load(.acquire) != 4) try caller_io.sleep(.fromMilliseconds(1), .awake);
+            var client = Client.initWithConfig(std.testing.allocator, transport_io, .{ .request_limit = budget, .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+            defer client.deinit();
+            var response = try client.get(endpoint, .{ .timeout_ms = 5000 });
+            defer response.deinit();
+            try std.testing.expectEqualStrings("ready", response.body.?);
+        }
+    };
+    var serving = try io.concurrent(Task.serve, .{&server});
+    defer _ = serving.cancel(io) catch {};
+    var requests: [4]?Io.Future(anyerror!void) = @splat(null);
+    defer for (&requests) |*pending| {
+        if (pending.*) |*future| _ = future.cancel(callers.io()) catch {};
+    };
+    for (&requests) |*pending| pending.* = try callers.io().concurrent(Task.fetch, .{ callers.io(), transport.io(), &limit, &entered, url });
+    for (&requests) |*pending| {
+        const result = pending.*.?.await(callers.io());
+        pending.* = null;
+        try result;
+    }
+    try serving.await(io);
+    try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &limit.active, .acquire));
+}
+
+test "request task admission shares byte quotas and reserves demand capacity ahead of speculation" {
+    const io = std.testing.io;
+    var limit: RequestLimit = .{ .capacity = 8, .max_bytes = 16 };
+    try limit.acquireBudget(io, null, null, 12, false);
+    try std.testing.expectEqual(@as(u64, 12), limit.active_bytes);
+    try std.testing.expectError(error.ConcurrencyUnavailable, limit.acquireBudget(io, null, null, 8, true));
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &limit.active, .acquire));
+    limit.releaseBudget(12);
+    try limit.acquireBudget(io, null, null, 128, false);
+    try std.testing.expectEqual(@as(u64, 16), limit.active_bytes);
+    try std.testing.expectError(error.ConcurrencyUnavailable, limit.acquireBudget(io, null, null, 1, true));
+    limit.releaseBudget(128);
+    _ = @atomicRmw(u32, &limit.demand_waiters, .Add, 1, .acq_rel);
+    try std.testing.expectError(error.ConcurrencyUnavailable, limit.acquireBudget(io, null, null, 1, true));
+    _ = @atomicRmw(u32, &limit.demand_waiters, .Sub, 1, .acq_rel);
+    for (0..6) |_| try limit.acquireBudget(io, null, null, 1, true);
+    try std.testing.expectError(error.ConcurrencyUnavailable, limit.acquireBudget(io, null, null, 1, true));
+    for (0..2) |_| try limit.acquireBudget(io, null, null, 1, false);
+    for (0..8) |_| limit.releaseBudget(1);
+    try std.testing.expectEqual(@as(u64, 0), limit.active_bytes);
+    try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &limit.active, .acquire));
+}
+
+test "request task admission keeps HEAD metadata probes independent of full body quotas" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    const TestServer = @import("../testing.zig").TestServer;
+    var server = try TestServer.start(a, io, &.{.{ .method = .HEAD, .path = "/metadata", .respond = .{ .status = 200, .body = "" } }});
+    defer server.deinit();
+    var serving = try io.concurrent(TestServer.handleOne, .{&server});
+    defer _ = serving.cancel(io) catch {};
+    var limit: RequestLimit = .{ .capacity = 3, .max_bytes = 16 };
+    try limit.acquireBudget(io, null, null, 16, false);
+    defer limit.releaseBudget(16);
+    var client = Client.initWithConfig(a, io, .{ .request_limit = &limit, .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+    defer client.deinit();
+    const url = try std.fmt.allocPrint(a, "{s}/metadata", .{server.baseUrl()});
+    defer a.free(url);
+    var response = try client.request(.HEAD, url, .{ .timeout_ms = 1000 });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try serving.await(io);
+    try std.testing.expectEqual(@as(u64, 16), limit.active_bytes);
+    try std.testing.expectEqual(@as(u32, 1), @atomicLoad(u32, &limit.active, .acquire));
+}
+
+test "request task admission lets admitted seeds wait without displacing demand or extending deadlines" {
+    const io = std.testing.io;
+    var limit: RequestLimit = .{ .capacity = 3, .max_bytes = 16 };
+    try limit.acquireBudget(io, null, null, 16, false);
+    var held = true;
+    defer if (held) limit.releaseBudget(16);
+    var entered = std.atomic.Value(bool).init(false);
+    var acquired = std.atomic.Value(bool).init(false);
+    const Task = struct {
+        fn run(budget: *RequestLimit, started: *std.atomic.Value(bool), ready: *std.atomic.Value(bool), cancellation: ?CancellationToken) !void {
+            started.store(true, .release);
+            try budget.acquireBudgetWaiting(std.testing.io, null, cancellation, 1, true, true);
+            defer budget.releaseBudget(1);
+            ready.store(true, .release);
+        }
+    };
+    var seed = try io.concurrent(Task.run, .{ &limit, &entered, &acquired, null });
+    defer _ = seed.cancel(io) catch {};
+    while (!entered.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expect(!acquired.load(.acquire));
+    // Already queued demand outranks the waiting seed even after bytes free.
+    _ = @atomicRmw(u32, &limit.demand_waiters, .Add, 1, .acq_rel);
+    limit.releaseBudget(16);
+    held = false;
+    try limit.acquireBudget(io, null, null, 16, false);
+    held = true;
+    _ = @atomicRmw(u32, &limit.demand_waiters, .Sub, 1, .acq_rel);
+    try std.testing.expect(!acquired.load(.acquire));
+    try std.testing.expectError(error.Timeout, limit.acquireBudgetWaiting(io, requestDeadlineMs(io, 5), null, 1, true, true));
+    limit.releaseBudget(16);
+    held = false;
+    try seed.await(io);
+    try std.testing.expect(acquired.load(.acquire));
+    entered.store(false, .release);
+    acquired.store(false, .release);
+    var canceled = std.atomic.Value(bool).init(false);
+    try limit.acquireBudget(io, null, null, 16, false);
+    held = true;
+    var stopped = try io.concurrent(Task.run, .{ &limit, &entered, &acquired, CancellationToken.fromAtomic(&canceled) });
+    defer _ = stopped.cancel(io) catch {};
+    while (!entered.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Cancelled, stopped.await(io));
+    try std.testing.expect(!acquired.load(.acquire));
+    limit.releaseBudget(16);
+    held = false;
+    try std.testing.expectEqual(@as(u32, 0), @atomicLoad(u32, &limit.active, .acquire));
+    try std.testing.expectEqual(@as(u64, 0), limit.active_bytes);
+}
+
+test "buffered response peak rejects unrepresentable admission bounds" {
+    try std.testing.expectEqual(@as(usize, 0), try Client.bufferedResponseBodyPeakBytes(0));
+    try std.testing.expectError(error.Overflow, Client.bufferedResponseBodyPeakBytes(std.math.maxInt(usize)));
+    try std.testing.expectError(error.Overflow, Client.bufferedResponseBodyPeakBytes(std.math.maxInt(usize) / 2));
+}
+
+test "buffered gzip streams within two body buffers and enforces encoded and decoded ceilings" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const payload = try a.alloc(u8, 65500);
+    defer a.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i);
+    // A complete gzip member containing one stored (uncompressed) DEFLATE
+    // block. Near-equal wire/output sizes expose accidental wire buffering.
+    const encoded = try a.alloc(u8, payload.len + 23);
+    defer a.free(encoded);
+    @memcpy(encoded[0..10], "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff");
+    encoded[10] = 1;
+    std.mem.writeInt(u16, encoded[11..13], @intCast(payload.len), .little);
+    std.mem.writeInt(u16, encoded[13..15], ~@as(u16, @intCast(payload.len)), .little);
+    @memcpy(encoded[15..][0..payload.len], payload);
+    std.mem.writeInt(u32, encoded[encoded.len - 8 ..][0..4], std.hash.Crc32.hash(payload), .little);
+    std.mem.writeInt(u32, encoded[encoded.len - 4 ..][0..4], @intCast(payload.len), .little);
+    const compressed_zeroes = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xed\xc1\x01\x0d\x00\x00\x00\xc2\xa0\xf7\x4f\x6d\x0f\x07\x14\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xef\x06\x78\xf9\x28\xad\xdc\xff\x00\x00";
+    const cases = [_]struct { limit: usize, truncated: bool = false, wire: ?[]const u8 = null, expected: ?anyerror = null }{
+        .{ .limit = 65536 },
+        .{ .limit = 65510, .expected = error.ResponseTooLarge }, // encoded bound only
+        .{ .limit = 1024, .wire = compressed_zeroes, .expected = error.ResponseTooLarge }, // decoded bound only
+        .{ .limit = 65536, .truncated = true, .expected = error.DecompressionFailed },
+    };
+    for (cases) |case| {
+        var server = try @import("../testing.zig").TestServer.start(a, io, &.{.{ .path = "/", .respond = .{ .body = case.wire orelse if (case.truncated) encoded[0 .. encoded.len - 4] else encoded, .headers = &.{.{ .name = "Content-Encoding", .value = "gzip" }} } }});
+        defer server.deinit();
+        var serving = try io.concurrent(@import("../testing.zig").TestServer.handleOne, .{&server});
+        defer serving.cancel(io) catch {};
+        var non_remapping = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+        var body_quota = @import("../util/quota_allocator.zig").QuotaAllocator{ .backing = non_remapping.allocator(), .limit = 2 * 65536 };
+        var client = Client.initWithConfig(a, io, .{ .http1_response_body_allocator = body_quota.allocator(), .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        const result = client.get(server.baseUrl(), .{ .max_response_size = case.limit });
+        if (case.expected) |expected| try std.testing.expectError(expected, result) else {
+            var response = try result;
+            defer response.deinit();
+            try std.testing.expectEqualSlices(u8, payload, response.body.?);
+            try std.testing.expect(!body_quota.exceeded);
+        }
+        try std.testing.expectEqual(@as(usize, 0), body_quota.live);
+    }
+}
+
+test "compressed responses share complete members integrity and bounds across buffered and writer paths" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const TestServer = @import("../testing.zig").TestServer;
+    const hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00";
+    const multi = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x2b\xcf\x2f\xca\x49\x01\x00\x43\x11\x77\x3a\x05\x00\x00\x00";
+    const padded = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x2b\xcf\x2f\xca\x49\x01\x00\x43\x11\x77\x3a\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    const empty = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    const bad_crc = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf7\xf9\x81\xed\x06\x00\x00\x00";
+    const bad_size = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x07\x00\x00\x00";
+    const bad_second = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x2b\xcf\x2f\xca\x49\x01\x00\x42\x11\x77\x3a\x05\x00\x00\x00";
+    const truncated_second = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x2b\xcf\x2f\xca\x49\x01\x00\x43\x11\x77\x3a\x05";
+    const junk = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00\x67\x61\x72\x62\x61\x67\x65";
+    const decoded_over = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xed\xc1\x01\x0d\x00\x00\x00\xc2\xa0\xf7\x4f\x6d\x0f\x07\x14\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xef\x06\x78\xf9\x28\xad\xdc\xff\x00\x00";
+    const encoded_over = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x00\x00\xf6\xf9\x81\xed\x06\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    const zlib_valid = "\x78\x9c\xcb\x48\xcd\xc9\xc9\x57\x28\xcf\x2f\xca\x49\x01\x00\x1a\x0b\x04\x5d";
+    const zlib_bad = "\x78\x9c\xcb\x48\xcd\xc9\xc9\x57\x28\xcf\x2f\xca\x49\x01\x00\x1a\x0b\x04\x5c";
+    const raw_valid = "\xcb\x48\xcd\xc9\xc9\x57\x28\xcf\x2f\xca\x49\x01\x00";
+    const raw_over = "\xcb\x48\xcd\xc9\xc9\x57\x28\xcf\x2f\xca\x49\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    const cases = [_]struct { wire: []const u8, coding: []const u8 = "gzip", decoded: []const u8 = "", limit: usize = 256, expected: ?anyerror = null }{
+        .{ .wire = hello, .decoded = "hello " },
+        .{ .wire = multi, .decoded = "hello world" },
+        .{ .wire = padded, .decoded = "hello world" },
+        .{ .wire = empty },
+        .{ .wire = bad_crc, .expected = error.DecompressionFailed },
+        .{ .wire = bad_size, .expected = error.DecompressionFailed },
+        .{ .wire = bad_second, .expected = error.DecompressionFailed },
+        .{ .wire = truncated_second, .expected = error.DecompressionFailed },
+        .{ .wire = junk, .expected = error.DecompressionFailed },
+        .{ .wire = decoded_over, .limit = 1024, .expected = error.ResponseTooLarge },
+        .{ .wire = encoded_over, .limit = 64, .expected = error.ResponseTooLarge },
+        .{ .wire = zlib_valid, .coding = "deflate", .decoded = "hello world" },
+        .{ .wire = zlib_bad, .coding = "deflate", .expected = error.DecompressionFailed },
+        .{ .wire = raw_valid, .coding = "deflate", .decoded = "hello world" },
+        .{ .wire = "\x03\x00", .coding = "deflate" }, // valid empty final block
+        .{ .wire = hello[0 .. hello.len - 1], .expected = error.DecompressionFailed },
+        .{ .wire = "\x07", .coding = "deflate", .expected = error.DecompressionFailed }, // reserved block type
+        .{ .wire = raw_valid[0 .. raw_valid.len - 1], .coding = "deflate", .expected = error.DecompressionFailed },
+        .{ .wire = raw_valid[0 .. raw_valid.len - 3], .coding = "deflate", .expected = error.DecompressionFailed },
+        .{ .wire = zlib_valid[0 .. zlib_valid.len - 1], .coding = "deflate", .expected = error.DecompressionFailed },
+        .{ .wire = raw_over, .coding = "deflate", .limit = 64, .expected = error.ResponseTooLarge },
+    };
+    for ([_]bool{ false, true }) |to_writer| {
+        for ([_]enum { content_length, chunked, close_delimited }{ .content_length, .chunked, .close_delimited }) |framing| {
+            const chunked = framing == .chunked;
+            for (cases) |case| {
+                const wire = if (chunked) try std.fmt.allocPrint(a, "{x}\r\n{s}\r\n0\r\n\r\n", .{ case.wire.len, case.wire }) else try a.dupe(u8, case.wire);
+                defer a.free(wire);
+                var server = try TestServer.start(a, io, &.{.{ .path = "/", .respond = .{ .body = wire, .chunked = chunked, .close_delimited = framing == .close_delimited, .headers = &.{.{ .name = "Content-Encoding", .value = case.coding }} } }});
+                defer server.deinit();
+                var serving = try io.concurrent(TestServer.handleOne, .{&server});
+                defer serving.cancel(io) catch {};
+                var client = Client.initWithConfig(a, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+                defer client.deinit();
+                var output = std.ArrayListUnmanaged(u8).empty;
+                defer output.deinit(a);
+                const result = if (to_writer) client.getToWriter(server.baseUrl(), .{ .max_response_size = case.limit }, arrayListWriter(&output, a), null, null) else client.get(server.baseUrl(), .{ .max_response_size = case.limit });
+                if (result) |value| {
+                    var reply = value;
+                    defer reply.deinit();
+                    if (case.expected != null) return error.AcceptedInvalidCompressedResponse;
+                    try std.testing.expectEqualStrings(case.decoded, if (to_writer) output.items else reply.body orelse "");
+                } else |err| {
+                    if (case.expected) |expected| try std.testing.expectEqual(expected, err) else return err;
+                }
+                try std.testing.expect(output.items.len <= case.limit);
+            }
+        }
+    }
+}
+
+test "request task admission accounts every body representation error ceilings and unknown streams" {
+    const Probe = struct {
+        process: *RequestLimit,
+        query: *RequestLimit,
+        expected: usize,
+        calls: usize = 0,
+        fn before(raw: *anyopaque, _: AttemptObserver.Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(u64, @min(self.expected, 64)), self.process.active_bytes);
+            try std.testing.expectEqual(@as(u64, @min(self.expected, 32)), self.query.active_bytes);
+            return error.AdmissionObserved;
+        }
+        fn after(_: *anyopaque, _: ?*const Response) void {}
+        fn read(_: *anyopaque, _: []u8) !usize {
+            return error.UploadMustNotStart;
+        }
+    };
+    var marker: u8 = 0;
+    const cases = [_]struct { options: RequestOptions, expected: usize = 17, method: types.Method = .POST, error_limit: ?usize = null }{
+        .{ .options = .{ .body = "1234567890123456", .max_response_size = 1 } },
+        .{ .options = .{ .borrowed_body = "1234567890123456", .max_response_size = 1 } },
+        .{ .options = .{ .json = "1234567890123456", .max_response_size = 1 } },
+        .{ .options = .{ .borrowed_body_segments = &.{ "12345678", "90123456" }, .max_response_size = 1 } },
+        .{ .options = .{ .borrowed_body = "1234567890123456", .max_response_size = 1 }, .expected = 49, .error_limit = 33 },
+        .{ .options = .{ .borrowed_body = "1234567890123456", .max_response_size = 1 }, .method = .HEAD, .expected = 16, .error_limit = 33 },
+        .{ .options = .{ .body_stream = .{ .context = &marker, .read = Probe.read }, .max_response_size = 1 }, .expected = std.math.maxInt(usize) },
+    };
+    for (cases) |case| for ([_]bool{ false, true }) |streamed_response| {
+        if (case.options.body_stream != null and !streamed_response) continue;
+        var process: RequestLimit = .{ .capacity = 8, .max_bytes = 64 };
+        var query: RequestLimit = .{ .capacity = 8, .max_bytes = 32 };
+        var probe: Probe = .{ .process = &process, .query = &query, .expected = case.expected };
+        var client = Client.initWithConfig(std.testing.allocator, std.testing.io, .{ .request_limit = &process, .query_request_limit = &query, .max_error_response_size = case.error_limit, .retry_policy = .{ .max_retries = 0 }, .attempt_observer = .{ .ptr = &probe, .before = Probe.before, .after = Probe.after } });
+        defer client.deinit();
+        if (streamed_response) {
+            var output: std.ArrayList(u8) = .empty;
+            defer output.deinit(std.testing.allocator);
+            try std.testing.expectError(error.AdmissionObserved, client.requestToWriter(case.method, "http://127.0.0.1:1/", case.options, arrayListWriter(&output, std.testing.allocator), null, null));
+        } else try std.testing.expectError(error.AdmissionObserved, client.request(case.method, "http://127.0.0.1:1/", case.options));
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        try std.testing.expectEqual(@as(u32, 0), process.active);
+        try std.testing.expectEqual(@as(u64, 0), process.active_bytes);
+        try std.testing.expectEqual(@as(u32, 0), query.active);
+        try std.testing.expectEqual(@as(u64, 0), query.active_bytes);
+    };
 }

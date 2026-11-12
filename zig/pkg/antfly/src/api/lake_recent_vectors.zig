@@ -29,6 +29,8 @@ const V = std.json.Value;
 const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Context = local.serverless_query_lake_read_context.Context;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
+const recovery = @import("lake_recent_work.zig");
+const lease_ms: u64 = 5_000;
 const retention_ms: u64 = 24 * 60 * 60 * 1000;
 pub const Job = struct {
     version: u16 = 1,
@@ -93,6 +95,13 @@ fn cutDigest(a: A, table: local.common_topology_records.TableRecord, publication
     std.crypto.hash.Blake3.hash(bytes, &digest, .{});
     return digest;
 }
+fn recipeCutDigest(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared) ![32]u8 {
+    const cut = try cutDigest(a, table, publication, overlay);
+    return if (publication.reader_protocol >= 102 and declarations.len == 1 and isRecipe(declarations[0]))
+        @import("lake_wal_image.zig").digest(.{ .format = "recipe-partition-recent-vectors-v1", .cut = cut, .recipe = declarations[0] })
+    else
+        cut;
+}
 fn jobKey(a: A, store: *Store, table: u64, cut: [32]u8) ![]u8 {
     return std.fmt.allocPrint(a, "{s}{s}recent-search/{d}/{s}.json", .{ store.opened.prefix, if (store.opened.prefix.len == 0) "" else "/", table, std.fmt.bytesToHex(cut, .lower) });
 }
@@ -100,15 +109,133 @@ fn cancellation(context: Context) Cancellation {
     return if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none;
 }
 const Aggregate = struct { required: u16 = 1, ready: u16 = 0, until_ms: u64 = std.math.maxInt(u64), last_error: ?[]const u8 = null, next_retry_ms: u64 = 0 };
+const BuildMode = enum { observe, background, query };
 pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64, memo: ?*Cache) !Prepared {
+    const prepared = if (publication.reader_protocol < 102 or !hasRecipes(declarations)) prepareLegacy(a, table, publication, overlay, declarations, store, context, options, build, cut_expires_ms, memo) else prepareRecipes(a, table, publication, overlay, declarations, store, context, options, build, cut_expires_ms, memo, true);
+    return prepared catch |err| {
+        try context.ensureActive();
+        return err;
+    };
+}
+fn hasRecipes(declarations: []const Declared) bool {
+    for (declarations) |declaration| if (isRecipe(declaration)) return true;
+    return false;
+}
+fn isRecipe(declaration: Declared) bool {
+    return declaration.artifact.kind == .vector_segment or declaration.artifact.kind == .sparse_segment;
+}
+pub fn selectedRecipes(a: A, declarations: []const Declared, req: local.storage_db_types.SearchRequest) ![]const Declared {
+    var selected: std.ArrayList(Declared) = .empty;
+    errdefer selected.deinit(a);
+    if (req.dense != null) try selectRecipe(a, &selected, declarations, .vector_segment, req.index_name);
+    if (req.sparse != null) try selectRecipe(a, &selected, declarations, .sparse_segment, req.index_name);
+    for (req.dense_queries) |query| try selectRecipe(a, &selected, declarations, .vector_segment, query.index_name);
+    for (req.sparse_queries) |query| try selectRecipe(a, &selected, declarations, .sparse_segment, query.index_name);
+    return selected.toOwnedSlice(a);
+}
+fn selectRecipe(a: A, selected: *std.ArrayList(Declared), declarations: []const Declared, kind: @FieldType(@FieldType(Declared, "artifact"), "kind"), name: ?[]const u8) !void {
+    var found: ?Declared = null;
+    for (declarations) |declaration| if (declaration.artifact.kind == kind and (if (name) |value| std.mem.eql(u8, value, declaration.name) else true)) {
+        if (found != null) return error.IndexNotFound;
+        found = declaration;
+    };
+    const declaration = found orelse return error.IndexNotFound;
+    for (selected.items) |prior| if (std.mem.eql(u8, prior.name, declaration.name)) return;
+    try selected.append(a, declaration);
+}
+pub fn prepareQuery(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, cut_expires_ms: u64, memo: ?*Cache, req: local.storage_db_types.SearchRequest) !Prepared {
+    if (publication.reader_protocol < 102) return prepareLegacy(a, table, publication, overlay, declarations, store, context, options, false, cut_expires_ms, memo) catch |err| {
+        try context.ensureActive();
+        return err;
+    };
+    const selected = try selectedRecipes(a, declarations, req);
+    defer a.free(selected);
+    // Restart cannot make a durable accepted cut depend on winning a race with
+    // the background scheduler. Repair only the requested recipes, under the
+    // caller's deadline, joining a live claim rather than duplicating its work.
+    // Callers without an I/O runtime remain observation-only.
+    const Budget = struct {
+        parent: Context,
+        provider: ?Cancellation,
+        deadline: u64,
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return @import("antfly_platform").time.monotonicNs() >= self.deadline or self.parent.isCancelled() or (if (self.provider) |token| token.isCancelled() else false);
+        }
+    };
+    var budget: Budget = .{ .parent = context, .provider = options.cancellation, .deadline = @min(@min(context.deadline_ns orelse std.math.maxInt(u64), options.deadline_ns orelse std.math.maxInt(u64)), @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s) };
+    var bounded = context;
+    bounded.deadline_ns = budget.deadline;
+    bounded.cancellation = .{ .ptr = &budget, .is_cancelled_fn = Budget.canceled };
+    var bounded_options = options;
+    bounded_options.deadline_ns = budget.deadline;
+    bounded_options.cancellation = .{ .ptr = &budget, .is_cancelled_fn = Budget.canceled };
+    // A read cannot publish table-wide readiness from a selected recipe subset.
+    return prepareRecipes(a, table, publication, overlay, selected, store, bounded, bounded_options, false, cut_expires_ms, memo, false) catch |err| {
+        // Providers expose boolean cancellation. Restore the scoped deadline
+        // and authority error when expiration races an in-flight GET/PUT.
+        try context.ensureActive();
+        try bounded.ensureActive();
+        return err;
+    };
+}
+fn supplied(configs: V, name: []const u8) bool {
+    const config = configs.object.get(name) orelse return false;
+    const external = if (config == .object) config.object.get("external") else null;
+    return if (external) |value| value == .bool and value.bool else false;
+}
+fn prepareRecipes(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64, memo: ?*Cache, table_status: bool) !Prepared {
+    var arena = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+    defer arena.deinit();
+    const work = arena.allocator();
+    const configs = try std.json.parseFromSliceLeaky(V, work, table.indexes_json, .{});
+    var runs: std.ArrayList(Run) = .empty;
+    var roots: std.ArrayList(Declared) = .empty;
+    var aggregate: Aggregate = .{ .ready = std.math.maxInt(u16) };
+    var failure: ?anyerror = null;
+    // Supplied vectors must not queue behind model calls. Successful recipe
+    // partitions are durable independently, and survive another recipe's retry.
+    for ([_]bool{ true, false }) |manual| for (declarations) |declaration| {
+        if (!isRecipe(declaration) or supplied(configs, declaration.name) != manual) continue;
+        try context.ensureActive();
+        var recipe_progress: Aggregate = .{};
+        const mode: BuildMode = if (build) .background else if (!table_status and context.io != null and !store.implementation.read_only) .query else .observe;
+        const prepared = preparePartitions(work, table, publication, overlay, &.{declaration}, store, context, options, mode, cut_expires_ms, memo, &recipe_progress) catch |err| {
+            aggregate.required = @max(aggregate.required, recipe_progress.required);
+            aggregate.ready = @min(aggregate.ready, recipe_progress.ready);
+            if (recipe_progress.last_error) |value| aggregate.last_error = value;
+            aggregate.next_retry_ms = @max(aggregate.next_retry_ms, recipe_progress.next_retry_ms);
+            if (err != error.IndexRebuilding) return err;
+            failure = err;
+            // A failed managed recipe must not prevent other ready recipes
+            // from making progress in the same reconciliation turn.
+            if (build) continue;
+            return err;
+        };
+        aggregate.required = @max(aggregate.required, recipe_progress.required);
+        aggregate.ready = @min(aggregate.ready, recipe_progress.ready);
+        aggregate.until_ms = @min(aggregate.until_ms, prepared.expires_ms);
+        try roots.appendSlice(work, prepared.declarations);
+        if (prepared.runs.len != 0) try runs.appendSlice(work, prepared.runs) else try runs.append(work, .{ .prefix = 0, .digest = overlay.contentIdentity(), .declarations = prepared.declarations, .cloud_generations = prepared.cloud_generations });
+    };
+    if (failure) |err| {
+        if (table_status) _ = try publishStatus(a, table, publication, overlay, store, context, if (aggregate.last_error != null) .failed else .building, cut_expires_ms, aggregate);
+        return err;
+    }
+    if (table_status) _ = try publishStatus(a, table, publication, overlay, store, context, .ready, cut_expires_ms, aggregate);
+    const result: Prepared = .{ .declarations = roots.items, .runs = runs.items, .expires_ms = aggregate.until_ms };
+    const encoded = try std.json.Stringify.valueAlloc(work, result, .{});
+    return std.json.parseFromSliceLeaky(Prepared, a, encoded, .{ .allocate = .alloc_always });
+}
+fn prepareLegacy(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64, memo: ?*Cache) !Prepared {
     var aggregate: Aggregate = .{};
-    const prepared = preparePartitions(a, table, publication, overlay, declarations, store, context, options, build, cut_expires_ms, memo, &aggregate) catch |err| {
+    const prepared = preparePartitions(a, table, publication, overlay, declarations, store, context, options, if (build) .background else .observe, cut_expires_ms, memo, &aggregate) catch |err| {
         if (err == error.IndexRebuilding) _ = try publishStatus(a, table, publication, overlay, store, context, if (aggregate.last_error != null) .failed else .building, cut_expires_ms, aggregate);
         return err;
     };
     // Partition identity is deliberately independent of the WAL head. Only a
     // completed composition proves coverage of the actual table cut.
-    var scratch = std.heap.ArenaAllocator.init(a);
+    var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
     defer scratch.deinit();
     const aggregate_key = @import("lake_wal_image.zig").digest(.{ .format = "recent-vector-composed-status-v1", .store = store.cache_identity, .cut = try cutDigest(scratch.allocator(), table, publication, overlay), .lsn = overlay.pending.lsn });
     if (memo) |cache| if (try cache.get(scratch.allocator(), aggregate_key, cut_expires_ms)) |_| return prepared;
@@ -116,12 +243,12 @@ pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publicati
     if (observed) if (memo) |cache| cache.put(aggregate_key, .{ .declarations = &.{} }, aggregate.until_ms);
     return prepared;
 }
-fn preparePartitions(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64, memo: ?*Cache, aggregate: *Aggregate) !Prepared {
-    var arena = std.heap.ArenaAllocator.init(a);
+fn preparePartitions(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, mode: BuildMode, cut_expires_ms: u64, memo: ?*Cache, aggregate: *Aggregate) !Prepared {
+    var arena = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
     defer arena.deinit();
     const sa = arena.allocator();
     const parts = try overlay.partitions(sa);
-    if (parts.len == 0) return prepareWhole(a, table, publication, overlay, declarations, store, context, options, build, cut_expires_ms, memo, aggregate);
+    if (parts.len == 0) return preparePartition(a, table, publication, overlay, declarations, store, context, options, mode, cut_expires_ms, memo, aggregate);
     aggregate.required = 0;
     var last_prefix: ?u8 = null;
     for (parts) |part| {
@@ -147,23 +274,67 @@ fn preparePartitions(a: A, table: local.common_topology_records.TableRecord, pub
         var digest: [32]u8 = undefined;
         hash.final(&digest);
         subset.pending.cut_identity = digest;
-        const prepared = try prepareWhole(a, table, publication, &subset, declarations, store, context, options, build, cut_expires_ms, memo, aggregate);
+        const prepared = try preparePartition(a, table, publication, &subset, declarations, store, context, options, mode, cut_expires_ms, memo, aggregate);
         try runs.append(a, .{ .prefix = prefix, .digest = digest, .declarations = prepared.declarations, .cloud_generations = prepared.cloud_generations });
         start = end;
     }
     return .{ .declarations = runs.items[0].declarations, .runs = try runs.toOwnedSlice(a), .expires_ms = aggregate.until_ms };
 }
-fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64, memo: ?*Cache, aggregate: *Aggregate) !Prepared {
+const PartitionIdentity = struct { cut: [32]u8, cache_key: [32]u8 };
+fn preparePartition(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, mode: BuildMode, cut_expires_ms: u64, memo: ?*Cache, aggregate: *Aggregate) !Prepared {
     try context.ensureActive();
-    var arena = std.heap.ArenaAllocator.init(a);
+    const identity: PartitionIdentity = identity: {
+        var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const cut = try recipeCutDigest(scratch.allocator(), table, publication, overlay, declarations);
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update(&store.cache_identity);
+        hash.update(&cut);
+        var key: [32]u8 = undefined;
+        hash.final(&key);
+        break :identity .{ .cut = cut, .cache_key = key };
+    };
+    // Immutable ready readers never queue behind singleflight or builder
+    // admission. Only cache misses join construction; recheck after claiming.
+    if (memo) |cache| if (try cache.get(a, identity.cache_key, @max(nowMs(), cut_expires_ms))) |ready| {
+        try context.ensureActive();
+        aggregate.ready += 1;
+        aggregate.until_ms = @min(aggregate.until_ms, ready.expires_ms);
+        return ready;
+    };
+    const flight = if (mode != .observe and context.io != null) try recovery.process.claim(identity.cache_key, context) else null;
+    defer if (flight) |held| held.deinit();
+    var delay_ms: u32 = 25;
+    while (true) {
+        return prepareWhole(a, table, publication, overlay, declarations, store, context, options, mode, cut_expires_ms, memo, aggregate, identity) catch |err| {
+            if (err == error.RecentVectorLeaseLost and mode != .query) return error.IndexRebuilding;
+            if (err != error.RecentVectorBuildInProgress and err != error.RecentVectorLeaseLost) return err;
+            // Only query callers join a claim. Failed jobs retain their retry
+            // backoff; expired claims remain recoverable through the same CAS.
+            std.debug.assert(mode == .query);
+            try context.ensureActive();
+            var random: [1]u8 = undefined;
+            context.io.?.random(&random);
+            var remaining: u32 = delay_ms / 2 + @as(u32, random[0]) % (delay_ms / 2 + 1);
+            while (remaining != 0) {
+                try context.ensureActive();
+                const step = @min(remaining, 25);
+                try context.io.?.sleep(.fromMilliseconds(step), .awake);
+                remaining -= step;
+            }
+            try context.ensureActive();
+            delay_ms = @min(delay_ms * 2, 500);
+            continue;
+        };
+    }
+}
+fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, mode: BuildMode, cut_expires_ms: u64, memo: ?*Cache, aggregate: *Aggregate, identity: PartitionIdentity) !Prepared {
+    try context.ensureActive();
+    var arena = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
     defer arena.deinit();
     const scratch = arena.allocator();
-    const cut = try cutDigest(scratch, table, publication, overlay);
-    var cache_hash = std.crypto.hash.Blake3.init(.{});
-    cache_hash.update(&store.cache_identity);
-    cache_hash.update(&cut);
-    var cache_key: [32]u8 = undefined;
-    cache_hash.final(&cache_key);
+    const cut = identity.cut;
+    const cache_key = identity.cache_key;
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
     if (memo) |cache| if (try cache.get(a, cache_key, @max(now, cut_expires_ms))) |ready| {
         try context.ensureActive();
@@ -191,38 +362,66 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
         aggregate.until_ms = @min(aggregate.until_ms, job.expires_ms);
         return std.json.parseFromSliceLeaky(Prepared, a, encoded, .{ .allocate = .alloc_always });
     }
-    if (!build) return error.IndexRebuilding;
-    if ((job.state == .building and job.lease_until_ms > now) or (job.state == .failed and job.next_retry_ms > now)) return error.IndexRebuilding;
+    if (mode == .observe) return error.IndexRebuilding;
+    if (job.state == .failed and job.next_retry_ms > now) return error.IndexRebuilding;
+    if (job.state == .building and job.lease_until_ms > now) {
+        // Rolling upgrades can encounter an old fixed two-minute claim. Do
+        // not consume the entire query budget waiting for an unjoinable lease.
+        if (job.lease_until_ms - now > lease_ms * 2) return error.IndexRebuilding;
+        return if (mode == .query) error.RecentVectorBuildInProgress else error.IndexRebuilding;
+    }
     const io = context.io orelse return error.UnsupportedQueryRequest;
+    // Reserve construction capacity before taking a durable claim: queued
+    // requests must not hold a lease that they cannot make progress on.
+    var admitted = try recovery.process.admit(context);
+    defer admitted.release();
+    try context.ensureActive();
     job.state = .building;
-    job.lease_until_ms = now +| 120_000;
+    job.lease_until_ms = nowMs() +| lease_ms;
     job.expires_ms = @max(now +| retention_ms, cut_expires_ms +| 1);
     job.attempts +|= 1;
     io.random(&job.owner_token);
     job.last_error = null;
+    // A replacement attempt owns fresh artifacts. An expired generation's
+    // complete provider map must never qualify the new output if map capture
+    // declines or becomes unavailable during this attempt.
+    job.declarations = &.{};
+    job.cloud_generations = null;
     var claimed = client.compareAndPut(store.opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, job, .{}), if (saved) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
-        error.PreconditionFailed, error.ObjectAlreadyExists => return error.IndexRebuilding,
+        error.PreconditionFailed, error.ObjectAlreadyExists => return if (mode == .query) error.RecentVectorBuildInProgress else error.IndexRebuilding,
         else => {
             // A canceled/lost response may follow a successful claim write.
             // Recover only our random ownership token within the same bounded
             // cleanup path; never release a concurrent or successor claim.
-            releaseClaim(scratch, store, key, null, job, io) catch {};
+            cleanupClaim(store, key, job, io);
             return err;
         },
     };
     defer claimed.deinit(client.allocator);
     var job_finished = false;
-    // Shutdown cancellation must not strand this claim until lease expiry.
-    // A separate one-second cleanup budget releases only our captured revision; a crashed
-    // process still relies on normal lease expiry, and a newer owner is fenced.
-    errdefer if (!job_finished) releaseClaim(scratch, store, key, claimed.writeRevision(), job, io) catch {};
+    // Cleanup has its own bounded allocator and cancellation budget. A failed
+    // request allocator must not strand ownership until lease expiry.
+    errdefer if (!job_finished) cleanupClaim(store, key, job, io);
+    var renewal: Renewal = .{ .store = store, .key = key, .io = io, .record = job, .parent = context, .provider = options.cancellation };
+    try renewal.init(claimed.writeRevision() orelse return error.MissingObjectRevision);
+    defer renewal.deinit();
+    var heartbeat = try io.concurrent(Renewal.run, .{&renewal});
+    var heartbeat_active = true;
+    defer if (heartbeat_active) {
+        renewal.stopped.set(io);
+        heartbeat.await(io);
+    };
+    var build_context = context;
+    build_context.cancellation = .{ .ptr = &renewal, .is_cancelled_fn = Renewal.canceled };
+    var build_options = options;
+    build_options.cancellation = .{ .ptr = &renewal, .is_cancelled_fn = Renewal.canceled };
     var artifacts = store.artifactStore();
     artifacts.upload_scope = try stores.UploadScope.forPublication(scopeDomain(table.table_id, store.identity), job.expires_ms, io);
     const object = artifacts.providerStore();
     const maps = @import("../serverless/artifacts/cloud_generations.zig");
-    var map_memory: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 64 * 1024 * 1024 };
+    var map_memory: local.sql_memory_budget = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a), .limit = 64 * 1024 * 1024 };
     var map_alloc: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = map_memory.allocator() };
-    var map_writer: ?maps.Writer = if (object) |provider| if (provider.fs_client == null and provider.client.vtable.version_retention != null) .{ .a = map_alloc.allocator(), .io = context.io, .reader = .{ .io = context.io, .client = provider.client, .bucket = provider.bucket, .prefix = provider.prefix, .shared = maps.sharedNavigation(provider.cloud_cache_scope) }, .scope = artifacts.upload_scope.?, .complete = true, .cancellation = cancellation(context) } else null else null;
+    var map_writer: ?maps.Writer = if (object) |provider| if (provider.fs_client == null and provider.client.vtable.version_retention != null) .{ .a = map_alloc.allocator(), .io = context.io, .reader = .{ .io = context.io, .client = provider.client, .bucket = provider.bucket, .prefix = provider.prefix, .shared = maps.sharedNavigation(provider.cloud_cache_scope) }, .scope = artifacts.upload_scope.?, .complete = true, .cancellation = cancellation(build_context) } else null else null;
     const previous_writer = if (object) |provider| provider.cloud_writer else null;
     const previous_reader = if (object) |provider| provider.cloud_reader else null;
     const previous_complete = if (previous_reader) |reader| reader.complete else false;
@@ -238,10 +437,17 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
         if (previous_reader) |reader| reader.complete = previous_complete;
         writer.deinit();
     };
-    const output: ?[]const Declared = buildSegments(a, scratch, table, overlay, declarations, &artifacts, store, context, options) catch |err| failed: {
+    var construction: local.sql_memory_budget = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a), .limit = 256 * 1024 * 1024 };
+    var build_arena = std.heap.ArenaAllocator.init(construction.allocator());
+    defer build_arena.deinit();
+    const output: ?[]const Declared = buildSegments(construction.allocator(), build_arena.allocator(), table, overlay, declarations, &artifacts, store, build_context, build_options) catch |err| failed: {
+        try renewal.check();
+        // Caller cancellation/pressure is not a model/provider failure. Release
+        // this claim without poisoning healthy later requests with backoff.
+        if (err == error.Canceled or err == error.Cancelled or err == error.DeadlineExceeded or err == error.RecentVectorLeaseLost or (err == error.OutOfMemory and !construction.isLocallyExhausted())) return err;
         job.state = .failed;
-        job.last_error = @errorName(err);
-        job.next_retry_ms = now +| @min(@as(u64, 300_000), @as(u64, job.attempts) * 5_000);
+        job.last_error = if (err == error.OutOfMemory) "RecentVectorWorkingSetExceeded" else @errorName(err);
+        job.next_retry_ms = nowMs() +| @min(@as(u64, 300_000), @as(u64, job.attempts) * 5_000);
         job.declarations = &.{};
         break :failed @as(?[]const Declared, null);
     };
@@ -249,14 +455,35 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
         job.state = .ready;
         job.declarations = ready;
         job.last_error = null;
-        if (map_writer) |*writer| if (try writer.finish(cancellation(context))) |root| {
+        const map_root = if (map_writer) |*writer| writer.finish(cancellation(build_context)) catch |err| {
+            try renewal.check();
+            return err;
+        } else null;
+        if (map_writer) |*writer| if (map_root) |root| {
             defer maps.freeRef(writer.a, root);
             job.cloud_generations = .{ .root = try maps.cloneRef(scratch, root), .complete = writer.complete and !writer.disabled };
         };
     }
     // CAS ties completion to this claim; an expired worker cannot overwrite
     // a replacement. Immutable artifacts are safe orphan candidates on failure.
-    var completed = try client.compareAndPut(store.opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, job, .{}), claimed.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null });
+    renewal.stopped.set(io);
+    heartbeat.await(io);
+    heartbeat_active = false;
+    renewal.pulse() catch |err| switch (err) {
+        error.PreconditionFailed, error.ObjectAlreadyExists => return error.RecentVectorLeaseLost,
+        else => {
+            try renewal.check();
+            return err;
+        },
+    };
+    try renewal.check();
+    var completed = client.compareAndPut(store.opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, job, .{}), renewal.revision, .{ .cancellation = if (build_context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
+        error.PreconditionFailed, error.ObjectAlreadyExists => return error.RecentVectorLeaseLost,
+        else => {
+            try renewal.check();
+            return err;
+        },
+    };
     job_finished = true;
     completed.deinit(client.allocator);
     if (job.state != .ready) {
@@ -286,7 +513,7 @@ fn statusAdvances(prior: Status, next: Status) bool {
 }
 fn publishStatus(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, store: *Store, context: Context, state_: @FieldType(Job, "state"), expiry: u64, aggregate: Aggregate) !bool {
     try context.ensureActive();
-    var arena = std.heap.ArenaAllocator.init(a);
+    var arena = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
     defer arena.deinit();
     const scratch = arena.allocator();
     const status_key = try statusKey(scratch, store, table, publication.namespace);
@@ -320,6 +547,101 @@ fn publishStatus(a: A, table: local.common_topology_records.TableRecord, publica
     }
     return false;
 }
+fn nowMs() u64 {
+    return @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+}
+// Lease control and cancellation cleanup never allocate from a possibly
+// exhausted request arena. At most two builders own this bounded workspace.
+fn cleanupClaim(store: *Store, key: []const u8, job: Job, io: std.Io) void {
+    var memory: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 128 * 1024 };
+    var transport_memory: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 8 * 1024 * 1024 };
+    var control = store.reopenReadOnlyWithAdmission(transport_memory.allocator(), .{ .control_requests = &recovery.process.control_requests, .control_io = io }) catch return;
+    defer control.deinit();
+    releaseClaim(memory.allocator(), &control, key, null, job, io) catch {};
+}
+const Renewal = struct {
+    store: *Store,
+    key: []const u8,
+    io: std.Io,
+    record: Job,
+    parent: Context,
+    provider: ?Cancellation = null,
+    memory: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 128 * 1024 },
+    transport_memory: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 8 * 1024 * 1024 },
+    control: ?Store = null,
+    revision: ?@import("objectstore").ObjectRevision = null,
+    expires: std.atomic.Value(u64) = .init(0),
+    failed: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null, // Published by failed's release store.
+    stopped: std.Io.Event = .unset,
+    fn init(self: *Renewal, revision: @import("objectstore").ObjectRevision) !void {
+        self.control = try self.store.reopenReadOnlyWithAdmission(self.transport_memory.allocator(), .{ .control_requests = &recovery.process.control_requests, .control_io = self.io });
+        errdefer {
+            self.control.?.deinit();
+            self.control = null;
+        }
+        self.revision = try revision.clone(self.memory.allocator());
+        self.expires.store(self.record.lease_until_ms, .release);
+    }
+    fn deinit(self: *Renewal) void {
+        if (self.revision) |*revision| revision.deinit(self.memory.allocator());
+        if (self.control) |*control| control.deinit();
+        std.debug.assert(self.memory.live == 0);
+        std.debug.assert(self.transport_memory.live == 0);
+    }
+    fn canceled(raw: *const anyopaque) bool {
+        const self: *const Renewal = @ptrCast(@alignCast(raw));
+        return self.failed.load(.acquire) or nowMs() >= self.expires.load(.acquire) or self.parent.isCancelled() or (if (self.provider) |token| token.isCancelled() else false);
+    }
+    fn check(self: *Renewal) !void {
+        try self.parent.ensureActive();
+        if (self.failed.load(.acquire)) return self.failure orelse error.RecentVectorLeaseLost;
+        if (nowMs() >= self.expires.load(.acquire)) return error.RecentVectorLeaseLost;
+    }
+    fn pulse(self: *Renewal) !void {
+        // Heartbeat tasks must never invoke source-reader checkpoints or use
+        // the query client's allocator. Only transport-safe boolean probes run
+        // here; fallible source authority is checked on the owning query lane.
+        if (self.failed.load(.acquire)) return self.failure orelse error.RecentVectorLeaseLost;
+        if (nowMs() >= self.expires.load(.acquire)) return error.RecentVectorLeaseLost;
+        if (self.parent.isCancelled() or (if (self.provider) |token| token.isCancelled() else false)) return error.Canceled;
+        if (self.record.lease_until_ms -| nowMs() > lease_ms / 2) return;
+        var arena = std.heap.ArenaAllocator.init(self.memory.allocator());
+        defer arena.deinit();
+        const a = arena.allocator();
+        var next = self.record;
+        next.lease_until_ms = nowMs() +| lease_ms;
+        var client = self.control.?.opened.client;
+        client.allocator = a;
+        var written = try client.compareAndPut(self.control.?.opened.bucket, self.key, try std.json.Stringify.valueAlloc(a, next, .{}), self.revision, .{ .cancellation = .{ .ptr = self, .is_cancelled_fn = canceled } });
+        defer written.deinit(a);
+        const revision = try (written.writeRevision() orelse return error.MissingObjectRevision).clone(self.memory.allocator());
+        if (self.revision) |*old| old.deinit(self.memory.allocator());
+        self.revision = revision;
+        self.record = next;
+        self.expires.store(next.lease_until_ms, .release);
+    }
+    fn run(self: *Renewal) void {
+        while (true) {
+            self.stopped.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => {
+                    self.pulse() catch |failure| {
+                        self.failure = switch (failure) {
+                            error.PreconditionFailed, error.ObjectAlreadyExists => error.RecentVectorLeaseLost,
+                            else => failure,
+                        };
+                        self.failed.store(true, .release);
+                        return;
+                    };
+                    continue;
+                },
+                else => return,
+            };
+            return;
+        }
+    }
+};
+
 fn releaseClaim(a: A, store: *Store, key: []const u8, revision: ?@import("objectstore").ObjectRevision, previous: Job, io: std.Io) !void {
     const protection = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(protection);
@@ -337,9 +659,11 @@ fn releaseClaim(a: A, store: *Store, key: []const u8, revision: ?@import("object
     record.next_retry_ms = 0;
     record.last_error = "interrupted";
     record.declarations = &.{};
+    record.cloud_generations = null;
     const bytes = try std.json.Stringify.valueAlloc(a, record, .{});
     defer a.free(bytes);
     var client = store.opened.client;
+    client.allocator = a;
     const token: local.storage_object_storage.CancellationToken = .{ .ptr = &cleanup, .is_cancelled_fn = Cleanup.cancelled };
     var observed: ?local.storage_object_storage.GetResult = null;
     defer if (observed) |*value| value.deinit(client.allocator);
@@ -353,6 +677,9 @@ fn releaseClaim(a: A, store: *Store, key: []const u8, revision: ?@import("object
     };
     var written = try client.compareAndPut(store.opened.bucket, key, bytes, expected, .{ .cancellation = token });
     written.deinit(client.allocator);
+}
+fn constructionCheckpoint(raw: *anyopaque) !void {
+    try @as(*const Context, @ptrCast(@alignCast(raw))).ensureActive();
 }
 fn buildSegments(a: A, out: A, table: local.common_topology_records.TableRecord, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *stores.ArtifactStore, wrapper: *Store, context: Context, options: local.inference_managed_embedder.InitOptions) ![]const Declared {
     const io = context.io orelse return error.UnsupportedQueryRequest;
@@ -393,6 +720,7 @@ fn buildSegments(a: A, out: A, table: local.common_topology_records.TableRecord,
             var index = try hbc.HBCIndex.openWithLsmOptions(budget.allocator(), path, hbc_config, .{});
             defer index.close();
             index.setIo(io);
+            index.construction_cancellation = token;
             var loader: dense.VectorLoader = .{ .backend = &vectors, .dims = archive.dims, .context = context };
             index.setExternalVectorLoader(&loader, dense.VectorLoader.load);
             index.setExternalVectorScratchLoader(&loader, dense.VectorLoader.loadInto);
@@ -434,7 +762,8 @@ fn buildSegments(a: A, out: A, table: local.common_topology_records.TableRecord,
                 try context.ensureActive();
                 try index.batchInsertWithMetadataOptions(writes.items, .{ .assume_absent_ids = true, .bulk_ingest = true, .skip_vector_store = true });
             }
-            try index.finishBulkIngestSessionWithOptions(.{});
+            var finish_context = context;
+            try index.finishBulkIngestSessionWithOptions(.{ .admission_ctx = &finish_context, .admission_fn = constructionCheckpoint });
             finished = true;
             try index.finalizeExperimentalPostingGenerationAtAppliedSequence(0, .{ .flatten = true, .make_authoritative = true });
             var checkpoint = (try index.nativeBackupGeneration(a, 0)) orelse return error.InvalidNativeLakeDenseRoot;
@@ -451,6 +780,7 @@ fn buildSegments(a: A, out: A, table: local.common_topology_records.TableRecord,
             const archive = try sparse.loadRoot(out, store.*, declaration.artifact, token, null);
             var index = try local.sparse_sparse.SparseIndex.open(budget.allocator(), path, .{ .lsm_options = .{ .flush_threshold = 8 * 1024 * 1024 } });
             defer index.close();
+            index.construction_cancellation = token;
             try index.beginBulkIngestSession();
             var finished = false;
             defer if (!finished) index.abortBulkIngestSession();
@@ -483,7 +813,8 @@ fn buildSegments(a: A, out: A, table: local.common_topology_records.TableRecord,
                 }
                 try index.batchWithOptions(writes.items, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true, .backend_batch_options = .{ .mode = .bulk_ingest } });
             }
-            try index.finishBulkIngestSessionWithOptions(.{});
+            var finish_context = context;
+            try index.finishBulkIngestSessionWithOptions(.{ .admission_ctx = &finish_context, .admission_fn = constructionCheckpoint });
             finished = true;
             var checkpoint = try index.pinNativeCheckpoint();
             defer checkpoint.deinit();
@@ -740,4 +1071,257 @@ test "external lake bounded WAL ready composition retries a conflicting incomple
     try std.testing.expectEqual(@as(usize, 3), race.puts);
     race.always = false;
     try std.testing.expect(try publishStatus(a, table, publication, &overlay, &store, .{}, .ready, now + 300_000, complete));
+}
+
+test "external lake bounded WAL recipe readiness is durable selected and cannot claim table coverage" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-recipe-readiness");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+    defer arena.deinit();
+    const work = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(work, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(a, json);
+    defer config.deinit();
+    var store = try Store.open(a, &config, null, false);
+    defer store.deinit();
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 4, .name = "history", .schema_json = "{}", .indexes_json = "{\"manual\":{\"type\":\"embeddings\",\"external\":true},\"managed\":{\"type\":\"embeddings\"}}" };
+    const publication: local.metadata_lake_index_catalog.Publication = .{ .generation = 1, .token = @splat(1), .signature = .{ .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) }, .published_at_ms = 1, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://bucket/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = "inventory" } }, .inventory = .{ .artifact_id = "inventory", .kind = .external_base_source, .byte_len = 42, .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } };
+    const overlay = try overlay_api.Overlay.init(work, .{ .lsn = 8, .key_fields = &.{"id"}, .changes = &.{} });
+    const manual: Declared = .{ .name = "manual", .binding = .{ .sidecar_kind = .vector, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "history", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .column_bindings = &.{"vector"}, .index_config_hash = "manual-config" }, .artifact = .{ .kind = .vector_segment, .metadata_version = 2, .artifact_id = "manual-root", .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .byte_len = 1 } };
+    var managed = manual;
+    managed.name = "managed";
+    const cut = try recipeCutDigest(work, table, publication, &overlay, &.{manual});
+    const managed_cut = try recipeCutDigest(work, table, publication, &overlay, &.{managed});
+    try std.testing.expect(!std.mem.eql(u8, &cut, &managed_cut));
+    const key = try jobKey(work, &store, table.table_id, cut);
+    const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+    const job: Job = .{ .state = .ready, .table_id = table.table_id, .object_generation = 0, .wal_lsn = 8, .archive_generation = 1, .desired = local.metadata_lake_index_catalog.desiredFingerprint(table), .cut = cut, .expires_ms = now + 600_000, .declarations = &.{manual} };
+    var client = store.opened.client;
+    var saved = try client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(work, job, .{}), .{});
+    saved.deinit(client.allocator);
+    // Reopen with no process memo: readiness must come from durable recipe state.
+    var reader = try Store.open(a, &config, null, false);
+    defer reader.deinit();
+    const req: local.storage_db_types.SearchRequest = .{ .dense_queries = &.{.{ .name = "v", .index_name = "manual", .query = .{ .vector = &.{1} } }} };
+    const ready = try prepareQuery(work, table, publication, &overlay, &.{ managed, manual }, &reader, .{}, .{}, now + 300_000, null, req);
+    try std.testing.expectEqual(@as(usize, 1), ready.runs.len);
+    try std.testing.expectEqualStrings("manual", ready.runs[0].declarations[0].name);
+    const status_key = try statusKey(work, &reader, table, publication.namespace);
+    try std.testing.expectError(error.FileNotFound, client.getObject(store.opened.bucket, status_key, .{}));
+    {
+        // A ready memo hit must bypass an unrelated in-progress observation
+        // of this same cut, preserving concurrent warm-query throughput.
+        var cache: Cache = .{ .budget = .{ .backing = a, .limit = 1024 * 1024 } };
+        defer cache.deinit();
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update(&reader.cache_identity);
+        hash.update(&cut);
+        var cache_key: [32]u8 = undefined;
+        hash.final(&cache_key);
+        cache.put(cache_key, .{ .declarations = &.{manual}, .expires_ms = now + 600_000 }, now + 600_000);
+        const context: Context = .{ .io = std.testing.io, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 100 * std.time.ns_per_ms };
+        const held = try recovery.process.claim(cache_key, context);
+        defer held.deinit();
+        const cached = try prepareQuery(work, table, publication, &overlay, &.{manual}, &reader, context, .{}, now + 300_000, &cache, req);
+        try std.testing.expectEqualStrings("manual", cached.declarations[0].name);
+    }
+    const mixed: local.storage_db_types.SearchRequest = .{ .dense_queries = &.{ req.dense_queries[0], .{ .name = "m", .index_name = "managed", .query = .{ .vector = &.{1} } } } };
+    try std.testing.expectError(error.IndexRebuilding, prepareQuery(work, table, publication, &overlay, &.{ managed, manual }, &reader, .{}, .{}, now + 300_000, null, mixed));
+    var old_publication = publication;
+    old_publication.reader_protocol = 101;
+    try std.testing.expectError(error.IndexRebuilding, prepareQuery(work, table, old_publication, &overlay, &.{ managed, manual }, &reader, .{}, .{}, now + 300_000, null, req));
+    var status_before = try client.getObject(store.opened.bucket, status_key, .{});
+    defer status_before.deinit(client.allocator);
+
+    // A foreground query joins a worker for its exact recipe, without claiming
+    // another job or publishing subset readiness. Deterministic completion on
+    // the second GET avoids depending on thread scheduling in this regression.
+    const objectstore = @import("objectstore");
+    const Worker = struct {
+        base: objectstore.Client,
+        ready_bytes: []const u8,
+        complete: bool = true,
+        gets: usize = 0,
+        puts: usize = 0,
+        cancel_on_get: bool = false,
+        cancelled: bool = false,
+        fn get(raw: *anyopaque, owned: A, bucket: []const u8, path: []const u8, opts: objectstore.GetOptions) !objectstore.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.gets += 1;
+            var base = self.base;
+            base.allocator = owned;
+            if (self.complete and self.gets == 2) {
+                var completed = try base.putObject(bucket, path, self.ready_bytes, .{});
+                completed.deinit(owned);
+            }
+            if (self.cancel_on_get) self.cancelled = true;
+            return base.getObject(bucket, path, opts);
+        }
+        fn put(raw: *anyopaque, _: A, _: []const u8, _: []const u8, _: []const u8, _: objectstore.PutOptions) !objectstore.PutResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.puts += 1;
+            return error.UnexpectedForegroundWrite;
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.cancelled;
+        }
+    };
+    const base = reader.opened.client;
+    defer reader.opened.client = base;
+    var worker: Worker = .{ .base = base, .ready_bytes = try std.json.Stringify.valueAlloc(work, job, .{}) };
+    var vtable = base.vtable.*;
+    vtable.get_object = Worker.get;
+    vtable.put_object = Worker.put;
+    reader.opened.client = .{ .allocator = base.allocator, .ptr = &worker, .vtable = &vtable };
+    var building = job;
+    building.state = .building;
+    building.lease_until_ms = now + lease_ms;
+    var active = try client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(work, building, .{}), .{});
+    active.deinit(client.allocator);
+    const context: Context = .{ .io = std.testing.io };
+    const joined = try prepareQuery(work, table, publication, &overlay, &.{ managed, manual }, &reader, context, .{}, now + 300_000, null, req);
+    try std.testing.expectEqualStrings("manual", joined.declarations[0].name);
+    try std.testing.expectEqual(@as(usize, 2), worker.gets);
+    try std.testing.expectEqual(@as(usize, 0), worker.puts);
+    var status_after = try client.getObject(store.opened.bucket, status_key, .{});
+    defer status_after.deinit(client.allocator);
+    try std.testing.expectEqualStrings(status_before.body, status_after.body);
+
+    active = try client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(work, building, .{}), .{});
+    active.deinit(client.allocator);
+    worker.gets = 0;
+    worker.complete = false;
+    var bounded = context;
+    bounded.deadline_ns = @import("antfly_platform").time.monotonicNs() + 20 * std.time.ns_per_ms;
+    try std.testing.expectError(error.DeadlineExceeded, prepareQuery(work, table, publication, &overlay, &.{manual}, &reader, bounded, .{}, now + 300_000, null, req));
+    try std.testing.expect(worker.gets > 0);
+    try std.testing.expectEqual(@as(usize, 0), worker.puts);
+    reader.implementation.read_only = true;
+    worker.gets = 0;
+    try std.testing.expectError(error.IndexRebuilding, prepareQuery(work, table, publication, &overlay, &.{manual}, &reader, context, .{}, now + 300_000, null, req));
+    try std.testing.expectEqual(@as(usize, 1), worker.gets);
+    try std.testing.expectEqual(@as(usize, 0), worker.puts);
+    reader.implementation.read_only = false;
+    worker.cancel_on_get = true;
+    bounded = context;
+    bounded.cancellation = .{ .ptr = &worker, .is_cancelled_fn = Worker.canceled };
+    try std.testing.expectError(error.Canceled, prepareQuery(work, table, publication, &overlay, &.{manual}, &reader, bounded, .{}, now + 300_000, null, req));
+    worker.cancel_on_get = false;
+    worker.cancelled = false;
+
+    // Genuine provider/model failures retain their backoff: query admission
+    // must not turn a failing recipe into a request-driven retry storm.
+    building.state = .failed;
+    building.last_error = "ProviderUnavailable";
+    building.next_retry_ms = now + 120_000;
+    active = try client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(work, building, .{}), .{});
+    active.deinit(client.allocator);
+    worker.gets = 0;
+    try std.testing.expectError(error.IndexRebuilding, prepareQuery(work, table, publication, &overlay, &.{manual}, &reader, context, .{}, now + 300_000, null, req));
+    try std.testing.expectEqual(@as(usize, 1), worker.gets);
+    try std.testing.expectEqual(@as(usize, 0), worker.puts);
+}
+
+test "external lake bounded WAL renewable claims fence stale workers and cleanup survives request exhaustion" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-recent-renewal");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const work = arena.allocator();
+    const json = try std.json.Stringify.valueAlloc(work, .{ .deployment_mode = "standalone", .storage = .{ .engine = "local", .local = .{ .base_dir = directory.path() } } }, .{});
+    var config = try local.common_config.Config.parseFromSlice(a, json);
+    defer config.deinit();
+    var store = try Store.open(a, &config, null, false);
+    defer store.deinit();
+    var client = store.opened.client;
+    const key = "recent-search/7/renewal.json";
+    const job: Job = .{ .table_id = 7, .object_generation = 0, .wal_lsn = 8, .archive_generation = 1, .desired = @splat(1), .cut = @splat(2), .lease_until_ms = nowMs() + lease_ms, .expires_ms = nowMs() + 60_000, .owner_token = @splat(1) };
+    var claimed = try client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(work, job, .{}), .{});
+    defer claimed.deinit(client.allocator);
+    var renewal: Renewal = .{ .store = &store, .key = key, .io = std.testing.io, .record = job, .parent = .{ .io = std.testing.io } };
+    try renewal.init(claimed.writeRevision().?);
+    defer renewal.deinit();
+    renewal.record.lease_until_ms = nowMs() + lease_ms / 2;
+    renewal.expires.store(renewal.record.lease_until_ms, .release);
+    try renewal.pulse();
+    var observed = try client.getObject(store.opened.bucket, key, .{});
+    defer observed.deinit(client.allocator);
+    const renewed = try std.json.parseFromSliceLeaky(Job, work, observed.body, .{});
+    try std.testing.expect(renewed.lease_until_ms >= job.lease_until_ms);
+    try std.testing.expectError(error.PreconditionFailed, client.compareAndPut(store.opened.bucket, key, "stale", claimed.writeRevision(), .{}));
+    var replacement = job;
+    replacement.owner_token = @splat(2);
+    replacement.attempts += 1;
+    var next = try client.compareAndPut(store.opened.bucket, key, try std.json.Stringify.valueAlloc(work, replacement, .{}), observed.metadata.writeRevision(), .{});
+    defer next.deinit(client.allocator);
+    renewal.record.lease_until_ms = nowMs() + lease_ms / 2;
+    renewal.expires.store(renewal.record.lease_until_ms, .release);
+    try std.testing.expectError(error.PreconditionFailed, renewal.pulse());
+    // Old cleanup must not remove a newer worker, even after a lost response.
+    cleanupClaim(&store, key, job, std.testing.io);
+    var current = try client.getObject(store.opened.bucket, key, .{});
+    defer current.deinit(client.allocator);
+    const state = try std.json.parseFromSliceLeaky(Job, work, current.body, .{});
+    try std.testing.expectEqual(replacement.owner_token, state.owner_token);
+    // The cleanup path owns its allocator, rather than the exhausted request.
+    var failed: local.sql_memory_budget = .{ .backing = a, .limit = 0 };
+    try std.testing.expectError(error.OutOfMemory, failed.allocator().alloc(u8, 1));
+    const original_allocator = store.opened.client.allocator;
+    store.opened.client.allocator = failed.allocator();
+    cleanupClaim(&store, key, replacement, std.testing.io);
+    store.opened.client.allocator = original_allocator;
+    var released = try client.getObject(store.opened.bucket, key, .{});
+    defer released.deinit(client.allocator);
+    const stopped = try std.json.parseFromSliceLeaky(Job, work, released.body, .{});
+    try std.testing.expectEqualStrings("interrupted", stopped.last_error.?);
+    try std.testing.expectEqual(@as(u64, 0), stopped.lease_until_ms);
+    renewal.expires.store(0, .release);
+    try std.testing.expectError(error.RecentVectorLeaseLost, renewal.pulse());
+}
+
+test "external lake bounded WAL control clients isolate HTTP allocation and bypass saturated data gates" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "gcs", "s3" }) |protocol| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const work = arena.allocator();
+        const credentials = try std.json.parseFromSliceLeaky(V, work, if (std.mem.eql(u8, protocol, "gcs"))
+            "{\"source\":\"bearer_token\",\"bearer_token\":\"test-only-token\"}"
+        else
+            "{\"source\":\"static\",\"access_key_id\":\"test-only-key\",\"secret_access_key\":\"test-only-secret\"}", .{});
+        const json = try std.json.Stringify.valueAlloc(work, .{
+            .deployment_mode = "standalone",
+            .storage = .{ .engine = "local", .local = .{ .base_dir = "." }, .artifacts = .{ .connection = "artifacts", .bucket = "bucket", .prefix = "tenant/indexes" } },
+            .connections = .{ .artifacts = .{ .kind = "external_io", .capabilities = .{"storage.primary"}, .external_io = .{ .protocol = protocol, .buckets = .{"bucket"}, .prefix = "tenant", .bucket_provisioning = "require_existing", .credentials = credentials } } },
+        }, .{});
+        var config = try local.common_config.Config.parseFromSlice(a, json);
+        defer config.deinit();
+        var data_requests: @import("httpx").RequestLimit = .{ .capacity = 0 };
+        var query_requests: @import("httpx").RequestLimit = .{ .capacity = 0 };
+        // Adapter construction must perform no provider I/O with these fake
+        // credentials. Data lanes are deliberately closed to expose coupling.
+        var store = try Store.openNativeWithTransport(work, &config, null, true, .standalone, null, .{ .io = std.testing.io, .requests = &data_requests, .query_requests = &query_requests });
+        defer store.deinit();
+        const job: Job = .{ .table_id = 7, .object_generation = 0, .wal_lsn = 8, .archive_generation = 1, .desired = @splat(1), .cut = @splat(2), .lease_until_ms = nowMs() + lease_ms };
+        var renewal: Renewal = .{ .store = &store, .key = "recent-search/7/control.json", .io = std.testing.io, .record = job, .parent = .{ .io = std.testing.io } };
+        try renewal.init(.{ .etag = "test-revision" });
+        defer renewal.deinit();
+        const control = &renewal.control.?;
+        try std.testing.expect(control.opened.client.ptr != store.opened.client.ptr);
+        try std.testing.expect(control.opened.client.allocator.ptr == renewal.transport_memory.allocator().ptr);
+        const data_http = if (store.opened.gcs_client) |gcs| &gcs.owned_httpx.?.client else &store.opened.s3_client.?.owned_httpx.?.client;
+        const control_http = if (control.opened.gcs_client) |gcs| &gcs.owned_httpx.?.client else &control.opened.s3_client.?.owned_httpx.?.client;
+        try std.testing.expect(data_http.allocator.ptr == work.ptr);
+        try std.testing.expect(control_http.allocator.ptr == renewal.transport_memory.allocator().ptr);
+        try std.testing.expect(control_http.config.request_limit == &recovery.process.control_requests);
+        try std.testing.expect(control_http.config.query_request_limit == null);
+        try std.testing.expectEqual(@as(usize, 64 * 1024), control_http.config.max_response_size);
+        try std.testing.expect(data_http.config.request_limit == &data_requests);
+        try std.testing.expect(data_http.config.query_request_limit == &query_requests);
+        try std.testing.expectEqual(store.identity, control.identity);
+        try std.testing.expectEqual(store.cache_identity, control.cache_identity);
+    }
 }
