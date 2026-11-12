@@ -16,8 +16,8 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-// Version 88 fences graph table descriptor strides across hosted runtimes.
-pub const abi_version: u32 = 88;
+// Version 89 fences bulk construction receipts and build-policy layouts.
+pub const abi_version: u32 = 89;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must

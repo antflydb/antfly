@@ -303,7 +303,12 @@ fn allocate(comptime scratch: bool, ptr: *anyopaque, len: usize, alignment: std.
     self.lock();
     defer self.mutex.unlock();
     const backing = if (scratch) reclaimingAllocator(self.backing) else self.backing;
-    if (!self.admit(len)) return null;
+    if (!self.admit(len)) {
+        if (comptime @hasDecl(@import("root"), "lakeExecutionProbeAllocationDenied")) {
+            @import("root").lakeExecutionProbeAllocationDenied(len, self.live, self.peak, self.limit, ra);
+        }
+        return null;
+    }
     const result = backing.rawAlloc(len, alignment, ra) orelse {
         self.releaseAdmission(len);
         return null;

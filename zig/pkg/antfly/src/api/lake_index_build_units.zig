@@ -57,7 +57,13 @@ pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, io: 
             try units.append(out, try single(out, table, entry.key_ptr.*, config, .text));
         } else if (std.mem.eql(u8, tag.string, "embeddings")) {
             const sparse = if (config.object.get("sparse")) |v| v == .bool and v.bool else false;
-            try units.append(out, try single(out, table, entry.key_ptr.*, config, if (sparse) .sparse else .dense));
+            var unit = try single(out, table, entry.key_ptr.*, config, if (sparse) .sparse else .dense);
+            // Offline clustering consumes the complete source in one private
+            // candidate, including when other families use file checkpoints.
+            if (!sparse) if (config.object.get("lake_bulk_build")) |algorithm| {
+                if (algorithm != .null) unit.incremental = false;
+            };
+            try units.append(out, unit);
         }
     }
     const consumed = try out.alloc(bool, requests.items.len);

@@ -30,6 +30,7 @@ const Config = struct {
     samples: usize = 3,
     vectors: usize = 10_000,
     dims: usize = 128,
+    metric: vec.DistanceMetric = .cosine,
     batch_size: usize = 1_000,
     seed: u64 = 42,
     leaf_size: u32 = 128,
@@ -388,6 +389,7 @@ pub fn runBenchmark(init: std.process.Init, args: *std.process.Args.Iterator) !v
     const items = try makeItems(allocator, cfg, dataset);
     defer freeItems(allocator, items);
 
+    try out.print("bulk_build_algo={s} metric={s}\n", .{ @tagName(cfg.bulk_build_algo), @tagName(cfg.metric) });
     try out.print(
         "hbc write bench samples={d} vectors={d} dims={d} batch_size={d} leaf_size={d} branching_factor={d} storage={s} kmeans_backend={s} kmeans_update_strategy={s}\n",
         .{ cfg.samples, cfg.vectors, cfg.dims, cfg.batch_size, cfg.leaf_size, cfg.branching_factor, @tagName(cfg.storage_mode), @tagName(cfg.kmeans_backend), @tagName(cfg.kmeans_update_strategy) },
@@ -1082,7 +1084,7 @@ fn hbcConfig(cfg: Config) hbc.HBCConfig {
     return .{
         .storage_backend = .lsm,
         .dims = @intCast(cfg.dims),
-        .metric = .cosine,
+        .metric = cfg.metric,
         .split_algo = cfg.split_algo,
         .branching_factor = cfg.branching_factor,
         .leaf_size = cfg.leaf_size,
@@ -1110,7 +1112,7 @@ fn makeDataset(allocator: Allocator, cfg: Config) ![]f32 {
         for (0..cfg.dims) |dim| {
             data[row * cfg.dims + dim] = base + random.float(f32) * 0.01;
         }
-        _ = vec.normalize(data[row * cfg.dims ..][0..cfg.dims]);
+        if (cfg.metric == .cosine) _ = vec.normalize(data[row * cfg.dims ..][0..cfg.dims]);
     }
     return data;
 }
@@ -1169,6 +1171,10 @@ fn parseArgs(allocator: Allocator, args: *std.process.Args.Iterator) !Config {
             cfg.bulk_build_algo = .recursive;
         } else if (std.mem.eql(u8, arg, "--bulk-build-doc-key-seeded")) {
             cfg.bulk_build_algo = .doc_key_seeded;
+        } else if (std.mem.eql(u8, arg, "--metric")) {
+            cfg.metric = std.meta.stringToEnum(vec.DistanceMetric, args.next() orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--bulk-build-emeans")) {
+            cfg.bulk_build_algo = .emeans;
         } else if (std.mem.eql(u8, arg, "--bulk-build-kmeans")) {
             cfg.bulk_build_algo = .kmeans;
         } else if (std.mem.eql(u8, arg, "--kmeans-backend")) {

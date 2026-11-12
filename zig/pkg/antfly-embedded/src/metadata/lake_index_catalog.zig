@@ -26,8 +26,9 @@ pub const Digest = [32]u8;
 pub const Token = [16]u8;
 pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
 pub const max_directory_artifacts: usize = 4096;
-pub const native_reader_protocol: u16 = 102;
+pub const native_reader_protocol: u16 = 103;
 pub const minimum_reader_protocol: u16 = 97;
+pub const construction_reader_protocol: u16 = 103;
 
 // Readers retain the prior contract while new writers publish opening bundles.
 fn validateReaderProtocol(protocol: u16) !void {
@@ -134,6 +135,12 @@ pub const OpeningBundle = struct {
         return stream.write(.{ .artifact = self.artifact, .decoded_bytes = self.decoded_bytes });
     }
 };
+/// Private, fenced construction receipts. They never satisfy an index
+/// declaration and are dropped from completed serving publications.
+pub const ConstructionWork = struct {
+    name: []const u8,
+    manifest: artifacts.ArtifactRef,
+};
 pub const Publication = struct {
     reader_protocol: u16 = native_reader_protocol,
     /// Recovery checkpoints exclude the unavailable serving publication from
@@ -154,6 +161,7 @@ pub const Publication = struct {
     /// generation or reader-retention admission. Missing bundles fall back to
     /// the original authenticated artifacts.
     opening_bundles: []const OpeningBundle = &.{},
+    construction: []const ConstructionWork = &.{},
     declarations: []const manifest.DeclaredArtifact = &.{},
     directory: ?DirectoryRef = null,
     cloud_generations: ?CloudGenerations = null,
@@ -174,6 +182,10 @@ pub const Publication = struct {
         } else {
             try writer.objectField("declarations");
             try writer.write(self.declarations);
+        }
+        if (self.construction.len != 0) {
+            try writer.objectField("construction");
+            try writer.write(self.construction);
         }
         try writer.objectField("cloud_generations");
         try writer.write(self.cloud_generations);
@@ -198,6 +210,12 @@ pub const Publication = struct {
             if (bundle.provider_generation) |generation| if (generation.len == 0 or generation.len > 4096 or std.mem.eql(u8, generation, "null")) return error.InvalidLakeIndexCatalog;
             if (bundle.artifact.kind != .doc_values or bundle.artifact.metadata_version != 1 or bundle.artifact.byte_len > 5 * 1024 * 1024 or bundle.decoded_bytes < 5 or bundle.decoded_bytes > 4 * 1024 * 1024) return error.InvalidLakeIndexCatalog;
             try artifactValid(bundle.artifact);
+        }
+        if (self.construction.len > max_artifacts or (self.reader_protocol < construction_reader_protocol and self.construction.len != 0)) return error.InvalidLakeIndexCatalog;
+        for (self.construction, 0..) |work, ordinal| {
+            if (work.name.len == 0 or work.name.len > 128 or work.manifest.kind != .doc_values or work.manifest.metadata_version != 1 or work.manifest.byte_len > 1024 * 1024) return error.InvalidLakeIndexCatalog;
+            try artifactValid(work.manifest);
+            for (self.construction[0..ordinal]) |previous| if (std.mem.eql(u8, previous.name, work.name)) return error.InvalidLakeIndexCatalog;
         }
         if (self.cloud_generations) |cloud| {
             try cloud.root.validate();
@@ -289,6 +307,7 @@ pub const State = struct {
         }
         if (self.published) |publication| {
             try publication.validate();
+            if (publication.construction.len != 0) return error.InvalidLakeIndexCatalog;
             if (publication.namespace != null and !std.meta.eql(publication.namespace, self.namespace)) return error.InvalidLakeIndexCatalog;
             if (publication.generation > self.generation or (self.pending != null and publication.generation >= self.pending.?.generation)) return error.InvalidLakeIndexCatalog;
         }
@@ -343,6 +362,7 @@ pub const State = struct {
     }
     pub fn publish(self: State, publication: Publication, now_ms: u64) !State {
         try self.validate();
+        if (publication.construction.len != 0) return error.InvalidLakeIndexCatalog;
         if (!std.meta.eql(self.namespace, publication.namespace)) return error.LakeIndexPublicationFenceChanged;
         const attempt = self.pending orelse return error.LakeIndexPublicationFenceChanged;
         if (attempt.reader_protocol != publication.reader_protocol or !try locatorEqual(std.heap.page_allocator, attempt.store_locator, publication.store_locator)) return error.LakeIndexPublicationFenceChanged;
@@ -598,6 +618,48 @@ test "metadata.lake opening publication preserves ready roots and fences changed
         invalid_reader.reader_protocol = @intCast(protocol);
         try std.testing.expectError(error.InvalidLakeIndexCatalog, invalid_reader.validate());
     }
+    var private = publication;
+    var work_manifest = inventory;
+    work_manifest.kind = .doc_values;
+    work_manifest.metadata_version = 1;
+    private.construction = &.{.{ .name = "dense", .manifest = work_manifest }};
+    try private.validate();
+    var unsupported_manifest = work_manifest;
+    unsupported_manifest.metadata_version = 2;
+    var unsupported_work = private;
+    unsupported_work.construction = &.{.{ .name = "dense", .manifest = unsupported_manifest }};
+    try std.testing.expectError(error.InvalidLakeIndexCatalog, unsupported_work.validate());
+    private.opening_bundles = accelerated.opening_bundles;
+    const private_bytes = try std.json.Stringify.valueAlloc(a, private, .{});
+    defer a.free(private_bytes);
+    const private_roundtrip = try std.json.parseFromSlice(Publication, a, private_bytes, .{});
+    defer private_roundtrip.deinit();
+    try private_roundtrip.value.validate();
+    try std.testing.expectEqual(@as(usize, 1), private_roundtrip.value.construction.len);
+    try std.testing.expectEqual(@as(usize, 1), private_roundtrip.value.opening_bundles.len);
+    private.opening_bundles = &.{};
+    _ = try attempt.saveCheckpoint(private, 101);
+    try std.testing.expectError(error.LakeIndexPublicationFenceChanged, attempt.saveCheckpoint(private, attempt.pending.?.lease_expires_at_ms));
+    var stale_work = private;
+    stale_work.token[0] ^= 1;
+    try std.testing.expectError(error.LakeIndexPublicationFenceChanged, attempt.saveCheckpoint(stale_work, 101));
+    try std.testing.expectError(error.InvalidLakeIndexCatalog, attempt.publish(private, 101));
+    var invalid_serving = attempt;
+    invalid_serving.pending = null;
+    invalid_serving.published = private;
+    try std.testing.expectError(error.InvalidLakeIndexCatalog, invalid_serving.validate());
+    for (minimum_reader_protocol..construction_reader_protocol) |protocol| {
+        private.reader_protocol = @intCast(protocol);
+        try std.testing.expectError(error.InvalidLakeIndexCatalog, private.validate());
+        var readable = publication;
+        readable.reader_protocol = @intCast(protocol);
+        try readable.validate();
+    }
+    private.construction = &.{};
+    try private.validate();
+    const private_legacy_bytes = try std.json.Stringify.valueAlloc(a, private, .{});
+    defer a.free(private_legacy_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, private_legacy_bytes, "construction") == null);
     var future = publication;
     future.reader_protocol = native_reader_protocol + 1;
     try std.testing.expectError(error.InvalidLakeIndexCatalog, future.validate());

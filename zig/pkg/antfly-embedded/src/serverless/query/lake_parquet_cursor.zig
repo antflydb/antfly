@@ -56,6 +56,7 @@ pub const Cursor = struct {
         any_match: *const fn (*anyopaque, types.ColumnBatch) anyerror!bool,
         select: ?*const fn (*anyopaque, types.ColumnBatch) anyerror![]const bool = null,
     };
+    const VectorReader = @import("lake_parquet_vector.zig").Reader;
     const HydrationChunk = struct {
         parent: ranges.RangeLease,
         refs: std.atomic.Value(usize) = .init(1),
@@ -68,6 +69,7 @@ pub const Cursor = struct {
     };
     const Column = struct {
         hydration_chunk: ?*HydrationChunk = null,
+        vector: ?*VectorReader = null,
         credit: ?*Admission.Credit = null,
         dictionary_credit: ?*Admission.Credit = null,
         required: bool = true,
@@ -145,6 +147,10 @@ pub const Cursor = struct {
     }
     pub fn deinit(self: *Cursor) void {
         for (self.columns) |*column| {
+            if (column.vector) |vector| {
+                vector.deinit();
+                self.a.destroy(vector);
+            }
             if (column.projection) |projection| projection.destroyWithAllocator(self.admission.allocator());
             if (column.decoded) |decoded| decoded.release();
             if (column.cached) |lease| lease.release();
@@ -159,7 +165,7 @@ pub const Cursor = struct {
         self.output.deinit();
     }
     pub fn retainColumns(self: *Cursor, a: A) !?types.ColumnOwner {
-        for (self.columns) |column| if (column.projection != null or (column.cached == null and column.decoded == null)) return null;
+        for (self.columns) |column| if (column.vector != null or column.projection != null or (column.cached == null and column.decoded == null)) return null;
         const Held = union(enum) {
             cached: struct { lease: @import("lake_decoded_cache.zig").Lease, credit: *Admission.Credit },
             local: *SharedColumns,
@@ -297,6 +303,11 @@ pub const Cursor = struct {
         return try @import("lake_parquet_metadata.zig").parsePageDirectory(a, offsets.bytes, if (bounds) |v| v.bytes else null, column.chunk, self.group.row_count, self.limits.max_struct_allocation_bytes / @max(@as(usize, 1), self.columns.len));
     }
     fn retire(self: *Cursor, column: *Column) void {
+        if (column.vector) |vector| {
+            _ = vector.output.reset(.free_all);
+            vector.vectors = &.{};
+            vector.nulls = &.{};
+        }
         if (column.projection) |projection| projection.destroyWithAllocator(self.admission.allocator());
         column.projection = null;
         if (column.decoded) |decoded| decoded.release();
@@ -797,6 +808,7 @@ pub const Cursor = struct {
         var count: usize = 0;
         var planned: usize = 0;
         for (self.columns, 0..) |*column, column_index| {
+            if (VectorReader.supports(column.chunk.logical_type)) continue;
             if (self.filter != null and !column.required) continue;
             if (planned == 4) break;
             if (column.consumed != column.count) continue;
@@ -943,6 +955,12 @@ pub const Cursor = struct {
         // admitted I/O phase as page headers. Loading every index here first
         // serialized cold columns before the parallel pipeline could start.
         // The inline advance path still loads its own index when saturated.
+        for (self.columns) |*column| {
+            if (VectorReader.supports(column.chunk.logical_type)) {
+                if ((!required_only or column.required) and column.first + column.count <= self.position) try self.advanceVector(column);
+                continue;
+            }
+        }
         const io = if (self.shared_reader) |reader| reader.context.io else null;
         if (io == null or (self.columns.len < 2 and !self.speculative)) {
             for (self.columns) |*column| {
@@ -1121,6 +1139,84 @@ pub const Cursor = struct {
     pub fn prepareEvidence(self: *Cursor) !void {
         try self.advanceColumns(true);
     }
+    const VectorSource = struct {
+        cursor: *Cursor,
+        column: *Column,
+        fn next(raw: *anyopaque, vector: *VectorReader) anyerror!bool {
+            const source: *@This() = @ptrCast(@alignCast(raw));
+            const self = source.cursor;
+            const column = source.column;
+            const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
+            while (column.offset < end) {
+                const probe = try self.headerRead(column);
+                var held = true;
+                defer if (held) probe.lease.release();
+                const len = std.math.add(usize, probe.parsed.header_len, probe.parsed.header.compressed_page_size) catch return error.ParquetPageTooLarge;
+                if (len > end - column.offset or len > self.limits.max_input_bytes or probe.parsed.header.uncompressed_page_size > self.limits.max_decoded_bytes) return error.ParquetPageTooLarge;
+                const lease = if (len <= probe.lease.bytes.len) probe.lease else full: {
+                    probe.lease.release();
+                    held = false;
+                    break :full try self.read(column, column.offset, len);
+                };
+                held = false;
+                defer lease.release();
+                const ready = try vector.decode(column.chunk, probe.parsed.header, lease.bytes[probe.parsed.header_len..len]);
+                column.offset += len;
+                if (ready) {
+                    self.pages_decoded += 1;
+                    return true;
+                }
+                self.dictionary_decodes += 1;
+            }
+            return false;
+        }
+    };
+
+    fn advanceVector(self: *Cursor, column: *Column) !void {
+        if (column.vector == null) {
+            const vector = try self.a.create(VectorReader);
+            errdefer self.a.destroy(vector);
+            vector.* = try VectorReader.init(self.admission.allocator(), column.chunk.logical_type);
+            column.vector = vector;
+        }
+        const vector = column.vector.?;
+        var source: VectorSource = .{ .cursor = self, .column = column };
+        const input: VectorReader.Source = .{ .ptr = &source, .next = VectorSource.next };
+        while (true) {
+            _ = vector.output.reset(.free_all);
+            const a = vector.output.allocator();
+            var values: std.ArrayList([]const f32) = .empty;
+            var json: std.ArrayList([]const u8) = .empty;
+            var nulls: std.ArrayList(u8) = .empty;
+            var retained_bytes: usize = 0;
+            const cohort_bytes = @min(8 * 1024 * 1024, self.limits.max_decoded_bytes / @max(1, self.columns.len));
+            while (nulls.items.len < 4096 and column.first + nulls.items.len < self.group.row_count) {
+                const row = (try vector.nextRow(input, a)) orelse return error.ParquetRowGroupRowCountMismatch;
+                if (vector.is_double) {
+                    // Keep authored doubles exact for SQL/stored-source reads.
+                    // Embedding consumers perform their existing float32 cast.
+                    const encoded = try VectorReader.doubleJson(a, row.doubles);
+                    try json.append(a, encoded);
+                    retained_bytes += row.doubles.len * @sizeOf(f64) + encoded.len + @sizeOf([]const u8) + 1;
+                } else {
+                    try values.append(a, row.values);
+                    retained_bytes += row.values.len * @sizeOf(f32) + @sizeOf([]const f32) + 1;
+                }
+                try nulls.append(a, @intFromBool(row.is_null));
+                if (retained_bytes >= cohort_bytes) break;
+            }
+            column.count = nulls.items.len;
+            vector.vectors = values.items;
+            vector.json = json.items;
+            vector.nulls = nulls.items;
+            if (column.first + column.count == self.group.row_count and try vector.available(input)) return error.ParquetRowGroupRowCountMismatch;
+            if (column.first + column.count > self.position) break;
+            if (column.count == 0) return error.ParquetRowGroupRowCountMismatch;
+            column.first += column.count;
+        }
+        column.consumed = @intCast(self.position - column.first);
+    }
+
     fn batch(self: *Cursor, count: usize, required_only: bool) !types.ColumnBatch {
         const a = self.output.allocator();
         const binding = @import("../external_source/rowsource_bridge.zig").bindingFromValidatedInventory(self.inventory);
@@ -1139,6 +1235,11 @@ pub const Cursor = struct {
                 const previous = projection.converted;
                 try vectors.append(a, try projection.project(a, begin, self.selected[0..count]));
                 self.selected_values_decoded += projection.converted - previous;
+                continue;
+            }
+            if (column.vector) |vector| {
+                const begin: usize = @intCast(self.position - column.first);
+                try vectors.append(a, .{ .name = column.chunk.column_id, .values = if (vector.is_double) .{ .json = vector.json[begin..][0..count] } else .{ .vector_f32 = vector.vectors[begin..][0..count] }, .nulls = .{ .bytes = vector.nulls[begin..][0..count] } });
                 continue;
             }
             const decoded = if (column.cached) |lease| lease.item.payload.columns[0] else column.decoded.?.value.columns[0];

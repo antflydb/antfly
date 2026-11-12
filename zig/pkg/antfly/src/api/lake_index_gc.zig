@@ -117,12 +117,23 @@ pub const Collector = struct {
         self.result.complete = true;
         return self.result;
     }
+    pub fn markConstruction(self: *Collector, a: A, work: local.metadata_lake_index_catalog.ConstructionWork, namespace: ?[32]u8) !void {
+        const ref = work.manifest;
+        if (!try self.expand(.{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, .artifact, "bulk-construction")) return;
+        try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
+        const root = try @import("lake_bulk_work.zig").load(a, self.store, ref, self.cancellation());
+        const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, namespace);
+        if (!std.mem.eql(u8, &root.generation.domain, &domain)) return error.InvalidNativeLakeGcReference;
+        if (root.file_directory) |directory| try self.markNativeFiles(a, root.generation.domain, directory);
+        try self.markNativeGeneration(a, root.generation);
+    }
     pub fn markPublication(self: *Collector, publication: local.metadata_lake_index_catalog.Publication) !void {
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
         const a = scratch.allocator();
         var binding: ?@import("lake_cloud_publication.zig").Binding = if (self.store.providerStore()) |object| try @import("lake_cloud_publication.zig").Binding.init(std.heap.page_allocator, object, publication, self.cancellation()) else null;
         defer if (binding) |*value| value.deinit();
+        for (publication.construction) |work| try self.markConstruction(a, work, publication.namespace);
         var hydrated = publication;
         for (publication.opening_bundles) |bundle| _ = try self.mark(.{ .artifact_id = bundle.artifact.artifact_id, .checksum = bundle.artifact.checksum, .byte_len = bundle.artifact.byte_len });
         if (hydrated.directory) |directory| {
@@ -465,9 +476,10 @@ pub const Collector = struct {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_sparse.zig"), ref);
                     if (root.file_directory) |directory| try self.markNativeFiles(a, root.generation.domain, directory);
-                    for (root.file_states) |file| for (file.docs) |document_ref| {
-                        _ = try self.mark(document_ref);
-                    };
+                    for (root.file_states) |file| {
+                        if (file.docs_root) |directory| try self.markGenerationPage(a, root.generation.domain, directory, true);
+                        for (file.docs) |document_ref| _ = try self.mark(document_ref);
+                    }
                     try self.markNativeGeneration(a, root.generation);
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
@@ -476,9 +488,10 @@ pub const Collector = struct {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_dense.zig"), ref);
                     if (root.file_directory) |directory| try self.markNativeFiles(a, root.generation.domain, directory);
-                    for (root.file_states) |file| for (file.docs) |document_ref| {
-                        _ = try self.mark(document_ref);
-                    };
+                    for (root.file_states) |file| {
+                        if (file.docs_root) |directory| try self.markGenerationPage(a, root.generation.domain, directory, true);
+                        for (file.docs) |document_ref| _ = try self.mark(document_ref);
+                    }
                     try self.markNativeGeneration(a, root.generation);
                 } else if (ref.metadata_version != 0) return error.InvalidNativeLakeGcReference;
             },
@@ -551,6 +564,7 @@ pub const Collector = struct {
                     var arena = std.heap.ArenaAllocator.init(w.a);
                     defer arena.deinit();
                     const file = try @import("lake_index_native_state.zig").decodeDirectoryFile(arena.allocator(), key, value, w.domain);
+                    if (file.docs_root) |document_root| try w.collector.markGenerationPage(w.a, w.domain, document_root, true);
                     for (file.docs) |ref| _ = try w.collector.mark(ref);
                     return;
                 }

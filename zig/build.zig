@@ -503,6 +503,10 @@ pub fn create(b: *std.Build) ?Artifacts {
     const lib_hash_test_step = b.step("lib-hash-test", "Run standalone lib/hash tests");
     lib_hash_test_step.dependOn(&run_lib_hash_tests.step);
 
+    const lib_compress_tests = b.addTest(.{ .root_module = antfly_imports.compress });
+    const run_lib_compress_tests = b.addRunArtifact(lib_compress_tests);
+    b.step("lib-compress-test", "Run bounded native compression and differential decoder tests").dependOn(&run_lib_compress_tests.step);
+
     const lib_vectorindex_tests = b.addTest(.{
         .root_module = vectorindex_mod,
         .filters = buildArguments(b) orelse &.{},
@@ -875,6 +879,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_test_step.dependOn(&run_lib_embeddings_tests.step);
     lib_test_step.dependOn(&run_lib_vectorindex_tests.step);
     lib_test_step.dependOn(&run_lib_hash_tests.step);
+    lib_test_step.dependOn(&run_lib_compress_tests.step);
     lib_test_step.dependOn(&run_lib_resolver_tests.step);
     lib_test_step.dependOn(&run_vector_cancellation_tests.step);
     lib_test_step.dependOn(&run_lib_chunking_tests.step);

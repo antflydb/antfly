@@ -1,0 +1,165 @@
+{
+  "date": "2026-11-09",
+  "base_commit": "be114cff355976b38dc1a07a0778ff8a5614d32a",
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "configuration": {
+    "vectors": 100000,
+    "dims": 128,
+    "batch_size": 1000,
+    "samples": 3,
+    "queries": 100,
+    "seed": 42,
+    "search_width": 16,
+    "metric": "l2_squared",
+    "storage": "memory",
+    "build": "online_coalesced",
+    "bulk_build_algo": "hilbert_seeded",
+    "backend": "cpu",
+    "leaf_size": 128,
+    "branching_factor": 128,
+    "emeans_epochs": 5,
+    "optimize": "ReleaseFast"
+  },
+  "notes": [
+    "Only the binary leaf-split optimizer differs between settings; the bulk builder is not invoked.",
+    "Insertion timer excludes fixture generation, index open, tree verification, and queries.",
+    "All runs passed active-count and tree-link validation outside the timed insertion loop.",
+    "All e-means leaf splits were confirmed by execution counters; internal splits remain on the existing policy.",
+    "Leaf means are recomputed after minimum-occupancy correction; leaves contain all 100000 members, at most 128 per leaf.",
+    "Queries run after reopen using L2 ground truth; fixed-budget recall is not a matched-recall latency comparison.",
+    "Samples reuse a fixed seeded synthetic dataset on a host with other active work. Small timing differences are not evidence of a speedup.",
+    "RSS is whole-process peak, not isolated optimizer workspace."
+  ],
+  "results": [
+    {
+      "leaf_split_optimizer": "lloyd",
+      "median_insert_seconds": 7.714016,
+      "insert_seconds": [
+        7.064517,
+        7.714016,
+        8.847669
+      ],
+      "median_leaf_partition_ms": 48.827,
+      "median_leaf_split_ms": 4114.175,
+      "recall_at_10": 0.419,
+      "warm_query_us": 1033.45,
+      "warm_query_p95_us": 2015.0,
+      "peak_process_rss_bytes": 885915648,
+      "leaf_shape": {
+        "workload": "build_shape",
+        "algorithm": "hilbert_seeded",
+        "metric": "l2_squared",
+        "leaves": 1134,
+        "members": 100000,
+        "min_leaf_members": 43,
+        "max_leaf_members": 128,
+        "mean_leaf_members": 88.18
+      },
+      "split_profiles": [
+        {
+          "workload": "split_profile",
+          "sample": 0,
+          "emeans_leaf_splits": false,
+          "emeans_leaf_split_calls": 0,
+          "emeans_leaf_split_rebalances": 0,
+          "split_leaf_ns": 3817930000,
+          "split_leaf_partition_ns": 48649000,
+          "split_internal_calls": 14,
+          "kmeans_assignment_points_total": 0
+        },
+        {
+          "workload": "split_profile",
+          "sample": 1,
+          "emeans_leaf_splits": false,
+          "emeans_leaf_split_calls": 0,
+          "emeans_leaf_split_rebalances": 0,
+          "split_leaf_ns": 4114175000,
+          "split_leaf_partition_ns": 48827000,
+          "split_internal_calls": 14,
+          "kmeans_assignment_points_total": 0
+        },
+        {
+          "workload": "split_profile",
+          "sample": 2,
+          "emeans_leaf_splits": false,
+          "emeans_leaf_split_calls": 0,
+          "emeans_leaf_split_rebalances": 0,
+          "split_leaf_ns": 4576363000,
+          "split_leaf_partition_ns": 51011000,
+          "split_internal_calls": 14,
+          "kmeans_assignment_points_total": 0
+        }
+      ],
+      "save_node_calls": [
+        26278,
+        26278,
+        26278
+      ]
+    },
+    {
+      "leaf_split_optimizer": "emeans",
+      "median_insert_seconds": 7.733338,
+      "insert_seconds": [
+        8.106419,
+        7.733338,
+        7.386543
+      ],
+      "median_leaf_partition_ms": 122.447,
+      "median_leaf_split_ms": 4244.665,
+      "recall_at_10": 0.456,
+      "warm_query_us": 873.29,
+      "warm_query_p95_us": 994.0,
+      "peak_process_rss_bytes": 923336704,
+      "leaf_shape": {
+        "workload": "build_shape",
+        "algorithm": "hilbert_seeded",
+        "metric": "l2_squared",
+        "leaves": 1170,
+        "members": 100000,
+        "min_leaf_members": 43,
+        "max_leaf_members": 128,
+        "mean_leaf_members": 85.47
+      },
+      "split_profiles": [
+        {
+          "workload": "split_profile",
+          "sample": 0,
+          "emeans_leaf_splits": true,
+          "emeans_leaf_split_calls": 1169,
+          "emeans_leaf_split_rebalances": 670,
+          "split_leaf_ns": 4476060000,
+          "split_leaf_partition_ns": 123414000,
+          "split_internal_calls": 15,
+          "kmeans_assignment_points_total": 933420
+        },
+        {
+          "workload": "split_profile",
+          "sample": 1,
+          "emeans_leaf_splits": true,
+          "emeans_leaf_split_calls": 1169,
+          "emeans_leaf_split_rebalances": 670,
+          "split_leaf_ns": 4244665000,
+          "split_leaf_partition_ns": 122447000,
+          "split_internal_calls": 15,
+          "kmeans_assignment_points_total": 933420
+        },
+        {
+          "workload": "split_profile",
+          "sample": 2,
+          "emeans_leaf_splits": true,
+          "emeans_leaf_split_calls": 1169,
+          "emeans_leaf_split_rebalances": 670,
+          "split_leaf_ns": 4038125000,
+          "split_leaf_partition_ns": 118386000,
+          "split_internal_calls": 15,
+          "kmeans_assignment_points_total": 933420
+        }
+      ],
+      "save_node_calls": [
+        26565,
+        26565,
+        26565
+      ]
+    }
+  ]
+}

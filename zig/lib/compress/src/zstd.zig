@@ -105,3 +105,33 @@ fn takeInt(comptime T: type, data: []const u8, pos: *usize) !T {
     defer pos.* += @sizeOf(T);
     return std.mem.readInt(T, data[pos.*..][0..@sizeOf(T)], .little);
 }
+
+test "Zstandard prefix decoding matches standard decoding across literal streams and blocks" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { frame: []const u8, len: usize, sha256: []const u8 }{
+        .{ .frame = @embedFile("testdata/cohere_literals.zst"), .len = 24576, .sha256 = "c4d4f0bb547163a34653b2b74769aadd76c7ec89c5cf004b440c8a4da0ca0f03" },
+        .{ .frame = @embedFile("testdata/cohere_multiblock.zst"), .len = 294912, .sha256 = "608a7180b1a6b04784c430b108b4caea87387c5398830111a019f5d18be1346e" },
+    };
+    for (cases) |case| {
+        const actual = try decode(a, case.frame, case.len);
+        defer a.free(actual);
+        var input: std.Io.Reader = .fixed(case.frame);
+        const window = try a.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
+        defer a.free(window);
+        var reference: std.compress.zstd.Decompress = .init(&input, window, .{});
+        const expected = try reference.reader.allocRemaining(a, .limited(case.len + 1));
+        defer a.free(expected);
+        try std.testing.expectEqualSlices(u8, expected, actual);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(actual, &digest, .{});
+        try std.testing.expectEqualStrings(case.sha256, &std.fmt.bytesToHex(digest, .lower));
+        for ([_]usize{ 0, 1, 4, 5, 10, case.frame.len / 2, case.frame.len - 1 }) |cut| {
+            if (decode(a, case.frame[0..cut], case.len)) |value| {
+                defer a.free(value);
+                // Empty input is an empty frame sequence; every nonempty
+                // prefix must fail before yielding partial vector payloads.
+                try std.testing.expect(cut == 0 and value.len == 0);
+            } else |_| {}
+        }
+    }
+}

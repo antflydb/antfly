@@ -669,7 +669,13 @@ fn lowercaseCodepoint(cp: u21) ?[]const u21 {
     return if (lo < data.lowercase.len and data.lowercase[lo].cp == cp) data.lowercase[lo].values else null;
 }
 
-fn exerciseBertNormalization(allocator: std.mem.Allocator) !void {
+fn exerciseBertNormalization(backing: std.mem.Allocator) !void {
+    // Fault enumeration must not depend on OS-specific in-place growth.
+    // Keep all growth on allocate/copy so every allocation is exercised.
+    var vtable = backing.vtable.*;
+    vtable.resize = std.mem.Allocator.noResize;
+    vtable.remap = std.mem.Allocator.noRemap;
+    const allocator: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
     const cases = [_]struct { profile: Bert = .{}, text: []const u8, expected: []const u8 }{
         .{ .text = "CAFÉ cafe\u{301} 世界!", .expected = "cafe cafe 世界!" },
         .{ .text = "İΣẮ が ば ぱ", .expected = "iσa か は は" },
