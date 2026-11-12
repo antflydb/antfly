@@ -15354,13 +15354,63 @@ fn tryFairWriterLockLegacy(allocator: Allocator, io: std.Io, path: []const u8) !
     return .{ .io_impl = undefined, .borrowed_io = io, .file = (try acquireWriterLock(allocator, io, path)).file, .acquired_ns = std.Io.Clock.awake.now(io).nanoseconds };
 }
 
+const PathRegionForWait = struct { entry: *inode_lock.Entry, region: *shared_lock_region.Region };
+
+/// Gets (not opens fresh) the shared lock region for `path` through the
+/// per-inode registry: `inode_lock.open`'s own `Entry` is cached per
+/// inode per process, and `ensureRegion` opens the region at most once
+/// per `Entry`, reusing it across every call -- unlike an earlier,
+/// reverted attempt at this same migration, which called
+/// `shared_lock_region.Region.open` fresh on every retry iteration and
+/// serialized every concurrent retrier through that call's own one-time
+/// setup lock. On success the caller owns the returned `Entry`
+/// reference and must `unref` it; on error (including a
+/// `inode_lock.isRegionUnusable` one) there is nothing to release.
+fn pathRegionForWait(io: std.Io, path: []const u8) !PathRegionForWait {
+    const entry = try inode_lock.open(io, path);
+    const region = inode_lock.ensureRegion(entry, io) catch |err| {
+        inode_lock.unref(entry, io);
+        return err;
+    };
+    return .{ .entry = entry, .region = region };
+}
+
 fn plainWriterLockUntil(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
+    // `null` when the region can't be used here -- `inode_lock.open`'s
+    // own `statFile` on the *data* file (not the sidecar `acquireWriterLock`
+    // below creates on demand) can fail with `FileNotFound` on a caller's
+    // first-ever acquire, before that data file exists yet, which is not
+    // the "this filesystem/region can't be used at all" condition
+    // `inode_lock.isRegionUnusable` means -- falls back to the legacy
+    // OS-lock-queue wait below either way. Anything else (notably
+    // `OutOfMemory`) propagates instead of being swallowed into a
+    // fallback that would likely fail the same way, the same posture
+    // every other migrated constructor's own `isRegionUnusable` check
+    // takes.
+    const cached: ?PathRegionForWait = blk: {
+        break :blk pathRegionForWait(wait_io, path) catch |err| {
+            if (err != error.FileNotFound and !inode_lock.isRegionUnusable(err)) return err;
+            break :blk null;
+        };
+    };
+    defer if (cached) |c| inode_lock.unref(c.entry, wait_io);
+
     var backoff_ns: i96 = 50 * std.time.ns_per_us;
     while (true) {
         if (acquireWriterLock(allocator, io, path)) |held| {
             return .{ .io_impl = undefined, .borrowed_io = io, .file = held.file };
         } else |err| if (err != error.WouldBlock and err != error.FileBusy) return err;
         if (deadline_ns - std.Io.Clock.awake.now(io).nanoseconds <= 0) return error.FileBusy;
+        if (cached) |c| {
+            // A real wake signal (or a short internal re-check step, not
+            // a dumb poll) on the region's own futex -- loop straight
+            // back to retry the real flock, no extra backoff on top of
+            // it.
+            c.region.waitWriterFreeBounded(wait_io, .{ .nanoseconds = deadline_ns }) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+            };
+            continue;
+        }
         if (waitPathLockWithIo(allocator, wait_io, path, true, deadline_ns)) |held| {
             var lease = held;
             lease.borrowed_io = io;
