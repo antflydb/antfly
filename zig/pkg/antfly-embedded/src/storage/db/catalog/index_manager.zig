@@ -15183,6 +15183,15 @@ pub const IndexManager = struct {
                     owned_embedding_names.items,
                 );
                 defer artifact_cleanup.deinit();
+                // #1216: a native-catalog HBC index's own metadata (dims,
+                // root node, postings) lives under a fixed, name-derived
+                // scope, independent of the generated-artifact cleanup
+                // above. Clear it durably before the catalog mutation below
+                // makes this index's removal visible, so a crash between
+                // the two can never leave the catalog saying "img" is gone
+                // while its stale dims survive underneath a later
+                // re-admission -- see `HBCIndex.deleteNativeCatalogScopeForRemoval`.
+                try entry.index.deleteNativeCatalogScopeForRemoval();
                 const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
                 try self.persistCatalogExcludingWithAtomicMutation(store, name, commit_mutation);
                 const replicated_leann = if (entry.index.leann) |leann_store| leann_store.isReplicated() else false;
