@@ -1298,6 +1298,175 @@ table before liveness/recovery; this design's cross-process piece
 with them, so it is extending a finished primitive rather than racing
 its own construction -- hence "tell me before (c)."
 
+### 9.3c Scan and iterator paths: merged overlay cursors
+
+Point gets alone are not enough: every range scan, prefix scan, or
+ordered cursor over a redo-log file's metadata/index/documents roots
+must also merge the in-process overlay, in the same key order, gated
+on the same pinned-checkpoint check `redoOverlayEntry` already uses. A
+scan that misses an overlay put, or returns an overlay-deleted key, is
+a correctness bug, not a performance gap.
+
+`OverlayScanState` (native.zig, nested in `NativeFile`) builds, once
+per cursor construction, a sorted snapshot of one root's
+`logical_overlay` keys restricted to the scan's prefix (borrowed key
+slices, no copies -- safe because nothing mutates the map for a
+cursor's lifetime: no commit runs concurrently with a cursor's use on
+the same handle). `CatalogCursor.next()`, `LiveRecordCursor.next()`,
+`hasLiveDocumentOutsidePrefix`, and
+`snapshotDocumentsWithPrefixAtCheckpointAlloc` each run the same
+merge-join: compare the overlay's next key against the tree cursor's
+next key, take the smaller, and on a tie let the overlay (always the
+newer state) supersede the tree's stale entry, consuming both.
+`metadataCatalogCursor`/`indexCatalogCursor`/
+`indexCatalogDirectoryCursor` all build on `catalogCursor`, so they
+inherit this for free.
+
+Two bugs surfaced building this, both caught and fixed with regression
+tests, not just by inspection:
+
+1. **Lost tree-side lookahead on ownership transfer.** When a
+   merge-join holds the tree cursor's already-fetched candidate across
+   loop iterations (so a tie, or an out-of-order overlay key, doesn't
+   silently skip it), the candidate's owned key must be detached from
+   the lookahead slot *before* the next fallible call (typically
+   `cursor.next()`), not after. `CatalogCursor`/`LiveRecordCursor` null
+   their lookahead field immediately after reading it, before doing
+   anything fallible, which is correct.
+   `snapshotDocumentsWithPrefixAtCheckpointAlloc`'s equivalent
+   lookahead did not: it mutated a *local copy* of the entry rather
+   than the actual `pending_tree` variable the function's own
+   top-level `errdefer` reads, so a failure in the immediately
+   following `cursor.next()` call double-freed a key already
+   transferred into (and counted in) the result list. Fixed at both of
+   that function's ownership-transfer sites.
+2. **`fetchPut` does not update the key on a match.**
+   `RedoCommitState.appendLogicalMutation` used
+   `logical_overlay[root].fetchPut(allocator, owned_key, decoded)` to
+   both insert and replace entries, and freed the returned `old.key`
+   on a match. `std.HashMapUnmanaged.fetchPutContext` only overwrites
+   `value_ptr.*`, never `key_ptr.*`, when it finds an existing match --
+   so `old.key` *is* the key still live in the map, and freeing it
+   corrupts the overlay the moment the same key is written a second
+   time within one uncheckpointed generation (an ordinary
+   put-then-overwrite or put-then-delete, not an edge case). Fixed by
+   switching to `getOrPut` and only storing the new key when there
+   wasn't already one to keep, matching the stdlib's own idiom for
+   this situation. This was a live memory-corruption bug that predates
+   the scan work; it would have corrupted the first production
+   workload that updated the same document twice before a checkpoint.
+
+New tests (native.zig): `"lite redo log document scan merges the
+overlay across put, overwrite, delete and a checkpoint boundary"`,
+`"...catalog cursor merges the overlay..."`, `"...vacuum captures
+uncheckpointed overlay and demotes the file rather than corrupting
+it"`, `"...openIndexValue (artifact lease resolution) sees an
+uncheckpointed overlay entry"`.
+
+### 9.3d Per-subsystem redo-log audit
+
+For every subsystem that touches native.zig's three roots, the
+decision is one of: it already reads/writes exclusively through the
+overlay-aware point-get/cursor family above; it must force a
+checkpoint first; or it is explicitly out of scope today. Audited:
+
+- **Full-text, dense (HBC), sparse, graph** (`backend.zig`'s
+  `.native_catalog` registrations, `native_catalog_sink.zig`,
+  `native_catalog_backend.zig`): all four route through
+  `native_catalog_backend.Backend`, which keeps its own in-process
+  ordered-tree mirror, seeded once at `Backend.init()` via the
+  overlay-aware `indexCatalogCursor`, and thereafter commits through
+  `putIndexCatalogBatch` -- the same `TransactionWrites`/
+  `logical_overlay` staging path as every other root. **Works through
+  the merged paths already.** `index_storage.zig`'s virtual-filesystem
+  reads for these four delegate to the already-patched
+  `getIndexCatalogRecord*`/`indexCatalogCursor`/
+  `indexCatalogDirectoryCursor` family.
+- **Algebraic indexes** (`storage/db/algebraic/`): no direct
+  `native.zig` access at all -- durable state goes through DocStore's
+  own primary `RuntimeStore`/`Txn` path (the `.documents`/metadata
+  point-get and scan family). **Works through the merged paths
+  already.**
+- **Artifact leases** (`artifact_source.zig`): writes stage ordinary
+  catalog mutations (already diverted automatically). Reads resolved
+  their external-value pointer through `NativeFile.openIndexValue`,
+  which called `lookupCatalogPage` directly with no overlay check -- a
+  real, live gap (`Registry.open`/`Capture.apply` call it on every
+  lease, not dead code). **Fixed**: `openIndexValue` now checks
+  `redoOverlayEntry(.index, ...)` first, matching its sibling
+  functions. This also forecloses a second, currently-unreachable use
+  of the same gap in `persistent.zig`'s mmap `SegmentFileStore` path
+  (dead today because Lite always configures `main_backend =
+  .native_catalog` for text/dense/sparse/graph, but would have been
+  live if that ever changes).
+- **Vacuum**: `copyVacuumCatalogRecords`/`copyVacuumDocumentRecords`
+  already scan via the overlay-aware `LiveRecordCursor`, so the
+  compacted file's *content* correctly includes uncheckpointed overlay
+  state without forcing a checkpoint first. But `prepareVacuum`'s
+  compacted header never reserved a redo-log region, and
+  `replaceWithPreparedGeneration` never reset the live handle's
+  `self.redo`/`self.manifest_commits_enabled` to match -- so vacuuming
+  a redo-log file left `self.redo.writer` pointing at the old file's
+  now-swapped-away fd and stale byte offsets, and the next commit
+  would have diverted into a log region that no longer existed,
+  corrupting the compacted file. **Fixed, by explicit demotion**:
+  vacuum now clears `self.redo` (freeing the overlay, safe because
+  every entry already reached the compacted file through the scan
+  above) and restores `self.manifest_commits_enabled = true` after a
+  successful publish. **Decision**: vacuum intentionally demotes a
+  redo-log file to an ordinary (non-redo) file rather than preserving
+  or re-reserving a log region in the rebuilt layout -- re-enabling
+  redo-log mode after a vacuum requires an explicit, separate
+  `enableRedoLog` call (not implemented). This is a known, deliberate
+  limitation, not a correctness gap. Regression test: `"...vacuum
+  captures uncheckpointed overlay and demotes the file rather than
+  corrupting it"`.
+- **Backup and restore**: the seal mechanism
+  (`native_backup_seal.zig`, `native_backup.zig`,
+  `backup_bundle_io.zig`/`backup_bundle.zig`) is byte/file-level
+  (hardlinks plus bounded copies), opaque to page/catalog structure
+  and to "redo" entirely. Since the log region lives inside the single
+  file's own bytes, a byte-level copy captures it along with
+  everything else, and `openWithRuntime`/`openWithIo` unconditionally
+  run `recoverRedoLog` whenever the decoded header carries a non-zero
+  `redo_log_capacity`, regardless of how the file arrived at that
+  path. **Works by construction**, not via the overlay-aware paths --
+  nothing to force-checkpoint for correctness. Open, not yet resolved:
+  whether the backup-pin/seal quiesce point freezes writers before its
+  stat+copy or merely races a live writer the same way crash recovery
+  does (if the latter, no worse than what `recoverRedoLog` already
+  tolerates, but unverified for this specific case); and whether to
+  offer an optional forced checkpoint before sealing purely to make the
+  captured image replay-free for tooling that doesn't understand the
+  redo-log wire format (an optimization, not a requirement).
+- **Split**: Lite's native single-file store has no shard/range split
+  machinery of its own; the `split`-named B-tree-node-overflow handling
+  inside `IndexEditor` is an unrelated concept. Real range/shard split
+  lives in `storage/lsm_backend.zig`, a separate SST-based engine that
+  never constructs a `NativeFile`. **Not applicable.**
+- **`check()`**: the existing `checkpointPrefixSize`/`truncated_file`
+  guard (page_count vs. physical file size) already catches, bluntly,
+  any uncheckpointed commit that allocated new pages (external-value
+  chains, the one page-shaped exception the diversion still makes) --
+  a known, already-documented limitation. Newly found: `liveStats()`
+  (feeding `live_file_count`/`live_bytes`/`compact_size`/
+  `reclaimable_bytes` into `CheckReport`) *is* overlay-aware via
+  `LiveRecordCursor`, while `record_count` comes from a raw,
+  non-overlay-aware tree walk -- so a redo-log commit that only
+  overwrites/deletes existing keys (no new pages, so the truncation
+  guard never fires) produces an internally inconsistent
+  `CheckReport` (`record_count` stale, `live_bytes`/`live_file_count`
+  current) rather than a hard failure. **Documented, not yet fixed**:
+  `check()` needs its own explicit decision -- skip/flag when
+  `self.redo != null` and the overlay is non-empty, or make
+  `record_count` overlay-aware too -- before redo-log becomes the
+  default; tracked as follow-up for step 3.
+
+This resolves point 2 in full except for the two explicitly open items
+above (backup/restore quiesce-ordering verification, and `check()`'s
+`record_count`/`liveStats` inconsistency), both documented decisions to
+revisit, not blockers left unexamined.
+
 ### 9.4 Background checkpointer: batched, owner-only, ride-along
 
 The checkpointer turns a batch of log records into tree pages,
