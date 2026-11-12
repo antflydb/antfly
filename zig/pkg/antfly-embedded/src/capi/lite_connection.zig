@@ -3430,29 +3430,26 @@ pub const Connection = struct {
         self.gate.mutex.dropRetained();
         var backoff: i96 = std.time.ns_per_ms;
         while (true) {
-            // A slow detached proof may outlast the retry budget. Always try
-            // the lease once: a stable verified tip must still be admitted if
-            // no contention wait is needed. An expired budget forbids waiting,
-            // not an uncontended acquisition.
-            const lease = native.lockReaderPathWithIo(alloc, io, self.path);
-            if (lease) |held| return self.owner.withReadRegistrationBatch(held) else |err| {
-                if (err != error.WouldBlock and err != error.FileBusy) return err;
+            // Reader admission: `fairReaderLockWithIo` claims no exclusion
+            // from a writer at all in region mode (copy-on-write; see its
+            // own doc comment for why) and succeeds immediately with no
+            // kernel lock -- not even the old non-blocking pre-check this
+            // loop used to make before ever reaching it, which would have
+            // meant taking a real kernel `.shared` lock on every admission
+            // regardless. Only its own legacy fallback (region unusable)
+            // can actually block here, up to `deadline`.
+            if (native.fairReaderLockWithIo(alloc, self.owner.path_lock_io.io(), self.path, deadline)) |held| return self.owner.withReadRegistrationBatch(held) else |err| switch (err) {
+                // Sidecar-free read-only snapshots retain their inode
+                // authority. Resource-limited executors retain bounded
+                // polling rather than making the deadline unbounded.
+                error.FileNotFound, error.ConcurrencyUnavailable => {
+                    if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| hook.notify(hook.ptr);
+                },
+                else => return err,
+            }
+            {
                 const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
                 if (remaining <= 0) return error.FileBusy;
-                if (comptime h.builtin.is_test) if (self.test_path_lease_busy) |hook| hook.notify(hook.ptr);
-                // Reader admission: migrated off the kernel's blocking
-                // `.shared` wait queue onto `fairReaderLockWithIo` (region-
-                // backed retry, kernel wait only as that function's own
-                // fallback when the region is unusable) -- see that
-                // function's own doc comment for why a reader's wait isn't
-                // simply the writer side's FIFO-ticket wait reused.
-                if (native.fairReaderLockWithIo(alloc, self.owner.path_lock_io.io(), self.path, deadline)) |held| return self.owner.withReadRegistrationBatch(held) else |wait_err| switch (wait_err) {
-                    // Sidecar-free read-only snapshots retain their inode
-                    // authority. Resource-limited executors retain bounded
-                    // polling rather than making the deadline unbounded.
-                    error.FileNotFound, error.ConcurrencyUnavailable => {},
-                    else => return wait_err,
-                }
                 var entropy: [4]u8 = undefined;
                 io.random(&entropy);
                 const floor = @divTrunc(backoff, 2);
@@ -6144,7 +6141,10 @@ test "capi native allocator proof issue1431 physical maintenance releases detach
             } else self.calls += 1;
             const during_replay = root.maintenance_publication != null;
             const store = root.owned_lite_backend.?.native_docstore.?;
-            const region = store.file.regionForInode() orelse {
+            const region = (store.file.regionForInode() catch |err| {
+                self.failure = err;
+                return;
+            }) orelse {
                 self.failure = error.IndexReplaySnapshotNotFenced;
                 return;
             };

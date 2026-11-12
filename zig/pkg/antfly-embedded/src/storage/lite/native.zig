@@ -5977,7 +5977,10 @@ pub const NativeFile = struct {
             // the two, so there is no longer a reason to branch on it
             // here either.
             if (opts.reader_coordinator) |coordinator| {
-                const region = inode_lock.ensureRegion(inode_entry, io) catch null;
+                const region = inode_lock.ensureRegion(inode_entry, io) catch |err| region_blk: {
+                    if (!inode_lock.isRegionUnusable(err)) return err;
+                    break :region_blk null;
+                };
                 result.reader_fence = try coordinator.registerFull(file, region, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint());
             }
             errdefer if (result.reader_fence) |fence| opts.reader_coordinator.?.unregister(fence);
@@ -6673,7 +6676,7 @@ pub const NativeFile = struct {
             // A full-graph snapshot reader always retains metadata, region
             // slot or not -- `registerFull` handles both uniformly now,
             // regardless of `indexed_reclamation`.
-            reader.reader_fence = try self.reader_coordinator.?.registerFull(reader.file, self.regionForInode(), inode, reader.metadataReuseFrontier(), self.headerFingerprint());
+            reader.reader_fence = try self.reader_coordinator.?.registerFull(reader.file, try self.regionForInode(), inode, reader.metadataReuseFrontier(), self.headerFingerprint());
         }
         return reader;
     }
@@ -6943,17 +6946,19 @@ pub const NativeFile = struct {
     /// The shared lock region for this inode's registry entry, or `null`
     /// when there is no entry at all (a standalone/`externally_locked`-free
     /// file never registered, which has no registry `Entry` to carry a
-    /// region on) or the region itself cannot be used right now. Every
-    /// reader-fence/epoch-reuse caller treats a `null` region the same way:
-    /// fall back to inode-only kernel fencing, never fail the whole open or
-    /// commit over it. Interim posture before this file's own fallback
-    /// detection (migration row 5) distinguishes "genuinely unusable" from
-    /// "transient failure" here -- every error from `ensureRegion` is
-    /// treated as "no region" for now, which is always safe (never wrong,
-    /// only ever more conservative than necessary).
-    pub fn regionForInode(self: *NativeFile) ?*shared_lock_region.Region {
+    /// region on) or the region itself is genuinely unusable right now
+    /// (`inode_lock.isRegionUnusable`, the same check the writer side
+    /// shares) -- every reader-fence/epoch-reuse caller treats a `null`
+    /// region the same way: fall back to inode-only kernel fencing, never
+    /// fail the whole open or commit over it. Any other error (notably
+    /// `OutOfMemory`) propagates instead of being swallowed into a
+    /// fallback that would likely fail the same way.
+    pub fn regionForInode(self: *NativeFile) !?*shared_lock_region.Region {
         const entry = self.inode_lock_ref.load(.acquire) orelse return null;
-        return inode_lock.ensureRegion(entry, self.runtime()) catch null;
+        return inode_lock.ensureRegion(entry, self.runtime()) catch |err| {
+            if (inode_lock.isRegionUnusable(err)) return null;
+            return err;
+        };
     }
 
     /// Read-generation locks join the same-owner frontier only while
@@ -6985,7 +6990,7 @@ pub const NativeFile = struct {
         // below still blocks this process's own exclusive reuse either
         // way).
         if (self.reader_coordinator) |coordinator| {
-            self.reader_fence = try coordinator.registerEpoch(self.file, self.regionForInode(), (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint(), false);
+            self.reader_fence = try coordinator.registerEpoch(self.file, try self.regionForInode(), (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint(), false);
         }
         errdefer if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
         // Only a fence that actually got a live region slot (`Fence
@@ -7056,7 +7061,7 @@ pub const NativeFile = struct {
         // `epoch_window` at its already-cleared `null`, which
         // `reuseFrontier`/`metadataReuseFrontier` already treat as "no
         // additional frontier from this source."
-        if (self.regionForInode()) |region| self.epoch_window = .{ .data = region.minimumPinnedSequence(), .metadata = region.minimumMetadataPinnedSequence() };
+        if (try self.regionForInode()) |region| self.epoch_window = .{ .data = region.minimumPinnedSequence(), .metadata = region.minimumMetadataPinnedSequence() };
         return handle;
     }
     fn beginReaderWindow(self: *NativeFile) !bool {
@@ -7066,7 +7071,7 @@ pub const NativeFile = struct {
             return true;
         }
         const inode = (try self.file.stat(self.runtime())).inode;
-        const frontier = coordinator.beginWithMetadata(inode, self.headerFingerprint(), self.free_pages_verified, self.regionForInode());
+        const frontier = coordinator.beginWithMetadata(inode, self.headerFingerprint(), self.free_pages_verified, try self.regionForInode());
         errdefer coordinator.end();
         self.reader_window_previous_frontier = self.minimum_reader_sequence;
         if (frontier.data) |sequence| self.minimum_reader_sequence = @min(self.minimum_reader_sequence orelse sequence, sequence);
@@ -11508,7 +11513,7 @@ pub const NativeFile = struct {
         // region's reader table (any reader, indexed or not -- the region
         // doesn't distinguish) refuses the vacuum rather than rewriting
         // pages a reader may still need.
-        if (self.regionForInode()) |region| if (region.minimumPinnedSequence() != null) return error.WouldBlock;
+        if (try self.regionForInode()) |region| if (region.minimumPinnedSequence() != null) return error.WouldBlock;
         var image = try self.prepareVacuum(cancel);
         defer image.deinit();
         try self.publishVacuum(&image);
@@ -15059,45 +15064,66 @@ pub fn lockReaderPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
 
 /// `acquirePathLeaseAssumeLocked`'s reader-admission wait, migrated off the
 /// kernel's blocking `.shared` lock queue (`waitPathLockWithIo(...,
-/// writer=false, ...)`), the last reader path still parked there. Unlike
-/// `fairWriterLockWithIo`, this is *not* a FIFO-ticket wait: a reader
-/// needs no ordering against other readers, and the region has no
-/// general "a writer released" signal a non-ticket-holding waiter can
-/// correctly wait on today -- `writer_release_epoch` is bumped and woken
-/// by `releaseWriter` only when a writer ticket is already queued (§8.2's
-/// own FIFO mechanism), never on an uncontended release, so a reader
-/// parked on it could wait past a release that had no queued ticket to
-/// wake it for. Until the region grows a dedicated release-notification
-/// word some non-ticket waiter can use (a design question for whoever
-/// extends §8.2, not resolved here), this retries its own non-blocking
-/// `lockReaderPathWithIo` attempt on a short bounded backoff instead of
-/// parking in the kernel's wait queue at all -- still removes the
-/// kernel-level block, at the cost of a capped poll interval rather than
-/// an instant wake. Falls back to the legacy blocking wait entirely when
-/// the region itself can't be used (`inode_lock.isRegionUnusable`), the
-/// same posture `fairWriterLockWithIo` already takes for its own callers;
-/// this function never attaches the opened region to the returned lease
-/// (`PathWriterLock.region` is writer-only -- `close()` unconditionally
-/// calls `releaseWriter()` on it whenever set, which a reader must never
-/// trigger), it only probes usability.
+/// writer=false, ...)`), the last reader path still parked there.
+///
+/// A reader's admission at this layer does not need exclusion from a
+/// writer at all: the store is copy-on-write (a commit never mutates a
+/// page an already-pinned reader can see; it lands on a fresh
+/// checkpoint slot/pages instead), and every real caller of this path --
+/// plain reads, status/index-list, and the `.maintain`-access snapshot
+/// copy -- only ever treats the returned lease as an admission
+/// throttle/reference, never as a signal that "no writer is mid-commit"
+/// (confirmed by tracing every caller: none inspects writer state
+/// through this lease, and the one place that genuinely needs real
+/// cross-process writer exclusion, `replaceWithPreparedGeneration`'s
+/// generation swap, already gets it independently through
+/// `enterMaintenanceWriter`/`tryWriterLeaseAssumeLocked`'s own exclusive
+/// re-acquisition, unrelated to this gate). The kernel `.shared`-vs-
+/// `.exclusive` wait this replaces was a holdover from flock's own
+/// semantics being the only coordination mechanism available before the
+/// region existed, not a correctness requirement.
+///
+/// So in region mode this never waits at all: open the region (to prove
+/// it's usable), and succeed immediately with no kernel lock -- `file =
+/// null` on the returned lease, nothing to release on `close()`. It does
+/// not claim or pin a region reader slot either: there is no commit
+/// generation to protect yet at this point (the caller hasn't opened the
+/// `NativeFile`, let alone read a header), so a slot held for this
+/// lease's -- potentially long-lived, re-admitted-per-query -- lifetime
+/// would consume one of the region's fixed 1024 slots for no protective
+/// effect, risking exhaustion for genuinely pinned NativeFile-level
+/// readers. The actual safety guarantee (pinning a real commit sequence)
+/// is `NativeFile.acquireReaderFence`'s job, already region-backed, once
+/// a real generation exists to pin. `PathWriterLock` has no field to
+/// stash a claimed slot index on for later release even if one were
+/// wanted here, and `.region` is writer-only (`close()` unconditionally
+/// calls `releaseWriter()` on it whenever set) -- not something a reader
+/// lease may ever populate.
+///
+/// Falls back to exactly the pre-migration two-step dance (one
+/// non-blocking `lockReaderPathWithIo` try, then one real blocking
+/// `waitPathLockWithIo`) entirely when the region itself can't be used
+/// (`inode_lock.isRegionUnusable`), the same posture `fairWriterLockWithIo`
+/// already takes for its own callers -- `lockReaderPathWithIo`'s kernel
+/// `.shared` lock remains the correctness authority there, unchanged,
+/// including `waitPathLockWithIo`'s own `error.FileNotFound`/
+/// `error.ConcurrencyUnavailable` cases, which this propagates rather
+/// than retrying itself: `acquirePathLeaseAssumeLocked`'s own outer loop
+/// already retries the whole admission attempt after those, and
+/// duplicating that retry here would just nest two copies of the same
+/// backoff.
 pub fn fairReaderLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
-    {
-        var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
-            if (inode_lock.isRegionUnusable(err)) return waitPathLockWithIo(allocator, io, path, false, deadline_ns);
-            return err;
-        };
-        region.close();
-    }
-    var backoff_ns: i96 = 50 * std.time.ns_per_us;
-    while (true) {
-        if (lockReaderPathWithIo(allocator, io, path)) |held| return held else |err| {
-            if (err != error.WouldBlock and err != error.FileBusy) return err;
+    var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
+        if (inode_lock.isRegionUnusable(err)) {
+            return lockReaderPathWithIo(allocator, io, path) catch |lock_err| {
+                if (lock_err != error.WouldBlock and lock_err != error.FileBusy) return lock_err;
+                return waitPathLockWithIo(allocator, io, path, false, deadline_ns);
+            };
         }
-        const remaining = deadline_ns - std.Io.Clock.awake.now(io).nanoseconds;
-        if (remaining <= 0) return error.FileBusy;
-        try io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake);
-        backoff_ns = @min(backoff_ns * 2, 4 * std.time.ns_per_ms);
-    }
+        return err;
+    };
+    region.close();
+    return .{ .io_impl = undefined, .borrowed_io = io, .file = null };
 }
 
 fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode, wait_for_reader_lock: bool) !LockFile {
@@ -25536,7 +25562,7 @@ test "lite reader registration path lease close retains only escaped snapshot pr
     lease.close();
     held = false;
     try std.testing.expectEqual(@as(usize, 0), coordinator.registration_batches);
-    const region = reader.regionForInode().?;
+    const region = (try reader.regionForInode()).?;
     try std.testing.expect(region.minimumMetadataPinnedSequence() != null);
     reader.close();
     reader_open = false;
@@ -25548,7 +25574,7 @@ test "lite reader registration path lease close retains only escaped snapshot pr
     // pinned," rather than reading a dangling `region`.
     var probe = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
     defer probe.close();
-    try std.testing.expectEqual(@as(?u64, null), probe.regionForInode().?.minimumMetadataPinnedSequence());
+    try std.testing.expectEqual(@as(?u64, null), (try probe.regionForInode()).?.minimumMetadataPinnedSequence());
 }
 
 /// Blocks (via `poll`, a portable sleep with no extra syscall declared just
@@ -25630,7 +25656,7 @@ test "lite reader fence across a forked child: writer withholds pages the child 
         // before this child claims anything through the inherited region,
         // the same ordering `shared_lock_region.zig`'s own fork tests use.
         var reader = NativeFile.openWithIo(a, io, path, .{ .read_only = true }) catch crossProcessParkForever();
-        const region = reader.regionForInode() orelse crossProcessParkForever();
+        const region = (reader.regionForInode() catch crossProcessParkForever()) orelse crossProcessParkForever();
         region.reclaimLivenessAfterFork() catch crossProcessParkForever();
         var child_coordinator = ReaderCoordinator.init(a, io);
         reader.reader_coordinator = &child_coordinator;
@@ -25653,7 +25679,7 @@ test "lite reader fence across a forked child: writer withholds pages the child 
     // cross-process pin, not just kernel-lock fencing.
     try std.testing.expectEqual(@as(u8, 1), report[0]);
 
-    const region = writer.regionForInode().?;
+    const region = (try writer.regionForInode()).?;
     try std.testing.expect(region.minimumPinnedSequence() != null);
     const before = (try writer.allocatorStats()).?.reused_pages;
     value[0] = 'b';
@@ -25678,7 +25704,7 @@ test "lite reader fence across a forked child: writer withholds pages the child 
     try std.testing.expect((try writer.check()).valid);
 }
 
-test "lite fairReaderLockWithIo succeeds immediately when uncontended and gives up at its own deadline when a writer holds the lease" {
+test "lite fairReaderLockWithIo never waits on a writer in region mode, uncontended or not" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -25689,18 +25715,60 @@ test "lite fairReaderLockWithIo succeeds immediately when uncontended and gives 
         var file = try NativeFile.createWithIo(a, io, path, .{ .no_sync = true });
         file.close();
     }
-    // Uncontended: the first `lockReaderPathWithIo` attempt inside
-    // `fairReaderLockWithIo` must succeed outright, never reaching its own
-    // backoff loop.
+    const short_deadline = std.Io.Clock.awake.now(io).nanoseconds + 2 * std.time.ns_per_s;
+    // Uncontended: succeeds immediately, no kernel lock taken at all --
+    // `lease.file == null` is the direct evidence (a kernel-lock-backed
+    // lease, the fallback path's own shape, always has a non-null file).
+    {
+        var lease = try fairReaderLockWithIo(a, io, path, short_deadline);
+        try std.testing.expect(lease.file == null);
+        lease.close();
+    }
+    // Contended: a writer holds the real exclusive sidecar lease the
+    // whole time. A reader admitted through the region needs no
+    // exclusion from it at all (copy-on-write; the actual safety
+    // guarantee is NativeFile.acquireReaderFence's pin, not this gate),
+    // so this must still succeed immediately -- never wait, let alone
+    // give up at the deadline.
+    var writer_lease = try lockWriterPathWithIo(a, io, path);
+    defer writer_lease.close();
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    const deadline = started + 150 * std.time.ns_per_ms;
+    var lease = try fairReaderLockWithIo(a, io, path, deadline);
+    try std.testing.expect(lease.file == null);
+    lease.close();
+    const elapsed = std.Io.Clock.awake.now(io).nanoseconds - started;
+    try std.testing.expect(elapsed < 50 * std.time.ns_per_ms);
+}
+
+test "lite fairReaderLockWithIo falls back to the legacy blocking wait when the region is unusable" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A filename long enough that the region's own sidecar
+    // (`<path>.aflite-lock`) exceeds the platform's single-component
+    // limit, same trigger as the reader-fence alias test -- the data
+    // file itself opens fine, only the region is unusable.
+    var name: [250]u8 = @splat('f');
+    @memcpy(name[243..], ".aflite");
+    const path = try testPath(a, tmp, &name);
+    defer a.free(path);
+    {
+        var file = try NativeFile.createWithIo(a, io, path, .{ .no_sync = true });
+        file.close();
+    }
+    // Uncontended: the legacy kernel-lock path still succeeds outright.
     {
         const deadline = std.Io.Clock.awake.now(io).nanoseconds + 2 * std.time.ns_per_s;
         var lease = try fairReaderLockWithIo(a, io, path, deadline);
+        try std.testing.expect(lease.file != null);
         lease.close();
     }
     // Contended: a writer holds the lease for longer than this call's own
-    // deadline, so it must actually wait (not fail on the first attempt)
-    // and then give up right around the deadline -- not instantly, and
-    // not hung past it either.
+    // deadline, so the legacy fallback must actually wait (not fail on
+    // the first attempt) and give up right around the deadline -- not
+    // instantly, and not hung past it either.
     var writer_lease = try lockWriterPathWithIo(a, io, path);
     defer writer_lease.close();
     const started = std.Io.Clock.awake.now(io).nanoseconds;
