@@ -2481,42 +2481,21 @@ fn estimateMetadataCacheBytes(metadata: []const u8) u64 {
         @sizeOf(usize);
 }
 
-fn nextHbcClockVictim(
-    clock_keys: []u64,
-    clock_refs: []bool,
-    hand: *usize,
-    protection: HbcCacheProtection,
-    kind: HbcCacheKind,
-) ?u64 {
-    if (clock_keys.len == 0) return null;
-    var scanned: usize = 0;
-    const limit = clock_keys.len * 2;
-    while (scanned < limit) : (scanned += 1) {
-        const slot = hand.*;
-        const key = clock_keys[slot];
-        if (key != 0 and !protection.protects(kind, key)) {
-            if (clock_refs[slot]) {
-                clock_refs[slot] = false;
-            } else {
-                hand.* = (slot + 1) % clock_keys.len;
-                return key;
-            }
+const LocalClockState = vectorindex_hbc_runtime.Clock.State;
+
+fn nextHbcClockVictim(keys: []u64, states: []LocalClockState, hand: *usize, protection: HbcCacheProtection, kind: HbcCacheKind) ?u64 {
+    const Filter = struct {
+        protection: HbcCacheProtection,
+        kind: HbcCacheKind,
+        pub fn protects(self: @This(), key: u64) bool {
+            return self.protection.protects(self.kind, key);
         }
-        hand.* = (slot + 1) % clock_keys.len;
-    }
-    return null;
+    };
+    return vectorindex_hbc_runtime.Clock.victim(keys, states, hand, Filter{ .protection = protection, .kind = kind });
 }
 
-fn claimLocalClockSlot(clock_keys: []u64, start_slot: usize, key: u64) ?usize {
-    if (clock_keys.len == 0) return null;
-    for (0..clock_keys.len) |offset| {
-        const slot = (start_slot + offset) % clock_keys.len;
-        if (clock_keys[slot] == 0) {
-            clock_keys[slot] = key;
-            return slot;
-        }
-    }
-    return null;
+fn claimLocalClockSlot(keys: []u64, states: []LocalClockState, start: usize, key: u64, reserved: ?usize) ?usize {
+    return vectorindex_hbc_runtime.Clock.claim(keys, states, start, key, reserved);
 }
 
 // ============================================================================
@@ -5372,24 +5351,24 @@ pub const HBCIndex = struct {
     node_cache: std.AutoHashMapUnmanaged(u64, *NodeCacheEntry),
     node_cache_slots: std.AutoHashMapUnmanaged(u64, usize),
     node_clock_keys: []u64,
-    node_clock_refs: []bool,
+    node_clock_states: []LocalClockState,
     node_clock_hand: usize,
     pinned_node_cache: std.AutoHashMapUnmanaged(u64, *NodeCacheEntry),
     quantized_cache: std.AutoHashMapUnmanaged(u64, *QuantizedCacheEntry),
     quantized_cache_slots: std.AutoHashMapUnmanaged(u64, usize),
     quantized_clock_keys: []u64,
-    quantized_clock_refs: []bool,
+    quantized_clock_states: []LocalClockState,
     quantized_clock_hand: usize,
     pinned_quantized_cache: std.AutoHashMapUnmanaged(u64, *QuantizedCacheEntry),
     vector_cache: std.AutoHashMapUnmanaged(u64, *VectorCacheEntry),
     vector_cache_slots: std.AutoHashMapUnmanaged(u64, usize),
     vector_clock_keys: []u64,
-    vector_clock_refs: []bool,
+    vector_clock_states: []LocalClockState,
     vector_clock_hand: usize,
     metadata_cache: std.AutoHashMapUnmanaged(u64, *MetadataCacheEntry),
     metadata_cache_slots: std.AutoHashMapUnmanaged(u64, usize),
     metadata_clock_keys: []u64,
-    metadata_clock_refs: []bool,
+    metadata_clock_states: []LocalClockState,
     metadata_clock_hand: usize,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     local_reclaimer_identity: u64 = 0,
@@ -6565,28 +6544,28 @@ pub const HBCIndex = struct {
 
         const node_clock_keys = try alloc.alloc(u64, effective_config.max_cached_nodes);
         errdefer alloc.free(node_clock_keys);
-        const node_clock_refs = try alloc.alloc(bool, effective_config.max_cached_nodes);
-        errdefer alloc.free(node_clock_refs);
+        const node_clock_states = try alloc.alloc(LocalClockState, effective_config.max_cached_nodes);
+        errdefer alloc.free(node_clock_states);
         const quantized_clock_keys = try alloc.alloc(u64, effective_config.max_cached_nodes);
         errdefer alloc.free(quantized_clock_keys);
-        const quantized_clock_refs = try alloc.alloc(bool, effective_config.max_cached_nodes);
-        errdefer alloc.free(quantized_clock_refs);
+        const quantized_clock_states = try alloc.alloc(LocalClockState, effective_config.max_cached_nodes);
+        errdefer alloc.free(quantized_clock_states);
         const vector_clock_keys = try alloc.alloc(u64, effective_config.max_cached_vectors);
         errdefer alloc.free(vector_clock_keys);
-        const vector_clock_refs = try alloc.alloc(bool, effective_config.max_cached_vectors);
-        errdefer alloc.free(vector_clock_refs);
+        const vector_clock_states = try alloc.alloc(LocalClockState, effective_config.max_cached_vectors);
+        errdefer alloc.free(vector_clock_states);
         const metadata_clock_keys = try alloc.alloc(u64, effective_config.max_cached_metadata);
         errdefer alloc.free(metadata_clock_keys);
-        const metadata_clock_refs = try alloc.alloc(bool, effective_config.max_cached_metadata);
-        errdefer alloc.free(metadata_clock_refs);
+        const metadata_clock_states = try alloc.alloc(LocalClockState, effective_config.max_cached_metadata);
+        errdefer alloc.free(metadata_clock_states);
         @memset(node_clock_keys, 0);
-        @memset(node_clock_refs, false);
+        @memset(node_clock_states, .empty);
         @memset(quantized_clock_keys, 0);
-        @memset(quantized_clock_refs, false);
+        @memset(quantized_clock_states, .empty);
         @memset(vector_clock_keys, 0);
-        @memset(vector_clock_refs, false);
+        @memset(vector_clock_states, .empty);
         @memset(metadata_clock_keys, 0);
-        @memset(metadata_clock_refs, false);
+        @memset(metadata_clock_states, .empty);
 
         const cache_identity = try hbcCacheIdentityAlloc(alloc, std.mem.span(path));
         errdefer alloc.free(cache_identity.stable_path);
@@ -6627,24 +6606,24 @@ pub const HBCIndex = struct {
             .node_cache = .empty,
             .node_cache_slots = .empty,
             .node_clock_keys = node_clock_keys,
-            .node_clock_refs = node_clock_refs,
+            .node_clock_states = node_clock_states,
             .node_clock_hand = 0,
             .pinned_node_cache = .empty,
             .quantized_cache = .empty,
             .quantized_cache_slots = .empty,
             .quantized_clock_keys = quantized_clock_keys,
-            .quantized_clock_refs = quantized_clock_refs,
+            .quantized_clock_states = quantized_clock_states,
             .quantized_clock_hand = 0,
             .pinned_quantized_cache = .empty,
             .vector_cache = .empty,
             .vector_cache_slots = .empty,
             .vector_clock_keys = vector_clock_keys,
-            .vector_clock_refs = vector_clock_refs,
+            .vector_clock_states = vector_clock_states,
             .vector_clock_hand = 0,
             .metadata_cache = .empty,
             .metadata_cache_slots = .empty,
             .metadata_clock_keys = metadata_clock_keys,
-            .metadata_clock_refs = metadata_clock_refs,
+            .metadata_clock_states = metadata_clock_states,
             .metadata_clock_hand = 0,
             .resource_manager = null,
             .local_reclaimer_identity = 0,
@@ -8380,10 +8359,10 @@ pub const HBCIndex = struct {
     }
 
     fn evictOneVectorCacheEntry(self: *HBCIndex, protection: HbcCacheProtection) bool {
-        const victim = nextHbcClockVictim(self.vector_clock_keys, self.vector_clock_refs, &self.vector_clock_hand, protection, .vector) orelse return false;
+        const victim = nextHbcClockVictim(self.vector_clock_keys, self.vector_clock_states, &self.vector_clock_hand, protection, .vector) orelse return false;
         if (self.vector_cache_slots.fetchRemove(victim)) |removed_slot| {
             self.vector_clock_keys[removed_slot.value] = 0;
-            self.vector_clock_refs[removed_slot.value] = false;
+            self.vector_clock_states[removed_slot.value] = .empty;
         }
         if (self.vector_cache.fetchRemove(victim)) |removed| {
             self.releaseLocalVectorEntry(removed.value);
@@ -8394,10 +8373,10 @@ pub const HBCIndex = struct {
     }
 
     fn evictOneMetadataCacheEntry(self: *HBCIndex, protection: HbcCacheProtection) bool {
-        const victim = nextHbcClockVictim(self.metadata_clock_keys, self.metadata_clock_refs, &self.metadata_clock_hand, protection, .metadata) orelse return false;
+        const victim = nextHbcClockVictim(self.metadata_clock_keys, self.metadata_clock_states, &self.metadata_clock_hand, protection, .metadata) orelse return false;
         if (self.metadata_cache_slots.fetchRemove(victim)) |removed_slot| {
             self.metadata_clock_keys[removed_slot.value] = 0;
-            self.metadata_clock_refs[removed_slot.value] = false;
+            self.metadata_clock_states[removed_slot.value] = .empty;
         }
         if (self.metadata_cache.fetchRemove(victim)) |removed| {
             self.releaseLocalMetadataEntry(removed.value);
@@ -8408,10 +8387,10 @@ pub const HBCIndex = struct {
     }
 
     fn evictOneQuantizedCacheEntry(self: *HBCIndex, protection: HbcCacheProtection) bool {
-        const victim = nextHbcClockVictim(self.quantized_clock_keys, self.quantized_clock_refs, &self.quantized_clock_hand, protection, .quantized) orelse return false;
+        const victim = nextHbcClockVictim(self.quantized_clock_keys, self.quantized_clock_states, &self.quantized_clock_hand, protection, .quantized) orelse return false;
         if (self.quantized_cache_slots.fetchRemove(victim)) |removed_slot| {
             self.quantized_clock_keys[removed_slot.value] = 0;
-            self.quantized_clock_refs[removed_slot.value] = false;
+            self.quantized_clock_states[removed_slot.value] = .empty;
         }
         if (self.quantized_cache.fetchRemove(victim)) |removed| {
             self.releaseLocalQuantizedEntry(removed.value);
@@ -8422,10 +8401,10 @@ pub const HBCIndex = struct {
     }
 
     fn evictOneNodeCacheEntry(self: *HBCIndex, protection: HbcCacheProtection) bool {
-        const victim = nextHbcClockVictim(self.node_clock_keys, self.node_clock_refs, &self.node_clock_hand, protection, .node) orelse return false;
+        const victim = nextHbcClockVictim(self.node_clock_keys, self.node_clock_states, &self.node_clock_hand, protection, .node) orelse return false;
         if (self.node_cache_slots.fetchRemove(victim)) |removed_slot| {
             self.node_clock_keys[removed_slot.value] = 0;
-            self.node_clock_refs[removed_slot.value] = false;
+            self.node_clock_states[removed_slot.value] = .empty;
         }
         if (self.node_cache.fetchRemove(victim)) |removed| {
             self.releaseLocalNodeEntry(removed.value);
@@ -8507,13 +8486,13 @@ pub const HBCIndex = struct {
             self.shared_cache_registered = false;
         }
         self.alloc.free(self.node_clock_keys);
-        self.alloc.free(self.node_clock_refs);
+        self.alloc.free(self.node_clock_states);
         self.alloc.free(self.quantized_clock_keys);
-        self.alloc.free(self.quantized_clock_refs);
+        self.alloc.free(self.quantized_clock_states);
         self.alloc.free(self.vector_clock_keys);
-        self.alloc.free(self.vector_clock_refs);
+        self.alloc.free(self.vector_clock_states);
         self.alloc.free(self.metadata_clock_keys);
-        self.alloc.free(self.metadata_clock_refs);
+        self.alloc.free(self.metadata_clock_states);
         if (self.hilbert) |*hilbert| hilbert.deinit();
         if (self.cached_scratch) |*scratch| {
             self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| scratch.bytes());
@@ -10232,6 +10211,7 @@ pub const HBCIndex = struct {
         if (self.write_session_depth != 0) return error.ActiveWriteSession;
         if (self.experimental_posting_capture_enabled) return error.ExperimentalPostingCaptureAlreadyActive;
 
+        if (options.check) |check| try check(options.context.?);
         if (self.experimentalPostingDurableAppliedSequence()) |covered| {
             if (covered != applied_sequence) return error.PostingCheckpointSequenceMismatch;
         } else {
@@ -10252,6 +10232,7 @@ pub const HBCIndex = struct {
                 _ = try self.finishExperimentalPostingCheckpointForReadiness();
             }
         }
+        if (options.check) |check| try check(options.context.?);
         // A non-flattening lifecycle fence must never join or discard an
         // opportunistic build. The builder retained an immutable generation
         // and a complete WAL-prefix boundary; publication atomically carries
@@ -12093,6 +12074,177 @@ pub const HBCIndex = struct {
         };
     }
 
+    /// Reads the bootstrap projection without retaining point results for the
+    /// corpus or probing every absent auxiliary key across overlapping runs.
+    /// Both qualification strategies feed the same native serializers below.
+    const InitialPostingRows = struct {
+        const Quantized = enum { none, root, all };
+        const Options = struct { auxiliary: bool = false, quantized: Quantized = .none, skip_root: bool = false };
+        const Row = struct { id: u64, packed_node: []const u8, range: ?[]const u8 = null, posting: ?[]const u8 = null, quantized: ?[]const u8 = null };
+        index: *HBCIndex,
+        options: Options,
+        check: ?*const fn (*anyopaque) anyerror!void,
+        context: ?*anyopaque,
+        point: bool,
+        next_id: u64 = 1,
+        scanned: usize = 0,
+        txn: ?vectorindex_store.NamespaceReadTxn = null,
+        nodes: ?vectorindex_store.Cursor = null,
+        quantized: ?vectorindex_store.Cursor = null,
+        node_entry: ?vectorindex_store.Entry = null,
+        quantized_entry: ?vectorindex_store.Entry = null,
+        buffers: [4]std.ArrayList(u8) = @splat(.empty),
+        present: [4]bool = @splat(false),
+
+        fn init(index: *HBCIndex, options: Options, check: ?*const fn (*anyopaque) anyerror!void, context: ?*anyopaque) !InitialPostingRows {
+            const point = if (comptime @hasDecl(@import("root"), "hbcBootstrapPointReads")) @import("root").hbcBootstrapPointReads() else false;
+            return initMode(index, options, check, context, point);
+        }
+        fn initMode(index: *HBCIndex, options: Options, check: ?*const fn (*anyopaque) anyerror!void, context: ?*anyopaque, point: bool) !InitialPostingRows {
+            if (index.metadata.node_count == std.math.maxInt(u64)) return error.Corrupted;
+            var self: InitialPostingRows = .{ .index = index, .options = options, .check = check, .context = context, .point = point };
+            errdefer self.deinit();
+            if (!self.point) {
+                self.txn = try index.store.beginRead();
+                self.nodes = try self.txn.?.openCursor(.nodes);
+                self.node_entry = try self.nodes.?.first();
+                if (options.quantized == .all) {
+                    self.quantized = try self.txn.?.openCursor(.quant);
+                    self.quantized_entry = try self.quantized.?.first();
+                }
+            }
+            return self;
+        }
+        fn deinit(self: *InitialPostingRows) void {
+            if (self.quantized) |*cursor| cursor.close();
+            if (self.nodes) |*cursor| cursor.close();
+            if (self.txn) |*txn| txn.abort();
+            for (&self.buffers) |*buffer| buffer.deinit(self.index.alloc);
+        }
+        fn active(self: *InitialPostingRows) !void {
+            if (self.scanned % 256 == 0) if (self.check) |check| try check(self.context.?);
+            self.scanned += 1;
+        }
+        fn get(self: *InitialPostingRows, namespace: Namespace, key: []const u8) !?[]const u8 {
+            return self.txn.?.get(namespace, key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+        }
+        fn nextPoint(self: *InitialPostingRows) !?Row {
+            while (self.next_id <= self.index.metadata.node_count) {
+                try self.active();
+                const id = self.next_id;
+                self.next_id += 1;
+                if (self.txn) |*txn| txn.abort();
+                self.txn = null;
+                if (self.options.skip_root and id == self.index.metadata.root_node) continue;
+                self.txn = try self.index.store.beginRead();
+                var key: [12]u8 = undefined;
+                const packed_value = (try self.get(.nodes, encodeNodeKey(&key, id, .packed_node))) orelse continue;
+                var row: Row = .{ .id = id, .packed_node = packed_value };
+                if (self.options.auxiliary) {
+                    row.range = try self.get(.nodes, encodeNodeKey(&key, id, .range));
+                    row.posting = try self.get(.nodes, encodeNodeKey(&key, id, .posting));
+                }
+                if (self.options.quantized == .all or (self.options.quantized == .root and id == self.index.metadata.root_node)) {
+                    var quant_key: [10]u8 = undefined;
+                    row.quantized = try self.get(.quant, encodeQuantKey(&quant_key, id));
+                }
+                return row;
+            }
+            return null;
+        }
+        fn copy(self: *InitialPostingRows, slot: usize, bytes: []const u8) !void {
+            try self.buffers[slot].appendSlice(self.index.alloc, bytes);
+            self.present[slot] = true;
+        }
+        fn quantizedFor(self: *InitialPostingRows, id: u64) !?[]const u8 {
+            if (self.options.quantized == .none) return null;
+            if (self.options.quantized == .root) {
+                if (id != self.index.metadata.root_node) return null;
+                var key: [10]u8 = undefined;
+                return self.get(.quant, encodeQuantKey(&key, id));
+            }
+            while (self.quantized_entry) |entry| {
+                const quant_id = decodeQuantizedNodeId(entry.key) orelse {
+                    self.quantized_entry = try self.quantized.?.next();
+                    continue;
+                };
+                if (quant_id > id) return null;
+                if (quant_id == id) return entry.value;
+                self.quantized_entry = try self.quantized.?.next();
+            }
+            return null;
+        }
+        fn next(self: *InitialPostingRows) !?Row {
+            if (self.point) return self.nextPoint();
+            while (true) {
+                for (&self.buffers) |*buffer| buffer.clearRetainingCapacity();
+                self.present = @splat(false);
+                var current_id: ?u64 = null;
+                while (self.node_entry) |entry| {
+                    const decoded = decodeNodeKey(entry.key) orelse {
+                        self.node_entry = try self.nodes.?.next();
+                        continue;
+                    };
+                    if (decoded.id > self.index.metadata.node_count) {
+                        self.node_entry = null;
+                        break;
+                    }
+                    if (decoded.id == 0) {
+                        self.node_entry = try self.nodes.?.next();
+                        continue;
+                    }
+                    if (current_id != null and decoded.id != current_id.?) break;
+                    if (current_id == null) {
+                        current_id = decoded.id;
+                        try self.active();
+                    }
+                    switch (decoded.suffix) {
+                        .packed_node => try self.copy(0, entry.value),
+                        .range => if (self.options.auxiliary) {
+                            try self.copy(1, entry.value);
+                        },
+                        .posting => if (self.options.auxiliary) {
+                            try self.copy(2, entry.value);
+                        },
+                        else => {},
+                    }
+                    self.node_entry = try self.nodes.?.next();
+                }
+                const id = current_id orelse return null;
+                if (!self.present[0] or (self.options.skip_root and id == self.index.metadata.root_node)) continue;
+                if (try self.quantizedFor(id)) |bytes| try self.copy(3, bytes);
+                return .{ .id = id, .packed_node = self.buffers[0].items, .range = if (self.present[1]) self.buffers[1].items else null, .posting = if (self.present[2]) self.buffers[2].items else null, .quantized = if (self.present[3]) self.buffers[3].items else null };
+            }
+        }
+    };
+
+    // Keep the fast ordered path for admitted snapshots. This is a hard cap on
+    // overlapping input streams, not a promise that 1024 streams fit every
+    // allocator quota. A staging allocation failure retries once after bounded
+    // consolidation; no serving authority has changed at that boundary.
+    const max_initial_posting_runs = 1024;
+
+    fn consolidateInitialPostingProjection(self: *HBCIndex) !bool {
+        return switch (self.env_owner) {
+            .lsm => |handle| blk: {
+                const before = handle.backend.runs.count();
+                const changed = try handle.backend.consolidateFreshSnapshot();
+                if (comptime @hasDecl(@import("root"), "hbcBootstrapProjectionConsolidated"))
+                    @import("root").hbcBootstrapProjectionConsolidated(before, handle.backend.runs.count());
+                break :blk changed;
+            },
+            .native => false,
+        };
+    }
+
+    const InitialPostingStage = struct {
+        staged: posting_segment_store_mod.StagedCheckpointSegment,
+        posting_count: u64,
+    };
+
     fn publishInitialPostingCheckpoint(
         self: *HBCIndex,
         posting_store: *posting_segment_store_mod.Store,
@@ -12101,6 +12253,36 @@ pub const HBCIndex = struct {
         check: ?*const fn (*anyopaque) anyerror!void,
         context: ?*anyopaque,
     ) !PostingCheckpointStats {
+        const forced: ?bool = if (comptime @hasDecl(@import("root"), "hbcBootstrapConsolidateProjection")) @import("root").hbcBootstrapConsolidateProjection() else null;
+        const too_many_runs = switch (self.env_owner) {
+            .lsm => |handle| handle.backend.runs.count() == handle.backend.runs.l0Files() and handle.backend.runs.count() > max_initial_posting_runs,
+            .native => false,
+        };
+        const consolidated = if (forced orelse too_many_runs) try self.consolidateInitialPostingProjection() else false;
+        const result = self.stageInitialPostingCheckpoint(posting_store, generation, sequence, check, context) catch |err| retry: {
+            if (err != error.OutOfMemory or forced == false or consolidated) return err;
+            if (check) |active| try active(context.?);
+            if (!try self.consolidateInitialPostingProjection()) return err;
+            break :retry try self.stageInitialPostingCheckpoint(posting_store, generation, sequence, check, context);
+        };
+        // Preparation and authority handoff are outside the retryable staging
+        // operation. Never retry an allocation failure after CURRENT may change.
+        if (check) |active| try active(context.?);
+        var prepared = try posting_store.prepareStagedCheckpoint(generation, sequence, result.staged);
+        defer prepared.deinit();
+        try self.installPreparedExperimentalPostingCheckpoint(posting_store, &prepared);
+        self.experimental_posting_overlay_collapsed_wal_bytes = posting_store.wal_committed_bytes;
+        return .{ .generation = generation, .covered_source_sequence = sequence, .posting_count = result.posting_count, .segment_bytes = result.staged.bytes, .flattened_generation = false };
+    }
+
+    fn stageInitialPostingCheckpoint(
+        self: *HBCIndex,
+        posting_store: *posting_segment_store_mod.Store,
+        generation: u64,
+        sequence: u64,
+        check: ?*const fn (*anyopaque) anyerror!void,
+        context: ?*anyopaque,
+    ) !InitialPostingStage {
         var staged_writer = try posting_store.beginStagedCheckpointSegment(generation);
         defer staged_writer.deinit();
         var writer = vectorindex_posting_segment.StreamingWriter.init(self.alloc);
@@ -12109,40 +12291,15 @@ pub const HBCIndex = struct {
         var metadata_bytes: [IndexMetadata.encoded_size]u8 = undefined;
         try writer.appendValueAt(sink, 0, .index_metadata, sequence, self.metadata.encode(&metadata_bytes));
         var posting_count: u64 = 0;
-        var node_id: u64 = 1;
-        while (node_id <= self.metadata.node_count) : (node_id += 1) {
-            if (node_id % 256 == 1) if (check) |active| try active(context.?);
-            // Point results belong to the read transaction. Release each node
-            // before reading the next so bootstrap cannot pin the corpus.
-            var txn = try self.store.beginRead();
-            defer txn.abort();
-            var key: [12]u8 = undefined;
-            const packed_node = txn.get(.nodes, encodeNodeKey(&key, node_id, .packed_node)) catch |err| switch (err) {
-                error.NotFound => continue,
-                else => return err,
-            };
-            try writer.appendValueAt(sink, node_id, .base, sequence, packed_node);
-            posting_count += 1;
-            const node_values = .{
-                .{ .suffix = vectorindex_hbc.Suffix.range, .kind = vectorindex_posting_segment.EntryKind.node_range },
-                .{ .suffix = vectorindex_hbc.Suffix.posting, .kind = vectorindex_posting_segment.EntryKind.posting_state },
-            };
-            inline for (node_values) |mapping| {
-                if (txn.get(.nodes, encodeNodeKey(&key, node_id, mapping.suffix))) |value| {
-                    try writer.appendValueAt(sink, node_id, mapping.kind, sequence, value);
-                } else |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                }
-            }
-            if (node_id == self.metadata.root_node or !self.config.use_quantization) {
-                var quant_key: [10]u8 = undefined;
-                if (txn.get(.quant, encodeQuantKey(&quant_key, node_id))) |value| {
-                    try writer.appendValueAt(sink, node_id, .quantized_checkpoint, sequence, value);
-                } else |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                }
+        {
+            var rows = try InitialPostingRows.init(self, .{ .auxiliary = true, .quantized = if (self.config.use_quantization) .root else .all }, check, context);
+            defer rows.deinit();
+            while (try rows.next()) |row| {
+                try writer.appendValueAt(sink, row.id, .base, sequence, row.packed_node);
+                posting_count += 1;
+                if (row.range) |value| try writer.appendValueAt(sink, row.id, .node_range, sequence, value);
+                if (row.posting) |value| try writer.appendValueAt(sink, row.id, .posting_state, sequence, value);
+                if (row.quantized) |value| try writer.appendValueAt(sink, row.id, .quantized_checkpoint, sequence, value);
             }
         }
 
@@ -12152,26 +12309,21 @@ pub const HBCIndex = struct {
         defer centroids.deinit();
         const centroid = try self.alloc.alloc(f32, self.metadata.dims);
         defer self.alloc.free(centroid);
-        node_id = 1;
-        while (node_id <= self.metadata.node_count) : (node_id += 1) {
-            if (node_id % 256 == 1) if (check) |active| try active(context.?);
-            var txn = try self.store.beginRead();
-            defer txn.abort();
-            var key: [12]u8 = undefined;
-            const packed_node = txn.get(.nodes, encodeNodeKey(&key, node_id, .packed_node)) catch |err| switch (err) {
-                error.NotFound => continue,
-                else => return err,
-            };
-            const node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
-            if (!node.header.is_leaf or node.ids_bytes.len == 0) continue;
-            if (node.centroid_bytes.len != centroid.len * 4) return error.Corrupted;
-            @memcpy(std.mem.sliceAsBytes(centroid), node.centroid_bytes);
-            const measure = switch (self.config.metric) {
-                .l2_squared => vec.dot(centroid, centroid),
-                .cosine => vec.norm(centroid),
-                .inner_product => 0,
-            };
-            try centroids.append(sink, node_id, node.covering_radius, centroid, measure);
+        {
+            var rows = try InitialPostingRows.init(self, .{}, check, context);
+            defer rows.deinit();
+            while (try rows.next()) |row| {
+                const node = try vectorindex_hbc.decodePackedNodeValue(row.packed_node);
+                if (!node.header.is_leaf or node.ids_bytes.len == 0) continue;
+                if (node.centroid_bytes.len != centroid.len * 4) return error.Corrupted;
+                @memcpy(std.mem.sliceAsBytes(centroid), node.centroid_bytes);
+                const measure = switch (self.config.metric) {
+                    .l2_squared => vec.dot(centroid, centroid),
+                    .cosine => vec.norm(centroid),
+                    .inner_product => 0,
+                };
+                try centroids.append(sink, row.id, node.covering_radius, centroid, measure);
+            }
         }
         const centroid_finish = try centroids.finish(sink);
         try writer.appendWrittenValueAt(sink, 0, .centroid_directory, sequence, centroid_finish.offset, centroid_finish.len, centroid_finish.checksum);
@@ -12180,29 +12332,19 @@ pub const HBCIndex = struct {
             try writer.alignForValue(sink, .quantized_directory);
             var quantized = try vectorindex_quantized_directory.StreamingWriter.init(self.alloc, sink, self.metadata.dims, self.metadata.metric);
             defer quantized.deinit();
-            node_id = 1;
-            while (node_id <= self.metadata.node_count) : (node_id += 1) {
-                if (node_id % 256 == 1) if (check) |active| try active(context.?);
-                if (node_id == self.metadata.root_node) continue;
-                var txn = try self.store.beginRead();
-                defer txn.abort();
-                var node_key: [12]u8 = undefined;
-                const packed_node = txn.get(.nodes, encodeNodeKey(&node_key, node_id, .packed_node)) catch |err| switch (err) {
-                    error.NotFound => continue,
-                    else => return err,
-                };
-                const node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
-                var key: [10]u8 = undefined;
-                const bytes = txn.get(.quant, encodeQuantKey(&key, node_id)) catch |err| switch (err) {
-                    error.NotFound => {
+            {
+                var rows = try InitialPostingRows.init(self, .{ .quantized = .all, .skip_root = true }, check, context);
+                defer rows.deinit();
+                while (try rows.next()) |row| {
+                    const node = try vectorindex_hbc.decodePackedNodeValue(row.packed_node);
+                    const bytes = row.quantized orelse {
                         if (node.header.is_leaf) quantized.observeFallbackLeaf(node.ids_bytes.len / @sizeOf(u64));
                         continue;
-                    },
-                    else => return err,
-                };
-                var decoded = try proto.RaBitQuantizedVectorSet.decode(self.alloc, bytes);
-                defer decoded.deinit(self.alloc);
-                try appendExperimentalLeafDirectory(self.alloc, self.resource_manager, null, &quantized, sink, node_id, &decoded, if (node.header.is_leaf) node.ids_bytes else &.{}, &.{});
+                    };
+                    var decoded = try proto.RaBitQuantizedVectorSet.decode(self.alloc, bytes);
+                    defer decoded.deinit(self.alloc);
+                    try appendExperimentalLeafDirectory(self.alloc, self.resource_manager, null, &quantized, sink, row.id, &decoded, if (node.header.is_leaf) node.ids_bytes else &.{}, &.{});
+                }
             }
             const quantized_finish = try quantized.finish(sink);
             try writer.appendWrittenValueAt(sink, 0, .quantized_directory, sequence, quantized_finish.offset, quantized_finish.len, quantized_finish.outer_checksum);
@@ -12245,11 +12387,7 @@ pub const HBCIndex = struct {
         const finish = try writer.finish(sink);
         const staged = try staged_writer.finish(finish.admission_checksum);
         if (staged.bytes != finish.bytes) return error.InvalidStagedPostingSegment;
-        var prepared = try posting_store.prepareStagedCheckpoint(generation, sequence, staged);
-        defer prepared.deinit();
-        try self.installPreparedExperimentalPostingCheckpoint(posting_store, &prepared);
-        self.experimental_posting_overlay_collapsed_wal_bytes = posting_store.wal_committed_bytes;
-        return .{ .generation = generation, .covered_source_sequence = sequence, .posting_count = posting_count, .segment_bytes = staged.bytes, .flattened_generation = false };
+        return .{ .staged = staged, .posting_count = posting_count };
     }
 
     /// Materializes the currently committed packed HBC node and RaBitQ values
@@ -12928,6 +13066,10 @@ pub const HBCIndex = struct {
     }
 
     fn stageNodeKeyPut(self: *HBCIndex, key: []const u8, value: []const u8) !bool {
+        // An offline candidate has no readers until its completed generation
+        // is published. Write node bodies into its bounded immutable batches;
+        // retaining a publication overlay here would grow with the corpus.
+        if (self.bulk_commit_rotation.fresh_snapshot) return false;
         if (!self.crossBatchPublicationActive()) return false;
         const staged_key = stagedNodeKeyId(key) orelse return false;
         const owned = try self.alloc.dupe(u8, value);
@@ -12944,6 +13086,10 @@ pub const HBCIndex = struct {
     }
 
     fn stageNodeKeyDelete(self: *HBCIndex, key: []const u8) !bool {
+        // An offline candidate has no readers until its completed generation
+        // is published. Write node bodies into its bounded immutable batches;
+        // retaining a publication overlay here would grow with the corpus.
+        if (self.bulk_commit_rotation.fresh_snapshot) return false;
         if (!self.crossBatchPublicationActive()) return false;
         const staged_key = stagedNodeKeyId(key) orelse return false;
         const result = try self.deferred_node_keys.getOrPut(self.alloc, staged_key);
@@ -13728,7 +13874,7 @@ pub const HBCIndex = struct {
         self.node_cache_slots.deinit(self.alloc);
         self.node_cache_slots = .empty;
         @memset(self.node_clock_keys, 0);
-        @memset(self.node_clock_refs, false);
+        @memset(self.node_clock_states, .empty);
         self.node_clock_hand = 0;
     }
 
@@ -13745,7 +13891,7 @@ pub const HBCIndex = struct {
         self.quantized_cache_slots.deinit(self.alloc);
         self.quantized_cache_slots = .empty;
         @memset(self.quantized_clock_keys, 0);
-        @memset(self.quantized_clock_refs, false);
+        @memset(self.quantized_clock_states, .empty);
         self.quantized_clock_hand = 0;
     }
 
@@ -13757,7 +13903,7 @@ pub const HBCIndex = struct {
         self.vector_cache_slots.deinit(self.alloc);
         self.vector_cache_slots = .empty;
         @memset(self.vector_clock_keys, 0);
-        @memset(self.vector_clock_refs, false);
+        @memset(self.vector_clock_states, .empty);
         self.vector_clock_hand = 0;
     }
 
@@ -13769,7 +13915,7 @@ pub const HBCIndex = struct {
         self.metadata_cache_slots.deinit(self.alloc);
         self.metadata_cache_slots = .empty;
         @memset(self.metadata_clock_keys, 0);
-        @memset(self.metadata_clock_refs, false);
+        @memset(self.metadata_clock_states, .empty);
         self.metadata_clock_hand = 0;
     }
 
@@ -13777,7 +13923,7 @@ pub const HBCIndex = struct {
         if (self.pinned_node_cache.fetchRemove(node_id)) |removed| releaseNodeCacheEntry(self.alloc, removed.value);
         if (self.node_cache_slots.fetchRemove(node_id)) |removed_slot| {
             self.node_clock_keys[removed_slot.value] = 0;
-            self.node_clock_refs[removed_slot.value] = false;
+            self.node_clock_states[removed_slot.value] = .empty;
         }
         if (self.node_cache.fetchRemove(node_id)) |removed| self.releaseLocalNodeEntry(removed.value);
     }
@@ -13786,7 +13932,7 @@ pub const HBCIndex = struct {
         if (self.pinned_quantized_cache.fetchRemove(node_id)) |removed| releaseQuantizedCacheEntry(self.alloc, removed.value);
         if (self.quantized_cache_slots.fetchRemove(node_id)) |removed_slot| {
             self.quantized_clock_keys[removed_slot.value] = 0;
-            self.quantized_clock_refs[removed_slot.value] = false;
+            self.quantized_clock_states[removed_slot.value] = .empty;
         }
         if (self.quantized_cache.fetchRemove(node_id)) |removed| self.releaseLocalQuantizedEntry(removed.value);
     }
@@ -13794,7 +13940,7 @@ pub const HBCIndex = struct {
     fn invalidateLocalVectorCacheLocked(self: *HBCIndex, vector_id: u64) void {
         if (self.vector_cache_slots.fetchRemove(vector_id)) |removed_slot| {
             self.vector_clock_keys[removed_slot.value] = 0;
-            self.vector_clock_refs[removed_slot.value] = false;
+            self.vector_clock_states[removed_slot.value] = .empty;
         }
         if (self.vector_cache.fetchRemove(vector_id)) |removed| self.releaseLocalVectorEntry(removed.value);
     }
@@ -13802,7 +13948,7 @@ pub const HBCIndex = struct {
     fn invalidateLocalMetadataCacheLocked(self: *HBCIndex, vector_id: u64) void {
         if (self.metadata_cache_slots.fetchRemove(vector_id)) |removed_slot| {
             self.metadata_clock_keys[removed_slot.value] = 0;
-            self.metadata_clock_refs[removed_slot.value] = false;
+            self.metadata_clock_states[removed_slot.value] = .empty;
         }
         if (self.metadata_cache.fetchRemove(vector_id)) |removed| self.releaseLocalMetadataEntry(removed.value);
     }
@@ -13811,11 +13957,11 @@ pub const HBCIndex = struct {
         if (self.config.max_cached_nodes == 0) return null;
         if (self.node_cache.contains(key)) return null;
         while (self.node_cache.count() >= self.config.max_cached_nodes) {
-            const victim = nextHbcClockVictim(self.node_clock_keys, self.node_clock_refs, &self.node_clock_hand, .none(), .node) orelse break;
+            const victim = nextHbcClockVictim(self.node_clock_keys, self.node_clock_states, &self.node_clock_hand, .none(), .node) orelse break;
             const slot = self.node_cache_slots.get(victim).?;
             if (self.node_cache_slots.fetchRemove(victim)) |removed_slot| {
                 self.node_clock_keys[removed_slot.value] = 0;
-                self.node_clock_refs[removed_slot.value] = false;
+                self.node_clock_states[removed_slot.value] = .empty;
             }
             if (self.node_cache.fetchRemove(victim)) |removed| self.releaseLocalNodeEntry(removed.value);
             return slot;
@@ -13827,11 +13973,11 @@ pub const HBCIndex = struct {
         if (self.config.max_cached_nodes == 0) return null;
         if (self.quantized_cache.contains(key)) return null;
         while (self.quantized_cache.count() >= self.config.max_cached_nodes) {
-            const victim = nextHbcClockVictim(self.quantized_clock_keys, self.quantized_clock_refs, &self.quantized_clock_hand, .none(), .quantized) orelse break;
+            const victim = nextHbcClockVictim(self.quantized_clock_keys, self.quantized_clock_states, &self.quantized_clock_hand, .none(), .quantized) orelse break;
             const slot = self.quantized_cache_slots.get(victim).?;
             if (self.quantized_cache_slots.fetchRemove(victim)) |removed_slot| {
                 self.quantized_clock_keys[removed_slot.value] = 0;
-                self.quantized_clock_refs[removed_slot.value] = false;
+                self.quantized_clock_states[removed_slot.value] = .empty;
             }
             if (self.quantized_cache.fetchRemove(victim)) |removed| self.releaseLocalQuantizedEntry(removed.value);
             return slot;
@@ -13843,7 +13989,7 @@ pub const HBCIndex = struct {
         if (self.config.max_cached_vectors == 0) return null;
         if (self.vector_cache.contains(key)) return null;
         while (self.vector_cache.count() >= self.config.max_cached_vectors) {
-            const victim = nextHbcClockVictim(self.vector_clock_keys, self.vector_clock_refs, &self.vector_clock_hand, .none(), .vector) orelse break;
+            const victim = nextHbcClockVictim(self.vector_clock_keys, self.vector_clock_states, &self.vector_clock_hand, .none(), .vector) orelse break;
             const slot = self.vector_cache_slots.get(victim).?;
             self.invalidateLocalVectorCacheLocked(victim);
             return slot;
@@ -13855,7 +14001,7 @@ pub const HBCIndex = struct {
         if (self.config.max_cached_metadata == 0) return null;
         if (self.metadata_cache.contains(key)) return null;
         while (self.metadata_cache.count() >= self.config.max_cached_metadata) {
-            const victim = nextHbcClockVictim(self.metadata_clock_keys, self.metadata_clock_refs, &self.metadata_clock_hand, .none(), .metadata) orelse break;
+            const victim = nextHbcClockVictim(self.metadata_clock_keys, self.metadata_clock_states, &self.metadata_clock_hand, .none(), .metadata) orelse break;
             const slot = self.metadata_cache_slots.get(victim).?;
             self.invalidateLocalMetadataCacheLocked(victim);
             return slot;
@@ -13875,13 +14021,12 @@ pub const HBCIndex = struct {
         const reserved_slot = self.ensureLocalNodeCacheCapacityLocked(owned.id);
         if (self.node_cache_slots.fetchRemove(owned.id)) |removed_slot| {
             self.node_clock_keys[removed_slot.value] = 0;
-            self.node_clock_refs[removed_slot.value] = false;
+            self.node_clock_states[removed_slot.value] = .empty;
         }
         if (self.node_cache.fetchRemove(owned.id)) |removed| self.releaseLocalNodeEntry(removed.value);
         entry.* = .{ .node = owned };
-        const slot = reserved_slot orelse claimLocalClockSlot(self.node_clock_keys, self.node_clock_hand, owned.id) orelse return error.CacheDisabled;
+        const slot = claimLocalClockSlot(self.node_clock_keys, self.node_clock_states, self.node_clock_hand, owned.id, reserved_slot) orelse return error.CacheDisabled;
         self.node_cache.putAssumeCapacity(owned.id, entry);
-        self.node_clock_refs[slot] = true;
         self.node_cache_slots.putAssumeCapacity(owned.id, slot);
     }
 
@@ -13895,13 +14040,12 @@ pub const HBCIndex = struct {
         const reserved_slot = self.ensureLocalQuantizedCacheCapacityLocked(node_id);
         if (self.quantized_cache_slots.fetchRemove(node_id)) |removed_slot| {
             self.quantized_clock_keys[removed_slot.value] = 0;
-            self.quantized_clock_refs[removed_slot.value] = false;
+            self.quantized_clock_states[removed_slot.value] = .empty;
         }
         if (self.quantized_cache.fetchRemove(node_id)) |removed| self.releaseLocalQuantizedEntry(removed.value);
         entry.* = .{ .quantized = owned };
-        const slot = reserved_slot orelse claimLocalClockSlot(self.quantized_clock_keys, self.quantized_clock_hand, node_id) orelse return error.CacheDisabled;
+        const slot = claimLocalClockSlot(self.quantized_clock_keys, self.quantized_clock_states, self.quantized_clock_hand, node_id, reserved_slot) orelse return error.CacheDisabled;
         self.quantized_cache.putAssumeCapacity(node_id, entry);
-        self.quantized_clock_refs[slot] = true;
         self.quantized_cache_slots.putAssumeCapacity(node_id, slot);
     }
 
@@ -13967,9 +14111,8 @@ pub const HBCIndex = struct {
         entry.* = .{ .vector = copied };
         const reserved_slot = self.ensureLocalVectorCacheCapacityLocked(vector_id);
         self.invalidateLocalVectorCacheLocked(vector_id);
-        const slot = reserved_slot orelse claimLocalClockSlot(self.vector_clock_keys, self.vector_clock_hand, vector_id) orelse return error.CacheDisabled;
+        const slot = claimLocalClockSlot(self.vector_clock_keys, self.vector_clock_states, self.vector_clock_hand, vector_id, reserved_slot) orelse return error.CacheDisabled;
         self.vector_cache.putAssumeCapacity(vector_id, entry);
-        self.vector_clock_refs[slot] = true;
         self.vector_cache_slots.putAssumeCapacity(vector_id, slot);
         return entry.vector;
     }
@@ -13985,9 +14128,8 @@ pub const HBCIndex = struct {
         entry.* = .{ .metadata = copied };
         const reserved_slot = self.ensureLocalMetadataCacheCapacityLocked(vector_id);
         self.invalidateLocalMetadataCacheLocked(vector_id);
-        const slot = reserved_slot orelse claimLocalClockSlot(self.metadata_clock_keys, self.metadata_clock_hand, vector_id) orelse return error.CacheDisabled;
+        const slot = claimLocalClockSlot(self.metadata_clock_keys, self.metadata_clock_states, self.metadata_clock_hand, vector_id, reserved_slot) orelse return error.CacheDisabled;
         self.metadata_cache.putAssumeCapacity(vector_id, entry);
-        self.metadata_clock_refs[slot] = true;
         self.metadata_cache_slots.putAssumeCapacity(vector_id, slot);
     }
 
@@ -17735,6 +17877,7 @@ pub const HBCIndex = struct {
     }
 
     pub const BulkSpool = vectorindex_hbc_index.bulk_spool.Spool;
+    pub const BulkSpoolOutput = vectorindex_hbc_index.bulk_spool.Output;
     pub const SpoolBuildOptions = vectorindex_hbc_index.SpoolBuildOptions;
 
     pub fn bulkBuildSpool(self: *HBCIndex, spool: *BulkSpool, root: BulkSpool.Partition, options: SpoolBuildOptions) !void {
@@ -27542,6 +27685,11 @@ test "stable generation finalization bootstraps capture-free rebuild into native
             .make_authoritative = true,
         });
         try std.testing.expectEqual(@as(?u64, 7), idx.experimentalPostingDurableAppliedSequence());
+        try std.testing.expectError(error.Cancelled, idx.finalizeExperimentalPostingGenerationAtAppliedSequence(7, .{
+            .flatten = true,
+            .check = Cancel.check,
+            .context = &loader_context,
+        }));
         try std.testing.expect(idx.experimentalPostingWalAuthoritative());
         try std.testing.expect(idx.env_owner == .native);
     }
@@ -35938,14 +36086,19 @@ test "spooled bulk construction bounds leaves commits and preserves reopened nat
     for (0..count) |row| _ = vec.normalize(values[row * dims ..][0..dims]);
     const Source = struct {
         values: []const f32,
+        loads: usize = 0,
         fn load(raw: *anyopaque, alloc: Allocator, id: u64, _: []const u8) ![]f32 {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            self.loads += 1;
+            if (id == count + 1) return alloc.dupe(f32, self.values[0..dims]);
             if (id == 0 or id > count) return error.NotFound;
             return alloc.dupe(f32, self.values[(id - 1) * dims ..][0..dims]);
         }
     };
     var source: Source = .{ .values = values };
-    const cases = [_]struct { emeans: bool, quantized: bool, metric: vec.DistanceMetric = .l2_squared, bits: u8 = 1, rotate: bool = false }{
+    const cases = [_]struct { emeans: bool, quantized: bool, metric: vec.DistanceMetric = .l2_squared, bits: u8 = 1, rotate: bool = false, compact: bool = true, prebind: bool = true }{
+        .{ .emeans = false, .quantized = true, .compact = false, .prebind = false },
+        .{ .emeans = false, .quantized = false, .compact = false },
         .{ .emeans = false, .quantized = false },
         .{ .emeans = true, .quantized = false },
         .{ .emeans = false, .quantized = true },
@@ -35955,6 +36108,7 @@ test "spooled bulk construction bounds leaves commits and preserves reopened nat
         .{ .emeans = true, .quantized = true, .bits = 4, .rotate = true },
     };
     for (cases) |case| {
+        source.loads = 0;
         var tp: TestPath = .{};
         const path = tp.initDisk();
         defer tp.cleanup();
@@ -35966,13 +36120,16 @@ test "spooled bulk construction bounds leaves commits and preserves reopened nat
         defer dir.close(io);
         const config: HBCConfig = .{ .dims = dims, .metric = case.metric, .leaf_size = 16, .branching_factor = 4, .max_cached_nodes = 8, .max_cached_vectors = 0, .max_cached_metadata = 0, .use_quantization = case.quantized, .quantization_bits = case.bits, .use_random_ortho_trans = case.rotate };
         {
-            var index = try HBCIndex.open(a, path, config);
+            var cache = try lsm_backend.Cache.initFallible(a, 64 * 1024);
+            defer cache.deinit();
+            var index = try HBCIndex.openWithLsmOptions(a, path, config, .{ .cache = &cache });
             defer index.close();
             index.setIo(io);
             index.setExternalVectorLoader(&source, Source.load);
             var spool: HBCIndex.BulkSpool = .{ .dir = dir, .io = io, .dims = dims };
             var buffer: [4096]u8 = undefined;
             var output = try spool.create(&buffer);
+            try output.enableIdentityCensus(a, .{ .rows = 7 });
             var output_open = true;
             defer if (output_open) output.abort(spool);
             var transformed: [dims]f32 = undefined;
@@ -35982,11 +36139,23 @@ test "spooled bulk construction bounds leaves commits and preserves reopened nat
             }
             const partition = try output.finish(io);
             output_open = false;
-            try index.bulkBuildSpool(&spool, partition, .{ .algorithm = if (case.emeans) .emeans else .lloyd, .commit_bytes = 1024, .sample_bytes = 4096, .terminal_bytes = 4096 });
+            try std.testing.expect(partition.identities_verified);
+            try index.bulkBuildSpool(&spool, partition, .{ .algorithm = if (case.emeans) .emeans else .lloyd, .commit_bytes = 1024, .sample_bytes = 4096, .terminal_bytes = 4096, .compact_partition_bytes = if (case.compact) 32 * 1024 * 1024 else 0, .prebind_parents = case.prebind });
             try std.testing.expectEqual(@as(u64, count), index.stats().active_count);
+            try std.testing.expectEqual(@as(usize, 0), index.env_owner.lsm.backend.run_index_cache.items.len);
+            try std.testing.expect(cache.snapshotStats().used_bytes <= 64 * 1024);
+            try std.testing.expectEqual(case.prebind, index.getWriteProfile().update_parent_calls == 0);
+            if (case.prebind) try std.testing.expectEqual(@as(usize, 0), source.loads);
             try std.testing.expect(index.bulk_commit_rotation.commits > 1);
             try std.testing.expectEqual(@as(usize, 0), index.write_session_depth);
             try std.testing.expect(index.getWriteProfile().bulk_build_leaf_max_members <= config.leaf_size);
+            try std.testing.expectEqual(case.compact, index.getWriteProfile().bulk_spool_compact_rows != 0);
+            if (case.compact) {
+                try std.testing.expect(index.getWriteProfile().bulk_spool_partition_bytes < count * (dims * 4 + 16));
+                // A canonical region is read once even when both sampling and
+                // routing scan it; children read only their ordinal records.
+                try std.testing.expect(spool.read_bytes <= spool.written_bytes);
+            }
             try std.testing.expect((try index.verifyTreeLinks()).consistent());
             var iterator = dir.iterate();
             try std.testing.expect((try iterator.next(io)) == null);
@@ -36005,6 +36174,33 @@ test "spooled bulk construction bounds leaves commits and preserves reopened nat
             defer hits.deinit();
             try std.testing.expectEqual(@as(u64, i + 1), hits.getHits()[0].vector_id);
         }
+        try reopened.enableNativePostingMutationStore();
+        try reopened.beginExperimentalPostingMutationCapture();
+        try reopened.batchApplyOptions(&.{
+            .{ .vector_id = 101, .vector = values[100 * dims ..][0..dims], .metadata = "replacement" },
+            .{ .vector_id = count + 1, .vector = values[0..dims], .metadata = "appended" },
+        }, &.{2}, .{ .skip_vector_store = true });
+        try reopened.persistExperimentalPostingSidecarAtAppliedSequence(count + 1, .{});
+        try std.testing.expectEqual(@as(u64, count), reopened.stats().active_count);
+        try std.testing.expect((try reopened.getMetadata(2)) == null);
+        const replacement = (try reopened.getMetadata(101)).?;
+        defer a.free(replacement);
+        try std.testing.expectEqualStrings("replacement", replacement);
+        try reopened.finalizeExperimentalPostingGenerationAtAppliedSequence(count + 1, .{ .flatten = true });
+        var consolidated = try HBCIndex.open(a, path, config);
+        defer consolidated.close();
+        consolidated.setIo(io);
+        consolidated.setExternalVectorLoader(&source, Source.load);
+        try consolidated.activateExperimentalPostingReads(count + 1);
+        try std.testing.expectEqual(@as(u64, count), consolidated.stats().active_count);
+        try std.testing.expect((try consolidated.getMetadata(2)) == null);
+        const retained_replacement = (try consolidated.getMetadata(101)).?;
+        defer a.free(retained_replacement);
+        const appended = (try consolidated.getMetadata(count + 1)).?;
+        defer a.free(appended);
+        try std.testing.expectEqualStrings("replacement", retained_replacement);
+        try std.testing.expectEqualStrings("appended", appended);
+        try std.testing.expect((try consolidated.verifyTreeLinks()).consistent());
     }
 }
 
@@ -36128,4 +36324,268 @@ test "external lake bounded WAL native dense construction cancels within a mutat
     try std.testing.expect(probe.checks >= 4);
     try std.testing.expectError(error.Canceled, index.publishExperimentalPostingCheckpoint(0));
     try std.testing.expectError(error.Canceled, index.finalizeExperimentalPostingGenerationAtAppliedSequence(0, .{}));
+}
+
+test "spooled bulk private projection stays bounded across many immutable batches" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Budget = @import("../sql/memory_budget.zig");
+    var budget: Budget = .{ .backing = a, .limit = 16 * 1024 * 1024 };
+    const Trace = struct {
+        child: Allocator,
+        budget: *Budget,
+        fn owner(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self = owner(raw);
+            return self.child.rawAlloc(len, alignment, ra) orelse {
+                std.debug.print("BULK_ALLOCATION_DENIED requested={} live={} peak={}\n", .{ len, self.budget.live, self.budget.peak });
+                std.debug.dumpCurrentStackTrace(.{ .first_address = ra });
+                return null;
+            };
+        }
+        fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+            return owner(raw).child.rawResize(bytes, alignment, len, ra);
+        }
+        fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+            return owner(raw).child.rawRemap(bytes, alignment, len, ra);
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            owner(raw).child.rawFree(bytes, alignment, ra);
+        }
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+        }
+    };
+    var trace: Trace = .{ .child = budget.allocator(), .budget = &budget };
+    const ba = trace.allocator();
+    // The immutable exact-vector owner shares the same admission budget in
+    // the lake builder. Reserve its representative resident metadata footprint
+    // so projection finalization cannot pass by consuming that owner's share.
+    const resident_source = try ba.alloc(u8, 6 * 1024 * 1024 + 512 * 1024);
+    defer ba.free(resident_source);
+    var cache = try lsm_backend.Cache.initFallible(ba, 1024 * 1024);
+    defer cache.deinit();
+    var tp: TestPath = .{};
+    const path = tp.initDisk();
+    defer tp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, std.mem.span(path));
+    const scratch_path = try std.fmt.allocPrint(a, "{s}/scratch", .{path});
+    defer a.free(scratch_path);
+    try std.Io.Dir.cwd().createDir(io, scratch_path, .fromMode(0o700));
+    const dir = try std.Io.Dir.cwd().openDir(io, scratch_path, .{ .iterate = true });
+    defer dir.close(io);
+    var index = try HBCIndex.openWithLsmOptions(ba, path, .{ .dims = 768, .leaf_size = 32, .branching_factor = 4, .max_cached_nodes = 4, .max_cached_vectors = 0, .max_cached_metadata = 0, .use_quantization = true, .use_random_ortho_trans = false }, .{ .cache = &cache, .backend_options = .{ .compact_threshold_runs = std.math.maxInt(usize), .l0_soft_limit_runs = std.math.maxInt(usize), .l0_hard_limit_runs = std.math.maxInt(usize) } });
+    defer index.close();
+    index.setIo(io);
+    var spool: HBCIndex.BulkSpool = .{ .dir = dir, .io = io, .dims = 768 };
+    var buffer: [4096]u8 = undefined;
+    var output = try spool.create(&buffer);
+    var output_open = true;
+    defer if (output_open) output.abort(spool);
+    try output.enableIdentityCensus(ba, .{ .rows = 1024 });
+    const count = 65536;
+    for (0..count) |row| {
+        var vector: [768]f32 = undefined;
+        for (&vector, 0..) |*value, column| value.* = @floatFromInt((row * (column + 3)) % 1009);
+        var metadata: [96]u8 = @splat(0);
+        std.mem.writeInt(u64, metadata[0..8], row, .little);
+        try output.append(@as(u64, row) *% 0x9e3779b97f4a7c15, &metadata, &vector);
+    }
+    const partition = try output.finish(io);
+    output_open = false;
+    index.bulkBuildSpool(&spool, partition, .{ .commit_bytes = 64 * 1024, .sample_bytes = 64 * 1024, .terminal_bytes = 64 * 1024 }) catch |err| {
+        const backend = index.env_owner.lsm.backend;
+        std.debug.print("BULK_STATE owned_indexes={} owned_tables={} owned_states={} runs={} commits={} active={} live={} peak={}\n", .{ backend.run_index_cache.items.len, backend.run_table_cache.items.len, backend.run_state_cache.items.len, backend.runs.count(), index.bulk_commit_rotation.commits, index.metadata.active_count, budget.live, budget.peak });
+        return err;
+    };
+    try std.testing.expect(index.bulk_commit_rotation.commits > 100);
+    try std.testing.expectEqual(@as(u64, count), index.stats().active_count);
+    try std.testing.expect(budget.peak <= budget.limit);
+}
+
+test "spooled bulk local cache clocks remain bounded after eviction including zero ids" {
+    const a = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.initDisk();
+    defer tp.cleanup();
+    var index = try HBCIndex.open(a, path, .{ .dims = 2, .use_quantization = false, .max_cached_nodes = 2, .max_cached_vectors = 2, .max_cached_metadata = 2, .pinned_tree_depth = 0 });
+    defer index.close();
+    for (0..128) |i| {
+        const id: u64 = if (i % 7 == 0) 0 else i;
+        const values = [_]f32{ @floatFromInt(i), -@as(f32, @floatFromInt(i)) };
+        index.cache_mu.lockExclusive();
+        defer index.cache_mu.unlockExclusive();
+        var node: Node = .{ .id = id, .is_leaf = true, .level = 0, .parent = 1, .centroid = try a.dupe(f32, &values), .children = &.{}, .members = &.{} };
+        index.cacheNodeLocalLocked(node) catch |err| {
+            node.deinit(a);
+            return err;
+        };
+        var quantized: QuantizedSet = .{ .nonquant = .{ .vectors = .{ .dims = 2, .count = 1, .data = try a.dupe(f32, &values) } } };
+        index.cacheQuantizedLocalLocked(id, quantized) catch |err| {
+            quantized.deinit(a);
+            return err;
+        };
+        _ = try index.cacheVectorLocalLocked(id, &values);
+        try index.cacheMetadataLocalLocked(id, std.mem.asBytes(&id));
+        inline for (.{
+            .{ index.node_clock_keys, index.node_clock_states, &index.node_cache_slots, index.node_cache.count() },
+            .{ index.quantized_clock_keys, index.quantized_clock_states, &index.quantized_cache_slots, index.quantized_cache.count() },
+            .{ index.vector_clock_keys, index.vector_clock_states, &index.vector_cache_slots, index.vector_cache.count() },
+            .{ index.metadata_clock_keys, index.metadata_clock_states, &index.metadata_cache_slots, index.metadata_cache.count() },
+        }) |view| {
+            var occupied: usize = 0;
+            for (view[1], 0..) |state, slot| {
+                if (state == .empty) continue;
+                occupied += 1;
+                try std.testing.expectEqual(@as(?usize, slot), view[2].get(view[0][slot]));
+            }
+            try std.testing.expectEqual(view[3], occupied);
+            try std.testing.expectEqual(view[2].count(), occupied);
+            try std.testing.expect(occupied <= 2);
+        }
+    }
+    index.cache_mu.lockExclusive();
+    defer index.cache_mu.unlockExclusive();
+    try std.testing.expect(index.evictOneVectorCacheEntry(.one(.vector, 0)));
+    try std.testing.expect(index.vector_cache.contains(0));
+    try std.testing.expectEqual(@as(usize, 1), index.vector_cache.count());
+}
+
+test "spooled bulk adaptive publication retries only staging allocation failure" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        failure: ?anyerror,
+        calls: usize = 0,
+        fn active(raw: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.failure) |err| {
+                self.failure = null;
+                return err;
+            }
+        }
+    };
+    const Scenario = enum { admitted, allocation_failure, cancelled, io_failure, excessive_fanout };
+    for ([_]Scenario{ .admitted, .allocation_failure, .cancelled, .io_failure, .excessive_fanout }) |scenario| {
+        const failure: ?anyerror = switch (scenario) {
+            .allocation_failure => error.OutOfMemory,
+            .cancelled => error.Cancelled,
+            .io_failure => error.AccessDenied,
+            else => null,
+        };
+        var tp: TestPath = .{};
+        const path = tp.initDisk();
+        defer tp.cleanup();
+        var index = try HBCIndex.openWithLsmOptions(a, path, .{ .dims = 2, .leaf_size = 4, .branching_factor = 4, .use_quantization = true }, .{
+            .backend_options = .{ .flush_threshold = 1, .compact_threshold_runs = std.math.maxInt(usize), .l0_soft_limit_runs = std.math.maxInt(usize), .l0_hard_limit_runs = std.math.maxInt(usize) },
+        });
+        defer index.close();
+        index.setIo(std.testing.io);
+        try index.batchInsertWithMetadataOptions(&.{
+            .{ .vector_id = 1, .vector = &.{ 1, 0 }, .metadata = "first" },
+        }, .{ .skip_vector_store = true });
+        const backend = index.env_owner.lsm.backend;
+        try backend.flushBufferedWritesWithOptions(.{ .compact = false });
+        try index.batchInsertWithMetadataOptions(&.{
+            .{ .vector_id = 2, .vector = &.{ 0, 1 }, .metadata = "second" },
+        }, .{ .skip_vector_store = true });
+        try backend.flushBufferedWritesWithOptions(.{ .compact = false });
+        if (scenario == .excessive_fanout) {
+            try backend.beginBulkIngestSession();
+            for (0..HBCIndex.max_initial_posting_runs + 1) |id| {
+                var key: [8]u8 = undefined;
+                std.mem.writeInt(u64, &key, id, .big);
+                try backend.ingestSortedTableEntries(&.{.{ .namespace_name = "bootstrap_padding", .key = &key, .value = "padding" }});
+            }
+            try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+        }
+        const before = backend.runs.count();
+        try std.testing.expect(before > 1);
+        try std.testing.expectEqual(scenario == .excessive_fanout, before > HBCIndex.max_initial_posting_runs);
+        var store = try index.openExperimentalPostingStore();
+        defer store.deinit();
+        var check: Check = .{ .failure = failure };
+        if (scenario == .cancelled or scenario == .io_failure) {
+            try std.testing.expectError(failure.?, index.publishInitialPostingCheckpoint(&store, 1, 7, Check.active, &check));
+            try std.testing.expectEqual(before, backend.runs.count());
+            try std.testing.expect(index.experimentalPostingDurableAppliedSequence() == null);
+            continue;
+        }
+        const result = try index.publishInitialPostingCheckpoint(&store, 1, 7, Check.active, &check);
+        try std.testing.expectEqual(@as(u64, 7), result.covered_source_sequence);
+        try std.testing.expectEqual(@as(?u64, 7), index.experimentalPostingDurableAppliedSequence());
+        try std.testing.expect(check.calls > 0);
+        if (failure != null or scenario == .excessive_fanout) {
+            try std.testing.expect(backend.runs.count() < before);
+            try std.testing.expect(check.calls > 1);
+        } else {
+            // An admitted snapshot must not pay the consolidation I/O cost.
+            try std.testing.expectEqual(before, backend.runs.count());
+        }
+        const first = (try index.getMetadata(1)) orelse return error.MissingMetadata;
+        defer a.free(first);
+        try std.testing.expectEqualStrings("first", first);
+    }
+}
+
+test "spooled bulk ordered publication rows match point reads across holes and optional values" {
+    const a = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.initDisk();
+    defer tp.cleanup();
+    var index = try HBCIndex.open(a, path, .{ .dims = 2, .leaf_size = 4, .branching_factor = 4, .use_quantization = true });
+    defer index.close();
+    index.setIo(std.testing.io);
+    var values: [32][2]f32 = undefined;
+    var items: [32]BatchInsertItem = undefined;
+    for (&values, &items, 0..) |*vector, *item, i| {
+        vector.* = .{ @floatFromInt(i), @floatFromInt(i % 3) };
+        item.* = .{ .vector_id = i + 11, .vector = vector, .metadata = "key" };
+    }
+    try index.bulkBuildWithMetadataOptions(&items, .{ .algo = .kmeans });
+    const hole = index.nextNodeId();
+    {
+        var txn = try index.store.beginWrite();
+        errdefer txn.abort();
+        var key: [12]u8 = undefined;
+        try txn.put(.nodes, encodeNodeKey(&key, hole, .range), "orphan");
+        try txn.put(.nodes, encodeNodeKey(&key, hole + 100, .packed_node), "out-of-range");
+        try txn.put(.nodes, encodeNodeKey(&key, 0, .packed_node), "reserved-zero");
+        try txn.put(.nodes, encodeNodeKey(&key, index.metadata.root_node, .header), "ignored-legacy-column");
+        try txn.put(.nodes, encodeNodeKey(&key, index.metadata.root_node, .range), "");
+        var quant_key: [10]u8 = undefined;
+        try txn.put(.quant, encodeQuantKey(&quant_key, hole), "orphan-quant");
+        try txn.commit();
+    }
+    const Check = struct {
+        fn digest(idx: *HBCIndex, options: HBCIndex.InitialPostingRows.Options, point: bool) !struct { hash: [32]u8, count: usize } {
+            var rows = try HBCIndex.InitialPostingRows.initMode(idx, options, null, null, point);
+            defer rows.deinit();
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            var count: usize = 0;
+            while (try rows.next()) |row| {
+                var id: [8]u8 = undefined;
+                std.mem.writeInt(u64, &id, row.id, .little);
+                hash.update(&id);
+                for ([_]?[]const u8{ row.packed_node, row.range, row.posting, row.quantized }) |value| {
+                    var header: [9]u8 = undefined;
+                    header[0] = @intFromBool(value != null);
+                    std.mem.writeInt(u64, header[1..9], if (value) |bytes| bytes.len else 0, .little);
+                    hash.update(&header);
+                    if (value) |bytes| hash.update(bytes);
+                }
+                count += 1;
+            }
+            return .{ .hash = hash.finalResult(), .count = count };
+        }
+    };
+    for ([_]HBCIndex.InitialPostingRows.Options{ .{}, .{ .auxiliary = true, .quantized = .root }, .{ .auxiliary = true, .quantized = .all }, .{ .quantized = .all, .skip_root = true } }) |options| {
+        const point = try Check.digest(&index, options, true);
+        const ordered = try Check.digest(&index, options, false);
+        try std.testing.expect(point.count > 0);
+        try std.testing.expectEqual(point.count, ordered.count);
+        try std.testing.expectEqualSlices(u8, &point.hash, &ordered.hash);
+    }
 }

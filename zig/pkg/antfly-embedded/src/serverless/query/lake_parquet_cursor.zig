@@ -1156,7 +1156,7 @@ pub const Cursor = struct {
                 const lease = if (len <= probe.lease.bytes.len) probe.lease else full: {
                     probe.lease.release();
                     held = false;
-                    break :full try self.read(column.offset, len);
+                    break :full try self.read(column, column.offset, len);
                 };
                 held = false;
                 defer lease.release();
@@ -1195,7 +1195,7 @@ pub const Cursor = struct {
                 if (vector.is_double) {
                     // Keep authored doubles exact for SQL/stored-source reads.
                     // Embedding consumers perform their existing float32 cast.
-                    const encoded = try std.json.Stringify.valueAlloc(a, row.doubles, .{});
+                    const encoded = try VectorReader.doubleJson(a, row.doubles);
                     try json.append(a, encoded);
                     retained_bytes += row.doubles.len * @sizeOf(f64) + encoded.len + @sizeOf([]const u8) + 1;
                 } else {

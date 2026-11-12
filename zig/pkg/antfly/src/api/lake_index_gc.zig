@@ -117,12 +117,23 @@ pub const Collector = struct {
         self.result.complete = true;
         return self.result;
     }
+    pub fn markConstruction(self: *Collector, a: A, work: local.metadata_lake_index_catalog.ConstructionWork, namespace: ?[32]u8) !void {
+        const ref = work.manifest;
+        if (!try self.expand(.{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, .artifact, "bulk-construction")) return;
+        try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
+        const root = try @import("lake_bulk_work.zig").load(a, self.store, ref, self.cancellation());
+        const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, namespace);
+        if (!std.mem.eql(u8, &root.generation.domain, &domain)) return error.InvalidNativeLakeGcReference;
+        if (root.file_directory) |directory| try self.markNativeFiles(a, root.generation.domain, directory);
+        try self.markNativeGeneration(a, root.generation);
+    }
     pub fn markPublication(self: *Collector, publication: local.metadata_lake_index_catalog.Publication) !void {
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
         const a = scratch.allocator();
         var binding: ?@import("lake_cloud_publication.zig").Binding = if (self.store.providerStore()) |object| try @import("lake_cloud_publication.zig").Binding.init(std.heap.page_allocator, object, publication, self.cancellation()) else null;
         defer if (binding) |*value| value.deinit();
+        for (publication.construction) |work| try self.markConstruction(a, work, publication.namespace);
         var hydrated = publication;
         for (publication.opening_bundles) |bundle| _ = try self.mark(.{ .artifact_id = bundle.artifact.artifact_id, .checksum = bundle.artifact.checksum, .byte_len = bundle.artifact.byte_len });
         if (hydrated.directory) |directory| {

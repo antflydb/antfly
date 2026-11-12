@@ -401,3 +401,140 @@ test "external lake execution legacy quantization reopens actual codec and rebui
     try std.testing.expect(!dense.canReuseQuantization(4, config));
     try std.testing.expect(dense.canReuseQuantization(5, config));
 }
+
+test "external lake execution resumes a fused authored source after durable receipt interruption" {
+    try checkBulkSourceRecovery(false);
+    try checkBulkSourceRecovery(true);
+}
+
+fn checkBulkSourceRecovery(all_missing: bool) !void {
+    const native_client = @import("lake_execution_native_client.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var temp = try local.common_test_directory.TestDirectory.init("bulk-source-resume");
+    defer temp.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, temp.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    if (!all_missing) {
+        var put = try client.putObject("antfly", "vectors.parquet", @embedFile("testdata/lake_vectors_0.parquet"), .{});
+        put.deinit(a);
+    }
+    // Optional vector columns can be absent from a whole source file. The
+    // identity proof includes it, while source preparation emits no vectors.
+    var missing = try client.putObject("antfly", "missing.parquet", @embedFile("testdata/lake_vectors_missing.parquet"), .{});
+    missing.deinit(a);
+    const schema = try std.fmt.allocPrint(a,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"bulk-source","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema","row_identity":{{"key_columns":["body"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"body":{{"type":"string"}},"dense":{{"type":"array","items":{{"type":"number"}}}},"sparse":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
+    , .{temp.path()});
+    defer a.free(schema);
+    const support = @import("lake_execution_qualification_support.zig");
+    var authority: support.State = .{ .allocator = a, .io = io, .table = .{ .table_id = 71, .name = "bulk-source", .schema_json = schema, .indexes_json = "{\"dense\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2,\"lake_bulk_build\":\"lloyd\",\"quantization_bits\":4}}" }, .interrupt_after_bulk_source = true };
+    defer authority.deinit();
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
+    defer binding.deinit(a);
+    var source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer source.deinit();
+    var store = try @import("lake_index_store.zig").Store.openNative(a, null, null, false, .standalone, temp.path());
+    defer store.deinit();
+    const pending = try publication.beginWithLocator(a, io, authority.table, &source, store.identity, .{}, 100, 1000, store.locator);
+    defer a.free(pending);
+    try authority.set(pending);
+    var cause: ?anyerror = null;
+    // Reading old publications remains supported, but a new worker must
+    // renew an old pending attempt before advertising expanded artifacts.
+    {
+        var legacy = try catalog.parse(a, pending);
+        defer legacy.deinit();
+        for ([_]u16{ catalog.minimum_reader_protocol, catalog.native_reader_protocol - 1 }) |protocol| {
+            legacy.value.pending.?.reader_protocol = protocol;
+            const encoded = try catalog.encode(a, legacy.value);
+            defer a.free(encoded);
+            try authority.set(encoded);
+            try std.testing.expectError(error.LakeIndexPublicationFenceChanged, native_client.build(a, io, authority.table, .{}, try store.executionDescriptor(), .{}, .none, authority.clock(), authority.lease(), null, .{}, .{}, &cause));
+        }
+        try authority.set(pending);
+        authority.now_ms = legacy.value.pending.?.lease_expires_at_ms;
+        try std.testing.expectError(error.LakeIndexPublicationFenceChanged, native_client.build(a, io, authority.table, .{}, try store.executionDescriptor(), .{}, .none, authority.clock(), authority.lease(), null, .{}, .{}, &cause));
+        authority.now_ms = 101;
+    }
+    try std.testing.expectError(error.Cancelled, native_client.build(a, io, authority.table, .{}, try store.executionDescriptor(), .{}, .none, authority.clock(), authority.lease(), null, .{}, .{}, &cause));
+    var interrupted = try catalog.parse(a, authority.table.lake_index_catalog_json);
+    defer interrupted.deinit();
+    const saved = interrupted.value.checkpoint.?;
+    try std.testing.expect(interrupted.value.published == null);
+    try std.testing.expectEqual(@as(usize, 0), saved.declarations.len);
+    try std.testing.expectEqual(@as(usize, 1), saved.construction.len);
+    try std.testing.expect(saved.row_identity != null);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const phase = try @import("lake_bulk_work.zig").load(ca, store.artifactStore(), saved.construction[0].manifest, .none);
+    const expected: usize = if (all_missing) 0 else 231;
+    try std.testing.expectEqual(expected, phase.partition.count);
+    try std.testing.expect(phase.spool_from_exact);
+    try std.testing.expect((try @import("lake_index_native_directory.zig").lookup(phase.generation, store.artifactStore(), "bulk-spool/0000000000000000", .none, null)) == null);
+    const Collector = @import("lake_index_gc.zig").Collector;
+    var collector: Collector = .{ .a = ca, .table = 71, .authority = undefined, .store = store.artifactStore(), .identity = store.identity, .namespace = saved.namespace, .context = .{}, .token = @splat(1), .audit_only = true, .remaining_reads = 32 * 1024 * 1024 };
+    try collector.markConstruction(ca, saved.construction[0], saved.namespace);
+    try std.testing.expect(collector.marked.contains(saved.construction[0].manifest.artifact_id));
+    authority.interrupt_after_bulk_source = false;
+    authority.interrupt_at_bulk_receipt = 2;
+    authority.now_ms = 102;
+    try std.testing.expectError(error.Cancelled, native_client.build(a, io, authority.table, .{}, try store.executionDescriptor(), .{}, .none, authority.clock(), authority.lease(), null, .{}, .{}, &cause));
+    var clustered = try catalog.parse(a, authority.table.lake_index_catalog_json);
+    defer clustered.deinit();
+    const built_phase = try @import("lake_bulk_work.zig").load(ca, store.artifactStore(), clustered.value.checkpoint.?.construction[0].manifest, .none);
+    try std.testing.expect(built_phase.index_complete);
+    authority.interrupt_at_bulk_receipt = null;
+    authority.now_ms = 103;
+    const result = try native_client.build(a, io, authority.table, .{}, try store.executionDescriptor(), .{}, .none, authority.clock(), authority.lease(), null, .{}, .{}, &cause);
+    defer a.free(result);
+    var ready = try catalog.parse(a, result);
+    defer ready.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ready.value.published.?.construction.len);
+    const ref = ready.value.published.?.directory.?;
+    const declared = try @import("lake_index_directory.zig").loadDocument(ca, store.artifactStore(), .{ .kind = .external_base_source, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, .none, null);
+    try std.testing.expectEqual(@as(usize, 1), declared.declarations.len);
+    const dense = @import("lake_index_native_dense.zig");
+    const root = try dense.loadRoot(ca, store.artifactStore(), declared.declarations[0].artifact, .none, null);
+    const files = @import("lake_index_native_files.zig");
+    var reader: files.Reader = .{ .root = root.generation, .prefix = "/resumed-bulk", .store = store.artifactStore(), .context = .{}, .scratch = a };
+    defer reader.deinit();
+    var vectors = try local.storage_lsm_backend.Backend.open(a, "/resumed-bulk/vectors", .{ .storage = reader.storage(), .backend = .{ .read_only = true, .create_if_missing = false } });
+    defer vectors.close();
+    var config: local.storage_hbc_adapter.HBCConfig = .{ .dims = 2 };
+    try dense.applyStoredQuantization(a, &config, root);
+    var index = try local.storage_hbc_adapter.HBCIndex.openWithLsmOptions(a, "/resumed-bulk", config, .{ .storage = reader.storage(), .backend_options = .{ .backend = .{ .read_only = true, .create_if_missing = false } } });
+    defer index.close();
+    index.setIo(io);
+    var loader: dense.VectorLoader = .{ .backend = &vectors, .dims = 2 };
+    index.setExternalVectorLoader(&loader, dense.VectorLoader.load);
+    try index.activateExperimentalPostingReads(0);
+    try std.testing.expectEqual(@as(u64, expected), index.stats().active_count);
+    var hits = try index.search(&.{ 1, 1 }, 10);
+    defer hits.deinit();
+    try std.testing.expectEqual(@min(@as(usize, 10), expected), hits.getHits().len);
+
+    // Restore the completed-tree checkpoint, then lose a chunk of its exact
+    // source manifest. It must trigger a fenced rebuild, never an empty LSM
+    // initialization or a permanently poisoned recovery checkpoint.
+    const checkpoint_bytes = try catalog.encode(a, clustered.value);
+    defer a.free(checkpoint_bytes);
+    try authority.set(checkpoint_bytes);
+    const directory = @import("lake_index_native_directory.zig");
+    const source_manifest = (try directory.lookup(built_phase.generation, store.artifactStore(), "vectors/manifest.bin", .none, null)).?;
+    var navigation: directory.Navigation = .{ .allocator = a };
+    defer navigation.deinit();
+    const chunks = try navigation.chunks(ca, built_phase.generation, store.artifactStore(), source_manifest, 0, 1, .none, null);
+    var artifacts_store = store.artifactStore();
+    try artifacts_store.deleteWithCancellation(chunks[0].artifact_id, .none);
+    const discards_before = authority.discards;
+    const repaired_bytes = try native_client.build(a, io, authority.table, .{}, try store.executionDescriptor(), .{}, .none, authority.clock(), authority.lease(), null, .{}, .{}, &cause);
+    defer a.free(repaired_bytes);
+    var repaired = try catalog.parse(a, repaired_bytes);
+    defer repaired.deinit();
+    try std.testing.expect(authority.discards > discards_before);
+    try std.testing.expect(repaired.value.published != null and repaired.value.published.?.construction.len == 0);
+}

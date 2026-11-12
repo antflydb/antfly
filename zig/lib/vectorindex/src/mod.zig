@@ -56,6 +56,7 @@ comptime {
         _ = @import("vector_block_manifest.zig");
         _ = @import("hbc_vector_directory.zig");
         _ = @import("hbc_index.zig");
+        _ = @import("bulk_identity.zig");
         _ = @import("posting.zig");
         _ = @import("spfresh_index.zig");
         _ = @import("posting_subgroups.zig");

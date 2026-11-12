@@ -16,9 +16,11 @@
 //! Remote dense generations use the native HBC posting authority and its
 //! retained immutable checkpoint. No second posting codec or ranking implementation is involved.
 const std = @import("std");
+const probe = @import("lake_execution_probe_hooks.zig");
 const local = @import("antfly_local_sources");
 const state = @import("lake_index_native_state.zig");
 const files = @import("lake_index_native_files.zig");
+const bulk_work = @import("lake_bulk_work.zig");
 const stores = @import("../serverless/artifacts/store.zig");
 const artifacts = @import("lake_index_aggregate_artifact.zig");
 const rebuild = @import("../serverless/build/lake_rebuild.zig");
@@ -103,9 +105,14 @@ const BuildCancellation = struct {
         try self.token.check();
         try self.provider.context.ensureActive();
     }
+    fn checkStorage(raw: *const anyopaque) !void {
+        const self: *const BuildCancellation = @ptrCast(@alignCast(raw));
+        try self.token.check();
+        try self.provider.context.ensureActive();
+    }
 };
 
-fn vectorStoreOptions(storage: ?local.storage_lsm_backend.Storage) local.storage_lsm_backend.Options {
+pub fn vectorStoreOptions(storage: ?local.storage_lsm_backend.Storage) local.storage_lsm_backend.Options {
     return .{
         .storage = storage,
         .flush_threshold = 64 * 1024,
@@ -115,19 +122,43 @@ fn vectorStoreOptions(storage: ?local.storage_lsm_backend.Storage) local.storage
     };
 }
 
+/// Private fresh source runs are immutable after their receipt is pinned.
+/// Ordinary close-time L0 pressure must not rewrite those authenticated files.
+/// Incremental/serving backends retain normal maintenance policy on reopen.
+pub const bulk_run_entry_limit: usize = 65536;
+
+pub fn bulkVectorStoreOptions(storage: ?local.storage_lsm_backend.Storage) local.storage_lsm_backend.Options {
+    var options = vectorStoreOptions(storage);
+    options.retain_bloom_filters = false;
+    // This unpublished source has no serving grace period. Version pins remain
+    // authoritative; reclaim superseded ingest files after the durable seal.
+    options.obsolete_retention_ns = 0;
+    // Bound each decoded input index as well as the merge's stream count.
+    // The byte limit still splits unusually wide rows earlier.
+    options.max_run_file_entries = bulk_run_entry_limit;
+    options.compact_threshold_runs = std.math.maxInt(usize);
+    options.l0_soft_limit_runs = std.math.maxInt(usize);
+    options.l0_hard_limit_runs = std.math.maxInt(usize);
+    // Delay size-tier merging during ingest, then seal the complete window
+    // once before its receipt. This yields bounded-size, disjoint sorted runs
+    // rather than retaining one overlapping run for every 16 MiB input batch.
+    options.bulk_ingest_tiered_l0_fan_in = std.math.maxInt(usize);
+    return options;
+}
+
 /// Fresh snapshots publish sorted immutable source runs directly. The run
 /// codec, checkpoints, point readers and later mutation overlay stay shared.
-const FreshVectors = struct {
+pub const FreshVectors = struct {
     arena: std.heap.ArenaAllocator,
     entries: std.ArrayList(local.storage_lsm_backend.TableEntry) = .empty,
     bytes: usize = 0,
-    fn init(a: A) FreshVectors {
+    pub fn init(a: A) FreshVectors {
         return .{ .arena = .init(a) };
     }
-    fn deinit(self: *FreshVectors) void {
+    pub fn deinit(self: *FreshVectors) void {
         self.arena.deinit();
     }
-    fn append(self: *FreshVectors, namespace: []const u8, key: []const u8, value: []const u8) !void {
+    pub fn append(self: *FreshVectors, namespace: []const u8, key: []const u8, value: []const u8) !void {
         const a = self.arena.allocator();
         try self.entries.append(a, .{ .namespace_name = namespace, .key = try a.dupe(u8, key), .value = try a.dupe(u8, value) });
         self.bytes += key.len + value.len + @sizeOf(local.storage_lsm_backend.TableEntry);
@@ -136,7 +167,7 @@ const FreshVectors = struct {
         const order = std.mem.order(u8, lhs.namespace_name.?, rhs.namespace_name.?);
         return if (order == .eq) std.mem.order(u8, lhs.key, rhs.key) == .lt else order == .lt;
     }
-    fn flush(self: *FreshVectors, backend: *local.storage_lsm_backend.Backend) !void {
+    pub fn flush(self: *FreshVectors, backend: *local.storage_lsm_backend.Backend) !void {
         if (self.entries.items.len == 0) return;
         std.mem.sort(local.storage_lsm_backend.TableEntry, self.entries.items, {}, less);
         for (self.entries.items[1..], self.entries.items[0 .. self.entries.items.len - 1]) |entry, previous| {
@@ -223,13 +254,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const io = provider.context.io orelse return error.UnsupportedSqlExecution;
         var random: [16]u8 = undefined;
         try io.randomSecure(&random);
-        const path = try std.fmt.allocPrintSentinel(a, "/tmp/antfly-lake-dense-{s}", .{std.fmt.bytesToHex(random, .lower)}, 0);
+        const local_stage = if (provider.bulk_stage) |stage| if (stage.finished != null and std.mem.eql(u8, stage.name, wanted.name)) stage else null else null;
+        const path = if (local_stage) |stage| try a.dupeSentinel(u8, stage.path, 0) else try std.fmt.allocPrintSentinel(a, "/tmp/antfly-lake-dense-{s}", .{std.fmt.bytesToHex(random, .lower)}, 0);
         defer a.free(path);
-        try std.Io.Dir.cwd().createDir(io, path, .fromMode(0o700));
+        if (local_stage == null) try std.Io.Dir.cwd().createDir(io, path, .fromMode(0o700));
         defer std.Io.Dir.cwd().deleteTree(io, path) catch {};
-        const overlay = if (seed) |root| try files.Overlay.create(a, root.generation, store.*, path, provider.context, cancellation) else null;
-        defer if (overlay) |candidate| candidate.release();
-        const candidate_storage = if (overlay) |candidate| candidate.storage() else null;
         var budget: local.sql_memory_budget = .{ .backing = a, .limit = 256 * 1024 * 1024 };
         var build_cancellation: BuildCancellation = .{ .token = cancellation, .provider = provider };
         var build_options: ?hbc.HBCIndex.SpoolBuildOptions = null;
@@ -237,7 +266,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (algorithm != .string) return error.InvalidIndexConfig;
             const selected = std.meta.stringToEnum(@TypeOf((hbc.HBCIndex.SpoolBuildOptions{}).algorithm), algorithm.string) orelse return error.InvalidIndexConfig;
             if (selected == .emeans and options.metric != .l2_squared) return error.EmeansRequiresL2;
-            if (seed == null) build_options = .{ .algorithm = selected, .check = BuildCancellation.check, .context = &build_cancellation };
+            if (seed == null) build_options = .{ .algorithm = selected, .prebind_parents = provider.bulk_prebind_parents, .compact_partition_bytes = if (provider.bulk_compact_partitions) 32 * 1024 * 1024 else 0, .check = BuildCancellation.check, .context = &build_cancellation };
         }
         const configured_bulk = @import("lake_enrichment_units.zig").configured(configuration, "lake_bulk_build") != null;
         var bulk_input_limit: u64 = 512 * 1024 * 1024;
@@ -249,25 +278,66 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             tracker.output_bytes = bulk_input_limit;
             tracker.directory_bytes = bulk_input_limit;
         }
+        var source_work: ?bulk_work.Root = if (local_stage) |stage| stage.finished else null;
+        if (build_options != null) for (provider.construction) |work| {
+            if (!std.mem.eql(u8, work.name, wanted.name)) continue;
+            const root = bulk_work.load(ca, store.*, work.manifest, cancellation) catch |err| switch (err) {
+                error.FileNotFound, error.NotFound, error.ObjectNotFound, error.LakeIndexArtifactUnavailable => continue,
+                else => return err,
+            };
+            if (root.dims == dims and root.input_allowance == bulk_input_limit and std.mem.eql(u8, root.algorithm, @tagName(build_options.?.algorithm)) and
+                std.mem.eql(u8, &root.recipe, &recipe) and rebuild.bindingsEqual(root.binding, binding) and
+                std.mem.eql(u8, &root.generation.domain, &store.upload_scope.?.domain)) source_work = root;
+        };
+        const resuming_source = source_work != null;
+        const overlay = if (local_stage != null) null else if (seed) |root| try files.Overlay.create(a, root.generation, store.*, path, provider.context, cancellation) else if (source_work) |root| try files.Overlay.create(a, root.generation, store.*, path, provider.context, cancellation) else null;
+        defer if (overlay) |candidate| candidate.release();
+        const candidate_storage = if (overlay) |candidate| candidate.storage() else null;
         if (build_options != null) {
             // Construction consumes each source vector once per partition.
             // Keep retained HBC caches within the shared builder allocator.
-            const per_leaf = @as(usize, dims) * (@as(usize, options.leaf_size) + 8);
+            const per_leaf = @as(usize, dims) * (@as(usize, options.leaf_size) + 8) * @sizeOf(f32);
             options.max_cached_nodes = std.math.clamp((16 * 1024 * 1024) / per_leaf, 1, 256);
             options.max_cached_vectors = 0;
             options.max_cached_metadata = 0;
             options.pinned_tree_depth = 0;
         }
+        var projection_cache = if (build_options != null) try local.storage_lsm_backend.Cache.initFallible(budget.allocator(), 16 * 1024 * 1024) else null;
+        defer if (projection_cache) |*cache| cache.deinit();
+        const cache = if (projection_cache) |*value| value else null;
         const vector_path = try std.fmt.allocPrint(ca, "{s}/vectors", .{path});
-        var vectors = try local.storage_lsm_backend.Backend.open(budget.allocator(), vector_path, vectorStoreOptions(candidate_storage));
+        var vector_options = if (build_options != null) bulkVectorStoreOptions(candidate_storage) else vectorStoreOptions(candidate_storage);
+        if (build_options != null) vector_options.bulk_cancellation = .{ .ptr = &build_cancellation, .check_fn = BuildCancellation.checkStorage };
+        vector_options.cache = cache;
+        var vectors = try local.storage_lsm_backend.Backend.open(budget.allocator(), vector_path, vector_options);
         defer vectors.close();
         var fresh_vectors = FreshVectors.init(budget.allocator());
         defer fresh_vectors.deinit();
-        var source_session = build_options != null;
+        var source_session = build_options != null and !resuming_source;
         if (source_session) try vectors.beginBulkIngestSession();
         defer if (source_session) vectors.abortBulkIngestSession();
-        var index = try hbc.HBCIndex.openWithLsmOptions(budget.allocator(), path, options, .{ .storage = candidate_storage });
+        // This projection is an unpublished candidate, consumed by the native
+        // generation writer. Preserve its immutable batches without a final
+        // bulk-window merge or close-time pressure compaction.
+        var projection_options: local.storage_lsm_backend.Options = .{ .storage = candidate_storage, .cache = cache };
+        if (build_options != null) {
+            projection_options.bulk_cancellation = .{ .ptr = &build_cancellation, .check_fn = BuildCancellation.checkStorage };
+            projection_options.retain_bloom_filters = false;
+            projection_options.max_run_file_entries = bulk_run_entry_limit;
+            projection_options.bulk_ingest_tiered_l0_fan_in = 0;
+            projection_options.compact_threshold_runs = std.math.maxInt(usize);
+            projection_options.l0_soft_limit_runs = std.math.maxInt(usize);
+            projection_options.l0_hard_limit_runs = std.math.maxInt(usize);
+        }
+        var index = try hbc.HBCIndex.openWithLsmOptions(budget.allocator(), path, options, .{ .backend_options = projection_options, .storage = candidate_storage, .cache = cache });
         defer index.close();
+        errdefer if (comptime @hasDecl(@import("root"), "lakeExecutionProbeFamily")) {
+            const owned_indexes = switch (index.env_owner) {
+                .lsm => |handle| handle.backend.run_index_cache.items.len,
+                .native => 0,
+            };
+            std.debug.print("PARQUET_BULK_FAILURE allocator_live={} allocator_peak={} owned_indexes={} commits={} cached_nodes={} node_limit={} pinned_nodes={} cached_quantized={}\n", .{ budget.live, budget.peak, owned_indexes, index.bulk_commit_rotation.commits, index.node_cache.count(), index.config.max_cached_nodes, index.pinned_node_cache.count(), index.quantized_cache.count() });
+        };
         index.setIo(io);
         var loader: VectorLoader = .{ .backend = &vectors, .dims = dims };
         index.setExternalVectorLoader(&loader, VectorLoader.load);
@@ -286,14 +356,23 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer if (baseline_postings) |*cut| cut.deinit();
         const spool_path = try std.fmt.allocPrint(ca, "{s}/bulk-spool", .{path});
         const spool_dir = if (build_options != null) dir: {
-            try std.Io.Dir.cwd().createDir(io, spool_path, .fromMode(0o700));
+            if (local_stage == null) try std.Io.Dir.cwd().createDir(io, spool_path, .fromMode(0o700));
             break :dir try std.Io.Dir.cwd().openDir(io, spool_path, .{});
         } else null;
         defer if (spool_dir) |dir| dir.close(io);
         var spool: hbc.HBCIndex.BulkSpool = .{ .dir = spool_dir orelse undefined, .io = io, .dims = dims };
         var spool_buffer: [64 * 1024]u8 = undefined;
-        var spool_output = if (build_options != null) try spool.create(&spool_buffer) else null;
+        var spool_output = if (build_options != null and !resuming_source) try spool.create(&spool_buffer) else null;
         defer if (spool_output) |*output| output.abort(spool);
+        if (spool_output) |*output| try output.enableIdentityCensus(budget.allocator(), .{ .check = BuildCancellation.check, .context = &build_cancellation });
+        if (source_work) |root| {
+            if (local_stage == null and !root.index_complete) {
+                if (root.spool_from_exact) try bulk_work.rebuildPartition(budget.allocator(), store.*, root, &spool, provider, &index, &vectors, cancellation);
+                try bulk_work.restorePartition(budget.allocator(), store.*, root, &spool, provider.context, cancellation);
+            } else spool.next_file = 1;
+            index.rng.hi = root.rng_hi;
+            index.rng.lo = root.rng_lo;
+        }
         if (spool_output) |*output| try output.enableSample(budget.allocator(), 16 * 32, build_options.?.sample_bytes, index.rng.intN(std.math.maxInt(usize)));
         const transformed: []f32 = if (build_options != null) try budget.allocator().alloc(f32, dims) else &.{};
         defer if (build_options != null) budget.allocator().free(transformed);
@@ -343,11 +422,12 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var input_provider = provider.*;
         input_provider.only_plan = &plan;
         input_provider.enrichment_columns = @import("lake_enrichment_units.zig").configured(producer.config, "template") != null;
-        const rows = try input_provider.provider().open_with_cancellation_fn.?(input_provider.provider().ptr, a, binding, cancellation);
-        defer rows.deinit(a);
+        const rows = if (!resuming_source) try input_provider.provider().open_with_cancellation_fn.?(input_provider.provider().ptr, a, binding, cancellation) else null;
+        defer if (rows) |source_rows| source_rows.deinit(a);
         var input_remaining: u64 = bulk_input_limit;
         const input = if (provider.resume_work) |work| &work.native_input_left else &input_remaining;
-        while (try rows.next(a)) |batch| {
+        const ingest_started = probe.start();
+        while (if (rows) |source_rows| try source_rows.next(a) else null) |batch| {
             var page_arena = std.heap.ArenaAllocator.init(a);
             defer page_arena.deinit();
             const pa = page_arena.allocator();
@@ -412,19 +492,75 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 if (seed != null) try index.persistExperimentalPostingSidecarAtAppliedSequence(0, .{});
             }
         }
-        if (spool_output) |*output| {
-            const root = try output.finish(io);
+        probe.finish("dense_ingest", ingest_started);
+        if (build_options != null and !(source_work != null and source_work.?.index_complete)) {
+            const root = if (spool_output) |*output| output.finish(io) catch |err| return if (err == error.DuplicateVectorId) error.NativeLakeVectorIdentityCollision else err else source_work.?.partition;
             spool_output = null;
-            try fresh_vectors.flush(&vectors);
-            try vectors.finishBulkIngestSessionWithOptions(.{ .compact = false });
-            source_session = false;
+            if (!resuming_source) {
+                try fresh_vectors.flush(&vectors);
+                try vectors.finishBulkIngestSessionWithOptions(.{ .compact = false });
+                source_session = false;
+                try vectors.checkpointRecoveryManifest();
+                try tracker.finish();
+                if (provider.bulk_checkpoints and provider.progress != null and provider.progress.?.save_work != null) {
+                    var cut = try vectors.pinNativeCheckpoint();
+                    defer cut.deinit();
+                    var phase_bytes: u64 = bulk_input_limit *| 3;
+                    const phase_budget: files.OutputBudget = .{ .generation = &phase_bytes };
+                    var generation = try files.publishCheckpointPaged(a, &cut, .{ .version = 2, .domain = store.upload_scope.?.domain }, "vectors/", store, cancellation, phase_budget, null);
+                    generation = try bulk_work.publishPartition(a, store, cut.storage, generation, spool_path, root, cancellation, phase_budget, true);
+                    source_work = .{ .spool_from_exact = true, .census_order = plan.selection != null, .binding = binding, .recipe = recipe, .dims = dims, .algorithm = @tagName(build_options.?.algorithm), .input_allowance = bulk_input_limit, .generation = generation, .partition = root, .file_directory = try plan.publishDirectory(a, store, generation.domain, cancellation), .rng_hi = index.rng.hi, .rng_lo = index.rng.lo };
+                    try bulk_work.save(a, provider, store, wanted.name, source_work.?, cancellation);
+                }
+            }
+            const cluster_started = probe.start();
+            defer probe.finish("dense_cluster", cluster_started);
             index.bulkBuildSpool(&spool, root, build_options.?) catch |err| switch (err) {
                 error.DuplicateVectorId => return error.NativeLakeVectorIdentityCollision,
                 else => return err,
             };
+            if (comptime @hasDecl(@import("root"), "lakeExecutionProbeFamily")) {
+                const profile = index.getWriteProfile();
+                const report = try std.json.Stringify.valueAlloc(a, .{ .identity_census_verified = root.identities_verified, .identity_read_bytes = root.identity_read_bytes, .identity_written_bytes = root.identity_written_bytes, .identity_merge_inputs = root.identity_merge_inputs, .projection_cache_peak_bytes = if (projection_cache) |*value| value.snapshotStats().peak_used_bytes else 0, .owned_index_count = switch (index.env_owner) {
+                    .lsm => |handle| handle.backend.run_index_cache.items.len,
+                    .native => 0,
+                }, .partition_bytes = profile.bulk_spool_partition_bytes, .partition_read_bytes = profile.bulk_spool_partition_read_bytes, .compact_rows = profile.bulk_spool_compact_rows, .projection_commit_ns = profile.bulk_projection_commit_ns, .save_node_ns = profile.save_node_ns, .update_parent_ns = profile.update_parent_ns, .update_parent_calls = profile.update_parent_calls, .training_ns = profile.bulk_build_leaf_training_ns, .routing_ns = profile.bulk_build_leaf_route_ns, .allocator_peak_bytes = budget.peak }, .{});
+                defer a.free(report);
+                std.debug.print("PARQUET_BULK_WORK {s}\n", .{report});
+            }
+        } else if (!resuming_source) {
+            try tracker.finish();
         }
+        if (build_options != null and provider.bulk_checkpoints and provider.progress != null and source_work != null and !source_work.?.index_complete) {
+            var cut = try index.pinNativeCheckpoint();
+            defer cut.deinit();
+            var phase_bytes: u64 = bulk_input_limit *| 3;
+            const phase_budget: files.OutputBudget = .{ .generation = &phase_bytes };
+            if (comptime @hasDecl(@import("root"), "lakeExecutionProbeFamily")) {
+                var projection_bytes: u64 = cut.manifest_bytes.len;
+                for (cut.run_sizes) |size| projection_bytes += size;
+                const observation = try std.json.Stringify.valueAlloc(a, .{ .runs = cut.run_ids.len, .bytes = projection_bytes }, .{});
+                defer a.free(observation);
+                std.debug.print("PARQUET_BULK_PROJECTION {s}\n", .{observation});
+            }
+            var receipt = source_work.?;
+            receipt.generation = try files.publishCheckpointPaged(a, &cut, receipt.generation, "", store, cancellation, phase_budget, null);
+            const directory = @import("lake_index_native_directory.zig");
+            // The completed tree replaces the routing frontier; keep only its
+            // exact source and native projection in the new recovery closure.
+            var changes = [_]directory.FileChange{
+                .{ .path = try std.fmt.allocPrint(ca, "bulk-spool/{s}", .{receipt.partition.name}), .file = null },
+                .{ .path = try std.fmt.allocPrint(ca, "bulk-spool/{s}.sample", .{receipt.partition.name}), .file = null },
+            };
+            receipt.generation = try directory.applyChanges(a, store, receipt.generation, if (receipt.partition.sample_count != 0) &changes else changes[0..1], cancellation, null);
+            receipt.index_complete = true;
+            receipt.rng_hi = index.rng.hi;
+            receipt.rng_lo = index.rng.lo;
+            try bulk_work.save(a, provider, store, wanted.name, receipt, cancellation);
+            source_work = receipt;
+        }
+        if (resuming_source and source_work.?.index_complete and index.stats().active_count != source_work.?.partition.count) return error.InvalidNativeLakeFiles;
         if (incremental_session) try index.finishBulkIngestSessionWithOptions(.{});
-        try tracker.finish();
         finished = true;
         // Keep small committed deltas; compact at a bounded WAL/depth boundary.
         var flatten = seed == null;
@@ -435,7 +571,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (tip.sealed_wals[0..tip.sealed_wal_count]) |wal| wal_bytes +|= wal.committed_bytes;
             flatten = wal_bytes >= 32 * 1024 * 1024 or tip.segment_generations.len >= 8 or tip.sealed_wal_count >= 4;
         };
+        const checkpoint_started = probe.start();
         try index.finalizeExperimentalPostingGenerationAtAppliedSequence(0, .{ .flatten = flatten, .make_authoritative = true, .check = BuildCancellation.check, .context = &build_cancellation });
+        probe.finish("dense_checkpoint", checkpoint_started);
         var checkpoint = (try index.nativeBackupGeneration(a, 0)) orelse return error.InvalidNativeLakeDenseRoot;
         defer checkpoint.deinit();
         var output_remaining: u64 = if (configured_bulk) try std.math.mul(u64, bulk_input_limit, 2) else 1024 * 1024 * 1024;
@@ -444,22 +582,49 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer navigation.deinit();
         var vector_checkpoint = try vectors.pinNativeCheckpoint();
         defer vector_checkpoint.deinit();
+        const upload_started = probe.start();
+        if (comptime @hasDecl(@import("root"), "lakeExecutionProbeFamily")) if (source_work) |source_phase| {
+            const retained: files.Reuse = .{ .root = source_phase.generation, .navigation = &navigation };
+            var reused_bytes: u64 = 0;
+            var new_bytes: u64 = 0;
+            var reused_runs: usize = 0;
+            for (vector_checkpoint.run_paths, vector_checkpoint.run_ids) |physical, id| {
+                const name = try std.fmt.allocPrint(a, "vectors/runs/{d}.tbl", .{id});
+                defer a.free(name);
+                const size = try vector_checkpoint.storage.fileSize(physical);
+                const retained_file = try retained.lookup(store.*, name, cancellation);
+                if (retained_file != null and retained_file.?.bytes == size) {
+                    reused_runs += 1;
+                    reused_bytes += size;
+                } else new_bytes += size;
+            }
+            const observation = try std.json.Stringify.valueAlloc(a, .{ .runs = vector_checkpoint.run_ids.len, .reused_runs = reused_runs, .reused_bytes = reused_bytes, .new_bytes = new_bytes }, .{});
+            defer a.free(observation);
+            std.debug.print("PARQUET_BULK_SOURCE {s}\n", .{observation});
+        };
         const generation = if (seed != null and seed.?.generation.version == 2) delta: {
             const before = try combineExtents(ca, try generationExtents(ca, &baseline_postings.?), try files.checkpointExtents(ca, &baseline_vectors.?, "vectors/"));
             const after = try combineExtents(ca, try generationExtents(ca, &checkpoint), try files.checkpointExtents(ca, &vector_checkpoint, "vectors/"));
             break :delta try files.publishExtentDelta(a, ca, checkpoint.storage, before, after, seed.?.generation, store, cancellation, output_bytes);
         } else full: {
             const posting_generation = try publishGeneration(a, ca, &checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .navigation = &navigation } else null);
-            const vector_generation = try files.publishCheckpoint(a, ca, &vector_checkpoint, store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .prefix = "vectors/", .navigation = &navigation } else null);
-            const staging_generation = try combineVectors(ca, posting_generation, vector_generation);
-            break :full try @import("lake_index_native_directory.zig").persist(a, ca, store, staging_generation, if (seed) |root| root.generation else null, cancellation, if (provider.resume_work) |work| &work.native_output_left else null);
+            const directory = @import("lake_index_native_directory.zig");
+            const posting_root = try directory.persist(a, ca, store, posting_generation, null, cancellation, if (provider.resume_work) |work| &work.native_output_left else null);
+            break :full try files.publishCheckpointPaged(a, &vector_checkpoint, posting_root, "vectors/", store, cancellation, output_bytes, if (seed) |root| .{ .root = root.generation, .navigation = &navigation } else if (source_work) |root| .{ .root = root.generation, .navigation = &navigation } else null);
         };
-        const root: Root = .{ .binding = binding, .config_json = config.config_json, .dims = dims, .metric = metric, .generation = generation, .recipe = recipe, .file_states = if (!plan.isPaged()) plan.files else &.{}, .file_directory = if (plan.isPaged()) try plan.publishDirectory(a, store, generation.domain, cancellation) else null };
+        probe.finish("dense_upload", upload_started);
+        const root: Root = .{ .binding = binding, .config_json = config.config_json, .dims = dims, .metric = metric, .generation = generation, .recipe = recipe, .file_states = if (source_work == null and !plan.isPaged()) plan.files else &.{}, .file_directory = if (source_work) |root| root.file_directory else if (plan.isPaged()) try plan.publishDirectory(a, store, generation.domain, cancellation) else null };
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > files.max_root_bytes) return error.NativeLakeFilesTooLarge;
         if (provider.resume_work) |work| try stores.chargeReadBudget(&work.native_output_left, bytes.len);
         var uploaded = try store.putWithCancellation(bytes, cancellation);
         defer uploaded.deinit(store.allocator);
+        if (comptime @hasDecl(@import("root"), "lakeExecutionProbeFamily")) {
+            const source_peak = if (local_stage) |stage| stage.budget.peak else 0;
+            const observation = try std.json.Stringify.valueAlloc(a, .{ .dense_allocator_peak_bytes = budget.peak, .source_allocator_peak_bytes = source_peak, .max_vector_allocator_peak_bytes = @max(budget.peak, source_peak) }, .{});
+            defer a.free(observation);
+            std.debug.print("PARQUET_BULK_MEMORY {s}\n", .{observation});
+        }
         const declaration: Declared = .{ .name = wanted.name, .binding = binding, .artifact = .{ .kind = .vector_segment, .name = wanted.name, .metadata_version = metadata_version, .artifact_id = uploaded.artifact_id, .byte_len = uploaded.byte_len, .checksum = uploaded.checksum } };
         const encoded = try std.json.Stringify.valueAlloc(ca, declaration, .{});
         try result.append(out, try std.json.parseFromSliceLeaky(Declared, out, encoded, .{ .allocate = .alloc_always }));
@@ -671,7 +836,7 @@ test "external lake execution immutable exact vectors bypass WAL within source q
     const encoded = try @import("antfly_vector").codec.encodePackedF32BytesAlloc(a, &vector);
     defer a.free(encoded);
     {
-        var backend = try local.storage_lsm_backend.Backend.open(budget.allocator(), path, vectorStoreOptions(null));
+        var backend = try local.storage_lsm_backend.Backend.open(budget.allocator(), path, bulkVectorStoreOptions(null));
         defer backend.close();
         try backend.beginBulkIngestSession();
         var fresh = FreshVectors.init(budget.allocator());
@@ -683,6 +848,10 @@ test "external lake execution immutable exact vectors bypass WAL within source q
         }
         try fresh.flush(&backend);
         try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+        try backend.checkpointRecoveryManifest();
+        var sealed = try backend.pinNativeCheckpoint();
+        defer sealed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), sealed.run_ids.len);
         const stats = backend.snapshotWriteStats();
         try std.testing.expect(stats.sorted_ingest_runs > 0);
         try std.testing.expectEqual(@as(u64, 0), stats.wal_append_bytes);
@@ -690,7 +859,7 @@ test "external lake execution immutable exact vectors bypass WAL within source q
         try std.testing.expect(@as(u64, count) * dims * 4 > budget.limit);
         try std.testing.expect(budget.peak <= budget.limit);
     }
-    var reopened = try local.storage_lsm_backend.Backend.open(budget.allocator(), path, vectorStoreOptions(null));
+    var reopened = try local.storage_lsm_backend.Backend.open(budget.allocator(), path, bulkVectorStoreOptions(null));
     defer reopened.close();
     var read = try reopened.beginRead();
     defer read.abort();
@@ -698,4 +867,88 @@ test "external lake execution immutable exact vectors bypass WAL within source q
         var key: [32]u8 = undefined;
         try std.testing.expectEqualSlices(u8, encoded, try read.get(.{ .name = "exact_vectors" }, try std.fmt.bufPrint(&key, "row-{d:0>8}", .{row})));
     }
+}
+
+test "external lake execution private source caps narrow SST entry counts across seal and reopen" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("offline-source-entry-cap");
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}/vectors", .{directory.path()});
+    defer a.free(path);
+    var budget: local.sql_memory_budget = .{ .backing = a, .limit = 16 * 1024 * 1024 };
+    const count = bulk_run_entry_limit + 1;
+    const encoded = try @import("antfly_vector").codec.encodePackedF32BytesAlloc(a, &.{ 1, 2 });
+    defer a.free(encoded);
+    {
+        var backend = try local.storage_lsm_backend.Backend.open(budget.allocator(), path, bulkVectorStoreOptions(null));
+        defer backend.close();
+        try backend.beginBulkIngestSession();
+        var fresh = FreshVectors.init(budget.allocator());
+        defer fresh.deinit();
+        for (0..count) |row| {
+            var key: [32]u8 = undefined;
+            try fresh.append("exact_vectors", try std.fmt.bufPrint(&key, "row-{d:0>8}", .{row}), encoded);
+            // Match the thousands of ingest runs in a corpus-scale source.
+            if (row % 32 == 31) try fresh.flush(&backend);
+        }
+        try fresh.flush(&backend);
+        try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+        try backend.checkpointRecoveryManifest();
+        try std.testing.expect(backend.runs.count() >= 2);
+        var rows: usize = 0;
+        for (0..backend.runs.count()) |i| {
+            const run = backend.runs.at(i);
+            try std.testing.expect(run.entry_count <= bulk_run_entry_limit);
+            try std.testing.expect(run.bloom_filter == null);
+            rows += run.entry_count;
+        }
+        try std.testing.expectEqual(count, rows);
+        try std.testing.expect(budget.footprint() <= budget.limit);
+    }
+    var reopened = try local.storage_lsm_backend.Backend.open(budget.allocator(), path, bulkVectorStoreOptions(null));
+    defer reopened.close();
+    const runs_path = try std.fs.path.join(a, &.{ path, "runs" });
+    defer a.free(runs_path);
+    const physical_runs = try reopened.storage.?.listFileNamesAlloc(a, runs_path);
+    defer local.storage_lsm_backend.Storage.freeFileNames(a, physical_runs);
+    // Recovery must not retain the old pre-merge corpus through its manifest.
+    try std.testing.expectEqual(reopened.runs.count(), physical_runs.len);
+    var read = try reopened.beginRead();
+    defer read.abort();
+    var key: [32]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, encoded, try read.get(.{ .name = "exact_vectors" }, try std.fmt.bufPrint(&key, "row-{d:0>8}", .{count - 1})));
+}
+
+test "external lake execution immutable source receipt survives close and reopen without run rewrites" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("offline-source-receipt");
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}/vectors", .{directory.path()});
+    defer a.free(path);
+    var ids: std.ArrayList(u64) = .empty;
+    defer ids.deinit(a);
+    {
+        var backend = try local.storage_lsm_backend.Backend.open(a, path, bulkVectorStoreOptions(null));
+        defer backend.close();
+        // Exceed the ordinary close-time L0 hard limit without a large fixture.
+        var fresh = FreshVectors.init(a);
+        defer fresh.deinit();
+        for (0..24) |row| {
+            var key: [32]u8 = undefined;
+            try fresh.append("exact_vectors", try std.fmt.bufPrint(&key, "row-{d:0>8}", .{row}), "immutable");
+            try fresh.flush(&backend);
+        }
+        var cut = try backend.pinNativeCheckpoint();
+        defer cut.deinit();
+        try std.testing.expect(cut.run_ids.len > 8);
+        try ids.appendSlice(a, cut.run_ids);
+    }
+    var reopened = try local.storage_lsm_backend.Backend.open(a, path, bulkVectorStoreOptions(null));
+    defer reopened.close();
+    var cut = try reopened.pinNativeCheckpoint();
+    defer cut.deinit();
+    try std.testing.expectEqualSlices(u64, ids.items, cut.run_ids);
+    var read = try reopened.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("immutable", try read.get(.{ .name = "exact_vectors" }, "row-00000023"));
 }

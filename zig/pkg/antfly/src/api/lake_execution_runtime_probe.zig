@@ -35,6 +35,17 @@ fn count(comptime name: [:0]const u8, fallback: usize, maximum: usize) !usize {
     if (value == 0 or value > maximum) return error.InvalidProbeWorkload;
     return value;
 }
+fn bulkPhaseTimes(counts: bool) [metrics.names.len + metrics.bulk_names.len]u64 {
+    var result: [metrics.names.len + metrics.bulk_names.len]u64 = undefined;
+    const base = familyTimes(.native, counts);
+    @memcpy(result[0..base.len], &base);
+    for (result[base.len..], 0..) |*value, index| value.* = if (counts)
+        @extern(*const fn (u8) callconv(.c) u64, .{ .name = "antfly_lake_probe_bulk_calls" })(@intCast(index))
+    else
+        @extern(*const fn (u8) callconv(.c) u64, .{ .name = "antfly_lake_probe_bulk_ns" })(@intCast(index));
+    return result;
+}
+
 fn writeFile(a: A, client: *local.storage_object_storage.ObjectStorage, ordinal: usize, rows: usize) !void {
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
@@ -201,6 +212,12 @@ pub fn run(io: std.Io) !void {
 /// vector column, including identity construction and artifact publication.
 fn runParquet(io: std.Io, uri: []const u8) !void {
     const a = std.heap.smp_allocator;
+    const provider_test = @extern(*const fn () callconv(.c) u8, .{ .name = "antfly_lake_probe_builtin_is_test" })() != 0;
+    const provider_mode = @extern(*const fn () callconv(.c) u8, .{ .name = "antfly_lake_probe_optimize" })();
+    if (@import("builtin").is_test or provider_test or !std.mem.eql(u8, @tagName(@import("builtin").mode), "fast") or provider_mode != 1) return error.InvalidProbeWorkload;
+    const mode_json = try std.json.Stringify.valueAlloc(a, .{ .caller = @tagName(@import("builtin").mode), .caller_value = @as(u8, 1), .provider = provider_mode, .provider_is_test = provider_test }, .{});
+    defer a.free(mode_json);
+    std.debug.print("PARQUET_BULK_BUILD_MODE {s}\n", .{mode_json});
     const dims = try count("ANTFLY_LAKE_BULK_DIMS", 768, 65536);
     const allowance = try count("ANTFLY_LAKE_BULK_INPUT_BYTES", 4 * 1024 * 1024 * 1024, std.math.maxInt(usize) / 2);
     const algorithm = if (std.c.getenv("ANTFLY_LAKE_BULK_ALGORITHM")) |raw| std.mem.span(raw) else "lloyd";
@@ -252,7 +269,13 @@ fn runParquet(io: std.Io, uri: []const u8) !void {
     try state.set(pending);
     var cause: ?anyerror = null;
     const started = @import("antfly_platform").time.monotonicNs();
-    const result = try @import("lake_execution_native_client.zig").build(a, io, state.table, .{}, try store.executionDescriptor(), context, .none, state.clock(), state.lease(), null, .{}, .{}, &cause);
+    const result = try @import("lake_execution_native_client.zig").build(a, io, state.table, .{}, try store.executionDescriptor(), context, .none, state.clock(), state.lease(), null, .{
+        .identity_spill_bytes = if (std.c.getenv("ANTFLY_LAKE_BULK_IDENTITY_SPILL_BYTES")) |value| try std.fmt.parseUnsigned(u64, std.mem.span(value), 10) else 1024 * 1024 * 1024,
+        .bulk_prebind_parents = if (std.c.getenv("ANTFLY_LAKE_BULK_PREBIND")) |flag| !std.mem.eql(u8, std.mem.span(flag), "0") else true,
+        .bulk_compact_partitions = if (std.c.getenv("ANTFLY_LAKE_BULK_COMPACT")) |flag| !std.mem.eql(u8, std.mem.span(flag), "0") else false,
+        .fuse_bulk_identity = if (std.c.getenv("ANTFLY_LAKE_BULK_FUSED")) |flag| !std.mem.eql(u8, std.mem.span(flag), "0") else true,
+        .bulk_source_checkpoints = if (std.c.getenv("ANTFLY_LAKE_BULK_CHECKPOINT")) |flag| !std.mem.eql(u8, std.mem.span(flag), "0") else true,
+    }, .{}, &cause);
     defer a.free(result);
     const elapsed = @import("antfly_platform").time.monotonicNs() - started;
     var ready = try catalog.parse(a, result);
@@ -289,4 +312,96 @@ fn runParquet(io: std.Io, uri: []const u8) !void {
     defer hits.deinit();
     if (hits.getHits().len == 0) return error.InvalidProbeWorkload;
     std.debug.print("PARQUET_BULK algorithm={s} vectors={} dims={} total_ns={} reopened_hits={} checkpoints={} logical_identity={}\n", .{ algorithm, index.stats().active_count, dims, elapsed, hits.getHits().len, state.checkpoints, ready.value.published.?.row_identity != null });
+    const phase_json = try std.json.Stringify.valueAlloc(a, .{ .names = metrics.names ++ metrics.bulk_names, .ns = bulkPhaseTimes(false), .calls = bulkPhaseTimes(true) }, .{});
+    defer a.free(phase_json);
+    std.debug.print("PARQUET_BULK_PHASES {s}\n", .{phase_json});
+    if (std.c.getenv("ANTFLY_LAKE_BULK_RECALL_DIR")) |raw| try parquetRecall(a, io, &index, &source, store.artifactStore(), root, std.mem.span(raw), dims);
+}
+
+fn parquetRecall(a: A, io: std.Io, index: *local.storage_hbc_adapter.HBCIndex, source: *local.serverless_query_lake_serving.ServingSource, store: @import("../serverless/artifacts/store.zig").ArtifactStore, root: @import("lake_index_native_dense.zig").Root, path: []const u8, dims: usize) !void {
+    // Truth uses one-based physical ordinals in lexically sorted object order.
+    // Authenticated private file identities map hits back to those coordinates.
+    const inventory = source.inventory;
+    const native_state = @import("lake_index_native_state.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const entries = if (root.file_directory) |directory| try native_state.directoryFiles(arena.allocator(), store, directory, root.generation.domain, .none) else root.file_states;
+    const group_rows = try arena.allocator().alloc([]u64, inventory.files.len);
+    for (inventory.files, group_rows) |file, *rows| {
+        var footer = try local.serverless_query_lake_schema.readFooter(a, source.scanner.reader(), file);
+        defer footer.deinit(a);
+        rows.* = try arena.allocator().alloc(u64, footer.row_groups.len);
+        for (footer.row_groups, rows.*) |group, *count_| count_.* = group.row_count;
+    }
+    const order = try a.alloc(usize, inventory.files.len);
+    defer a.free(order);
+    for (order, 0..) |*ordinal, i| ordinal.* = i;
+    std.mem.sort(usize, order, inventory.files, struct {
+        fn less(files: []const local.serverless_external_source_types.FileEntry, left: usize, right: usize) bool {
+            return std.mem.lessThan(u8, files[left].object_uri, files[right].object_uri);
+        }
+    }.less);
+    const query_path = try std.fs.path.join(a, &.{ path, "queries.f32" });
+    defer a.free(query_path);
+    const truth_path = try std.fs.path.join(a, &.{ path, "truth.u64" });
+    defer a.free(truth_path);
+    const query_bytes = try std.Io.Dir.cwd().readFileAlloc(io, query_path, a, .limited(64 * 1024 * 1024));
+    defer a.free(query_bytes);
+    const truth_bytes = try std.Io.Dir.cwd().readFileAlloc(io, truth_path, a, .limited(8 * 1024 * 1024));
+    defer a.free(truth_bytes);
+    if (query_bytes.len == 0 or query_bytes.len % (dims * 4) != 0) return error.InvalidProbeWorkload;
+    const nq = query_bytes.len / (dims * 4);
+    if (nq > 1000 or truth_bytes.len != nq * 100 * 8) return error.InvalidProbeWorkload;
+    const queries = try a.alloc(f32, query_bytes.len / 4);
+    defer a.free(queries);
+    for (queries, 0..) |*value, ordinal| value.* = @bitCast(std.mem.readInt(u32, query_bytes[ordinal * 4 ..][0..4], .little));
+    var last_recall: f64 = 0;
+    for ([_]usize{ 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072 }) |probes| {
+        index.config.flat_centroid_probe_count = probes;
+        var found: usize = 0;
+        var scored: u64 = 0;
+        const started = @import("antfly_platform").time.monotonicNs();
+        for (0..nq) |qi| {
+            var result = try index.searchProfiledRequest(.{ .query = queries[qi * dims ..][0..dims], .k = 100, .search_width = @intCast(probes), .epsilon = 7, .rerank_factor = 4, .load_metadata = true });
+            defer result.results.deinit();
+            for (result.results.getHits()) |hit| {
+                const key = hit.metadata orelse return error.InvalidProbeWorkload;
+                const coordinates = try local.storage_rowsource_identity.parse(key);
+                const file_state = for (entries) |entry| {
+                    const digest = std.fmt.bytesToHex(&(entry.key_digest orelse entry.digest), .lower);
+                    if (std.mem.eql(u8, &digest, coordinates.digest)) break entry;
+                } else {
+                    std.log.err("recall private key has no authenticated file: {s}", .{key});
+                    return error.InvalidProbeWorkload;
+                };
+                var ordinal: u64 = coordinates.row + 1;
+                var matched = false;
+                for (order) |fi| {
+                    const file = inventory.files[fi];
+                    if (std.mem.eql(u8, file.file_id, file_state.id)) {
+                        if (coordinates.group >= group_rows[fi].len or coordinates.row >= group_rows[fi][coordinates.group]) {
+                            std.log.err("recall coordinate outside pinned footer file={s} group={} row={}", .{ file.file_id, coordinates.group, coordinates.row });
+                            return error.InvalidProbeWorkload;
+                        }
+                        for (group_rows[fi][0..coordinates.group]) |count_| ordinal += count_;
+                        matched = true;
+                        break;
+                    }
+                    for (group_rows[fi]) |count_| ordinal += count_;
+                }
+                if (!matched) return error.InvalidProbeWorkload;
+                for (0..100) |rank| if (std.mem.readInt(u64, truth_bytes[(qi * 100 + rank) * 8 ..][0..8], .little) == ordinal) {
+                    found += 1;
+                    break;
+                };
+            }
+            scored += result.profile.approx_vectors_scored;
+        }
+        last_recall = @as(f64, @floatFromInt(found)) / @as(f64, @floatFromInt(nq * 100));
+        const report = try std.json.Stringify.valueAlloc(a, .{ .queries = nq, .probes = probes, .k = 100, .hits = found, .recall = last_recall, .scored = scored, .elapsed_ns = @import("antfly_platform").time.monotonicNs() - started }, .{});
+        defer a.free(report);
+        std.debug.print("PARQUET_BULK_RECALL {s}\n", .{report});
+        if (probes >= 8192 and last_recall >= 0.95) break;
+    }
+    if (last_recall < 0.95) return error.InvalidProbeWorkload;
 }

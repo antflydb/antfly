@@ -117,15 +117,21 @@ pub fn nativeFragmentsEligible(configs: std.json.Value) bool {
     if (configs != .object) return false;
     for (configs.object.values()) |config| {
         if (!configurationReusable(config)) return false;
-        // Offline construction consumes one complete physical snapshot. A
-        // fragment payload plane would duplicate the vector corpus before that
-        // scan, and can exhaust optional capture admission on large imports.
-        if (@import("lake_enrichment_units.zig").configured(config, "lake_bulk_build") != null) return false;
         const kind = config.object.get("type") orelse return false;
         if (kind != .string or !(std.mem.eql(u8, kind.string, "full_text") or std.mem.eql(u8, kind.string, "embeddings") or std.mem.eql(u8, kind.string, "algebraic"))) return false;
     }
     return true;
 }
+/// Whole-source construction skips optional payload copies only on a fresh
+/// publication. Keeping the option configured must not disable later deltas.
+pub fn fragmentsEligibleForBuild(configs: std.json.Value, fresh: bool) bool {
+    if (!nativeFragmentsEligible(configs)) return false;
+    if (fresh) for (configs.object.values()) |config| {
+        if (@import("lake_enrichment_units.zig").configured(config, "lake_bulk_build") != null) return false;
+    };
+    return true;
+}
+
 pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, source: *@import("lake_index_row_source.zig").Provider, base: local.serverless_manifest_base_source.BaseSourceDescriptor) ![]const Recipe {
     var desired = try @import("../serverless/build/lake_rebuild.zig").desiredArtifactsFromResolvedExternalSourceAlloc(a, base, source.source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .indexes_json = table.indexes_json });
     defer desired.deinit(a);
@@ -328,7 +334,8 @@ test "external lake execution input recipes decline payload capture for enrichme
     defer arena.deinit();
     for ([_][]const u8{ "{}", "{\"text\":{\"type\":\"full_text\",\"field\":\"body\"}}", "{\"graph\":{\"type\":\"graph\"}}", "{\"text\":{\"type\":\"full_text\",\"enrichments\":[{}]}}", "{\"dense\":{\"type\":\"embeddings\",\"lake_bulk_build\":\"lloyd\"}}", "{\"dense\":{\"type\":\"embeddings\",\"lake_bulk_build\":\"emeans\"}}" }, 0..) |bytes_, i| {
         const config = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), bytes_, .{});
-        try std.testing.expectEqual(i < 2, nativeFragmentsEligible(config));
+        try std.testing.expectEqual(i < 2, fragmentsEligibleForBuild(config, true));
+        try std.testing.expectEqual(i < 2 or i >= 4, fragmentsEligibleForBuild(config, false));
     }
 }
 

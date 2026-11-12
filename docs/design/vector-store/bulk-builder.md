@@ -3,11 +3,18 @@
 Fresh native Parquet lake indexes can select sampled hierarchical Lloyd or
 e-means construction. The build operates on the complete source snapshot.
 Configurations with offline clustering run as whole-source consumers in the
-lake producer pipeline. They use the physical source provider and skip optional
-logical fragment payload capture and assembly, avoiding another vector-corpus
-copy ahead of the bulk scan. Stable row membership and input evidence remain
-verified. Subsequent published-generation updates use the native
-incremental mutation path.
+lake producer pipeline. A fresh, single authored dense index with stable row
+identity tees the verifier's typed batches directly into immutable exact-vector
+runs and the transformed root partition. Identity verification must finish before
+these private outputs become recoverable work. No intermediate replay corpus or
+second Parquet decode is required on this path. Generated embeddings, multiple
+consumers, and unavailable identity evidence retain ordinary source consumption.
+
+Fresh offline construction skips optional logical fragment payload assembly.
+That decision is phase-specific: keeping bulk mode configured does not disable
+fragment assembly and logical deltas for subsequent published-generation updates.
+Existing physical generations can require a one-time rebase into the logical
+fragment namespace when adopting that representation.
 
 ## Configuration
 
@@ -54,7 +61,14 @@ separately to process RSS.
    embedding consumers perform their float32 conversion at the vector boundary.
    SQL and stored-source reads preserve doubles, including finite values outside
    the float32 range. Repetition and definition levels preserve rows across page
-   boundaries and distinguish null lists from empty lists. The reader retains
+   boundaries and distinguish null lists from empty lists. Numeric SQL arrays
+   may exceed embedding dimensions and may contain null elements. Packed float
+   columns use a reader-produced NaN sentinel for null coordinates; actual
+   nonfinite authored coordinates are rejected, SQL materializes the sentinel
+   as null, and embedding consumers reject it. DOUBLE SQL arrays serialize null
+   explicitly, without converting it into a nonfinite-number string. FLOAT pages
+   and dictionaries decode directly to float32, avoiding a float64 intermediate.
+   The reader retains
    one physical page and a bounded output cohort. Zstandard pages use the shared
    native decoder's bounded Huffman prefix table: at most 2,048 two-byte entries
    replace per-literal linear symbol searches. Short stream tails retain exact
@@ -80,47 +94,148 @@ separately to process RSS.
    capacities. This bounds recursive progress for identical vectors and skewed
    inputs. The progress threshold always requires at least one row to leave the
    largest child, including two-row and three-row forced-spill partitions.
-5. Finish small partitions in memory under an 8 MiB admission estimate covering
+5. With an explicit compact-partition allowance, when a nonterminal partition
+   fits an admitted canonical region (32 MiB in qualification),
+   retain its original checked records in bounded memory. Descendants then store
+   12-byte checksummed offsets instead of copying vectors and keys. Each gather
+   verifies both the ordinal record and the original record. Large regions stay
+   sequential full-vector partitions, so this optimization cannot turn the full
+   corpus into random source reads. The region is released after its depth-first
+   subtree completes. Routing and fallback sampling scan the retained canonical
+   bytes directly; they do not reread that region from scratch storage. A
+   zero-byte allowance retains full-vector partitions and is the production
+   default. Paired qualification selects each representation explicitly.
+6. Finish small partitions in memory under an 8 MiB admission estimate covering
    vectors, identities, and per-row construction scratch. Their learned hierarchy
    uses confidence-ordered capacity assignment. Final leaves respect the index's
    leaf capacity, which defaults to 100.
-6. Encode leaf payloads directly from their transformed matrices. Build weighted
+7. Reserve each internal node ID before descending into its children. Encode
+   each leaf once from its transformed matrix with its final parent already set.
+   Only the real root leaf uses the nonquantized root representation. This avoids
+   temporary root payloads, later packed-node rewrites, and exact-vector reloads
+   to requantize the leaves. Build weighted
    parent centroids, covering radii, split ranges, and reverse mappings through
    the existing HBC write methods. Rotate storage transactions around an 8 MiB
    staged-byte budget between complete writes. Fresh private projection batches
    use immutable bulk ingestion. Flush the private projection before native
    handoff. Construction failures discard the entire private candidate.
-7. Stream the native generation into an atomic staging sink. Topology,
+8. Use ordered publication directly for an admitted private projection with at
+   most 1,024 construction runs. Larger snapshots, or one staging attempt that
+   exhausts allocator admission, consolidate into a disjoint LSM level through
+   a bounded merge with at most 64 active streams. Multi-file intermediate
+   streams open their SSTs sequentially; consumed passes are removed before the
+   next pass. Ordered namespace cursors then concatenate the level's files.
+   The allocation-failure retry releases partial staging before consolidation;
+   preparation and `CURRENT` installation are outside that retry boundary.
+   Stream the native generation into an atomic staging sink. Topology,
    centroid blocks, quantized scan blocks, and ordered vector-directory blocks
-   share the established native codecs. Bootstrap point-read transactions end
-   after each node. Initial publication, synchronous checkpoints, and background
+   share the established native codecs. Bootstrap publication groups ordered
+   node keys and merge-joins ordered quantization keys. It retains only one
+   node's values and closes each pass's cursors before beginning the next pass.
+   This avoids repeated absent-key probes and run-index decoding across the
+   overlapping immutable construction runs. The root quantization exception
+   needs one point lookup. Qualification can select the former point-read
+   access strategy while sharing every serializer, so performance comparisons
+   do not compare different native formats. Initial publication, synchronous checkpoints, and background
    full consolidation share bounded streaming publication. Centroid writers
    retain one block, including when flattening an existing large generation.
-8. Validate and install the staged receipt, publish durable `CURRENT`, and mark
+9. Validate and install the staged receipt, publish durable `CURRENT`, and mark
    native authority. Publish the posting checkpoint and exact-vector checkpoint
    together through the existing lake artifact and generation-directory path.
    Paged chunk directories admit more than 65,536 chunks. Inline chunk arrays
    retain their separate allocation bound. Generation admission consequently
    scales beyond the former 16 GiB aggregate limit. Large source files page their
    identity-chunk references through the same authenticated ordered tree. The
-   tracker buffers at most 32 references per active file. Native vector and
+   tracker buffers at most 32 references per active file. Exact-source file
+   descriptors are published in bounded batches directly into a paged tree;
+   the paged generation has no 8,192-file ceiling. Legacy inline roots retain
+   their separate allocation limit. Native vector and
    sparse metadata version 5 adds this directory, while readers retain version
    4 compatibility. Deletion and garbage collection traverse the paged references.
 
 External partition scratch is proportional to one corpus plus the partition
-currently being split. Terminal construction memory and the depth-first parent
+currently being split. The worker also retains the materialized exact-vector
+runs until native handoff. The source handoff also checkpoints its local
+recovery manifest so superseded ingest SSTs do not retain another corpus copy
+during clustering; reader and checkpoint pins remain authoritative. Peak local
+storage therefore includes those exact
+runs, the live routing partitions and the current split's output, plus the
+private projection and native generation being emitted. Uploaded source
+checkpoints share their immutable exact-vector objects with final publication;
+publication does not upload another corpus copy. Filesystem object-store
+qualification places those checkpoint objects on the same disk as worker
+scratch, whereas remote object storage holds them separately. Input/output
+allowances govern admitted work and artifacts; they do not reserve local disk
+space. Terminal construction memory and the depth-first parent
 frontier remain bounded independently of the full vector matrix. The index's
 ordered metadata namespace supplies cross-partition identity checks. Duplicate
 IDs within a terminal partition are checked before staging its metadata.
 
 The private candidate owns its scratch directory. Cancellation, allocation
 failure, malformed scratch input, and duplicate IDs discard the candidate.
-Recovery reuses completed lake checkpoints. An interrupted fresh whole-corpus
-candidate is rebuilt from the admitted immutable source.
+Recovery uses private source and completed-clustering receipts as well as
+finished index declarations. A source receipt binds the source snapshot,
+configuration recipe, dimensions, algorithm, input allowance, RNG state,
+immutable exact-vector runs, the small checksummed reservoir, and paged file
+identities. The root partition is reconstructed from those authenticated keys and
+exact vectors in original producer order after restart; it is not uploaded as a
+second corpus copy. A completed-clustering receipt replaces the source-phase work with
+the private native projection checkpoint. Recovery opens a fresh overlay and
+reuses the verified identity/input census from the same catalog checkpoint.
+
+These receipts live in the catalog's separate `construction` field. They never
+satisfy a serving declaration, and final publication rejects a nonempty
+construction set. Saving uses the active lease and catalog fence. Both ordinary
+and resumable GC retain the receipt, its file identities, and its authenticated
+file/chunk tree. Protocol 103 carries construction receipts; protocols 97–102 remain
+readable for prior serving generations and cannot carry the new work field.
+An unfinished attempt carrying an older protocol must renew its publication fence
+under protocol 103 before building new artifacts. The worker rejects the old
+attempt rather than publishing expanded artifacts with an older reader contract.
+
+A crash within source preparation repeats that source phase; a crash within
+clustering reconstructs the root partition from durable exact vectors and repeats
+clustering. A crash after the
+clustering receipt reuses the completed tree. Final native serialization and
+catalog publication retain their existing atomic handoff. Private phase output
+has a separate allowance of three times the configured input bytes; final serving
+generation output retains the twice-input allowance. Checkpoint uploads reuse
+exact-vector objects in final publication.
+
+Both fused and ordinary ingestion use the shared vector producer for missing and
+null columns, numeric conversion, dimensions, and finite-coordinate validation.
+The tee borrows typed float32 vectors instead of adding a second set of rules.
 
 ## Verification and measurement
 
-Run the focused construction and publication regressions.
+Native bootstrap publication can be qualified independently from source scanning
+and clustering with `zig build bench-hbc-publication -Doptimize=ReleaseFast`.
+Run `zig-out/bin/bench_hbc_publication <private-projection-clone> <dims> <count>
+ordered` or replace `ordered` with `point`. Each run requires a fresh disposable
+clone of the same sealed projection. Both strategies share the native encoders;
+only the projection access pattern changes. The tool enforces a 256 MiB allocator
+limit with a 16 MiB LSM cache retention target, rejects exact-source reads, reopens native authority,
+and checks member count and 100 metadata values. Its timer covers finalization;
+opening the private input, metadata sampling and reopened validation are outside
+the timer. A timed-out point run is a censored observation, not a completed
+baseline or an exact speedup ratio.
+
+On one frozen 10M projection with 582 immutable runs (2.688 GB), two ordered
+publication observations took 33.4 and 51.2 seconds, produced identical native
+manifest digests, and peaked at 214.1 MB with zero exact-source reads. The
+interleaved point-read observation remained incomplete after 120 seconds measured
+from the publication-start marker. Relative to the slower ordered observation,
+this establishes a conservative 2.34x lower bound for this phase. Concurrent
+compiler activity and changing host load make these shared-workstation
+observations unsuitable as a dedicated-host throughput guarantee. They justify
+the ordered access algorithm, while full import timings and recall are qualified
+separately.
+
+Run the focused construction and publication regressions. The high-dimensional
+private-projection regression builds 65,536 vectors at 768 dimensions through
+more than 100 immutable batch commits under a 16 MiB allocator limit, including
+clean backend teardown. It catches retention across commits separately from the
+normal 256 MiB runtime admission limit.
 
 ```sh
 cd zig
@@ -150,6 +265,124 @@ Parquet normalization, exact-vector LSM construction, remote reads, and artifact
 upload are separate stages. The lake integration regression exercises the
 Parquet-to-published-artifact path across multiple files and reopens its native
 vector index.
+
+## Complete Parquet operation qualification
+
+`zig/bench/vectors/prepare_raw_recall.py` computes held-out top-100 squared-L2
+truth from original float32 coordinates with float64 accumulation. It never
+normalizes the corpus. A training directory can contain the framed ten-file
+Cohere fixture produced by `prepare_framed_cohere.py`; physical ordinals follow
+lexically sorted object names. Reopened native metadata is resolved through the
+authenticated file directory and pinned Parquet footers before comparison.
+
+Build the install-only probe in ReleaseFast, then run the alternating comparison:
+
+```sh
+zig build --build-file zig/build.zig lake-execution-runtime-probe-build -Doptimize=ReleaseFast
+python3 zig/bench/vectors/bench_bulk_pipeline.py \
+  zig/zig-out/bin/lake-execution-runtime-probe train.parquet raw-recall \
+  comparison.json --logs comparison-logs --trials 3
+```
+
+The same runner accepts a framed multi-object fixture directly. For the ten-file
+10M corpus, after preparing its raw-coordinate truth:
+
+```sh
+python3 zig/bench/vectors/bench_bulk_pipeline.py \
+  zig/zig-out/bin/lake-execution-runtime-probe cohere-10m-input raw-recall-10m-v2 \
+  qualification-10m.json --logs qualification-10m --trials 1 \
+  --variants prebound_parents --allowance 42949672960 \
+  --identity-spill-allowance 8589934592
+```
+
+Framed qualification verifies the exact ordered object inventory, each envelope,
+body size and body checksum against the ground-truth source list. It hashes the
+query/truth payloads as well. After each child exits it revalidates the source and
+truth before qualifying the already saved process measurements. These checks
+are outside the child's operation and process timers; they warm filesystem data,
+so the run does not establish cold-cache throughput.
+
+The Python tools require Python 3.11 or later; truth preparation additionally
+requires NumPy and PyArrow. The default three variants share the same verified ReleaseFast caller/provider
+executable,
+checkpoint policy, dataset and recall sweep. They compare full-vector partitions,
+fused identity ingestion, and fused ingestion with preassigned parents. Add
+`--variants fused_compact` to qualify the optional compact representation with
+preassigned parents. Trial
+order reverses between repetitions. Reports retain source/executable checksums,
+host load, elapsed and process CPU time, process peak RSS, private projection size,
+exact-source reuse, phase attribution, and logical partition read/write bytes,
+both private vector-allocator peaks, and all recall observations. Phase timers
+are nested attribution counters and must not be summed as disjoint elapsed phases. The recall
+sweep always includes 512 through 8,192 probes and widens up to 131,072 if needed
+to qualify 95% recall; reports retain that extra search work. Allocator peaks
+are distinct from process RSS and do not total every runtime quota.
+
+The operation timer includes identity verification, exact-vector construction,
+clustering, durable phase receipts, native serialization, and an artifact
+publication candidate. It excludes fixture framing, final metadata CAS, and
+reopened recall. File-backed object-store timings do not establish S3 throughput
+or HTTP import latency. Run these measurements without overlapping builds.
+
+Local HBC cache limits are enforced by a shared clock implementation for node,
+quantized, vector and metadata caches. Reusing a victim slot always records its
+replacement key before publishing the entry. Occupancy is explicit, independent
+of the full-width key, so ID zero remains cacheable and evictable. This prevents
+untracked replacement entries from accumulating beyond the configured capacity.
+Node cloning also releases partial ownership on allocation failure. Regressions
+exercise repeated eviction in all four cache classes and construct the private
+projection while reserving 6.5 MiB for the concurrently resident exact-vector
+owner within the same 16 MiB test budget.
+
+Private offline construction bypasses the cross-batch node publication overlay.
+That overlay is necessary for live updates, but retaining every packed node body
+until the end of an unpublished candidate makes memory grow with corpus size.
+Offline node puts and deletes go directly into the rotating immutable batches;
+the completed generation remains the only serving publication boundary. The
+private projection retains its bounded immutable batches, leaves bulk-window
+merging disabled, and disables ordinary close-time L0 pressure compaction. Its
+immutable receipt and native emitter are
+the next owners, so a corpus-wide rewrite during disposable-candidate teardown
+would spend memory and I/O after construction has already finished. Each
+completed-child result also retains its scalar covering radius alongside its
+centroid. Parent construction composes those bounds directly using the same
+metric-specific chord formula as storage-backed recomputation, avoiding child
+node reloads solely to recover already-computed bounds. The retained child
+centroids also feed the shared quantizer directly when serializing a new parent,
+so internal payload construction does not reload those same children again.
+Inner product and
+invalid child bounds retain the existing unknown-radius semantics.
+
+The initial root writer also collects a bounded external ID census. A 2 MiB
+sort buffer and at most 32 merge inputs establish exact global uniqueness before
+clustering. CRC-protected spill records, cancellation and owned-file cleanup
+apply to every pass. The private source receipt retains the completed census
+attestation; old/unverified root partitions receive one sequential verification
+pass. Terminal builders no longer probe the growing private projection as an
+identity registry. Remaining private LSM reads use a shared cache with a 16 MiB
+retention target. Pinned handles can temporarily exceed that target while their
+allocations remain charged to the hard 256 MiB builder quota,
+and the node-cache allowance includes four-byte coordinates. The 256 MiB runtime
+budget is unchanged. See [the source-storage design](bulk-source-storage.md) for
+the failure that motivated this change and recovery invariants.
+
+Private source and projection SSTs also cap entries at 65,536, with the existing
+byte cap splitting wide rows earlier. Bounded merge fan-in alone does not bound
+per-file index size. The entry cap uses the existing SST format and lazy
+concatenation, while output reservations respect the same cap. Normal serving
+and incremental entry policies remain unchanged.
+
+On the frozen 10M projection, the entry-cap experiment reduced consolidation's
+publication-window allocator peak from 208.8 MB to 47.6 MB. Two capped runs took
+74.1 and 56.7 seconds versus one uncapped 81.1-second control. These shared-host
+observations establish a memory benefit without an observed latency regression;
+they do not establish a repeatable throughput gain or lower process RSS. The cap
+produced 313 physical output files versus eight, still one concatenated level
+stream. Admitted direct publication remained faster at 22.1–29.2 seconds, so
+consolidation remains adaptive rather than unconditional. All five final-binary publication runs produced identical full immutable segment
+SHA-256 hashes, reopened 10M vectors, matched 100 metadata samples and made zero
+exact-vector loads. Whole-import qualification is recorded separately from this
+phase experiment.
 
 ## Storage and I/O decisions
 
@@ -198,9 +431,9 @@ the caller's final catalog transaction, and reopen/search are outside the timer.
 The report includes whether optional logical identity evidence was published.
 
 The operation probe preserves the authored vector coordinates and uses squared
-L2. Its query checks serving and exact-vector reopening. Recall measurement
-continues to use held-out queries and matching ground truth in the quality
-benchmark.
+L2. Its initial query checks serving and exact-vector reopening. Set
+`ANTFLY_LAKE_BULK_RECALL_DIR` to matching raw-coordinate truth to qualify
+held-out recall after reopening, as the paired pipeline harness does.
 
 
 ## Compressed-source kernel benchmark
@@ -224,7 +457,150 @@ measurements isolate compressed-source decoding; complete Parquet operation
 measurements remain separate.
 
 
-## Recorded complete-operation observations
+## Final reviewed runtime qualification
+
+The final v68 runtime was qualified with one complete import per corpus after
+the metadata-owner drain, separately from the earlier repetitions above. The 1M
+operation took 143.499 seconds native and
+197.032 seconds whole probe. The 10M operation took
+1671.739 seconds native and 1853.348 seconds whole
+probe. All recall and scored counts matched the preceding qualified versions.
+Both imports wrote two construction checkpoints, reopened successfully and
+reused all source runs without new source bytes. The 10M dense/source allocator
+peaks were 214.4/43.9 MB, separately, within the unchanged
+256 MiB per-owner limits. The post-handoff 10M source contained only its 153
+live SSTs / 31.55 GB nominal lengths, versus 2,075 / 63.12 GB before the ownership
+fix. One read-only inventory observation is recorded in the raw conditions.
+These focused runs establish final-runtime correctness and scale; they do not
+establish a repeatable small elapsed-time gain over the earlier repetitions.
+
+## Core-builder repetitions before the complete metadata-owner drain
+
+The v67 runtime included the durable metadata handoff and eligible-file pass,
+before the complete metadata-owner drain. Three complete 1M imports took 142.116,
+140.845 and 161.186 seconds native, with median 142.116 seconds. Whole-probe
+times were 193.340, 192.073 and 223.801 seconds. All preserved recall and
+scored-vector counts at every width, wrote two construction checkpoints,
+reopened successfully and reused all exact-source runs. The dense allocator
+peak was about 54.2 MB and the separate source peak was 39.9 MB.
+
+The pre-handoff capped runtime below had a 146.227-second native median. These
+sequential three-run groups on a shared workstation do not establish a
+repeatable throughput gain from the manifest handoff. Its purpose is releasing
+superseded local source generations before clustering; the regression requires
+physical SST inventory to match the live sealed inventory after reopening.
+The frozen final source, executables, measurements and selected raw records are
+in the [qualification report](../../../zig/bench/vectors/cohere_bulk_recovery_qualification.json).
+
+## Entry-cap qualification before the recovery-manifest handoff
+
+The earlier capped runtime (reader protocol 103, runtime ABI 89), before the
+recovery-manifest handoff, was qualified separately from the historical runs
+below. Three 1M-vector imports took
+146.227, 162.481 and 145.500 seconds in the native operation, with median
+146.227 seconds. Whole-probe times were 203.667, 233.211 and 207.092 seconds.
+All matched the uncapped control's recall and scored-vector counts at every
+width, wrote both construction checkpoints, reopened the index, and reused all
+exact-source runs without new source bytes. Dense allocator peaks were about
+54.2 MB and the separate source peak was 39.9 MB.
+
+The merged-main control without the private SST entry cap took 151.821 seconds
+native and 229.323 seconds whole probe. One control followed by three capped
+trials on a shared host does not establish a repeatable speedup. It shows no
+observed median regression from the cap, whose demonstrated benefit is the
+publication allocator reduction above. The earlier parent-rewrite comparison
+below measures a different change and source revision.
+
+## 10M complete-operation qualification before the bounded-merge review
+
+The v48 ReleaseFast probe qualifies raw Cohere Large 10M: ten authored Parquet
+objects, 768 dimensions, Lloyd clustering, one-bit quantization, fused source
+preparation and preassigned parents. The complete native build call takes
+1,817.7 seconds; the whole probe, including reopen, recall and teardown, takes
+2,091.2 seconds. This is one shared-workstation scale observation, not a paired
+10M throughput comparison. It includes one second of read-only profiling during
+root routing, with no pauses or overlapping builds or cleanup from this task.
+
+The build verifies the global ID census, publishes two construction receipts,
+reopens all ten million members with logical identity evidence, and returns ten
+query hits. It reuses all 31,562,812,645 exact-source bytes across 60 immutable
+runs, writing zero new exact-source bytes at final publication. Dense allocation
+peaks at 252,550,961 bytes and the separate source allocator at 140,686,900 bytes;
+both remain below their respective 256 MiB limits. These are allocator counters,
+not a claim that whole-process RSS is limited to 256 MiB.
+
+Reopened recall@100 against authored float32 coordinates and float64 squared-L2
+ground truth is 61.00%, 72.00%, 82.37%, 89.96%, 94.79% and 96.83% at 512,
+1,024, 2,048, 4,096, 8,192 and 16,384 probes. The probe uses 100 queries, epsilon
+7 and rerank multiplier 4, increasing search width until it exceeds 95% recall.
+Search width is reported explicitly rather than assuming that a 1M setting
+provides the same recall at 10M.
+
+Construction emits a 2.688 GB private projection in 582 runs, performs zero
+parent updates, and peaks at 93.1 MB before native publication. Clustering takes
+540.3 seconds and the native checkpoint takes 46.2 seconds. Those phase timers
+are nested within the operation and must not be summed with its total. Source
+preparation and durable receipts remain substantial costs; the ordered publisher
+does not eliminate them. The recorded qualification retains earlier allocation
+failures and the terminated legacy publication observation as unqualified runs.
+
+## Initial bulk-path comparison (before the external ID census)
+
+This initial comparison predates the external ID census. Its later 10M run
+exposed retained lookup-index growth and is recorded as unqualified; it does not
+establish the final implementation's corpus-scale behavior.
+
+The three-way comparison on raw Cohere 1M Parquet (768 dimensions, one-bit
+quantization, Lloyd) uses one ReleaseFast executable, three alternating trials,
+and source/completed-clustering checkpoints in every variant. The [recorded
+observations](../../../zig/bench/vectors/cohere_bulk_recovery_qualification.json)
+pin the executable, source snapshot, toolchain, input and ground-truth hashes,
+trial order, phase attribution, allocation peaks, source reuse, and recall sweeps.
+
+| Variant | Median native operation | Median whole-probe CPU | Private LSM projection |
+| --- | ---: | ---: | ---: |
+| Separate identity/source, late parents | 204.9 s | 233.5 s | 590.3 MB |
+| Fused identity/source, late parents | 161.3 s | 196.3 s | 590.3 MB |
+| Fused identity/source, preassigned parents | 130.5 s | 176.4 s | 285.4 MB |
+
+The combined change reduces median operation time by 36.3%, whole-probe CPU by
+24.4%, and private projection bytes by 51.6%. The final operation observations
+are 128.6, 130.5 and 142.5 seconds; controls are 191.6, 205.5 and 204.9 seconds.
+These are shared-workstation measurements, with recorded host load, rather than
+a dedicated-host throughput guarantee. Whole-probe CPU includes fixture framing,
+source opening, reopened recall and teardown; the native operation excludes those
+steps and the caller's final metadata CAS.
+
+Every variant reopens an index reporting one million members, returns logical identity,
+checks both construction receipts, and reuses all 3,156,307,497 exact-source bytes
+at final publication. All runs have identical recall and scored-vector counts at
+each width: recall@100 is 85.00%, 93.36%, 97.58%, 98.98% and 99.16% at 512,
+1,024, 2,048, 4,096 and 8,192 probes. Ground truth uses authored float32 coordinates
+and float64 squared-L2 accumulation, without normalization.
+
+Preassigned construction performs zero parent updates versus 14,248 for each
+late-parent control. Its maximum reported dense allocator peak is 189.8 MB,
+versus 247.6 MB for controls; the separate fused source allocator peaks at
+41.0 MB. Whole-probe RSS ranges substantially and does not establish a consistent
+RSS reduction. These allocator figures neither total every runtime quota nor
+include all serving-query allocations.
+
+An isolated optional compact observation takes 133.4 seconds with the same
+recall, compared with the noncompact median of 130.5 seconds. Logical child
+partition writes fall from 13.485 GB to 10.870 GB (19.4%); reads, including the
+initial root partition, fall from 16.667 GB to 14.051 GB (15.7%). The dense
+allocator peak rises to 200.9 MB. This supports keeping compact regions available
+for explicit qualification, but not enabling them by default on elapsed-time
+evidence. Reservoir and exact-plane I/O are outside these partition counters.
+
+The internal fused/preassigned policies apply after selecting the offline bulk
+path; `lake_bulk_build` remains opt-in. Materialized immutable exact vectors,
+shared native serialization, mutation overlays and source-retention rules remain
+the serving contract. The remaining private projection commit is only a few
+seconds per 1M operation; this comparison does not justify a separate final-format
+emitter or an implicit source-backed reranking contract.
+
+## Historical complete-operation observations
 
 On the authored Cohere 1M Parquet corpus (768 dimensions, 3.13 GB source), the
 local filesystem operation took 788.9 seconds with standard Zstandard literal

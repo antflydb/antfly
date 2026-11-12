@@ -205,15 +205,20 @@ pub const Node = struct {
     }
 
     pub fn clone(self: Node, alloc: Allocator) !Node {
+        const centroid = try alloc.dupe(f32, self.centroid);
+        errdefer alloc.free(centroid);
+        const children = try alloc.dupe(u64, self.children);
+        errdefer alloc.free(children);
+        const members = try alloc.dupe(u64, self.members);
         return .{
             .id = self.id,
             .is_leaf = self.is_leaf,
             .level = self.level,
             .parent = self.parent,
-            .centroid = try alloc.dupe(f32, self.centroid),
+            .centroid = centroid,
             .covering_radius = self.covering_radius,
-            .children = try alloc.dupe(u64, self.children),
-            .members = try alloc.dupe(u64, self.members),
+            .children = children,
+            .members = members,
             .posting_state = self.posting_state,
             .backing = &.{},
         };
@@ -333,3 +338,20 @@ pub const SplitRebuildWork = struct {
         return self.right_only_members + self.mixed_right_members;
     }
 };
+
+test "node clone frees partial ownership after allocation failure" {
+    const Check = struct {
+        fn run(a: Allocator) !void {
+            var centroid = [_]f32{ 1, 2 };
+            var children = [_]u64{ 3, 4 };
+            var members = [_]u64{ 5, 6 };
+            const node: Node = .{ .id = 1, .is_leaf = false, .level = 1, .parent = 0, .centroid = &centroid, .children = &children, .members = &members };
+            var copy = try node.clone(a);
+            defer copy.deinit(a);
+            try std.testing.expectEqualSlices(f32, &centroid, copy.centroid);
+            try std.testing.expectEqualSlices(u64, &children, copy.children);
+            try std.testing.expectEqualSlices(u64, &members, copy.members);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}

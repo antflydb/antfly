@@ -749,6 +749,11 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const build_quality_step = b.step("bench-build-quality", "Build bounded-bootstrap held-out recall benchmark");
     build_quality_step.dependOn(&b.addInstallArtifact(build_quality, .{}).step);
 
+    const publication_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_hbc_publication.zig"), .target = target, .optimize = optimize });
+    publication_mod.addImport("antfly_hbc_isolate_root", hbc_isolate_root_mod);
+    const publication = b.addExecutable(.{ .name = "bench_hbc_publication", .root_module = publication_mod });
+    b.step("bench-hbc-publication", "Qualify native publication from a sealed HBC projection").dependOn(&b.addInstallArtifact(publication, .{}).step);
+
     const zstd_bench_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_zstd.zig"), .target = target, .optimize = optimize });
     zstd_bench_mod.addImport("antfly_compress", options.antfly_imports.compress);
     const zstd_bench = b.addExecutable(.{ .name = "bench_zstd", .root_module = zstd_bench_mod });

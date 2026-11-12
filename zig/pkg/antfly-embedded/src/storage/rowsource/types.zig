@@ -211,7 +211,7 @@ pub const ColumnValues = union(ColumnKind) {
             .json => |v| try std.json.parseFromSliceLeaky(std.json.Value, a, v[row], .{ .parse_numbers = false }),
             .vector_f32 => |vectors| value: {
                 const items = try a.alloc(std.json.Value, vectors[row].len);
-                for (items, vectors[row]) |*item, coordinate| item.* = .{ .float = coordinate };
+                for (items, vectors[row]) |*item, coordinate| item.* = if (std.math.isNan(coordinate)) .null else .{ .float = coordinate };
                 break :value .{ .array = std.array_list.Managed(std.json.Value).fromOwnedSlice(a, items) };
             },
         };

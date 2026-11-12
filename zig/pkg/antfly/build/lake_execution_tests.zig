@@ -29,7 +29,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     provider_options.addOption(bool, "shared_storage_core", false);
     provider_options.addOption(bool, "storage_engine_owner", true);
     provider.addOptions("storage_engine_options", provider_options);
-    const archive = @import("../../../build_support/embedded/shared_library.zig").addProviderArchive(b, provider, "lake-execution-abi-provider-probe", 9 * 1024 * 1024 * 1024);
+    const archive = @import("../../../build_support/embedded/shared_library.zig").addProviderArchive(b, provider, "lake-execution-abi-provider-probe", 12 * 1024 * 1024 * 1024);
     const consumer = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/lake_execution_linked_test_root.zig"), .target = target, .optimize = optimize });
     test_imports.configure(b, consumer, true, true);
     const consumer_options = b.addOptions();

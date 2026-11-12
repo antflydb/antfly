@@ -23,9 +23,11 @@ pub const Reader = struct {
     arena: std.heap.ArenaAllocator,
     output: std.heap.ArenaAllocator,
     dictionary: ?[]f64 = null,
+    dictionary_f32: ?[]f32 = null,
     repetitions: []const u8 = &.{},
     definitions: []const u8 = &.{},
     values: []const f64 = &.{},
+    values_f32: []const f32 = &.{},
     position: usize = 0,
     value_position: usize = 0,
     maximum_definition: u8,
@@ -39,6 +41,17 @@ pub const Reader = struct {
     eof: bool = false,
     pub const Source = struct { ptr: *anyopaque, next: *const fn (*anyopaque, *Reader) anyerror!bool };
     pub const Row = struct { values: []const f32 = &.{}, doubles: []const f64 = &.{}, is_null: bool };
+    pub fn doubleJson(a: A, values: []const f64) ![]u8 {
+        const Numbers = struct {
+            values: []const f64,
+            pub fn jsonStringify(self: @This(), writer: anytype) !void {
+                try writer.beginArray();
+                for (self.values) |value| try writer.write(if (std.math.isNan(value)) @as(?f64, null) else @as(?f64, value));
+                try writer.endArray();
+            }
+        };
+        return std.json.Stringify.valueAlloc(a, Numbers{ .values = values }, .{});
+    }
     pub fn supports(logical: []const u8) bool {
         return std.mem.startsWith(u8, logical, "vector_f32:") or std.mem.startsWith(u8, logical, "vector_f64_json:");
     }
@@ -54,6 +67,7 @@ pub const Reader = struct {
     }
     pub fn deinit(self: *Reader) void {
         if (self.dictionary) |dictionary| self.a.free(dictionary);
+        if (self.dictionary_f32) |dictionary| self.a.free(dictionary);
         self.pending.deinit(self.a);
         self.pending_double.deinit(self.a);
         self.output.deinit();
@@ -65,8 +79,8 @@ pub const Reader = struct {
         const a = self.arena.allocator();
         const payload = try page.decodePagePayloadAlloc(a, original, try @import("lake_parquet_rowgroup.zig").compressionCodecForColumnChunk(chunk), encoded);
         if (original.page_type == .dictionary_page) {
-            if (self.dictionary != null) return error.InvalidParquetPage;
-            self.dictionary = if (std.mem.eql(u8, chunk.physical_type, "float")) try page.decodePlainF32DictionaryPageAsF64Alloc(self.a, original, payload.bytes) else try page.decodePlainF64DictionaryPageAlloc(self.a, original, payload.bytes);
+            if (self.dictionary != null or self.dictionary_f32 != null) return error.InvalidParquetPage;
+            if (self.is_double) self.dictionary = try page.decodePlainF64DictionaryPageAlloc(self.a, original, payload.bytes) else self.dictionary_f32 = try page.decodePlainF32DictionaryPageAlloc(self.a, original, payload.bytes);
             return false;
         }
         if (original.page_type != .data_page and original.page_type != .data_page_v2) return error.UnsupportedParquetPage;
@@ -87,9 +101,17 @@ pub const Reader = struct {
         header.data_payload_offset = 0;
         header.repetition_level_bytes = 0;
         header.definition_level_bytes = 0;
-        self.values = if (present == 0) &.{} else if (header.encoding == .rle_dictionary or header.encoding == .plain_dictionary)
-            try page.decodeDictionaryF64DataPageAlloc(a, header, self.dictionary orelse return error.InvalidParquetPage, payload.bytes[offset..])
-        else if (std.mem.eql(u8, chunk.physical_type, "float")) try page.decodePlainF32AsF64Alloc(a, header, payload.bytes[offset..]) else try page.decodePlainF64Alloc(a, header, payload.bytes[offset..]);
+        if (self.is_double) {
+            self.values = if (present == 0) &.{} else if (header.encoding == .rle_dictionary or header.encoding == .plain_dictionary)
+                try page.decodeDictionaryF64DataPageAlloc(a, header, self.dictionary orelse return error.InvalidParquetPage, payload.bytes[offset..])
+            else
+                try page.decodePlainF64Alloc(a, header, payload.bytes[offset..]);
+        } else {
+            self.values_f32 = if (present == 0) &.{} else if (header.encoding == .rle_dictionary or header.encoding == .plain_dictionary)
+                try page.decodeDictionaryF32DataPageAlloc(a, header, self.dictionary_f32 orelse return error.InvalidParquetPage, payload.bytes[offset..])
+            else
+                try page.decodePlainF32Alloc(a, header, payload.bytes[offset..]);
+        }
         self.position = 0;
         self.value_position = 0;
         return true;
@@ -108,7 +130,7 @@ pub const Reader = struct {
     }
     pub fn available(self: *Reader, source: Source) !bool {
         while (self.position == self.repetitions.len) {
-            if (self.value_position != self.values.len) return error.InvalidParquetPage;
+            if (self.value_position != (if (self.is_double) self.values.len else self.values_f32.len)) return error.InvalidParquetPage;
             if (self.eof) return false;
             if (!try source.next(source.ptr, self)) {
                 self.eof = true;
@@ -129,15 +151,19 @@ pub const Reader = struct {
         while (true) {
             const current = self.definitions[self.position];
             if (current == self.maximum_definition) {
-                if (pending.items.len >= 65536) return error.InvalidVectorDimensions;
-                const value: T = @floatCast(self.values[self.value_position]);
+                const value: T = if (T == f64) self.values[self.value_position] else self.values_f32[self.value_position];
                 if (!std.math.isFinite(value)) return error.InvalidVectorValue;
                 try pending.append(self.a, value);
                 self.value_position += 1;
-            } else if (current >= self.null_definition + 1 or pending.items.len != 0) return error.InvalidVectorValue;
+            } else if (current == self.null_definition + 1 and self.maximum_definition == self.null_definition + 2) {
+                // Packed float columns represent null elements with a NaN
+                // sentinel. SQL materializes null; embedding validation rejects
+                // nonfinite coordinates at its own boundary.
+                try pending.append(self.a, std.math.nan(T));
+            } else if (pending.items.len != 0) return error.InvalidParquetPage;
             self.position += 1;
             if (!try self.available(source) or self.repetitions[self.position] == 0) break;
-            if (current != self.maximum_definition) return error.InvalidParquetPage;
+            if (current < self.null_definition + 1) return error.InvalidParquetPage;
         }
         return if (T == f64)
             .{ .doubles = try out.dupe(f64, pending.items), .is_null = is_null }
@@ -193,7 +219,7 @@ test "Parquet vector lists carry a row across V1 pages and preserve V2 null and 
     try std.testing.expect(try optional.nextRow(input, a) == null);
 }
 
-test "Parquet vector lists reject null coordinates and orphaned continuations" {
+test "Parquet numeric lists preserve null coordinates and reject orphaned continuations" {
     const Source = struct {
         sent: bool = false,
         orphan: bool,
@@ -209,7 +235,14 @@ test "Parquet vector lists reject null coordinates and orphaned continuations" {
         var source: Source = .{ .orphan = orphan };
         var reader = try Reader.init(std.testing.allocator, "vector_f32:3:1");
         defer reader.deinit();
-        try std.testing.expectError(if (orphan) error.InvalidParquetPage else error.InvalidVectorValue, reader.nextRow(.{ .ptr = &source, .next = Source.next }, std.testing.allocator));
+        if (orphan) {
+            try std.testing.expectError(error.InvalidParquetPage, reader.nextRow(.{ .ptr = &source, .next = Source.next }, std.testing.allocator));
+        } else {
+            const row = (try reader.nextRow(.{ .ptr = &source, .next = Source.next }, std.testing.allocator)).?;
+            defer std.testing.allocator.free(row.values);
+            try std.testing.expectEqual(@as(usize, 1), row.values.len);
+            try std.testing.expect(std.math.isNan(row.values[0]));
+        }
     }
 }
 
@@ -240,4 +273,40 @@ test "Parquet DOUBLE lists preserve precision and values outside float32 range" 
     var parsed = try std.json.parseFromSlice([]f64, std.testing.allocator, json, .{});
     defer parsed.deinit();
     try std.testing.expectEqualSlices(f64, &expected, parsed.value);
+}
+
+test "Parquet numeric arrays are not limited by embedding dimensions" {
+    const a = std.testing.allocator;
+    const count = 65537;
+    var reader = try Reader.init(a, "vector_f32:3:1");
+    defer reader.deinit();
+    const values = try a.alloc(f32, count);
+    defer a.free(values);
+    @memset(values, 1);
+    const repetitions = try a.alloc(u8, count);
+    defer a.free(repetitions);
+    @memset(repetitions, 1);
+    repetitions[0] = 0;
+    const definitions = try a.alloc(u8, count);
+    defer a.free(definitions);
+    @memset(definitions, 3);
+    reader.values_f32 = values;
+    reader.repetitions = repetitions;
+    reader.definitions = definitions;
+    const End = struct {
+        fn next(_: *anyopaque, _: *Reader) !bool {
+            return false;
+        }
+    };
+    var marker: u8 = 0;
+    const row = (try reader.nextRow(.{ .ptr = &marker, .next = End.next }, a)).?;
+    defer a.free(row.values);
+    try std.testing.expectEqual(@as(usize, count), row.values.len);
+    const columns = @import("../../storage/rowsource/types.zig");
+    const converted = try (columns.ColumnValues{ .vector_f32 = &.{&.{ 1, std.math.nan(f32), 2 }} }).jsonAt(a, 0);
+    defer a.free(converted.array.items);
+    try std.testing.expect(converted.array.items[1] == .null);
+    const encoded = try Reader.doubleJson(a, &[_]f64{ 1, std.math.nan(f64), 2 });
+    defer a.free(encoded);
+    try std.testing.expectEqualStrings("[1,null,2]", encoded);
 }

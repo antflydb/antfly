@@ -74,6 +74,7 @@ pub const BuiltBulkNode = struct {
     range: ?types.NodeSplitRange,
     level: u16,
     member_count: usize,
+    covering_radius: f32,
 
     pub fn deinit(self: *BuiltBulkNode, alloc: Allocator) void {
         alloc.free(self.centroid);
@@ -7295,26 +7296,26 @@ fn candidateFrontierHasOnlyResolvedBounds(candidates: anytype) bool {
     return true;
 }
 
+fn expandedCoveringRadius(metric: vec.DistanceMetric, centroid: []const f32, child_centroid: []const f32, child_radius: f32) f32 {
+    if (metric == .inner_product or !std.math.isFinite(child_radius) or child_radius < 0) return std.math.nan(f32);
+    const distance = vec.distanceToQuery(centroid, queryMeasureForMetric(metric, centroid), child_centroid, metric);
+    const chord = switch (metric) {
+        .l2_squared => @sqrt(@max(distance, 0)),
+        .cosine => @sqrt(2.0 * @min(@max(distance, 0), 2.0)),
+        .inner_product => unreachable,
+    };
+    return chord + child_radius;
+}
+
 fn computeInternalCoveringRadius(self: anytype, txn: anytype, node: *const types.Node) !f32 {
     if (self.config.metric == .inner_product) return std.math.nan(f32);
-    if (node.children.len == 0) return 0;
     var radius: f32 = 0;
     for (node.children) |child_id| {
         var child = try loadNode(self, txn, child_id);
         defer child.deinit(self.alloc);
-        if (!std.math.isFinite(child.covering_radius) or child.covering_radius < 0) return std.math.nan(f32);
-        const center_distance = vec.distanceToQuery(
-            node.centroid,
-            queryMeasureForMetric(self.config.metric, node.centroid),
-            child.centroid,
-            self.config.metric,
-        );
-        const center_chord = switch (self.config.metric) {
-            .l2_squared => @sqrt(@max(center_distance, 0)),
-            .cosine => @sqrt(2.0 * @min(@max(center_distance, 0), 2.0)),
-            .inner_product => unreachable,
-        };
-        radius = @max(radius, center_chord + child.covering_radius);
+        const bound = expandedCoveringRadius(self.config.metric, node.centroid, child.centroid, child.covering_radius);
+        if (!std.math.isFinite(bound)) return std.math.nan(f32);
+        radius = @max(radius, bound);
     }
     return radius;
 }
@@ -10504,6 +10505,8 @@ fn bulkNoteStaged(self: anytype, txn: anytype, bytes: u64) !void {
         return;
     }
     // On a failed commit the batch is still open; the caller aborts it.
+    const commit_started = kmeans.monotonicNs();
+    defer self.write_profile.bulk_projection_commit_ns += kmeans.monotonicNs() -| commit_started;
     try txn.commit();
     rotation.commits += 1;
     rotation.staged = 0;
@@ -10685,6 +10688,8 @@ pub const SpoolBuildOptions = struct {
     algorithm: enum { lloyd, emeans } = .lloyd,
     sample_bytes: usize = 8 * 1024 * 1024,
     terminal_bytes: usize = 8 * 1024 * 1024,
+    compact_partition_bytes: usize = 0,
+    prebind_parents: bool = true,
     commit_bytes: u64 = 8 * 1024 * 1024,
     check: ?*const fn (*anyopaque) anyerror!void = null,
     context: ?*anyopaque = null,
@@ -10698,11 +10703,20 @@ pub const SpoolBuildOptions = struct {
 /// The spool contains transformed vectors and is consumed by this call.
 pub fn bulkBuildSpool(self: anytype, spool: *bulk_spool.Spool, root: bulk_spool.Spool.Partition, options: SpoolBuildOptions) !void {
     defer spool.remove(root);
+    const initial_written = spool.written_bytes;
+    const initial_compact = spool.compact_rows;
+    const initial_read = spool.read_bytes;
+    defer {
+        self.write_profile.bulk_spool_partition_bytes += spool.written_bytes - initial_written;
+        self.write_profile.bulk_spool_partition_read_bytes += spool.read_bytes - initial_read;
+        self.write_profile.bulk_spool_compact_rows += spool.compact_rows - initial_compact;
+    }
     if (spool.dims != self.config.dims) return error.InvalidDimensions;
     if (root.count == 0) return;
     if (self.metadata.active_count != 0 or self.write_session_depth != 0) return error.IndexNotEmpty;
     if (options.commit_bytes == 0 or self.config.leaf_size == 0 or (options.check != null and options.context == null)) return error.InvalidBulkBuildConfig;
     if (options.algorithm == .emeans and self.config.metric != .l2_squared) return error.EmeansRequiresL2;
+    if (!root.identities_verified) try spool.verifyIdentities(self.alloc, root, .{ .check = options.check, .context = options.context });
     try self.beginBulkIngestSession();
     var session_open = true;
     errdefer if (session_open) self.abortBulkIngestSession();
@@ -10717,11 +10731,13 @@ pub fn bulkBuildSpool(self: anytype, spool: *bulk_spool.Spool, root: bulk_spool.
         errdefer abortVectorCacheMutationsIfSupported(self);
         try self.bindTxnLike(&batch);
         try self.prepareEmptyPreparedBulkBuild(&batch, &.{});
-        var built = try buildSpoolSubtree(self, &batch, spool, root, options);
+        var built = try buildSpoolSubtree(self, &batch, spool, root, options, 0);
         defer built.deinit(self.alloc);
         if (built.member_count != root.count) return error.InvalidBulkSpoolCount;
         self.metadata.root_node = built.node_id;
         self.metadata.active_count = @intCast(root.count);
+        const commit_started = kmeans.monotonicNs();
+        defer self.write_profile.bulk_projection_commit_ns += kmeans.monotonicNs() -| commit_started;
         try finalizeWriteTxnOptions(self, &batch, .{}, nowNsU64Fixed, elapsedSinceU64Fixed);
         try batch.commit();
     }
@@ -10742,14 +10758,29 @@ fn buildSpoolSubtree(
     spool: *bulk_spool.Spool,
     partition: bulk_spool.Spool.Partition,
     options: SpoolBuildOptions,
+    parent_id: u64,
 ) anyerror!BuiltBulkNode {
     try options.checkActive();
     const leaf_size: usize = self.config.leaf_size;
-    if (partition.count <= leaf_size) return buildSpoolLeaf(self, txn, spool.*, partition, options);
+    if (partition.count <= leaf_size) return buildSpoolLeaf(self, txn, spool, partition, options, parent_id);
     const row_bytes = @as(usize, self.config.dims) * @sizeOf(f32) + @sizeOf(bulk_build.PreparedBulkBuildInput) + @sizeOf(kmeans.Point) +
         @sizeOf(kmeans.Entry) + 4 * @sizeOf(usize) + @sizeOf(f32);
     const terminal_rows = (options.terminal_bytes -| partition.metadata_bytes) / row_bytes;
-    if (partition.count <= terminal_rows) return buildSpoolLeaf(self, txn, spool.*, partition, options);
+    if (partition.count <= terminal_rows) return buildSpoolLeaf(self, txn, spool, partition, options, parent_id);
+    // Admit one small canonical region, then route only checked offsets in its
+    // descendants. Large regions retain sequential full-vector partitions.
+    var canonical: ?[]u8 = null;
+    defer if (canonical) |bytes| {
+        spool.canonical = null;
+        self.alloc.free(bytes);
+    };
+    const encoded_bytes = std.math.add(u64, std.math.mul(u64, partition.count, @as(u64, self.config.dims) * 4 + 14) catch return error.InvalidBulkSpoolCount, partition.metadata_bytes) catch return error.InvalidBulkSpoolCount;
+    if (spool.canonical == null and !partition.indirect and encoded_bytes <= options.compact_partition_bytes) {
+        canonical = try spool.dir.readFileAlloc(spool.io, &partition.name, self.alloc, .limited(options.compact_partition_bytes));
+        if (canonical.?.len != encoded_bytes) return error.InvalidBulkSpoolCount;
+        spool.canonical = canonical;
+        spool.read_bytes = std.math.add(u64, spool.read_bytes, encoded_bytes) catch return error.InvalidBulkSpoolCount;
+    }
     const leaf_count = try std.math.divCeil(usize, partition.count, leaf_size);
     const branches = @min(leaf_count, std.math.clamp(self.config.branching_factor, 2, spool_max_branches));
     var partitions: [spool_max_branches]bulk_spool.Spool.Partition = undefined;
@@ -10757,24 +10788,25 @@ fn buildSpoolSubtree(
     spool.remove(partition);
     defer for (partitions[0..branches]) |child| spool.remove(child);
 
+    const node_id = if (options.prebind_parents) self.nextNodeId() else 0;
     var children: [spool_max_branches]BuiltBulkNode = undefined;
     var initialized: usize = 0;
     defer for (children[0..initialized]) |*child| child.deinit(self.alloc);
     var level: u16 = 1;
     for (partitions[0..branches]) |child| {
         if (child.count == 0) continue;
-        children[initialized] = try buildSpoolSubtree(self, txn, spool, child, options);
+        children[initialized] = try buildSpoolSubtree(self, txn, spool, child, options, node_id);
         spool.remove(child);
         level = @max(level, children[initialized].level + 1);
         initialized += 1;
     }
-    var parent = try buildBulkParentFromNodeRange(self, txn, children[0..initialized], level);
+    var parent = try buildBulkParentFromNodeRangeWithIdentity(self, txn, children[0..initialized], level, if (options.prebind_parents) .{ .node_id = node_id, .parent_id = parent_id } else null);
     errdefer parent.deinit(self.alloc);
     try bulkNoteStaged(self, txn, @as(u64, self.config.dims) * 4 + branches * 64);
     return parent;
 }
 
-fn buildSpoolLeaf(self: anytype, txn: anytype, spool: bulk_spool.Spool, partition: bulk_spool.Spool.Partition, options: SpoolBuildOptions) !BuiltBulkNode {
+fn buildSpoolLeaf(self: anytype, txn: anytype, spool: *bulk_spool.Spool, partition: bulk_spool.Spool.Partition, options: SpoolBuildOptions, parent_id: u64) !BuiltBulkNode {
     var arena = std.heap.ArenaAllocator.init(self.alloc);
     defer arena.deinit();
     const a = arena.allocator();
@@ -10782,14 +10814,13 @@ fn buildSpoolLeaf(self: anytype, txn: anytype, spool: bulk_spool.Spool, partitio
     const matrix = try a.alloc(f32, try std.math.mul(usize, partition.count, dims));
     const inputs = try a.alloc(bulk_build.PreparedBulkBuildInput, partition.count);
     const ids = try a.alloc(u64, partition.count);
-    const existing = try a.alloc(?[]const u8, partition.count);
     const key = try a.alloc(u8, spool_max_key);
-    var reader = try spool.open(partition, try a.alloc(u8, spool_buffer_bytes));
-    defer reader.file.close(spool.io);
+    var reader = try spool.openInput(partition, try a.alloc(u8, spool_buffer_bytes));
+    defer reader.close(spool.io);
     for (inputs, ids, 0..) |*input, *id, i| {
         if (i % 256 == 0) try options.checkActive();
         const vector = matrix[i * dims ..][0..dims];
-        const row = try bulk_spool.read(&reader.interface, key, vector);
+        const row = try spool.readRow(partition, reader.reader(), key, vector, 0);
         id.* = row.id;
         input.* = .{ .vector_id = row.id, .vector = vector, .transformed = vector, .metadata = try a.dupe(u8, row.key) };
     }
@@ -10797,22 +10828,21 @@ fn buildSpoolLeaf(self: anytype, txn: anytype, spool: bulk_spool.Spool, partitio
     for (ids[1..], ids[0 .. ids.len - 1]) |id, previous| {
         if (id == previous) return error.DuplicateVectorId;
     }
-    // The private HBC namespace is also the disk-backed uniqueness set.
-    try self.getMetadataManySortedInTxnUncached(txn, ids, existing);
-    for (existing) |metadata| if (metadata != null) return error.DuplicateVectorId;
+    // The root census already proved global uniqueness without probing the
+    // growing projection. Retain the local check as a corruption backstop.
     for (inputs) |input| {
         var encoded: [10]u8 = undefined;
         try self.appendNamespaced(txn, .vecs, hbc.encodeVecMetaKey(&encoded, input.vector_id), input.metadata);
         try bulkNoteStaged(self, txn, input.metadata.len + 16);
     }
     if (partition.count > self.config.leaf_size) {
-        return buildBulkHierarchicalKmeansFromInputsOptions(self, txn, inputs, options);
+        return buildBulkHierarchicalKmeansFromInputsWithParent(self, txn, inputs, options, parent_id);
     }
     self.write_profile.bulk_build_leaf_count += 1;
     const profile = &self.write_profile;
     profile.bulk_build_leaf_min_members = if (profile.bulk_build_leaf_count == 1) partition.count else @min(profile.bulk_build_leaf_min_members, partition.count);
     profile.bulk_build_leaf_max_members = @max(profile.bulk_build_leaf_max_members, partition.count);
-    return buildBulkLeafWithMatrix(self, txn, self.nextNodeId(), inputs, 0, 0, matrix);
+    return buildBulkLeafWithMatrix(self, txn, self.nextNodeId(), inputs, parent_id, 0, matrix);
 }
 
 fn partitionBulkSpool(
@@ -10845,11 +10875,11 @@ fn partitionBulkSpool(
             point.* = .{ .stable_id = try bulk_spool.readSample(&reader.interface, value), .vector = value, .weight = 1 };
         }
     } else {
-        var reader = try spool.open(partition, read_buffer);
-        defer reader.file.close(spool.io);
+        var reader = try spool.openInput(partition, read_buffer);
+        defer reader.close(spool.io);
         for (0..partition.count) |i| {
             if (i % 256 == 0) try options.checkActive();
-            const row = try bulk_spool.read(&reader.interface, key, vector);
+            const row = try spool.readRow(partition, reader.reader(), key, vector, 0);
             const slot = if (i < sample_count) i else self.rng.intN(i + 1);
             if (slot >= sample_count) continue;
             const value = sample[slot * dims ..][0..dims];
@@ -10911,15 +10941,18 @@ fn routeBulkSpool(
         remaining[branch] = quota * (partition.count / leaf_count) + @min(leaf_cursor + quota, extra) - @min(leaf_cursor, extra);
         leaf_cursor += quota;
         outputs[branch] = try spool.create(try a.alloc(u8, spool_buffer_bytes));
+        outputs[branch].partition.indirect = spool.canonical != null;
         opened += 1;
         try outputs[branch].enableSample(self.alloc, spool_max_branches * 32, options.sample_bytes, self.rng.intN(std.math.maxInt(usize)));
     }
 
-    var reader = try spool.open(partition, read_buffer);
-    defer reader.file.close(spool.io);
+    var reader = try spool.openInput(partition, read_buffer);
+    defer reader.close(spool.io);
+    var physical_offset: u64 = 0;
     for (0..partition.count) |i| {
         if (i % 256 == 0) try options.checkActive();
-        const row = try bulk_spool.read(&reader.interface, key, vector);
+        const row = try spool.readRow(partition, reader.reader(), key, vector, physical_offset);
+        physical_offset += if (partition.indirect) 12 else 14 + row.key.len + dims * 4;
         var best: ?usize = null;
         var best_distance = std.math.inf(f32);
         for (remaining[0..branches], 0..) |capacity, branch| {
@@ -10931,7 +10964,7 @@ fn routeBulkSpool(
             }
         }
         const branch = best orelse return error.InvalidBulkSpoolCount;
-        try outputs[branch].append(row.id, row.key, vector);
+        try outputs[branch].appendLocated(row.id, row.key, vector, row.offset);
         if (balanced) remaining[branch] -= 1;
     }
     for (outputs[0..opened], partitions) |*output, *child| {
@@ -11225,6 +11258,7 @@ pub fn buildBulkHilbertSeeded(
                 .range = merged_range,
                 .level = current_level,
                 .member_count = member_count,
+                .covering_radius = node.covering_radius,
             };
             next_count += 1;
             child_cursor += group_size;
@@ -11243,6 +11277,7 @@ pub fn buildBulkHilbertSeeded(
         .range = if (current[0].range) |range| try range.clone(self.alloc) else null,
         .level = current[0].level,
         .member_count = current[0].member_count,
+        .covering_radius = current[0].covering_radius,
     };
 }
 
@@ -11461,6 +11496,16 @@ fn buildBulkHierarchicalKmeansFromInputsOptions(
     inputs: []const bulk_build.PreparedBulkBuildInput,
     options: ?SpoolBuildOptions,
 ) !BuiltBulkNode {
+    return buildBulkHierarchicalKmeansFromInputsWithParent(self, txn, inputs, options, 0);
+}
+
+fn buildBulkHierarchicalKmeansFromInputsWithParent(
+    self: anytype,
+    txn: anytype,
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+    options: ?SpoolBuildOptions,
+    parent_id: u64,
+) !BuiltBulkNode {
     if (inputs.len == 0) return error.TooFewVectors;
     const dims: usize = @intCast(self.config.dims);
     const leaf_size = @max(@as(usize, 1), self.config.leaf_size);
@@ -11501,7 +11546,7 @@ fn buildBulkHierarchicalKmeansFromInputsOptions(
     };
 
     const target_leaf_count = std.math.divCeil(usize, inputs.len, leaf_size) catch unreachable;
-    return try buildBulkHierarchicalKmeansSubtree(self, txn, inputs, indexes, target_leaf_count, &scratch, options);
+    return try buildBulkHierarchicalKmeansSubtree(self, txn, inputs, indexes, target_leaf_count, &scratch, options, parent_id);
 }
 
 fn buildBulkHierarchicalKmeansSubtree(
@@ -11512,6 +11557,7 @@ fn buildBulkHierarchicalKmeansSubtree(
     target_leaf_count: usize,
     scratch: *BulkHierarchicalKmeansScratch,
     options: ?SpoolBuildOptions,
+    parent_id: u64,
 ) !BuiltBulkNode {
     if (options) |config| try config.checkActive();
     const leaf_size = @max(@as(usize, 1), self.config.leaf_size);
@@ -11526,12 +11572,12 @@ fn buildBulkHierarchicalKmeansSubtree(
             }
         }
         if (comptime @hasDecl(childType(@TypeOf(self)), "putNamespaced")) {
-            return buildBulkLeafIndexed(self, txn, self.nextNodeId(), inputs, indexes, 0, 0);
+            return buildBulkLeafIndexed(self, txn, self.nextNodeId(), inputs, indexes, parent_id, 0);
         }
         const selected = try self.alloc.alloc(bulk_build.PreparedBulkBuildInput, indexes.len);
         defer self.alloc.free(selected);
         for (selected, indexes) |*out, input_index| out.* = inputs[input_index];
-        return buildBulkLeaf(self, txn, self.nextNodeId(), selected, 0, 0);
+        return buildBulkLeaf(self, txn, self.nextNodeId(), selected, parent_id, 0);
     }
 
     const dims: usize = @intCast(self.config.dims);
@@ -11631,6 +11677,8 @@ fn buildBulkHierarchicalKmeansSubtree(
             self.write_profile.bulk_build_leaf_cluster_ns += route_ns;
         }
     }
+    const prebind = if (options) |config| config.prebind_parents else true;
+    const node_id = if (prebind) self.nextNodeId() else 0;
     const children = try self.alloc.alloc(BuiltBulkNode, cluster_count);
     var child_count: usize = 0;
     defer {
@@ -11648,12 +11696,13 @@ fn buildBulkHierarchicalKmeansSubtree(
             child_target_leaf_count,
             scratch,
             options,
+            node_id,
         );
         parent_level = @max(parent_level, children[child_count].level +| 1);
         child_count += 1;
         index_start += group_size;
     }
-    var parent = try buildBulkParentFromNodeRange(self, txn, children, parent_level);
+    var parent = try buildBulkParentFromNodeRangeWithIdentity(self, txn, children, parent_level, if (prebind) .{ .node_id = node_id, .parent_id = parent_id } else null);
     errdefer parent.deinit(self.alloc);
     if (options != null) try bulkNoteStaged(self, txn, @as(u64, self.config.dims) * 4 + cluster_count * 64);
     return parent;
@@ -12346,6 +12395,7 @@ fn buildBulkSubtreeRecursive(
         .range = range,
         .level = level,
         .member_count = member_count,
+        .covering_radius = node.covering_radius,
     };
 }
 
@@ -12407,6 +12457,7 @@ fn buildBulkLeafIndexed(
         .range = range,
         .level = level,
         .member_count = indexes.len,
+        .covering_radius = node.covering_radius,
     };
 }
 
@@ -12487,6 +12538,7 @@ fn buildBulkParentLevels(
                 .range = merged_range,
                 .level = current_level,
                 .member_count = member_count,
+                .covering_radius = node.covering_radius,
             };
             next_count += 1;
             child_cursor += group_size;
@@ -12508,6 +12560,7 @@ fn buildBulkParentLevels(
         .range = if (current[0].range) |range| try range.clone(self.alloc) else null,
         .level = current[0].level,
         .member_count = current[0].member_count,
+        .covering_radius = current[0].covering_radius,
     };
 }
 
@@ -12555,6 +12608,7 @@ fn buildBulkKmeansParentLevels(
         .range = if (current[0].range) |range| try range.clone(self.alloc) else null,
         .level = current[0].level,
         .member_count = current[0].member_count,
+        .covering_radius = current[0].covering_radius,
     };
 }
 
@@ -12642,16 +12696,30 @@ fn buildBulkKmeansParentLevel(
     return try self.alloc.realloc(out, out_count);
 }
 
+const BulkParentIdentity = struct { node_id: u64, parent_id: u64 };
+
 fn buildBulkParentFromNodeRange(
     self: anytype,
     txn: anytype,
     nodes: []BuiltBulkNode,
     level: u16,
 ) !BuiltBulkNode {
+    return buildBulkParentFromNodeRangeWithIdentity(self, txn, nodes, level, null);
+}
+
+/// Fresh recursive construction reserves the parent before its children. Their
+/// packed headers and quantized payloads are then born in their final form.
+fn buildBulkParentFromNodeRangeWithIdentity(
+    self: anytype,
+    txn: anytype,
+    nodes: []BuiltBulkNode,
+    level: u16,
+    identity: ?BulkParentIdentity,
+) !BuiltBulkNode {
     const indexes = try self.alloc.alloc(usize, nodes.len);
     defer self.alloc.free(indexes);
     for (indexes, 0..) |*index, i| index.* = i;
-    return try buildBulkParentFromNodeIndexes(self, txn, nodes, indexes, level);
+    return try buildBulkParentFromNodeIndexesWithIdentity(self, txn, nodes, indexes, level, identity);
 }
 
 fn buildBulkParentFromNodeIndexes(
@@ -12661,7 +12729,18 @@ fn buildBulkParentFromNodeIndexes(
     indexes: []const usize,
     level: u16,
 ) !BuiltBulkNode {
-    const node_id = self.nextNodeId();
+    return buildBulkParentFromNodeIndexesWithIdentity(self, txn, nodes, indexes, level, null);
+}
+
+fn buildBulkParentFromNodeIndexesWithIdentity(
+    self: anytype,
+    txn: anytype,
+    nodes: []BuiltBulkNode,
+    indexes: []const usize,
+    level: u16,
+    identity: ?BulkParentIdentity,
+) !BuiltBulkNode {
+    const node_id = if (identity) |reserved| reserved.node_id else self.nextNodeId();
     var child_ids = try self.alloc.alloc(u64, indexes.len);
     errdefer self.alloc.free(child_ids);
 
@@ -12678,7 +12757,7 @@ fn buildBulkParentFromNodeIndexes(
         child_ids[i] = child.node_id;
         addWeightedVector(centroid, child.centroid, child.member_count);
         member_count += child.member_count;
-        try self.updateParent(txn, child.node_id, node_id);
+        if (identity == null) try self.updateParent(txn, child.node_id, node_id);
         if (merged_range == null) {
             if (child.range) |range| merged_range = try range.clone(self.alloc);
         } else {
@@ -12694,13 +12773,42 @@ fn buildBulkParentFromNodeIndexes(
         .id = node_id,
         .is_leaf = false,
         .level = level,
-        .parent = 0,
+        .parent = if (identity) |reserved| reserved.parent_id else 0,
         .centroid = centroid,
         .children = child_ids,
         .members = &.{},
     };
-    node.covering_radius = try computeInternalCoveringRadius(self, txn, &node);
-    try self.saveNodeBody(txn, &node);
+    // The child proof is already owned by the depth-first builder. Loading
+    // every child back from immutable projection runs adds table probes and
+    // decoding solely to recover this scalar and its retained centroid.
+    node.covering_radius = if (self.config.metric == .inner_product) std.math.nan(f32) else 0;
+    if (self.config.metric != .inner_product) for (indexes) |node_index| {
+        const child = &nodes[node_index];
+        const bound = expandedCoveringRadius(self.config.metric, centroid, child.centroid, child.covering_radius);
+        if (!std.math.isFinite(bound)) {
+            node.covering_radius = std.math.nan(f32);
+            break;
+        }
+        node.covering_radius = @max(node.covering_radius, bound);
+    };
+    if (comptime @hasDecl(childType(@TypeOf(self)), "putNamespaced")) {
+        const child_vectors = try self.alloc.alloc(f32, indexes.len * self.config.dims);
+        defer self.alloc.free(child_vectors);
+        for (indexes, 0..) |node_index, row| {
+            @memcpy(child_vectors[row * self.config.dims ..][0..self.config.dims], nodes[node_index].centroid);
+        }
+        const save_started = nowNsU64Fixed();
+        defer {
+            self.write_profile.save_node_ns += elapsedSinceU64Fixed(save_started);
+            self.write_profile.save_node_calls += 1;
+        }
+        try savePackedNodeValue(self, txn, &node);
+        try refreshQuantizedWithKnownVectors(self, txn, &node, child_vectors, nowNsU64Fixed, elapsedSinceU64Fixed);
+        clearDeferredQuantizedNode(self, node.id);
+        try self.cacheNode(&node);
+    } else {
+        try self.saveNodeBody(txn, &node);
+    }
     try self.putNodeSplitRange(txn, node_id, if (merged_range) |*owned| owned else null);
     self.alloc.free(child_ids);
 
@@ -12710,6 +12818,7 @@ fn buildBulkParentFromNodeIndexes(
         .range = merged_range,
         .level = level,
         .member_count = member_count,
+        .covering_radius = node.covering_radius,
     };
 }
 
@@ -12791,6 +12900,7 @@ fn buildBulkLeafWithMatrix(
         .range = range,
         .level = level,
         .member_count = inputs.len,
+        .covering_radius = node.covering_radius,
     };
 }
 

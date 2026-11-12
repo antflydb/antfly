@@ -16,24 +16,36 @@
 //! Qualification-root counters. No pointer to these values crosses an owner.
 const std = @import("std");
 pub const names = [_][]const u8{ "identity", "fragments", "spool", "aggregate", "ordered", "text", "sparse", "dense" };
+pub const bulk_names = [_][]const u8{ "bulk_tee", "bulk_receipt", "dense_ingest", "dense_cluster", "dense_checkpoint", "dense_upload" };
 pub const Metrics = struct {
     parallel_jobs: std.atomic.Value(u64) = .init(0),
     ns: [names.len]std.atomic.Value(u64) = @splat(.init(0)),
     calls: [names.len]std.atomic.Value(u64) = @splat(.init(0)),
+    bulk_ns: [bulk_names.len]std.atomic.Value(u64) = @splat(.init(0)),
+    bulk_calls: [bulk_names.len]std.atomic.Value(u64) = @splat(.init(0)),
     pub fn reset(self: *@This()) void {
         self.parallel_jobs.store(0, .monotonic);
         for (&self.ns, &self.calls) |*time, *calls| {
             time.store(0, .monotonic);
             calls.store(0, .monotonic);
         }
+        for (&self.bulk_ns, &self.bulk_calls) |*time, *calls| {
+            time.store(0, .monotonic);
+            calls.store(0, .monotonic);
+        }
     }
     pub fn record(self: *@This(), comptime name: []const u8, elapsed: u64) void {
         const index = comptime slot: {
-            for (names, 0..) |candidate, slot_index| if (std.mem.eql(u8, name, candidate)) break :slot slot_index;
+            for (names ++ bulk_names, 0..) |candidate, slot_index| if (std.mem.eql(u8, name, candidate)) break :slot slot_index;
             @compileError("unknown physical family probe");
         };
-        _ = self.ns[index].fetchAdd(elapsed, .monotonic);
-        _ = self.calls[index].fetchAdd(1, .monotonic);
+        if (comptime index < names.len) {
+            _ = self.ns[index].fetchAdd(elapsed, .monotonic);
+            _ = self.calls[index].fetchAdd(1, .monotonic);
+        } else {
+            _ = self.bulk_ns[index - names.len].fetchAdd(elapsed, .monotonic);
+            _ = self.bulk_calls[index - names.len].fetchAdd(1, .monotonic);
+        }
     }
     pub fn times(self: *@This()) [names.len]u64 {
         var result: [names.len]u64 = undefined;
