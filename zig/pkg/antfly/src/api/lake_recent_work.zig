@@ -25,6 +25,9 @@ pub const Gate = struct {
     // Each builder has 256 MiB working admission plus a 64 MiB map writer.
     // Both foreground and background callers share this 640 MiB ceiling.
     admission: local.storage_resource_manager.DenseWorkAdmission.Queue = .{ .capacity = 2 },
+    // Bounded extra node lane for renewing/releasing ownership. These small
+    // requests must not wait behind saturated data-upload request gates.
+    control_requests: @import("httpx").RequestLimit = .{ .capacity = 2, .max_bytes = 8 * 1024 * 1024 },
     pub const Flight = struct {
         gate: *Gate,
         io: std.Io,

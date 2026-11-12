@@ -794,8 +794,14 @@ backoff. Foreground and background builders share FIFO admission for two active
 builders. Each has a 256 MiB construction workspace (including temporary roots
 and row IDs) and a separate 64 MiB map budget. Reclaiming scratch preserves parent
 quotas and releases each partition's temporary memory before the next. Claim
-renewal and one-second conditional cleanup use small independent control-plane
-budgets so request allocation failure cannot strand ownership.
+renewal and one-second conditional cleanup use independent control-plane budgets
+so request allocation failure cannot strand ownership. Each control client has
+an 8 MiB transport budget plus a 128 KiB payload budget, and uses a separate
+node lane capped at two requests and 8 MiB in-flight reservation. Its HTTP pools
+and internal allocator are independently owned; replacing only an operation's
+result allocator cannot make a request-arena transport safe for concurrent use.
+Heartbeat tasks use boolean cancellation probes and do not call fallible source
+reader checkpoints from another task. No control operation provisions a bucket.
 
 Repair, admission and waiting share the request deadline (at most 30 seconds)
 and cancellation; they do not refresh the budget per partition. Native dense

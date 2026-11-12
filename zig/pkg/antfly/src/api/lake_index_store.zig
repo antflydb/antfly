@@ -129,17 +129,39 @@ pub const Store = struct {
     pub fn reopenReadOnlyWithPriority(self: *const Store, a: A, speculative: bool) !Store {
         return self.reopenReadOnlyWithAdmission(a, .{ .speculative = speculative });
     }
-    pub fn reopenReadOnlyWithAdmission(self: *const Store, a: A, admission: struct { speculative: bool = false, wait_for_speculative_io: bool = false }) !Store {
+    pub fn reopenReadOnlyWithAdmission(self: *const Store, a: A, admission: struct { speculative: bool = false, wait_for_speculative_io: bool = false, control_requests: ?*@import("httpx").RequestLimit = null, control_io: ?std.Io = null }) !Store {
         var options = self.reopen_options orelse return error.NativeArtifactStorageRequired;
+        if (admission.control_requests != null and options.transport == null) options.transport = .{};
         if (options.transport) |*transport| {
             transport.speculative = admission.speculative;
             transport.wait_for_speculative_io = admission.wait_for_speculative_io;
+            if (admission.control_requests) |requests| {
+                // Reserved node control lane: it cannot queue behind the data
+                // requests whose ownership it is responsible for renewing.
+                transport.requests = requests;
+                transport.query_requests = null;
+                if (admission.control_io) |io| transport.io = io;
+                transport.speculative = false;
+                transport.wait_for_speculative_io = false;
+            }
         }
         var result = if (options.config) |config|
             try openRetainedNativeWithTransport(a, config, options.secrets, self.locator, true, options.deployment, options.local_base_dir, options.transport)
         else
             try openNativeWithTransport(a, null, options.secrets, true, options.deployment, options.local_base_dir, options.transport);
         errdefer result.deinit();
+        if (admission.control_requests != null) {
+            // Claims are small control records. A data-sized response ceiling
+            // would reserve the entire byte gate and serialize heartbeats.
+            if (result.opened.gcs_client) |gcs| if (gcs.owned_httpx) |http| {
+                http.client.config.max_response_size = 64 * 1024;
+                http.client.config.max_error_response_size = 4096;
+            };
+            if (result.opened.s3_client) |s3| if (s3.owned_httpx) |http| {
+                http.client.config.max_response_size = 64 * 1024;
+                http.client.config.max_error_response_size = 4096;
+            };
+        }
         result.implementation.cloud_cache = self.implementation.cloud_cache;
         if (!std.mem.eql(u8, &result.identity, &self.identity)) return error.ExternalLakeIndexStoreChanged;
         if (!std.mem.eql(u8, &result.cache_identity, &self.cache_identity)) return error.ExternalLakeIndexCredentialsChanged;

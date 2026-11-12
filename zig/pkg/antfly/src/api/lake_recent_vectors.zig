@@ -554,7 +554,10 @@ fn nowMs() u64 {
 // exhausted request arena. At most two builders own this bounded workspace.
 fn cleanupClaim(store: *Store, key: []const u8, job: Job, io: std.Io) void {
     var memory: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 128 * 1024 };
-    releaseClaim(memory.allocator(), store, key, null, job, io) catch {};
+    var transport_memory: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 8 * 1024 * 1024 };
+    var control = store.reopenReadOnlyWithAdmission(transport_memory.allocator(), .{ .control_requests = &recovery.process.control_requests, .control_io = io }) catch return;
+    defer control.deinit();
+    releaseClaim(memory.allocator(), &control, key, null, job, io) catch {};
 }
 const Renewal = struct {
     store: *Store,
@@ -564,18 +567,27 @@ const Renewal = struct {
     parent: Context,
     provider: ?Cancellation = null,
     memory: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 128 * 1024 },
+    transport_memory: local.sql_memory_budget = .{ .backing = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator), .limit = 8 * 1024 * 1024 },
+    control: ?Store = null,
     revision: ?@import("objectstore").ObjectRevision = null,
     expires: std.atomic.Value(u64) = .init(0),
     failed: std.atomic.Value(bool) = .init(false),
     failure: ?anyerror = null, // Published by failed's release store.
     stopped: std.Io.Event = .unset,
     fn init(self: *Renewal, revision: @import("objectstore").ObjectRevision) !void {
+        self.control = try self.store.reopenReadOnlyWithAdmission(self.transport_memory.allocator(), .{ .control_requests = &recovery.process.control_requests, .control_io = self.io });
+        errdefer {
+            self.control.?.deinit();
+            self.control = null;
+        }
         self.revision = try revision.clone(self.memory.allocator());
         self.expires.store(self.record.lease_until_ms, .release);
     }
     fn deinit(self: *Renewal) void {
         if (self.revision) |*revision| revision.deinit(self.memory.allocator());
+        if (self.control) |*control| control.deinit();
         std.debug.assert(self.memory.live == 0);
+        std.debug.assert(self.transport_memory.live == 0);
     }
     fn canceled(raw: *const anyopaque) bool {
         const self: *const Renewal = @ptrCast(@alignCast(raw));
@@ -587,16 +599,21 @@ const Renewal = struct {
         if (nowMs() >= self.expires.load(.acquire)) return error.RecentVectorLeaseLost;
     }
     fn pulse(self: *Renewal) !void {
-        try self.check();
+        // Heartbeat tasks must never invoke source-reader checkpoints or use
+        // the query client's allocator. Only transport-safe boolean probes run
+        // here; fallible source authority is checked on the owning query lane.
+        if (self.failed.load(.acquire)) return self.failure orelse error.RecentVectorLeaseLost;
+        if (nowMs() >= self.expires.load(.acquire)) return error.RecentVectorLeaseLost;
+        if (self.parent.isCancelled() or (if (self.provider) |token| token.isCancelled() else false)) return error.Canceled;
         if (self.record.lease_until_ms -| nowMs() > lease_ms / 2) return;
         var arena = std.heap.ArenaAllocator.init(self.memory.allocator());
         defer arena.deinit();
         const a = arena.allocator();
         var next = self.record;
         next.lease_until_ms = nowMs() +| lease_ms;
-        var client = self.store.opened.client;
+        var client = self.control.?.opened.client;
         client.allocator = a;
-        var written = try client.compareAndPut(self.store.opened.bucket, self.key, try std.json.Stringify.valueAlloc(a, next, .{}), self.revision, .{ .cancellation = .{ .ptr = self, .is_cancelled_fn = canceled } });
+        var written = try client.compareAndPut(self.control.?.opened.bucket, self.key, try std.json.Stringify.valueAlloc(a, next, .{}), self.revision, .{ .cancellation = .{ .ptr = self, .is_cancelled_fn = canceled } });
         defer written.deinit(a);
         const revision = try (written.writeRevision() orelse return error.MissingObjectRevision).clone(self.memory.allocator());
         if (self.revision) |*old| old.deinit(self.memory.allocator());
@@ -1262,4 +1279,48 @@ test "external lake bounded WAL renewable claims fence stale workers and cleanup
     try std.testing.expectEqual(@as(u64, 0), stopped.lease_until_ms);
     renewal.expires.store(0, .release);
     try std.testing.expectError(error.RecentVectorLeaseLost, renewal.pulse());
+}
+
+test "external lake bounded WAL control clients isolate HTTP allocation and bypass saturated data gates" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "gcs", "s3" }) |protocol| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const work = arena.allocator();
+        const credentials = try std.json.parseFromSliceLeaky(V, work, if (std.mem.eql(u8, protocol, "gcs"))
+            "{\"source\":\"bearer_token\",\"bearer_token\":\"test-only-token\"}"
+        else
+            "{\"source\":\"static\",\"access_key_id\":\"test-only-key\",\"secret_access_key\":\"test-only-secret\"}", .{});
+        const json = try std.json.Stringify.valueAlloc(work, .{
+            .deployment_mode = "standalone",
+            .storage = .{ .engine = "local", .local = .{ .base_dir = "." }, .artifacts = .{ .connection = "artifacts", .bucket = "bucket", .prefix = "tenant/indexes" } },
+            .connections = .{ .artifacts = .{ .kind = "external_io", .capabilities = .{"storage.primary"}, .external_io = .{ .protocol = protocol, .buckets = .{"bucket"}, .prefix = "tenant", .bucket_provisioning = "require_existing", .credentials = credentials } } },
+        }, .{});
+        var config = try local.common_config.Config.parseFromSlice(a, json);
+        defer config.deinit();
+        var data_requests: @import("httpx").RequestLimit = .{ .capacity = 0 };
+        var query_requests: @import("httpx").RequestLimit = .{ .capacity = 0 };
+        // Adapter construction must perform no provider I/O with these fake
+        // credentials. Data lanes are deliberately closed to expose coupling.
+        var store = try Store.openNativeWithTransport(work, &config, null, true, .standalone, null, .{ .io = std.testing.io, .requests = &data_requests, .query_requests = &query_requests });
+        defer store.deinit();
+        const job: Job = .{ .table_id = 7, .object_generation = 0, .wal_lsn = 8, .archive_generation = 1, .desired = @splat(1), .cut = @splat(2), .lease_until_ms = nowMs() + lease_ms };
+        var renewal: Renewal = .{ .store = &store, .key = "recent-search/7/control.json", .io = std.testing.io, .record = job, .parent = .{ .io = std.testing.io } };
+        try renewal.init(.{ .etag = "test-revision" });
+        defer renewal.deinit();
+        const control = &renewal.control.?;
+        try std.testing.expect(control.opened.client.ptr != store.opened.client.ptr);
+        try std.testing.expect(control.opened.client.allocator.ptr == renewal.transport_memory.allocator().ptr);
+        const data_http = if (store.opened.gcs_client) |gcs| &gcs.owned_httpx.?.client else &store.opened.s3_client.?.owned_httpx.?.client;
+        const control_http = if (control.opened.gcs_client) |gcs| &gcs.owned_httpx.?.client else &control.opened.s3_client.?.owned_httpx.?.client;
+        try std.testing.expect(data_http.allocator.ptr == work.ptr);
+        try std.testing.expect(control_http.allocator.ptr == renewal.transport_memory.allocator().ptr);
+        try std.testing.expect(control_http.config.request_limit == &recovery.process.control_requests);
+        try std.testing.expect(control_http.config.query_request_limit == null);
+        try std.testing.expectEqual(@as(usize, 64 * 1024), control_http.config.max_response_size);
+        try std.testing.expect(data_http.config.request_limit == &data_requests);
+        try std.testing.expect(data_http.config.query_request_limit == &query_requests);
+        try std.testing.expectEqual(store.identity, control.identity);
+        try std.testing.expectEqual(store.cache_identity, control.cache_identity);
+    }
 }
