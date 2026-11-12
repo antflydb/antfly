@@ -99,6 +99,7 @@ pub const RunAdmission = struct {
 
     controller: *memory.AdmissionController,
     denial_observer: ?DenialObserver = null,
+    failure: ?*memory.AdmissionFailure = null,
     backend_class: memory.BackendClass,
     limits: memory.Limits,
     static_workspace_bytes: usize,
@@ -166,6 +167,7 @@ pub const RunAdmission = struct {
             .limits = self.limits,
             .amounts = amounts,
             .required_residency = required,
+            .failure = self.failure,
         }}, self.check_live_memory, pressure) catch |err| {
             // Controller locks are released before inspecting OS memory or
             // emitting diagnostics. Sessions share the manager's sampler gate.
@@ -174,6 +176,7 @@ pub const RunAdmission = struct {
                 .limits = self.limits,
                 .amounts = amounts,
                 .required_residency = required,
+                .failure = self.failure,
             });
             return err;
         };
@@ -187,6 +190,7 @@ pub const RunAdmission = struct {
             .limits = self.limits,
             .amounts = .{ .host_scratch_bytes = bytes },
             .required_residency = self.requiredResidency(),
+            .failure = self.failure,
         };
         self.controller.validateRequests(&.{request}) catch |err| {
             if (self.denial_observer) |observer| observer.record(observer.context, err, null, request);
@@ -796,6 +800,15 @@ pub const Session = struct {
         return if (self.vtable.forwardBatchPolicy) |query| query(self.ptr, inputs) else .{};
     }
 
+    /// A borrowed request view; never mutate the shared model's admission.
+    pub fn withAdmissionControl(self: Session, control: ?InferenceExecutionControl) Session {
+        var result = self;
+        if (result.run_admission) |*admission| {
+            admission.failure = if (control) |active| active.admission_failure else null;
+        }
+        return result;
+    }
+
     /// Run a forward pass with the given input tensors.
     pub fn run(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
         var resource_lease = if (self.run_admission) |admission|
@@ -818,7 +831,7 @@ pub const Session = struct {
         try active.check();
         var hard_cancellation = try active.enterUninterruptible(self.interruption());
         defer hard_cancellation.deinit();
-        var resource_lease = if (self.run_admission) |admission|
+        var resource_lease = if (self.withAdmissionControl(active).run_admission) |admission|
             try admission.acquireRequest(try self.planRun(inputs, null), self.outputInfo())
         else
             null;

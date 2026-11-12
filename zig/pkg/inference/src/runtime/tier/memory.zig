@@ -787,6 +787,25 @@ pub const ResidencySource = struct {
     }
 };
 
+/// Request- or load-flight-owned failure details. Concurrent preparation may
+/// report through the same sink, but no pointer is retained by a model/lease.
+pub const AdmissionFailure = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    value: ?AdmissionAmounts.LimitExceeded = null,
+
+    pub fn record(self: *AdmissionFailure, value: ?AdmissionAmounts.LimitExceeded) void {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        self.value = value;
+    }
+
+    pub fn snapshot(self: *AdmissionFailure) ?AdmissionAmounts.LimitExceeded {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        return self.value;
+    }
+};
+
 pub const AdmissionRequest = struct {
     backend_class: BackendClass,
     limits: Limits,
@@ -796,6 +815,7 @@ pub const AdmissionRequest = struct {
     required_residency: Residency = .{},
     /// Optional request-local diagnostic; never retained by the controller.
     limit_exceeded: ?*?AdmissionAmounts.LimitExceeded = null,
+    failure: ?*AdmissionFailure = null,
 };
 
 // Shared by reservation and cumulative request validation, so neither path
@@ -831,6 +851,7 @@ const AdmissionPlan = struct {
                 for (requests) |request| {
                     if (backendClassIndex(request.backend_class) == index) {
                         if (request.limit_exceeded) |out| out.* = exceeded;
+                        if (request.failure) |failure| failure.record(exceeded);
                     }
                 }
                 return error.ResourceLimitExceeded;
@@ -846,9 +867,10 @@ const AdmissionPlan = struct {
             .kv_limit_bytes = shared.kv_limit_bytes,
             .scratch_limit_bytes = shared.scratch_limit_bytes,
         }) catch return error.ResourceLimitExceeded) |exceeded| {
-            for (requests) |request| if (request.limit_exceeded) |out| {
-                out.* = exceeded;
-            };
+            for (requests) |request| {
+                if (request.limit_exceeded) |out| out.* = exceeded;
+                if (request.failure) |failure| failure.record(exceeded);
+            }
             return error.ResourceLimitExceeded;
         }
     }
@@ -5064,4 +5086,32 @@ test "model residency admission publication stays coherent across concurrent upd
         const value = source.snapshot();
         try std.testing.expectEqual(value.by_backend[0].host_weight_bytes * 2, value.by_backend[1].backend_weight_bytes);
     }
+}
+
+test "request admission failure sinks preserve concurrent isolation" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Probe = struct {
+        controller: *AdmissionController,
+        failure: *AdmissionFailure,
+        bytes: usize,
+        fn run(self: @This()) !void {
+            for (0..1000) |_| {
+                try std.testing.expectError(error.ResourceLimitExceeded, self.controller.tryAcquireRequests(&.{.{
+                    .backend_class = .cpu,
+                    .limits = .{ .host_limit_bytes = 100 },
+                    .amounts = .{ .host_scratch_bytes = self.bytes },
+                    .failure = self.failure,
+                }}, false));
+                try std.testing.expectEqual(self.bytes, self.failure.snapshot().?.requested_bytes);
+            }
+        }
+    };
+    var controller = AdmissionController{};
+    var first = AdmissionFailure{};
+    var second = AdmissionFailure{};
+    var one = try std.testing.io.concurrent(Probe.run, .{Probe{ .controller = &controller, .failure = &first, .bytes = 110 }});
+    var two = try std.testing.io.concurrent(Probe.run, .{Probe{ .controller = &controller, .failure = &second, .bytes = 120 }});
+    try one.await(std.testing.io);
+    try two.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
 }

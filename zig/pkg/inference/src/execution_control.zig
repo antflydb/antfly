@@ -127,6 +127,9 @@ pub const UninterruptibleGuard = struct {
 pub const InferenceExecutionControl = struct {
     /// False only for Node-owned startup/offline work with no request waiter.
     request_owned: bool = true,
+    /// Borrowed only by structured request work. Coalesced loads use their own
+    /// flight-owned sink and copy terminal details to each surviving waiter.
+    admission_failure: ?*@import("runtime/tier/memory.zig").AdmissionFailure = null,
     /// Verified selection carried by value through async admission/loading.
     model_selection: ?@import("registry/model_selection.zig").Constraint = null,
     /// The HTTP route owns a request slot; audio leaves reserve only work units.

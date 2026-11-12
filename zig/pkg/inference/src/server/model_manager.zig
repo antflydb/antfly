@@ -4497,6 +4497,7 @@ const LoadFlight = struct {
     native_call_policy: execution_control_mod.NativeCallPolicy = .require_supervision,
     model: ?*LoadedModel = null,
     err: ?anyerror = null,
+    admission_failure: runtime.tier.memory.AdmissionFailure = .{},
     /// Protected by ModelManager.load_lock. The manager-owned task holds one
     /// reference and every request waiter holds another.
     refs: usize = 2,
@@ -4562,6 +4563,7 @@ const LoadFlightControl = struct {
 
     fn control(self: *@This()) InferenceExecutionControl {
         return .{
+            .admission_failure = &self.flight.admission_failure,
             .io = self.flight.io,
             .ptr = self,
             .check_fn = check,
@@ -5407,7 +5409,7 @@ pub const ModelManager = struct {
         }
     };
 
-    fn loadNativeWhisperPrompt(self: *ModelManager, man: *const manifest_mod.ModelManifest, artifacts: *PublishedArtifacts, tokenizer: tokenizer_mod.Tokenizer, required: runtime.tier.memory.Residency) !ManagedWhisperPrompt {
+    fn loadNativeWhisperPrompt(self: *ModelManager, man: *const manifest_mod.ModelManifest, artifacts: *PublishedArtifacts, tokenizer: tokenizer_mod.Tokenizer, required: runtime.tier.memory.Residency, control: ?InferenceExecutionControl) !ManagedWhisperPrompt {
         const config_fallback = if (man.config_path == null) try artifacts.resolve("config.json") else null;
         defer if (config_fallback) |path| self.allocator.free(path);
         const config_path = man.config_path orelse config_fallback;
@@ -5430,6 +5432,7 @@ pub const ModelManager = struct {
                 .limits = self.admissionLimitsForBackend(.{ .backend = .native }),
                 .amounts = .{ .host_weight_bytes = try checkedScaledBytes(encoded, 32, 1024 * 1024) },
                 .required_residency = required,
+                .failure = if (control) |active| active.admission_failure else null,
             }})
         else
             null;
@@ -7273,7 +7276,7 @@ pub const ModelManager = struct {
         ) !ManagedHfTokenizer {
             var proof = try ComponentConstruction.init(self.manager.allocator, self.manager.session_manager.io orelse std.Options.debug_io, try self.selection(), null, self.borrowed_artifacts);
             defer proof.deinit();
-            var tokenizer = try self.manager.loadManagedHfTokenizerFileWithArtifacts(tokenizer_path, proof.artifacts());
+            var tokenizer = try self.manager.loadManagedHfTokenizerFileWithArtifacts(tokenizer_path, proof.artifacts(), null);
             errdefer tokenizer.deinit();
             try proof.finish();
             return tokenizer;
@@ -7706,6 +7709,7 @@ pub const ModelManager = struct {
                     .limits = admission_limits,
                     .amounts = admission_plan.peak,
                     .required_residency = required_residency,
+                    .failure = if (control) |active| active.admission_failure else null,
                 }}) catch |err| {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
@@ -7772,20 +7776,21 @@ pub const ModelManager = struct {
         self: *ModelManager,
         tokenizer_path: []const u8,
     ) !ManagedHfTokenizer {
-        return self.loadManagedHfTokenizerFileWithArtifacts(tokenizer_path, null);
+        return self.loadManagedHfTokenizerFileWithArtifacts(tokenizer_path, null, null);
     }
 
     fn loadManagedHfTokenizerFileWithArtifacts(
         self: *ModelManager,
         tokenizer_path: []const u8,
         artifacts: ?*const PublishedArtifacts,
+        control: ?InferenceExecutionControl,
     ) !ManagedHfTokenizer {
         const plan = try tokenizerFileAdmissionPlan(
             self.allocator,
             tokenizer_path,
             .huggingface,
         );
-        var resource_lease = try self.acquireTokenizerAdmission(plan);
+        var resource_lease = try self.acquireTokenizerAdmissionWithControl(plan, control);
         errdefer if (resource_lease) |*lease| lease.release();
 
         const tok_bytes = if (artifacts) |verified|
@@ -7815,16 +7820,18 @@ pub const ModelManager = struct {
         };
     }
 
-    fn acquireTokenizerAdmission(
-        self: *ModelManager,
-        plan: ModelLoadAdmissionPlan,
-    ) !?runtime.tier.memory.AdmissionLease {
+    fn acquireTokenizerAdmission(self: *ModelManager, plan: ModelLoadAdmissionPlan) !?runtime.tier.memory.AdmissionLease {
+        return self.acquireTokenizerAdmissionWithControl(plan, null);
+    }
+
+    fn acquireTokenizerAdmissionWithControl(self: *ModelManager, plan: ModelLoadAdmissionPlan, control: ?InferenceExecutionControl) !?runtime.tier.memory.AdmissionLease {
         if (!self.admission_enabled) return null;
-        return try self.acquireAmountsWithEviction(
-            .cpu,
-            self.admissionLimitsForBackend(.{ .backend = .native }),
-            plan.peak,
-        );
+        return try self.acquireRequestsWithEviction(&.{.{
+            .backend_class = .cpu,
+            .limits = self.admissionLimitsForBackend(.{ .backend = .native }),
+            .amounts = plan.peak,
+            .failure = if (control) |active| active.admission_failure else null,
+        }});
     }
 
     pub fn lockLoadedModels(self: *ModelManager) void {
@@ -8454,7 +8461,12 @@ pub const ModelManager = struct {
             loaded.active_handles += 1;
             self.unlockLoadedModels();
         }
-        if (maybe_err) |err| return err;
+        if (maybe_err) |err| {
+            if (err == error.ResourceLimitExceeded) if (control) |active| {
+                if (active.admission_failure) |sink| sink.record(flight.load_state.admission_failure.snapshot());
+            };
+            return err;
+        }
         return .{
             .manager = self,
             .assets = assets orelse return error.TokenizerLoadFailed,
@@ -8643,7 +8655,7 @@ pub const ModelManager = struct {
         defer sidecars.deinit();
         if (publication != null and !std.meta.eql(publication, sidecars.managed_publication)) return error.ModelArtifactsChanging;
 
-        var managed_tokenizer = try self.loadManagedHfTokenizerFileWithArtifacts(sidecars.tokenizer_path, &artifacts);
+        var managed_tokenizer = try self.loadManagedHfTokenizerFileWithArtifacts(sidecars.tokenizer_path, &artifacts, control);
         errdefer managed_tokenizer.deinit();
         const config_bytes = try artifacts.readPath(sidecars.config_path, 16 * 1024 * 1024);
         defer self.allocator.free(config_bytes);
@@ -9504,11 +9516,17 @@ pub const ModelManager = struct {
                 else => return err,
             };
         }
+        const failure = flight.admission_failure.snapshot();
         var result = self.consumeLoadFlightWaiter(flight_key, flight, .adopt);
         waiter_consumed = true;
         errdefer result.handle.release();
         if (control) |active| try active.check();
-        if (result.err) |err| return err;
+        if (result.err) |err| {
+            if (err == error.ResourceLimitExceeded) if (control) |active| {
+                if (active.admission_failure) |sink| sink.record(failure);
+            };
+            return err;
+        }
         if (result.handle.model == null) return error.NoBackendAvailable;
         return result.handle;
     }
@@ -9786,7 +9804,7 @@ pub const ModelManager = struct {
         const gemma_compat = tokenizerGemmaCompat(man, model_dir);
         const kind = try tokenizerKindWithArtifacts(man, &artifacts, gemma_compat);
         const plan = try tokenizerLoadAdmissionPlanWithArtifacts(self.allocator, model_dir, &man, kind, &artifacts);
-        var lease = try self.acquireTokenizerAdmission(plan);
+        var lease = try self.acquireTokenizerAdmissionWithControl(plan, control);
         errdefer if (lease) |*active| active.release();
         var hf: ?*hf_tokenizer.HfTokenizer = null;
         var sp: ?*sentencepiece.Processor = null;
@@ -9938,7 +9956,7 @@ pub const ModelManager = struct {
         else
             null;
         var tokenizer_resource_lease = if (tokenizer_admission_plan) |plan|
-            try self.acquireTokenizerAdmission(plan)
+            try self.acquireTokenizerAdmissionWithControl(plan, control)
         else
             null;
         errdefer if (tokenizer_resource_lease) |*lease| lease.release();
@@ -10022,7 +10040,7 @@ pub const ModelManager = struct {
             try session_factory.sealGlinerDecisionTokenizerDigest(session, digest);
 
         var managed_whisper_prompt: ?ManagedWhisperPrompt = if (session_factory.getWhisperConfig(session) != null)
-            try self.loadNativeWhisperPrompt(&man, &tokenizer_artifacts, if (hf_tok) |ht| ht.tokenizer() else sp_tok.?.tokenizer(), try (if (loaded_session.resource_lease) |lease| runtime.tier.memory.Residency.fromLease(lease) else runtime.tier.memory.Residency{}).merge(if (tokenizer_resource_lease) |lease| .fromLease(lease) else .{}))
+            try self.loadNativeWhisperPrompt(&man, &tokenizer_artifacts, if (hf_tok) |ht| ht.tokenizer() else sp_tok.?.tokenizer(), try (if (loaded_session.resource_lease) |lease| runtime.tier.memory.Residency.fromLease(lease) else runtime.tier.memory.Residency{}).merge(if (tokenizer_resource_lease) |lease| .fromLease(lease) else .{}), control)
         else
             null;
         errdefer if (managed_whisper_prompt) |*prompt| prompt.deinit();
@@ -12381,6 +12399,7 @@ fn loadSessionForPreferredBackendsWithArtifacts(
                 .limits = admission_limits,
                 .amounts = admission_plan.peak,
                 .required_residency = required_residency,
+                .failure = if (control) |active| active.admission_failure else null,
             }}) catch |err| {
                 std.log.warn(
                     "loadModel({s}) backend {s} admission failed: {s}; peak_host={d} peak_backend={d} host_limit={d} backend_limit={d} combined_limit={d}",
@@ -18651,7 +18670,7 @@ test "model selection native Whisper consumes only authenticated prompt sidecars
     var constrained = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
     defer constrained.deinit();
     try (ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 1, .combined_limit_bytes = 1 } }).configure(&constrained);
-    if (constrained.loadNativeWhisperPrompt(&metadata, &prompt_artifacts, prompt_tokenizer.tokenizer(), .{})) |value| {
+    if (constrained.loadNativeWhisperPrompt(&metadata, &prompt_artifacts, prompt_tokenizer.tokenizer(), .{}, null)) |value| {
         var unexpected = value;
         unexpected.deinit();
         return error.TestExpectedError;
@@ -18703,7 +18722,7 @@ test "model selection legacy Whisper metadata growth cannot exceed its admission
     defer manager.deinit();
     try (ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 128 * 1024 * 1024, .combined_limit_bytes = 128 * 1024 * 1024 } }).configure(&manager);
     const man = manifest_mod.ModelManifest{ .allocator = a };
-    try std.testing.expectError(error.FileTooLarge, manager.loadNativeWhisperPrompt(&man, &artifacts, tokenizer.tokenizer(), .{}));
+    try std.testing.expectError(error.FileTooLarge, manager.loadNativeWhisperPrompt(&man, &artifacts, tokenizer.tokenizer(), .{}, null));
     try std.testing.expect(!Probe.grow);
     try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
 }
@@ -20470,4 +20489,48 @@ test "optional admission staging stays retryable until its phase commits" {
     var recovered = try session.admitHostPreprocess(30);
     defer recovered.deinit();
     try std.testing.expectEqual(@as(usize, 50), controller.snapshot().hostTotalBytes());
+}
+
+test "load admission failure details survive flight ownership and reach each waiter" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    const flight = try std.testing.allocator.create(LoadFlight);
+    flight.* = .{ .io = std.testing.io };
+    try manager.in_flight_loads.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "denied"), flight);
+    defer manager.releaseLoadFlight("denied", flight);
+    try std.testing.expect(flight.tryAddWaiter());
+    flight.refs += 1;
+    const expected = runtime.tier.memory.AdmissionAmounts.LimitExceeded{ .limit = .host, .requested_bytes = 110, .limit_bytes = 100 };
+    // The shared task borrows only the flight's storage, never a request stack.
+    var active = LoadFlightControl{ .flight = flight };
+    active.control().admission_failure.?.record(expected);
+    manager.finishLoadFlight(flight, null, error.ResourceLimitExceeded);
+    var first = runtime.tier.memory.AdmissionFailure{};
+    var second = runtime.tier.memory.AdmissionFailure{};
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.waitForLoadFlight("denied", flight, .{ .admission_failure = &first }));
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.waitForLoadFlight("denied", flight, .{ .admission_failure = &second }));
+    try std.testing.expectEqualDeep(expected, first.snapshot().?);
+    try std.testing.expectEqualDeep(expected, second.snapshot().?);
+    first.record(null);
+    try std.testing.expectEqualDeep(expected, second.snapshot().?);
+}
+
+test "lazy component load admission retains its blocking budget and required bytes" {
+    const a = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, a);
+    const root = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer a.free(root);
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 1 });
+    var failure = runtime.tier.memory.AdmissionFailure{};
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.loadManagedSessionWithAdmission(root, &.{.native}, null, .{ .admission_failure = &failure, .native_call_policy = .in_process }, .{ .path = root, .publication = try managed_receipt.publicationGeneration(a, std.testing.io, root) }, null));
+    const exceeded = failure.snapshot().?;
+    try std.testing.expect(exceeded.limit == .host);
+    try std.testing.expectEqual(@as(usize, 1), exceeded.limit_bytes);
+    try std.testing.expect(exceeded.requested_bytes > exceeded.limit_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
 }

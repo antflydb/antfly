@@ -5752,7 +5752,7 @@ pub const NativeGenerationPipeline = struct {
             .{ prompt.len, actual_prompt_tokens },
         );
 
-        var image_memory = @import("preprocessing_memory.zig").Scope.init(allocator, self.session, self.media_prepaid, self.media_run_budget);
+        var image_memory = @import("preprocessing_memory.zig").Scope.init(allocator, if (self.session) |session| session.withAdmissionControl(self.execution_control) else null, self.media_prepaid, self.media_run_budget);
         defer image_memory.deinit();
         var prepared_multimodal_prompt: ?gemma3_mm.PreparedPrompt = null;
         defer if (prepared_multimodal_prompt) |*prepared| {
