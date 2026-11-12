@@ -1055,10 +1055,10 @@ pub const Demand = packed struct(u8) {
 /// a durable tip. See `checkin`'s doc comment for why the foreign check
 /// uses `PathWriterLock.othersWaitingAcrossProcesses`, not the plain
 /// `othersWaiting`: this process's own maintenance worker competes for the
-/// same kernel lease through the same file-based fair queue as a
-/// genuinely foreign waiter, and the two are indistinguishable from
-/// `othersWaiting` alone -- `othersWaitingAcrossProcesses` tells them
-/// apart by the process id `writer_queue` now stamps on every ticket.
+/// same kernel lease through the same region ticket ring as a genuinely
+/// foreign waiter, and the two are indistinguishable from `othersWaiting`
+/// alone -- `othersWaitingAcrossProcesses` tells them apart by the
+/// process id the region's own ticket ring stamps on every ticket.
 ///
 /// At most one writer is ever "checked out" of the lane at a time
 /// (`checked_out`): `checkout`/`checkin` replace *when* the kernel lease
@@ -2021,7 +2021,7 @@ pub const Owner = struct {
             else => return err,
         };
         errdefer held.close();
-        stats.recordAcquired(if (held.queue_turn != null) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+        stats.recordAcquired(if (held.contended) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
         wal_trace.recordOp(.maintenance_lease_acquired);
         held.startHold(stats);
         if (self.stopping.load(.acquire)) return error.Canceled;
@@ -3422,7 +3422,7 @@ pub const Connection = struct {
                 if (err == error.FileBusy) stats.recordBusy(@intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
                 return err;
             };
-            stats.recordAcquired(if (lease.queue_turn != null) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+            stats.recordAcquired(if (lease.contended) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
             lease.startHold(stats);
             return self.owner.withReadRegistrationBatch(lease);
         }

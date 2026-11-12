@@ -589,7 +589,6 @@ pub const storage_lite_index_storage = @import("storage/lite/index_storage.zig")
 pub const storage_lite_ledger_digest = @import("storage/lite/ledger_digest.zig");
 pub const storage_lite_mod = @import("storage/lite/mod.zig");
 pub const storage_lite_path_lock_wait = @import("storage/lite/path_lock_wait.zig");
-pub const storage_lite_writer_queue = @import("storage/lite/writer_queue.zig");
 pub const storage_lite_write_amplification_bench_test = @import("storage/lite/write_amplification_bench_test.zig");
 pub const storage_lite_write_amplification_cpu_bench_test = @import("storage/lite/write_amplification_cpu_bench_test.zig");
 pub const storage_lite_native = @import("storage/lite/native.zig");
