@@ -436,29 +436,45 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const preparation_timestamp_ns = if (req.document_version_scheme == .revision_v1 or req.timestamp_ns != 0) req.timestamp_ns else S.ownerField(self, "backend_runtime").*.clock().nowRealtimeNs();
             const preparation_alloc = prepared_row_allocator.allocator();
 
+            // Everything below through the index-plan/writer scratch lives only
+            // until this attempt's commit completes (same lifetime the explicit
+            // frees already gave it): the coalesced write/delete order map, the
+            // transform read snapshot, the merged graph write/delete arrays, the
+            // relational index-ready flags, and the index-record writer. Bump
+            // allocation from one arena replaces many small tracked
+            // allocator calls (each independently charged against the
+            // DebugAllocator's per-allocation bookkeeping) with a handful of
+            // page requests; the individual `.deinit`/`.free` calls below stay
+            // in place (a no-op against an arena allocator) so a retry/error
+            // path that forgets one costs nothing extra, and `commit_arena`
+            // itself is torn down, once, when this attempt returns.
+            var commit_arena = std.heap.ArenaAllocator.init(preparation_alloc);
+            defer commit_arena.deinit();
+            const commit_alloc = commit_arena.allocator();
+
             // Resolve request ordering and transforms before row preparation. A
             // transform that reads durable state carries an optimistic version
             // predicate into the commit fence; retries rebuild both the effective
             // JSON and every derived artifact from a fresh base.
             const resolve_transforms_start_ns = monotonicTimeNs();
             var transform_snapshot = try self.captureTransformReadSnapshot(
-                preparation_alloc,
+                commit_alloc,
                 types.BatchWrite,
                 req.writes,
                 req.deletes,
                 req.transforms,
             );
-            defer transform_snapshot.deinit(preparation_alloc);
+            defer transform_snapshot.deinit(commit_alloc);
             var effective_ops = try coalesceKeyValueRequest(
                 self,
-                preparation_alloc,
+                commit_alloc,
                 types.BatchWrite,
                 req.writes,
                 req.deletes,
                 req.transforms,
                 &transform_snapshot,
             );
-            defer effective_ops.deinit(preparation_alloc);
+            defer effective_ops.deinit(commit_alloc);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.resolve_transforms_ns, resolve_transforms_start_ns);
 
             if (req.reject_graph_transform_projections and
@@ -469,11 +485,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const merge_effective_req_start_ns = monotonicTimeNs();
             var owned_effective_graph_writes: ?[]types.GraphEdgeWrite = null;
-            defer if (owned_effective_graph_writes) |owned| preparation_alloc.free(owned);
+            defer if (owned_effective_graph_writes) |owned| commit_alloc.free(owned);
             const effective_graph_writes = if (effective_ops.graph_writes.items.len == 0)
                 req.graph_writes
             else blk: {
-                const combined = try preparation_alloc.alloc(types.GraphEdgeWrite, req.graph_writes.len + effective_ops.graph_writes.items.len);
+                const combined = try commit_alloc.alloc(types.GraphEdgeWrite, req.graph_writes.len + effective_ops.graph_writes.items.len);
                 @memcpy(combined[0..req.graph_writes.len], req.graph_writes);
                 @memcpy(combined[req.graph_writes.len..], effective_ops.graph_writes.items);
                 owned_effective_graph_writes = combined;
@@ -481,11 +497,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
 
             var owned_effective_graph_deletes: ?[]types.GraphEdgeDelete = null;
-            defer if (owned_effective_graph_deletes) |owned| preparation_alloc.free(owned);
+            defer if (owned_effective_graph_deletes) |owned| commit_alloc.free(owned);
             const effective_graph_deletes = if (effective_ops.graph_deletes.items.len == 0)
                 req.graph_deletes
             else blk: {
-                const combined = try preparation_alloc.alloc(types.GraphEdgeDelete, req.graph_deletes.len + effective_ops.graph_deletes.items.len);
+                const combined = try commit_alloc.alloc(types.GraphEdgeDelete, req.graph_deletes.len + effective_ops.graph_deletes.items.len);
                 @memcpy(combined[0..req.graph_deletes.len], req.graph_deletes);
                 @memcpy(combined[req.graph_deletes.len..], effective_ops.graph_deletes.items);
                 owned_effective_graph_deletes = combined;
@@ -590,8 +606,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (req.integrity_commands.len != 0 and !local_decision_apply) return error.InvalidIntegrityOperation;
             var relational_index_snapshot = S.ownerField(self, "core").*.relational_indexes.acquire();
             defer if (relational_index_snapshot) |*index_snapshot| index_snapshot.deinit();
-            const index_ready = try preparation_alloc.alloc(bool, if (relational_index_snapshot) |index_snapshot| index_snapshot.plan.boundIndexes().len else 0);
-            defer preparation_alloc.free(index_ready);
+            // index_ready is a one-shot flag array sized once per batch, unlike
+            // prepared_index_keys/index_writer below, which the comments on
+            // their own types document as reusable flat buffers meant to
+            // amortize across every row of a multi-row batch via
+            // clearRetainingCapacity/ensureTotalCapacity; those stay on
+            // preparation_alloc so a large batch keeps reusing one backing
+            // allocation instead of abandoning a page per row inside an arena.
+            const index_ready = try commit_alloc.alloc(bool, if (relational_index_snapshot) |index_snapshot| index_snapshot.plan.boundIndexes().len else 0);
+            defer commit_alloc.free(index_ready);
             var prepared_index_keys: ?relational_index_plans.Batch = if (relational_index_snapshot) |index_snapshot|
                 relational_index_plans.Batch.init(preparation_alloc, index_snapshot.plan)
             else
