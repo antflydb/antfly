@@ -3841,6 +3841,7 @@ pub fn openCursor(context: anytype) !catalog.Cursor {
 }
 
 pub fn execute(context: anytype) anyerror!@import("runtime.zig").Output {
+    try @import("window_runtime.zig").validateInvocation(context);
     // Binding and invocation admission have already run. A zero demand must
     // not open eager retained/archive sources, including aggregate fallbacks.
     const statement = context.binding.relation.?.statement;
@@ -5095,35 +5096,45 @@ test "SQL retained source finite prefixes require a complete consumer proof" {
     }
 }
 
+const RetainedDemandFixture = struct {
+    opens: usize = 0,
+    offset: usize = 0,
+    mutations: usize = 0,
+    overflow_first: bool = true,
+    fn resolve(_: *anyopaque, _: Allocator, name: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+        if (!std.mem.eql(u8, name.table, "sink")) return error.UnexpectedPhysicalResolve;
+        return .{ .id = 2, .physical_name = "sink", .schema_version = 1, .columns = &.{ .{ .name = "_id", .path = "_id", .type = .string }, .{ .name = "v", .path = "v", .type = .number } } };
+    }
+    fn retained(_: *anyopaque, a: Allocator, definition: @import("ast.zig").RetainedTable) !catalog.Table {
+        const spec = try a.create(catalog.Table.RetainedBinding);
+        spec.* = .{ .definition = definition, .dataset = @splat(1), .fingerprint = @splat(2), .generation = 1 };
+        return .{ .id = 1, .physical_name = "summary", .schema_version = 1, .retained = spec, .columns = &.{ .{ .name = "n", .path = "n", .type = .integer }, .{ .name = "sum_v", .path = "sum_v", .type = .number } } };
+    }
+    fn open(raw: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.opens += 1;
+        return .{ .ptr = self, .next = next, .close = close };
+    }
+    fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const end = @min(2, self.offset + limit);
+        const rows = try a.alloc(catalog.Row, end - self.offset);
+        const layout = try catalog.Row.TypedLayout.init(a, &.{ "n", "sum_v" });
+        for (rows, self.offset..) |*row, index| row.* = try catalog.Row.fromDatums(a, "row", layout, &.{ Datum.json(.{ .integer = if (index == 0) 2 else 1 }), if ((index == 0) == self.overflow_first) Datum.failed(.retained_numeric_overflow) else Datum.json(.{ .float = 42 }) });
+        self.offset = end;
+        return .{ .rows = rows, .after = if (end < 2) "more" else null };
+    }
+    fn mutate(raw: *anyopaque, _: Allocator, _: Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.mutations += 1;
+        return error.UnexpectedMutation;
+    }
+    fn close(_: *anyopaque) void {}
+    fn checkpoint(_: *anyopaque) !void {}
+};
+
 test "SQL retained source finite prefixes preserve lazy cell failures and zero demand" {
-    const Fixture = struct {
-        opens: usize = 0,
-        offset: usize = 0,
-        fn resolve(_: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
-            return error.UnexpectedPhysicalResolve;
-        }
-        fn retained(_: *anyopaque, a: Allocator, definition: @import("ast.zig").RetainedTable) !catalog.Table {
-            const spec = try a.create(catalog.Table.RetainedBinding);
-            spec.* = .{ .definition = definition, .dataset = @splat(1), .fingerprint = @splat(2), .generation = 1 };
-            return .{ .id = 1, .physical_name = "summary", .schema_version = 1, .retained = spec, .columns = &.{ .{ .name = "n", .path = "n", .type = .integer }, .{ .name = "sum_v", .path = "sum_v", .type = .number } } };
-        }
-        fn open(raw: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.opens += 1;
-            return .{ .ptr = self, .next = next, .close = close };
-        }
-        fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            const end = @min(2, self.offset + limit);
-            const rows = try a.alloc(catalog.Row, end - self.offset);
-            const layout = try catalog.Row.TypedLayout.init(a, &.{ "n", "sum_v" });
-            for (rows, self.offset..) |*row, index| row.* = try catalog.Row.fromDatums(a, "row", layout, &.{ Datum.json(.{ .integer = if (index == 0) 2 else 1 }), if (index == 0) Datum.failed(.retained_numeric_overflow) else Datum.json(.{ .float = 42 }) });
-            self.offset = end;
-            return .{ .rows = rows, .after = if (end < 2) "more" else null };
-        }
-        fn close(_: *anyopaque) void {}
-        fn checkpoint(_: *anyopaque) !void {}
-    };
+    const Fixture = RetainedDemandFixture;
     for ([_]struct { sql: []const u8, rows: usize, fails: bool = false }{
         .{ .sql = "SELECT sum_v FROM retained_summary(stats,'0','60') WHERE n=1", .rows = 1 },
         .{ .sql = "SELECT CASE WHEN n=1 THEN sum_v ELSE 0 END FROM retained_summary(stats,'0','60')", .rows = 2 },
@@ -5150,6 +5161,43 @@ test "SQL retained source finite prefixes preserve lazy cell failures and zero d
             defer result.deinit();
             try std.testing.expectEqual(case.rows, result.output.rows.len);
             if (case.rows == 0) try std.testing.expectEqual(@as(usize, 0), fixture.opens);
+        }
+    }
+}
+
+test "SQL retained source storage assignments reject failures before writer admission" {
+    const Fixture = RetainedDemandFixture;
+    // Both first-row and later-row failures must abort before writer admission.
+    for ([_]bool{ true, false }) |overflow_first| {
+        var fixture: Fixture = .{ .overflow_first = overflow_first };
+        const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .resolve_retained = Fixture.retained, .scan = SetTestBackend.scan, .mutate = Fixture.mutate, .open_scan = Fixture.open, .checkpoint = Fixture.checkpoint } };
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, "INSERT INTO sink(_id,v) SELECT 'result',sum_v FROM retained_summary(stats,'0','60')", .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.RetainedSeriesNumericOverflow, @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), fixture.mutations);
+    }
+}
+
+test "SQL retained source window invocation validates offsets before opening sources" {
+    const Fixture = RetainedDemandFixture;
+    for ([_][]const u8{
+        "SELECT SUM(n) OVER (ROWS $1 PRECEDING) FROM retained_summary(stats,'0','60') LIMIT 0",
+        "SELECT SUM(n) OVER (ROWS $1 PRECEDING) FROM retained_summary(stats,'0','60') LIMIT 1",
+        "SELECT SUM(n) OVER (ROWS BETWEEN CURRENT ROW AND $1 FOLLOWING) FROM retained_summary(stats,'0','60') LIMIT 0",
+        "SELECT SUM(n) OVER (ROWS $1 PRECEDING) FROM (SELECT n FROM retained_summary(stats,'0','60')) r LIMIT 0",
+    }) |sql| {
+        for ([_]std.json.Value{ .{ .integer = -1 }, .null, .{ .integer = 0 } }) |parameter| {
+            if (parameter == .integer and parameter.integer == 0 and std.mem.endsWith(u8, sql, "LIMIT 1")) continue;
+            var fixture: Fixture = .{};
+            const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .resolve_retained = Fixture.retained, .scan = SetTestBackend.scan, .mutate = Fixture.mutate, .open_scan = Fixture.open, .checkpoint = Fixture.checkpoint } };
+            var compiled = try @import("compiler.zig").compile(std.testing.allocator, sql, .{});
+            defer compiled.deinit();
+            if (parameter == .integer and parameter.integer == 0) {
+                var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{parameter}, .{});
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 0), result.output.rows.len);
+            } else try std.testing.expectError(error.InvalidSqlParameters, @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{parameter}, .{}));
+            try std.testing.expectEqual(@as(usize, 0), fixture.opens);
         }
     }
 }

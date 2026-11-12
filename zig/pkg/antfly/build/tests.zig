@@ -449,7 +449,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, retained_catalog_tests).step);
     const retained_owner_rpc_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[1],
-        .filters = &.{ "retained owner controls", "system catalog retained work" },
+        .filters = &.{ "retained owner controls", "retained owner acknowledgement", "system catalog retained work" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("retained-dataset-owner-rpc-test", "Verify private retained owner transport grants and version rejection")

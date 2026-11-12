@@ -189,7 +189,7 @@ pub const Call = union(enum) {
     /// Calls whose native owners report the first possible durable effect.
     pub fn tracksSQLSubmission(self: @This()) bool {
         return switch (self) {
-            .mutate, .relation_replace, .relation_schema_mutate, .fk_initial_create_begin, .fk_generation_publication_begin => true,
+            .mutate, .relation_replace, .relation_schema_mutate, .fk_initial_create_begin, .fk_generation_publication_begin, .retained_owner_acknowledge => true,
             else => false,
         };
     }
@@ -335,4 +335,11 @@ test "retained owner controls bind grants to distinct private request bodies" {
         const Legacy = union(enum) { retained_dataset_work: struct { after_id: u64 = 0 } };
         try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(Legacy, a, bytes, .{}));
     }
+}
+
+test "retained owner acknowledgements preserve preflight non-admission" {
+    const call: Call = .{ .retained_owner_acknowledge = undefined };
+    try std.testing.expect(call.isMutation());
+    try std.testing.expect(call.requiresAdministrativeGrant());
+    try std.testing.expect(call.tracksSQLSubmission());
 }

@@ -1289,8 +1289,10 @@ pub const MetadataHttpClient = struct {
                 error.TableTopologyProtocolUpgradeRequired,
             409 => if (std.mem.eql(u8, response.body, "ResolverCurationConflict"))
                 error.ResolverCurationConflict
-            else if ((input == .store_root_enroll or input == .store_root_enrollment_status) and std.mem.eql(u8, response.body, "StoreRootEnrollmentChanged"))
+            else if ((input == .store_root_enroll or input == .store_root_enrollment_status or input == .retained_owner_acknowledge) and std.mem.eql(u8, response.body, "StoreRootEnrollmentChanged"))
                 error.StoreRootEnrollmentChanged
+            else if (input == .retained_owner_acknowledge and std.mem.eql(u8, response.body, "RetainedOwnerPlanChanged"))
+                error.RetainedOwnerPlanChanged
             else
                 error.CatalogGenerationChanged,
             413 => error.CatalogCommandTooLarge,
@@ -4911,4 +4913,54 @@ test "metadata.lake index owner projection read negotiates older peers without w
     executor.status = 503;
     executor.body = "NotLeader";
     try std.testing.expectError(error.NotLeader, client.readSystemCatalog("http://metadata.invalid", owner, 25, null));
+}
+
+test "retained owner acknowledgement preserves definite fences and ambiguous delivery" {
+    const a = std.testing.allocator;
+    const Executor = struct {
+        outcome: []const u8 = routes.Routes.raft_mutation_outcome_not_proposed,
+        body: []const u8 = "StoreRootEnrollmentChanged",
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const body = try alloc.dupe(u8, self.body);
+            errdefer alloc.free(body);
+            const headers = try alloc.alloc(http_common.Header, 1);
+            errdefer alloc.free(headers);
+            const name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header);
+            errdefer alloc.free(name);
+            headers[0] = .{ .name = name, .value = try alloc.dupe(u8, self.outcome) };
+            return .{ .status = 409, .body = body, .headers = headers };
+        }
+    };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("retained-admin-secret", "retained-admin-issuer");
+    const input: @import("../system_catalog/server_call.zig").Call = .{ .retained_owner_acknowledge = .{
+        .resource = 7,
+        .generation = 1,
+        .plan = @splat(1),
+        .dataset = @splat(2),
+        .definition = @splat(3),
+        .group = 11,
+        .partition = @splat(4),
+        .incarnation = 1,
+        .owner_revision = 1,
+        .mode = .ready,
+        .cut = .{ .sequence = 1, .complete_from_ns = 0, .admitted_ns = 1 },
+        .identity = .{ .metadata_incarnation = "0123456789abcdef0123456789abcdef".*, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = @splat(1) },
+        .reporter_incarnation = 1,
+        .replica_id = 11,
+        .metadata_version = 1,
+        .native_root = 1,
+    } };
+    const forwarding: raft_mutation_forwarding.Context = .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true };
+    var submitted = false;
+    try std.testing.expectError(error.StoreRootEnrollmentChanged, client.forwardSystemCatalogObserved("http://metadata.invalid", input, forwarding, true, &submitted));
+    try std.testing.expect(!submitted);
+    executor.body = "RetainedOwnerPlanChanged";
+    try std.testing.expectError(error.RetainedOwnerPlanChanged, client.forwardSystemCatalogObserved("http://metadata.invalid", input, forwarding, true, &submitted));
+    try std.testing.expect(!submitted);
+    executor.outcome = routes.Routes.raft_mutation_outcome_unknown;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.forwardSystemCatalogObserved("http://metadata.invalid", input, forwarding, true, &submitted));
+    try std.testing.expect(submitted);
 }

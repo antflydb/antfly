@@ -6889,8 +6889,14 @@ pub const DataServer = struct {
             // Maintenance ticks do not rewrite the metadata owner journal.
             // Only a logical state transition needs a verified acknowledgement.
             if (result.mode != snapshot.owner.mode) {
+                _ = self.status_source.systemCatalog(owner_alloc, context, .{ .retained_owner_acknowledge = result }) catch |err| {
+                    self.recordRetainedOwnerFailure(owner_alloc, snapshot, err, context) catch {};
+                    std.log.warn("retained owner acknowledgement deferred group={d} err={s}", .{ snapshot.owner.group, @errorName(err) });
+                    continue;
+                };
+                // A rejected acknowledgement made no durable progress. Only
+                // successful transitions license the fast follow-up sweep.
                 self.retained_owner_sweep.busy = true;
-                _ = try self.status_source.systemCatalog(owner_alloc, context, .{ .retained_owner_acknowledge = result });
             }
         }
     }

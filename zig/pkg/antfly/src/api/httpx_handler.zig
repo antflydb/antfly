@@ -2997,7 +2997,7 @@ pub const AntflyApiHandler = struct {
         const a = ctx.allocator;
         const local = @import("antfly_local_sources");
         const retained = local.system_catalog_retained_datasets;
-        var context = operationContext(ctx, identity);
+        const context = operationContext(ctx, identity);
         const source = self.api_server.source;
         if (action == .create) {
             const admin = @import("retained_dataset_admin.zig");
@@ -3008,8 +3008,11 @@ pub const AntflyApiHandler = struct {
             const table = try request.source.resourceNameAlloc(a);
             defer a.free(table);
             if (!try http_server_mod.tablePermissionCurrentlyAllowed(identity, table, .admin)) return textResponse(ctx, 403, "source table administration required");
-            context.setting_admin = true;
-            const bytes = source.systemCatalog(a, context, .{ .retained_source_candidate = request.source }) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
+            // Scope the internal read capability to candidate discovery. The
+            // ordinary resource mutation below must not carry a setting grant.
+            var candidate_context = context;
+            candidate_context.setting_admin = true;
+            const bytes = source.systemCatalog(a, candidate_context, .{ .retained_source_candidate = request.source }) catch |err| return textResponse(ctx, system_catalog.httpStatus(err), @errorName(err));
             defer a.free(bytes);
             const candidate = try std.json.parseFromSliceLeaky(admin.Source, a, bytes, .{ .allocate = .alloc_always });
             const cfg = self.api_server.cfg;

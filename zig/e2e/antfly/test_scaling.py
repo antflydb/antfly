@@ -979,6 +979,18 @@ class MultiNodeScalingCluster:
         }
         self.config_path.write_text(json.dumps(config), encoding="utf-8")
 
+    def _config_path_for_node(self, role: str, node_id: int) -> Path:
+        # Local primary storage (including authentication) has one writer.
+        # Shared connection/artifact settings remain identical across nodes.
+        config = json.loads(self.config_path.read_text())
+        if config.get("storage", {}).get("engine") == "local":
+            config["storage"]["local"] = {
+                "base_dir": str(self.root / f"{role}-{node_id}-storage")
+            }
+        path = self.root / f"{role}-{node_id}.json"
+        path.write_text(json.dumps(config))
+        return path
+
     def _open_log(self, name: str) -> Any:
         path = self.root / name
         handle = path.open("w")
@@ -1003,7 +1015,7 @@ class MultiNodeScalingCluster:
                 self.binary,
                 "metadata",
                 "--config",
-                str(self.config_path),
+                str(self._config_path_for_node("metadata", int(node["id"]))),
                 "--id",
                 str(node["id"]),
                 # This fixture probes the metadata admin listener directly and
@@ -1011,6 +1023,8 @@ class MultiNodeScalingCluster:
                 "--health",
                 "false",
                 *self._cadence_args(),
+                "--data-dir",
+                str(self.root / f"metadata-{node['id']}"),
                 "--replica-root-dir",
                 str(self.root / f"metadata-{node['id']}-replicas"),
                 "--replica-catalog-path",
@@ -1091,7 +1105,7 @@ class MultiNodeScalingCluster:
             self.binary,
             "data",
             "--config",
-            str(self.config_path),
+            str(self._config_path_for_node("data", node_id)),
             "--api-host",
             self.host,
             "--api-port",
@@ -1109,6 +1123,8 @@ class MultiNodeScalingCluster:
             "--health",
             "false",
             *self._cadence_args(),
+            "--data-dir",
+            str(self.root / f"data-{node['id']}"),
             "--replica-root-dir",
             str(self.root / f"data-{node['id']}-replicas"),
             "--replica-catalog-path",

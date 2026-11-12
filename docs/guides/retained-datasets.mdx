@@ -11,6 +11,8 @@ The administrative storage API accepts already prepared segments. Native retaine
 
 ## Activation and cancellation
 
+Distributed native owners require administrator-approved physical store-root signing identities. Generate a proof on each data store with `antfly internal store-root proof --replica-root-dir <path> --metadata-incarnation <cluster-incarnation> --node-id <node> --store-id <store>`, then submit it once to `POST /store-roots/enroll` as a cluster administrator. Enroll replacement physical roots before they serve retained owners. Ordinary node registration does not grant this authority. Until enrollment, activation remains pending and owner diagnostics report `StoreRootEnrollmentChanged`; enrolling the exact root lets maintenance resume automatically. Standalone local and Lite enroll their own single-writer binding during startup.
+
 Creating a summary starts asynchronous activation over retained source rows. Dimensions and measures share one output-column namespace; their names must be distinct and cannot use generated column names. Existing rows must have valid timestamps. The source remains protected while activation or closure is in progress.
 
 To cancel an activating summary, POST its current `expected_revision` and `cancel_activation: true` to `/databases/{database}/namespaces/{namespace}/datasets/{dataset}/close`. Cancellation enters `retiring`, discards partial summary state, and stops further registration. Owners must durably revoke capture and reclaim their state before the source dependency is released. This also recovers activation blocked by invalid historical rows. Closing an active summary instead preserves its summaries through verified archive handoff.

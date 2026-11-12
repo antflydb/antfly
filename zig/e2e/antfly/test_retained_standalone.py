@@ -519,7 +519,14 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
                 f"SELECT sum_id FROM retained_summary(public.overflow_sum, '{first_bucket}', '{first_bucket + interval}')"
             )
 
+        sql("CREATE TABLE overflow_sink (v DOUBLE PRECISION)")
+
         def check_overflow_projection():
+            with pytest.raises(OSError, match="400.*22003"):
+                sql(
+                    f"INSERT INTO overflow_sink(v) SELECT sum_id FROM retained_summary(public.overflow_sum, '{first_bucket}', '{first_bucket + interval}')"
+                )
+            assert int(sql("SELECT COUNT(*) FROM overflow_sink")["rows"][0][0]) == 0
             selected = sql(
                 f"SELECT n, avg_id FROM retained_summary(public.overflow_sum, '{first_bucket}', '{first_bucket + interval}')"
             )["rows"]
@@ -588,6 +595,32 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
                         connection.execute(
                             f"SELECT sum_id FROM {relation}", prepare=prepared
                         ).fetchall()
+                    with pytest.raises(psycopg.errors.NumericValueOutOfRange):
+                        connection.execute(
+                            f"INSERT INTO overflow_sink(v) SELECT sum_id FROM {relation}",
+                            prepare=prepared,
+                        )
+                    assert (
+                        connection.execute(
+                            "SELECT COUNT(*) FROM overflow_sink"
+                        ).fetchone()[0]
+                        == 0
+                    )
+                    for invalid in (-1, None):
+                        with pytest.raises(psycopg.errors.InvalidParameterValue):
+                            connection.execute(
+                                f"SELECT SUM(n) OVER (ROWS %s PRECEDING) FROM {relation} LIMIT 0",
+                                (invalid,),
+                                prepare=prepared,
+                            )
+                    assert (
+                        connection.execute(
+                            f"SELECT SUM(n) OVER (ROWS %s PRECEDING) FROM {relation} LIMIT 0",
+                            (0,),
+                            prepare=prepared,
+                        ).fetchall()
+                        == []
+                    )
 
         check_overflow_projection()
         api(
