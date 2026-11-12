@@ -209,6 +209,12 @@ The chunkers `fixed_bert` and `fixed_bpe` are built in and need no download. Chu
 
 Admission checks every request limit before considering contention. A request that exceeds its own scratch, KV, backend, host, or combined limit fails permanently even when another model currently occupies memory. Feasible requests may reclaim idle models and caches before returning a retryable capacity refusal.
 
+Default CPU and Metal host budgets use the shared safe host pool; on Metal, host and device allocations also share a combined unified-memory cap. Lazy media encoders must fit alongside their required resident model. Explicit `--host-budget-mb` and other budget overrides remain hard caps.
+
+Feasibility includes the model's live session and tokenizer leases in their original CPU or GPU domains. Releasing an optional component removes it from the required working set. Incremental preprocessing checks the cumulative memory owned by that request, while charging only its new allocations.
+
+Generation requests that exceed a stable budget return HTTP 400 with `retryable: false`, the blocking `budget`, `required_bytes` (including required resident resources), and `limit_bytes`. These diagnostics also cover lazy model/component loads and incremental media preprocessing. A checkpoint resume includes its held upload/decode reservation when checking whether execution can fit; that reservation is not charged twice.
+
 Both permanent and temporary memory-admission failures record the error identity, requested bytes, current reservations, and configured limits in the inference process logs. For `MODEL_RESOURCE_LIMIT`, inspect the `inference run admission denied` and `inference run admission request` records before changing budgets. A loaded model's RSS does not include all request scratch or preprocessing memory. The process envelope and live host/cgroup capacity apply in addition to the individual inference budgets.
 
 Native EmbeddingGemma text execution lets physical temporary allocations consume its prepaid workspace, reserving only additional bytes. The 512 MiB temporary-allocation ceiling is a guard, not an upfront reservation. Retained output buffers keep their admission when an execution phase finishes. Cumulative scratch owned by one request is checked against the policy separately from other requests' occupancy.

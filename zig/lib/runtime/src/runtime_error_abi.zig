@@ -1105,6 +1105,7 @@ pub const Detail = enum(c_int) {
     storage_owner_admission_pending,
     reembed_budget_exceeded,
     reembed_setup_retry,
+    unsupported_node_filter_query,
     // Retained dataset catalog admission and owner-read outcomes.
     retained_dataset_source_in_use,
     retained_dataset_source_not_ready,
@@ -1901,6 +1902,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidEnrichmentConfig => status(.invalid_argument, .invalid_enrichment_config),
         error.UnsupportedQueryRequest, error.UnsupportedAggregation => status(.unsupported, .unsupported_query_request),
         error.UnsupportedHierarchyGrouping => status(.unsupported, .unsupported_query_request),
+        error.UnsupportedNodeFilterQuery => status(.invalid_argument, .unsupported_node_filter_query),
         error.UnsupportedFilterQueryRequest => status(.unsupported, .unsupported_filter_query_request),
         error.UnsupportedExclusionQueryRequest => status(.unsupported, .unsupported_exclusion_query_request),
         error.UnsupportedSyncLevel => status(.unsupported, .unsupported_sync_level),
@@ -3020,6 +3022,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_operation => "UnsupportedOperation",
         .unsupported_tensor_type => "UnsupportedTensorType",
         .unsupported_query_request => "UnsupportedQueryRequest",
+        .unsupported_node_filter_query => "UnsupportedNodeFilterQuery",
         .unsupported_filter_query_request => "UnsupportedFilterQueryRequest",
         .unsupported_exclusion_query_request => "UnsupportedExclusionQueryRequest",
         .unsupported_sync_level => "UnsupportedSyncLevel",
@@ -4074,4 +4077,11 @@ test "storage owner lease admission retains retryability across runtime callback
     try std.testing.expectEqual(@backingInt(Code.retryable), wire.code);
     try std.testing.expect(errorHasStableDetail(error.StorageOwnerAdmissionPending));
     try std.testing.expectEqual(error.StorageOwnerAdmissionPending, errorFromStatus(wire));
+}
+
+test "unsupported graph node filter survives the runtime boundary as a client error" {
+    const wire = statusFromError(error.UnsupportedNodeFilterQuery);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), wire.code);
+    try std.testing.expectEqual(error.UnsupportedNodeFilterQuery, errorFromStatus(wire));
+    try std.testing.expect(errorHasStableDetail(error.UnsupportedNodeFilterQuery));
 }

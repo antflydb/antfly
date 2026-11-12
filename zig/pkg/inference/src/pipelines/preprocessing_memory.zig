@@ -80,16 +80,11 @@ pub const Scope = struct {
     fn acquire(raw: *anyopaque, amount: usize) !memory.AdmissionLease {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const owned = try std.math.add(usize, self.owner.prepaid_host_bytes, self.owner.reserved_bytes);
-        if (self.session) |session| if (session.run_admission) |admission| {
-            // Credit and growth belong to one request. Its own baseline must
-            // not make an intrinsically oversized request look like contention.
-            try admission.validateOwnedHostScratch(try std.math.add(usize, owned, amount));
-        };
         const required_budget = (try std.math.add(usize, owned, amount)) -| self.borrowed_budget_bytes;
         const budget_growth = required_budget -| self.budget_bytes;
         if (self.budget) |budget| try reserveBudget(budget, budget_growth);
         errdefer if (self.budget) |budget| budget.release(.{ .kind = .scratch, .tier = .host, .bytes = budget_growth });
-        const lease = if (self.session) |session| (try session.admitHostPreprocess(amount)).lease else null;
+        const lease = if (self.session) |session| (try session.admitHostPreprocessOwned(amount, owned)).lease else null;
         // Offline callers may have only a local run budget and no session.
         // A local lease gives those reservations the same owned cleanup path.
         const result = lease orelse try self.local_controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = amount }, false);
@@ -432,4 +427,31 @@ test "image decode admission shared denial refunds local budget and permits same
     try scope.trim();
     try std.testing.expectEqual(credit.bytes, budget.host_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 4096), controller.snapshot().host_scratch_bytes);
+}
+
+test "preprocessing admission growth refunds both budgets after a resident working set denial" {
+    var controller = memory.AdmissionController{};
+    const limits = memory.Limits{ .host_limit_bytes = 100 * 1024 };
+    var weights = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 90 * 1024 }, false);
+    defer weights.release();
+    const session = sessions.Session{ .ptr = &controller, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = limits, .static_workspace_bytes = 0, .required_residency = weights.amounts, .check_live_memory = false } };
+    var failure = memory.AdmissionFailure{};
+    const request_session = session.withAdmissionControl(.{ .admission_failure = &failure });
+    var budget = memory.RunBudget.init(limits);
+    var scope = Scope.init(std.testing.allocator, request_session, .{}, &budget);
+    defer scope.deinit();
+    const alloc = try scope.allocator();
+    const first = try alloc.alloc(u8, 6 * 1024);
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 6 * 1024));
+    try std.testing.expectEqual(error.ResourceLimitExceeded, scope.failure(error.OutOfMemory));
+    try std.testing.expect(session.run_admission.?.failure == null);
+    const exceeded = failure.snapshot().?;
+    try std.testing.expect(exceeded.limit == .host);
+    try std.testing.expectEqual(limits.host_limit_bytes, exceeded.limit_bytes);
+    try std.testing.expect(exceeded.requested_bytes > exceeded.limit_bytes);
+    try std.testing.expectEqual(scope.owner.reserved_bytes, budget.host_scratch_bytes);
+    alloc.free(first);
+    try scope.trim();
+    try std.testing.expectEqualDeep(weights.amounts, controller.snapshot());
+    try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
 }

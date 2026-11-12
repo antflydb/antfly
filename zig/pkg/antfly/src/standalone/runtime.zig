@@ -235,6 +235,7 @@ const InferenceRuntimeConfigWire = struct {
 
     audio_readers: []const antfly.transcribing.NamedConfig = &.{},
     embedded_enabled: bool = true,
+    worker_executable: ?[]const u8 = null,
     worker_environment: []const struct { name: []const u8, value: []const u8 } = &.{},
     resources: platform.resource_policy.Resources = .{},
     generation_batching: platform.inference_settings.GenerationBatching = .{},
@@ -5950,9 +5951,15 @@ pub fn runFromIterator(
     if (cli.inference_scratch_budget_mb) |value| inference_resource_policy.inference.memory.max_scratch_bytes = try mibToBytes(value);
     const audio_readers = if (loaded_cfg) |cfg| try cfg.transcribers.hostedReaders(alloc) else try alloc.alloc(antfly.transcribing.NamedConfig, 0);
     defer alloc.free(audio_readers);
+    // The CLI knows it implements `inference _worker`. Supply its OS path
+    // explicitly: the inference owner is a static archive and cannot infer
+    // whether its final linker host is this CLI or an embedding application.
+    const worker_executable = std.process.executablePathAlloc(init.io, alloc) catch null;
+    defer if (worker_executable) |path| alloc.free(path);
     const inference_runtime_config_json = try std.json.Stringify.valueAlloc(alloc, InferenceRuntimeConfigWire{
         .audio_readers = audio_readers,
         .embedded_enabled = embedded_inference_enabled,
+        .worker_executable = worker_executable,
         .worker_environment = worker_environment.items,
         .resources = inference_resource_policy,
         .generation_batching = configured_inference.generation_batching,
@@ -5973,6 +5980,30 @@ pub fn runFromIterator(
     }, .{});
     defer alloc.free(inference_runtime_config_json);
 
+    // Inherited policy stays live even when inference runs in a replaceable
+    // worker. Explicit inference policy retains its configured precedence.
+    const SecuritySource = struct {
+        remote: ?*const antfly.common.config.Config.RemoteContentConfig,
+        explicit: ?*const antfly.common.config.Config.ContentSecurityConfig,
+        fn acquire(raw: ?*anyopaque, out: *inference_bridge.String) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const bytes = self.snapshot() catch |err| return inference_bridge.statusFromError(err);
+            out.* = .init(bytes);
+            return .ok;
+        }
+        fn snapshot(self: *@This()) ![]u8 {
+            var lease = if (self.remote) |remote| try remote.acquire() else null;
+            defer if (lease) |*value| value.deinit();
+            const fallback = if (lease) |value| if (value.config.security) |*security| security else null else null;
+            const effective = @import("antfly_scraping").effectiveContentSecurity(self.explicit, fallback);
+            const security: antfly.common.config.Config.ContentSecurityConfig = if (effective) |value| value.* else .{};
+            return std.json.Stringify.valueAlloc(std.heap.smp_allocator, security, .{});
+        }
+        fn release(_: ?*anyopaque, bytes: inference_bridge.String) callconv(.c) void {
+            std.heap.smp_allocator.free(bytes.slice());
+        }
+    };
+    var security_source = SecuritySource{ .remote = remote_content, .explicit = if (loaded_cfg) |cfg| if (cfg.inference.content_security) |*security| security else null else null };
     var handle: ?*anyopaque = null;
     const inference_create_context = inference_bridge.CreateContext{
         .abi_version = inference_bridge.abi_version,
@@ -5995,6 +6026,7 @@ pub fn runFromIterator(
         .max_loaded_models = if (loaded_cfg) |cfg| cfg.inference.max_loaded_models orelse 0 else 0,
         .has_max_loaded_models = if (loaded_cfg) |cfg| @intFromBool(cfg.inference.max_loaded_models != null) else 0,
         .content_security_json = inference_bridge.OptionalString.init(content_security_json),
+        .content_security_source = .{ .context = &security_source, .acquire = SecuritySource.acquire, .release = SecuritySource.release },
         .s3_credentials_json = inference_bridge.OptionalString.init(s3_credentials_json),
         .runtime_config_json = inference_bridge.String.init(inference_runtime_config_json),
         .executor = .init(&inference_io),

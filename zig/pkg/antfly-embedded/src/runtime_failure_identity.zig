@@ -31,6 +31,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .unsupported_node_filter_query, .err = error.UnsupportedNodeFilterQuery },
     .{ .status = .storage_owner_admission_pending, .err = error.StorageOwnerAdmissionPending },
     .{ .status = .raft_apply_writer_unavailable, .err = error.RaftApplyWriterUnavailable },
     .{ .status = .read_transient_failure, .err = error.ReadTransientFailure },
@@ -1352,4 +1353,8 @@ test "retained admission and read errors survive compiled storage boundaries" {
         try std.testing.expectError(expected, statusToError(failure.status));
         try std.testing.expectEqualStrings(@errorName(expected), failure.errorName());
     }
+}
+
+test "unsupported graph node filter survives the storage boundary" {
+    try std.testing.expectError(error.UnsupportedNodeFilterQuery, statusToError(statusFromError(error.UnsupportedNodeFilterQuery)));
 }

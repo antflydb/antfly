@@ -90,6 +90,8 @@ pub const HBCConfig = struct {
     dims: u32,
     metric: vec.DistanceMetric = .l2_squared,
     split_algo: vec.ClustAlgorithm = .kmeans,
+    /// Opt-in CPU L2 e-means for ordinary binary leaf splits only.
+    experimental_emeans_leaf_splits: bool = false,
     branching_factor: u32 = 16,
     leaf_size: u32 = 100,
     search_width: u32 = 32,
@@ -113,6 +115,8 @@ pub const HBCConfig = struct {
     /// is roughly 1.3 standard deviations, so small values miss neighbors.
     quantization_refine_margin: f32 = 2,
     bulk_build_algo: BulkBuildAlgo = .hilbert_seeded,
+    /// Optional reservoir size for Lloyd and e-means bulk leaf training. Zero uses all rows.
+    bulk_build_training_sample_size: usize = 0,
     prefer_key_local_leaf_splits: bool = false,
     key_local_leaf_split_penalty: f32 = 1.10,
     max_cached_nodes: usize = 100_000,
@@ -154,6 +158,8 @@ pub const BulkBuildAlgo = enum {
     hilbert_seeded,
     doc_key_seeded,
     kmeans,
+    /// Experimental CPU L2 leaf clustering; parent levels still use Lloyd.
+    emeans,
 };
 
 pub const Node = struct {
@@ -199,15 +205,20 @@ pub const Node = struct {
     }
 
     pub fn clone(self: Node, alloc: Allocator) !Node {
+        const centroid = try alloc.dupe(f32, self.centroid);
+        errdefer alloc.free(centroid);
+        const children = try alloc.dupe(u64, self.children);
+        errdefer alloc.free(children);
+        const members = try alloc.dupe(u64, self.members);
         return .{
             .id = self.id,
             .is_leaf = self.is_leaf,
             .level = self.level,
             .parent = self.parent,
-            .centroid = try alloc.dupe(f32, self.centroid),
+            .centroid = centroid,
             .covering_radius = self.covering_radius,
-            .children = try alloc.dupe(u64, self.children),
-            .members = try alloc.dupe(u64, self.members),
+            .children = children,
+            .members = members,
             .posting_state = self.posting_state,
             .backing = &.{},
         };
@@ -327,3 +338,20 @@ pub const SplitRebuildWork = struct {
         return self.right_only_members + self.mixed_right_members;
     }
 };
+
+test "node clone frees partial ownership after allocation failure" {
+    const Check = struct {
+        fn run(a: Allocator) !void {
+            var centroid = [_]f32{ 1, 2 };
+            var children = [_]u64{ 3, 4 };
+            var members = [_]u64{ 5, 6 };
+            const node: Node = .{ .id = 1, .is_leaf = false, .level = 1, .parent = 0, .centroid = &centroid, .children = &children, .members = &members };
+            var copy = try node.clone(a);
+            defer copy.deinit(a);
+            try std.testing.expectEqualSlices(f32, &centroid, copy.centroid);
+            try std.testing.expectEqualSlices(u64, &children, copy.children);
+            try std.testing.expectEqualSlices(u64, &members, copy.members);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}

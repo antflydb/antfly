@@ -3427,9 +3427,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try types.validateMergeArtifacts(req);
             const max_prepared_generation_retries = 2;
             var retry_count: usize = 0;
-            // Provider results are semantic request data, not schema/index-plan
-            // data. Keep them across optimistic publication retries so catalog
-            // churn cannot multiply expensive external work.
+            // Keep provider results across optimistic retries under their
+            // captured input, revision, epoch and forced document incarnation.
+            // Unrelated catalog churn reuses valid work; a new target cannot
+            // relabel the preceding attempt's result.
             var generated_memo = GeneratedEmbeddingMemo.init(allocator_guard.allocator());
             // Cache restoration is an internal preservation operation. Ordinary
             // writes and explicit regeneration retain their provider semantics.

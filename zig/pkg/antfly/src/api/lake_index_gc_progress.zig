@@ -135,6 +135,7 @@ pub const Progress = struct {
                 for (node.children) |child| try self.enqueue(.{ .generation_page = .{ .ref = child.ref, .depth = page.depth + 1 } });
             },
             .publication => |publication| {
+                for (publication.construction) |work| try collector.markConstruction(a, work, publication.namespace);
                 if (publication.cloud_generations) |cloud| try self.enqueue(.{ .generation_page = .{ .ref = cloud.root, .depth = 0 } });
                 try self.enqueue(.{ .chunk = .{ .artifact_id = publication.inventory.artifact_id, .checksum = publication.inventory.checksum, .byte_len = publication.inventory.byte_len } });
                 // Resumable GC expands publications directly instead of calling
@@ -212,6 +213,7 @@ pub const Progress = struct {
                         }
                         if (visitor.native_files) {
                             const file = try @import("lake_index_native_state.zig").decodeDirectoryFile(visitor.a, key, bytes, visitor.progress.value.domain);
+                            if (file.docs_root) |root| try visitor.progress.enqueue(.{ .page = .{ .ref = root, .ordered_rows = false, .native_chunks = true } });
                             for (file.docs) |ref| try visitor.progress.enqueue(.{ .chunk = ref });
                             return;
                         }

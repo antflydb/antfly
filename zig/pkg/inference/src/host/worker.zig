@@ -136,8 +136,9 @@ pub fn invokeProvider(client: *Client, context: *const bridge.ProviderInvokeCont
     defer if (document_key) |key| client.unregisterDocumentStore(key);
     var input = try wire.ProviderInput.init(arena.allocator(), context);
     input.options.document_store = document_key;
+    const security_json = context.content_security_json.slice() orelse try client.content_security_source.copy(arena.allocator());
     const data = try std.json.Stringify.valueAlloc(arena.allocator(), input.options, .{});
-    const response = try client.invokePayload(.provider, data, .{ .body_segments = input.body.segments }, control.view());
+    const response = try client.invokePayload(.provider, data, .{ .body_segments = input.body.segments, .auxiliary = security_json orelse "" }, control.view(), security_json != null);
     defer response.deinit();
     try ForwardControl.check(&control);
     const reply_options = try std.json.parseFromSliceLeaky(wire.Reply, arena.allocator(), response.view().metadata, .{});
@@ -182,6 +183,7 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
     for (source_params, params) |param, *out| out.* = .{ .name = param.name.slice(), .value = param.value.slice() };
     const document_key = try client.registerDocumentStore(context.document_store);
     defer if (document_key) |key| client.unregisterDocumentStore(key);
+    const security_json = context.content_security_json.slice() orelse try client.content_security_source.copy(alloc);
     const data = try std.json.Stringify.valueAlloc(alloc, wire.Http{
         .document_store = document_key,
         .route = route,
@@ -194,7 +196,7 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
         .stream_body = stream_body,
         .streaming_body = streaming_body,
     }, .{});
-    const result = client.invoke(.http, data, body.slice() orelse "", control.view()) catch |err| {
+    const result = client.invokePayload(.http, data, .{ .body = body.slice() orelse "", .auxiliary = security_json orelse "" }, control.view(), security_json != null) catch |err| {
         if (control.stream_started) return err;
         if (err == error.BodyTooLarge) {
             var response = httpx.Response.init(client.alloc, 413);
@@ -238,6 +240,9 @@ pub const Client = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
     create_json: []u8,
+    initial_content_security: ?[]u8 = null,
+    worker_executable: ?[]u8 = null,
+    content_security_source: bridge.ContentSecuritySource = .{},
     environment: std.process.Environ.Map,
     mutex: std.Io.Mutex = .init,
     worker: ?*Worker = null,
@@ -281,7 +286,10 @@ pub const Client = struct {
         defer arena.deinit();
         const json = try std.json.Stringify.valueAlloc(alloc, try wire.Create.fromContext(arena.allocator(), context), .{});
         errdefer alloc.free(json);
-        const settings = try std.json.parseFromSliceLeaky(struct { worker_environment: []const EnvironmentEntry = &.{} }, arena.allocator(), context.runtime_config_json.slice(), .{ .ignore_unknown_fields = true });
+        const initial_security = if (context.content_security_json.slice()) |bytes| try alloc.dupe(u8, bytes) else null;
+        errdefer if (initial_security) |bytes| alloc.free(bytes);
+        if (initial_security) |bytes| if (bytes.len > rpc.max_auxiliary_bytes) return error.BodyTooLarge;
+        const settings = try std.json.parseFromSliceLeaky(struct { worker_environment: []const EnvironmentEntry = &.{}, worker_executable: ?[]const u8 = null }, arena.allocator(), context.runtime_config_json.slice(), .{ .ignore_unknown_fields = true });
         var environment = std.process.Environ.Map.init(alloc);
         errdefer environment.deinit();
         // This child uses RPC as its lifeline, not the separate inference-run
@@ -291,8 +299,10 @@ pub const Client = struct {
                 std.mem.eql(u8, entry.name, "ANTFLY_INFERENCE_SUPERVISOR_LIFELINE")) continue;
             try environment.put(entry.name, entry.value);
         }
+        const worker_executable = if (settings.worker_executable) |path| try alloc.dupe(u8, path) else null;
+        errdefer if (worker_executable) |path| alloc.free(path);
         const self = try alloc.create(Client);
-        self.* = .{ .alloc = alloc, .io = io, .create_json = json, .environment = environment };
+        self.* = .{ .alloc = alloc, .io = io, .create_json = json, .worker_executable = worker_executable, .initial_content_security = initial_security, .environment = environment, .content_security_source = context.content_security_source };
         return self;
     }
 
@@ -312,6 +322,8 @@ pub const Client = struct {
         if (self.worker) |worker| worker.destroy();
         if (self.budget) |budget| budget.release_context(budget.context);
         self.alloc.free(self.create_json);
+        if (self.worker_executable) |path| self.alloc.free(path);
+        if (self.initial_content_security) |bytes| self.alloc.free(bytes);
         self.environment.deinit();
         self.alloc.destroy(self);
     }
@@ -327,7 +339,7 @@ pub const Client = struct {
         if (self.budget == null) return error.ResourceOwnerNotConfigured;
         const worker = try self.alloc.create(Worker);
         errdefer self.alloc.destroy(worker);
-        const executable = try resolveWorkerExecutable(self.alloc, self.io);
+        const executable = try resolveWorkerExecutable(self.alloc, self.io, self.worker_executable);
         defer self.alloc.free(executable);
         const child = std.process.spawn(self.io, .{
             .argv = &.{ executable, "inference", "_worker" },
@@ -363,8 +375,8 @@ pub const Client = struct {
         errdefer worker.child.kill(self.io);
         try worker.endpoint.start();
         errdefer worker.endpoint.deinit();
-        const initialized = try call(&worker.endpoint, .initialize, self.create_json, control);
-        self.alloc.free(initialized);
+        const initialized = try callSegments(&worker.endpoint, .initialize, "", .{ .body = self.create_json, .auxiliary = self.initial_content_security orelse "" }, control, self.initial_content_security != null);
+        initialized.deinit();
         const configured = try call(&worker.endpoint, .configure, "", control);
         self.alloc.free(configured);
         self.generation += 1;
@@ -374,10 +386,10 @@ pub const Client = struct {
     }
 
     pub fn invoke(self: *Client, operation: wire.Operation, options: []const u8, data: []const u8, control: rpc.Control) !rpc.OwnedPayload {
-        return self.invokePayload(operation, options, .{ .body = data }, control);
+        return self.invokePayload(operation, options, .{ .body = data }, control, false);
     }
 
-    fn invokePayload(self: *Client, operation: wire.Operation, options: []const u8, payload: rpc.Payload, control: rpc.Control) !rpc.OwnedPayload {
+    fn invokePayload(self: *Client, operation: wire.Operation, options: []const u8, payload: rpc.Payload, control: rpc.Control, has_security: bool) !rpc.OwnedPayload {
         while (!self.mutex.tryLock()) {
             if (control.check) |check| try check(control.ptr);
             try self.io.sleep(.fromMilliseconds(1), .awake);
@@ -393,20 +405,20 @@ pub const Client = struct {
             self.active -= 1;
             self.mutex.unlock(self.io);
         }
-        const result = try callSegments(&worker.endpoint, operation, options, payload, control);
+        const result = try callSegments(&worker.endpoint, operation, options, payload, control, has_security);
         // Hand off an independent response before releasing this worker lease.
         return result.detach();
     }
 };
 
 fn callPayload(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []const u8, data: []const u8, control: rpc.Control) !rpc.OwnedPayload {
-    return callSegments(endpoint, operation, options, .{ .body = data }, control);
+    return callSegments(endpoint, operation, options, .{ .body = data }, control, false);
 }
 
-fn callSegments(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []const u8, payload: rpc.Payload, control: rpc.Control) !rpc.OwnedPayload {
+fn callSegments(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []const u8, payload: rpc.Payload, control: rpc.Control, has_security: bool) !rpc.OwnedPayload {
     const alloc = endpoint.alloc;
     if (options.len > rpc.max_metadata_bytes) return error.BodyTooLarge;
-    const header = try std.json.Stringify.valueAlloc(alloc, wire.Request{ .operation = operation, .options = options }, .{});
+    const header = try std.json.Stringify.valueAlloc(alloc, wire.Request{ .operation = operation, .options = options, .has_content_security = has_security }, .{});
     defer alloc.free(header);
     var framed = payload;
     framed.metadata = header;
@@ -475,23 +487,30 @@ fn findOnPathAlloc(alloc: std.mem.Allocator, io: std.Io, name: []const u8) !?[]u
 /// (`<exe> inference _worker`, host-owned and replaceable so a crashing GPU
 /// driver call or unabortable native session load cannot take the caller
 /// down with it -- see `BackendRuntime.hasUninterruptibleCalls`). The
-/// `antfly` CLI binary re-execs itself, which is correct: `argv[0]` names the
-/// `antfly` binary the user launched. A library host (libantfly linked into a
-/// Go test binary, `examples/antfly-docs-knowledge-base`, or any other consumer) has no such
-/// self: its `argv[0]` is the host binary, not an `antfly` executable that
+/// `antfly` CLI binary explicitly supplies its OS executable path. A library
+/// host (libantfly linked into a Go test binary or another application) has no
+/// such self: its `argv[0]` is the host binary, not an `antfly` executable that
 /// understands `inference _worker`. Resolution order:
 ///
 ///  1. `ANTFLY_INFERENCE_WORKER`, an explicit override naming the worker
 ///     executable directly.
-///  2. The image this code was loaded from, via `dladdr`: for the statically
-///     linked `antfly` binary this resolves to itself (unchanged behavior);
-///     for a shared `libantfly`, it resolves to the `.dylib`/`.so`, next to
-///     which we look for a sibling antfly binary.
-///  3. An antfly binary on `PATH`.
-fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
-    if (platform.env.getenvSlice(worker_executable_env)) |override| {
+///  2. A CLI-owned executable path, resolved by the standalone launcher using
+///     the OS API (/proc/self/exe on Linux), independent of argv[0] and PATH.
+///  3. The image containing this code via dladdr, or a sibling antfly next to
+///     libantfly. Embedding hosts never implicitly re-exec themselves.
+///  4. An antfly binary on PATH.
+fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io, configured: ?[]const u8) ![]u8 {
+    return resolveWorkerExecutableWithOverride(alloc, io, configured, platform.env.getenvSlice(worker_executable_env));
+}
+
+fn resolveWorkerExecutableWithOverride(alloc: std.mem.Allocator, io: std.Io, configured: ?[]const u8, override_path: ?[]const u8) ![]u8 {
+    if (override_path) |override| {
         if (override.len == 0) return error.InferenceWorkerExecutableNotConfigured;
         return alloc.dupe(u8, override);
+    }
+    if (configured) |path| {
+        if (path.len == 0) return error.InferenceWorkerExecutableNotConfigured;
+        return alloc.dupe(u8, path);
     }
     if (selfImagePathAlloc(alloc)) |self_path| {
         defer alloc.free(self_path);
@@ -530,7 +549,8 @@ fn reply(endpoint: *rpc.Endpoint, status: bridge.Status, options: []const u8, bo
 fn requestEnvelope(arena: std.mem.Allocator, request: *rpc.Request) !wire.Envelope {
     const payload = request.payload.view();
     const header = try std.json.parseFromSliceLeaky(wire.Request, arena, payload.metadata, .{});
-    return .{ .operation = header.operation, .options = header.options, .data = payload.body };
+    if (!header.has_content_security and payload.auxiliary.len != 0) return error.InvalidWorkerFrame;
+    return .{ .operation = header.operation, .options = header.options, .data = payload.body, .content_security_json = if (header.has_content_security) payload.auxiliary else null };
 }
 
 const Observation = struct { key: u64, bytes: u64 = 0, tokenizer: bool };
@@ -747,7 +767,8 @@ const Child = struct {
             const create_arena = self.create_arena.allocator();
             const create = try std.json.parseFromSliceLeaky(wire.Create, create_arena, envelope.data, .{ .allocate = .alloc_always });
             var out: ?*anyopaque = null;
-            const context = try create.toContext(create_arena, &self.io, &out);
+            var context = try create.toContext(create_arena, &self.io, &out);
+            context.content_security_json = .init(envelope.content_security_json);
             self.state = @ptrCast(@alignCast(try host.linkedInferenceCreateLocal(&context, true)));
             return reply(&self.endpoint, .ok, "", "");
         }
@@ -804,6 +825,7 @@ const Child = struct {
                     .abi_version = bridge.abi_version,
                     .handle = state,
                     .operation = provider.operation,
+                    .content_security_json = .init(envelope.content_security_json),
                     .request_json = .init(media.metadata),
                     .deadline_ns = provider.deadline_ns orelse 0,
                     .has_deadline = @intFromBool(provider.deadline_ns != null),
@@ -862,6 +884,7 @@ const Child = struct {
                 try host.linkedInferenceHandleHttp(&.{
                     .abi_version = bridge.abi_version,
                     .route_handle = route_handle,
+                    .content_security_json = .init(envelope.content_security_json),
                     .request = &view,
                     .document_store = if (documents) |binding| binding.view() else .{},
                     .cancellation = .{ .context = request, .is_cancelled = cancelled },
@@ -1293,7 +1316,7 @@ const ForwardDocuments = struct {
         const a = self.child.alloc;
         const options = try std.json.Stringify.valueAlloc(a, wire.DocumentStoreRequest{ .capability = self.key, .metadata = metadata }, .{});
         defer a.free(options);
-        const payload = try callSegments(&self.child.endpoint, .document_store, options, .{ .body = body }, .{});
+        const payload = try callSegments(&self.child.endpoint, .document_store, options, .{ .body = body }, .{}, false);
         errdefer payload.deinit();
         var parsed = try std.json.parseFromSlice(wire.Reply, a, payload.view().metadata, .{});
         errdefer parsed.deinit();
@@ -1479,4 +1502,16 @@ test "inference worker checkpoint upload feeds incremental HTTP reads and recove
     try std.testing.expectEqual(@as(u64, 100123), std.mem.readInt(u64, recovery.view().body[0..8], .little));
     try std.testing.expect(!fixture.parent.closed.load(.acquire));
     try std.testing.expect(!fixture.child.closed.load(.acquire));
+}
+
+test "worker discovery prefers the CLI OS path and preserves explicit overrides" {
+    const alloc = std.testing.allocator;
+    const configured = "/off-path/renamed-antfly";
+    const path = try resolveWorkerExecutableWithOverride(alloc, std.testing.io, configured, null);
+    defer alloc.free(path);
+    try std.testing.expectEqualStrings(configured, path);
+    const overridden = try resolveWorkerExecutableWithOverride(alloc, std.testing.io, configured, "/explicit/antfly");
+    defer alloc.free(overridden);
+    try std.testing.expectEqualStrings("/explicit/antfly", overridden);
+    try std.testing.expectError(error.InferenceWorkerExecutableNotConfigured, resolveWorkerExecutableWithOverride(alloc, std.testing.io, configured, ""));
 }

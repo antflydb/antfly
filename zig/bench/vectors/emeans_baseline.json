@@ -1,0 +1,110 @@
+{
+  "date": "2026-11-09",
+  "base_commit": "62186c31b3",
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "configuration": {
+    "vectors": 10000,
+    "dims": 128,
+    "samples": 3,
+    "queries": 100,
+    "seed": 42,
+    "metric": "l2_squared",
+    "storage": "memory",
+    "leaf_size": 128,
+    "branching_factor": 128,
+    "backend": "cpu",
+    "optimize": "ReleaseFast",
+    "dataset": "16 synthetic diagonal clusters, unnormalized; uniform coordinate noise 0.01; queries perturb sampled training points by up to 0.0001 per coordinate"
+  },
+  "notes": [
+    "Timing rows are medians of three runs on one fixed seeded dataset, not three independent datasets.",
+    "Other builds and services were active on the host; timings are indicative.",
+    "Peak RSS covers the entire benchmark process and all samples, not isolated clustering scratch.",
+    "The benchmark closes and reopens each index before warm-query measurements.",
+    "Synthetic results are not a production rollout gate."
+  ],
+  "cases": [
+    {
+      "search_width": 16,
+      "results": [
+        {
+          "algorithm": "hilbert_seeded",
+          "build_ms": 225.814,
+          "warm_query_us": 192.29,
+          "warm_query_p95_us": 491.0,
+          "recall_at_10": 0.243,
+          "peak_process_rss_bytes": 101105664,
+          "leaves": 79,
+          "min_leaf_members": 126,
+          "max_leaf_members": 127,
+          "mean_leaf_members": 126.58
+        },
+        {
+          "algorithm": "kmeans",
+          "build_ms": 328.169,
+          "warm_query_us": 392.02,
+          "warm_query_p95_us": 479.0,
+          "recall_at_10": 0.929,
+          "peak_process_rss_bytes": 98467840,
+          "leaves": 114,
+          "min_leaf_members": 30,
+          "max_leaf_members": 128,
+          "mean_leaf_members": 87.72
+        },
+        {
+          "algorithm": "emeans",
+          "build_ms": 132.601,
+          "warm_query_us": 388.38,
+          "warm_query_p95_us": 469.0,
+          "recall_at_10": 0.92,
+          "peak_process_rss_bytes": 100614144,
+          "leaves": 115,
+          "min_leaf_members": 16,
+          "max_leaf_members": 128,
+          "mean_leaf_members": 86.96
+        }
+      ]
+    },
+    {
+      "search_width": 32,
+      "results": [
+        {
+          "algorithm": "hilbert_seeded",
+          "build_ms": 230.874,
+          "warm_query_us": 225.3,
+          "warm_query_p95_us": 579.0,
+          "recall_at_10": 0.199,
+          "peak_process_rss_bytes": 85557248,
+          "leaves": 79,
+          "min_leaf_members": 126,
+          "max_leaf_members": 127,
+          "mean_leaf_members": 126.58
+        },
+        {
+          "algorithm": "kmeans",
+          "build_ms": 406.096,
+          "warm_query_us": 428.24,
+          "warm_query_p95_us": 598.0,
+          "recall_at_10": 0.929,
+          "peak_process_rss_bytes": 83951616,
+          "leaves": 114,
+          "min_leaf_members": 30,
+          "max_leaf_members": 128,
+          "mean_leaf_members": 87.72
+        },
+        {
+          "algorithm": "emeans",
+          "build_ms": 131.845,
+          "warm_query_us": 452.35,
+          "warm_query_p95_us": 923.0,
+          "recall_at_10": 0.92,
+          "peak_process_rss_bytes": 105562112,
+          "leaves": 115,
+          "min_leaf_members": 16,
+          "max_leaf_members": 128,
+          "mean_leaf_members": 86.96
+        }
+      ]
+    }
+  ]
+}

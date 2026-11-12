@@ -18695,6 +18695,11 @@ export interface components {
          * @enum {string}
          */
         DerivedCoveragePolicy: "strict" | "partial" | "best_effort";
+        /**
+         * @description Offline clustering algorithm for fresh native Parquet lake HBC indexes.
+         * @enum {string}
+         */
+        LakeBulkBuildAlgorithm: "lloyd" | "emeans";
         /** @description Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment. */
         ArtifactIndexSource: {
             /** @description Stable name of a generated artifact stream. */
@@ -18791,6 +18796,13 @@ export interface components {
              * @default false
              */
             sparse?: boolean;
+            /** @description Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates. */
+            lake_bulk_build?: components["schemas"]["LakeBulkBuildAlgorithm"];
+            /**
+             * Format: int64
+             * @description Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+             */
+            lake_bulk_build_max_input_bytes?: number;
             /** @description Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes. */
             dimension?: number;
             /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
@@ -20173,6 +20185,9 @@ export interface components {
             external_vector_space?: string;
             /** @default false */
             sparse?: boolean;
+            lake_bulk_build?: components["schemas"]["LakeBulkBuildAlgorithm"];
+            /** Format: int64 */
+            lake_bulk_build_max_input_bytes?: number;
             dimension?: number;
             field?: string;
             /** @description Embedding artifact streams indexed together as independent vector members. */
@@ -30957,19 +30972,19 @@ export interface components {
         ChunkSourceReference: {
             /** @enum {string} */
             type: "source";
-            /** @description HTTP(S) or S3 object URI resolved through configured content security and credentials. */
+            /** @description HTTP(S), S3, or absolute file:// URI resolved through configured content security and credentials. Local files require an explicit remote_content.security.allowed_paths allowlist. */
             uri: string;
             mime_type: string;
-            /** @description Quoted strong HTTP/S3 ETag or immutable S3 version ID; enforced on every range read. */
+            /** @description Quoted strong HTTP/S3 ETag, immutable S3 version ID, or lowercase SHA-256 hex digest for file_sha256. Local files are verified in a bounded streaming scan; unchanged files reuse a bounded process-local verification cache across continuation pages. Size, inode, mtime and ctime are checked around every range read. */
             version: string;
             /**
-             * @description Defaults to strong_etag. S3 version IDs are supported only for S3 sources.
+             * @description Defaults to strong_etag. S3 version IDs require S3 sources; file_sha256 requires a local file URI.
              * @enum {string}
              */
-            version_kind?: "strong_etag" | "s3_version_id";
+            version_kind?: "strong_etag" | "s3_version_id" | "file_sha256";
             /**
              * Format: int64
-             * @description Exact immutable object length, verified against Content-Range.
+             * @description Exact immutable object length, verified against Content-Range or local file metadata.
              */
             length: number;
         };

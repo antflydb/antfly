@@ -21,6 +21,8 @@ const std = @import("std");
 
 pub const max_frame_bytes = 64 * 1024;
 pub const max_metadata_bytes = 1024 * 1024;
+/// Trusted request context has its own cap and shares receive admission.
+pub const max_auxiliary_bytes = 1024 * 1024;
 pub const max_body_bytes = 64 * 1024 * 1024;
 const max_retained_bytes = 256 * 1024 * 1024;
 const control_budget_bytes = 4 * 1024 * 1024;
@@ -41,6 +43,7 @@ const ResourceTask = struct { id: u64, len: usize, bytes: [max_resource_bytes]u8
 pub const Payload = struct {
     metadata: []const u8 = "",
     body: []const u8 = "",
+    auxiliary: []const u8 = "",
     /// Send-only scatter/gather body. The receiver still owns one admitted slab.
     body_segments: ?[]const []const u8 = null,
 
@@ -57,7 +60,8 @@ pub const Payload = struct {
     fn size(self: Payload) !usize {
         if (self.metadata.len > max_metadata_bytes)
             return error.BodyTooLarge;
-        return self.metadata.len + try self.bodySize();
+        if (self.auxiliary.len > max_auxiliary_bytes) return error.BodyTooLarge;
+        return self.metadata.len + self.auxiliary.len + try self.bodySize();
     }
 };
 
@@ -67,9 +71,10 @@ pub const OwnedPayload = struct {
     alloc: std.mem.Allocator,
     bytes: []u8,
     metadata_len: usize,
+    auxiliary_len: usize = 0,
 
     pub fn view(self: OwnedPayload) Payload {
-        return .{ .metadata = self.bytes[0..self.metadata_len], .body = self.bytes[self.metadata_len..] };
+        return .{ .metadata = self.bytes[0..self.metadata_len], .auxiliary = self.bytes[self.metadata_len..][0..self.auxiliary_len], .body = self.bytes[self.metadata_len + self.auxiliary_len ..] };
     }
     pub fn deinit(self: OwnedPayload) void {
         if (self.endpoint) |endpoint| {
@@ -293,19 +298,21 @@ pub const Endpoint = struct {
         const counter = if (size <= max_frame_bytes) &self.control_bytes else &self.retained_bytes;
         counter.* -= size;
     }
-    fn allocateLocked(self: *Endpoint, metadata_len: usize, body_len: usize) !OwnedPayload {
-        if (metadata_len > max_metadata_bytes or body_len > max_body_bytes) return error.BodyTooLarge;
-        const size = metadata_len + body_len;
+    fn allocateLocked(self: *Endpoint, metadata_len: usize, body_len: usize, auxiliary_len: usize) !OwnedPayload {
+        if (metadata_len > max_metadata_bytes or body_len > max_body_bytes or auxiliary_len > max_auxiliary_bytes) return error.BodyTooLarge;
+        const size = metadata_len + body_len + auxiliary_len;
         try self.reserveBytesLocked(size);
         errdefer self.releaseBytesLocked(size);
-        return .{ .endpoint = self, .alloc = self.alloc, .bytes = try self.alloc.alloc(u8, size), .metadata_len = metadata_len };
+        return .{ .endpoint = self, .alloc = self.alloc, .bytes = try self.alloc.alloc(u8, size), .metadata_len = metadata_len, .auxiliary_len = auxiliary_len };
     }
     pub fn copyPayload(self: *Endpoint, value: Payload) !OwnedPayload {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const owned = try self.allocateLocked(value.metadata.len, try value.bodySize());
+        _ = try value.size();
+        const owned = try self.allocateLocked(value.metadata.len, try value.bodySize(), value.auxiliary.len);
         @memcpy(owned.bytes[0..value.metadata.len], value.metadata);
-        var offset = value.metadata.len;
+        @memcpy(owned.bytes[value.metadata.len..][0..value.auxiliary.len], value.auxiliary);
+        var offset = value.metadata.len + value.auxiliary.len;
         for (value.body_segments orelse &.{value.body}) |segment| {
             @memcpy(owned.bytes[offset..][0..segment.len], segment);
             offset += segment.len;
@@ -479,11 +486,12 @@ pub const Endpoint = struct {
             _ = self.offers.remove(transfer);
             self.mutex.unlock(self.io);
         }
-        var description: [21]u8 = undefined;
+        var description: [25]u8 = undefined;
         description[0] = @backingInt(kind);
         std.mem.writeInt(u64, description[1..9], request_id, .little);
         std.mem.writeInt(u32, description[9..13], @intCast(payload.metadata.len), .little);
         std.mem.writeInt(u64, description[13..21], try payload.bodySize(), .little);
+        std.mem.writeInt(u32, description[21..25], @intCast(payload.auxiliary.len), .little);
         errdefer self.sendFrame(.abort, transfer, "") catch {};
         try self.sendFrame(.offer, transfer, &description);
         while (!offer.ready.isSet()) {
@@ -498,8 +506,8 @@ pub const Endpoint = struct {
         if (self.closed.load(.acquire)) return error.InferenceWorkerUnavailable;
         if (!offer.accepted) return error.QueueFull;
         const parts = payload.body_segments orelse &.{payload.body};
-        for (0..parts.len + 1) |index| {
-            const part = if (index == 0) payload.metadata else parts[index - 1];
+        for (0..parts.len + 2) |index| {
+            const part = if (index == 0) payload.metadata else if (index == 1) payload.auxiliary else parts[index - 2];
             var offset: usize = 0;
             while (offset < part.len) {
                 if (control.check) |check| try check(control.ptr);
@@ -634,12 +642,13 @@ pub const Endpoint = struct {
                     pending.ready.set(self.io);
                 },
                 .offer => {
-                    if (length != 21 or self.incoming.contains(id)) return error.InvalidWorkerFrame;
+                    if (length != 25 or self.incoming.contains(id)) return error.InvalidWorkerFrame;
                     const message_kind = std.enums.fromInt(MessageKind, bytes[0]) orelse return error.InvalidWorkerFrame;
                     const request_id = std.mem.readInt(u64, bytes[1..9], .little);
                     const metadata_len = std.mem.readInt(u32, bytes[9..13], .little);
                     const body_len = std.mem.readInt(u64, bytes[13..21], .little);
-                    if (request_id == 0 or metadata_len > max_metadata_bytes or body_len > max_body_bytes)
+                    const auxiliary_len = std.mem.readInt(u32, bytes[21..25], .little);
+                    if (request_id == 0 or metadata_len > max_metadata_bytes or body_len > max_body_bytes or auxiliary_len > max_auxiliary_bytes)
                         return error.InvalidWorkerFrame;
                     if (message_kind == .request and (request_id % 2 == self.next_id % 2 or self.active.contains(request_id)))
                         return error.InvalidWorkerFrame;
@@ -651,7 +660,7 @@ pub const Endpoint = struct {
                         try self.replyOffer(.reject, id);
                         continue;
                     }
-                    const payload = self.allocateLocked(metadata_len, @intCast(body_len)) catch {
+                    const payload = self.allocateLocked(metadata_len, @intCast(body_len), auxiliary_len) catch {
                         try self.replyOffer(.reject, id);
                         continue;
                     };
@@ -929,7 +938,7 @@ test "inference worker bulk capacity rejects one request and leaves nested resou
     // Occupy the complete bulk allowance without occupying control capacity.
     pair.child.mutex.lockUncancelable(pair.child.io);
     pair.child.retained_limit = body.len;
-    const occupied = try pair.child.allocateLocked(0, body.len);
+    const occupied = try pair.child.allocateLocked(0, body.len, 0);
     pair.child.mutex.unlock(pair.child.io);
     defer occupied.deinit();
     try std.testing.expectError(error.QueueFull, pair.parent.call(.{ .body = body }, .{}));
@@ -1025,7 +1034,7 @@ test "inference worker truncated logical messages close transport and release re
     var pair: TestPair = undefined;
     try pair.init();
     defer pair.deinit();
-    var offer: [21]u8 = @splat(0);
+    var offer: [25]u8 = @splat(0);
     offer[0] = @backingInt(MessageKind.request);
     std.mem.writeInt(u64, offer[1..9], 1, .little);
     std.mem.writeInt(u64, offer[13..21], 2 * max_frame_bytes, .little);
@@ -1053,7 +1062,7 @@ test "inference worker terminal capacity errors require no receive credits" {
         defer pair.parent.mutex.unlock(pair.parent.io);
         pair.parent.retained_limit = 0;
         while (held_count < held.len) : (held_count += 1)
-            held[held_count] = try pair.parent.allocateLocked(0, max_frame_bytes);
+            held[held_count] = try pair.parent.allocateLocked(0, max_frame_bytes, 0);
     }
     const body = try std.testing.allocator.alloc(u8, 2 * max_frame_bytes);
     defer std.testing.allocator.free(body);
@@ -1480,7 +1489,7 @@ test "inference worker streaming events wait for receive credit and remain cance
             pair.parent.mutex.lockUncancelable(pair.parent.io);
             defer pair.parent.mutex.unlock(pair.parent.io);
             while (held_count < held.len) : (held_count += 1)
-                held[held_count] = try pair.parent.allocateLocked(0, max_frame_bytes);
+                held[held_count] = try pair.parent.allocateLocked(0, max_frame_bytes, 0);
         }
         pair.child.mutex.lockUncancelable(pair.child.io);
         const initial_transfer = pair.child.next_transfer;
@@ -1628,4 +1637,27 @@ test "inference worker idle uploads allow response events and early terminal rep
         try std.testing.expectEqualStrings(if (std.mem.eql(u8, operation, "idle-upload")) "complete" else "early", response.view().body);
         try std.testing.expect(source.stopped.load(.acquire));
     }
+}
+
+test "content security snapshot uses separately bounded admitted raw RPC bytes" {
+    const a = std.testing.allocator;
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    const policy = try a.alloc(u8, max_auxiliary_bytes);
+    defer a.free(policy);
+    for (policy, 0..) |*b, i| b.* = "\\\"/path"[i % 7];
+    const result = try pair.parent.call(.{ .metadata = "provider", .auxiliary = policy, .body_segments = &.{ "request", " bytes" } }, .{});
+    const detached = result.detach();
+    defer detached.deinit();
+    try std.testing.expectEqualStrings(policy, detached.view().auxiliary);
+    try std.testing.expectEqualStrings("provider", detached.view().metadata);
+    try std.testing.expectEqualStrings("request bytes", detached.view().body);
+    const too_large = try a.alloc(u8, max_auxiliary_bytes + 1);
+    defer a.free(too_large);
+    try std.testing.expectError(error.BodyTooLarge, pair.parent.call(.{ .auxiliary = too_large }, .{}));
+    try std.testing.expectEqual(@as(usize, 1), pair.handled.load(.monotonic));
+    const after = try pair.parent.call(.{ .body = "healthy" }, .{});
+    defer after.deinit();
+    try std.testing.expectEqualStrings("healthy", after.view().body);
 }

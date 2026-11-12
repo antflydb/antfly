@@ -133,6 +133,50 @@ const InferenceExecutionControl = execution_control_mod.InferenceExecutionContro
 const cancellable_rerank_batch_size: usize = 8;
 const native_call_cancellation_grace_ns: u64 = 5 * std.time.ns_per_s;
 
+const admission_failure_key = "antfly.inference_admission_failure";
+
+fn httpAdmissionFailure(ctx: *const httpx.Context) ?*runtime.tier.memory.AdmissionFailure {
+    return if (ctx.getData(admission_failure_key)) |raw| @ptrCast(@alignCast(raw)) else null;
+}
+
+/// Stack-owned for the entire handler, including joined preparation workers.
+/// A nested generation route restores its caller's diagnostic on return.
+const AdmissionFailureScope = struct {
+    failure: runtime.tier.memory.AdmissionFailure = .{},
+    previous: ?httpx.Context.DataEntry = null,
+
+    fn bind(self: *@This(), ctx: *httpx.Context) !void {
+        self.previous = if (ctx.data) |data| data.get(admission_failure_key) else null;
+        if (self.previous != null) {
+            ctx.data.?.getPtr(admission_failure_key).?.* = .{ .ptr = &self.failure };
+        } else try ctx.setData(admission_failure_key, &self.failure, null);
+    }
+
+    fn unbind(self: *@This(), ctx: *httpx.Context) void {
+        if (self.previous) |previous| {
+            ctx.data.?.getPtr(admission_failure_key).?.* = previous;
+        } else _ = ctx.data.?.remove(admission_failure_key);
+    }
+};
+
+fn modelResourceLimitResponse(ctx: *httpx.Context) !httpx.Response {
+    if (httpAdmissionFailure(ctx)) |failure| {
+        if (failure.snapshot()) |exceeded| return ctx.status(400).json(.{
+            .@"error" = "MODEL_RESOURCE_LIMIT",
+            .message = "request and required model residency exceed the configured inference budget",
+            .budget = @tagName(exceeded.limit),
+            .required_bytes = exceeded.requested_bytes,
+            .limit_bytes = exceeded.limit_bytes,
+            .retryable = false,
+        });
+    }
+    return ctx.status(400).json(.{
+        .@"error" = "MODEL_RESOURCE_LIMIT",
+        .message = "request resource plan exceeds the configured inference budget",
+        .retryable = false,
+    });
+}
+
 fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExecutionControl {
     const Check = struct {
         fn check(raw: ?*anyopaque) !void {
@@ -146,6 +190,8 @@ fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExec
         }
     };
     return .{
+        .admission_failure = httpAdmissionFailure(ctx),
+        .content_security_json = if (ctx.getData("antfly.content_security_json")) |raw| @as(*const []const u8, @ptrCast(@alignCast(raw))).* else null,
         .http_request_admitted = true,
         .document_store = if (ctx.getData("antfly.document_store")) |raw| @as(*const @import("antfly_runtime_abi").document_abi.View, @ptrCast(@alignCast(raw))).* else .{},
         .io = ctx.io,
@@ -1900,8 +1946,25 @@ fn inferenceDownloadContext(context: *const InferenceDownloadRequestContext) !sc
             return false;
         }
     };
+    const Blocking = struct {
+        fn check(raw: *const anyopaque) !void {
+            const request: *const InferenceDownloadRequestContext = @ptrCast(@alignCast(raw));
+            try request.control.check();
+        }
+        fn enter(raw: *const anyopaque) !u64 {
+            const request: *const InferenceDownloadRequestContext = @ptrCast(@alignCast(raw));
+            const guard = try request.control.enterUninterruptible(.uninterruptible);
+            return guard.token;
+        }
+        fn leave(raw: *const anyopaque, token: u64) void {
+            const request: *const InferenceDownloadRequestContext = @ptrCast(@alignCast(raw));
+            var guard = execution_control_mod.UninterruptibleGuard{ .boundary = request.control.hard_cancellation, .token = token };
+            guard.deinit();
+        }
+    };
     return .{
         .io = context.io,
+        .blocking_io = .{ .context = context, .enter = Blocking.enter, .leave = Blocking.leave, .check = Blocking.check },
         .timeout_ms = try remainingInferenceDeadlineMs(context.control.deadline_ns, embedTimingNowNs()),
         .cancellation = .{
             .ptr = context,
@@ -3252,6 +3315,7 @@ fn modelArtifactsChangingResponse(ctx: *httpx.Context) !httpx.Response {
 }
 
 fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.ResourceLimitExceeded) return modelResourceLimitResponse(ctx);
     if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
     if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
     return switch (err) {
@@ -3277,11 +3341,6 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
             .@"error" = "INVALID_MODEL",
             .message = "GLiNER specialty artifacts must match the qualified FP32 checkpoint and provenance",
         }),
-        error.ResourceLimitExceeded => ctx.status(400).json(.{
-            .@"error" = "MODEL_RESOURCE_LIMIT",
-            .message = "model resource plan exceeds the configured inference budget; inspect admission logs for requested bytes and host, backend, combined, KV and scratch limits",
-            .retryable = false,
-        }),
         error.ProcessIsolationRequired => ctx.status(503).json(.{
             .@"error" = "PROCESS_ISOLATION_REQUIRED",
             .message = "this backend requires the supervised inference process; configure inference.api_url instead of embedding it in the database process",
@@ -3295,6 +3354,7 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
 }
 
 fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.ResourceLimitExceeded) return modelResourceLimitResponse(ctx);
     if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
     if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
     return switch (err) {
@@ -3311,11 +3371,6 @@ fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
         error.Canceled, error.Cancelled => ctx.status(408).json(.{
             .@"error" = "INFERENCE_CANCELLED",
             .message = "the inference request was cancelled",
-            .retryable = false,
-        }),
-        error.ResourceLimitExceeded => ctx.status(400).json(.{
-            .@"error" = "MODEL_RESOURCE_LIMIT",
-            .message = "request resource plan exceeds the configured inference budget; inspect admission logs for requested bytes and host, backend, combined, KV and scratch limits",
             .retryable = false,
         }),
         error.ProcessIsolationRequired => ctx.status(503).json(.{
@@ -4370,6 +4425,7 @@ const SileroWeightCache = struct {
 const HostCaches = struct {
     allocator: std.mem.Allocator,
     media_index_cache: @import("../pipelines/media_index_cache.zig").Cache = .{},
+    local_source_verifications: scraping.LocalVerificationCache = .{},
     silero_weights: SileroWeightCache = .{},
     silero_weights_lock: std.atomic.Mutex = .unlocked,
 
@@ -13991,6 +14047,9 @@ pub const Node = struct {
     }
 
     pub fn createEmbedding(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const tracing = platform.env.getenv("ANTFLY_EMBED_TRACE_DIR") != null;
         const trace_started = if (tracing) embedding_trace.now() else 0;
         var execution_control = httpInferenceExecutionControl(self, ctx);
@@ -14678,9 +14737,15 @@ pub const Node = struct {
             defer transport_admission.deinit();
             var transport_bound = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = transport_admission.allocator(), .limit = try std.math.add(usize, 32 * 1024 * 1024, request.limits.remote_cache_bytes) };
             const transport_allocator = transport_bound.allocator();
-            var security = effectiveRequestContentSecurity(self);
+            var security_snapshot = if (control.content_security_json) |json| try std.json.parseFromSlice(scraping.ContentSecurityConfig, transport_allocator, json, .{}) else null;
+            defer if (security_snapshot) |*snapshot| snapshot.deinit();
+            var security = if (security_snapshot) |snapshot| defaultedRequestContentSecurity(snapshot.value) else effectiveRequestContentSecurity(self);
             const download_context = InferenceDownloadRequestContext{ .io = io, .control = control };
-            const remote = try scraping.PinnedRange.create(transport_allocator, try inferenceDownloadContext(&download_context), reference.uri, reference.version, if (reference.version_kind == .strong_etag) .strong_etag else .s3_version_id, reference.length, &security, if (self.config.s3_credentials) |*credentials| credentials else null, &.{});
+            const remote = try scraping.PinnedRange.createWithLocalCache(transport_allocator, try inferenceDownloadContext(&download_context), reference.uri, reference.version, switch (reference.version_kind) {
+                .strong_etag => .strong_etag,
+                .s3_version_id => .s3_version_id,
+                .file_sha256 => .file_sha256,
+            }, reference.length, &security, if (self.config.s3_credentials) |*credentials| credentials else null, &.{}, &self.host_caches.local_source_verifications);
             defer remote.destroy();
             const Range = struct {
                 fn read(raw: *anyopaque, offset: u64, out: []u8, check: media.source.Control) !usize {
@@ -14709,7 +14774,9 @@ pub const Node = struct {
             resolved.native_source = &source;
             resolved.native_transport_bytes = 0; // Transport allocations already own shared admission.
             resolved.source_version = reference.version;
-            return self.chunkAndEmbedAdmitted(a, io, control, resolved, target, sink);
+            const execution = try self.chunkAndEmbedAdmitted(a, io, control, resolved, target, sink);
+            try remote.validate();
+            return execution;
         }
         if (request.transcribe_boundary) return self.chunkTranscribeBoundary(a, io, control, request, target, sink);
         if (target.model.len == 0 or (target.dimensions != null and target.dimensions.? == 0)) return error.InvalidChunkModel;
@@ -14782,6 +14849,9 @@ pub const Node = struct {
     }
 
     fn chunkModelAwareHttp(self: *Node, ctx: *httpx.Context, body: api.ChunkRequest, input: lib_chunker.Input, config: lib_chunker.FixedChunkConfig) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const wire = @import("chunk_response.zig");
         var output_config: ?std.json.Parsed(lib_chunker.outputs.Config) = null;
         defer if (output_config) |*parsed_outputs| parsed_outputs.deinit();
@@ -14960,6 +15030,9 @@ pub const Node = struct {
     }
 
     pub fn rerankDocuments(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const execution_control = httpInferenceExecutionControl(self, ctx);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
@@ -15304,9 +15377,9 @@ pub const Node = struct {
             if (try self.growSlotUnits(ctx, reserved_units, image_units)) |response| return response;
             reserved_units = image_units;
         }
-        var image_permit = model.session.admitHostPreprocess(image_working_bytes) catch |err| return inferenceFailureResponse(ctx, err);
+        var image_permit = model.session.withAdmissionControl(model_path_selection_control).admitHostPreprocess(image_working_bytes) catch |err| return inferenceFailureResponse(ctx, err);
         defer image_permit.deinit();
-        var image_memory = @import("../pipelines/preprocessing_memory.zig").Scope.init(ctx.allocator, model.session, .{ .process_bytes = image_working_bytes }, null);
+        var image_memory = @import("../pipelines/preprocessing_memory.zig").Scope.init(ctx.allocator, model.session.withAdmissionControl(model_path_selection_control), .{ .process_bytes = image_working_bytes }, null);
         defer image_memory.deinit();
         const image_allocator = try image_memory.allocator();
 
@@ -15511,6 +15584,9 @@ pub const Node = struct {
     }
 
     pub fn prepareChatContext(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var control = httpInferenceExecutionControl(self, ctx);
         control.check() catch |err| return contextRequestFailure(ctx, err);
         const bytes = (try ctx.body()) orelse return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -15690,6 +15766,10 @@ pub const Node = struct {
         // Keep this charge until the decoded checkpoint itself is destroyed.
         upload_admission: ?runtime.tier.memory.AdmissionLease = null,
 
+        fn requiredResidency(self: *const NativeCheckpointTransfer) runtime.tier.memory.Residency {
+            return if (self.upload_admission) |lease| .fromLease(lease) else .{};
+        }
+
         fn releaseOwnedState(self: *NativeCheckpointTransfer) void {
             if (self.prepare) |request| request.deinit();
             if (self.resume_request) |request| request.deinit();
@@ -15724,6 +15804,9 @@ pub const Node = struct {
     }
 
     pub fn resumeNativeKvCheckpoint(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var lease = NativeCheckpointLease.acquire(&self.native_checkpoint_active) orelse
             return modelResourceBusyResponse(ctx);
         defer lease.release();
@@ -15821,6 +15904,9 @@ pub const Node = struct {
     }
 
     fn completeNativeOrOrdinaryGeneration(self: *Node, ctx: *httpx.Context, native_transfer: ?*NativeCheckpointTransfer) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         // Also retire upload ownership if generation returns an error before
         // it can construct an HTTP response or a deferred terminal callback.
         defer if (native_transfer) |transfer| transfer.releaseOwnedState();
@@ -17138,6 +17224,7 @@ pub const Node = struct {
                 .backend_class = target_backend_class,
                 .limits = target_admission_limits,
                 .amounts = .fromEstimate(resource_estimate),
+                .failure = execution_control.admission_failure,
             },
         };
         const native_resume = if (native_transfer) |transfer| transfer.resume_request != null else false;
@@ -17167,6 +17254,7 @@ pub const Node = struct {
                         ),
                     ),
                     .amounts = .fromEstimate(estimate),
+                    .failure = execution_control.admission_failure,
                 },
             };
             break :blk 2;
@@ -17183,20 +17271,13 @@ pub const Node = struct {
             // A partial upload must not borrow the model's execution workspace
             // or reserve device KV/scratch. Ordinary generation can proceed
             // while the bounded checkpoint body is still arriving.
-            native_transfer.?.upload_admission = self.model_manager.acquireRunResourceAmounts(
-                target_backend_class,
-                target_admission_limits,
-                .{ .host_scratch_bytes = native_host_reservation },
-            ) catch |err| {
-                if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
-                return switch (err) {
-                    error.ResourceLimitExceeded => ctx.status(400).json(.{
-                        .@"error" = "MODEL_RESOURCE_LIMIT",
-                        .message = "request exceeds the configured inference resource budget",
-                    }),
-                    else => inferenceFailureResponse(ctx, err),
-                };
-            };
+            native_transfer.?.upload_admission = self.model_manager.acquireRunResourceEstimates(&.{.{
+                .backend_class = target_backend_class,
+                .limits = target_admission_limits,
+                .amounts = .{ .host_scratch_bytes = native_host_reservation },
+                .required_residency = if (model.session.run_admission) |admission| admission.requiredResidency() else .{},
+                .failure = execution_control.admission_failure,
+            }}) catch |err| return inferenceFailureResponse(ctx, err);
         }
         const native_identity = if (native_transfer != null or platform.env.getenvBool("ANTFLY_INFERENCE_ATTENTION_MATCH_FIT_PROBE"))
             model.nativeKvIdentity(kv_dtype, execution_control) catch |err| return nativeCheckpointErrorResponse(ctx, err)
@@ -17220,22 +17301,14 @@ pub const Node = struct {
         // Admit execution only after a native upload has been fully decoded
         // and its framing validated. The separate host lease remains charged,
         // so admission still enforces the combined host/device envelope.
+        if (native_transfer) |transfer| {
+            // The decoded checkpoint cannot be reclaimed to make its own
+            // execution fit. Include it without charging its lease again.
+            admission_requests[0].resources.required_residency = try admission_requests[0].resources.required_residency.merge(transfer.requiredResidency());
+        }
         var admission_lease = self.model_manager.acquireGenerationResources(
             admission_requests[0..admission_request_count],
-        ) catch |err| {
-            if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
-            return switch (err) {
-                error.ResourceLimitExceeded => ctx.status(400).json(.{
-                    .@"error" = "MODEL_RESOURCE_LIMIT",
-                    .message = "request exceeds the configured inference resource budget",
-                }),
-                // Ownership configuration errors should have failed startup before
-                // request surfaces were published. Keep the HTTP boundary total so
-                // a violated invariant is reported as an internal failure instead
-                // of widening this inferred error set into a compile failure.
-                else => inferenceFailureResponse(ctx, err),
-            };
-        };
+        ) catch |err| return inferenceFailureResponse(ctx, err);
         defer admission_lease.release();
 
         const first_locked_model = if (draft_model_for_generation) |draft_model|
@@ -18603,6 +18676,9 @@ pub const Node = struct {
     }
 
     pub fn generateBatchContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
@@ -21225,6 +21301,9 @@ pub const Node = struct {
     }
 
     pub fn classifyDocument(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.DocumentClassificationRequest)) orelse
@@ -21332,6 +21411,9 @@ pub const Node = struct {
     }
 
     pub fn classifyDocumentTokens(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.DocumentTokenClassificationRequest)) orelse
@@ -21483,6 +21565,9 @@ pub const Node = struct {
     }
 
     pub fn rewriteText(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.RewriteRequest)) orelse
@@ -21600,6 +21685,9 @@ pub const Node = struct {
     /// Antfarm's native OCR adapter uses the existing reader contract and the
     /// same request permits, media policy, cancellation, and memory admission.
     pub fn antfarmAppleOcr(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         if (!readers_api.apple.enabled) return ctx.status(501).json(.{ .@"error" = "APPLE_OCR_UNAVAILABLE", .message = "Apple OCR is unavailable on this server" });
         const Request = struct {
             images: []const struct { url: []const u8 },
@@ -22009,6 +22097,9 @@ pub const Node = struct {
         return self.executeDocumentRemote(ctx, .extract);
     }
     fn executeDocumentRemote(self: *Node, ctx: *httpx.Context, operation: enum { read, extract }) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const protocol = readers_api.document_stream;
         if (!std.mem.eql(u8, ctx.header("content-type") orelse "", protocol.content_type)) return ctx.status(415).json(.{ .@"error" = "UnsupportedDocumentTransport" });
         const model = ctx.header("X-Antfly-Document-Model") orelse return ctx.status(400).json(.{ .@"error" = "ModelRequired" });
@@ -22353,6 +22444,9 @@ pub const Node = struct {
     }
 
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
         defer if (attachment_envelope) |*envelope| envelope.deinit();
@@ -23199,6 +23293,9 @@ pub const Node = struct {
     }
 
     pub fn dictate(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var execution_control = httpInferenceExecutionControl(self, ctx);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
         var attachment_envelope: ?httpx.attachment_envelope.Envelope = null;
@@ -23753,6 +23850,9 @@ pub const Node = struct {
     }
 
     pub fn createTranscriptionSession(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const execution_control = httpInferenceExecutionControl(self, ctx);
         var parsed = (try ctx.parseJson(api.TranscriptionSessionRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
@@ -23871,6 +23971,9 @@ pub const Node = struct {
     }
 
     pub fn appendTranscriptionAudio(self: *Node, ctx: *httpx.Context, session_id: []const u8) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const execution_control = httpInferenceExecutionControl(self, ctx);
         if (!transcription_sessions.isValidId(session_id)) return transcriptionSessionNotFound(ctx);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
@@ -24474,6 +24577,9 @@ pub const Node = struct {
     }
 
     pub fn extractJSON(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
@@ -25282,6 +25388,9 @@ pub const Node = struct {
     }
 
     pub fn decide(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const request_json = (try ctx.body()) orelse return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Request body required" });
         const response_json = self.decideJsonWithAdmission(ctx.allocator, request_json, .http_route, httpInferenceExecutionControl(self, ctx)) catch |err| return decideFailureResponse(ctx, err);
         defer ctx.allocator.free(response_json);
@@ -25794,6 +25903,9 @@ pub const Node = struct {
     }
 
     pub fn loadModelInstance(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         var parsed = (try ctx.parseJson(api.ModelInstanceLoadRequest)) orelse
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Request body required" });
         defer parsed.deinit();
@@ -26463,6 +26575,9 @@ pub const Node = struct {
     }
 
     pub fn predict(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var admission_failure = AdmissionFailureScope{};
+        try admission_failure.bind(ctx);
+        defer admission_failure.unbind(ctx);
         const execution_control = httpInferenceExecutionControl(self, ctx);
         execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
         var parsed = (try ctx.parseJson(api.PredictRequest)) orelse
@@ -41541,6 +41656,13 @@ test "dense partial result cleanup owns every allocation exactly once" {
 test "audio embedding asset guard releases admission on early failure" {
     var model: model_manager_mod.LoadedModel = undefined;
     model.managed_publication = null;
+    model.admission_residency = .{};
+    model.resource_lease = null;
+    model.tokenizer_resource_lease = null;
+    model.whisper_prompt_admission = null;
+    model.vision_resource_lease = null;
+    model.text_projection_resource_lease = null;
+    model.visual_projection_resource_lease = null;
     model.embedding_session_lock = .unlocked;
     model.audio_session = null;
     model.audio_projection = null;
@@ -42281,8 +42403,12 @@ test "multimodal rerank parser rejects invalid image data uris" {
 
 /// Decode a data URI (data:mime/type;base64,...) to raw bytes.
 fn effectiveRequestContentSecurity(self: *const Node) scraping.ContentSecurityConfig {
+    return defaultedRequestContentSecurity(self.config.content_security);
+}
+
+fn defaultedRequestContentSecurity(config: ?scraping.ContentSecurityConfig) scraping.ContentSecurityConfig {
     var effective = default_request_content_security;
-    const configured = self.config.content_security orelse return effective;
+    const configured = config orelse return effective;
     if (configured.allowed_hosts != null) effective.allowed_hosts = configured.allowed_hosts;
     if (configured.block_private_ips != null) effective.block_private_ips = configured.block_private_ips;
     if (configured.max_download_size_bytes != null) effective.max_download_size_bytes = configured.max_download_size_bytes;
@@ -42980,6 +43106,12 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
             .message = "prompt exceeds the model context window after reserving output tokens",
             .retryable = false,
         },
+        error.ResourceLimitExceeded => .{
+            .status = 400,
+            .code = "MODEL_RESOURCE_LIMIT",
+            .message = "request and required model residency exceed the configured inference budget",
+            .retryable = false,
+        },
         error.MemoryBudgetExceeded => .{
             .status = 507,
             .code = "MEMORY_BUDGET_EXCEEDED",
@@ -43039,6 +43171,7 @@ test "generation deadline errors retain canonical timeout and cancellation respo
 }
 
 fn generationErrorResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.ResourceLimitExceeded) return modelResourceLimitResponse(ctx);
     if (isTransientInferenceCapacityError(err))
         return modelResourceBusyResponse(ctx);
     if (generationRequestFailure(err)) |failure| {
@@ -47889,6 +48022,130 @@ test "context checkpoint HTTP errors distinguish stale revisions from corrupt pa
     }
 }
 
+test "model aware media local source validates transport before model execution" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "media", .data = "0123456789" });
+    const path = try tmp.dir.realPathFileAlloc(io, "media", a);
+    defer a.free(path);
+    const uri = try std.fmt.allocPrint(a, "file://{s}", .{path});
+    defer a.free(uri);
+    const paths = [_][]u8{path};
+    var node = try Node.init(a, .{ .process_termination_available = true, .content_security = .{ .allowed_paths = &.{} } });
+    const allowed = try std.json.Stringify.valueAlloc(a, .{ .allowed_paths = paths }, .{});
+    defer a.free(allowed);
+    var control = InferenceExecutionControl{ .deadline_ns = platform.time.monotonicNs() + 60 * std.time.ns_per_s, .content_security_json = allowed };
+    defer node.deinit();
+    try node.attachIo(io);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("0123456789", &digest, .{});
+    const version = std.fmt.bytesToHex(digest, .lower);
+    const chunks = @import("../pipelines/media_chunking.zig");
+    var request = chunks.Request{ .input = .{ .source = .{ .uri = uri, .mime_type = "video/mp4", .version_kind = .file_sha256, .version = &version, .length = 10 } } };
+    const Discard = struct {
+        fn accept(_: *anyopaque, _: chunks.Item) !void {
+            return error.UnexpectedOutput;
+        }
+    };
+    const sink = chunks.Sink{ .context = &node, .accept = Discard.accept };
+    // An empty model is rejected only after the local transport is resolved.
+    try std.testing.expectError(error.InvalidChunkModel, node.chunkAndEmbedAdmitted(a, io, control, request, .{ .model = "" }, sink));
+    try std.testing.expectError(error.InvalidChunkModel, node.chunkAndEmbedAdmitted(a, io, control, request, .{ .model = "" }, sink));
+    try std.testing.expectEqual(@as(u64, 1), node.host_caches.local_source_verifications.hash_count.load(.monotonic));
+    request.input.source.version = "0000000000000000000000000000000000000000000000000000000000000000";
+    try std.testing.expectError(error.SourceVersionChanged, node.chunkAndEmbedAdmitted(a, io, control, request, .{ .model = "" }, sink));
+    request.input.source.version = &version;
+    control.content_security_json = "{\"allowed_paths\":[]}";
+    try std.testing.expectError(error.PathNotAllowed, node.chunkAndEmbedAdmitted(a, io, control, request, .{ .model = "" }, sink));
+    control.deadline_ns = 0;
+    try std.testing.expectError(error.Timeout, node.chunkAndEmbedAdmitted(a, io, control, request, .{ .model = "" }, sink));
+}
+
+test "model aware media local source completes paged WAV decoding replay and final mutation checks" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const chunks = @import("../pipelines/media_chunking.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const samples: [4096]f32 = @splat(0.125);
+    const encoded = try audio_mod.wav.encodeInterleaved(a, &samples, 1, .{ .audio_format = 3, .sample_rate = 16000, .bits_per_sample = 32 });
+    defer a.free(encoded);
+    try tmp.dir.writeFile(io, .{ .sub_path = "audio.wav", .data = encoded });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const uri = try std.fmt.allocPrint(a, "file://{s}/audio.wav", .{root});
+    defer a.free(uri);
+    const paths = [_][]u8{root};
+    var node = try Node.init(a, .{ .models_dir = root, .process_termination_available = true, .content_security = .{ .allowed_paths = &.{} } });
+    defer node.deinit();
+    try node.attachIo(io);
+    const policy = try std.json.Stringify.valueAlloc(a, .{ .allowed_paths = paths, .max_download_size_bytes = @as(u64, 1024) }, .{});
+    defer a.free(policy);
+    var control = InferenceExecutionControl{ .deadline_ns = platform.time.monotonicNs() + 60 * std.time.ns_per_s, .content_security_json = policy };
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(encoded, &hash, .{});
+    const version = std.fmt.bytesToHex(hash, .lower);
+    const targets = [_]lib_chunker.outputs.Target{.{ .name = "speech", .kind = .transcribe, .model = "fixture-transcriber" }};
+    const config = lib_chunker.outputs.Config{ .boundary_model = "speech", .targets = &targets };
+    // Use the production audio planner, decoder, admission, range transport,
+    // collectors and replay. Only the final model invocation is a deterministic
+    // consumer, so this qualification requires no downloaded weights.
+    const Consumer = struct {
+        consumers: MediaOutputExecution,
+        dir: std.Io.Dir,
+        mutate: bool = false,
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, payload: chunks.Payload, descriptor: lib_chunker.planning.Descriptor, _: ?chunks.EmbeddingContext, _: ?chunks.Output, _: ?anyerror, _: bool) ![]const lib_chunker.outputs.Result {
+            const owner: *MediaOutputExecution = @ptrCast(@alignCast(raw));
+            const self: *@This() = @fieldParentPtr("consumers", owner);
+            try std.testing.expect(payload == .pcm and payload.pcm.samples.len != 0);
+            for (payload.pcm.samples) |sample| try std.testing.expectApproxEqAbs(@as(f32, 0.125), sample, 0.00001);
+            self.calls += 1;
+            const coordinates = descriptor.coordinates;
+            const spans = try alloc.alloc(lib_chunker.outputs.Span, 1);
+            spans[0] = .{ .text = "tone", .start_ns = coordinates.start_ns.?, .end_ns = coordinates.end_ns.? };
+            const results = try alloc.alloc(lib_chunker.outputs.Result, 1);
+            results[0] = .{ .name = "speech", .kind = .transcribe, .required = true, .model = "fixture-transcriber", .model_identity = &owner.resolved[0].identity, .model_revision = &owner.resolved[0].revision, .recipe_id = &owner.resolved[0].recipe_id, .start_ns = coordinates.start_ns, .end_ns = coordinates.end_ns, .status = .complete, .spans = spans };
+            if (self.mutate) try self.dir.writeFile(std.testing.io, .{ .sub_path = "audio.wav", .data = "changed" });
+            return results;
+        }
+    };
+    var consumer = Consumer{ .consumers = .{ .node = &node, .io = io, .control = control, .config = config, .initialized = 1 }, .dir = tmp.dir };
+    consumer.consumers.resolved[0] = .{ .path = "", .identity = @splat('a'), .revision = @splat('b'), .recipe_id = @splat('c') };
+    var request = chunks.Request{ .input = .{ .source = .{ .uri = uri, .mime_type = "audio/wav", .version = &version, .version_kind = .file_sha256, .length = encoded.len } }, .outputs = config, .output_executor = .{ .context = &consumer.consumers, .execute = Consumer.execute }, .transcribe_boundary = true, .audio_boundary = true, .needs_audio = true, .execute = false, .allow_partial = true, .max_chunks = 1, .include_content = true, .policy = .{ .window_ns = 50 * std.time.ns_per_ms, .step_ns = 50 * std.time.ns_per_ms } };
+    const target = chunk_response.Target{ .model = "fixture-transcriber", .task_type = "TRANSCRIBE" };
+    var first = try node.chunkModelPageDirect(a, io, control, request, target);
+    defer first.deinit(a);
+    try std.testing.expect(first.chunks.len == 1 and !first.complete);
+    try std.testing.expect(first.chunks[0].data.?.len > 1024);
+    var ordinal = first.covered_through_ordinal;
+    while (true) {
+        const cursor = try std.fmt.allocPrint(a, "{s}:{d}", .{ first.plan_id, ordinal });
+        defer a.free(cursor);
+        request.continuation = cursor;
+        var page = try node.chunkModelPageDirect(a, io, control, request, target);
+        defer page.deinit(a);
+        try std.testing.expectEqual(ordinal, page.start_ordinal);
+        try std.testing.expect(page.covered_through_ordinal > ordinal);
+        try std.testing.expectEqualStrings(first.plan_id, page.plan_id);
+        ordinal = page.covered_through_ordinal;
+        if (page.complete) break;
+    }
+    try std.testing.expect(consumer.calls > 1);
+    const replay = try node.replayModelChunkDirect(a, io, control, request, target, first.plan_id, first.source_fingerprint, 0);
+    defer lib_chunker.types.freeChunks(a, replay);
+    try std.testing.expectEqualDeep(first.chunks[0].metadata.?.descriptor.coordinates, replay[0].metadata.?.descriptor.coordinates);
+    try std.testing.expectEqual(@as(u64, 1), node.host_caches.local_source_verifications.hash_count.load(.monotonic));
+    control.content_security_json = "{\"allowed_paths\":[]}";
+    try std.testing.expectError(error.PathNotAllowed, node.chunkModelPageDirect(a, io, control, request, target));
+    control.content_security_json = policy;
+    request.continuation = null;
+    consumer.mutate = true;
+    try std.testing.expectError(error.SourceVersionChanged, node.chunkModelPageDirect(a, io, control, request, target));
+}
+
 test "model aware media borrowed PCM transcription rejects empty input before model work" {
     var node = try Node.init(std.testing.allocator, .{ .max_concurrent_requests = 1 });
     defer node.deinit();
@@ -51982,4 +52239,74 @@ test "direct dictation cleanup rejects unfinished and normalized empty text" {
     try std.testing.expectEqualStrings("Hello.", text);
     complete.text = @constCast("\"\"");
     try std.testing.expectError(error.InferenceOutputIncomplete, Node.normalizeDirectDictationOutput(a, complete));
+}
+
+test "checkpoint resume admission counts owned upload and model exactly once" {
+    const memory = runtime.tier.memory;
+    var manager = model_manager_mod.ModelManager.init(std.testing.allocator, backends_mod.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    const controller = &manager.resource_domain.?.admission;
+    const limits = memory.Limits{ .host_limit_bytes = 100 };
+    controller.configureSharedLimits(.{});
+    var weights = try controller.tryAcquire(.gpu, limits, .{ .host_weight_bytes = 90 }, false);
+    defer weights.release();
+    var transfer = Node.NativeCheckpointTransfer{ .metadata = "{}", .upload_admission = try controller.tryAcquire(.gpu, limits, .{ .host_scratch_bytes = 5 }, false) };
+    defer transfer.releaseOwnedState();
+    const session = backends_mod.Session{ .ptr = controller, .vtable = undefined, .run_admission = .{ .controller = controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 0, .required_residency = weights.amounts, .check_live_memory = false } };
+    var failure = memory.AdmissionFailure{};
+    var request = model_manager_mod.GenerationAdmissionRequest{ .session = session, .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = .{ .host_scratch_bytes = 10 }, .required_residency = transfer.requiredResidency(), .failure = &failure } };
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&.{request}));
+    try std.testing.expectEqual(@as(usize, 105), failure.snapshot().?.requested_bytes);
+    try std.testing.expectEqual(@as(usize, 95), controller.snapshot().hostTotalBytes());
+    request.resources.amounts.host_scratch_bytes = 5;
+    var fitting = try manager.acquireGenerationResources(&.{request});
+    try std.testing.expectEqual(@as(usize, 100), controller.snapshot().hostTotalBytes());
+    fitting.release();
+    var peer = try controller.tryAcquire(.gpu, limits, .{ .host_scratch_bytes = 1 }, false);
+    defer peer.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireGenerationResources(&.{request}));
+}
+
+test "admission HTTP diagnostics preserve lazy load preprocessing and nested request isolation" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var outer = AdmissionFailureScope{};
+    try outer.bind(&ctx);
+    defer outer.unbind(&ctx);
+    outer.failure.record(.{ .limit = .host, .requested_bytes = 110, .limit_bytes = 100 });
+    {
+        var inner = AdmissionFailureScope{};
+        try inner.bind(&ctx);
+        defer inner.unbind(&ctx);
+        try std.testing.expect(httpAdmissionFailure(&ctx).?.snapshot() == null);
+        inner.failure.record(.{ .limit = .scratch, .requested_bytes = 240, .limit_bytes = 200 });
+        var response = try generationErrorResponse(&ctx, error.ResourceLimitExceeded);
+        defer response.deinit();
+        const parsed = try std.json.parseFromSlice(struct { budget: []const u8, required_bytes: usize, limit_bytes: usize, retryable: bool }, a, response.body.?, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try std.testing.expectEqualStrings("scratch", parsed.value.budget);
+        try std.testing.expectEqual(@as(usize, 240), parsed.value.required_bytes);
+        try std.testing.expectEqual(@as(usize, 200), parsed.value.limit_bytes);
+        try std.testing.expect(!parsed.value.retryable);
+    }
+    var response = try modelLoadFailureResponse(&ctx, error.ResourceLimitExceeded);
+    defer response.deinit();
+    const parsed = try std.json.parseFromSlice(struct { budget: []const u8, required_bytes: usize, limit_bytes: usize, retryable: bool }, a, response.body.?, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("host", parsed.value.budget);
+    try std.testing.expectEqual(@as(usize, 110), parsed.value.required_bytes);
+    try std.testing.expectEqual(@as(usize, 100), parsed.value.limit_bytes);
+    try std.testing.expect(!parsed.value.retryable);
+    const batch = batchGenerationError(error.ResourceLimitExceeded);
+    try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", batch.code);
+    try std.testing.expect(!batch.retryable);
+    var busy = try inferenceFailureResponse(&ctx, error.ResourceTemporarilyUnavailable);
+    defer busy.deinit();
+    try std.testing.expectEqual(@as(u16, 503), busy.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, busy.body.?, "required_bytes") == null);
 }

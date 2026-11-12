@@ -130,7 +130,7 @@ fn validatedNames(a: A, sa: A, server: *@import("http_server.zig").ApiHttpServer
         if (std.mem.eql(u8, kind.string, "embeddings") and (if (config.object.get("sparse")) |sparse| sparse == .bool and sparse.bool else false)) {
             const native = @import("lake_index_native_sparse.zig");
             const declaration = for (selected.publication().declarations) |decl| {
-                if (decl.artifact.kind == .sparse_segment and decl.artifact.metadata_version == native.metadata_version and std.mem.eql(u8, decl.name, entry.key_ptr.*)) break decl;
+                if (decl.artifact.kind == .sparse_segment and native.supportsMetadata(decl.artifact.metadata_version) and std.mem.eql(u8, decl.name, entry.key_ptr.*)) break decl;
             } else continue;
             const root = native.loadRoot(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context }) catch |err| {
                 try context.ensureActive();
@@ -149,7 +149,7 @@ fn validatedNames(a: A, sa: A, server: *@import("http_server.zig").ApiHttpServer
         if (std.mem.eql(u8, kind.string, "embeddings")) {
             const native = @import("lake_index_native_dense.zig");
             const declaration = for (selected.publication().declarations) |decl| {
-                if (decl.artifact.kind == .vector_segment and decl.artifact.metadata_version == native.metadata_version and std.mem.eql(u8, decl.name, entry.key_ptr.*)) break decl;
+                if (decl.artifact.kind == .vector_segment and native.supportsMetadata(decl.artifact.metadata_version) and std.mem.eql(u8, decl.name, entry.key_ptr.*)) break decl;
             } else continue;
             const root = native.loadRoot(sa, store.artifactStore(), declaration.artifact, normalized.cancellation, .{ .cache = &server.lake_read_cache, .scope = store.cache_identity, .context = context }) catch |err| {
                 try context.ensureActive();

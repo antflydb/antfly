@@ -521,6 +521,23 @@ pub fn applyChanges(a: A, store: *stores.ArtifactStore, prior: files.Root, chang
 /// File descriptors are small; unchanged descriptors produce no page writes.
 /// Legacy inline chunks migrate once, while current generations path-copy only
 /// changed files and retain unchanged chunk-map subtrees across checkpoints.
+/// Convert a small inline descriptor without retaining its chunk strings in
+/// the generation owner. Large files already arrive with paged chunks.
+pub fn pageFile(a: A, out: A, store: *stores.ArtifactStore, domain: [32]u8, input: files.File, token: Token, work: ?*u64) !files.File {
+    var file = input;
+    try file.validate(domain);
+    if (file.chunk_root == null and file.chunks.len != 0) {
+        var access: Access = undefined;
+        access.initPublication(store.*, domain, token);
+        access.work = work;
+        const changes = try out.alloc(tree.Mutation, file.chunks.len);
+        for (file.chunks, changes, 0..) |ref, *change, ordinal| change.* = .{ .key = try out.dupe(u8, &key(ordinal)), .value = try std.json.Stringify.valueAlloc(out, ref, .{}) };
+        file.chunk_root = try tree.apply(a, access.backing(), null, changes);
+    }
+    file.chunks = &.{};
+    return file;
+}
+
 pub fn persist(a: A, out: A, store: *stores.ArtifactStore, staging: files.Root, previous: ?files.Root, token: Token, work: ?*u64) !files.Root {
     try staging.validate();
     const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
@@ -859,4 +876,39 @@ test "external lake native decoded navigation leases avoid warm copies preserve 
     try std.testing.expect(uncached.lease == null);
     try std.testing.expectEqualStrings("file", uncached.entries[0].key);
     try std.testing.expectEqual(512 * 1024 * 1024 - @as(u64, root.directory.?.bytes), uncached_access.reads);
+}
+
+test "external lake execution paged file directories exceed the former run count ceiling" {
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("native-many-runs");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(3) };
+    var result: files.Root = .{ .version = 2, .domain = @splat(7) };
+    const count = 8193;
+    var first: usize = 0;
+    while (first < count) {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const out = arena.allocator();
+        const end = @min(first + 64, count);
+        const changes = try out.alloc(FileChange, end - first);
+        for (changes, first..) |*change, index| {
+            const path = try std.fmt.allocPrint(out, "vectors/runs/{d:0>8}.tbl", .{index});
+            change.* = .{ .path = path, .file = .{ .path = path, .bytes = 0 } };
+        }
+        result = try applyChanges(a, &store, result, changes, .none, null);
+        first = end;
+    }
+    try result.validate();
+    try std.testing.expectEqual(@as(u32, count), result.file_count);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), result, .{});
+    try std.testing.expect(encoded.len < 1024);
+    var reader: files.Reader = .{ .root = result, .prefix = "/many", .store = store, .context = .{}, .scratch = a };
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(u64, 0), try reader.storage().fileSize("/many/vectors/runs/00008192.tbl"));
 }

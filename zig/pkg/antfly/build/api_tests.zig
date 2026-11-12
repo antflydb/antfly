@@ -323,6 +323,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http unsupported filter query response names the offending node",
         "api http server drop table observes metadata absence before local cleanup",
         "public api smoke integration creates table inserts and queries documents",
+        "public api integration supports hybrid query pruner and reranker",
         "provisioned table write source routes batch writes across ranges",
         "public api integration recreates managed embeddings index after corrupt artifact",
         "public api split integration uses distributed global text stats for bm25 and significant_terms",
@@ -1274,6 +1275,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "provisioned stale read admits before routing without a redundant catalog validation",
             "distributed graph source read rejects topology change before aggregation",
             "hosted cross-range graph query expands explicit local start keys",
+            "hosted cross-range graph start set follows final reranking",
             "provisioned reads reject a group removed from the table topology",
             "provisioned table read source rejects uncertified point reads and permits explicit stale reads",
             "catalog backed router skips non-serving relocation placements",
@@ -1704,6 +1706,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = @import("runtime_memory.zig").testCompileMaxRss("api-table-write-implementation-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const evaluation_graph_step = b.step("inference-evaluation-graph-test", "Verify final-ranked graph starts in public and cross-range queries");
+    const evaluation_public_graph = b.addRunArtifact(public_api_parity_tests);
+    evaluation_public_graph.addArgs(&.{ "--test-filter", "public api integration supports hybrid query pruner and reranker" });
+    const evaluation_distributed_graph = b.addRunArtifact(write_implementation_tests);
+    evaluation_distributed_graph.addArgs(&.{ "--test-filter", "hosted cross-range graph start set follows final reranking" });
+    @import("../../../build_support/antfly/test_support.zig").configureTestRun(evaluation_public_graph);
+    @import("../../../build_support/antfly/test_support.zig").configureTestRun(evaluation_distributed_graph);
+    evaluation_graph_step.dependOn(&evaluation_public_graph.step);
+    evaluation_graph_step.dependOn(&evaluation_distributed_graph.step);
     const run_api_table_writes_docid_tests = @import("linked_tests.zig").runPair(b, api_table_writes_docid_tests, write_implementation_tests);
     const run_api_table_reads_docid_tests = @import("linked_tests.zig").runPair(b, api_table_reads_linked_tests, write_implementation_tests);
     b.step("antfly-api-table-read-test", "Run table-read routing and internal group contracts").dependOn(&run_api_table_reads_docid_tests.step);

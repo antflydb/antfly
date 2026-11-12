@@ -740,10 +740,140 @@ pub const AdmissionResourceBudget = struct {
     }
 };
 
+/// Already admitted model resources, retaining their original CPU/GPU domain.
+/// This is a feasibility description, never a second reservation.
+pub const Residency = struct {
+    by_backend: [backend_class_count]AdmissionAmounts = emptyAdmissionAmountsByBackend(),
+
+    pub fn fromAmounts(backend: BackendClass, amounts: AdmissionAmounts) Residency {
+        var result = Residency{};
+        result.by_backend[backendClassIndex(backend)] = amounts;
+        return result;
+    }
+
+    pub fn fromLease(lease: AdmissionLease) Residency {
+        return .{ .by_backend = lease.amounts_by_backend };
+    }
+
+    pub fn merge(self: Residency, other: Residency) !Residency {
+        var result = self;
+        for (&result.by_backend, other.by_backend) |*amounts, addition|
+            amounts.* = try amounts.merge(addition);
+        return result;
+    }
+
+    pub fn total(self: Residency) !AdmissionAmounts {
+        return self.by_backend[0].merge(self.by_backend[1]);
+    }
+};
+
+/// Model-owned publication of its live lease set. Readers copy two small
+/// counters under an accounting lock; they never scan models, allocate, or
+/// acquire the optional-session gate. The model outlives all borrowing sessions.
+pub const ResidencySource = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    value: Residency = .{},
+
+    pub fn snapshot(self: *ResidencySource) Residency {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        return self.value;
+    }
+
+    pub fn replace(self: *ResidencySource, value: Residency) void {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        self.value = value;
+    }
+};
+
+/// Request- or load-flight-owned failure details. Concurrent preparation may
+/// report through the same sink, but no pointer is retained by a model/lease.
+pub const AdmissionFailure = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    value: ?AdmissionAmounts.LimitExceeded = null,
+
+    pub fn record(self: *AdmissionFailure, value: ?AdmissionAmounts.LimitExceeded) void {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        self.value = value;
+    }
+
+    pub fn snapshot(self: *AdmissionFailure) ?AdmissionAmounts.LimitExceeded {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        return self.value;
+    }
+};
+
 pub const AdmissionRequest = struct {
     backend_class: BackendClass,
     limits: Limits,
     amounts: AdmissionAmounts,
+    /// Already admitted residency required by this operation. Used only for
+    /// intrinsic feasibility, never charged again. Callers must own its leases.
+    required_residency: Residency = .{},
+    /// Optional request-local diagnostic; never retained by the controller.
+    limit_exceeded: ?*?AdmissionAmounts.LimitExceeded = null,
+    failure: ?*AdmissionFailure = null,
+};
+
+// Shared by reservation and cumulative request validation, so neither path
+// can omit required residency or confuse an impossible plan with contention.
+const AdmissionPlan = struct {
+    amounts_by_backend: [backend_class_count]AdmissionAmounts = emptyAdmissionAmountsByBackend(),
+    required: Residency = .{},
+    limits_by_backend: [backend_class_count]Limits = .{ .{}, .{} },
+    active_backends: [backend_class_count]bool = .{ false, false },
+    amounts: AdmissionAmounts = .{},
+
+    fn init(requests: []const AdmissionRequest) !AdmissionPlan {
+        var plan = AdmissionPlan{};
+        for (requests) |request| if (request.limit_exceeded) |out| {
+            out.* = null;
+        };
+        for (requests) |request| {
+            const index = backendClassIndex(request.backend_class);
+            plan.required = plan.required.merge(request.required_residency) catch return error.ResourceLimitExceeded;
+            plan.required.by_backend[index] = plan.required.by_backend[index].merge(request.amounts) catch return error.ResourceLimitExceeded;
+            plan.amounts_by_backend[index] = plan.amounts_by_backend[index].merge(request.amounts) catch return error.ResourceLimitExceeded;
+            plan.limits_by_backend[index] = if (plan.active_backends[index]) intersectAdmissionLimits(plan.limits_by_backend[index], request.limits) else request.limits;
+            plan.active_backends[index] = true;
+            plan.amounts = plan.amounts.merge(request.amounts) catch return error.ResourceLimitExceeded;
+        }
+        return plan;
+    }
+
+    fn validateDomains(self: *const AdmissionPlan, requests: []const AdmissionRequest) !void {
+        for (0..backend_class_count) |index| {
+            if (!self.active_backends[index]) continue;
+            if (self.required.by_backend[index].firstLimitExceeded(self.limits_by_backend[index]) catch return error.ResourceLimitExceeded) |exceeded| {
+                for (requests) |request| {
+                    if (backendClassIndex(request.backend_class) == index) {
+                        if (request.limit_exceeded) |out| out.* = exceeded;
+                        if (request.failure) |failure| failure.record(exceeded);
+                    }
+                }
+                return error.ResourceLimitExceeded;
+            }
+        }
+    }
+
+    fn validateShared(self: *const AdmissionPlan, requests: []const AdmissionRequest, shared: SharedAdmissionLimits) !void {
+        const required = self.required.total() catch return error.ResourceLimitExceeded;
+        if (required.firstLimitExceeded(.{
+            .host_limit_bytes = shared.host_limit_bytes,
+            .combined_limit_bytes = shared.unified_limit_bytes,
+            .kv_limit_bytes = shared.kv_limit_bytes,
+            .scratch_limit_bytes = shared.scratch_limit_bytes,
+        }) catch return error.ResourceLimitExceeded) |exceeded| {
+            for (requests) |request| {
+                if (request.limit_exceeded) |out| out.* = exceeded;
+                if (request.failure) |failure| failure.record(exceeded);
+            }
+            return error.ResourceLimitExceeded;
+        }
+    }
 };
 
 /// A bounded sub-ledger for KV/scratch already charged by a model's resident
@@ -888,7 +1018,7 @@ pub const LiveReservation = struct {
 
     /// Call only after physical allocation, without a fallible step between
     /// allocation and transfer. Remaining credit stays pending in this epoch.
-    pub fn materialize(self: *@This(), bytes: usize) Residency {
+    pub fn materialize(self: *@This(), bytes: usize) LiveReservation.Residency {
         std.debug.assert(bytes <= self.remaining);
         self.remaining -= bytes;
         if (!self.tracked) return .{};
@@ -1090,6 +1220,14 @@ pub const AdmissionController = struct {
         );
     }
 
+    /// Check an operation's entire owned working set without charging it again.
+    /// No live-memory probe or occupancy check belongs in intrinsic feasibility.
+    pub fn validateRequests(self: *AdmissionController, requests: []const AdmissionRequest) !void {
+        const plan = try AdmissionPlan.init(requests);
+        try plan.validateDomains(requests);
+        try plan.validateShared(requests, self.sharedLimitsSnapshot());
+    }
+
     pub fn tryAcquireRequestsWithPressure(
         self: *AdmissionController,
         requests: []const AdmissionRequest,
@@ -1097,22 +1235,12 @@ pub const AdmissionController = struct {
         pressure: *?AdmissionPressure,
     ) !AdmissionLease {
         pressure.* = null;
-        var amounts_by_backend = emptyAdmissionAmountsByBackend();
-        var limits_by_backend = [_]Limits{ .{}, .{} };
-        var active_backends = [_]bool{ false, false };
-        var amounts: AdmissionAmounts = .{};
-
-        for (requests) |request| {
-            const index = backendClassIndex(request.backend_class);
-            amounts_by_backend[index] = amounts_by_backend[index].merge(request.amounts) catch
-                return error.ResourceLimitExceeded;
-            limits_by_backend[index] = if (active_backends[index])
-                intersectAdmissionLimits(limits_by_backend[index], request.limits)
-            else
-                request.limits;
-            active_backends[index] = true;
-            amounts = amounts.merge(request.amounts) catch return error.ResourceLimitExceeded;
-        }
+        const plan = try AdmissionPlan.init(requests);
+        try plan.validateDomains(requests);
+        const amounts_by_backend = plan.amounts_by_backend;
+        const limits_by_backend = plan.limits_by_backend;
+        const active_backends = plan.active_backends;
+        const amounts = plan.amounts;
 
         const request_host = amounts.hostTotalBytesChecked() catch return error.ResourceLimitExceeded;
         const request_backend = amounts.backendTotalBytesChecked() catch return error.ResourceLimitExceeded;
@@ -1120,15 +1248,6 @@ pub const AdmissionController = struct {
         const request_scratch = amounts.scratchTotalBytesChecked() catch return error.ResourceLimitExceeded;
         const request_combined = std.math.add(usize, request_host, request_backend) catch
             return error.ResourceLimitExceeded;
-
-        // Check every intrinsic limit before considering contention. An
-        // occupied host pool must not hide an impossible scratch/KV/backend
-        // request and cause needless eviction and retries.
-        for (0..backend_class_count) |index| {
-            if (!active_backends[index]) continue;
-            if ((amounts_by_backend[index].firstLimitExceeded(limits_by_backend[index]) catch
-                return error.ResourceLimitExceeded) != null) return error.ResourceLimitExceeded;
-        }
 
         // Publish a provisional reservation while holding only the in-memory
         // accounting lock. The potentially blocking OS/cgroup probe runs after
@@ -1140,10 +1259,7 @@ pub const AdmissionController = struct {
 
             // Shared limits can tighten concurrently; inspect them only under
             // the accounting lock, before testing aggregate occupancy.
-            try checkAdmissionLimit(request_host, request_host, self.shared_limits.host_limit_bytes);
-            try checkAdmissionLimit(request_combined, request_combined, self.shared_limits.unified_limit_bytes);
-            try checkAdmissionLimit(request_kv, request_kv, self.shared_limits.kv_limit_bytes);
-            try checkAdmissionLimit(request_scratch, request_scratch, self.shared_limits.scratch_limit_bytes);
+            try plan.validateShared(requests, self.shared_limits);
 
             const next = addAdmissionAmounts(self.admitted, amounts) orelse
                 return error.ResourceLimitExceeded;
@@ -2038,10 +2154,7 @@ fn deriveLimitsForBackend(backend: BackendClass, info: SystemMemoryInfo) Limits 
             // headroom. The live pressure check sees only materialized bytes;
             // this stable cap also protects concurrent reservations that have
             // not reached memory.current/MemAvailable yet.
-            const host_limit = @min(
-                clampBytes(safe_pool / 2, gib(2), gib(8)),
-                safe_pool,
-            );
+            const host_limit = safe_pool;
             break :blk .{
                 .host_limit_bytes = host_limit,
                 .backend_limit_bytes = 0,
@@ -2057,17 +2170,17 @@ fn deriveLimitsForBackend(backend: BackendClass, info: SystemMemoryInfo) Limits 
             };
         },
         .gpu => blk: {
-            var combined = clampBytes(safe_pool / 2, gib(6), gib(12));
-            // Metal uses unified memory; discrete Linux GPU residency is not
-            // constrained by the process cgroup's host-memory limit.
-            if (builtin.os.tag == .macos) combined = @min(combined, safe_pool);
-            const host_limit = @min(
+            const combined = if (builtin.os.tag == .macos) safe_pool else clampBytes(safe_pool / 2, gib(6), gib(12));
+            // Unified-memory model weights and lazy media encoders share the
+            // physical host pool. A staging fraction sized for discrete GPUs
+            // artificially caps that working set even when RAM is available.
+            const host_limit = if (builtin.os.tag == .macos) safe_pool else @min(
                 clampBytes(combined / 4, gib(1), gib(3)),
                 safe_pool,
             );
             break :blk .{
                 .host_limit_bytes = host_limit,
-                .backend_limit_bytes = @min(
+                .backend_limit_bytes = if (builtin.os.tag == .macos) safe_pool else @min(
                     clampBytes((combined * 3) / 4, gib(4), gib(9)),
                     combined,
                 ),
@@ -4703,7 +4816,8 @@ test "derive gpu limits keeps combined cap sane" {
         .available_bytes = gib(40),
     });
     try std.testing.expect(limits.combined_limit_bytes >= gib(6));
-    try std.testing.expect(limits.combined_limit_bytes <= gib(12));
+    const upper_bound = if (builtin.os.tag == .macos) gib(40) - liveHostMemoryHeadroom(gib(64)) else gib(12);
+    try std.testing.expect(limits.combined_limit_bytes <= upper_bound);
     try std.testing.expect(limits.backend_limit_bytes <= limits.combined_limit_bytes);
 }
 
@@ -4907,4 +5021,97 @@ test "managed PJRT metadata residency cannot refund a newer pressure epoch" {
     resident.release();
     try std.testing.expectEqual(next, controller.live_pending_bytes);
     try std.testing.expectEqual(capacity, controller.live_capacity_bytes);
+}
+
+test "required model residency distinguishes impossible media loads from contention" {
+    var controller = AdmissionController{};
+    const limits = Limits{ .host_limit_bytes = 100, .combined_limit_bytes = 200 };
+    var model = try controller.tryAcquire(.gpu, limits, .{ .host_weight_bytes = 90 }, false);
+    defer model.release();
+    var exceeded: ?AdmissionAmounts.LimitExceeded = null;
+    const request = AdmissionRequest{ .backend_class = .gpu, .limits = limits, .amounts = .{ .host_weight_bytes = 20 }, .required_residency = .fromLease(model), .limit_exceeded = &exceeded };
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquireRequests(&.{request}, false));
+    try std.testing.expectEqual(AdmissionAmounts.LimitExceeded{ .limit = .host, .requested_bytes = 110, .limit_bytes = 100 }, exceeded.?);
+    // The same occupancy is temporary if the resident model is unrelated.
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.gpu, limits, request.amounts, false));
+    var fitting = request;
+    fitting.amounts.host_weight_bytes = 10;
+    var encoder = try controller.tryAcquireRequests(&.{fitting}, false);
+    defer encoder.release();
+    try std.testing.expectEqual(@as(?AdmissionAmounts.LimitExceeded, null), exceeded);
+    try std.testing.expectEqual(@as(usize, 100), controller.snapshot().hostTotalBytes());
+}
+
+test "unified memory default admits Gemma weights and media encoder in the shared pool" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const limits = deriveLimitsForBackend(.gpu, .{ .total_bytes = gib(36), .available_bytes = gib(36) });
+    const safe_pool = gib(36) - liveHostMemoryHeadroom(gib(36));
+    try std.testing.expectEqual(safe_pool, limits.host_limit_bytes);
+    try std.testing.expectEqual(safe_pool, limits.combined_limit_bytes);
+    var controller = AdmissionController{};
+    controller.configureSharedLimits(.{ .host_limit_bytes = safe_pool, .unified_limit_bytes = safe_pool });
+    var weights = try controller.tryAcquire(.gpu, limits, .{ .host_weight_bytes = 5315805258 }, false);
+    defer weights.release();
+    var encoder = try controller.tryAcquireRequests(&.{.{ .backend_class = .gpu, .limits = limits, .amounts = .{ .host_weight_bytes = 991552256 }, .required_residency = .fromLease(weights) }}, false);
+    defer encoder.release();
+    const capped = applyLimitOverrides(limits, .{ .host_limit_bytes = 5423376736 });
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquireRequests(&.{.{ .backend_class = .gpu, .limits = capped, .amounts = .{ .host_weight_bytes = 991552256 }, .required_residency = .fromLease(weights) }}, false));
+}
+
+test "required residency admission preserves CPU and GPU policy domains" {
+    var controller = AdmissionController{};
+    controller.configureSharedLimits(.{ .host_limit_bytes = 150 });
+    var weights = try controller.tryAcquire(.gpu, .{ .host_limit_bytes = 60 }, .{ .host_weight_bytes = 40 }, false);
+    defer weights.release();
+    var tokenizer = try controller.tryAcquire(.cpu, .{ .host_limit_bytes = 100 }, .{ .host_weight_bytes = 70 }, false);
+    defer tokenizer.release();
+    const required = try Residency.fromLease(weights).merge(.fromLease(tokenizer));
+    var request = try controller.tryAcquireRequests(&.{.{ .backend_class = .gpu, .limits = .{ .host_limit_bytes = 60 }, .amounts = .{ .host_scratch_bytes = 20 }, .required_residency = required }}, false);
+    defer request.release();
+    try std.testing.expectEqual(@as(usize, 60), controller.snapshotBackend(.gpu).hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 70), controller.snapshotBackend(.cpu).hostTotalBytes());
+}
+
+test "model residency admission publication stays coherent across concurrent updates" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Writer = struct {
+        fn run(source: *ResidencySource) void {
+            for (1..10001) |i| source.replace(.{ .by_backend = .{ .{ .host_weight_bytes = i }, .{ .backend_weight_bytes = i * 2 } } });
+        }
+    };
+    var source = ResidencySource{};
+    var writer = try std.testing.io.concurrent(Writer.run, .{&source});
+    defer writer.await(std.testing.io);
+    for (0..10000) |_| {
+        const value = source.snapshot();
+        try std.testing.expectEqual(value.by_backend[0].host_weight_bytes * 2, value.by_backend[1].backend_weight_bytes);
+    }
+}
+
+test "request admission failure sinks preserve concurrent isolation" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Probe = struct {
+        controller: *AdmissionController,
+        failure: *AdmissionFailure,
+        bytes: usize,
+        fn run(self: @This()) !void {
+            for (0..1000) |_| {
+                try std.testing.expectError(error.ResourceLimitExceeded, self.controller.tryAcquireRequests(&.{.{
+                    .backend_class = .cpu,
+                    .limits = .{ .host_limit_bytes = 100 },
+                    .amounts = .{ .host_scratch_bytes = self.bytes },
+                    .failure = self.failure,
+                }}, false));
+                try std.testing.expectEqual(self.bytes, self.failure.snapshot().?.requested_bytes);
+            }
+        }
+    };
+    var controller = AdmissionController{};
+    var first = AdmissionFailure{};
+    var second = AdmissionFailure{};
+    var one = try std.testing.io.concurrent(Probe.run, .{Probe{ .controller = &controller, .failure = &first, .bytes = 110 }});
+    var two = try std.testing.io.concurrent(Probe.run, .{Probe{ .controller = &controller, .failure = &second, .bytes = 120 }});
+    try one.await(std.testing.io);
+    try two.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
 }

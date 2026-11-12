@@ -152,6 +152,7 @@ pub const TableApi = struct {
         InvalidFilterQueryRequest,
         InvalidExclusionQueryRequest,
         UnsupportedFilterQueryRequest,
+        UnsupportedNodeFilterQuery,
         UnsupportedExclusionQueryRequest,
         UnsupportedQueryRequest,
         UnsupportedHierarchyGrouping,
@@ -1967,6 +1968,10 @@ pub fn handleTableQueryRequest(
                 "exclusion_query",
                 .invalid,
             ),
+            error.UnsupportedNodeFilterQuery => return .{
+                .status = 400,
+                .body = try alloc.dupe(u8, "unsupported graph node_filter.filter_query"),
+            },
             error.UnsupportedFilterQueryRequest => return publicFilterQueryErrorResponse(
                 alloc,
                 body,
@@ -4366,6 +4371,12 @@ test "public table query handler preserves structured filter and hierarchy diagn
         try std.testing.expectEqualStrings("query_string", parsed.value.offending_node);
         try std.testing.expect(!parsed.value.retryable);
     }
+
+    var graph_backend = Backend{ .err = error.UnsupportedNodeFilterQuery };
+    var graph_resp = try handleTableQueryRequest(std.testing.allocator, "docs", "{}", null, graph_backend.iface());
+    defer graph_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), graph_resp.status);
+    try std.testing.expectEqualStrings("unsupported graph node_filter.filter_query", graph_resp.body);
 
     var hierarchy_backend = Backend{ .err = error.UnsupportedHierarchyGrouping };
     var hierarchy_resp = try handleTableQueryRequest(

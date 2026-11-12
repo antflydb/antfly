@@ -3412,6 +3412,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("lake-text-frontier-test", "Verify metadata-only global admission, score bounds, ties and bounded profile aggregation")
         .dependOn(&addFilteredTestRunArtifact(b, text_frontier_tests).step);
+    const recent_native_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_recent_native_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, recent_native_mod, true, true);
+    const recent_native_tests = b.addTest(.{
+        .root_module = recent_native_mod,
+        .filters = &.{"external lake bounded WAL native"},
+        .max_rss = 8 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lake-recent-native-test", "Verify cooperative recent dense/sparse construction cancellation")
+        .dependOn(&addFilteredTestRunArtifact(b, recent_native_tests).step);
     const filtered_topk_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_filtered_topk_test_root.zig"),
         .target = target,
@@ -6552,6 +6566,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db graph indexed admission reuses compressed membership and honors cancellation and memory",
         "graph committed intents survive canceled durability fences",
         "graph.query.",
+        "prefix-only pattern hops run without a document evaluator",
+        "batch prefix filtering bypasses document evaluation and query filters fail explicitly",
         "index maintenance VOPR regression exact replay",
         // This bounded smoke shares the storage compilation with its unit coverage.
         "db graph metric runtime background coordinator and worker pool loops publish pagerank",
@@ -7002,6 +7018,57 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-authority-invalidation-test", "Verify cohort invalidation across schema and policy publication")
         .dependOn(&addFilteredTestRunArtifact(b, authority_invalidation_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const inference_evaluation_tests = b.addTest(.{
+        .name = "inference-evaluation-storage-tests",
+        .root_module = db_test_mod,
+        .filters = &.{
+            "full_index reuses unchanged",
+            "paper evaluation producer upgrades require explicit reprocess",
+            "paper evaluation rejects superseded A completion",
+            "document extraction pins provider generation",
+            "document extraction unit chunks embed in provider batches",
+            "dense enrichment skips unchanged",
+            "sparse enrichment skips unchanged source hash",
+            "synchronous sparse reuse binds resolved revisions",
+            "embedding epochs fence zero and repeated model incarnations",
+            "deferred reprocess intent is bounded generation and config fenced",
+            "sparse chunk ownership survives mixed publication",
+            "embedding publication verifies large parents",
+            "embedding publication verifies bounded catalog",
+            "sparse publication bounds",
+            "sparse cleanup guards",
+            "chunked sparse enrichment skips unchanged chunks",
+            "ordered artifact inventory covers every config generation",
+            "loaded resolver envelopes preserve inventory",
+            "document mutation revision capture owns allocation failures",
+            "model aware media fused reuse rejects a changed provider generation with the same alias",
+            "model aware media retained named text permits a changed embedding generation",
+            "model aware media vocabulary inference rejects a producing generation change hidden by rollback",
+            "shared PDF page embedding checkpoints successful siblings before retry",
+            "cached content authority fences legacy writes",
+            "backfill skips cached bodies and publishes metadata only",
+            "targeted proof repair bounds deduplicates and fences publication",
+            "ordered artifact inventory legacy direct sparse writes fence the source and model generation",
+            "ordered artifact inventory direct producers carry unchanged input across unrelated row changes",
+            "ordered artifact inventory chunk vectors carry unchanged text across unrelated row changes",
+            "ordered artifact inventory chunk vector callback publishes and retires without reinference after acceptance",
+            "templated dense artifact reuse follows the resolved model revision",
+            "source vector table rejects delayed enrichment",
+            "full effort filtered recall matches eligible cosine oracle",
+            "full effort exhausts",
+            "subgroup native lifecycle",
+            "global subgroup plan preserves native lifecycle",
+            "hbc search charges estimated quantized scan bytes to node admission",
+            "small quantized complete snapshot validates authoritative leaf assignments",
+            "quantized native routing serves exact complete coverage across delta and reopen",
+            "searchWithRequest applies filter prefix and distance bounds",
+        },
+        .max_rss = 12 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("inference-evaluation-storage-test", "Verify unchanged-input reuse, revision fencing, and filtered vector recall")
+        .dependOn(&addFilteredTestRunArtifact(b, inference_evaluation_tests).step);
+
     const repair_publication_tests = b.addTest(.{
         .name = "artifact-repair-publication-tests",
         .root_module = db_test_mod,

@@ -3,7 +3,8 @@
 //
 // Adapted from the Zig 0.17.0 standard library Zstandard decoder.
 // Upstream Decompress.zig SHA-256: 7198d63cd364e0c852fdcc3c6658421cbb45459888b58d263246c8e379c21a15
-// Native dictionary support and frame initialization are Antfly modifications.
+// Native dictionaries, frame initialization, and Huffman prefix lookup are
+// Antfly modifications.
 //
 // The MIT License (Expat)
 //
@@ -895,7 +896,7 @@ pub const Frame = struct {
                     },
                     .compressed, .treeless => {
                         const buf = try w.writableSlice(len);
-                        const huffman_tree = d.huffman_tree.?;
+                        const huffman_tree = &d.huffman_tree.?;
                         const max_bit_count = huffman_tree.max_bit_count;
                         const starting_bit_count = LiteralsSection.HuffmanTree.weightToBitCount(
                             huffman_tree.nodes[huffman_tree.symbol_count_minus_one].weight,
@@ -905,6 +906,16 @@ pub const Frame = struct {
                         var huffman_tree_index: usize = huffman_tree.symbol_count_minus_one;
                         var bit_count_to_read: u4 = starting_bit_count;
                         for (buf) |*out| {
+                            // Peek on a value copy. Near a stream boundary the
+                            // old exact-width path handles short final symbols
+                            // and the transition between four literal streams.
+                            var peek = d.literal_stream_reader;
+                            if (peek.readBitsNoEof(u16, max_bit_count)) |prefix| {
+                                const entry = huffman_tree.lookup[prefix];
+                                _ = d.literal_stream_reader.readBitsNoEof(u16, entry.bits) catch unreachable;
+                                out.* = entry.symbol;
+                                continue;
+                            } else |_| {}
                             var prefix: u16 = 0;
                             while (true) {
                                 const new_bits = try d.readLiteralsBits(bit_count_to_read);
@@ -1110,6 +1121,8 @@ pub const LiteralsSection = struct {
         max_bit_count: u4,
         symbol_count_minus_one: u8,
         nodes: [256]PrefixedSymbol,
+        lookup: [2048]Entry = undefined,
+        const Entry = struct { symbol: u8, bits: u8 };
 
         pub const PrefixedSymbol = struct {
             symbol: u8,
@@ -1122,7 +1135,7 @@ pub const LiteralsSection = struct {
             index: usize,
         };
 
-        pub fn query(self: HuffmanTree, index: usize, prefix: u16) error{HuffmanTreeIncomplete}!Result {
+        pub fn query(self: *const HuffmanTree, index: usize, prefix: u16) error{HuffmanTreeIncomplete}!Result {
             var node = self.nodes[index];
             const weight = node.weight;
             var i: usize = index;
@@ -1299,11 +1312,27 @@ pub const LiteralsSection = struct {
 
             var weight_sorted_prefixed_symbols: [256]PrefixedSymbol = undefined;
             const prefixed_symbol_count = assignSymbols(weight_sorted_prefixed_symbols[0..symbol_count], weights.*);
-            const tree: HuffmanTree = .{
+            var tree: HuffmanTree = .{
                 .max_bit_count = max_number_of_bits,
                 .symbol_count_minus_one = @as(u8, @intCast(prefixed_symbol_count - 1)),
                 .nodes = weight_sorted_prefixed_symbols,
             };
+            // Zstandard caps Huffman codes at eleven bits. Expand canonical
+            // prefixes once per tree; hot literal decoding becomes one lookup.
+            const table_size: usize = @as(usize, 1) << tree.max_bit_count;
+            @memset(tree.lookup[0..table_size], .{ .symbol = 0, .bits = 0 });
+            for (tree.nodes[0..prefixed_symbol_count]) |node| {
+                const bits = weightToBitCount(node.weight, tree.max_bit_count);
+                const suffix: u4 = tree.max_bit_count - bits;
+                const begin = @as(usize, node.prefix) << suffix;
+                const end = begin + (@as(usize, 1) << suffix);
+                if (bits == 0 or end > table_size) return error.MalformedHuffmanTree;
+                for (tree.lookup[begin..end]) |*entry| {
+                    if (entry.bits != 0) return error.MalformedHuffmanTree;
+                    entry.* = .{ .symbol = node.symbol, .bits = bits };
+                }
+            }
+            for (tree.lookup[0..table_size]) |entry| if (entry.bits == 0) return error.MalformedHuffmanTree;
             return tree;
         }
 
@@ -2034,3 +2063,34 @@ pub const Dictionary = struct {
         a.destroy(self);
     }
 };
+
+test "Huffman prefix lookup matches canonical traversal across all eleven-bit prefixes" {
+    for ([_]usize{ 3, 12, 255, 256 }) |count| {
+        var weights: [256]u4 = @splat(0);
+        if (count == 12) {
+            weights[0] = 1;
+            for (weights[1 .. count - 1], 0..) |*weight, i| weight.* = @intCast(i + 1);
+        } else @memset(weights[0 .. count - 1], 1);
+        const tree = try LiteralsSection.HuffmanTree.build(&weights, count);
+        for (tree.lookup[0 .. @as(usize, 1) << tree.max_bit_count], 0..) |entry, slot| {
+            var index: usize = tree.symbol_count_minus_one;
+            var bits = LiteralsSection.HuffmanTree.weightToBitCount(tree.nodes[index].weight, tree.max_bit_count);
+            while (true) {
+                const prefix: u16 = @intCast(slot >> (tree.max_bit_count - bits));
+                switch (try tree.query(index, prefix)) {
+                    .symbol => |symbol| {
+                        try std.testing.expectEqual(symbol, entry.symbol);
+                        try std.testing.expectEqual(@as(u8, bits), entry.bits);
+                        break;
+                    },
+                    .index => |next| {
+                        index = next;
+                        bits = LiteralsSection.HuffmanTree.weightToBitCount(tree.nodes[index].weight, tree.max_bit_count);
+                    },
+                }
+            }
+        }
+    }
+    var incomplete: [256]u4 = @splat(0);
+    try std.testing.expectError(error.MalformedHuffmanTree, LiteralsSection.HuffmanTree.build(&incomplete, 1));
+}

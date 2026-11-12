@@ -3098,6 +3098,23 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     if (root.get("summarizer") != null) return error.UnsupportedCreateTableRequest;
     const leann_algorithm = try denseAlgorithmIsLeann(root);
     if (sparse and leann_algorithm) return error.InvalidCreateTableRequest;
+    if (root.get("lake_bulk_build")) |algorithm| {
+        if (algorithm != .null) {
+            if (sparse or leann_algorithm or algorithm != .string) return error.InvalidCreateTableRequest;
+            const lloyd = std.mem.eql(u8, algorithm.string, "lloyd");
+            const emeans = std.mem.eql(u8, algorithm.string, "emeans");
+            if (!lloyd and !emeans) return error.InvalidCreateTableRequest;
+            if (emeans and !std.mem.eql(u8, if (cfg.distance_metric) |metric| @tagName(metric) else @tagName(shared_vector.default_distance_metric), "l2_squared")) {
+                return error.InvalidCreateTableRequest;
+            }
+        }
+    }
+
+    if (root.get("lake_bulk_build_max_input_bytes")) |limit| {
+        if (limit != .integer or limit.integer <= 0) return error.InvalidCreateTableRequest;
+        const algorithm = root.get("lake_bulk_build") orelse return error.InvalidCreateTableRequest;
+        if (algorithm == .null) return error.InvalidCreateTableRequest;
+    }
 
     const field_name = cfg.field;
     const template_value = cfg.template;
@@ -12855,4 +12872,45 @@ test "managed embedder HTTP revision pins fence text grouped framed and numeric 
     const upgraded_rows = try managed.denseInterface().withTextGeneration(upgraded).embedDenseBatch(a, "visual", &.{"upgraded"}, 2);
     defer db_embedder.freeDenseEmbeddingBatch(a, upgraded_rows);
     try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.75 }, upgraded_rows[0]);
+}
+
+test "offline lake build configuration validates algorithms metrics and corpus allowances" {
+    const a = std.testing.allocator;
+    const valid = [_][]const u8{
+        \\{"type":"embeddings","external":true,"dimension":8}
+        ,
+        \\{"type":"embeddings","external":true,"dimension":8,"lake_bulk_build":"lloyd","distance_metric":"cosine","lake_bulk_build_max_input_bytes":4294967296}
+        ,
+        \\{"type":"embeddings","external":true,"dimension":8,"lake_bulk_build":"emeans"}
+        ,
+    };
+    for (valid) |raw| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        const normalized = try translateEmbeddingsIndexConfigJsonWithOptions(a, "dense", parsed.value, .{});
+        defer a.free(normalized);
+        var result = try std.json.parseFromSlice(std.json.Value, a, normalized, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(i64, 8), result.value.object.get("dims").?.integer);
+    }
+    const invalid = [_][]const u8{
+        \\{"type":"embeddings","external":true,"dimension":8,"lake_bulk_build":"emeans","distance_metric":"cosine"}
+        ,
+        \\{"type":"embeddings","external":true,"dimension":8,"lake_bulk_build":"lloyd","sparse":true}
+        ,
+        \\{"type":"embeddings","external":true,"dimension":8,"lake_bulk_build_max_input_bytes":4294967296}
+        ,
+        \\{"type":"embeddings","external":true,"dimension":8,"lake_bulk_build":"lloyd","lake_bulk_build_max_input_bytes":0}
+        ,
+        \\{"type":"embeddings","external":true,"dimension":8,"lake_bulk_build":"lloyd","lake_bulk_build_max_input_bytes":"large"}
+        ,
+    };
+    for (invalid) |raw| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        if (translateEmbeddingsIndexConfigJsonWithOptions(a, "dense", parsed.value, .{})) |normalized| {
+            a.free(normalized);
+            return error.TestExpectedError;
+        } else |_| {}
+    }
 }

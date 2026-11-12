@@ -41,9 +41,12 @@ pub const BuildProgress = struct {
     lease: Lease,
     saved: catalog.Publication,
     declarations: std.ArrayList(std.json.Parsed(local.serverless_segment_sidecar_manifest.DeclaredArtifact)) = .empty,
+    work: std.ArrayList(std.json.Parsed(catalog.ConstructionWork)) = .empty,
     pub fn deinit(self: *BuildProgress) void {
         for (self.declarations.items) |*declaration| declaration.deinit();
         self.declarations.deinit(self.a);
+        for (self.work.items) |*entry| entry.deinit();
+        self.work.deinit(self.a);
     }
     fn remember(self: *BuildProgress, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact) !void {
         // Each current declaration owns a reclaimable region, independently
@@ -81,12 +84,35 @@ pub const BuildProgress = struct {
         self.saved.source_navigation = ref;
         try self.persist();
     }
+    fn rememberWork(self: *BuildProgress, work: catalog.ConstructionWork) !void {
+        const bytes = try std.json.Stringify.valueAlloc(self.a, work, .{});
+        defer self.a.free(bytes);
+        var owned = try std.json.parseFromSlice(catalog.ConstructionWork, self.a, bytes, .{ .allocate = .alloc_always });
+        errdefer owned.deinit();
+        for (self.work.items) |*entry| if (std.mem.eql(u8, entry.value.name, work.name)) {
+            entry.deinit();
+            entry.* = owned;
+            return;
+        };
+        try self.work.append(self.a, owned);
+    }
+    fn saveWork(raw: *anyopaque, work: catalog.ConstructionWork) !void {
+        const self: *BuildProgress = @ptrCast(@alignCast(raw));
+        if (self.io) |io| try self.mutex.lock(io);
+        defer if (self.io) |io| self.mutex.unlock(io);
+        try self.cancellation.check();
+        try self.rememberWork(work);
+        try self.persist();
+    }
     fn persist(self: *@This()) !void {
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
         const declarations = try scratch.allocator().alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, self.declarations.items.len);
         for (declarations, self.declarations.items) |*value, owned| value.* = owned.value;
         var saved = self.saved;
+        const work = try scratch.allocator().alloc(catalog.ConstructionWork, self.work.items.len);
+        for (work, self.work.items) |*entry, owned| entry.* = owned.value;
+        saved.construction = work;
         saved.directory = try @import("lake_index_directory.zig").publish(scratch.allocator(), self.store, declarations, self.cancellation);
         const maps = @import("../serverless/artifacts/cloud_generations.zig");
         const writer = if (self.store.providerStore()) |object| object.cloud_writer else null;
@@ -101,7 +127,7 @@ pub const BuildProgress = struct {
     }
 };
 pub fn buildWithReuse(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo, policy: BuildPolicy) ![]u8 {
-    return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, policy.allow_reuse, policy.identity_spill_bytes) catch |err| {
+    return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, policy.allow_reuse, policy.identity_spill_bytes, policy) catch |err| {
         switch (err) {
             error.LakeIndexArtifactUnavailable, error.CloudGenerationMapUnavailable, error.ArtifactIntegrityMismatch, error.InvalidLogicalRowIdentity, error.LogicalRowIdentityAdmissionDeclined => {},
             else => return err,
@@ -122,9 +148,9 @@ pub fn buildWithReuse(a: A, artifact_store: *stores.ArtifactStore, table: record
             }
             const fresh = try owner.snapshot(owner.ptr, a);
             defer a.free(fresh.lake_index_catalog_json);
-            return buildAttempt(a, artifact_store, fresh, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false, if (err == error.LogicalRowIdentityAdmissionDeclined) 0 else policy.identity_spill_bytes);
+            return buildAttempt(a, artifact_store, fresh, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false, if (err == error.LogicalRowIdentityAdmissionDeclined) 0 else policy.identity_spill_bytes, policy);
         }
-        return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false, if (err == error.LogicalRowIdentityAdmissionDeclined) 0 else policy.identity_spill_bytes);
+        return buildAttempt(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, false, if (err == error.LogicalRowIdentityAdmissionDeclined) 0 else policy.identity_spill_bytes, policy);
     };
 }
 /// Prior inventory is an optional planning proof. Missing/corrupt derived
@@ -145,7 +171,7 @@ pub fn priorInventory(a: A, store: stores.ArtifactStore, ref: local.serverless_m
     };
     return inventory;
 }
-fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo, reuse: bool, identity_spill_bytes: u64) ![]u8 {
+fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo, reuse: bool, identity_spill_bytes: u64, policy: BuildPolicy) ![]u8 {
     var allocations: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = backing };
     const a = allocations.allocator();
     try context.ensureActive();
@@ -156,6 +182,10 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     if (!reuse_published) current.value.published = null;
     if (!reuse) current.value.checkpoint = null;
     const attempt = current.value.pending orelse return error.LakeIndexPublicationFenceChanged;
+    // Old publications/checkpoints remain readable. A worker must renew an
+    // old pending lease before producing artifacts under the expanded current
+    // admission contract; never advertise them under a prior reader protocol.
+    if (attempt.reader_protocol != catalog.native_reader_protocol) return error.LakeIndexPublicationFenceChanged;
     const started = try clock.now_ms(clock.ptr);
     if (started < attempt.started_at_ms or started >= attempt.lease_expires_at_ms) return error.LakeIndexPublicationFenceChanged;
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse return error.InvalidExternalTableBinding;
@@ -295,8 +325,23 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     defer progress.deinit();
     if (lease) |owner| if (owner.save_checkpoint != null) {
         if (current.value.checkpoint) |saved| for (saved.declarations) |declaration| try progress.remember(declaration);
-        provider.progress = .{ .ptr = &progress, .save = BuildProgress.save, .save_batch = BuildProgress.saveBatch };
+        if (current.value.checkpoint) |saved| {
+            if (std.meta.eql(saved.signature, signature) and std.meta.eql(saved.namespace, current.value.namespace)) {
+                provider.construction = saved.construction;
+                for (saved.construction) |work| try progress.rememberWork(work);
+            }
+        }
+        provider.progress = .{ .ptr = &progress, .save = BuildProgress.save, .save_batch = BuildProgress.saveBatch, .save_work = BuildProgress.saveWork };
     };
+    provider.bulk_checkpoints = policy.bulk_source_checkpoints and attempt.reader_protocol >= 98;
+    provider.bulk_compact_partitions = policy.bulk_compact_partitions;
+    provider.bulk_prebind_parents = policy.bulk_prebind_parents;
+    var bulk_stage = if (policy.fuse_bulk_identity and current.value.published == null and provider.construction.len == 0 and provider.progress != null and (current.value.checkpoint == null or current.value.checkpoint.?.row_identity == null))
+        try @import("lake_bulk_stage.zig").Stage.start(a, table, base_source, &provider, &scoped, cancellation)
+    else
+        null;
+    defer if (bulk_stage) |stage| stage.deinit();
+    provider.bulk_stage = bulk_stage;
     const previous_contributions = if (current.value.published) |previous| if (!mapped_predecessor and reusable_directory and std.meta.eql(previous.namespace, current.value.namespace) and std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and std.mem.eql(u8, &previous.signature.store, &signature.store)) previous.file_contributions else &.{} else &.{};
     const contributions_api = @import("lake_index_contributions.zig");
     var contribution_index: contributions_api.Index = undefined;
@@ -362,19 +407,46 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     var captured_rows: ?*@import("lake_row_payloads.zig").Capture = null;
     defer if (captured_rows) |capture| capture.deinit();
     const identity_started = probe.start();
-    var row_identity = if (identity_unchanged) previous_identity else @import("lake_row_identity_build.zig").build(a, na, table, &scoped, &provider, signature.source, base_source, navigation.ref, previous_identity, cancellation, &captured_rows) catch |err| switch (err) {
+    var recovered_identity: ?row_identity_api.Root = null;
+    if (current.value.checkpoint) |saved| if (saved.row_identity) |ref| {
+        if (std.meta.eql(saved.signature, signature) and std.meta.eql(saved.namespace, current.value.namespace)) {
+            const root = try row_identity_api.load(na, scoped, ref, cancellation, null);
+            if (!std.mem.eql(u8, &root.domain, &scope.domain) or !std.mem.eql(u8, &root.cut, &signature.source) or !std.mem.eql(u8, &root.definitionFingerprint(), &signature.desired)) return error.InvalidLogicalRowIdentity;
+            recovered_identity = root;
+        }
+    };
+    var row_identity = if (recovered_identity != null) recovered_identity else if (identity_unchanged) previous_identity else @import("lake_row_identity_build.zig").build(a, na, table, &scoped, &provider, signature.source, base_source, navigation.ref, previous_identity, cancellation, &captured_rows) catch |err| switch (err) {
         // An optional identity declaration is not an enforced SQL constraint.
         // Insufficient identity evidence keeps ordinary complete construction.
         error.NullLogicalRowKey, error.DuplicateLogicalRowKey, error.LogicalRowIdentityAdmissionDeclined => null,
         else => return err,
     };
     probe.finish("identity", identity_started);
+    // Bind the verified input census to subsequent private phase receipts.
+    // It carries no serving declaration authority until final publication.
+    if (provider.progress != null) if (row_identity) |identity| {
+        var proof = identity;
+        if (std.mem.allEqual(u8, &proof.artifacts, 0)) proof.artifacts = try row_identity_api.declarationDigest(a, &.{});
+        try proof.reseal(a);
+        progress.saved.row_identity = try row_identity_api.publish(na, &scoped, proof, cancellation);
+    };
+    if (bulk_stage) |stage| {
+        if (row_identity != null and recovered_identity == null and !identity_unchanged) {
+            try stage.finish(&provider);
+        } else {
+            // Optional identity admission may decline after scanning most of a
+            // corpus. Release its unusable tee before the complete fallback.
+            provider.bulk_stage = null;
+            stage.deinit();
+            bulk_stage = null;
+        }
+    }
     var fragments: ?*@import("lake_row_fragments.zig").Build = null;
     defer if (fragments) |value| value.deinit();
     if (!identity_unchanged) if (row_identity) |identity| {
         // Legacy sidecars/enrichment dependencies retain the physical builder.
         const configs = try std.json.parseFromSliceLeaky(std.json.Value, na, table.indexes_json, .{});
-        const reusable_inputs = @import("lake_row_input_recipes.zig").nativeFragmentsEligible(configs);
+        const reusable_inputs = @import("lake_row_input_recipes.zig").fragmentsEligibleForBuild(configs, previous_identity == null);
         if (reusable_inputs) {
             const started_probe = probe.start();
             defer probe.finish("fragments", started_probe);

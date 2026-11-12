@@ -743,6 +743,7 @@ pub const JoinType = types.JoinType;
 pub const KernelJitConfig = types.KernelJitConfig;
 pub const KernelJitMode = types.KernelJitMode;
 pub const KeyRange = types.KeyRange;
+pub const LakeBulkBuildAlgorithm = types.LakeBulkBuildAlgorithm;
 pub const LakeCatalogCommitRequest = types.LakeCatalogCommitRequest;
 pub const LakeCatalogConfig = types.LakeCatalogConfig;
 pub const LakeCatalogCreateRequest = types.LakeCatalogCreateRequest;

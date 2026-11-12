@@ -24,6 +24,7 @@ pub const Phase = enum {
     publication,
     index,
     ranking,
+    vector_recovery, // Selected recipe admission/recovery, separate from ranking.
     // Nested text phases; opening occurs only on immutable corpus cache misses.
     text_directory,
     text_inventory,

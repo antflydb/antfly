@@ -3606,9 +3606,26 @@ pub const Sequential = struct {
                 .bool => 1,
                 .i64 => 2,
                 .f64 => 3,
-                .bytes, .json => 5,
+                .bytes, .json, .vector_f32 => 5,
                 else => return error.InvalidSqlSpill,
             };
+            if (kind == .vector_f32) {
+                const vectors = try a.alloc([]const f32, count_rows);
+                errdefer a.free(vectors);
+                var initialized: usize = 0;
+                errdefer for (vectors[0..initialized]) |vector| a.free(vector);
+                for (vectors, nulls, 0..) |*vector, flag, row_index| {
+                    if (flag != 0) {
+                        vector.* = &.{};
+                    } else {
+                        const value = (try self.cell(row_index, column)).value;
+                        if (value != .string) return error.InvalidSqlSpill;
+                        vector.* = try @import("antfly_vector").codec.decodePackedF32BytesAlloc(a, value.string);
+                    }
+                    initialized += 1;
+                }
+                return .{ .name = "", .values = .{ .vector_f32 = vectors }, .nulls = .{ .bytes = nulls } };
+            }
             if (encoded) |stored| {
                 if (stored.values == .dictionary and kind != .json and kind != .bool) {
                     const dictionary = stored.values.dictionary;

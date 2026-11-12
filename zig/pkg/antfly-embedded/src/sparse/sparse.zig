@@ -2422,6 +2422,8 @@ pub const SparseBackend = enum {
 };
 
 pub const SparseIndex = struct {
+    construction_cancellation: ?CancellationToken = null,
+
     alloc: Allocator,
     store: backend_erased.Store,
     owner: StoreOwner,
@@ -2763,7 +2765,11 @@ pub const SparseIndex = struct {
         return try self.batchWithOptions(writes, deletes, .{});
     }
 
+    fn checkConstruction(self: *SparseIndex) !void {
+        if (self.construction_cancellation) |token| try token.check();
+    }
     pub fn batchWithOptions(self: *SparseIndex, input: []const SparseWrite, deletes: []const []const u8, options: BatchOptions) !void {
+        try self.checkConstruction();
         var normalized = std.heap.ArenaAllocator.init(self.alloc);
         defer normalized.deinit();
         const working = try canonicalWorkingBytes(input);
@@ -2826,6 +2832,7 @@ pub const SparseIndex = struct {
         // Process inserts
         phase_start_ns = nowNs();
         for (writes) |w| {
+            try self.checkConstruction();
             try self.processInsert(scratch, txn, w.doc_id, w.vec, w.doc_num, touched_terms_ptr);
             try physical_maps.update(txn, w.doc_id, try self.docNumForDocIdTxn(txn, w.doc_id));
             _ = scratch_arena.reset(.retain_capacity);
@@ -3986,6 +3993,7 @@ pub const SparseIndex = struct {
         phase_start_ns = nowNs();
         try last_index_by_doc.ensureTotalCapacity(self.alloc, @intCast(writes.len));
         for (writes, 0..) |write, i| {
+            try self.checkConstruction();
             try last_index_by_doc.put(self.alloc, write.doc_id, i);
         }
         self.write_profile.dedupe_ns += elapsedSince(phase_start_ns);
@@ -3997,6 +4005,7 @@ pub const SparseIndex = struct {
         var posting_count: usize = 0;
         phase_start_ns = nowNs();
         for (writes, 0..) |write, i| {
+            try self.checkConstruction();
             if (last_index_by_doc.get(write.doc_id).? != i) continue;
             if (write.vec.indices.len != write.vec.values.len) return error.InvalidSparseVector;
             if (!options.assume_new_doc_ids) {
@@ -4047,6 +4056,7 @@ pub const SparseIndex = struct {
         try postings.ensureTotalCapacity(self.alloc, posting_count);
 
         for (active_indices.items) |write_idx| {
+            try self.checkConstruction();
             const write = writes[write_idx];
             phase_start_ns = nowNs();
             const doc_num = try self.allocateBulkDocNum(write.doc_id, write.doc_num, &occupied_doc_nums);
@@ -4065,6 +4075,7 @@ pub const SparseIndex = struct {
             const doc_num_u32: u32 = @intCast(doc_num);
             phase_start_ns = nowNs();
             for (write.vec.indices, 0..) |term_id, term_idx| {
+                if (term_idx % 256 == 0) try self.checkConstruction();
                 try postings.append(self.alloc, .{
                     .term_id = term_id,
                     .doc_num = doc_num_u32,
@@ -9368,4 +9379,31 @@ test "sparse shared parallel ranges preserve signed canonical scores filters and
     var predicate: Predicate = .{ .fail = true };
     const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
     try std.testing.expectError(error.TestPredicateFailed, idx.searchConstrained(a, &query, 17, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows }, .score_spill = .{ .io = threaded.io(), .directory = "/tmp" } }));
+}
+
+test "external lake bounded WAL native sparse construction cancels inside bulk document enumeration" {
+    const a = std.testing.allocator;
+    var buffer: [256]u8 = undefined;
+    const path = tmpPath(&buffer, "sparse-recovery-cancel");
+    defer cleanupTmp(path);
+    var index = try SparseIndex.open(a, path, .{});
+    defer index.close();
+    const Probe = struct {
+        checks: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            if (self.checks >= 3) return error.Canceled;
+        }
+    };
+    var probe: Probe = .{};
+    index.construction_cancellation = .{ .ptr = &probe, .check_fn = Probe.check };
+    defer index.construction_cancellation = null;
+    const input = [_]SparseWrite{
+        .{ .doc_id = "one", .vec = .{ .indices = &.{1}, .values = &.{1} } },
+        .{ .doc_id = "two", .vec = .{ .indices = &.{2}, .values = &.{1} } },
+        .{ .doc_id = "three", .vec = .{ .indices = &.{3}, .values = &.{1} } },
+    };
+    try std.testing.expectError(error.Canceled, index.batchWithOptions(&input, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true }));
+    try std.testing.expect(probe.checks >= 3);
 }
