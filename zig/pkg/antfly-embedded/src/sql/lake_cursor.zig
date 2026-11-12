@@ -423,7 +423,7 @@ pub fn projectedRow(alloc: Allocator, table: catalog.Table, row: rows.ProjectedR
             .i64 => |v| .{ .integer = v },
             .f64 => |v| .{ .float = v },
             .bool => |v| .{ .bool = v },
-            .vector_f32 => return error.UnsupportedSqlExecution,
+            .vector_f32 => |v| try (@import("../storage/rowsource/types.zig").ColumnValues{ .vector_f32 = &.{v} }).jsonAt(alloc, 0),
         } else .null;
         try object.put(alloc, column.name, value);
         try nulls.append(alloc, cell.value == null);

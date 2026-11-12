@@ -28,8 +28,16 @@ pub const File = struct {
     key_digest: ?[32]u8 = null,
     aggregate_digest: ?[32]u8 = null,
     docs: []const artifacts.ChunkRef = &.{},
+    docs_root: ?@import("../serverless/graph_segment/page_tree.zig").Ref = null,
     count: u64 = 0,
     key_width: u16 = 96,
+    pub fn chunkCount(self: File) u64 {
+        return if (self.docs_root) |root| root.records else self.docs.len;
+    }
+    pub fn jsonStringify(self: File, writer: anytype) !void {
+        if (self.docs_root != null) return writer.write(.{ .id = self.id, .digest = self.digest, .key_digest = self.key_digest, .aggregate_digest = self.aggregate_digest, .docs = self.docs, .count = self.count, .key_width = self.key_width, .docs_root = self.docs_root });
+        return writer.write(.{ .id = self.id, .digest = self.digest, .key_digest = self.key_digest, .aggregate_digest = self.aggregate_digest, .docs = self.docs, .count = self.count, .key_width = self.key_width });
+    }
 };
 fn part(hash: *std.crypto.hash.Blake3, bytes: []const u8) void {
     var length: [8]u8 = undefined;
@@ -114,6 +122,11 @@ pub fn validate(files: []const File, domain: [32]u8) !void {
         if (file.key_digest) |digest| if (std.mem.allEqual(u8, &digest, 0)) return error.InvalidNativeLakeFileState;
         if (file.key_width != 96 and file.key_width != 108) return error.InvalidNativeLakeFileState;
         if (file.id.len == 0 or std.mem.allEqual(u8, &file.digest, 0) or (try names.getOrPut(std.heap.page_allocator, file.id)).found_existing) return error.InvalidNativeLakeFileState;
+        if (file.docs_root) |root| {
+            try root.validate();
+            if (file.docs.len != 0 or file.count == 0 or root.records > file.count) return error.InvalidNativeLakeFileState;
+            continue;
+        }
         var count: u64 = 0;
         for (file.docs) |ref| {
             if (ref.byte_len == 0 or ref.byte_len % file.key_width != 0 or ref.byte_len > 256 * 1024) return error.InvalidNativeLakeFileState;
@@ -296,6 +309,7 @@ pub const Plan = struct {
             changed.* = true;
             if (old.get(file.file_id)) |prior| if (std.mem.eql(u8, &prior.digest, &state.digest)) {
                 state.docs = prior.docs;
+                state.docs_root = prior.docs_root;
                 state.count = prior.count;
                 state.key_width = prior.key_width;
                 changed.* = false;
@@ -511,12 +525,16 @@ pub const Tracker = struct {
     active: ?usize = null,
     output_bytes: u64 = 256 * 1024 * 1024,
     cumulative_bytes: ?*u64 = null,
+    directory_bytes: u64 = 512 * 1024 * 1024,
     pub fn init(a: A, out: A, plan: *Plan, store: *stores.ArtifactStore, cancellation: Cancellation) !Tracker {
         return .{ .plan = plan, .a = a, .out = out, .store = store, .cancellation = cancellation };
     }
     pub fn deinit(self: *Tracker) void {
         var it = self.refs.valueIterator();
-        while (it.next()) |refs| refs.deinit(self.a);
+        while (it.next()) |refs| {
+            self.releaseReferences(refs);
+            refs.deinit(self.a);
+        }
         self.refs.deinit(self.a);
         self.pending.deinit(self.a);
     }
@@ -541,9 +559,12 @@ pub const Tracker = struct {
         const file = try self.plan.mutable(file_index);
         if (file.count != 0 and file.key_width != width) return error.InvalidNativeLakeFileState;
         file.key_width = width;
-        const slot = try self.refs.getOrPut(self.a, file_index);
-        if (!slot.found_existing) slot.value_ptr.* = .empty;
-        try slot.value_ptr.append(self.a, .{ .artifact_id = try self.out.dupe(u8, reference.artifact_id), .checksum = try self.out.dupe(u8, reference.checksum), .byte_len = reference.byte_len });
+        const id = try self.a.dupe(u8, reference.artifact_id);
+        const checksum = self.a.dupe(u8, reference.checksum) catch |err| {
+            self.a.free(id);
+            return err;
+        };
+        try self.addReference(file_index, .{ .artifact_id = id, .checksum = checksum, .byte_len = reference.byte_len });
         file.count += reference.byte_len / width;
     }
     fn keepKey(self: *Tracker, file: File, key: []const u8) !void {
@@ -553,20 +574,64 @@ pub const Tracker = struct {
         if (self.pending.items.len == 0) return;
         try stores.chargeReadBudget(self.cumulative_bytes orelse &self.output_bytes, self.pending.items.len);
         var store = self.store.*;
-        store.allocator = self.out;
+        store.allocator = self.a;
         const ref = try store.putWithCancellation(self.pending.items, self.cancellation);
         defer if (ref.provider_version) |version| store.allocator.free(version);
-        const slot = try self.refs.getOrPut(self.a, self.active.?);
-        if (!slot.found_existing) slot.value_ptr.* = .empty;
-        try slot.value_ptr.append(self.a, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
+        try self.addReference(self.active.?, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
         self.pending.clearRetainingCapacity();
+    }
+    fn releaseReferences(self: *Tracker, references: *std.ArrayList(artifacts.ChunkRef)) void {
+        for (references.items) |reference| {
+            self.a.free(reference.artifact_id);
+            self.a.free(reference.checksum);
+        }
+        references.clearRetainingCapacity();
+    }
+    fn addReference(self: *Tracker, file: usize, reference: artifacts.ChunkRef) !void {
+        var owned = false;
+        errdefer if (!owned) {
+            self.a.free(reference.artifact_id);
+            self.a.free(reference.checksum);
+        };
+        const slot = try self.refs.getOrPut(self.a, file);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(self.a, reference);
+        owned = true;
+        if (slot.value_ptr.items.len == 32) try self.spillReferences(file, slot.value_ptr);
+    }
+    fn spillReferences(self: *Tracker, index: usize, references: *std.ArrayList(artifacts.ChunkRef)) !void {
+        if (references.items.len == 0) return;
+        const tree = @import("../serverless/graph_segment/page_tree.zig");
+        const file = try self.plan.mutable(index);
+        const first = if (file.docs_root) |root| root.records else 0;
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = self.store.upload_scope.?.domain, .attempt = self.store.upload_scope.?.attempt, .artifacts = self.store, .cancellation = self.cancellation, .remaining_read_bytes = &self.directory_bytes, .remaining_write_bytes = &self.directory_bytes, .streaming = true };
+        pages.admitPublication();
+        const keys = try a.alloc([8]u8, references.items.len);
+        const edits = try a.alloc(tree.Mutation, references.items.len);
+        for (keys, edits, references.items, 0..) |*key, *edit, reference, ordinal| {
+            std.mem.writeInt(u64, key, first + ordinal, .big);
+            edit.* = .{ .key = key, .value = try std.json.Stringify.valueAlloc(a, reference, .{}) };
+        }
+        file.docs_root = try tree.apply(a, pages.store(), file.docs_root, edits);
+        file.docs = &.{};
+        self.releaseReferences(references);
     }
     pub fn finish(self: *Tracker) !void {
         try self.flush();
         var it = self.refs.iterator();
         while (it.next()) |slot| {
             const file = try self.plan.mutable(slot.key_ptr.*);
-            file.docs = try self.out.dupe(artifacts.ChunkRef, slot.value_ptr.items);
+            if (file.docs_root != null) {
+                try self.spillReferences(slot.key_ptr.*, slot.value_ptr);
+            } else {
+                const refs = try self.out.alloc(artifacts.ChunkRef, slot.value_ptr.items.len);
+                for (refs, slot.value_ptr.items) |*reference, input| reference.* = .{ .artifact_id = try self.out.dupe(u8, input.artifact_id), .checksum = try self.out.dupe(u8, input.checksum), .byte_len = input.byte_len };
+                file.docs = refs;
+                self.releaseReferences(slot.value_ptr);
+            }
         }
     }
 };
@@ -581,6 +646,7 @@ pub const Deletes = struct {
     tracker: ?*Tracker = null,
     file: usize = 0,
     chunk: usize = 0,
+    members: u64 = 0,
     budget: u64 = 256 * 1024 * 1024,
     key_width: usize = 96,
     pub fn deinit(self: *Deletes) void {
@@ -607,19 +673,43 @@ pub const Deletes = struct {
             // A previously all-null vector fragment has no key chunks. Its
             // proven delta can still gather just the rows becoming non-null.
             if (self.tracker != null and !self.current.unchanged(file) and self.current.canPatch(file)) try self.current.partial_files.put(self.current.a, self.current.by_id.get(file.id).?, {});
-            if (self.current.unchanged(file) or self.chunk == file.docs.len) {
+            const unchanged = self.current.unchanged(file);
+            if (unchanged or self.chunk == file.chunkCount()) {
+                if (!unchanged and self.members != file.count) return error.InvalidNativeLakeFileState;
                 self.file += 1;
                 self.chunk = 0;
+                self.members = 0;
                 self.loaded = null;
                 continue;
             }
-            const ref = file.docs[self.chunk];
+            const ref = if (file.docs_root) |root| paged: {
+                const tree = @import("../serverless/graph_segment/page_tree.zig");
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                var artifact_store = store;
+                var writes: u64 = 0;
+                var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = self.domain, .artifacts = &artifact_store, .cancellation = cancellation, .remaining_read_bytes = &self.budget, .remaining_write_bytes = &writes };
+                var key: [8]u8 = undefined;
+                std.mem.writeInt(u64, &key, self.chunk, .big);
+                var cursor = try tree.Cursor.init(arena.allocator(), pages.store(), root, &key, null);
+                defer cursor.deinit();
+                const entry = (try cursor.next()) orelse return error.InvalidNativeLakeFileState;
+                if (!std.mem.eql(u8, entry.key, &key)) return error.InvalidNativeLakeFileState;
+                const parsed = try @import("lake_index_native_directory.zig").decodeChunk(arena.allocator(), entry.value, self.domain);
+                break :paged artifacts.ChunkRef{ .artifact_id = try a.dupe(u8, parsed.artifact_id), .checksum = try a.dupe(u8, parsed.checksum), .byte_len = parsed.byte_len };
+            } else file.docs[self.chunk];
+            defer if (file.docs_root != null) {
+                a.free(ref.artifact_id);
+                a.free(ref.checksum);
+            };
             self.chunk += 1;
             try stores.chargeReadBudget(&self.budget, ref.byte_len);
             const bytes = try artifacts.readArtifact(a, store, ref, cancellation, null);
             errdefer a.free(bytes);
             self.key_width = file.key_width;
             if (bytes.len % self.key_width != 0) return error.InvalidNativeLakeFileState;
+            self.members = std.math.add(u64, self.members, bytes.len / self.key_width) catch return error.InvalidNativeLakeFileState;
+            if (self.members > file.count) return error.InvalidNativeLakeFileState;
             for (0..bytes.len / self.key_width) |row| {
                 const key = bytes[row * self.key_width ..][0..self.key_width];
                 const expected = std.fmt.bytesToHex(&(file.key_digest orelse file.digest), .lower);
@@ -930,4 +1020,62 @@ test "external lake logical vector state path copies directories without immutab
     var invalid = provider;
     invalid.native_delta.?.source = "another-source";
     try std.testing.expectError(error.InvalidNativeLakeFileState, Plan.initPaged(a, out, &invalid, &.{}, root, true, true));
+}
+
+test "external lake execution paged identity references preserve deletion and small file records" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("paged-vector-identities");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(1, @splat(7), null);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    var current = [_]File{.{ .id = "fragment", .digest = @splat(2), .key_digest = @splat(9) }};
+    var changed = [_]bool{true};
+    var plan: Plan = .{ .a = a, .files = &current, .changed = &changed };
+    defer plan.deinit();
+    defer plan.changed = &.{};
+    try plan.by_id.put(a, "fragment", 0);
+    const key = try plan.privateKey(out, .{ .external = .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "fragment", .row_group_ordinal = 0, .row_ordinal = 0 } });
+    const reference = try store.putWithCancellation(key, .none);
+    defer {
+        a.free(reference.artifact_id);
+        a.free(reference.checksum);
+        if (reference.provider_version) |version| a.free(version);
+    }
+    var tracker = try Tracker.init(a, out, &plan, &store, .none);
+    defer tracker.deinit();
+    for (0..257) |_| try tracker.keepChunk(0, .{ .artifact_id = reference.artifact_id, .checksum = reference.checksum, .byte_len = reference.byte_len }, 96);
+    try tracker.finish();
+    try validate(&current, store.upload_scope.?.domain);
+    try std.testing.expect(current[0].docs_root != null);
+    try std.testing.expectEqual(@as(u64, 257), current[0].chunkCount());
+    const encoded = try std.json.Stringify.valueAlloc(out, current[0], .{});
+    try std.testing.expect(encoded.len < 1024);
+    var parsed = try std.json.parseFromSlice(File, a, encoded, .{});
+    defer parsed.deinit();
+    const file_directory = (try plan.publishDirectory(a, &store, domain, .none)).?;
+    var collector: @import("lake_index_gc.zig").Collector = .{ .a = a, .table = 1, .authority = undefined, .store = store, .identity = @splat(7), .context = .{ .io = std.testing.io }, .token = @splat(1), .audit_only = true, .remaining_reads = 16 * 1024 * 1024 };
+    defer {
+        var keys = collector.marked.keyIterator();
+        while (keys.next()) |owned| a.free(owned.*);
+        collector.marked.deinit(a);
+    }
+    try collector.markNativeFiles(a, domain, file_directory);
+    try std.testing.expect(collector.marked.contains(reference.artifact_id));
+    const prior = current[0];
+    current[0] = .{ .id = "fragment", .digest = @splat(3) };
+    var deletes: Deletes = .{ .files = &.{prior}, .current = &plan, .domain = store.upload_scope.?.domain };
+    defer deletes.deinit();
+    var count_: usize = 0;
+    while (try deletes.next(a, store, .none)) |bytes| {
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings(key, bytes);
+        count_ += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 257), count_);
 }

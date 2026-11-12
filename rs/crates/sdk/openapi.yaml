@@ -43617,6 +43617,12 @@ components:
         - best_effort
       default: strict
       description: How generation-scoped source outcomes determine derived-index completeness.
+    LakeBulkBuildAlgorithm:
+      type: string
+      enum:
+        - lloyd
+        - emeans
+      description: Offline clustering algorithm for fresh native Parquet lake HBC indexes.
     ArtifactIndexSource:
       type: object
       additionalProperties: false
@@ -43811,6 +43817,19 @@ components:
           default: false
           description: When true, creates a sparse (SPLADE) inverted index. When false (default), creates
             a dense HBC vector index.
+        lake_bulk_build:
+          $ref: '#/components/schemas/LakeBulkBuildAlgorithm'
+          description: Optional offline clustering algorithm for fresh native Parquet lake HBC indexes.
+            Both algorithms train on bounded samples and partition the corpus on disk. E-means requires
+            l2_squared distance. Existing generations continue to use incremental updates.
+        lake_bulk_build_max_input_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Total vector and identity bytes admitted for a fresh offline lake build, with a
+            server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora.
+            Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this
+            input allowance.
         dimension:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -46608,6 +46627,12 @@ components:
         sparse:
           type: boolean
           default: false
+        lake_bulk_build:
+          $ref: '#/components/schemas/LakeBulkBuildAlgorithm'
+        lake_bulk_build_max_input_bytes:
+          type: integer
+          format: int64
+          minimum: 1
         dimension:
           type: integer
           minimum: 1

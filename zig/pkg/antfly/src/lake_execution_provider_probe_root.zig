@@ -18,6 +18,15 @@ pub const antfly_sources = @import("source_owner_physical.zig");
 const std = @import("std");
 const metrics = @import("api/lake_execution_probe_metrics.zig");
 var families: metrics.Metrics = .{};
+var allocation_denials: std.atomic.Value(usize) = .init(0);
+/// Diagnostics belong only to this independently compiled qualification owner;
+/// normal runtime allocation admission and ABI layouts are unchanged.
+pub fn lakeExecutionProbeAllocationDenied(requested: usize, live: usize, peak: usize, limit: usize, return_address: usize) void {
+    if (allocation_denials.fetchAdd(1, .monotonic) >= 16) return;
+    std.debug.print("LAKE_ALLOCATION_DENIED requested={} live={} peak={} limit={}\n", .{ requested, live, peak, limit });
+    std.debug.dumpCurrentStackTrace(.{ .first_address = return_address });
+}
+
 pub fn lakeExecutionProbeParallelJob() void {
     _ = families.parallel_jobs.fetchAdd(1, .monotonic);
 }
@@ -33,6 +42,13 @@ fn probeFamilyNs(index: u8) callconv(.c) u64 {
 fn probeFamilyCalls(index: u8) callconv(.c) u64 {
     return if (index < metrics.names.len) families.calls[index].load(.monotonic) else 0;
 }
+fn probeBulkNs(index: u8) callconv(.c) u64 {
+    return if (index < metrics.bulk_names.len) families.bulk_ns[index].load(.monotonic) else 0;
+}
+fn probeBulkCalls(index: u8) callconv(.c) u64 {
+    return if (index < metrics.bulk_names.len) families.bulk_calls[index].load(.monotonic) else 0;
+}
+
 var cache_decoded_hits: std.atomic.Value(u64) = .init(0);
 fn probeDecodedHits() callconv(.c) u64 {
     return cache_decoded_hits.load(.monotonic);
@@ -117,6 +133,8 @@ comptime {
     @export(&probeOptimize, .{ .name = "antfly_lake_probe_optimize", .visibility = .hidden });
     @export(&probeIsTest, .{ .name = "antfly_lake_probe_builtin_is_test", .visibility = .hidden });
     @export(&probeParallelJobs, .{ .name = "antfly_lake_probe_parallel_jobs", .visibility = .hidden });
+    @export(&probeBulkNs, .{ .name = "antfly_lake_probe_bulk_ns", .visibility = .hidden });
+    @export(&probeBulkCalls, .{ .name = "antfly_lake_probe_bulk_calls", .visibility = .hidden });
     @export(&probeFamilyNs, .{ .name = "antfly_lake_probe_family_ns", .visibility = .hidden });
     @export(&probeFamilyCalls, .{ .name = "antfly_lake_probe_family_calls", .visibility = .hidden });
     @export(&probeDecodedHits, .{ .name = "antfly_lake_probe_decoded_hits", .visibility = .hidden });
