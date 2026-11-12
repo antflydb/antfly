@@ -656,12 +656,7 @@ fn downloadHttpOutcomeAlloc(
 /// client share an allocator, so a successful response does not briefly use
 /// twice the configured response limit.
 fn takeHttpResponseBodyAlloc(alloc: Allocator, response: *httpx.Response) ![]u8 {
-    const body = response.body orelse return try alloc.alloc(u8, 0);
-    if (!response.body_owned) return try alloc.dupe(u8, body);
-    response.body = null;
-    response.body_owned = false;
-    response.body_allocator = null;
-    return @constCast(body);
+    return response.takeBodyAlloc(alloc);
 }
 
 fn validateHttpUri(uri: std.Uri) !void {
@@ -1144,9 +1139,9 @@ fn downloadGcsContentAllocInternal(
     if (result.body.len > max_bytes) return error.StreamTooLong;
     const content_type = try alloc.dupe(u8, result.metadata.content_type orelse guessMimeType(location.key));
     errdefer alloc.free(content_type);
-    const data = try alloc.dupe(u8, result.body);
-    errdefer alloc.free(data);
     try ceiling.check();
+    const data = result.body;
+    result.body = &.{};
     return .{ .content_type = content_type, .data = data };
 }
 
@@ -1232,9 +1227,9 @@ fn downloadS3AllocInternal(
 
     const content_type = try alloc.dupe(u8, result.metadata.content_type orelse guessMimeType(key));
     errdefer alloc.free(content_type);
-    const data = try alloc.dupe(u8, result.body);
-    errdefer alloc.free(data);
     try ceiling.check();
+    const data = result.body;
+    result.body = &.{};
     const downloaded = DownloadedContent{
         .content_type = content_type,
         .data = data,

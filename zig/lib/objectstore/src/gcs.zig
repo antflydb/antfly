@@ -261,12 +261,13 @@ const HttpxTransport = struct {
         var result = try transportResponseAlloc(
             alloc,
             response.status.code,
-            response.body orelse "",
+            "",
             response.headers.get("ETag"),
             response.headers.get("Content-Type"),
             response.headers.get("Location"),
         );
         errdefer result.deinit(alloc);
+        result.body = try response.takeBodyAlloc(alloc);
         if (response.status.code == 206) {
             if (response.headers.get("Content-Range")) |value| result.content_range = try types.ContentRange.parse(value);
         }
@@ -846,8 +847,9 @@ pub const JsonApiClient = struct {
             }
         }
         if (response.content_type) |value| {
+            const replacement = try alloc.dupe(u8, value);
             if (meta.content_type) |current| alloc.free(current);
-            meta.content_type = try alloc.dupe(u8, value);
+            meta.content_type = replacement;
         }
 
         const body = response.body;
@@ -2877,4 +2879,29 @@ test "GCS expired operation deadline fails before transport dispatch" {
     defer client.deinit();
     var store = client.client();
     try std.testing.expectError(error.Timeout, store.getObject("bucket", "doc", .{ .version_id = "123", .skip_metadata_probe = true }));
+}
+
+test "GCS metadata replacement releases every partial allocation" {
+    const Fixture = struct {
+        fn request(_: ?*anyopaque, a: Allocator, _: HttpMethod, url: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+            if (std.mem.indexOf(u8, url, "alt=media") != null)
+                return transportResponseAlloc(a, 200, "x", "http-etag", "new/type", null);
+            return transportResponseAlloc(a, 200, "{\"name\":\"doc\",\"bucket\":\"bucket\",\"etag\":\"json-etag\",\"generation\":\"42\",\"size\":\"1\",\"contentType\":\"old/type\"}", null, "application/json", null);
+        }
+        fn run(a: Allocator) !void {
+            const cfg: JsonApiConfig = blk: {
+                const endpoint = try a.dupe(u8, "https://gcs.test/storage/v1");
+                errdefer a.free(endpoint);
+                break :blk .{ .endpoint = endpoint, .upload_endpoint = try a.dupe(u8, "https://gcs.test/upload/storage/v1") };
+            };
+            var provider = JsonApiClient.initWithRequestFn(a, cfg, null, request);
+            defer provider.deinit();
+            var store = provider.client();
+            var result = store.getObject("bucket", "doc", .{}) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+            defer result.deinit(a);
+            try std.testing.expectEqualStrings("new/type", result.metadata.content_type.?);
+            try std.testing.expectEqualStrings("x", result.body);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
