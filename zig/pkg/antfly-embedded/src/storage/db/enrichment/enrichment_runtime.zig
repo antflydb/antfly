@@ -44601,8 +44601,8 @@ test "model aware media local source recipes enforce current policy without load
     try authorizeModelSource(&runtime, source.input.?);
     remote.security.?.allowed_paths = &.{};
     // Retained page/replay input must not bypass policy after extraction.
-    try std.testing.expectError(error.PathNotAllowed, dispatchModelPage(&runtime, a, .{}, source.input.?));
-    try std.testing.expectError(error.PathNotAllowed, probeModelPass(&runtime, .{}, source.input.?));
+    try std.testing.expectError(error.PathNotAllowed, dispatchModelPage(&runtime, a, .{ .provider = .antfly }, source.input.?));
+    try std.testing.expectError(error.PathNotAllowed, probeModelPass(&runtime, .{ .provider = .antfly }, source.input.?));
     try std.testing.expectError(error.PathNotAllowed, extractModelChunkSource(a, .{ .io = io, .remote_content = &remote }, raw, request, null));
 }
 

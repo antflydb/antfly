@@ -81,7 +81,7 @@ pub const HTTPHeader = struct {
 /// Execution context for one remote-content operation. For HTTP/S3,
 /// `timeout_ms` is an additional ceiling and the configured timeout (or 30s
 /// default) still applies. File I/O uses caller cancellation when this is null;
-/// a nonzero file deadline fails closed because std.Io files cannot enforce it.
+/// a finite file deadline requires a caller-supplied blocking-I/O boundary.
 /// Zero disables that individual ceiling rather than the configured one.
 /// Hard quota for connection state, TLS buffers, trust roots and HTTP metadata.
 /// Bodies have a separate allocation domain and never consume this quota.
@@ -874,9 +874,8 @@ fn downloadFileAllocWithContext(
     // permanent denials even when the caller supplies a request deadline.
     try requireFileAccess(security);
     // std.Io file operations are cancelable but do not accept a deadline.
-    // Waiting for a canceled blocking filesystem task can itself remain
-    // blocked on a network filesystem, so reject a claimed time ceiling
-    // instead of returning after it has already expired.
+    // A caller-supplied execution boundary supervises potentially blocking
+    // filesystems; without one a finite deadline fails closed.
     const lease = try context.enterFileIo();
     defer lease.deinit();
     try context.check();

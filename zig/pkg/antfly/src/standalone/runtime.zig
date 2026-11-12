@@ -5720,7 +5720,8 @@ pub fn runFromIterator(
             defer if (lease) |*value| value.deinit();
             const fallback = if (lease) |value| if (value.config.security) |*security| security else null else null;
             const effective = @import("antfly_scraping").effectiveContentSecurity(self.explicit, fallback);
-            return std.json.Stringify.valueAlloc(std.heap.smp_allocator, if (effective) |value| value.* else .{}, .{});
+            const security: antfly.common.config.Config.ContentSecurityConfig = if (effective) |value| value.* else .{};
+            return std.json.Stringify.valueAlloc(std.heap.smp_allocator, security, .{});
         }
         fn release(_: ?*anyopaque, bytes: inference_bridge.String) callconv(.c) void {
             std.heap.smp_allocator.free(bytes.slice());
