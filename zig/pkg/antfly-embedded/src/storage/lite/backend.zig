@@ -341,6 +341,14 @@ pub const Handle = struct {
                 opts.index_backends.sparse_main_native_catalog_sink = self.native_catalog_sink.?.sink();
                 opts.index_backends.graph_reverse_backend = .native_catalog;
                 opts.index_backends.graph_native_catalog_sink = self.native_catalog_sink.?.sink();
+                // `.native_catalog` indexes publish segments inline through
+                // the catalog sink and never get a file-backed
+                // SegmentFileStore (see persistent.zig's index-open gate), so
+                // large-payload typed staging needs its own bounded scratch
+                // directory. Point it at the real directory that hosts this
+                // Lite file -- never the virtual `native_index_base_path`
+                // used for index namespacing below.
+                opts.index_backends.native_catalog_scratch_dir = std.fs.path.dirname(self.native_docstore.?.file.path);
                 opts.index_backends.text_lsm_storage = storage;
                 opts.index_backends.dense_lsm_storage = storage;
                 opts.index_backends.vector_block_storage = storage;
@@ -426,6 +434,10 @@ pub const Handle = struct {
         opts.index_backends.sparse_main_native_catalog_sink = self.native_catalog_sink.?.sink();
         opts.index_backends.graph_reverse_backend = .native_catalog;
         opts.index_backends.graph_native_catalog_sink = self.native_catalog_sink.?.sink();
+        // See the root-namespace configureDbOpenOptions above: bound
+        // large-payload typed staging to the real host directory, not the
+        // virtual per-namespace `index_base_path` set below.
+        opts.index_backends.native_catalog_scratch_dir = std.fs.path.dirname(self.native_docstore.?.file.path);
         opts.index_backends.text_lsm_storage = storage;
         opts.index_backends.dense_lsm_storage = storage;
         opts.index_backends.vector_block_storage = storage;
