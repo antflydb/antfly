@@ -136,9 +136,9 @@ pub fn invokeProvider(client: *Client, context: *const bridge.ProviderInvokeCont
     defer if (document_key) |key| client.unregisterDocumentStore(key);
     var input = try wire.ProviderInput.init(arena.allocator(), context);
     input.options.document_store = document_key;
-    input.options.content_security_json = context.content_security_json.slice() orelse try client.content_security_source.copy(arena.allocator());
+    const security_json = context.content_security_json.slice() orelse try client.content_security_source.copy(arena.allocator());
     const data = try std.json.Stringify.valueAlloc(arena.allocator(), input.options, .{});
-    const response = try client.invokePayload(.provider, data, .{ .body_segments = input.body.segments }, control.view());
+    const response = try client.invokePayload(.provider, data, .{ .body_segments = input.body.segments, .auxiliary = security_json orelse "" }, control.view(), security_json != null);
     defer response.deinit();
     try ForwardControl.check(&control);
     const reply_options = try std.json.parseFromSliceLeaky(wire.Reply, arena.allocator(), response.view().metadata, .{});
@@ -185,7 +185,6 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
     defer if (document_key) |key| client.unregisterDocumentStore(key);
     const security_json = context.content_security_json.slice() orelse try client.content_security_source.copy(alloc);
     const data = try std.json.Stringify.valueAlloc(alloc, wire.Http{
-        .content_security_json = security_json,
         .document_store = document_key,
         .route = route,
         .method = context.request.method,
@@ -197,7 +196,7 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
         .stream_body = stream_body,
         .streaming_body = streaming_body,
     }, .{});
-    const result = client.invoke(.http, data, body.slice() orelse "", control.view()) catch |err| {
+    const result = client.invokePayload(.http, data, .{ .body = body.slice() orelse "", .auxiliary = security_json orelse "" }, control.view(), security_json != null) catch |err| {
         if (control.stream_started) return err;
         if (err == error.BodyTooLarge) {
             var response = httpx.Response.init(client.alloc, 413);
@@ -241,6 +240,7 @@ pub const Client = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
     create_json: []u8,
+    initial_content_security: ?[]u8 = null,
     content_security_source: bridge.ContentSecuritySource = .{},
     environment: std.process.Environ.Map,
     mutex: std.Io.Mutex = .init,
@@ -285,6 +285,9 @@ pub const Client = struct {
         defer arena.deinit();
         const json = try std.json.Stringify.valueAlloc(alloc, try wire.Create.fromContext(arena.allocator(), context), .{});
         errdefer alloc.free(json);
+        const initial_security = if (context.content_security_json.slice()) |bytes| try alloc.dupe(u8, bytes) else null;
+        errdefer if (initial_security) |bytes| alloc.free(bytes);
+        if (initial_security) |bytes| if (bytes.len > rpc.max_auxiliary_bytes) return error.BodyTooLarge;
         const settings = try std.json.parseFromSliceLeaky(struct { worker_environment: []const EnvironmentEntry = &.{} }, arena.allocator(), context.runtime_config_json.slice(), .{ .ignore_unknown_fields = true });
         var environment = std.process.Environ.Map.init(alloc);
         errdefer environment.deinit();
@@ -296,7 +299,7 @@ pub const Client = struct {
             try environment.put(entry.name, entry.value);
         }
         const self = try alloc.create(Client);
-        self.* = .{ .alloc = alloc, .io = io, .create_json = json, .environment = environment, .content_security_source = context.content_security_source };
+        self.* = .{ .alloc = alloc, .io = io, .create_json = json, .initial_content_security = initial_security, .environment = environment, .content_security_source = context.content_security_source };
         return self;
     }
 
@@ -316,6 +319,7 @@ pub const Client = struct {
         if (self.worker) |worker| worker.destroy();
         if (self.budget) |budget| budget.release_context(budget.context);
         self.alloc.free(self.create_json);
+        if (self.initial_content_security) |bytes| self.alloc.free(bytes);
         self.environment.deinit();
         self.alloc.destroy(self);
     }
@@ -367,8 +371,8 @@ pub const Client = struct {
         errdefer worker.child.kill(self.io);
         try worker.endpoint.start();
         errdefer worker.endpoint.deinit();
-        const initialized = try call(&worker.endpoint, .initialize, self.create_json, control);
-        self.alloc.free(initialized);
+        const initialized = try callSegments(&worker.endpoint, .initialize, "", .{ .body = self.create_json, .auxiliary = self.initial_content_security orelse "" }, control, self.initial_content_security != null);
+        initialized.deinit();
         const configured = try call(&worker.endpoint, .configure, "", control);
         self.alloc.free(configured);
         self.generation += 1;
@@ -378,10 +382,10 @@ pub const Client = struct {
     }
 
     pub fn invoke(self: *Client, operation: wire.Operation, options: []const u8, data: []const u8, control: rpc.Control) !rpc.OwnedPayload {
-        return self.invokePayload(operation, options, .{ .body = data }, control);
+        return self.invokePayload(operation, options, .{ .body = data }, control, false);
     }
 
-    fn invokePayload(self: *Client, operation: wire.Operation, options: []const u8, payload: rpc.Payload, control: rpc.Control) !rpc.OwnedPayload {
+    fn invokePayload(self: *Client, operation: wire.Operation, options: []const u8, payload: rpc.Payload, control: rpc.Control, has_security: bool) !rpc.OwnedPayload {
         while (!self.mutex.tryLock()) {
             if (control.check) |check| try check(control.ptr);
             try self.io.sleep(.fromMilliseconds(1), .awake);
@@ -397,20 +401,20 @@ pub const Client = struct {
             self.active -= 1;
             self.mutex.unlock(self.io);
         }
-        const result = try callSegments(&worker.endpoint, operation, options, payload, control);
+        const result = try callSegments(&worker.endpoint, operation, options, payload, control, has_security);
         // Hand off an independent response before releasing this worker lease.
         return result.detach();
     }
 };
 
 fn callPayload(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []const u8, data: []const u8, control: rpc.Control) !rpc.OwnedPayload {
-    return callSegments(endpoint, operation, options, .{ .body = data }, control);
+    return callSegments(endpoint, operation, options, .{ .body = data }, control, false);
 }
 
-fn callSegments(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []const u8, payload: rpc.Payload, control: rpc.Control) !rpc.OwnedPayload {
+fn callSegments(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []const u8, payload: rpc.Payload, control: rpc.Control, has_security: bool) !rpc.OwnedPayload {
     const alloc = endpoint.alloc;
     if (options.len > rpc.max_metadata_bytes) return error.BodyTooLarge;
-    const header = try std.json.Stringify.valueAlloc(alloc, wire.Request{ .operation = operation, .options = options }, .{});
+    const header = try std.json.Stringify.valueAlloc(alloc, wire.Request{ .operation = operation, .options = options, .has_content_security = has_security }, .{});
     defer alloc.free(header);
     var framed = payload;
     framed.metadata = header;
@@ -534,7 +538,8 @@ fn reply(endpoint: *rpc.Endpoint, status: bridge.Status, options: []const u8, bo
 fn requestEnvelope(arena: std.mem.Allocator, request: *rpc.Request) !wire.Envelope {
     const payload = request.payload.view();
     const header = try std.json.parseFromSliceLeaky(wire.Request, arena, payload.metadata, .{});
-    return .{ .operation = header.operation, .options = header.options, .data = payload.body };
+    if (!header.has_content_security and payload.auxiliary.len != 0) return error.InvalidWorkerFrame;
+    return .{ .operation = header.operation, .options = header.options, .data = payload.body, .content_security_json = if (header.has_content_security) payload.auxiliary else null };
 }
 
 const Observation = struct { key: u64, bytes: u64 = 0, tokenizer: bool };
@@ -751,7 +756,8 @@ const Child = struct {
             const create_arena = self.create_arena.allocator();
             const create = try std.json.parseFromSliceLeaky(wire.Create, create_arena, envelope.data, .{ .allocate = .alloc_always });
             var out: ?*anyopaque = null;
-            const context = try create.toContext(create_arena, &self.io, &out);
+            var context = try create.toContext(create_arena, &self.io, &out);
+            context.content_security_json = .init(envelope.content_security_json);
             self.state = @ptrCast(@alignCast(try host.linkedInferenceCreateLocal(&context, true)));
             return reply(&self.endpoint, .ok, "", "");
         }
@@ -808,7 +814,7 @@ const Child = struct {
                     .abi_version = bridge.abi_version,
                     .handle = state,
                     .operation = provider.operation,
-                    .content_security_json = .init(provider.content_security_json),
+                    .content_security_json = .init(envelope.content_security_json),
                     .request_json = .init(media.metadata),
                     .deadline_ns = provider.deadline_ns orelse 0,
                     .has_deadline = @intFromBool(provider.deadline_ns != null),
@@ -867,7 +873,7 @@ const Child = struct {
                 try host.linkedInferenceHandleHttp(&.{
                     .abi_version = bridge.abi_version,
                     .route_handle = route_handle,
-                    .content_security_json = .init(incoming.content_security_json),
+                    .content_security_json = .init(envelope.content_security_json),
                     .request = &view,
                     .document_store = if (documents) |binding| binding.view() else .{},
                     .cancellation = .{ .context = request, .is_cancelled = cancelled },
@@ -1299,7 +1305,7 @@ const ForwardDocuments = struct {
         const a = self.child.alloc;
         const options = try std.json.Stringify.valueAlloc(a, wire.DocumentStoreRequest{ .capability = self.key, .metadata = metadata }, .{});
         defer a.free(options);
-        const payload = try callSegments(&self.child.endpoint, .document_store, options, .{ .body = body }, .{});
+        const payload = try callSegments(&self.child.endpoint, .document_store, options, .{ .body = body }, .{}, false);
         errdefer payload.deinit();
         var parsed = try std.json.parseFromSlice(wire.Reply, a, payload.view().metadata, .{});
         errdefer parsed.deinit();

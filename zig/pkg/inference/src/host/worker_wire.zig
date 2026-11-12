@@ -17,11 +17,11 @@ const std = @import("std");
 const bridge = @import("antfly_inference_bridge");
 const http = @import("antfly_runtime_abi").http_abi;
 
-pub const version: u32 = 7;
+pub const version: u32 = 8;
 // Only options are JSON metadata. The application payload is carried raw.
-pub const Request = struct { operation: Operation, options: []const u8 = "" };
+pub const Request = struct { operation: Operation, options: []const u8 = "", has_content_security: bool = false };
 pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
-pub const Envelope = struct { operation: Operation, options: []const u8 = "", data: []const u8 };
+pub const Envelope = struct { operation: Operation, options: []const u8 = "", data: []const u8, content_security_json: ?[]const u8 = null };
 pub const Operation = enum { initialize, configure, provider, http, reserve, retain, release, prompt_cache, tokenizer_cache, document_store };
 pub const Reply = struct { status: bridge.Status = .ok, options: []const u8 = "" };
 pub const Event = struct {
@@ -63,7 +63,6 @@ pub const Create = struct {
     keep_alive: ?[]const u8,
     max_loaded_models: i64,
     has_max_loaded_models: u8,
-    content_security_json: ?[]const u8,
     s3_credentials_json: ?[]const u8,
     runtime_config_json: []const u8,
 
@@ -95,7 +94,6 @@ pub const Create = struct {
             .keep_alive = context.keep_alive.slice(),
             .max_loaded_models = context.max_loaded_models,
             .has_max_loaded_models = context.has_max_loaded_models,
-            .content_security_json = context.content_security_json.slice(),
             .s3_credentials_json = context.s3_credentials_json.slice(),
             .runtime_config_json = context.runtime_config_json.slice(),
         };
@@ -132,7 +130,6 @@ pub const Create = struct {
             .keep_alive = .init(self.keep_alive),
             .max_loaded_models = self.max_loaded_models,
             .has_max_loaded_models = self.has_max_loaded_models,
-            .content_security_json = .init(self.content_security_json),
             .s3_credentials_json = .init(self.s3_credentials_json),
             .runtime_config_json = .init(self.runtime_config_json),
             .executor = .init(io),
@@ -175,7 +172,6 @@ pub const AttachmentRef = struct {
     page_number: ?u32,
 };
 pub const Provider = struct {
-    content_security_json: ?[]const u8 = null,
     document_store: ?[16]u8 = null,
     operation: c_int,
     deadline_ns: ?u64,
@@ -268,7 +264,6 @@ pub const ProviderOutput = struct {
 };
 pub const Header = struct { name: []const u8, value: []const u8 };
 pub const Http = struct {
-    content_security_json: ?[]const u8 = null,
     document_store: ?[16]u8 = null,
     streaming_body: bool = false,
     route: []const u8,
@@ -416,23 +411,5 @@ test "native checkpoint worker streaming stays limited to exact POST resume rout
         try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/generate/context/resume/"));
         try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/generate/context/checkpoint"));
         try std.testing.expect(!nativeCheckpointResume(.post, prefix ++ "/chat/completions"));
-    }
-}
-
-test "content security snapshot crosses provider and HTTP wire values per request" {
-    const a = std.testing.allocator;
-    for ([_][]const u8{ "{\"allowed_paths\":[\"/expanded\"]}", "{\"allowed_paths\":[]}" }) |policy| {
-        const provider = Provider{ .content_security_json = policy, .operation = 0, .deadline_ns = 123, .numeric = false, .attachment_refs = &.{} };
-        const json = try std.json.Stringify.valueAlloc(a, provider, .{});
-        defer a.free(json);
-        var decoded = try std.json.parseFromSlice(Provider, a, json, .{});
-        defer decoded.deinit();
-        try std.testing.expectEqualStrings(policy, decoded.value.content_security_json.?);
-        const request = Http{ .content_security_json = policy, .route = "/chunk", .method = .post, .path = "/chunk", .query = null, .headers = &.{}, .params = &.{}, .has_body = false };
-        const http_json = try std.json.Stringify.valueAlloc(a, request, .{});
-        defer a.free(http_json);
-        var http_decoded = try std.json.parseFromSlice(Http, a, http_json, .{});
-        defer http_decoded.deinit();
-        try std.testing.expectEqualStrings(policy, http_decoded.value.content_security_json.?);
     }
 }

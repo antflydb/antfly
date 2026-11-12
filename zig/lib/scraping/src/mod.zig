@@ -1073,11 +1073,14 @@ pub const PinnedRange = struct {
             var key_hash = std.crypto.hash.sha2.Sha256.init(.{});
             key_hash.update(self.identity);
             const key = key_hash.finalResult();
-            const verification = if (cache) |receipts| try receipts.acquire(context, key) else null;
-            defer if (verification) |verification_lease| verification_lease.deinit();
-            try local.check(context.io);
             const cached_digest = if (cache) |receipts| receipts.lookup(key, stat) else null;
             const digest = cached_digest orelse computed: {
+                const verification = if (cache) |receipts| try receipts.acquire(context, key) else null;
+                defer if (verification) |lease| lease.deinit();
+                // A preceding verifier may have populated the receipt while
+                // this request waited. Warm hits never occupy flight slots.
+                try local.check(context.io);
+                if (cache) |receipts| if (receipts.lookup(key, stat)) |digest| break :computed digest;
                 if (cache) |receipts| _ = receipts.hash_count.fetchAdd(1, .monotonic);
                 // Hash outside the cache lock. Warm continuation requests use
                 // verified metadata without rescanning a multi-GB recording.
@@ -3257,4 +3260,45 @@ test "local source cancellation during hashing releases verification and publish
     for (cache.flights) |flight| try std.testing.expectEqual(@as(usize, 0), flight.references);
     const range = try PinnedRange.createWithLocalCache(a, .{ .io = base }, fixture.uri, &fixture.version, .file_sha256, fixture.length, &security, null, &.{}, &cache);
     defer range.destroy();
+}
+
+test "warm local receipts bypass busy and saturated verification flights" {
+    const a = std.testing.allocator;
+    var fixture = try LocalSourceFixture.init(a, "0123456789");
+    defer fixture.deinit();
+    const paths = [_][]u8{fixture.path};
+    const security = ContentSecurityConfig{ .allowed_paths = &paths };
+    var cache: LocalVerificationCache = .{};
+    const cold = try PinnedRange.createWithLocalCache(a, .{ .io = std.testing.io }, fixture.uri, &fixture.version, .file_sha256, fixture.length, &security, null, &.{}, &cache);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(cold.identity);
+    const actual_key = hash.finalResult();
+    cold.destroy();
+    var leases: [64]LocalVerificationCache.VerificationLease = undefined;
+    var held: usize = 0;
+    defer for (leases[0..held]) |lease| lease.deinit();
+    for (&leases, 0..) |*lease, i| {
+        var key: [32]u8 = @splat(0);
+        std.mem.writeInt(u64, key[0..8], i, .little);
+        if (i == 0) key = actual_key;
+        lease.* = try cache.acquire(DownloadContext{ .io = std.testing.io }, key);
+        held += 1;
+    }
+    // Also hold this file's own flight: a warm request must not wait for it.
+    // A regression must fail promptly instead of hanging this test forever.
+    const Deadline = struct {
+        expires: u64,
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return @import("antfly_platform").time.monotonicNs() >= self.expires;
+        }
+    };
+    const deadline = Deadline{ .expires = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s };
+    const warm = try PinnedRange.createWithLocalCache(a, .{ .io = std.testing.io, .cancellation = CancellationToken.fromCallback(&deadline, Deadline.cancelled) }, fixture.uri, &fixture.version, .file_sha256, fixture.length, &security, null, &.{}, &cache);
+    defer warm.destroy();
+    var bytes: [4]u8 = undefined;
+    _ = try warm.readAt(6, &bytes);
+    try std.testing.expectEqualStrings("6789", &bytes);
+    try std.testing.expectEqual(@as(u64, 1), cache.hash_count.load(.monotonic));
+    try std.testing.expectError(error.SourceVersionChanged, PinnedRange.createWithLocalCache(a, .{ .io = std.testing.io }, fixture.uri, "0000000000000000000000000000000000000000000000000000000000000000", .file_sha256, fixture.length, &security, null, &.{}, &cache));
 }

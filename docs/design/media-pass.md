@@ -83,7 +83,11 @@ reader independently checks both the lexical path and the canonical open
 descriptor path, rejecting symlink escapes and nonregular files. Empty or omitted
 path allowlists deny access. Standalone inference inherits a fresh trusted
 snapshot of the storage policy on each request, including requests sent through
-the supervised worker. Explicit inference content-security configuration retains
+the supervised worker. Policy bytes occupy a separately bounded 1 MiB raw RPC
+section, sharing receive admission without consuming the 1 MiB metadata or
+64 MiB application-body limits. Startup policy uses the same section. JSON
+escaping does not amplify policy memory or reduce application-body capacity.
+Explicit inference content-security configuration retains
 precedence; separately deployed inference must configure its own allowlist.
 Storage does not open the file and need not mount the inference filesystem.
 
@@ -96,8 +100,10 @@ authorize the file and compare inode, size, mtime and ctime. Concurrent cold
 requests for the same file share one verification; unrelated files verify
 independently. The cache records the actual digest independently of the caller's
 claim, so incorrect claims cannot trigger repeated scans of unchanged bytes.
-At most 64 distinct verifications can be outstanding; saturation returns a
-retryable resource error. Cancelled waiters release their slots. Cache misses
+Warm receipt hits bypass verification coordination, including when the same
+file has a busy verification slot or all slots are occupied. At most 64 distinct
+cold verifications can be outstanding; saturation returns a retryable resource
+error for misses. Cancelled waiters release their slots. Cache misses
 and metadata changes require a fresh hash; receipts never survive process
 restart. No file contents or decoded media are retained by this cache.
 
@@ -118,3 +124,12 @@ three 4 KiB reads across the file, and reuse after an incorrect digest claim.
 On the development machine the cold verification took 648 ms and the warm open
 plus reads took 1 ms, using 1,646 allocator bytes. These are local filesystem
 measurements, excluding media decoding and model execution.
+
+Run `zig build lib-scraping-test inference-content-security-test
+inference-worker-transport-test` from `zig/` for transport, decoder, live-policy
+and worker-framing regressions. After building `antfly`, run
+`ANTFLY_WORKER_TRANSPORT_TESTS=1 uv run --project zig/e2e/antfly pytest
+zig/e2e/antfly/test_inference_worker_transport.py -k live_local_policy` from the
+repository root to qualify large startup/reloaded policies, CPU worker launch,
+local authorization, exact 64 MiB body limits and replacement after SIGKILL.
+This test requires no model weights.

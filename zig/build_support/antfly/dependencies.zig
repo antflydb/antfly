@@ -1255,9 +1255,15 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     inference_host_mod.addImport("antfly_inference_worker_wire", inference_worker_wire_mod);
     inference_host_mod.addImport("antfly_inference_provider_failure", inference_provider_failure_mod);
     const content_security_tests = b.step("inference-content-security-test", "Qualify live policy snapshots across local and worker inference boundaries");
-    for ([_]*std.Build.Module{ inference_bridge_mod, inference_worker_wire_mod, inference_host_mod, inference_server_mod }) |module| {
+    for ([_]*std.Build.Module{ inference_bridge_mod, inference_worker_wire_mod, inference_host_mod, inference_server_mod, inference_worker_rpc_mod }) |module| {
         const tests = b.addTest(.{ .root_module = module, .filters = &.{ "content security snapshot", "local source policy", "model aware media local source" } });
         content_security_tests.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    const worker_transport_tests = b.step("inference-worker-transport-test", "Qualify bounded native worker framing, admission, cancellation and policy transport");
+    for ([_]*std.Build.Module{ inference_worker_wire_mod, inference_worker_rpc_mod }) |module| {
+        const tests = b.addTest(.{ .root_module = module });
+        worker_transport_tests.dependOn(&b.addRunArtifact(tests).step);
     }
 
     // Native products always reuse the compiled Apache owners. Source-only
