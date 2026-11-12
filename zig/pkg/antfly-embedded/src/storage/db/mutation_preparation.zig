@@ -998,7 +998,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         else => return err,
                     };
                     defer if (old) |raw| alloc.free(raw);
-                    request.reprocess_generation = if (old) |raw| try intent.generationForConfig(raw, request.producer_json) else 0;
+                    request.reprocess_generation = if (old) |raw| try intent.generation(raw) else 0;
                     if (containsName(force_generated_artifact_names, requestEmbeddingName(request.*))) {
                         request.reprocess_generation = std.math.add(u64, request.reprocess_generation, 1) catch return error.ResourceLimitExceeded;
                         const encoded = intent.encode(request.producer_json, request.reprocess_generation);
