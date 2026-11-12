@@ -107,6 +107,7 @@ fn cancellation(context: Context) Cancellation {
     return if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none;
 }
 const Aggregate = struct { required: u16 = 1, ready: u16 = 0, until_ms: u64 = std.math.maxInt(u64), last_error: ?[]const u8 = null, next_retry_ms: u64 = 0 };
+const BuildMode = enum { observe, background, query };
 pub fn prepare(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64, memo: ?*Cache) !Prepared {
     if (publication.reader_protocol < 102 or !hasRecipes(declarations)) return prepareLegacy(a, table, publication, overlay, declarations, store, context, options, build, cut_expires_ms, memo);
     return prepareRecipes(a, table, publication, overlay, declarations, store, context, options, build, cut_expires_ms, memo, true);
@@ -141,8 +142,28 @@ pub fn prepareQuery(a: A, table: local.common_topology_records.TableRecord, publ
     if (publication.reader_protocol < 102) return prepareLegacy(a, table, publication, overlay, declarations, store, context, options, false, cut_expires_ms, memo);
     const selected = try selectedRecipes(a, declarations, req);
     defer a.free(selected);
+    // Restart cannot make a durable accepted cut depend on winning a race with
+    // the background scheduler. Repair only the requested recipes, under the
+    // caller's deadline, joining a live claim rather than duplicating its work.
+    // Callers without an I/O runtime remain observation-only.
+    const Budget = struct {
+        parent: Context,
+        provider: ?Cancellation,
+        deadline: u64,
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return @import("antfly_platform").time.monotonicNs() >= self.deadline or self.parent.isCancelled() or (if (self.provider) |token| token.isCancelled() else false);
+        }
+    };
+    var budget: Budget = .{ .parent = context, .provider = options.cancellation, .deadline = @min(@min(context.deadline_ns orelse std.math.maxInt(u64), options.deadline_ns orelse std.math.maxInt(u64)), @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s) };
+    var bounded = context;
+    bounded.deadline_ns = budget.deadline;
+    bounded.cancellation = .{ .ptr = &budget, .is_cancelled_fn = Budget.canceled };
+    var bounded_options = options;
+    bounded_options.deadline_ns = budget.deadline;
+    bounded_options.cancellation = .{ .ptr = &budget, .is_cancelled_fn = Budget.canceled };
     // A read cannot publish table-wide readiness from a selected recipe subset.
-    return prepareRecipes(a, table, publication, overlay, selected, store, context, options, false, cut_expires_ms, memo, false);
+    return prepareRecipes(a, table, publication, overlay, selected, store, bounded, bounded_options, false, cut_expires_ms, memo, false);
 }
 fn supplied(configs: V, name: []const u8) bool {
     const config = configs.object.get(name) orelse return false;
@@ -164,7 +185,8 @@ fn prepareRecipes(a: A, table: local.common_topology_records.TableRecord, public
         if (!isRecipe(declaration) or supplied(configs, declaration.name) != manual) continue;
         try context.ensureActive();
         var recipe_progress: Aggregate = .{};
-        const prepared = preparePartitions(work, table, publication, overlay, &.{declaration}, store, context, options, build, cut_expires_ms, memo, &recipe_progress) catch |err| {
+        const mode: BuildMode = if (build) .background else if (!table_status and context.io != null and !store.implementation.read_only) .query else .observe;
+        const prepared = preparePartitions(work, table, publication, overlay, &.{declaration}, store, context, options, mode, cut_expires_ms, memo, &recipe_progress) catch |err| {
             aggregate.required = @max(aggregate.required, recipe_progress.required);
             aggregate.ready = @min(aggregate.ready, recipe_progress.ready);
             if (recipe_progress.last_error) |value| aggregate.last_error = value;
@@ -193,7 +215,7 @@ fn prepareRecipes(a: A, table: local.common_topology_records.TableRecord, public
 }
 fn prepareLegacy(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64, memo: ?*Cache) !Prepared {
     var aggregate: Aggregate = .{};
-    const prepared = preparePartitions(a, table, publication, overlay, declarations, store, context, options, build, cut_expires_ms, memo, &aggregate) catch |err| {
+    const prepared = preparePartitions(a, table, publication, overlay, declarations, store, context, options, if (build) .background else .observe, cut_expires_ms, memo, &aggregate) catch |err| {
         if (err == error.IndexRebuilding) _ = try publishStatus(a, table, publication, overlay, store, context, if (aggregate.last_error != null) .failed else .building, cut_expires_ms, aggregate);
         return err;
     };
@@ -207,12 +229,12 @@ fn prepareLegacy(a: A, table: local.common_topology_records.TableRecord, publica
     if (observed) if (memo) |cache| cache.put(aggregate_key, .{ .declarations = &.{} }, aggregate.until_ms);
     return prepared;
 }
-fn preparePartitions(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64, memo: ?*Cache, aggregate: *Aggregate) !Prepared {
+fn preparePartitions(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, mode: BuildMode, cut_expires_ms: u64, memo: ?*Cache, aggregate: *Aggregate) !Prepared {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const sa = arena.allocator();
     const parts = try overlay.partitions(sa);
-    if (parts.len == 0) return prepareWhole(a, table, publication, overlay, declarations, store, context, options, build, cut_expires_ms, memo, aggregate);
+    if (parts.len == 0) return preparePartition(a, table, publication, overlay, declarations, store, context, options, mode, cut_expires_ms, memo, aggregate);
     aggregate.required = 0;
     var last_prefix: ?u8 = null;
     for (parts) |part| {
@@ -238,13 +260,29 @@ fn preparePartitions(a: A, table: local.common_topology_records.TableRecord, pub
         var digest: [32]u8 = undefined;
         hash.final(&digest);
         subset.pending.cut_identity = digest;
-        const prepared = try prepareWhole(a, table, publication, &subset, declarations, store, context, options, build, cut_expires_ms, memo, aggregate);
+        const prepared = try preparePartition(a, table, publication, &subset, declarations, store, context, options, mode, cut_expires_ms, memo, aggregate);
         try runs.append(a, .{ .prefix = prefix, .digest = digest, .declarations = prepared.declarations, .cloud_generations = prepared.cloud_generations });
         start = end;
     }
     return .{ .declarations = runs.items[0].declarations, .runs = try runs.toOwnedSlice(a), .expires_ms = aggregate.until_ms };
 }
-fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, build: bool, cut_expires_ms: u64, memo: ?*Cache, aggregate: *Aggregate) !Prepared {
+fn preparePartition(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, mode: BuildMode, cut_expires_ms: u64, memo: ?*Cache, aggregate: *Aggregate) !Prepared {
+    var delay_ms: u32 = 10;
+    while (true) {
+        return prepareWhole(a, table, publication, overlay, declarations, store, context, options, mode, cut_expires_ms, memo, aggregate) catch |err| {
+            if (err != error.RecentVectorBuildInProgress) return err;
+            // Only query callers join a claim. Failed jobs retain their retry
+            // backoff; expired claims remain recoverable through the same CAS.
+            std.debug.assert(mode == .query);
+            try context.ensureActive();
+            try context.io.?.sleep(.fromMilliseconds(delay_ms), .awake);
+            try context.ensureActive();
+            delay_ms = @min(delay_ms * 2, 100);
+            continue;
+        };
+    }
+}
+fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publication: local.metadata_lake_index_catalog.Publication, overlay: *const overlay_api.Overlay, declarations: []const Declared, store: *Store, context: Context, options: local.inference_managed_embedder.InitOptions, mode: BuildMode, cut_expires_ms: u64, memo: ?*Cache, aggregate: *Aggregate) !Prepared {
     try context.ensureActive();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -282,8 +320,9 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
         aggregate.until_ms = @min(aggregate.until_ms, job.expires_ms);
         return std.json.parseFromSliceLeaky(Prepared, a, encoded, .{ .allocate = .alloc_always });
     }
-    if (!build) return error.IndexRebuilding;
-    if ((job.state == .building and job.lease_until_ms > now) or (job.state == .failed and job.next_retry_ms > now)) return error.IndexRebuilding;
+    if (mode == .observe) return error.IndexRebuilding;
+    if (job.state == .failed and job.next_retry_ms > now) return error.IndexRebuilding;
+    if (job.state == .building and job.lease_until_ms > now) return if (mode == .query) error.RecentVectorBuildInProgress else error.IndexRebuilding;
     const io = context.io orelse return error.UnsupportedQueryRequest;
     job.state = .building;
     job.lease_until_ms = now +| 120_000;
@@ -297,7 +336,7 @@ fn prepareWhole(a: A, table: local.common_topology_records.TableRecord, publicat
     job.declarations = &.{};
     job.cloud_generations = null;
     var claimed = client.compareAndPut(store.opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, job, .{}), if (saved) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else null }) catch |err| switch (err) {
-        error.PreconditionFailed, error.ObjectAlreadyExists => return error.IndexRebuilding,
+        error.PreconditionFailed, error.ObjectAlreadyExists => return if (mode == .query) error.RecentVectorBuildInProgress else error.IndexRebuilding,
         else => {
             // A canceled/lost response may follow a successful claim write.
             // Recover only our random ownership token within the same bounded
@@ -879,4 +918,95 @@ test "external lake bounded WAL recipe readiness is durable selected and cannot 
     var old_publication = publication;
     old_publication.reader_protocol = 101;
     try std.testing.expectError(error.IndexRebuilding, prepareQuery(work, table, old_publication, &overlay, &.{ managed, manual }, &reader, .{}, .{}, now + 300_000, null, req));
+    var status_before = try client.getObject(store.opened.bucket, status_key, .{});
+    defer status_before.deinit(client.allocator);
+
+    // A foreground query joins a worker for its exact recipe, without claiming
+    // another job or publishing subset readiness. Deterministic completion on
+    // the second GET avoids depending on thread scheduling in this regression.
+    const objectstore = @import("objectstore");
+    const Worker = struct {
+        base: objectstore.Client,
+        ready_bytes: []const u8,
+        complete: bool = true,
+        gets: usize = 0,
+        puts: usize = 0,
+        cancel_on_get: bool = false,
+        cancelled: bool = false,
+        fn get(raw: *anyopaque, owned: A, bucket: []const u8, path: []const u8, opts: objectstore.GetOptions) !objectstore.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.gets += 1;
+            var base = self.base;
+            base.allocator = owned;
+            if (self.complete and self.gets == 2) {
+                var completed = try base.putObject(bucket, path, self.ready_bytes, .{});
+                completed.deinit(owned);
+            }
+            if (self.cancel_on_get) self.cancelled = true;
+            return base.getObject(bucket, path, opts);
+        }
+        fn put(raw: *anyopaque, _: A, _: []const u8, _: []const u8, _: []const u8, _: objectstore.PutOptions) !objectstore.PutResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.puts += 1;
+            return error.UnexpectedForegroundWrite;
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.cancelled;
+        }
+    };
+    const base = reader.opened.client;
+    defer reader.opened.client = base;
+    var worker: Worker = .{ .base = base, .ready_bytes = try std.json.Stringify.valueAlloc(work, job, .{}) };
+    var vtable = base.vtable.*;
+    vtable.get_object = Worker.get;
+    vtable.put_object = Worker.put;
+    reader.opened.client = .{ .allocator = base.allocator, .ptr = &worker, .vtable = &vtable };
+    var building = job;
+    building.state = .building;
+    building.lease_until_ms = now + 120_000;
+    var active = try client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(work, building, .{}), .{});
+    active.deinit(client.allocator);
+    const context: Context = .{ .io = std.testing.io };
+    const joined = try prepareQuery(work, table, publication, &overlay, &.{ managed, manual }, &reader, context, .{}, now + 300_000, null, req);
+    try std.testing.expectEqualStrings("manual", joined.declarations[0].name);
+    try std.testing.expectEqual(@as(usize, 2), worker.gets);
+    try std.testing.expectEqual(@as(usize, 0), worker.puts);
+    var status_after = try client.getObject(store.opened.bucket, status_key, .{});
+    defer status_after.deinit(client.allocator);
+    try std.testing.expectEqualStrings(status_before.body, status_after.body);
+
+    active = try client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(work, building, .{}), .{});
+    active.deinit(client.allocator);
+    worker.gets = 0;
+    worker.complete = false;
+    var bounded = context;
+    bounded.deadline_ns = @import("antfly_platform").time.monotonicNs() + 20 * std.time.ns_per_ms;
+    try std.testing.expectError(error.DeadlineExceeded, prepareQuery(work, table, publication, &overlay, &.{manual}, &reader, bounded, .{}, now + 300_000, null, req));
+    try std.testing.expect(worker.gets > 0);
+    try std.testing.expectEqual(@as(usize, 0), worker.puts);
+    reader.implementation.read_only = true;
+    worker.gets = 0;
+    try std.testing.expectError(error.IndexRebuilding, prepareQuery(work, table, publication, &overlay, &.{manual}, &reader, context, .{}, now + 300_000, null, req));
+    try std.testing.expectEqual(@as(usize, 1), worker.gets);
+    try std.testing.expectEqual(@as(usize, 0), worker.puts);
+    reader.implementation.read_only = false;
+    worker.cancel_on_get = true;
+    bounded = context;
+    bounded.cancellation = .{ .ptr = &worker, .is_cancelled_fn = Worker.canceled };
+    try std.testing.expectError(error.Canceled, prepareQuery(work, table, publication, &overlay, &.{manual}, &reader, bounded, .{}, now + 300_000, null, req));
+    worker.cancel_on_get = false;
+    worker.cancelled = false;
+
+    // Genuine provider/model failures retain their backoff: query admission
+    // must not turn a failing recipe into a request-driven retry storm.
+    building.state = .failed;
+    building.last_error = "ProviderUnavailable";
+    building.next_retry_ms = now + 120_000;
+    active = try client.putObject(store.opened.bucket, key, try std.json.Stringify.valueAlloc(work, building, .{}), .{});
+    active.deinit(client.allocator);
+    worker.gets = 0;
+    try std.testing.expectError(error.IndexRebuilding, prepareQuery(work, table, publication, &overlay, &.{manual}, &reader, context, .{}, now + 300_000, null, req));
+    try std.testing.expectEqual(@as(usize, 1), worker.gets);
+    try std.testing.expectEqual(@as(usize, 0), worker.puts);
 }

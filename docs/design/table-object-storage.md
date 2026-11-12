@@ -779,6 +779,15 @@ carry those exact runs. Older publications retain their prior interpretation;
 the coordinator republishes vector declarations under the new capability before
 using independent recipe cuts. Compatible text-only publications remain reusable.
 
+An unretained vector query can repair missing selected recipe partitions after
+restart using the same durable CAS claims as background reconciliation. It joins
+an active worker with bounded polling rather than returning a readiness error
+solely because recovery has not been scheduled yet. Repair and waiting share the
+request deadline (at most 30 seconds) and cancellation; they do not refresh the
+budget per partition. Ready partitions are reused, provider/model failure backoff
+is preserved, and a selected query cannot advance table-wide coverage. Retained
+snapshots remain observation-only and require their already protected runs.
+
 The first implementation's five-second accepted-write preparation window remains
 best effort, not a general full-index acknowledgement: caller deadlines and
 cancellation remain authoritative. Pending managed enrichment can still return
