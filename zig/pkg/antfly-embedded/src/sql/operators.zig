@@ -731,6 +731,7 @@ pub const Aggregate = struct {
         try self.addDistinctCount(try support.merge(self.alloc, source));
     }
     pub fn update(self: *Aggregate, value: Datum) !void {
+        _ = try value.requireValue();
         if (self.wide) |wide| return wide.add(value, @import("catalog.zig").Count.one);
         if (value.sql_null) {
             if (self.patterns) |state| {
@@ -3382,6 +3383,7 @@ pub const Grouped = struct {
 };
 
 pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
+    if (value.failure != null) return value;
     if (value.numeric) |number| {
         if (value.sql_null or value.array != null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
         const exact = @import("numeric_value.zig");

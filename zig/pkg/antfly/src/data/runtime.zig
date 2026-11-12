@@ -12465,37 +12465,7 @@ pub const DataServer = struct {
         }
         var reader = try owners.openRetainedRead(a, group, table_name, .{ .fence = fence, .start_ns = try std.fmt.parseInt(i128, request.start_ns, 10), .end_ns = try std.fmt.parseInt(i128, request.end_ns, 10), .admitted_ns = now, .dimensions_json = request.dimensions_json, .after = request.after }, context);
         defer reader.deinit();
-        var rows: std.ArrayList(local.storage_retained_series.Bucket) = .empty;
-        var encoded_bytes: usize = 0;
-        var position: ?local.storage_retained_series.Cursor = null;
-        var root: []const u8 = "";
-        var next_key: ?local.retained_dataset_types.RowKey = null;
-        var observation: ?read_api.Observation = null;
-        var admitted_ns: i128 = now;
-        while (true) {
-            const raw = try reader.nextJson(a, @min(128, request.limit - @as(u32, @intCast(rows.items.len))), context);
-            if (raw.len > @import("../api/retained_dataset_read.zig").max_result_bytes - encoded_bytes) return error.DatasetPageBudgetExceeded;
-            encoded_bytes += raw.len;
-            const page = try std.json.parseFromSliceLeaky(struct { root_incarnation: []const u8, page: local.storage_retained_series.Page }, a, raw, .{});
-            if (position) |prior| {
-                if (!std.meta.eql(prior, page.page.cursor) or !std.mem.eql(u8, root, page.root_incarnation)) return error.RetainedSeriesResetRequired;
-            } else {
-                position = page.page.cursor;
-                root = page.root_incarnation;
-                observation = .{ .root = try std.fmt.parseInt(u128, root, 10), .cursor = page.page.cursor, .source_sequence = page.page.source_sequence, .admitted_ns = try read_api.Observation.retentionBoundary(admission.spec, page.page.admitted_ns) };
-                admitted_ns = @max(now, page.page.admitted_ns);
-            }
-            if (page.page.rows.len > request.limit - rows.items.len) return error.DatasetPageBudgetExceeded;
-            try rows.appendSlice(a, page.page.rows);
-            if (page.page.after == null) break;
-            if (rows.items.len == request.limit) {
-                if (!request.allow_more) return error.DatasetPageBudgetExceeded;
-                next_key = local.storage_retained_series_archive.key(rows.items[rows.items.len - 1]);
-                break;
-            }
-        }
-        try context.ensureActive();
-        return std.json.Stringify.valueAlloc(alloc, @import("../api/retained_dataset_read.zig").NativeReply{ .rows = rows.items, .root_incarnation = root, .cursor = position orelse return error.RetainedSeriesNotReady, .next = next_key, .admitted_ns = admitted_ns, .observation = observation }, .{});
+        return @import("../api/retained_native_materialize.zig").collect(self.alloc, alloc, &reader, request, admission.spec, now, context);
     }
 
     fn executeRetainedOwnerControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.retained_owner_control.Request, input: antfly.public_api.operation.RequestContext) !antfly.public_api.retained_owner_control.Response {

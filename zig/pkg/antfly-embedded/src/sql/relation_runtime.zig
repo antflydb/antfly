@@ -3841,6 +3841,13 @@ pub fn openCursor(context: anytype) !catalog.Cursor {
 }
 
 pub fn execute(context: anytype) anyerror!@import("runtime.zig").Output {
+    // Binding and invocation admission have already run. A zero demand must
+    // not open eager retained/archive sources, including aggregate fallbacks.
+    const statement = context.binding.relation.?.statement;
+    if (statement.limit != null and try context.hasRowLimit(statement.limit) and try context.count(statement.limit, 0) == 0) {
+        if (try context.offsetCount(statement.offset) > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
+        return .{ .columns = context.binding.columns, .command_tag = "SELECT" };
+    }
     const owner = try Source(@TypeOf(context)).create(context);
     defer owner.close();
     var lowered = owner.engine.context;
@@ -5085,5 +5092,64 @@ test "SQL retained source finite prefixes require a complete consumer proof" {
         try std.testing.expectEqual(case.window, fixture.window);
         try std.testing.expectEqual(case.conditions, fixture.conditions);
         if (case.window) |maximum| try std.testing.expectEqual(maximum, fixture.examined);
+    }
+}
+
+test "SQL retained source finite prefixes preserve lazy cell failures and zero demand" {
+    const Fixture = struct {
+        opens: usize = 0,
+        offset: usize = 0,
+        fn resolve(_: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return error.UnexpectedPhysicalResolve;
+        }
+        fn retained(_: *anyopaque, a: Allocator, definition: @import("ast.zig").RetainedTable) !catalog.Table {
+            const spec = try a.create(catalog.Table.RetainedBinding);
+            spec.* = .{ .definition = definition, .dataset = @splat(1), .fingerprint = @splat(2), .generation = 1 };
+            return .{ .id = 1, .physical_name = "summary", .schema_version = 1, .retained = spec, .columns = &.{ .{ .name = "n", .path = "n", .type = .integer }, .{ .name = "sum_v", .path = "sum_v", .type = .number } } };
+        }
+        fn open(raw: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.opens += 1;
+            return .{ .ptr = self, .next = next, .close = close };
+        }
+        fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const end = @min(2, self.offset + limit);
+            const rows = try a.alloc(catalog.Row, end - self.offset);
+            const layout = try catalog.Row.TypedLayout.init(a, &.{ "n", "sum_v" });
+            for (rows, self.offset..) |*row, index| row.* = try catalog.Row.fromDatums(a, "row", layout, &.{ Datum.json(.{ .integer = if (index == 0) 2 else 1 }), if (index == 0) Datum.failed(.retained_numeric_overflow) else Datum.json(.{ .float = 42 }) });
+            self.offset = end;
+            return .{ .rows = rows, .after = if (end < 2) "more" else null };
+        }
+        fn close(_: *anyopaque) void {}
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    for ([_]struct { sql: []const u8, rows: usize, fails: bool = false }{
+        .{ .sql = "SELECT sum_v FROM retained_summary(stats,'0','60') WHERE n=1", .rows = 1 },
+        .{ .sql = "SELECT CASE WHEN n=1 THEN sum_v ELSE 0 END FROM retained_summary(stats,'0','60')", .rows = 2 },
+        .{ .sql = "SELECT sum_v FROM retained_summary(stats,'0','60') LIMIT 1 OFFSET 1", .rows = 1 },
+        .{ .sql = "SELECT COALESCE(7, sum_v) FROM retained_summary(stats,'0','60')", .rows = 2 },
+        .{ .sql = "SELECT CASE WHEN s.n=1 THEN s.sum_v ELSE 0 END FROM retained_summary(stats,'0','60') s JOIN (VALUES(1),(2)) x(n) ON s.n=x.n", .rows = 2 },
+        .{ .sql = "SELECT CASE WHEN n=1 THEN sum_v ELSE 0 END FROM retained_summary(stats,'0','60') ORDER BY n", .rows = 2 },
+        .{ .sql = "SELECT COUNT(*) FROM retained_summary(stats,'0','60')", .rows = 1 },
+        .{ .sql = "SELECT COUNT(sum_v) FROM retained_summary(stats,'0','60')", .rows = 0, .fails = true },
+        .{ .sql = "SELECT COUNT(*) FROM retained_summary(stats,'0','60') LIMIT 0", .rows = 0 },
+        .{ .sql = "SELECT sum_v FROM retained_summary(stats,'0','60') LIMIT $1", .rows = 0 },
+        .{ .sql = "SELECT sum_v FROM retained_summary(stats,'0','60')", .rows = 0, .fails = true },
+        .{ .sql = "SELECT n FROM retained_summary(stats,'0','60') WHERE sum_v > 0", .rows = 0, .fails = true },
+    }) |case| {
+        var fixture: Fixture = .{};
+        const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .resolve_retained = Fixture.retained, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .open_scan = Fixture.open, .checkpoint = Fixture.checkpoint } };
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        const parameters: []const std.json.Value = if (std.mem.indexOf(u8, case.sql, "$1") != null) &.{.{ .integer = 0 }} else &.{};
+        if (case.fails) {
+            try std.testing.expectError(error.RetainedSeriesNumericOverflow, @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, parameters, .{}));
+        } else {
+            var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, parameters, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(case.rows, result.output.rows.len);
+            if (case.rows == 0) try std.testing.expectEqual(@as(usize, 0), fixture.opens);
+        }
     }
 }

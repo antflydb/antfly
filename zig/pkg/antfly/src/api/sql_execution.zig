@@ -28,6 +28,7 @@ const setting_catalog = @import("antfly_local_sources").sql_setting_catalog;
 test {
     _ = @import("sql_memory_owner.zig");
     _ = @import("retained_sql_projection.zig");
+    _ = @import("retained_native_materialize.zig");
 }
 
 // Parsed syntax equality excludes diagnostic positions and is charged to the
@@ -2633,10 +2634,10 @@ pub const Adapter = struct {
             const cost = projection.rowCost(row);
             if (cost > budget.*) return error.SqlProgramLimitExceeded;
             budget.* -= cost;
-            const projected = try projection.project(a, row);
-            const values = projected.object;
+            var projected = try projection.project(a, row);
+            projected.version = binding.generation;
             for (scan_request.conditions) |condition| {
-                const value = if (std.mem.eql(u8, condition.column, "_id")) std.json.Value{ .string = &key } else values.get(condition.column) orelse return error.InvalidSqlBackendResponse;
+                const value = if (std.mem.eql(u8, condition.column, "_id")) std.json.Value{ .string = &key } else (try (try projected.cell(condition.column)).requireValue()).value;
                 switch (condition.op) {
                     .is_null => if (value != .null) continue :row_loop,
                     .is_not_null => if (value == .null) continue :row_loop,
@@ -2661,7 +2662,7 @@ pub const Adapter = struct {
                     },
                 }
             }
-            try rows.append(a, .{ .id = try a.dupe(u8, &key), .version = binding.generation, .value = .{ .object = values } });
+            try rows.append(a, projected);
         }
         try self.verify(a, table);
         return rows.items;

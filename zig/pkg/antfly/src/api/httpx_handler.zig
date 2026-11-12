@@ -7003,7 +7003,7 @@ pub const AntflyApiHandler = struct {
                     try writer.writer.writeByte('[');
                     for (columns, 0..) |definition, column| {
                         if (column != 0) try writer.writer.writeByte(',');
-                        const value = try page.values.cell(page.arena.allocator(), row, column);
+                        const value = try (try page.values.cell(page.arena.allocator(), row, column)).requireValue();
                         if (cells % 8 == 0) try nulls.append(a, 0);
                         if (value.sql_null) nulls.items[cells / 8] |= @as(u8, 1) << @intCast(cells % 8);
                         cells += 1;

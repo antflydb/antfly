@@ -29,6 +29,7 @@ pub const Projection = struct {
     measure_count: usize,
     dimensions: []const Dimension,
     measures: []const Measure,
+    layout: *const catalog.Row.TypedLayout,
 
     fn needed(scan: catalog.Scan, name: []const u8) bool {
         for (scan.fields) |field| if (std.mem.eql(u8, field, name)) return true;
@@ -47,25 +48,47 @@ pub const Projection = struct {
         for (summary.measures, 0..) |measure, i| if (needed(scan, measure.name)) {
             try measures.append(a, .{ .name = try a.dupe(u8, measure.name), .index = i, .law = measure.law });
         };
-        return .{ .timestamp = needed(scan, "bucket_start"), .dimension_count = summary.dimensions.len, .measure_count = summary.measures.len, .dimensions = dimensions.items, .measures = measures.items };
+        var names: std.ArrayList([]const u8) = .empty;
+        if (needed(scan, "bucket_start")) try names.append(a, "bucket_start");
+        for (dimensions.items) |column| try names.append(a, column.name);
+        for (measures.items) |column| try names.append(a, column.name);
+        return .{ .layout = try catalog.Row.TypedLayout.init(a, names.items), .timestamp = needed(scan, "bucket_start"), .dimension_count = summary.dimensions.len, .measure_count = summary.measures.len, .dimensions = dimensions.items, .measures = measures.items };
     }
     pub fn rowCost(self: Projection, row: series.Bucket) usize {
         return @sizeOf(catalog.Row) + @sizeOf(types.RowKey) + row.dimensions.len +
-            (self.dimensions.len + self.measures.len + @intFromBool(self.timestamp)) * (@sizeOf(std.json.Value) + 32);
+            (self.dimensions.len + self.measures.len + @intFromBool(self.timestamp)) * @sizeOf(local.sql_scalar.Datum);
     }
-    pub fn project(self: Projection, a: A, row: series.Bucket) !std.json.Value {
+    pub fn project(self: Projection, a: A, row: series.Bucket) !catalog.Row {
         if (row.metrics.len != self.measure_count) return error.RetainedSeriesCorrupt;
         const dimensions = try std.json.parseFromSliceLeaky([]std.json.Value, a, row.dimensions, .{ .allocate = .alloc_always });
         if (dimensions.len != self.dimension_count) return error.RetainedSeriesCorrupt;
-        var values: std.json.ObjectMap = .empty;
-        if (self.timestamp) try values.put(a, "bucket_start", .{ .string = try local.datetime.formatDateTimeSignedNsAlloc(a, row.start_ns) });
-        for (self.dimensions) |column| try values.put(a, column.name, dimensions[column.index]);
-        for (self.measures) |column| try values.put(a, column.name, switch (try row.metrics[column.index].finalize(column.law)) {
-            .null => .null,
-            .integer => |value| .{ .integer = value },
-            .number => |value| .{ .float = value },
-        });
-        return .{ .object = values };
+        const Datum = local.sql_scalar.Datum;
+        const cells = try a.alloc(Datum, self.layout.names.len);
+        var index: usize = 0;
+        if (self.timestamp) {
+            cells[index] = Datum.json(.{ .string = try local.datetime.formatDateTimeSignedNsAlloc(a, row.start_ns) });
+            index += 1;
+        }
+        for (self.dimensions) |column| {
+            cells[index] = Datum.fromJson(dimensions[column.index]);
+            index += 1;
+        }
+        for (self.measures) |column| {
+            const value = row.metrics[column.index].finalize(column.law) catch |err| switch (err) {
+                error.RetainedSeriesNumericOverflow => {
+                    cells[index] = Datum.failed(.retained_numeric_overflow);
+                    index += 1;
+                    continue;
+                },
+            };
+            cells[index] = switch (value) {
+                .null => .{},
+                .integer => |number| Datum.json(.{ .integer = number }),
+                .number => |number| Datum.json(.{ .float = number }),
+            };
+            index += 1;
+        }
+        return .{ .id = try a.dupe(u8, &local.storage_retained_series_archive.key(row)), .version = 0, .value = .null, .typed_cells = .{ .layout = self.layout, .values = cells } };
     }
 };
 
@@ -82,18 +105,18 @@ test "SQL retained source projection isolates overflow and preserves predicate a
     var scan: catalog.Scan = .{ .fields = &.{ "avg_v", "n" }, .limit = 1 };
     const selected = try Projection.init(a, summary, scan);
     const value = try selected.project(a, row);
-    try std.testing.expect(value.object.get("sum_v") == null);
-    try std.testing.expect(value.object.get("bucket_start") == null);
-    try std.testing.expectEqual(std.math.floatMax(f64), value.object.get("avg_v").?.float);
-    try std.testing.expectEqual(@as(i64, 2), value.object.get("n").?.integer);
+    try std.testing.expect(!try value.hasField("sum_v"));
+    try std.testing.expect(!try value.hasField("bucket_start"));
+    try std.testing.expectEqual(std.math.floatMax(f64), (try value.cell("avg_v")).value.float);
+    try std.testing.expectEqual(@as(i64, 2), (try value.cell("n")).value.integer);
     scan.fields = &.{};
-    try std.testing.expectEqual(@as(usize, 0), (try (try Projection.init(a, summary, scan)).project(a, row)).object.count());
+    try std.testing.expectEqual(@as(usize, 0), (try (try Projection.init(a, summary, scan)).project(a, row)).typed_cells.?.count());
     scan.fields = &.{"sum_v"};
-    try std.testing.expectError(error.RetainedSeriesNumericOverflow, (try Projection.init(a, summary, scan)).project(a, row));
+    try std.testing.expectError(error.RetainedSeriesNumericOverflow, (try (try (try Projection.init(a, summary, scan)).project(a, row)).cell("sum_v")).requireValue());
     scan.fields = &.{"n"};
     scan.order = &.{.{ .column = "sum_v" }};
-    try std.testing.expectError(error.RetainedSeriesNumericOverflow, (try Projection.init(a, summary, scan)).project(a, row));
+    try std.testing.expectError(error.RetainedSeriesNumericOverflow, (try (try (try Projection.init(a, summary, scan)).project(a, row)).cell("sum_v")).requireValue());
     scan.order = &.{};
     scan.conditions = &.{.{ .column = "sum_v", .op = .is_not_null }};
-    try std.testing.expectError(error.RetainedSeriesNumericOverflow, (try Projection.init(a, summary, scan)).project(a, row));
+    try std.testing.expectError(error.RetainedSeriesNumericOverflow, (try (try (try Projection.init(a, summary, scan)).project(a, row)).cell("sum_v")).requireValue());
 }

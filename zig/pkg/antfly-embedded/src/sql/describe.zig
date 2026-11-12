@@ -927,6 +927,7 @@ fn bindOrder(alloc: std.mem.Allocator, table: catalog.Table, statement: ast.Sele
 /// Typed internal boundaries must never coerce an array's JSON placeholder.
 /// Array element descriptors are part of the type, not inferred from values.
 pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, kind: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !@import("scalar.zig").Datum {
+    if (raw.failure != null) return raw;
     if (raw.sql_null and raw.value != .null) return error.SqlTypeMismatch;
     if (raw.numeric) |value| {
         if (kind != .number or element_type != .numeric or raw.sql_null or raw.value != .null or raw.array != null or raw.patterns != null) return error.SqlTypeMismatch;

@@ -700,7 +700,7 @@ const OwnedRead = struct {
                 if (self.page.columns[column].type != .json) return error.InvalidSqlBackendResponse;
                 return .{ .json_bytes = bytes, .sql_null = false };
             }
-            const value = try self.page.values.cell(alloc, row, column);
+            const value = try (try self.page.values.cell(alloc, row, column)).requireValue();
             if (value.array) |array| {
                 const definition = self.page.columns[column];
                 if (value.sql_null or value.value != .null or value.patterns != null or definition.type != .array or definition.element_type != array.element_type) return error.InvalidSqlBackendResponse;

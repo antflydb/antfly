@@ -529,10 +529,65 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
                 f"SELECT COUNT(*) FROM retained_summary(public.overflow_sum, '{first_bucket}', '{first_bucket + interval}')"
             )["rows"]
             assert int(counted[0][0]) == 1
+            assert (
+                sql(
+                    f"SELECT sum_id FROM retained_summary(public.overflow_sum, '{first_bucket}', '{first_bucket + interval}') WHERE n = 0"
+                )["rows"]
+                == []
+            )
+            guarded = sql(
+                f"SELECT CASE WHEN n = 0 THEN sum_id ELSE 7 END FROM retained_summary(public.overflow_sum, '{first_bucket}', '{first_bucket + interval}')"
+            )["rows"]
+            assert len(guarded) == 1 and int(guarded[0][0]) == 7
+            assert (
+                sql(
+                    f"SELECT COUNT(*) FROM retained_summary(public.overflow_sum, '{first_bucket}', '{first_bucket + interval}') LIMIT 0"
+                )["rows"]
+                == []
+            )
             with pytest.raises(OSError, match="400.*22003"):
                 sql(
                     f"SELECT n FROM retained_summary(public.overflow_sum, '{first_bucket}', '{first_bucket + interval}') WHERE sum_id > 0"
                 )
+
+            try:
+                import psycopg
+            except ImportError:
+                return
+            with psycopg.connect(
+                host="127.0.0.1",
+                port=pgwire_port,
+                dbname="default",
+                user="admin",
+                password="e2e-bootstrap-password",
+                sslmode="disable",
+                autocommit=True,
+            ) as connection:
+                relation = f"retained_summary(public.overflow_sum, '{first_bucket}', '{first_bucket + interval}')"
+                for prepared in (False, True):
+                    assert (
+                        connection.execute(
+                            f"SELECT sum_id FROM {relation} WHERE n=0", prepare=prepared
+                        ).fetchall()
+                        == []
+                    )
+                    guarded_rows = connection.execute(
+                        f"SELECT CASE WHEN n=0 THEN sum_id ELSE 7 END FROM {relation}",
+                        prepare=prepared,
+                    ).fetchall()
+                    assert len(guarded_rows) == 1 and int(guarded_rows[0][0]) == 7
+                    assert (
+                        connection.execute(
+                            f"SELECT COUNT(*) FROM {relation} LIMIT %s",
+                            (0,),
+                            prepare=prepared,
+                        ).fetchall()
+                        == []
+                    )
+                    with pytest.raises(psycopg.errors.NumericValueOutOfRange):
+                        connection.execute(
+                            f"SELECT sum_id FROM {relation}", prepare=prepared
+                        ).fetchall()
 
         check_overflow_projection()
         api(

@@ -1191,9 +1191,9 @@ test "SQL global aggregate invocation constants reuse a captured empty or nonemp
 }
 
 test "SQL sorted scalar producers execute only selected parents and retain cold scan pruning" {
-    const cases = [_]struct { sql: []const u8, calls: usize, rows: usize, scans: usize = 512 }{
+    const cases = [_]struct { sql: []const u8, calls: usize, rows: usize, scans: usize = 512, captures: usize = 1 }{
         .{ .sql = "SELECT (SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY o.delta DESC LIMIT $1 OFFSET $2", .calls = 3, .rows = 2 },
-        .{ .sql = "SELECT (SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY o.delta DESC LIMIT 0 OFFSET $2", .calls = 0, .rows = 0, .scans = 0 },
+        .{ .sql = "SELECT (SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY o.delta DESC LIMIT 0 OFFSET $2", .calls = 0, .rows = 0, .scans = 0, .captures = 0 },
         .{ .sql = "SELECT (SELECT ai_probability(o.id,'Refund?','local')) AS p FROM source o ORDER BY p LIMIT $1 OFFSET $2", .calls = 512, .rows = 2 },
         .{ .sql = "SELECT o.delta AS rank,(SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY rank DESC LIMIT $1 OFFSET $2", .calls = 3, .rows = 2 },
         .{ .sql = "SELECT o.delta,(SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY 1 DESC LIMIT $1 OFFSET $2", .calls = 3, .rows = 2 },
@@ -1215,8 +1215,8 @@ test "SQL sorted scalar producers execute only selected parents and retain cold 
         try std.testing.expectEqual(case.rows, result.output.rows.len);
         try std.testing.expectEqual(case.calls, provider.calls);
         try std.testing.expectEqual(case.scans, backend.rows_read);
-        try std.testing.expectEqual(@as(usize, 1), backend.captures);
-        try std.testing.expectEqual(@as(usize, 1), backend.closes);
+        try std.testing.expectEqual(case.captures, backend.captures);
+        try std.testing.expectEqual(case.captures, backend.closes);
         try std.testing.expectEqual(@as(usize, 0), backend.commits);
         if (result.output.columns.len == 2 and result.output.columns[0].type == .integer) {
             try std.testing.expectEqualStrings("5110", result.output.rows[0][0].string);
