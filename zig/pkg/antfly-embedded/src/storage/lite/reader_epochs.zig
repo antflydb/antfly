@@ -321,40 +321,92 @@ test "lite reader epochs guard cross-generation registration and reject replaced
     try std.testing.expectError(error.FileNotFound, namespace.directory.access(io, "identity", .{}));
 }
 
-// Reject pathname-based parent canonicalization: publication must resolve the
-// directory through its open handle, including for relative database paths.
-test "lite reader epochs publish identity only inside the pinned namespace" {
+// Model a cwd change at the first pathname-based lookup, without changing the
+// real process cwd (which would interfere with other tests). Every hook performs
+// the real filesystem operation; only the directory used for cwd is switched.
+test "lite reader epochs keep relative publication in its original directory when cwd changes" {
     const Probe = struct {
-        fn realPathFile(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: []u8) std.Io.Dir.RealPathFileError!usize {
-            return error.OperationUnsupported;
+        var current: std.Io.Dir = undefined;
+        var next: std.Io.Dir = undefined;
+        var changed: bool = false;
+
+        fn base(dir: std.Io.Dir) std.Io.Dir {
+            return if (dir.handle == std.Io.Dir.cwd().handle) current else dir;
+        }
+        fn switchCwd() void {
+            if (changed) return;
+            current = next;
+            changed = true;
+        }
+        fn realPath(_: ?*anyopaque, dir: std.Io.Dir, buffer: []u8) std.Io.Dir.RealPathError!usize {
+            return base(dir).realPath(std.testing.io, buffer);
+        }
+        fn realPathFile(_: ?*anyopaque, dir: std.Io.Dir, path: []const u8, buffer: []u8) std.Io.Dir.RealPathFileError!usize {
+            switchCwd();
+            return base(dir).realPathFile(std.testing.io, path, buffer);
+        }
+        fn openDir(_: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenOptions) std.Io.Dir.OpenError!std.Io.Dir {
+            switchCwd();
+            return base(dir).openDir(std.testing.io, path, options);
         }
     };
     const a = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/relative.aflite", .{tmp.sub_path});
-    defer a.free(path);
-    const data = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true });
-    defer data.close(io);
-    var vtable = io.vtable.*;
-    vtable.dirRealPathFile = Probe.realPathFile;
-    const pinned_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
-    const published = try Namespace.open(a, pinned_io, path, true, true);
-    defer published.close(a, io);
-    try std.testing.expectEqual(@as(u64, 32), (try published.guard.stat(io)).size);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "identity", .{}));
-    const reopened = try Namespace.open(a, io, path, false, true);
-    defer reopened.close(a, io);
-    try std.testing.expectEqualSlices(u8, &published.digest, &reopened.digest);
-    try std.testing.expectEqualStrings(published.canonical, reopened.canonical);
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.Blake3.hash(published.canonical, &digest, .{});
-    const marker = try std.fmt.allocPrint(a, ".aflite-readers-{x}/identity", .{digest});
-    defer a.free(marker);
-    const identity = try tmp.dir.openFile(io, marker, .{});
-    defer identity.close(io);
-    try std.testing.expectEqual((try published.guard.stat(io)).inode, (try identity.stat(io)).inode);
+    // Cover both a bare filename and a relative path with directory components.
+    for ([_][]const u8{ "relative.aflite", "nested/relative.aflite" }) |relative| {
+        var intended = std.testing.tmpDir(.{});
+        defer intended.cleanup();
+        var unrelated = std.testing.tmpDir(.{});
+        defer unrelated.cleanup();
+        const root = try intended.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        const parent_name = std.fs.path.dirname(relative) orelse ".";
+        if (!std.mem.eql(u8, parent_name, ".")) {
+            try intended.dir.createDir(io, parent_name, .fromMode(0o700));
+            try unrelated.dir.createDir(io, parent_name, .fromMode(0o700));
+        }
+        const data = try intended.dir.createFile(io, relative, .{ .read = true });
+        defer data.close(io);
+        Probe.current = intended.dir;
+        Probe.next = unrelated.dir;
+        Probe.changed = false;
+        var vtable = io.vtable.*;
+        vtable.dirRealPath = Probe.realPath;
+        vtable.dirRealPathFile = Probe.realPathFile;
+        vtable.dirOpenDir = Probe.openDir;
+        const changing_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+        const published = try Namespace.open(a, changing_io, relative, true, true);
+        defer published.close(a, io);
+        try std.testing.expect(Probe.changed);
+
+        // A real cwd race must not leave either a bare identity or a namespace
+        // directory in the unrelated location, even if that parent exists.
+        const wrong_parent = try unrelated.dir.openDir(io, parent_name, .{ .iterate = true });
+        defer wrong_parent.close(io);
+        var entries = wrong_parent.iterate();
+        try std.testing.expectEqual(@as(?std.Io.Dir.Entry, null), try entries.next(io));
+        try std.testing.expectError(error.FileNotFound, intended.dir.access(io, "identity", .{}));
+        const expected = try std.fs.path.join(a, &.{ root, relative });
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, published.canonical);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(expected, &digest, .{});
+        const marker = try std.fmt.allocPrint(a, "{s}/.aflite-readers-{x}/identity", .{ parent_name, digest });
+        defer a.free(marker);
+        const identity = try intended.dir.openFile(io, marker, .{});
+        defer identity.close(io);
+        try std.testing.expectEqual(@as(u64, 32), (try identity.stat(io)).size);
+        try std.testing.expectEqual((try published.guard.stat(io)).inode, (try identity.stat(io)).inode);
+        // Reader registration must also resolve the relative database path
+        // before a later cwd change, and recover the publisher's binding.
+        Probe.current = intended.dir;
+        Probe.changed = false;
+        const reopened = try Namespace.open(a, changing_io, relative, false, true);
+        defer reopened.close(a, io);
+        try std.testing.expect(Probe.changed);
+        try std.testing.expectEqualStrings(expected, reopened.canonical);
+        try std.testing.expectEqualSlices(u8, &published.digest, &reopened.digest);
+    }
 }
 
 test "lite reader epochs preserve symlink bindings and reject missing databases" {
