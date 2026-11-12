@@ -1516,3 +1516,75 @@ test "retained series compiled fields use frozen roots and SQL JSON count proven
     binding.compiled.?.measures = &scalar;
     try std.testing.expectEqual(@as(?f64, null), (try normalizeValue(a, binding, value)).values[0]);
 }
+
+test "retained series controlled DB reads release writers after snapshot capture and cancel queued admission" {
+    const a = std.testing.allocator;
+    const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/controlled-series", .{tmp.sub_path}, 0);
+    defer a.free(path);
+    const namespace = @import("db/doc_identity.zig").Namespace{ .table_id = 1, .shard_id = 2, .range_id = 3 };
+    var db = try DB.open(a, path, .{ .identity_namespace = namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false, .start_resolver_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    try db.batch(.{ .timestamp_ns = 1, .writes = &.{.{ .key = "a", .value = "{\"ts\":1,\"v\":3}" }} });
+    var partition: series.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&@import("db/online_source_contract.zig").namespaceBytes(namespace), &partition, .{});
+    const binding: Binding = .{ .spec = .{ .id = @splat(1), .generation = 1, .definition = @splat(2), .source_partition = partition, .source_incarnation = 1, .interval_ns = 10, .mutable_for_ns = 100, .laws = &.{.count} }, .timestamp = "ts", .fields = &.{null} };
+    const fence: @import("retained_series_control.zig").Fence = .{ .id = binding.spec.id, .generation = 1, .definition = binding.spec.definition, .partition = partition, .incarnation = 1 };
+    try db.batch(.{ .timestamp_ns = 2, .retained_series = .{ .action = .install, .fence = fence, .binding = binding } });
+    try db.batch(.{ .timestamp_ns = 3, .retained_series = .{ .action = .backfill, .fence = fence } });
+    const Probe = struct {
+        db: *DB,
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        queued: bool = false,
+        write: bool = false,
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.queued) return self.calls == 2;
+            if (self.calls != 3) return false;
+            // The third checkpoint is outside snapshot capture. A failed
+            // try-lock turns the old lock-lifetime bug into a bounded failure.
+            if (!self.db.core.tryLockApplyExclusive()) {
+                self.failure = error.WriterBlockedByRetainedRead;
+                return true;
+            }
+            self.db.core.unlockApplyExclusive();
+            if (self.write) self.db.batch(.{ .timestamp_ns = 4, .writes = &.{.{ .key = "b", .value = "{\"ts\":11,\"v\":9}" }} }) catch |err| {
+                self.failure = err;
+                return true;
+            };
+            return false;
+        }
+        fn control(self: *@This()) @import("retained_series_read_contract.zig").Control {
+            return .{ .cancellation_ctx = self, .is_cancelled_fn = canceled };
+        }
+    };
+    var opening: Probe = .{ .db = &db, .write = true };
+    const query: @import("retained_series_read_contract.zig").Query = .{ .fence = fence, .start_ns = 0, .end_ns = 20, .admitted_ns = 3 };
+    const reader = try db.openRetainedSeriesReadControlled(a, query, opening.control());
+    defer reader.close();
+    try std.testing.expect(opening.failure == null);
+    // The concurrent source write completed, while this reader kept the cut
+    // taken before that write. A fresh reader observes the second bucket.
+    try std.testing.expectEqual(@as(usize, 1), (try reader.next(10)).rows.len);
+    const fresh = try db.openRetainedSeriesRead(a, query);
+    defer fresh.close();
+    try std.testing.expectEqual(@as(usize, 2), (try fresh.next(10)).rows.len);
+    var status: Probe = .{ .db = &db };
+    const json = try db.queryRetainedSeriesJsonControlled(a, .status, status.control());
+    a.free(json);
+    try std.testing.expect(status.failure == null);
+    {
+        db.core.lockApplyExclusive();
+        defer db.core.unlockApplyExclusive();
+        var waiting: Probe = .{ .db = &db, .queued = true };
+        try std.testing.expectError(error.Canceled, db.queryRetainedSeriesJsonControlled(a, .status, waiting.control()));
+        try std.testing.expectEqual(@as(usize, 2), waiting.calls);
+        waiting.calls = 0;
+        try std.testing.expectError(error.Canceled, db.openRetainedSeriesReadControlled(a, query, waiting.control()));
+        try std.testing.expectEqual(@as(usize, 2), waiting.calls);
+    }
+}

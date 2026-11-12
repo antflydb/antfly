@@ -38,6 +38,18 @@ pub const Replay = struct {
 pub const max_response_bytes = 6 * 1024 * 1024;
 
 pub fn executeJson(a: A, txn: anytype, root_incarnation: u128, request: contract.Request) ![]u8 {
+    return executeJsonControlled(a, txn, root_incarnation, request, .{});
+}
+pub fn executeJsonControlled(output: A, txn: anytype, root_incarnation: u128, request: contract.Request, operation: contract.Control) ![]u8 {
+    var memory: @import("antfly_platform").allocator.BoundedAllocator = .{ .backing = output, .limit = 32 * 1024 * 1024 };
+    defer std.debug.assert(memory.live == 0);
+    return executeAdmitted(output, &memory, txn, root_incarnation, request, operation) catch |err| {
+        return if (err == error.OutOfMemory and memory.denied) error.DatasetPageBudgetExceeded else err;
+    };
+}
+fn executeAdmitted(output: A, memory: *@import("antfly_platform").allocator.BoundedAllocator, txn: anytype, root_incarnation: u128, request: contract.Request, operation: contract.Control) ![]u8 {
+    try operation.check();
+    const a = memory.allocator();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const temp = arena.allocator();
@@ -52,12 +64,15 @@ pub fn executeJson(a: A, txn: anytype, root_incarnation: u128, request: contract
                     break false;
                 }
             } else true else false;
-            break :result try std.json.Stringify.valueAlloc(a, Revocation{ .root_incarnation = root, .fence = fence, .revoked = revoked, .reclaimed = reclaimed }, .{});
+            break :result try contract.stringifyAlloc(a, Revocation{ .root_incarnation = root, .fence = fence, .revoked = revoked, .reclaimed = reclaimed }, .{}, operation);
         },
         .status => result: {
             const entries = try temp.alloc(Entry, bindings.len);
-            for (bindings, entries) |binding, *entry| entry.* = .{ .binding = binding, .progress = try (series.Engine{ .alloc = a, .spec = binding.spec }).status(temp, txn) };
-            break :result try std.json.Stringify.valueAlloc(a, Status{ .root_incarnation = root, .entries = entries }, .{});
+            for (bindings, entries) |binding, *entry| {
+                try operation.check();
+                entry.* = .{ .binding = binding, .progress = try (series.Engine{ .alloc = a, .spec = binding.spec, .read_control = operation }).status(temp, txn) };
+            }
+            break :result try contract.stringifyAlloc(a, Status{ .root_incarnation = root, .entries = entries }, .{}, operation);
         },
         .poll => |poll| result: {
             if (poll.root_incarnation != root_incarnation) return error.RetainedSeriesResetRequired;
@@ -66,15 +81,17 @@ pub fn executeJson(a: A, txn: anytype, root_incarnation: u128, request: contract
                 if (std.mem.eql(u8, &binding.spec.id, &poll.fence.id) and binding.spec.generation == poll.fence.generation) break binding.spec;
             } else return error.RetainedSeriesDefinitionMismatch;
             try control.requireFence(poll.fence, spec);
-            const engine = series.Engine{ .alloc = a, .spec = spec };
+            const engine = series.Engine{ .alloc = a, .spec = spec, .read_control = operation };
             const frames = try engine.poll(temp, txn, poll.cursor, poll.limit);
             const progress = try engine.status(temp, txn);
             var cursor = poll.cursor;
             if (frames.len != 0) cursor.sequence = frames[frames.len - 1].sequence;
-            break :result try std.json.Stringify.valueAlloc(a, Replay{ .root_incarnation = root, .cursor = cursor, .frames = frames, .admitted_ns = progress.admitted_ns, .latest_sequence = if (poll.include_latest) progress.feed_latest else 0 }, .{});
+            break :result try contract.stringifyAlloc(a, Replay{ .root_incarnation = root, .cursor = cursor, .frames = frames, .admitted_ns = progress.admitted_ns, .latest_sequence = if (poll.include_latest) progress.feed_latest else 0 }, .{}, operation);
         },
     };
-    errdefer a.free(response);
+    defer a.free(response);
     if (response.len > max_response_bytes) return error.RetainedSeriesBatchTooLarge;
-    return response;
+    try operation.check();
+    if (response.len > memory.limit - memory.live) return error.DatasetPageBudgetExceeded;
+    return output.dupe(u8, response);
 }

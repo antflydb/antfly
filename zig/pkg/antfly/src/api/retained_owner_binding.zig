@@ -71,7 +71,14 @@ pub fn publicProjection(a: A, timestamp: []const u8, dimensions: []const []const
             if (reference.*) |*field| {
                 const p = property(document.properties, field.column) orelse return error.InvalidDatasetDefinition;
                 const kind = public_schema.runtimeRelationalColumnType(p) orelse return error.InvalidDatasetDefinition;
-                if (measure.law != .count and kind != .number) return error.InvalidDatasetDefinition;
+                // This generation's persisted numeric state and serving type
+                // are binary64. Exact integer/decimal domains need a versioned
+                // state and result contract, never an implicit lossy cast.
+                if (measure.law != .count) switch (kind) {
+                    .number => {},
+                    .integer, .numeric => return error.UnsupportedRetainedMeasureType,
+                    else => return error.InvalidDatasetDefinition,
+                };
                 const json = kind == .json;
                 if (document_index != 0 and (field.result == .json) != json) return error.InvalidDatasetDefinition;
                 field.result = if (json) .json else .scalar;
@@ -273,4 +280,17 @@ test "retained owner native controls public creation freezes literal fields and 
     try std.testing.expectError(error.InvalidDatasetDefinition, admin.descriptor(a, std.testing.io, input, public_source, @splat(3)));
     input.measures = &.{.{ .name = "n", .law = .sum, .field = "doc" }};
     try std.testing.expectError(error.InvalidDatasetDefinition, admin.descriptor(a, std.testing.io, input, public_source, @splat(3)));
+}
+
+test "retained owner native controls numeric domains are explicit and never silently rounded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "{\"type\":\"integer\"}", "{\"type\":\"number\",\"x-antfly-sql-type\":\"numeric\"}" }) |property_json| {
+        const schema_json = try std.mem.concat(a, u8, &.{ "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"ts\":{\"type\":\"integer\"},\"v\":", property_json, "}}}}}" });
+        for ([_]t.Law{ .sum, .avg, .min, .max }) |law| {
+            try std.testing.expectError(error.UnsupportedRetainedMeasureType, publicProjection(a, "ts", &.{}, &.{.{ .name = "value", .field = "v", .law = law }}, schema_json));
+        }
+        _ = try publicProjection(a, "ts", &.{}, &.{.{ .name = "n", .field = "v", .law = .count }}, schema_json);
+    }
 }

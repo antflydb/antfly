@@ -54,3 +54,83 @@ pub const Control = struct {
         if (self.deadline_ns != @import("std").math.maxInt(u64) and @import("antfly_platform").time.monotonicNs() >= self.deadline_ns) return error.Timeout;
     }
 };
+
+/// Buffered JSON serialization checks admission between bounded output chunks,
+/// including large strings. A writer failure preserves its original identity.
+pub fn stringifyAlloc(a: @import("std").mem.Allocator, value: anytype, options: @import("std").json.Stringify.Options, operation: Control) ![]u8 {
+    const std = @import("std");
+    try operation.check();
+    const Writer = struct {
+        output: std.Io.Writer.Allocating,
+        operation: Control,
+        buffer: [4096]u8 = undefined,
+        writer: std.Io.Writer = undefined,
+        failure: ?anyerror = null,
+        fn send(self: *@This(), bytes: []const u8) !void {
+            var position: usize = 0;
+            while (position < bytes.len) {
+                try self.operation.check();
+                const end = @min(bytes.len, position + self.buffer.len);
+                self.output.writer.writeAll(bytes[position..end]) catch return error.OutOfMemory;
+                position = end;
+            }
+        }
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", w));
+            return self.drainInner(w, data, splat) catch |err| {
+                self.failure = err;
+                return error.WriteFailed;
+            };
+        }
+        fn drainInner(self: *@This(), w: *std.Io.Writer, data: []const []const u8, splat: usize) !usize {
+            try self.send(w.buffered());
+            w.end = 0;
+            var count: usize = 0;
+            for (data[0 .. data.len - 1]) |bytes| {
+                try self.send(bytes);
+                count += bytes.len;
+            }
+            const pattern = data[data.len - 1];
+            for (0..splat) |_| try self.send(pattern);
+            return count + pattern.len * splat;
+        }
+    };
+    var writer: Writer = .{ .output = .init(a), .operation = operation };
+    defer writer.output.deinit();
+    writer.writer = .{ .vtable = &.{ .drain = Writer.drain }, .buffer = &writer.buffer };
+    std.json.Stringify.value(value, options, &writer.writer) catch |err| return writer.failure orelse err;
+    writer.writer.flush() catch |err| return writer.failure orelse err;
+    try operation.check();
+    return writer.output.toOwnedSlice() catch return error.OutOfMemory;
+}
+
+test "retained series controlled serialization interrupts large strings and releases allocation failures" {
+    const std = @import("std");
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, 128 * 1024);
+    defer a.free(bytes);
+    @memset(bytes, 'a');
+    const Probe = struct {
+        calls: usize = 0,
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            return self.calls == 5;
+        }
+    };
+    var probe: Probe = .{};
+    try std.testing.expectError(error.Canceled, stringifyAlloc(a, .{ .value = bytes }, .{}, .{ .cancellation_ctx = &probe, .is_cancelled_fn = Probe.canceled }));
+    try std.testing.expectEqual(@as(usize, 5), probe.calls);
+    const actual = try stringifyAlloc(a, .{ .value = bytes }, .{}, .{});
+    defer a.free(actual);
+    const expected = try std.json.Stringify.valueAlloc(a, .{ .value = bytes }, .{});
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, actual);
+    const Scenario = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            const result = try stringifyAlloc(backing, .{ .values = [_][]const u8{ "a", "b" }, .n = 7 }, .{}, .{});
+            backing.free(result);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Scenario.run, .{});
+}

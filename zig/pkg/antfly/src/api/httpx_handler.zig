@@ -3021,7 +3021,10 @@ pub const AntflyApiHandler = struct {
             defer storage.deinit();
             if (storage.locator.protocol == .filesystem) return textResponse(ctx, 503, "shared archive storage required");
             const io = self.api_server.sharedApiIo() orelse return textResponse(ctx, 503, "dataset service unavailable");
-            const definition = admin.descriptor(a, io, request, candidate, storage.identity) catch |err| return textResponse(ctx, 400, @errorName(err));
+            const definition = admin.descriptor(a, io, request, candidate, storage.identity) catch |err| return textResponse(ctx, 400, if (err == error.UnsupportedRetainedMeasureType)
+                "SUM/AVG/MIN/MAX require a DOUBLE PRECISION source field; INTEGER and NUMERIC measures need an exact-domain retained state. COUNT accepts these types."
+            else
+                @errorName(err));
             const json = try std.json.Stringify.valueAlloc(a, definition, .{});
             if (!try http_server_mod.tablePermissionCurrentlyAllowed(identity, table, .admin)) return textResponse(ctx, 403, "source table administration required");
             const mutation: system_catalog.Mutation = .{ .action = .create, .kind = .dataset, .database = route.database, .namespace = route.namespace, .name = name, .source_json = json };

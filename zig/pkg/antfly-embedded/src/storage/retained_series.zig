@@ -1009,12 +1009,9 @@ pub const Engine = struct {
         return self.scanWhere(a, txn, start_ns, end_ns, admitted_ns, after, limit, null, null);
     }
     pub fn scanWhere(self: Engine, a: A, txn: anytype, start_ns: i128, end_ns: i128, admitted_ns: i128, after: ?[]const u8, limit: usize, dimensions_json: ?[]const u8, first_after: ?@import("../retained_dataset_types.zig").RowKey) !Page {
-        try self.read_control.check();
-        if (limit == 0 or limit > max_changes or start_ns >= end_ns or try self.spec.bucket(start_ns) != start_ns or try self.spec.bucket(end_ns) != end_ns) return error.RetainedSeriesResolutionMismatch;
-        const cut = try self.snapshotCursor(txn);
-        const state = try self.load(a, txn);
-        if (start_ns < state.complete_from_ns) return error.RetainedSeriesCoverageMissing;
-        if (try self.spec.expired(start_ns, @max(admitted_ns, state.admitted_ns))) return error.RetainedSeriesHistoryExpired;
+        if (limit == 0 or limit > max_changes) return error.RetainedSeriesResolutionMismatch;
+        const state = try self.validateRange(a, txn, start_ns, end_ns, admitted_ns, first_after);
+        const cut = self.cursorFor(state);
         const p = try self.key(a, "bucket:");
         const biased = @as(u128, @bitCast(start_ns)) ^ (@as(u128, 1) << 127);
         const lower = try std.fmt.allocPrint(a, "{s}{x:0>32}:", .{ p, biased });
@@ -1033,25 +1030,52 @@ pub const Engine = struct {
     /// A closed owner exports through the last physical bucket, including
     /// future observations. A committed archive frontier may split a bucket.
     pub fn scanArchive(self: Engine, a: A, txn: anytype, request: @import("retained_series_read_contract.zig").ArchiveStart, after: ?[]const u8, limit: usize) !Page {
-        try self.read_control.check();
         if (limit == 0 or limit > max_changes) return error.RetainedSeriesBatchTooLarge;
-        const state = try self.load(a, txn);
-        const closed = try state.closureCut();
-        if (request.sequence != closed.sequence or request.complete_from_ns != closed.complete_from_ns or request.closed_at_ns != closed.admitted_ns) return error.RetainedSeriesDefinitionMismatch;
-        const types = @import("../retained_dataset_types.zig");
-        for (request.first_key) |digit| {
-            if (!std.ascii.isDigit(digit) and (digit < 'a' or digit > 'f')) return error.RetainedSeriesResolutionMismatch;
-        }
-        const start_ns = try types.rowKeyTimestamp(request.first_key);
-        if (try self.spec.bucket(start_ns) != start_ns) return error.RetainedSeriesResolutionMismatch;
-        if (start_ns < closed.complete_from_ns) return error.RetainedSeriesCoverageMissing;
-        const cut = try self.snapshotCursor(txn);
+        const state = try self.validateArchive(a, txn, request);
+        const start_ns = try @import("../retained_dataset_types.zig").rowKeyTimestamp(request.first_key);
+        const cut = self.cursorFor(state);
         const bucket_prefix = try self.key(a, "bucket:");
         const lower = try std.fmt.allocPrint(a, "{s}{s}:{s}", .{ bucket_prefix, request.first_key[0..32], request.first_key[32..] });
         var page = try self.scanKeyRange(a, txn, bucket_prefix, lower, start_ns, null, after, limit, cut);
         page.admitted_ns = state.admitted_ns;
         page.source_sequence = state.source_sequence;
         return page;
+    }
+
+    /// Validate admission from progress only. Opening a snapshot never scans
+    /// bucket data; its first page performs that work exactly once.
+    pub fn validateRange(self: Engine, a: A, txn: anytype, start_ns: i128, end_ns: i128, admitted_ns: i128, first_after: ?@import("../retained_dataset_types.zig").RowKey) !Progress {
+        try self.read_control.check();
+        if (start_ns >= end_ns or try self.spec.bucket(start_ns) != start_ns or try self.spec.bucket(end_ns) != end_ns) return error.RetainedSeriesResolutionMismatch;
+        const state = try self.readProgress(a, txn);
+        if (start_ns < state.complete_from_ns) return error.RetainedSeriesCoverageMissing;
+        if (try self.spec.expired(start_ns, @max(admitted_ns, state.admitted_ns))) return error.RetainedSeriesHistoryExpired;
+        if (first_after) |resume_key| {
+            for (resume_key) |digit| if (!std.ascii.isDigit(digit) and (digit < 'a' or digit > 'f')) return error.RetainedSeriesResolutionMismatch;
+            const timestamp = try @import("../retained_dataset_types.zig").rowKeyTimestamp(resume_key);
+            if (timestamp < start_ns or timestamp >= end_ns) return error.RetainedSeriesResolutionMismatch;
+        }
+        return state;
+    }
+    pub fn validateArchive(self: Engine, a: A, txn: anytype, request: @import("retained_series_read_contract.zig").ArchiveStart) !Progress {
+        try self.read_control.check();
+        const state = try self.readProgress(a, txn);
+        const closed = try state.closureCut();
+        if (request.sequence != closed.sequence or request.complete_from_ns != closed.complete_from_ns or request.closed_at_ns != closed.admitted_ns) return error.RetainedSeriesDefinitionMismatch;
+        for (request.first_key) |digit| if (!std.ascii.isDigit(digit) and (digit < 'a' or digit > 'f')) return error.RetainedSeriesResolutionMismatch;
+        const start_ns = try @import("../retained_dataset_types.zig").rowKeyTimestamp(request.first_key);
+        if (try self.spec.bucket(start_ns) != start_ns) return error.RetainedSeriesResolutionMismatch;
+        if (start_ns < closed.complete_from_ns) return error.RetainedSeriesCoverageMissing;
+        return state;
+    }
+    fn readProgress(self: Engine, a: A, txn: anytype) !Progress {
+        const state = try self.load(a, txn);
+        if (state.revoked) return error.RetainedSeriesSourceRevoked;
+        if (!state.ready) return error.RetainedSeriesNotReady;
+        return state;
+    }
+    pub fn cursorFor(self: Engine, state: Progress) Cursor {
+        return .{ .definition = state.definition, .partition = self.spec.source_partition, .incarnation = state.source_incarnation, .sequence = state.feed_latest };
     }
 
     fn scanKeyRange(self: Engine, a: A, txn: anytype, p: []const u8, lower: []const u8, start_ns: i128, end_ns: ?i128, after: ?[]const u8, limit: usize, cut: Cursor) !Page {
@@ -1203,6 +1227,7 @@ pub const Engine = struct {
         var total_bytes: usize = 0;
         const bucket_prefix = try self.key(a, "bucket:");
         for (frames, 0..) |*frame, i| {
+            try self.read_control.check();
             const raw = try txn.get(try self.frameKey(a, cursor.sequence + i + 1));
             if (raw.len > max_frame_bytes or raw.len > max_feed_bytes - total_bytes) return error.RetainedSeriesCorrupt;
             total_bytes += raw.len;
@@ -1210,6 +1235,7 @@ pub const Engine = struct {
             if (frame.edits.len == 0 or frame.edits.len > 8) return error.RetainedSeriesCorrupt;
             var previous: ?[]const u8 = null;
             for (frame.edits) |edit| {
+                try self.read_control.check();
                 if (!std.mem.startsWith(u8, edit.key, bucket_prefix) or edit.key.len != bucket_prefix.len + 97 or edit.key[bucket_prefix.len + 32] != ':' or
                     (previous != null and std.mem.order(u8, previous.?, edit.key) != .lt)) return error.RetainedSeriesCorrupt;
                 const suffix = edit.key[bucket_prefix.len..];

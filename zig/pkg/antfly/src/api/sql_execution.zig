@@ -2485,6 +2485,7 @@ pub const Adapter = struct {
 
     const RetainedStatement = struct {
         alloc: std.mem.Allocator,
+        memory: @import("antfly_platform").allocator.BoundedAllocator,
         arena: std.heap.ArenaAllocator,
         raw: ?catalog.StatementRead = null,
 
@@ -2492,6 +2493,7 @@ pub const Adapter = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.raw) |ordinary| ordinary.close(ordinary.ptr);
             self.arena.deinit();
+            std.debug.assert(self.memory.live == 0);
             self.alloc.destroy(self);
         }
     };
@@ -2545,8 +2547,15 @@ pub const Adapter = struct {
         if (self.staged) |staged| if (staged.tables.len != 0) return error.UnsupportedSqlExecution;
         if (requests.len == 0 or requests.len > 64) return error.SqlProgramLimitExceeded;
         const owner = try alloc.create(RetainedStatement);
-        owner.* = .{ .alloc = alloc, .arena = std.heap.ArenaAllocator.init(alloc) };
+        owner.* = .{ .alloc = alloc, .memory = .{ .backing = self.server.alloc, .limit = 32 * 1024 * 1024 }, .arena = undefined };
+        owner.arena = std.heap.ArenaAllocator.init(owner.memory.allocator());
         errdefer RetainedStatement.close(owner);
+        return self.captureRetainedStatementAdmitted(owner, requests) catch |err| {
+            return if (err == error.OutOfMemory and owner.memory.denied) error.SqlProgramLimitExceeded else err;
+        };
+    }
+    fn captureRetainedStatementAdmitted(self: *Adapter, owner: *RetainedStatement, requests: []const catalog.StatementScan) !?catalog.StatementRead {
+        const alloc = owner.alloc;
         const a = owner.arena.allocator();
         const cursors = try a.alloc(catalog.Cursor, requests.len);
         var ordinary: std.ArrayList(catalog.StatementScan) = .empty;
@@ -2555,7 +2564,7 @@ pub const Adapter = struct {
         var captures = std.ArrayList(@import("retained_dataset_read.zig").Capture).empty;
         for (requests, cursors, 0..) |request, *cursor, index| {
             if (request.table.retained) |binding| {
-                const rows = try self.materializeRetainedRows(a, request.table, request.request, binding.*, &budget, &captures);
+                const rows = try self.materializeRetainedRows(a, owner.memory.allocator(), request.table, request.request, binding.*, &budget, &captures);
                 const reader = try a.create(RetainedCursor);
                 reader.* = .{ .rows = rows };
                 cursor.* = .{ .ptr = reader, .next = RetainedCursor.next, .close = StatementRead.borrowedClose, .estimated_rows = rows.len, .order_satisfied = request.request.order.len == 0 };
@@ -2576,7 +2585,7 @@ pub const Adapter = struct {
         return .{ .ptr = owner, .cursors = cursors, .close = RetainedStatement.close };
     }
 
-    fn materializeRetainedRows(self: *Adapter, a: std.mem.Allocator, table: catalog.Table, scan_request: catalog.Scan, binding: catalog.Table.RetainedBinding, budget: *usize, captures: *std.ArrayList(@import("retained_dataset_read.zig").Capture)) ![]const catalog.Row {
+    fn materializeRetainedRows(self: *Adapter, a: std.mem.Allocator, working: std.mem.Allocator, table: catalog.Table, scan_request: catalog.Scan, binding: catalog.Table.RetainedBinding, budget: *usize, captures: *std.ArrayList(@import("retained_dataset_read.zig").Capture)) ![]const catalog.Row {
         try self.verify(a, table);
         if (scan_request.after != null or scan_request.include_primary_digest or scan_request.search != null or scan_request.index_equality != null) return error.UnsupportedSqlExecution;
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
@@ -2611,7 +2620,7 @@ pub const Adapter = struct {
         const prefix = if (window) |maximum| maximum > 0 and maximum <= read.max_input_rows else false;
         const projection = try @import("retained_sql_projection.zig").Projection.init(a, summary, scan_request);
         const request: read.Request = .{ .start_ns = try self.retainedBound(a, binding.definition.start), .end_ns = try self.retainedBound(a, binding.definition.end), .max_rows = if (prefix) @intCast(window.?) else read.max_input_rows, .dimensions_json = dimension_filter, .page = prefix };
-        var result = if (prefix) try read.readResolvedPrefix(self.server, snapshot, definition, request, self.context) else try read.readResolved(self.server, snapshot, definition, request, self.context);
+        var result = try read.readResolvedAdmitted(self.server, working, snapshot, definition, request, self.context, prefix);
         defer result.deinit();
         var native_owners: usize = 0;
         for (snapshot.owners) |owner| if (owner.independent_receipt == null) {
@@ -2629,6 +2638,7 @@ pub const Adapter = struct {
         }
         var rows: std.ArrayList(catalog.Row) = .empty;
         row_loop: for (result.rows) |row| {
+            try self.context.ensureActive();
             const key = local.storage_retained_series_archive.key(row);
             if (scan_request.primary_key) |primary| if (!std.mem.eql(u8, primary, &key)) continue;
             const cost = projection.rowCost(row);

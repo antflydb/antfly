@@ -71,15 +71,14 @@ pub const Session = struct {
         } else return error.RetainedSeriesDefinitionMismatch;
         try control.requireFence(query.fence, spec);
         const engine = series.Engine{ .alloc = self.alloc, .spec = spec, .read_control = operation };
-        const cursor = try engine.snapshotCursor(snapshot);
-        // Validation scratch belongs to this call, not to the retained binding.
+        // Admission reads only progress; sparse bucket scans belong to next().
         var validation = std.heap.ArenaAllocator.init(self.alloc);
         defer validation.deinit();
-        if (query.archive) |archive| {
-            _ = try engine.scanArchive(validation.allocator(), snapshot, archive, null, 1);
-        } else {
-            _ = try engine.scanWhere(validation.allocator(), snapshot, query.start_ns, query.end_ns, query.admitted_ns, null, 1, query.dimensions_json, query.after);
-        }
+        const state = if (query.archive) |archive|
+            try engine.validateArchive(validation.allocator(), snapshot, archive)
+        else
+            try engine.validateRange(validation.allocator(), snapshot, query.start_ns, query.end_ns, query.admitted_ns, query.after);
+        const cursor = engine.cursorFor(state);
         try operation.check();
         self.definition_arena = arena;
         self.page_arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -244,6 +243,14 @@ test "retained series native reader sparse seeks retain bounded memory and inter
         }
     };
     {
+        var admission: Probe = .{};
+        const reader = try Session.openControlled(a, try db.beginReadTxn(), testQuery("[\"absent\"]"), 7, .{ .cancellation_ctx = &admission, .is_cancelled_fn = Probe.canceled });
+        defer reader.close();
+        // Opening never visits the hundred thousand unmatched buckets. The
+        // eighth checkpoint would cancel the old eager validation scan.
+        try std.testing.expect(admission.calls < 8);
+    }
+    {
         const reader = try Session.open(a, try db.beginReadTxn(), testQuery(null), 7);
         defer reader.close();
         var encoding: Probe = .{ .stop_at = 150 };
@@ -253,9 +260,9 @@ test "retained series native reader sparse seeks retain bounded memory and inter
         // its rows, and the failed response must not leave any outgoing copy.
         try std.testing.expect(reader.after != null);
     }
-    var opening: Probe = .{};
+    var opening: Probe = .{ .stop_at = 2 };
     try std.testing.expectError(error.Canceled, Session.openControlled(a, try db.beginReadTxn(), testQuery("[\"absent\"]"), 7, .{ .cancellation_ctx = &opening, .is_cancelled_fn = Probe.canceled }));
-    try std.testing.expectEqual(@as(usize, 8), opening.calls);
+    try std.testing.expectEqual(@as(usize, 2), opening.calls);
     {
         const reader = try Session.open(a, try db.beginReadTxn(), testQuery(null), 7);
         defer reader.close();

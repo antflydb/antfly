@@ -4658,7 +4658,7 @@ pub fn storageOwnerRetainedQueryJson(owner: ?*anyopaque, request: *const kernel_
     defer parsed.deinit();
     const control: backups_api.BackupOperationControl = .{ .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else std.math.maxInt(u64), .cancellation = ownerQueryCancellation(request) };
     control.ensureActive() catch |err| return storageOwnerStatusFromError(err);
-    const response = handle.db.queryRetainedSeriesJson(handle.alloc, parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    const response = handle.db.queryRetainedSeriesJsonControlled(handle.alloc, parsed.value, retainedReadControl(&control)) catch |err| return storageOwnerStatusFromError(err);
     control.ensureActive() catch |err| {
         handle.alloc.free(response);
         return storageOwnerStatusFromError(err);

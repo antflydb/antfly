@@ -353,23 +353,30 @@ fn readResolvedOwned(server: anytype, snapshot: Snapshot, definition: dataset.De
     budget.* = .{ .backing = backing, .limit = max_result_bytes };
     var context = try request_context.platformDeadline();
     context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s);
-    const PageReader = struct {
-        server: @TypeOf(server),
-        snapshot: Snapshot,
-        definition: dataset.Definition,
-        pub fn page(self: @This(), a: A, request: Request, ctx: operation.RequestContext) !Result {
-            return readResolvedBudgeted(self.server, a, self.snapshot, self.definition, request, ctx);
-        }
-    };
-    var result = (if (prefix)
-        readPrefixBudgeted(budget.allocator(), input, context, PageReader{ .server = server, .snapshot = snapshot, .definition = definition })
-    else
-        readResolvedBudgeted(server, budget.allocator(), snapshot, definition, input, context)) catch |err| {
+    var result = readResolvedAdmitted(server, budget.allocator(), snapshot, definition, input, context, prefix) catch |err| {
         std.debug.assert(budget.live == 0);
         return if (err == error.OutOfMemory and budget.denied) error.DatasetPageBudgetExceeded else err;
     };
     result.budget = budget;
     return result;
+}
+/// The caller owns a stable reclaiming admission allocator through projection
+/// and serialization. Results release their scratch without owning that budget.
+pub fn readResolvedAdmitted(server: anytype, a: A, snapshot: Snapshot, definition: dataset.Definition, input: Request, input_context: operation.RequestContext, prefix: bool) !Result {
+    var context = try input_context.platformDeadline();
+    context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s);
+    const PageReader = struct {
+        server: @TypeOf(server),
+        snapshot: Snapshot,
+        definition: dataset.Definition,
+        pub fn page(self: @This(), alloc: A, request: Request, ctx: operation.RequestContext) !Result {
+            return readResolvedBudgeted(self.server, alloc, self.snapshot, self.definition, request, ctx);
+        }
+    };
+    return if (prefix)
+        readPrefixBudgeted(a, input, context, PageReader{ .server = server, .snapshot = snapshot, .definition = definition })
+    else
+        readResolvedBudgeted(server, a, snapshot, definition, input, context);
 }
 fn readPrefixBudgeted(a: A, input: Request, context: operation.RequestContext, reader: anytype) !Result {
     if (!input.page or input.max_rows == 0 or input.max_rows > max_input_rows) return error.DatasetPageBudgetExceeded;
@@ -532,6 +539,17 @@ pub fn certify(server: anytype, a: A, captures: []const Capture, context: operat
 }
 
 pub fn queryJson(server: anytype, a: A, target: local.system_catalog_domain.Target, input: QueryRequest, context: operation.RequestContext) ![]u8 {
+    var memory: MemoryBudget = .{ .backing = server.alloc, .limit = max_result_bytes };
+    defer std.debug.assert(memory.live == 0);
+    var admission = try context.platformDeadline();
+    admission.deadline_ns = @min(admission.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s);
+    return queryJsonAdmitted(server, a, &memory, target, input, admission) catch |err| {
+        return if (err == error.OutOfMemory and memory.denied) error.DatasetPageBudgetExceeded else err;
+    };
+}
+fn queryJsonAdmitted(server: anytype, output_alloc: A, memory: *MemoryBudget, target: local.system_catalog_domain.Target, input: QueryRequest, context: operation.RequestContext) ![]u8 {
+    const a = memory.allocator();
+    try context.ensureActive();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -547,11 +565,20 @@ pub fn queryJson(server: anytype, a: A, target: local.system_catalog_domain.Targ
         if (timestamp < try range.start() or timestamp >= try range.end()) return error.InvalidDatasetCoverage;
     }
     const request: Request = .{ .start_ns = input.start_ns, .end_ns = input.end_ns, .max_rows = input.max_rows, .page = true, .after = if (input.after) |after| try parseAfter(after) else null, .dimensions_json = if (input.dimensions) |values| try canonicalDimensions(scratch, definition, values) else null };
-    var result = try readResolved(server, snapshot, definition, request, context);
+    var result = try readResolvedAdmitted(server, a, snapshot, definition, request, context, false);
     defer result.deinit();
+    return formatJsonResult(output_alloc, memory, summary, result, context);
+}
+fn formatJsonResult(output_alloc: A, memory: *MemoryBudget, summary: dataset.Summary, result: Result, context: operation.RequestContext) ![]u8 {
+    try context.ensureActive();
+    const a = memory.allocator();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
     const Row = struct { bucket_start_ns: []const u8, dimensions: []const std.json.Value, values: []const std.json.Value };
     const output = try scratch.alloc(Row, result.rows.len);
     for (result.rows, output) |row, *out| {
+        try context.ensureActive();
         const dimensions = try std.json.parseFromSliceLeaky([]std.json.Value, scratch, row.dimensions, .{ .parse_numbers = false });
         if (dimensions.len != summary.dimensions.len) return error.RetainedSeriesCorrupt;
         const values = try scratch.alloc(std.json.Value, summary.measures.len);
@@ -562,7 +589,11 @@ pub fn queryJson(server: anytype, a: A, target: local.system_catalog_domain.Targ
         };
         out.* = .{ .bucket_start_ns = try std.fmt.allocPrint(scratch, "{d}", .{row.start_ns}), .dimensions = dimensions, .values = values };
     }
-    return std.json.Stringify.valueAlloc(a, .{ .initial_history = result.history, .dimensions = summary.dimensions, .measures = summary.measures, .rows = output, .next = if (result.next) |key| try scratch.dupe(u8, &key) else null }, .{});
+    const bytes = try local.storage_retained_series_read_contract.stringifyAlloc(a, .{ .initial_history = result.history, .dimensions = summary.dimensions, .measures = summary.measures, .rows = output, .next = if (result.next) |key| try scratch.dupe(u8, &key) else null }, .{}, operationControl(&context));
+    defer a.free(bytes);
+    try context.ensureActive();
+    if (bytes.len > memory.limit - memory.live) return error.DatasetPageBudgetExceeded;
+    return output_alloc.dupe(u8, bytes);
 }
 
 test "retained owner native controls merge archived and native average states without fallback" {
@@ -853,4 +884,42 @@ test "retained owner native controls SQL prefix preserves one native cut and rej
     try std.testing.expectError(error.OutOfMemory, readPrefixBudgeted(limited.allocator(), request, .{}, &bounded));
     try std.testing.expect(limited.denied);
     try std.testing.expectEqual(@as(usize, 0), limited.live);
+}
+
+/// Borrowed only for synchronous processing and JSON serialization.
+pub fn operationControl(context: *const operation.RequestContext) local.storage_retained_series_read_contract.Control {
+    return .{ .deadline_ns = context.deadline_ns orelse std.math.maxInt(u64), .cancellation_ctx = context, .is_cancelled_fn = struct {
+        fn canceled(raw: *const anyopaque) bool {
+            const ctx: *const operation.RequestContext = @ptrCast(@alignCast(raw));
+            ctx.cancellation.check() catch return true;
+            return false;
+        }
+    }.canceled };
+}
+
+fn jsonEncodingScenario(backing: A) !void {
+    var memory: MemoryBudget = .{ .backing = backing, .limit = max_result_bytes };
+    defer std.debug.assert(memory.live == 0);
+    var metrics = [_]series.Metric{.{ .count = 1 }};
+    const rows = [_]series.Bucket{.{ .start_ns = 0, .dimensions = "[\"north\"]", .metrics = &metrics, .rows = 1 }};
+    const summary: dataset.Summary = .{ .source = @splat(1), .timestamp = "ts", .dimensions = &.{"site"}, .interval_ns = 1, .mutable_for_ns = 1, .measures = &.{.{ .name = "n", .law = .count }} };
+    var result: Result = .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .rows = &rows, .history = .retained_source_rows };
+    defer result.deinit();
+    const encoded = try formatJsonResult(backing, &memory, summary, result, .{});
+    defer backing.free(encoded);
+}
+test "retained owner native controls public JSON projection and reply copies share live admission" {
+    const a = std.testing.allocator;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, jsonEncodingScenario, .{});
+    var memory: MemoryBudget = .{ .backing = a, .limit = 1024 };
+    defer std.debug.assert(memory.live == 0);
+    const admitted = try memory.allocator().alloc(u8, 1000);
+    defer memory.allocator().free(admitted);
+    const summary: dataset.Summary = .{ .source = @splat(1), .timestamp = "ts", .interval_ns = 1, .mutable_for_ns = 1, .measures = &.{.{ .name = "n", .law = .count }} };
+    var result: Result = .{ .arena = std.heap.ArenaAllocator.init(a), .rows = &.{}, .history = .retained_source_rows };
+    defer result.deinit();
+    try std.testing.expectError(error.OutOfMemory, formatJsonResult(a, &memory, summary, result, .{}));
+    try std.testing.expect(memory.denied);
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, formatJsonResult(a, &memory, summary, result, .{ .cancellation = .fromAtomic(&canceled) }));
 }

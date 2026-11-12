@@ -60,8 +60,9 @@ pub const Projection = struct {
     }
     pub fn project(self: Projection, a: A, row: series.Bucket) !catalog.Row {
         if (row.metrics.len != self.measure_count) return error.RetainedSeriesCorrupt;
-        const dimensions = try std.json.parseFromSliceLeaky([]std.json.Value, a, row.dimensions, .{ .allocate = .alloc_always });
-        if (dimensions.len != self.dimension_count) return error.RetainedSeriesCorrupt;
+        // COUNT(*) and measure-only scans do not need to decode dimensions.
+        const dimensions = if (self.dimensions.len == 0) &.{} else try std.json.parseFromSliceLeaky([]std.json.Value, a, row.dimensions, .{ .allocate = .alloc_always });
+        if (self.dimensions.len != 0 and dimensions.len != self.dimension_count) return error.RetainedSeriesCorrupt;
         const Datum = local.sql_scalar.Datum;
         const cells = try a.alloc(Datum, self.layout.names.len);
         var index: usize = 0;
@@ -119,4 +120,28 @@ test "SQL retained source projection isolates overflow and preserves predicate a
     scan.order = &.{};
     scan.conditions = &.{.{ .column = "sum_v", .op = .is_not_null }};
     try std.testing.expectError(error.RetainedSeriesNumericOverflow, (try (try (try Projection.init(a, summary, scan)).project(a, row)).cell("sum_v")).requireValue());
+}
+
+test "SQL retained source count-only projection skips unselected dimension decoding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const name = try a.alloc(u8, 4000);
+    @memset(name, 'x');
+    const dimensions = try std.json.Stringify.valueAlloc(a, [_][]const u8{name}, .{});
+    const summary: types.Summary = .{ .source = @splat(1), .timestamp = "ts", .dimensions = &.{"site"}, .interval_ns = 1, .mutable_for_ns = 1, .measures = &.{.{ .name = "n", .law = .count }} };
+    const projection = try Projection.init(a, summary, .{ .fields = &.{}, .limit = 1 });
+    var memory: @import("antfly_platform").allocator.BoundedAllocator = .{ .backing = std.testing.allocator, .limit = 128 };
+    defer std.debug.assert(memory.live == 0);
+    var metrics = [_]series.Metric{.{ .count = 1 }};
+    const row: series.Bucket = .{ .start_ns = 0, .dimensions = dimensions, .rows = 1, .metrics = &metrics };
+    const projected = try projection.project(memory.allocator(), row);
+    defer memory.allocator().free(projected.id);
+    try std.testing.expectEqual(@as(usize, 0), projected.typed_cells.?.count());
+    try std.testing.expect(memory.peak <= 128);
+    const selected = try Projection.init(a, summary, .{ .fields = &.{"site"}, .limit = 1 });
+    var limited_arena = std.heap.ArenaAllocator.init(memory.allocator());
+    defer limited_arena.deinit();
+    try std.testing.expectError(error.OutOfMemory, selected.project(limited_arena.allocator(), row));
+    try std.testing.expect(memory.denied);
 }
