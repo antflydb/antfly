@@ -27,6 +27,7 @@ const apply_state = @import("../db/derived/apply_state.zig");
 const replay_reference = @import("../db/derived/replay_reference.zig");
 const internal_keys = @import("../internal_keys.zig");
 const native = @import("native.zig");
+const inode_lock = @import("inode_lock.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 pub const reclamation = @import("reclamation.zig");
 const maintenance = @import("../maintenance.zig");
@@ -2200,6 +2201,29 @@ pub const Store = struct {
     // Called with read_mutex held. Pins are ordered by published sequence.
     fn pinInitializedReadGeneration(self: *Store, pin: *ReadPin) !*ReadGeneration {
         const generation = self.read_generation.?;
+        // §9.6a: register this pin's own fixed snapshot sequence with the
+        // shared redo overlay *before* any of this function's own state
+        // mutations below, so a failure here (allocation only -- `pin`
+        // itself never fails otherwise) leaves nothing to unwind. This is
+        // the in-process half of `minimumPinnedSequence`, scoped to the
+        // overlay specifically (see `SharedRedoOverlay.pin`'s own doc
+        // comment for why this is a separate, narrower tracker rather than
+        // the existing cross-process mechanism): without it, `reclaim`
+        // could drop a version this generation's own readers still need.
+        if (generation.file.redo) |*redo| try redo.shared.pin(std.heap.page_allocator, self.file.runtime(), pin.sequence);
+        // Reader-pin registry (inode_lock.Entry.reader_pins): registers
+        // this same fixed sequence as a general page-reuse pin, not just
+        // a redo-overlay one -- `generation.file` is a plain,
+        // uncoordinated reader for an indexed_reclamation store (it never
+        // claims a `region` slot; see that registry's own doc comment),
+        // so without this it would be invisible to `reuseFrontier`'s
+        // combined computation beyond whatever `self.reader_frontier`
+        // already covers for this exact case. Registered on the same
+        // inode-keyed `Entry` `generation.file`/`self.file` both resolve
+        // to.
+        if (generation.file.inode_lock_ref.load(.acquire)) |entry| {
+            try inode_lock.pinReader(entry, self.file.runtime(), .{ .data = pin.sequence, .metadata = pin.sequence });
+        }
         // An idle connection must not fence reclamation. Only actual read
         // transactions hold the inode lock, including streams between calls.
         if (generation.scoped_reader_lock and pin.kernel_reader) {
@@ -2274,6 +2298,21 @@ pub const Store = struct {
         if (!generation.retired) self.reader_frontier.store(if (generation.first_pin) |first| first.sequence else std.math.maxInt(u64), .release);
         const reclaim = generation.references == 0 and generation.retired;
         self.read_mutex.unlock(io);
+        // §9.6a: mirror image of `pinInitializedReadGeneration`'s own
+        // `pin` call -- releases this pin's hold on the shared overlay,
+        // then opportunistically reclaims whatever that newly-advanced
+        // floor now permits (passing `0` leaves `durable_checkpoint_sequence`
+        // itself unchanged -- `reclaim`'s own `@max` -- while still
+        // recomputing the floor against the just-updated pin set; see
+        // `reclaim`'s own doc comment for why this is also worth doing
+        // right after `checkpointRedoLog` publishes, not only here).
+        if (generation.file.redo) |*redo| {
+            redo.shared.unpin(io, pin.sequence);
+            redo.shared.reclaim(std.heap.page_allocator, io, 0);
+        }
+        if (generation.file.inode_lock_ref.load(.acquire)) |entry| {
+            inode_lock.unpinReader(entry, io, .{ .data = pin.sequence, .metadata = pin.sequence });
+        }
         self.readMetadataAllocator().destroy(pin);
         if (reclaim) {
             // Only the last releaser owns this unreachable generation. Preserve
@@ -3563,8 +3602,9 @@ pub const Store = struct {
         if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return;
         const redo = self.file.redo orelse return;
         if (redo.checkpointing) return;
+        const io = self.file.runtime();
         var overlay_entries: u64 = 0;
-        for (redo.logical_overlay) |map| overlay_entries += map.count();
+        for (0..3) |root_idx| overlay_entries += redo.shared.count(io, @intCast(root_idx));
         // Idle: this call only happens on `rideAlongFlushLoop`'s own
         // periodic wake, which already implies nothing more pressing woke
         // it sooner -- any non-empty overlay reaching this point has had at
@@ -3572,7 +3612,7 @@ pub const Store = struct {
         // run, so it is cheap to clear opportunistically rather than
         // leaving it to grow (and the next reopen's replay to cover)
         // indefinitely.
-        const has_overlay_work = overlay_entries != 0 or redo.overlay.count() != 0;
+        const has_overlay_work = overlay_entries != 0 or redo.shared.pagesCount(io) != 0;
         // Threshold: byte usage past the halfway point, well before the
         // emergency 25%-remaining backpressure (`maybeAutoCheckpointRedoLog`)
         // would ever fire. Checked independently of `has_overlay_work`: a
@@ -8399,8 +8439,9 @@ test "lite redo-log idle-flush timer checkpoints an uncheckpointed overlay witho
     const hasOverlayWork = struct {
         fn run(s: *Store) bool {
             const redo = s.file.redo orelse return false;
-            for (redo.logical_overlay) |map| if (map.count() != 0) return true;
-            return redo.overlay.count() != 0;
+            const io = s.file.runtime();
+            for (0..3) |root_idx| if (redo.shared.count(io, @intCast(root_idx)) != 0) return true;
+            return redo.shared.pagesCount(io) != 0;
         }
     }.run;
     try std.testing.expect(hasOverlayWork(&store));

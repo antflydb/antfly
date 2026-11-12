@@ -1797,19 +1797,156 @@ snapshot taken once at `beginTransaction`, which `stageMutation` never
 touches): `self.transaction_header.?.checkpoints[...].commit_sequence
 + 1`.
 
-**Not yet done**: the `inode_lock.Entry`-resident shared structure
-itself (so a writer's `self.file` and every `ReadGeneration.file` on
-the same inode reference the *same* overlay instead of each building
-an independent copy), per-version reclaim keyed on durable-checkpoint-
-coverage plus `minimumPinnedSequence()` (today's mechanism for that
-frontier is already `commit_sequence`-keyed, the right kind of number,
-but split between a Store-private in-process half and a cross-process
-region half that only sees *coordinated* readers -- a real gap to
-resolve as part of wiring this up, not just plumbing), and
-`observeReadCheckpoint` actually advancing a generation's read mark
-against that shared structure. `ReadGeneration` itself is still
-unfixed; WS5's `error.ReplayIndexUnavailable` failure (and the general
-class it represents) remains open until that lands.
+**Landed since (§9.6b)**: the `inode_lock.Entry`-resident shared
+structure itself, per-version reclaim, and a separate, general
+in-process reader-pin registry that closes a related but distinct
+gap in the page-reuse frontier. See §9.6b for the full account.
+
+### 9.6b Cross-instance sharing, per-version reclaim, and the in-process reader-pin registry
+
+Landed: `redo_overlay.zig` (new, standalone module -- no `native.zig`/
+`inode_lock.zig` dependency, avoiding the import cycle `inode_lock.zig`
+holding one by value would otherwise create) holds `VersionedOverlayEntry`
+(moved here unchanged) and a new `SharedRedoOverlay`: three roots'
+worth of versioned maps, a page-shaped-write map (external value
+chains only), a `durable_checkpoint_sequence`, and a `pins` multiset
+(see below). `inode_lock.Entry` gained a `redo_overlay: ?SharedRedoOverlay`
+field, next to `region`, and `ensureRedoOverlay(entry, io, ctx, populate)`:
+lazily populates it once per `Entry` (so every `NativeFile` on this
+inode -- the live writer and every `ReadGeneration.file` alike --
+reference the *same* instance), running `populate` only for the
+genuine first opener. `RedoCommitState` (`native.zig`) now holds
+`shared: *SharedRedoOverlay` instead of its own `logical_overlay`/
+`overlay` maps; every read/write path that touched those (point reads,
+`checkpointRedoLog`'s fold/clear, `OverlayScanState`, `readBackingPages`'
+page-overlay check, `hasLiveDocumentOutsidePrefix`) now goes through
+`SharedRedoOverlay`'s own methods instead.
+
+`recoverRedoLog` is two-pass to make this safe: a cheap, metadata-only
+replay runs for *every* opener (using the function's own allocator) to
+get `outcome`/the final `CompactCheckpoint` -- every opener needs this
+for its own `redo.writer`/`self.header` regardless of who populates the
+shared overlay. `ensureRedoOverlay`'s own `populate` callback (invoked
+only for a genuine first opener) then runs a second, full replay
+directly into the shared structure, using `std.heap.page_allocator`
+unconditionally -- the structure outlives, and is shared across,
+whichever instance populated it, so it cannot be tied to any one
+caller's own allocator (the same rule `inode_lock.zig`'s own doc
+comment already establishes for `region`). A naive "replay once with
+the caller's allocator, then hand the result to the shared structure"
+alternative is unsafe for exactly this reason (allocator-ownership
+mismatch across instances) and was deliberately rejected.
+
+`resolveAlloc` (renamed from `resolve`) returns an owned copy of the
+resolved value, not a borrowed pointer into the chain: once the
+structure is shared across threads/instances, a reference held across
+the method's own `unlock` is a real use-after-free risk (a concurrent
+`reclaim` could free the exact node just resolved). Every caller in
+`native.zig` (`redoOverlayEntry` and its ten-odd call sites) was
+updated to free the returned value after use; `LiveRecordCursor.next`
+(whose own contract says a returned slice "remain[s] valid until the
+next call to `next()`") holds the value in a new `overlay_value` field
+instead of freeing it immediately, to match that contract.
+
+**Per-version reclaim** (`SharedRedoOverlay.reclaim`): a version is
+dropped once it is both covered by a durable checkpoint
+(`durable_checkpoint_sequence`) and strictly older than every live
+pin. `checkpointRedoLog` calls it (with the checkpoint that just
+landed, which covers everything it folded by construction) instead of
+unconditionally clearing every map, since a reader pinned to an older
+checkpoint may still need a version this checkpoint's own build also
+folded into real pages. When no pin is live at all, a key's chain
+collapsing to a single checkpoint-covered version is dropped
+*entirely* (the key itself removed, not just trimmed to one node):
+nothing could resolve to it instead of the real tree, which already
+has the same value as of the fold. (First landed without this last
+step -- the chain-trim-to-one-node-but-never-remove-the-key version
+left `count()` permanently non-zero after a checkpoint, breaking an
+existing integration test that asserted the overlay goes empty with no
+readers around; fixed by collecting keys to drop during the map
+iteration and removing them afterward, since this map's iterator does
+not tolerate a concurrent `fetchRemove` of the entry it is visiting.)
+
+**Pin tracking, a scoped decision**: `SharedRedoOverlay.pin`/`unpin`
+are a new, dedicated, in-process-only multiset on the structure
+itself, *not* routed through the existing `minimumPinnedSequence`/
+`shared_lock_region.zig`/`ReaderCoordinator` cross-process machinery.
+Reasoning: that machinery exists to let *coordinated* readers be seen
+cross-process; the overlay itself is never visible cross-process at
+all (it is a pure in-process cache of logged-but-not-yet-checkpointed
+mutations), so only the in-process half is ever relevant to it, and a
+narrower, dedicated tracker is safer to land under time pressure than
+restructuring code several other subsystems depend on. Wired into
+docstore.zig's `pinInitializedReadGeneration`/`releaseReadGeneration`
+(the same two functions already pin/unpin the general reader-pin
+registry below), guarded by `generation.file.redo != null`.
+
+**A separate, related gap, found while investigating a reported
+32-thread/maintenance data-corruption bug** (which turned out to have
+an unrelated root cause -- a stale writer instance -- fixed by the
+writer-side agent itself): `NativeFile.reuseFrontier`/
+`metadataReuseFrontier` already combine four inputs end to end
+(checkpoint floors, `epoch_window` from `region.minimumPinnedSequence`/
+`minimumMetadataPinnedSequence`, `minimum_reader_sequence` -- itself a
+region scan plus the `ReaderCoordinator`'s own in-process inode-only
+fence list -- and `Store.reader_frontier`, the `ReadGeneration`/
+`ReadPin` mechanism's direct atomic, independent of `region`). Every
+reader category traced by direct code reading (ordinary `Txn` reads/
+writes via `ReadPin`→`reader_frontier`, artifact leases via either
+`ReaderCoordinator.registerFull` or catalog-reachability,
+`forkBorrowedRead`'s documented parent-pin lifetime contract) turned
+out to already be covered by one of these. One genuine, if narrower,
+gap remained: a reader that opens its *own*, plain, uncoordinated
+`NativeFile` directly -- `captureFullReadSnapshot`'s own reader
+(`coordinated = self.reader_coordinator != null and self.durable_header
+== null and !self.read_only`, false in the common case of no
+`reader_coordinator` configured at all, which is also vacuum's own
+verification snapshot's path, since `performVacuum` calls exactly this)
+-- never claims a `region` slot and is a *different* `NativeFile`
+instance than whichever one `Store.reader_frontier` happens to be wired
+into, so none of the four existing terms reach it.
+
+Fixed with a second new addition to `inode_lock.Entry`:
+`reader_pins: std.ArrayListUnmanaged(ReaderPin)` (a `{ data: ?u64,
+metadata: ?u64 }` multiset, mirroring `region`'s own data/metadata
+split), `pinReader`/`unpinReader`, and `minimumReaderSequence`/
+`minimumMetadataReaderSequence` (the in-process-registry's own minimum
+alone -- callers combine it with `region`'s answer via `@min`, matching
+every other term already in `reuseFrontier`). `metadataReuseFrontier`/
+`reuseFrontier` each gained one more `@min` term reading this through
+`self.inode_lock_ref`. `captureFullReadSnapshot` pins *before* opening
+its own reader, using `self`'s own currently-known checkpoint sequence
+as the guard value: whatever the new reader actually resolves to a
+moment later can only be the same sequence or later (checkpoints never
+move backward), so this is always a safe, if momentarily conservative,
+lower bound -- closing the window a concurrent frontier computation
+could otherwise run through between "the checkpoint the new reader
+will depend on becomes real" and "a pin exists to protect it." The pin
+is released in `close()`, before `inode_lock.unref` (which can be the
+call that frees the `Entry` this pin lives on). Also wired into
+docstore.zig's `pinInitializedReadGeneration`/`releaseReadGeneration`
+(redundant with `reader_frontier` for that specific category, but
+gives every category one single mechanism to reason about going
+forward). A per-inode `last_committed_sequence: std.atomic.Value(u64)`
+field was reserved next to `reader_pins` for the writer-side agent's
+own stale-writer-instance detection (a different, unrelated fix); not
+populated or read by this module.
+
+New test: "lite uncoordinated snapshot reader pins its checkpoint and
+survives page reuse" (`native.zig`) -- opens a plain snapshot with no
+`reader_coordinator` configured anywhere, confirms its pin registers,
+drives many durable overwrites and a bounded number of reclamation
+attempts while the snapshot stays open (`reusable_pages` stays `0`
+throughout -- note this needs a *bounded* retry loop, not a
+`retirementNeedsService()`-driven one, since an externally-pinned
+backlog never resolves on its own the way crossing a durability
+barrier does), confirms the snapshot still reads its original,
+untouched page correctly, then closes it and confirms the same backlog
+drains and pages become reusable.
+
+`ReadGeneration` itself is now fixed: WS5's `error.ReplayIndexUnavailable`
+failure and the general class it represented depended on exactly this
+cross-instance sharing landing.
 
 ### 9.7a Point 3: threading the option, and holding back the default
 
