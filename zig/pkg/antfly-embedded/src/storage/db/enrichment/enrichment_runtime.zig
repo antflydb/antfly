@@ -7191,8 +7191,10 @@ fn getOrCreateRequestChunksWithProvider(runtime: *EnrichmentRuntime, alloc: Allo
             const chunks = if (source.input) |input|
                 if (model_chunk_client.supportsPagedCalls(chunk_config, provider))
                     try prepareModelPassChunksWithProbe(runtime, request, chunk_config, input, doc_store_key, source_digest.?, pass_scope, observed, false)
-                else
-                    try model_chunk_client.chunkMediaWithProvider(alloc, chunk_config, input, provider)
+                else legacy: {
+                    try authorizeModelSource(runtime, input);
+                    break :legacy try model_chunk_client.chunkMediaWithProvider(alloc, chunk_config, input, provider);
+                }
             else
                 try alloc.alloc(chunker_mod.Chunk, 0);
             errdefer chunker_mod.freeChunks(alloc, chunks);
@@ -7799,9 +7801,20 @@ fn mediaPassInputDigest(runtime: *EnrichmentRuntime, request: enrichment_types.G
     return hash.finalResult();
 }
 
+fn dispatchModelPage(runtime: *EnrichmentRuntime, a: Allocator, config: chunking_types_mod.Config, input: @import("inference_chunker").Input) !@import("inference_chunker").types.ChunkPage {
+    try authorizeModelSource(runtime, input);
+    return model_chunk_client.chunkPageWithProvider(a, config, input, runtime.config.chunk_provider);
+}
+
+fn authorizeModelSource(runtime: *EnrichmentRuntime, input: @import("inference_chunker").Input) !void {
+    if (input == .source and input.source.version_kind == .file_sha256)
+        try scraping.authorizeLocalSource(runtime.alloc, concurrencyIo(runtime), input.source.uri, runtime.config.remote_content);
+}
+
 /// Resolve deployed generations through the same local/remote chunk contract.
 /// Planning-only targets return identities without executing any output model.
 fn probeModelPass(runtime: *EnrichmentRuntime, supplied: chunking_types_mod.Config, input: @import("inference_chunker").Input) !@import("inference_chunker").types.ChunkPage {
+    try authorizeModelSource(runtime, input);
     return model_chunk_client.probeModelPageWithProvider(runtime.alloc, supplied, input, runtime.config.chunk_provider);
 }
 
@@ -7900,7 +7913,7 @@ fn prepareModelPassChunksWithProbe(runtime: *EnrichmentRuntime, request: enrichm
             const encoded = try storeGetOptionalAllocWithRetry(runtime, page_key) orelse return error.InvalidEnrichmentState;
             defer a.free(encoded);
             break :blk try media_pass.decodePage(a, encoded);
-        } else model_chunk_client.chunkPageWithProvider(a, config, input, runtime.config.chunk_provider) catch |err| {
+        } else dispatchModelPage(runtime, a, config, input) catch |err| {
             if (err == error.StaleChunkContinuation or err == error.SourceVersionChanged) {
                 try clearMediaPassScope(runtime, prefix, cursor.input_digest);
                 return error.EnrichmentSourceChanged;
@@ -18322,7 +18335,7 @@ fn prepareMediaRepairPageWithSkips(runtime: *EnrichmentRuntime, supplied: chunki
     }
     config.replay = null;
     config.replay = try chunking_types_mod.cloneReplay(a, .{ .plan_id = metadata.plan_id, .source_fingerprint = metadata.source_fingerprint, .source_version = metadata.source_version, .ordinal = metadata.descriptor.ordinal });
-    return model_chunk_client.chunkPageWithProvider(a, config, input, runtime.config.chunk_provider);
+    return dispatchModelPage(runtime, a, config, input);
 }
 
 fn repairMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, raw_doc: []const u8, chunker_json: []const u8, prefix: []const u8, name: []const u8, metadata: *@import("inference_chunker").types.ModelMetadata, current_identity: ?@import("inference_chunker").outputs.Result) !void {
@@ -39898,6 +39911,7 @@ fn extractModelChunkSourceCached(a: Allocator, config: Config, raw: []const u8, 
             return .{ .input = .{ .text = text }, .bytes = text };
         },
         .source => |borrowed| {
+            if (borrowed.version_kind == .file_sha256) try scraping.authorizeLocalSource(a, config.io orelse return error.UnsupportedPlatform, borrowed.uri, config.remote_content);
             var reference = borrowed;
             var result = ModelChunkSource{};
             errdefer result.deinit(a);
@@ -44547,6 +44561,49 @@ test "backup preflight literal fields match enrichment execution" {
     const json = try report.jsonAlloc("{\"version\":1,\"configuration_id\":\"empty-destination\"}");
     defer a.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "source_local") != null);
+}
+
+test "model aware media local source recipes enforce current policy without loading bytes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "media", .data = "media" });
+    const path = try tmp.dir.realPathFileAlloc(io, "media", a);
+    defer a.free(path);
+    const uri = try std.fmt.allocPrint(a, "file://{s}", .{path});
+    defer a.free(uri);
+    const paths = [_][]u8{path};
+    var remote = scraping.RemoteContentConfig{ .security = .{ .allowed_paths = &paths, .max_download_size_bytes = 1 } };
+    const raw = try std.json.Stringify.valueAlloc(a, .{ .body = .{ .type = "source", .uri = uri, .mime_type = "video/mp4", .version_kind = "file_sha256", .version = "721c9525ade2ea8903d343ef25cf68b9b1fabb61f35b5210966e3cc9e454cd27", .length = 5 } }, .{});
+    defer a.free(raw);
+    const request = enrichment_types.GeneratedEnrichmentRequest{ .kind = .chunk_text, .index_name = "idx", .artifact_name = "chunks", .embedding_name = "embedding", .doc_key = "doc", .source_field = "body" };
+    var source = try extractModelChunkSource(a, .{ .io = io, .remote_content = &remote }, raw, request, null);
+    defer source.deinit(a);
+    try std.testing.expectEqual(.file_sha256, source.input.?.source.version_kind);
+    try std.testing.expectEqualStrings(uri, source.input.?.source.uri);
+    try std.testing.expect(source.bytes == null);
+    var runtime = EnrichmentRuntime{
+        .alloc = a,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .io = io, .remote_content = &remote },
+        .ownership = undefined,
+    };
+    try authorizeModelSource(&runtime, source.input.?);
+    remote.security.?.allowed_paths = &.{};
+    // Retained page/replay input must not bypass policy after extraction.
+    try std.testing.expectError(error.PathNotAllowed, dispatchModelPage(&runtime, a, .{ .provider = .antfly }, source.input.?));
+    try std.testing.expectError(error.PathNotAllowed, probeModelPass(&runtime, .{ .provider = .antfly }, source.input.?));
+    try std.testing.expectError(error.PathNotAllowed, extractModelChunkSource(a, .{ .io = io, .remote_content = &remote }, raw, request, null));
 }
 
 test "model aware media retained source recipes own their immutable object reference" {

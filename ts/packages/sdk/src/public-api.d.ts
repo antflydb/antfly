@@ -30713,19 +30713,19 @@ export interface components {
         ChunkSourceReference: {
             /** @enum {string} */
             type: "source";
-            /** @description HTTP(S) or S3 object URI resolved through configured content security and credentials. */
+            /** @description HTTP(S), S3, or absolute file:// URI resolved through configured content security and credentials. Local files require an explicit remote_content.security.allowed_paths allowlist. */
             uri: string;
             mime_type: string;
-            /** @description Quoted strong HTTP/S3 ETag or immutable S3 version ID; enforced on every range read. */
+            /** @description Quoted strong HTTP/S3 ETag, immutable S3 version ID, or lowercase SHA-256 hex digest for file_sha256. Local files are verified in a bounded streaming scan; unchanged files reuse a bounded process-local verification cache across continuation pages. Size, inode, mtime and ctime are checked around every range read. */
             version: string;
             /**
-             * @description Defaults to strong_etag. S3 version IDs are supported only for S3 sources.
+             * @description Defaults to strong_etag. S3 version IDs require S3 sources; file_sha256 requires a local file URI.
              * @enum {string}
              */
-            version_kind?: "strong_etag" | "s3_version_id";
+            version_kind?: "strong_etag" | "s3_version_id" | "file_sha256";
             /**
              * Format: int64
-             * @description Exact immutable object length, verified against Content-Range.
+             * @description Exact immutable object length, verified against Content-Range or local file metadata.
              */
             length: number;
         };
