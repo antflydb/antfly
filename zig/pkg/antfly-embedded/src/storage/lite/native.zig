@@ -4390,6 +4390,17 @@ const RedoCommitState = struct {
     /// *and* synced). May run ahead of the on-disk checkpoint slot's own
     /// `commit_sequence`, which only a real checkpoint advances.
     durable_sequence: u64 = 0,
+    /// §9.3b: the on-disk checkpoint sequence this log is currently
+    /// relative to -- what a fresh reopen's `redo_log.replay` would use
+    /// as `start_after_sequence`. Set from the on-disk checkpoint at
+    /// `recoverRedoLog`/`createWithRedoLog` time, advanced only when a
+    /// real checkpoint lands (`checkpointRedoLog`), never by an ordinary
+    /// redo commit. Published to the shared lock region (alongside
+    /// `durable_sequence` and the log's current tail offset) so a
+    /// cross-process reader knows whether its own cached baseline is
+    /// still current or whether it must rebuild from a new one ("re-open
+    /// semantics").
+    checkpoint_sequence: u64 = 0,
     /// See this struct's own doc comment.
     checkpointing: bool = false,
 
@@ -5824,6 +5835,15 @@ pub const NativeFile = struct {
     /// writer file that created it).
     reader_pin_entry: ?*inode_lock.Entry = null,
     reader_pin_sequence: u64 = 0,
+    /// §9.3b: this instance's own claimed reader slot in the shared lock
+    /// region, used only by `refreshCrossProcessRedoOverlay` to pin the
+    /// `commit_sequence` this process has safely caught up to in another
+    /// process's redo log -- distinct from `reader_fence` (page-reuse
+    /// retention, pinned at a checkpoint sequence, one slot already
+    /// spoken for by the plain-reader-open/`acquireReaderFence`/
+    /// `captureFullReadSnapshot` triad). Claimed lazily on first refresh,
+    /// released in `close()`.
+    cross_process_redo_reader_slot: ?u32 = null,
     reader_window_depth: usize = 0,
     reader_window_lock: ?inode_lock.Handle = null,
     /// The reuse frontier `acquireEpochReuseLock` last read directly from
@@ -6392,7 +6412,7 @@ pub const NativeFile = struct {
             // appends to it.
             fn populate(_: void, _: *redo_overlay.SharedRedoOverlay, _: Allocator) anyerror!void {}
         }.populate);
-        self.redo = RedoCommitState{ .writer = redo_log.Writer.init(self.file, io, offset, capacity), .shared = shared };
+        self.redo = RedoCommitState{ .writer = redo_log.Writer.init(self.file, io, offset, capacity), .shared = shared, .checkpoint_sequence = checkpoint.commit_sequence };
     }
 
     /// Replays the valid log prefix past the on-disk checkpoint's own
@@ -6465,7 +6485,9 @@ pub const NativeFile = struct {
             .writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, outcome.valid_bytes, outcome.last_sequence),
             .shared = shared,
             .durable_sequence = outcome.last_sequence orelse checkpoint.commit_sequence,
+            .checkpoint_sequence = checkpoint.commit_sequence,
         };
+        self.publishRedoLogState();
     }
 
     /// Turns every page the redo log's overlay is still carrying into a
@@ -6493,12 +6515,20 @@ pub const NativeFile = struct {
     /// log-zeroing step below leaves stale (but harmless -- already fully
     /// reflected in the new, durable checkpoint) bytes at the start of the
     /// log. `redo_log.replay` recognizes this directly (its own
-    /// superseded-vs-corrupt distinction, checked only at the first
-    /// record position): a record whose sequence is at or below the
-    /// checkpoint baseline is superseded, not corrupt, so recovery treats
-    /// it as a clean end rather than failing closed. See "lite redo log
-    /// checkpoint recovers cleanly from a crash between the new slot and
-    /// log-zeroing" for the exercised scenario.
+    /// superseded-vs-corrupt distinction): a record whose sequence is at
+    /// or below the checkpoint baseline is superseded, not corrupt, so
+    /// recovery treats it as a clean end rather than failing closed. See
+    /// "lite redo log checkpoint recovers cleanly from a crash between
+    /// the new slot and log-zeroing" for the exercised scenario.
+    ///
+    /// §9.3b: the zero/reset step below is also gated on the shared
+    /// region's minimum pinned sequence -- a live cross-process reader
+    /// may not have caught up to this checkpoint yet, in which case the
+    /// reclaim is deferred (not skipped forever; the next pass retries).
+    /// While deferred, the writer keeps appending past the stale prefix
+    /// instead of resetting over it, so `replay`'s superseded handling
+    /// must (and does) tolerate a superseded run followed by genuinely
+    /// new records, not just a superseded run with nothing after it.
     pub fn checkpointRedoLog(self: *NativeFile) anyerror!void {
         const redo: *RedoCommitState = if (self.redo) |*r| r else return error.InvalidTransactionState;
         const io = self.runtimeIo();
@@ -6594,6 +6624,7 @@ pub const NativeFile = struct {
         // appended -- now fully superseded by the checkpoint that just
         // landed.
         const old_tail = redo.writer.tail;
+        const new_checkpoint_sequence = self.activeCheckpoint().commit_sequence;
         // §9.6a: unlike the pre-sharing design, this is not an
         // unconditional clear -- a reader pinned to an older checkpoint
         // than the one that just landed may still need an overlay version
@@ -6603,17 +6634,183 @@ pub const NativeFile = struct {
         // every version folded above by construction (its own
         // `commit_sequence` is freshly assigned after all of them), so it
         // is the correct reclaim floor.
-        redo.shared.reclaim(std.heap.page_allocator, io, self.activeCheckpoint().commit_sequence);
+        redo.shared.reclaim(std.heap.page_allocator, io, new_checkpoint_sequence);
         redo.shared.maybeClearPages(std.heap.page_allocator, io);
-        if (builtin.is_test and self.test_skip_redo_log_zero) return;
-        if (old_tail > 0) {
-            const zeros = try self.allocator.alloc(u8, @intCast(old_tail));
-            defer self.allocator.free(zeros);
-            @memset(zeros, 0);
-            try self.file.writePositionalAll(io, zeros, self.header.redo_log_offset);
-            try self.file.sync(io);
+        // The real on-disk checkpoint is durable now regardless of
+        // whether the log's stale prefix below gets physically reclaimed
+        // this pass: a fresh reopen already reads this baseline straight
+        // off the checkpoint slot, and a cross-process reader must see it
+        // too, so a stale cached baseline on its side is recognized as
+        // stale rather than silently misread ("re-open semantics",
+        // §9.3b).
+        redo.checkpoint_sequence = new_checkpoint_sequence;
+        if (builtin.is_test and self.test_skip_redo_log_zero) {
+            self.publishRedoLogState();
+            return;
         }
-        redo.writer = redo_log.Writer.init(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity);
+        // §9.3b: must not physically reclaim log bytes a live
+        // cross-process reader still needs. Gated on the region's
+        // minimum pinned sequence -- the only mechanism that tracks "a
+        // reader outside this process hasn't caught up yet": an
+        // in-process reader never reads raw log bytes at all, only
+        // `redo.shared`'s own in-memory version chains, which `reclaim`
+        // above already governs through its own, separate pin list. If a
+        // live cross-process reader is pinned below this checkpoint,
+        // defer the reclaim entirely -- the writer keeps appending past
+        // `old_tail` instead of resetting over it (safe:
+        // `redo_log.replay`'s superseded-record handling tolerates a
+        // stale leading run followed by genuinely new records, see
+        // redo_log.zig's own "a superseded run can be followed by
+        // genuinely new records" test) -- and the next checkpointer pass
+        // retries once the blocking reader has caught up or died. A
+        // bounded-retry posture, not a `retirementNeedsService()`-driven
+        // one: an externally-pinned backlog never resolves on its own,
+        // the same rule every other reader-pin-blocks-reclaim case in
+        // this codebase already follows.
+        const pinned_below: bool = blk: {
+            const region = (self.regionForInode() catch break :blk false) orelse break :blk false;
+            const min_pinned = region.minimumPinnedSequence() orelse break :blk false;
+            break :blk min_pinned < new_checkpoint_sequence;
+        };
+        if (!pinned_below) {
+            if (old_tail > 0) {
+                const zeros = try self.allocator.alloc(u8, @intCast(old_tail));
+                defer self.allocator.free(zeros);
+                @memset(zeros, 0);
+                try self.file.writePositionalAll(io, zeros, self.header.redo_log_offset);
+                try self.file.sync(io);
+            }
+            redo.writer = redo_log.Writer.init(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity);
+        } else {
+            // Deferred: `old_tail`/the bytes already in the log are left
+            // exactly as they are (still correct, just now superseded).
+            // But `redo.writer.last_sequence` must still advance past
+            // `new_checkpoint_sequence` -- the checkpoint commit above
+            // consumed that sequence number without ever appending a log
+            // record for it (`checkpointing = true` disabled the whole
+            // redo-append branch for that one commit) -- otherwise the
+            // *next* ordinary commit's own append would fail the
+            // writer's own continuity check (`error.SequenceOutOfOrder`,
+            // expecting `old_tail`'s last record's sequence + 1, which is
+            // now one behind the real next value). `redo_log.replay`'s
+            // own superseded-run handling (redo_log.zig) is built to
+            // tolerate exactly this gap on a later reopen/cross-process
+            // catch-up.
+            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, old_tail, new_checkpoint_sequence);
+        }
+        self.publishRedoLogState();
+    }
+
+    /// §9.3b/step (g): catches this process's own redo-log overlay up to
+    /// whatever another process has published to the shared lock region,
+    /// without reopening. Safe to call on any redo-log `NativeFile`,
+    /// including the live writer itself (a no-op there: its own
+    /// `durable_sequence` is always >= whatever it last published).
+    ///
+    /// Always pins this process's own reader slot at `redo.durable_sequence`
+    /// *before* reading anything new -- never at the newer value this call
+    /// is about to advance to -- so the writer's own reclaim gate
+    /// (`checkpointRedoLog`'s `pinned_below` check) can never race ahead
+    /// of what this call is in the middle of reading. The pin only moves
+    /// forward once the corresponding bytes have actually been applied.
+    ///
+    /// Reuses `redo_log.replay` with this process's own last-applied
+    /// sequence as `start_after_sequence`: everything already applied is,
+    /// from this call's own point of view, "superseded" by its own
+    /// baseline (§9.3b's generalized superseded-skip in redo_log.zig), so
+    /// one call always scans the *whole* log region (replay has no
+    /// resume-from-byte-offset primitive) but only ever delivers genuinely
+    /// new records to the overlay -- correct regardless of whether the
+    /// writer's own on-disk checkpoint advanced since the last refresh.
+    /// If it did, the *real* on-disk checkpoint slot (roots, page_count,
+    /// manifest) is re-read first (`loadCheckpointSlots`/
+    /// `recoverActiveCheckpoint`/`adoptIndexPublicationHeader`, exactly
+    /// `refreshIfWriterBaseStale`'s own in-process staleness fix, reused
+    /// here for the cross-process case) -- this instance's own real-page
+    /// reads must follow the new roots, not the stale ones it opened or
+    /// last refreshed with. Either way, once the overlay is caught up,
+    /// `self.header.checkpoints[active].commit_sequence` is bumped to the
+    /// new `durable_sequence` -- the same "provisional, no real pages
+    /// touched" trick an ordinary redo commit already applies to its own
+    /// writer (`publishCheckpoint`'s redo branch) -- so overlay-aware
+    /// reads (`redoOverlayEntry`'s own `checkpoint.commit_sequence` bound)
+    /// actually see the records this call just applied.
+    pub fn refreshCrossProcessRedoOverlay(self: *NativeFile) !void {
+        const redo: *RedoCommitState = if (self.redo) |*r| r else return error.InvalidTransactionState;
+        const region = (try self.regionForInode()) orelse return;
+        const io = self.runtimeIo();
+        const entry = self.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
+
+        const slot = self.cross_process_redo_reader_slot orelse blk: {
+            const pid: u32 = @bitCast(std.c.getpid());
+            const claimed = try region.claimReaderSlot(pid);
+            self.cross_process_redo_reader_slot = claimed;
+            break :blk claimed;
+        };
+        // Pin at what we already have *before* reading anything new.
+        region.pinReader(slot, @max(redo.durable_sequence, 1));
+
+        const published = region.readLogState();
+
+        // §9.3b "re-open semantics": the real on-disk checkpoint has
+        // moved since this instance last synced with it. Re-read it
+        // (roots, page_count, manifest -- real fields, not the logical
+        // watermark bumped below) before anything else, the same
+        // in-process staleness fix `refreshIfWriterBaseStale` already
+        // applies, triggered here by the region's published watermark
+        // instead of `inode_lock.committedSequence`.
+        if (published.checkpoint_sequence > redo.checkpoint_sequence) {
+            var header_bytes: [header_size]u8 = undefined;
+            try readHeaderExactAt(self.file, io, &header_bytes);
+            var header = try decodeHeader(&header_bytes);
+            const file_size = (try self.file.stat(io)).size;
+            header.checkpoints = loadCheckpointSlots(self.file, io, header.page_size, file_size);
+            const recovered = try recoverActiveCheckpoint(self.file, io, header, file_size, false);
+            header.active_checkpoint = recovered.index;
+            try self.adoptIndexPublicationHeader(header);
+            redo.checkpoint_sequence = self.header.checkpoints[self.header.active_checkpoint].commit_sequence;
+        }
+
+        if (published.durable_sequence > redo.durable_sequence) {
+            const ApplyCtx = struct {
+                overlay: *redo_overlay.SharedRedoOverlay,
+                fn onRecord(ctx_ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
+                    const ac: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+                    if (record.payload.len < CompactCheckpoint.encoded_size + 4) return error.InvalidNativeRedoRecord;
+                    const logical_len = std.mem.readInt(u32, record.payload[CompactCheckpoint.encoded_size..][0..4], .little);
+                    const logical_start = CompactCheckpoint.encoded_size + 4;
+                    if (logical_start + logical_len > record.payload.len) return error.InvalidNativeRedoRecord;
+                    try ac.overlay.decodeLogicalMutationsPayload(std.heap.page_allocator, record.payload[logical_start..][0..logical_len], record.commit_sequence);
+                    try ac.overlay.decodeRedoGroupPayload(std.heap.page_allocator, record.payload[logical_start + logical_len ..]);
+                }
+            };
+
+            const ReplayCtx = struct {
+                file: *NativeFile,
+                io: std.Io,
+                start_after_sequence: u64,
+                outcome: redo_log.ReplayOutcome = undefined,
+                fn run(rc: *@This(), overlay: *redo_overlay.SharedRedoOverlay) anyerror!void {
+                    var actx: ApplyCtx = .{ .overlay = overlay };
+                    rc.outcome = try redo_log.replay(rc.file.allocator, rc.file.file, rc.io, rc.file.header.redo_log_offset, rc.file.header.redo_log_capacity, rc.start_after_sequence, ApplyCtx.onRecord, &actx);
+                    if (rc.outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
+                }
+            };
+            var rctx: ReplayCtx = .{ .file = self, .io = io, .start_after_sequence = redo.durable_sequence };
+            try inode_lock.withRedoOverlayLock(entry, io, &rctx, ReplayCtx.run);
+
+            const outcome = rctx.outcome;
+            redo.durable_sequence = outcome.last_sequence orelse redo.durable_sequence;
+            redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, outcome.valid_bytes, outcome.last_sequence);
+        }
+
+        // Provisional bump, exactly as an ordinary redo commit already
+        // does for its own writer: no real pages touched, just the
+        // logical watermark overlay-aware reads compare against.
+        self.header.checkpoints[self.header.active_checkpoint].commit_sequence = redo.durable_sequence;
+
+        // Advance our pin to match what we just safely applied.
+        region.pinReader(slot, @max(redo.durable_sequence, 1));
     }
 
     fn createWithMode(
@@ -6838,6 +7035,17 @@ pub const NativeFile = struct {
         if (self.reader_pin_entry) |entry| {
             inode_lock.unpinReader(entry, io, .{ .data = self.reader_pin_sequence, .metadata = self.reader_pin_sequence });
             self.reader_pin_entry = null;
+        }
+        // Same ordering requirement as `reader_pin_entry` just above:
+        // releasing this slot needs `regionForInode()`, which needs
+        // `self.inode_lock_ref` still live, so it must run before the
+        // `inode_lock.unref` below.
+        if (self.cross_process_redo_reader_slot) |slot| {
+            if (self.regionForInode() catch null) |region| {
+                region.unpinReader(slot);
+                region.releaseReaderSlot(slot);
+            }
+            self.cross_process_redo_reader_slot = null;
         }
         if (self.inode_lock_ref.load(.acquire)) |entry| {
             inode_lock.unref(entry, io);
@@ -7475,6 +7683,44 @@ pub const NativeFile = struct {
             if (inode_lock.isRegionUnusable(err)) return null;
             return err;
         };
+    }
+
+    /// §9.3b: publishes `self.redo`'s current state (the checkpoint
+    /// baseline it is relative to, the highest durable sequence, and the
+    /// log's durable tail offset) to the shared lock region, if this
+    /// inode has one -- the cross-process WAL index a reader in a
+    /// different process consults to catch up. A no-op (not an error)
+    /// when there is no redo log or no usable region: both are the same
+    /// "nothing to publish, nothing to read" case `regionForInode`
+    /// already treats uniformly elsewhere. Called at `recoverRedoLog`/
+    /// `createWithRedoLog` time (so a fresh reader sees *some* state
+    /// immediately rather than stale zeros until the first commit) and
+    /// after every durable append or checkpoint thereafter. No new
+    /// syscalls on the steady-state path: `regionForInode` only opens the
+    /// region the first time any caller on this inode needs it (already
+    /// done by the ordinary commit path's own reuse-frontier scan), every
+    /// call after that is a mutex lock plus atomic stores into the
+    /// already-mapped region.
+    ///
+    /// Deliberately `void`, not an error union: this is a cross-process
+    /// convenience, not part of the durability contract this process's
+    /// own commit just satisfied (the fsync already happened; a reader
+    /// in *this* process already sees the result through `self.redo`
+    /// regardless). Any failure to reach or publish to the region --
+    /// including `OutOfMemory`, unlike `regionForInode`'s own stricter
+    /// contract for callers that need the region for correctness -- is
+    /// swallowed here: a cross-process reader just sees stale (but never
+    /// wrong) watermarks until the next successful publish, the same
+    /// "stale but safe" posture every other process already has before
+    /// this call ever runs once.
+    fn publishRedoLogState(self: *NativeFile) void {
+        const redo = if (self.redo) |*r| r else return;
+        const region = (self.regionForInode() catch return) orelse return;
+        region.publishLogState(.{
+            .checkpoint_sequence = redo.checkpoint_sequence,
+            .durable_sequence = redo.durable_sequence,
+            .durable_offset = redo.writer.tail,
+        });
     }
 
     /// Read-generation locks join the same-owner frontier only while
@@ -15338,6 +15584,17 @@ pub const NativeFile = struct {
                 return error.OutcomeUnknown;
             };
             redo.durable_sequence = checkpoint.commit_sequence;
+            // §9.3b: publish right after the append this process just
+            // made durable, never before -- ride-along/deferred appends
+            // elsewhere are unsynced and must never be visible to a
+            // cross-process reader until a `durable=true` commit's own
+            // sync (the one that just returned, above) covers them.
+            // `redo.checkpoint_sequence` is untouched by an ordinary
+            // commit (only `checkpointRedoLog` advances it), so this
+            // publishes the same baseline a cross-process reader already
+            // has whenever nothing has been checkpointed since it last
+            // refreshed.
+            self.publishRedoLogState();
             self.header.checkpoints[self.header.active_checkpoint] = checkpoint;
             wal_trace.recordCommit();
             self.last_synced_header = self.header;
@@ -27532,6 +27789,331 @@ test "lite redo log checkpoint turns overlay pages into real pages, advances the
     // (replayed from the log, not yet checkpointed) -- the same known,
     // documented gap `checkpointRedoLog`'s own doc comment and the
     // earlier redo-log tests already call out, not a regression.
+}
+
+test "lite redo log cross-process refresh sees put, overwrite and delete made after it opened" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-refresh.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer writer.close();
+    try writer.beginTransaction();
+    try writer.putDocument("alpha", "one");
+    try writer.commitTransaction();
+
+    // A second, independent handle on the same path -- standing in for a
+    // different process's own open (within one process, `inode_lock`'s
+    // registry is still per-inode, so this handle's `self.redo` is its
+    // own independent copy of `durable_sequence`/`writer`/
+    // `checkpoint_sequence` even though it shares the same in-memory
+    // `SharedRedoOverlay` instance -- the exact same relationship a real
+    // second process has to its own, separate overlay instance, minus
+    // only the "separate instance" part this test doesn't need to
+    // exercise `refreshCrossProcessRedoOverlay`'s own catch-up logic).
+    var reader = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    defer reader.close();
+    const alpha = (try reader.getDocumentAlloc(a, "alpha")).?;
+    a.free(alpha);
+
+    // Put, after the reader opened: invisible until refreshed.
+    try writer.beginTransaction();
+    try writer.putDocument("beta", "two");
+    try writer.commitTransaction();
+    try std.testing.expectEqual(@as(?[]u8, null), try reader.getDocumentAlloc(a, "beta"));
+    try reader.refreshCrossProcessRedoOverlay();
+    const beta = (try reader.getDocumentAlloc(a, "beta")).?;
+    defer a.free(beta);
+    try std.testing.expectEqualStrings("two", beta);
+
+    // Overwrite.
+    try writer.beginTransaction();
+    try writer.putDocument("alpha", "one-v2");
+    try writer.commitTransaction();
+    const alpha_stale = (try reader.getDocumentAlloc(a, "alpha")).?;
+    defer a.free(alpha_stale);
+    try std.testing.expectEqualStrings("one", alpha_stale);
+    try reader.refreshCrossProcessRedoOverlay();
+    const alpha_fresh = (try reader.getDocumentAlloc(a, "alpha")).?;
+    defer a.free(alpha_fresh);
+    try std.testing.expectEqualStrings("one-v2", alpha_fresh);
+
+    // Delete.
+    try writer.beginTransaction();
+    try writer.deleteDocument("beta");
+    try writer.commitTransaction();
+    const beta_before_delete = (try reader.getDocumentAlloc(a, "beta")).?;
+    a.free(beta_before_delete);
+    try reader.refreshCrossProcessRedoOverlay();
+    try std.testing.expectEqual(@as(?[]u8, null), try reader.getDocumentAlloc(a, "beta"));
+
+    // A refresh with nothing new is a clean no-op.
+    try reader.refreshCrossProcessRedoOverlay();
+}
+
+test "lite redo log cross-process refresh still sees a pinned reader's own writes across a checkpoint" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-refresh-checkpoint.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer writer.close();
+    try writer.beginTransaction();
+    try writer.putDocument("alpha", "one");
+    try writer.commitTransaction();
+
+    var reader = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    defer reader.close();
+    // Pin at what the reader already has, same as a real refresh's own
+    // first step, so the checkpointer below sees a live pin behind the
+    // checkpoint it is about to publish.
+    try reader.refreshCrossProcessRedoOverlay();
+
+    try writer.beginTransaction();
+    try writer.putDocument("beta", "two");
+    try writer.commitTransaction();
+
+    // The writer overwrites "alpha" and checkpoints -- the reader hasn't
+    // refreshed past "beta" yet, so its pin (at the sequence right after
+    // "alpha") is strictly behind the checkpoint that's about to land.
+    try writer.beginTransaction();
+    try writer.putDocument("alpha", "one-v2");
+    try writer.commitTransaction();
+    try writer.checkpointRedoLog();
+
+    // The reader still resolves everything correctly after refreshing,
+    // even though the checkpoint landed while it was behind.
+    try reader.refreshCrossProcessRedoOverlay();
+    const alpha = (try reader.getDocumentAlloc(a, "alpha")).?;
+    defer a.free(alpha);
+    try std.testing.expectEqualStrings("one-v2", alpha);
+    const beta = (try reader.getDocumentAlloc(a, "beta")).?;
+    defer a.free(beta);
+    try std.testing.expectEqualStrings("two", beta);
+}
+
+test "lite redo log checkpointer defers log reclaim while a cross-process reader is pinned behind it" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-refresh-gate.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer writer.close();
+    try writer.beginTransaction();
+    try writer.putDocument("alpha", "one");
+    try writer.commitTransaction();
+
+    {
+        var reader = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+        defer reader.close();
+        try reader.refreshCrossProcessRedoOverlay(); // pins at "alpha"'s sequence
+
+        try writer.beginTransaction();
+        try writer.putDocument("beta", "two");
+        try writer.commitTransaction();
+
+        const tail_before = writer.redo.?.writer.tail;
+        try std.testing.expect(tail_before > 0);
+        try writer.checkpointRedoLog();
+        // Deferred: the reader's pin is still behind this checkpoint, so
+        // the log's stale prefix must not have been physically reclaimed.
+        try std.testing.expectEqual(tail_before, writer.redo.?.writer.tail);
+        // But the real checkpoint itself still landed (durable, not
+        // deferred).
+        const alpha_after_checkpoint = (try writer.getDocumentAlloc(a, "alpha")).?;
+        a.free(alpha_after_checkpoint);
+
+        // Caught up; `reader.close()` below (deferred) releases the pin.
+        try reader.refreshCrossProcessRedoOverlay();
+    }
+
+    try writer.beginTransaction();
+    try writer.putDocument("gamma", "three");
+    try writer.commitTransaction();
+    try writer.checkpointRedoLog();
+    try std.testing.expectEqual(@as(u64, 0), writer.redo.?.writer.tail);
+}
+
+test "lite redo log publishRedoLogState never runs when the durable append itself fails -- a torn/failed commit is never visible cross-process" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-refresh-torn.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer file.close();
+    try file.beginTransaction();
+    try file.putDocument("alpha", "one");
+    try file.commitTransaction();
+
+    const region = (try file.regionForInode()).?;
+    const before = region.readLogState();
+    try std.testing.expectEqual(file.redo.?.durable_sequence, before.durable_sequence);
+
+    // Inject a failure at exactly the point `publishCheckpoint`'s redo
+    // branch would otherwise append+sync -- the one place this design
+    // publishes from (§9.3b: "the published end only advances after the
+    // durable append"). The failed commit's own sequence must never
+    // reach the region.
+    file.test_fail_checkpoint_publication = error.TestInjectedFailure;
+    try file.beginTransaction();
+    try file.putDocument("beta", "two");
+    try std.testing.expectError(error.OutcomeUnknown, file.commitTransaction());
+    file.test_fail_checkpoint_publication = null;
+
+    const after = region.readLogState();
+    try std.testing.expectEqual(before.durable_sequence, after.durable_sequence);
+    try std.testing.expectEqual(before.durable_offset, after.durable_offset);
+    try std.testing.expectEqual(before.checkpoint_sequence, after.checkpoint_sequence);
+
+    // A genuinely durable commit right after still works and does
+    // publish, proving the failed attempt above left nothing wedged.
+    try file.beginTransaction();
+    try file.putDocument("beta", "two");
+    try file.commitTransaction();
+    const final = region.readLogState();
+    try std.testing.expect(final.durable_sequence > before.durable_sequence);
+}
+
+test "lite redo log cross-process: a forked child sees commits the parent makes after the child opens" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-fork-refresh.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer writer.close();
+    try writer.beginTransaction();
+    try writer.putDocument("alpha", "one");
+    try writer.commitTransaction();
+
+    // go_fds: parent tells the child "beta is committed, refresh now."
+    // result_fds: child reports back what it saw.
+    var go_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&go_fds));
+    var result_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&result_fds));
+
+    const child_pid = std.c.fork();
+    if (child_pid == 0) {
+        _ = std.posix.system.close(go_fds[1]);
+        _ = std.posix.system.close(result_fds[0]);
+        const io = std.testing.io;
+        var reader = NativeFile.openWithIo(a, io, path, .{ .read_only = true }) catch crossProcessParkForever();
+        const region = (reader.regionForInode() catch crossProcessParkForever()) orelse crossProcessParkForever();
+        region.reclaimLivenessAfterFork() catch crossProcessParkForever();
+        var go: [1]u8 = undefined;
+        crossProcessReadBounded(go_fds[0], &go, 5000) catch crossProcessParkForever();
+        reader.refreshCrossProcessRedoOverlay() catch crossProcessParkForever();
+        const beta = (reader.getDocumentAlloc(a, "beta") catch crossProcessParkForever()) orelse crossProcessParkForever();
+        const ok = std.mem.eql(u8, beta, "two");
+        const report: [1]u8 = .{if (ok) 1 else 0};
+        _ = std.c.write(result_fds[1], &report, report.len);
+        crossProcessParkForever();
+    }
+    _ = std.posix.system.close(go_fds[0]);
+    _ = std.posix.system.close(result_fds[1]);
+    var child_reaped = false;
+    defer if (!child_reaped) {
+        _ = std.c.kill(child_pid, std.c.SIG.KILL);
+        _ = std.c.waitpid(child_pid, null, 0);
+    };
+    defer _ = std.posix.system.close(go_fds[1]);
+    defer _ = std.posix.system.close(result_fds[0]);
+
+    try writer.beginTransaction();
+    try writer.putDocument("beta", "two");
+    try writer.commitTransaction();
+
+    const go: [1]u8 = .{1};
+    _ = std.c.write(go_fds[1], &go, go.len);
+
+    var report: [1]u8 = undefined;
+    try crossProcessReadBounded(result_fds[0], &report, 5000);
+    try std.testing.expectEqual(@as(u8, 1), report[0]);
+
+    _ = std.c.kill(child_pid, std.c.SIG.KILL);
+    _ = try crossProcessReapBounded(child_pid, 2000);
+    child_reaped = true;
+}
+
+test "lite redo log cross-process: checkpointer defers reclaim while a forked child is pinned, reclaims after kill -9" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-fork-gate.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer writer.close();
+    try writer.beginTransaction();
+    try writer.putDocument("alpha", "one");
+    try writer.commitTransaction();
+
+    var result_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&result_fds));
+
+    const child_pid = std.c.fork();
+    if (child_pid == 0) {
+        _ = std.posix.system.close(result_fds[0]);
+        const io = std.testing.io;
+        var reader = NativeFile.openWithIo(a, io, path, .{ .read_only = true }) catch crossProcessParkForever();
+        const region = (reader.regionForInode() catch crossProcessParkForever()) orelse crossProcessParkForever();
+        region.reclaimLivenessAfterFork() catch crossProcessParkForever();
+        // Pins at "alpha"'s sequence, then parks -- never catches up to
+        // "beta", standing in for a slow or stuck cross-process reader.
+        reader.refreshCrossProcessRedoOverlay() catch crossProcessParkForever();
+        const report: [1]u8 = .{1};
+        _ = std.c.write(result_fds[1], &report, report.len);
+        crossProcessParkForever();
+    }
+    _ = std.posix.system.close(result_fds[1]);
+    var child_reaped = false;
+    defer if (!child_reaped) {
+        _ = std.c.kill(child_pid, std.c.SIG.KILL);
+        _ = std.c.waitpid(child_pid, null, 0);
+    };
+    defer _ = std.posix.system.close(result_fds[0]);
+
+    var report: [1]u8 = undefined;
+    try crossProcessReadBounded(result_fds[0], &report, 5000);
+    try std.testing.expectEqual(@as(u8, 1), report[0]);
+
+    try writer.beginTransaction();
+    try writer.putDocument("beta", "two");
+    try writer.commitTransaction();
+
+    const tail_before = writer.redo.?.writer.tail;
+    try std.testing.expect(tail_before > 0);
+    try writer.checkpointRedoLog();
+    // The forked child is still alive and pinned behind this checkpoint
+    // -- reclaim must be deferred, exactly as the in-process version of
+    // this test already proves, now through a real second OS process.
+    try std.testing.expectEqual(tail_before, writer.redo.?.writer.tail);
+
+    _ = std.c.kill(child_pid, std.c.SIG.KILL);
+    _ = try crossProcessReapBounded(child_pid, 2000);
+    child_reaped = true;
+
+    // Dead now: the next checkpointer pass reclaims normally, exactly
+    // like `shared_lock_region.zig`'s own "a kill -9'd reader's pin is
+    // cleared by the frontier scan" -- here through the full
+    // `checkpointRedoLog` path instead of the region's raw primitives.
+    try writer.beginTransaction();
+    try writer.putDocument("gamma", "three");
+    try writer.commitTransaction();
+    try writer.checkpointRedoLog();
+    try std.testing.expectEqual(@as(u64, 0), writer.redo.?.writer.tail);
 }
 
 test "lite redo log checkpoint is a no-op with nothing to checkpoint" {

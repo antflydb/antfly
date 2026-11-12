@@ -480,6 +480,30 @@ pub fn ensureRedoOverlay(
     return &entry.redo_overlay.?;
 }
 
+/// Runs `apply` against this inode's already-populated shared overlay
+/// under the same `entry.mutex` `ensureRedoOverlay`'s own `populate`
+/// callback runs under. §9.3b's cross-process catch-up refresh needs
+/// this: `redo_overlay.SharedRedoOverlay.decodeLogicalMutationsPayload`/
+/// `decodeRedoGroupPayload` are deliberately unlocked (safe only while
+/// nothing else can reach the overlay concurrently -- see their own doc
+/// comments), so any caller that touches them *after* the overlay
+/// already exists (every caller but the genuine first opener, which
+/// `ensureRedoOverlay` itself already serializes) must take this lock
+/// itself, exactly as `ensureRedoOverlay` does for first population.
+/// Returns `error.InvalidTransactionState` if the overlay was never
+/// populated at all (nothing to refresh).
+pub fn withRedoOverlayLock(
+    entry: *Entry,
+    io: Io,
+    ctx: anytype,
+    apply: *const fn (@TypeOf(ctx), *redo_overlay.SharedRedoOverlay) anyerror!void,
+) !void {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    const overlay = if (entry.redo_overlay) |*o| o else return error.InvalidTransactionState;
+    try apply(ctx, overlay);
+}
+
 /// Lazily opens (once per `Entry`, shared by every reference to it) and
 /// returns this inode's shared lock region. `entry.mutex` serializes
 /// concurrent first-use the same way it already serializes every other
