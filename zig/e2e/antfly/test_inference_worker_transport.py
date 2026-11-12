@@ -106,20 +106,22 @@ def test_worker_launch_body_limits_and_replacement(tmp_path, focused):
             assert worker is not None, (
                 "Standalone inference must launch its supervised worker"
             )
-            # Missing embedding fields intentionally produce a stable 400 from
-            # the worker's parser, without downloading or running a model.
-            endpoint = f"{base}/ai/v1/embed"
-            baseline = requests.post(endpoint, data=b"{}", timeout=10)
-            assert baseline.status_code == 400, baseline.text + logs()
+            # A valid fixed chunk request reaches the worker and needs no model.
+            # Invalid embedding requests can be rejected by the parent before
+            # crossing RPC, so they cannot qualify limits or replacement.
+            endpoint = f"{base}/ai/v1/chunk"
+            payload = b'{"input":"worker transport","model":"fixed"}'
+            baseline = requests.post(endpoint, data=payload, timeout=10)
+            assert baseline.status_code == 200, baseline.text + logs()
             for size in (48 * 1024 * 1024, 64 * 1024 * 1024):
-                body = b" " * (size - 2) + b"{}"
+                body = b" " * (size - len(payload)) + payload
                 response = requests.post(
                     endpoint,
                     data=body,
                     headers={"Content-Type": "application/json"},
                     timeout=60,
                 )
-                assert response.status_code == 400, response.text + logs()
+                assert response.status_code == 200, response.text + logs()
                 assert response.json() == baseline.json()
                 assert _inference_worker_pid(process.pid) == worker
             response = requests.post(endpoint, data=body + b" ", timeout=60)
@@ -129,8 +131,8 @@ def test_worker_launch_body_limits_and_replacement(tmp_path, focused):
             os.kill(worker, signal.SIGKILL)
             deadline = time.monotonic() + 30
             while True:
-                response = requests.post(endpoint, data=b"{}", timeout=10)
-                if response.status_code == 400:
+                response = requests.post(endpoint, data=payload, timeout=10)
+                if response.status_code == 200:
                     replacement = _inference_worker_pid(process.pid)
                     if replacement is not None and replacement != worker:
                         break
@@ -261,14 +263,18 @@ def test_worker_live_local_policy_large_snapshots_and_replacement(tmp_path):
             expect_policy("PathNotAllowed")
             # Ordinary text requests retain their independent 64 MiB body cap
             # even while the full large policy crosses each worker request.
-            embed = f"{base}/ai/v1/embed"
-            baseline = requests.post(embed, data=b"{}", timeout=10)
-            assert baseline.status_code == 400, baseline.text + logs()
-            body = b" " * (64 * 1024 * 1024 - 2) + b"{}"
-            large = requests.post(embed, data=body, timeout=60)
-            assert large.status_code == 400, large.text + logs()
+            endpoint = f"{base}/ai/v1/chunk"
+            payload = b'{"input":"worker transport","model":"fixed"}'
+            baseline = requests.post(endpoint, data=payload, timeout=10)
+            assert baseline.status_code == 200, baseline.text + logs()
+            body = b" " * (64 * 1024 * 1024 - len(payload)) + payload
+            large = requests.post(endpoint, data=body, timeout=60)
+            assert large.status_code == 200, large.text + logs()
             assert large.json() == baseline.json()
-            assert requests.post(embed, data=body + b" ", timeout=60).status_code == 413
+            assert (
+                requests.post(endpoint, data=body + b" ", timeout=60).status_code == 413
+            )
+
             publish(True)
             # A wrong digest proves the worker reached actual local verification
             # without requiring a model. Revocation must stop it before that.
