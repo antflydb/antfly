@@ -25,6 +25,7 @@ const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const full_text_index_defaults = @import("../../../common/full_text_index_defaults.zig");
 const native_artifact_sink = @import("../../native_artifact_sink.zig");
+const native_catalog_backend = @import("../../native_catalog_backend.zig");
 const native_backup = @import("../native_backup.zig");
 const process_memory = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
@@ -1406,6 +1407,17 @@ pub const IndexManager = struct {
     /// Owned copy of `IndexBackendOptions.native_catalog_scratch_dir`. See
     /// `persistent.PersistentIndexOptions.scratch_dir`.
     native_catalog_scratch_dir: ?[]u8 = null,
+    /// #1216 (creation side): borrowed, set only by `addWithOptions`
+    /// (never by anything reopen uses) for the duration of its one call
+    /// into `openConfiguredIndexWithAuthorization`, and cleared
+    /// immediately after. `openConfiguredIndexDetached`'s dense_vector
+    /// branch reads it to tell a genuinely fresh admission apart from a
+    /// normal reopen -- `self.get(cfg.name)` cannot make that distinction
+    /// from inside the shared open path, since the index being opened is,
+    /// by construction, absent from the open-indexes list in *either*
+    /// case at that point. Must be set/read/cleared only while
+    /// `catalog_mutex` is held, which both call sites already do.
+    fresh_admission_name: ?[]const u8 = null,
     byte_range: docstore_mod.ByteRange,
     relaxed_split_durability: bool,
     leann_replication: bool = false,
@@ -13174,6 +13186,13 @@ pub const IndexManager = struct {
             try self.appendOpenedIndex(opened);
             entry.* = null;
         } else {
+            // #1216 (creation side): line 13109's `self.has(cfg.name)` check
+            // above already proved no live index of this name exists
+            // anywhere -- this call can only be reached by a fresh
+            // admission, never a reopen. See `fresh_admission_name`'s doc
+            // comment.
+            self.fresh_admission_name = stored_cfg.name;
+            defer self.fresh_admission_name = null;
             try self.openConfiguredIndexWithAuthorization(
                 store,
                 stored_cfg,
@@ -24171,6 +24190,30 @@ pub const IndexManager = struct {
 
                 const zpath = try self.alloc.dupeSentinel(u8, path, 0);
                 defer self.alloc.free(zpath);
+
+                // #1216 (creation side): a crash between a fresh admission's
+                // native-catalog metadata seed (just below, inside
+                // `HBCIndex.openWithLsmOptions`) and that admission's own
+                // catalog-config commit (back in `addWithOptions`, after
+                // this call returns) leaves scope records under this name
+                // with no catalog entry to own them. A later retry -- same
+                // name, any dims -- must not resurrect that orphaned
+                // generation's metadata as if it were live
+                // (`openWithLsmOptions`'s loaded-metadata path has no way
+                // to tell "orphan" from "legitimate", and a dims mismatch
+                // between the orphan and the retry's config surfaces as a
+                // spurious `DimensionMismatch`). Gated on
+                // `fresh_admission_name`, not `self.get`, precisely because
+                // a normal reopen reaches this same call with no way to
+                // tell it apart otherwise -- see that field's doc comment.
+                if (self.dense_storage_backend == .native_catalog and
+                    self.fresh_admission_name != null and
+                    std.mem.eql(u8, self.fresh_admission_name.?, cfg.name))
+                {
+                    if (self.dense_main_native_catalog_sink) |sink| {
+                        try native_catalog_backend.deleteAllForScope(self.alloc, sink, path);
+                    }
+                }
 
                 const index = try self.alloc.create(hbc_mod.HBCIndex);
                 var index_owned = true;
