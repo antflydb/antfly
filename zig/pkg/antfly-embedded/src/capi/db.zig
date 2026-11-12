@@ -3160,6 +3160,15 @@ pub const LiteResolvedOpenOptions = struct {
     allocator_verification_owner: ?*lite_backend.native.NativeFile = null,
     /// Exclusive temporary verifier; consumes its cache before DB.open.
     allocator_state_donor: ?*lite_backend.native.NativeFile = null,
+    /// See `docstore.Store.CreateOptions.use_redo_log`'s own doc comment.
+    /// Meaningless on `open` (only `create` reaches it).
+    use_redo_log: ?bool = null,
+    /// `null` keeps the existing default (`reclamation.Options.page_reuse
+    /// = true`). `use_redo_log = true` combined with an unset or `true`
+    /// `page_reuse` here is a caller error (see `use_redo_log`'s own doc
+    /// comment) -- set this to `false` explicitly to use redo-log.
+    /// Meaningless on `open` (only `create` reaches it).
+    page_reuse: ?bool = null,
 };
 
 pub fn optionFieldType(comptime Options: type, comptime field_name: []const u8) type {
@@ -3340,6 +3349,12 @@ pub const HostLiteOpenOptions = struct {
     no_sync: bool = false,
     /// See `LiteResolvedOpenOptions.ride_along_idle_ns`.
     ride_along_idle_ns: ?u64 = null,
+    /// See `docstore.Store.CreateOptions.use_redo_log`'s own doc comment.
+    /// Meaningless unless `create` is set.
+    use_redo_log: ?bool = null,
+    /// See `LiteResolvedOpenOptions.page_reuse`. Meaningless unless
+    /// `create` is set.
+    page_reuse: ?bool = null,
 };
 
 pub fn openLiteHandleWithRuntime(
@@ -3354,6 +3369,8 @@ pub fn openLiteHandleWithRuntime(
         .profile = if (options.hosted) .hosted else .native,
         .no_sync = options.no_sync,
         .ride_along_idle_ns = options.ride_along_idle_ns,
+        .use_redo_log = options.use_redo_log,
+        .page_reuse = options.page_reuse,
     }, options.create, io, backend_runtime));
 }
 
@@ -3399,6 +3416,8 @@ pub fn openLiteHandleAllocWithSharedInference(
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
             .ride_along_idle_ns = resolved.ride_along_idle_ns,
+            .use_redo_log = resolved.use_redo_log,
+            .reclamation = .{ .page_reuse = resolved.page_reuse orelse true },
         })
     else
         try lite_backend.Handle.open(alloc, path, .{

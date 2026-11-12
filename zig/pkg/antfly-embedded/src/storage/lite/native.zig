@@ -4336,10 +4336,21 @@ fn decodeLogicalMutationsPayload(allocator: Allocator, payload: []const u8, over
         errdefer allocator.free(decoded.value);
         const owned_key = try allocator.dupe(u8, key);
         errdefer allocator.free(owned_key);
-        if (try overlay[root].fetchPut(allocator, owned_key, decoded)) |old| {
-            allocator.free(old.key);
-            allocator.free(old.value.value);
+        // Not `fetchPut` -- see `appendLogicalMutation`'s matching comment:
+        // it only overwrites `value_ptr.*` on a match, never `key_ptr.*`,
+        // so treating its returned "old" key as separately freeable frees
+        // the map's own still-live key. Replaying a log whose range covers
+        // more than one record for the same key (an ordinary put-then-
+        // overwrite or put-then-delete before the next checkpoint, ahead
+        // of a reopen) hits this on every recovery, not just rarely.
+        const gop = try overlay[root].getOrPut(allocator, owned_key);
+        if (gop.found_existing) {
+            allocator.free(owned_key);
+            allocator.free(gop.value_ptr.value);
+        } else {
+            gop.key_ptr.* = owned_key;
         }
+        gop.value_ptr.* = decoded;
     }
 }
 
@@ -6242,6 +6253,32 @@ pub const NativeFile = struct {
         try file.enableRedoLog(redo_log_capacity_bytes);
         return file;
     }
+
+    /// `createWithRedoLog`'s owned-io counterpart, for every caller that
+    /// (like plain `createWithOptions`) has no `std.Io` of its own to lend
+    /// and expects this file to own and manage its own runtime. Point 3's
+    /// default-for-new-files policy (docstore.zig's `Store.createWithOptions`)
+    /// needs this: it is reached whenever a caller passes no `opts.io`.
+    pub fn createWithRedoLogOwnedIo(allocator: Allocator, path: []const u8, opts: CreateOptions, redo_log_capacity_bytes: u64) !NativeFile {
+        std.debug.assert(!opts.indexed_reclamation);
+        var file = try createWithOptions(allocator, path, opts);
+        errdefer file.close();
+        try file.enableRedoLog(redo_log_capacity_bytes);
+        return file;
+    }
+
+    /// Default log region size for a newly created redo-log file (point 3:
+    /// redo-log becomes the default commit path for new, non-indexed
+    /// files). Sized to hold several thousand small commits (the §9.8 gate
+    /// target is ~1.2 KB durable bytes per primary-only write) before the
+    /// synchronous 25%-remaining backpressure check
+    /// (`maybeAutoCheckpointRedoLog`) forces a checkpoint -- large enough
+    /// that an ordinary write-rate workload checkpoints on the owner's
+    /// background/idle turn (step 4) under normal conditions, not on this
+    /// synchronous path. No prior sizing precedent exists in this codebase
+    /// to inherit; this is a fresh, deliberately generous default, not a
+    /// measured optimum.
+    pub const default_redo_log_capacity_bytes: u64 = 8 * 1024 * 1024;
 
     /// Upgrades a freshly bootstrapped, ordinary (non-indexed) file to the
     /// redo-log format in place: reserves `redo_log_capacity_bytes`
@@ -8323,7 +8360,7 @@ pub const NativeFile = struct {
             };
             const live = try self.liveStats(cancel);
             var valid = report;
-            valid.record_count = records;
+            valid.record_count = records + self.redoOverlayEntryCount();
             valid.live_file_count = live.record_count;
             valid.live_bytes = live.bytes;
             valid.live_accounting = live.accounting;
@@ -8374,7 +8411,7 @@ pub const NativeFile = struct {
 
         var valid = report;
         _ = document_index_pages;
-        valid.record_count = catalog_records + index_catalog_records + document_records;
+        valid.record_count = catalog_records + index_catalog_records + document_records + self.redoOverlayEntryCount();
         valid.live_file_count = live.record_count;
         valid.live_bytes = live.bytes;
         valid.live_accounting = live.accounting;
@@ -13855,6 +13892,24 @@ pub const NativeFile = struct {
         if (checkpoint.commit_sequence != self.activeCheckpoint().commit_sequence) return null;
         const e = redo.logical_overlay[@backingInt(root)].getPtr(key) orelse return null;
         return .{ .previous_page = 0, .key = key, .value = e.value, .is_delete = e.is_delete, .external_value_root_page = e.external_value_root_page, .external_value_len = e.external_value_len };
+    }
+
+    /// §9.3d/`check()`: the number of keys currently staged only in the
+    /// redo-log overlay (uncheckpointed), across all three roots, for the
+    /// *active* checkpoint. `check()`'s `record_count` is a raw physical
+    /// page/chain count that predates redo-log mode and already double-
+    /// counts historical/tombstoned revisions by design (see its own
+    /// doc comment); without this, a redo-log commit that only writes
+    /// into the overlay (never allocating a page) could make
+    /// `record_count` *undercount* `live_file_count` -- a new, narrower
+    /// invariant break this restores rather than attempting to make
+    /// `record_count` itself overlay-aware (a much bigger semantic change
+    /// for every existing, non-redo caller of `check()`).
+    fn redoOverlayEntryCount(self: *NativeFile) u64 {
+        const redo = self.redo orelse return 0;
+        var total: u64 = 0;
+        for (redo.logical_overlay) |map| total += map.count();
+        return total;
     }
 
     /// A sorted snapshot of one root's redo-log logical_overlay keys
