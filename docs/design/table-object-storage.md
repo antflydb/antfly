@@ -780,13 +780,35 @@ the coordinator republishes vector declarations under the new capability before
 using independent recipe cuts. Compatible text-only publications remain reusable.
 
 An unretained vector query can repair missing selected recipe partitions after
-restart using the same durable CAS claims as background reconciliation. It joins
-an active worker with bounded polling rather than returning a readiness error
-solely because recovery has not been scheduled yet. Repair and waiting share the
-request deadline (at most 30 seconds) and cancellation; they do not refresh the
-budget per partition. Ready partitions are reused, provider/model failure backoff
-is preserved, and a selected query cannot advance table-wide coverage. Retained
-snapshots remain observation-only and require their already protected runs.
+restart using the same durable CAS claims as background reconciliation. Recovery
+uses five-second renewable leases; a joined heartbeat renews the exact captured
+revision while construction runs. Completion CAS uses the latest revision, and
+loss of renewal cancels work. A crash leaves at most the short lease rather than
+a two-minute fixed claim. Old binaries' longer active claims remain fenced and
+return a retryable readiness error without consuming the full query deadline.
+
+A process-wide singleflight coalesces callers for the same credential-scoped
+partition/recipe key. Local followers wait for notification and then recheck the
+immutable memo; only one local owner polls a remote worker, with jittered bounded
+backoff. Foreground and background builders share FIFO admission for two active
+builders. Each has a 256 MiB construction workspace (including temporary roots
+and row IDs) and a separate 64 MiB map budget. Reclaiming scratch preserves parent
+quotas and releases each partition's temporary memory before the next. Claim
+renewal and one-second conditional cleanup use small independent control-plane
+budgets so request allocation failure cannot strand ownership.
+
+Repair, admission and waiting share the request deadline (at most 30 seconds)
+and cancellation; they do not refresh the budget per partition. Native dense
+insertion and full-checkpoint traversal, sparse document/term enumeration and
+bulk-publication windows cooperate with cancellation. Ready partitions are
+reused, provider/model failure backoff starts at failure time, and caller
+cancellation or request pressure does not become a durable model failure.
+Selected queries cannot advance table-wide coverage. Retained snapshots remain
+observation-only and require their already protected runs. The `vector_recovery`
+phase measures selected recent-vector admission/recovery separately from ranking.
+The assembled HN fixture exercises graceful and abrupt restarts, and records
+first-vector and repeat-query timings separately; it is functional qualification,
+not an optimized cold-search benchmark.
 
 The first implementation's five-second accepted-write preparation window remains
 best effort, not a general full-index acknowledgement: caller deadlines and

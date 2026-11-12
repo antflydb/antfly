@@ -32,7 +32,10 @@ pytestmark = [
 ]
 
 
-def test_hackernews_managed_lake_pending_hierarchy_and_restart(tmp_path, monkeypatch):
+@pytest.mark.parametrize("restart_mode", ["graceful", "crash"])
+def test_hackernews_managed_lake_pending_hierarchy_and_restart(
+    tmp_path, monkeypatch, restart_mode
+):
     # Optional lake dependencies are imported only after marker selection. Full
     # lake CI installs them; missing dependencies or artifacts must fail rather
     # than silently skip this assembled-server regression.
@@ -64,7 +67,7 @@ def test_hackernews_managed_lake_pending_hierarchy_and_restart(tmp_path, monkeyp
     # text projections, provenance/revisions, publication and restart. The
     # independent HTTP object/catalog oracles require no cloud credentials.
     module.test_native_catalog_file_commit_read_and_restart(
-        tmp_path, "managed", "overlay"
+        tmp_path, "managed", "overlay", restart_mode=restart_mode
     )
     # A reset during optional/background work can leave foreground assertions
     # passing. Keep the original transport regression visible in that case.
