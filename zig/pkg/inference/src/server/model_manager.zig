@@ -7621,6 +7621,26 @@ pub const ModelManager = struct {
         borrowed: ?*PublishedArtifacts,
         required_residency: runtime.tier.memory.Residency,
     ) !ManagedSession {
+        var failure = runtime.tier.memory.AdmissionFailure.Capture.init(if (control) |active| active.admission_failure else null);
+        var scoped_control = control;
+        if (scoped_control) |*active| active.admission_failure = failure.sink();
+        return loadManagedSessionWithAdmissionUsingManagerImpl(self, model_path, preferred_backends, shared_backend_ctx, source_session_manager, scoped_control, selected, borrowed, required_residency) catch |err| {
+            failure.publish(err);
+            return err;
+        };
+    }
+
+    fn loadManagedSessionWithAdmissionUsingManagerImpl(
+        self: *ModelManager,
+        model_path: []const u8,
+        preferred_backends: []const backends.BackendType,
+        shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
+        source_session_manager: *const backends.SessionManager,
+        control: ?InferenceExecutionControl,
+        selected: ResolvedModel,
+        borrowed: ?*PublishedArtifacts,
+        required_residency: runtime.tier.memory.Residency,
+    ) !ManagedSession {
         if (control) |active| try active.update(.loading_model, 0, 1);
         const io = if (control) |active| active.io orelse source_session_manager.io orelse std.Options.debug_io else source_session_manager.io orelse std.Options.debug_io;
         var construction_proof = try ComponentConstruction.init(self.allocator, io, selected, control, borrowed);
@@ -12235,6 +12255,25 @@ fn loadSessionForPreferredBackends(
 }
 
 fn loadSessionForPreferredBackendsWithArtifacts(
+    manager: *ModelManager,
+    preferred_backends: []const backends.BackendType,
+    model_dir: []const u8,
+    provided_man: manifest_mod.ModelManifest,
+    source_session_manager: *const backends.SessionManager,
+    control: ?InferenceExecutionControl,
+    borrowed: ?*PublishedArtifacts,
+    required_residency: runtime.tier.memory.Residency,
+) !LoadedSessionPlan {
+    var failure = runtime.tier.memory.AdmissionFailure.Capture.init(if (control) |active| active.admission_failure else null);
+    var scoped_control = control;
+    if (scoped_control) |*active| active.admission_failure = failure.sink();
+    return loadSessionForPreferredBackendsWithArtifactsImpl(manager, preferred_backends, model_dir, provided_man, source_session_manager, scoped_control, borrowed, required_residency) catch |err| {
+        failure.publish(err);
+        return err;
+    };
+}
+
+fn loadSessionForPreferredBackendsWithArtifactsImpl(
     manager: *ModelManager,
     preferred_backends: []const backends.BackendType,
     model_dir: []const u8,

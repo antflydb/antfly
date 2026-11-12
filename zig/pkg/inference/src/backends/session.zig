@@ -800,13 +800,15 @@ pub const Session = struct {
         return if (self.vtable.forwardBatchPolicy) |query| query(self.ptr, inputs) else .{};
     }
 
+    pub fn withAdmissionFailure(self: Session, failure: ?*memory.AdmissionFailure) Session {
+        var result = self;
+        if (result.run_admission) |*admission| admission.failure = failure;
+        return result;
+    }
+
     /// A borrowed request view; never mutate the shared model's admission.
     pub fn withAdmissionControl(self: Session, control: ?InferenceExecutionControl) Session {
-        var result = self;
-        if (result.run_admission) |*admission| {
-            admission.failure = if (control) |active| active.admission_failure else null;
-        }
-        return result;
+        return self.withAdmissionFailure(if (control) |active| active.admission_failure else null);
     }
 
     /// Run a forward pass with the given input tensors.
