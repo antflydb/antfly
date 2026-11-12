@@ -6282,13 +6282,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (source_parts) |parts| {
                     defer template_mod.freeContentParts(alloc, parts);
 
-                    const vector = try enrichment_runtime_mod.embedDensePartsTracked(runtime, consumer_indexes, alloc, pinned_embedder, embedding_name, parts, request.expected_dims);
-                    defer alloc.free(vector);
-                    try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
                     const source_hash = if (parts.len == 1 and parts[0] == .text and dense_embedder.textPartsEquivalent(embedding_name))
                         enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, parts[0].text, generation.revision)
                     else
                         try enrichment_runtime_mod.densePartsSourceHash(alloc, request, parts, generation.revision);
+                    if (skip_unchanged_artifacts) {
+                        const retained_key = try embeddingArtifactKeyForBaseAlloc(alloc, request.doc_key, embedding_name);
+                        defer alloc.free(retained_key);
+                        if (try storedOrPendingEmbeddingSourceHashImpl(db, shared_pending_writes, retained_key, request.expected_dims)) |existing_hash| {
+                            if (existing_hash == source_hash) {
+                                try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
+                                try appendForConsumers(alloc, dense_embeddings, request.doc_key, null, retained_key, &.{}, consumer_indexes);
+                                return;
+                            }
+                        }
+                    }
+                    const vector = try enrichment_runtime_mod.embedDensePartsTracked(runtime, consumer_indexes, alloc, pinned_embedder, embedding_name, parts, request.expected_dims);
+                    defer alloc.free(vector);
+                    try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
                     const artifact_key = try appendEmbeddingArtifactWrite(
                         alloc,
                         artifact_writes,
@@ -6321,6 +6332,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return;
             }
             defer alloc.free(source_text.?);
+
+            // Synchronous enrichment shares the worker's input-identity reuse
+            // contract. Retain consumer attachment without a producer call.
+            if (skip_unchanged_artifacts) {
+                const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, request.doc_key, embedding_name);
+                defer alloc.free(artifact_key);
+                const source_hash = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source_text.?, generation.revision);
+                if (try storedOrPendingEmbeddingSourceHashImpl(db, shared_pending_writes, artifact_key, request.expected_dims)) |existing_hash| {
+                    if (existing_hash == source_hash) {
+                        try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
+                        try appendForConsumers(alloc, dense_embeddings, request.doc_key, null, artifact_key, &.{}, consumer_indexes);
+                        return;
+                    }
+                }
+            }
 
             const memo_key = GeneratedEmbeddingMemo.keyAtRevision(GeneratedEmbeddingMemo.key(
                 .dense_embedding,
@@ -6993,6 +7019,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return;
             }
             defer alloc.free(source_text.?);
+
+            if (reuse_unchanged) {
+                const retained_key = try embeddingArtifactKeyForBaseAlloc(alloc, request.doc_key, embedding_name);
+                defer alloc.free(retained_key);
+                const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source_text.?, request.producer_json, request.reprocess_generation);
+                if (try storedOrPendingEmbeddingSourceHash(db, shared_pending_writes, retained_key)) |existing_hash| {
+                    if (existing_hash == source_hash) {
+                        try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, request.doc_key, retained_key, &.{}, &.{}, consumer_indexes);
+                        return;
+                    }
+                }
+            }
 
             const memo_key = GeneratedEmbeddingMemo.key(
                 .sparse_embedding,
@@ -12261,8 +12299,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             pending_writes: ?*const PendingArtifactWriteIndex,
             artifact_key: []const u8,
         ) !?u64 {
+            return storedOrPendingEmbeddingSourceHashImpl(db, pending_writes, artifact_key, null);
+        }
+
+        fn storedOrPendingEmbeddingSourceHashImpl(
+            db: anytype,
+            pending_writes: ?*const PendingArtifactWriteIndex,
+            artifact_key: []const u8,
+            expected_dims: ?u32,
+        ) !?u64 {
             if (pending_writes) |index| {
                 if (index.get(artifact_key)) |value| {
+                    if (expected_dims) |dims| {
+                        const metadata = @import("../artifact_payload.zig").Metadata.decode(value) catch return null;
+                        if (metadata.dense_dimensions != dims) return null;
+                    }
                     return enrichment_artifact_codec.sourceHash(value) catch null;
                 }
             }
@@ -12277,6 +12328,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 => return null,
                 else => return err,
             };
+            if (expected_dims) |dims| if (metadata.dense_dimensions != dims) return null;
             return metadata.sourceHash();
         }
 
