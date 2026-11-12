@@ -5599,6 +5599,7 @@ pub const DataServer = struct {
     retained_resource_cursor: u64 = 0,
     retained_owner_cursor: @import("../metadata/retained_dataset_owners.zig").Cursor = .{},
     retained_owner_sweep: @import("../metadata/retained_dataset_owners.zig").WorkSweep = .{},
+    retained_archive_backoff: @import("../metadata/retained_dataset_owners.zig").ArchiveBackoff = .{},
     retained_plan_turn: bool = false,
     graph_cleanup_running: std.atomic.Value(bool) = .init(false),
     graph_cleanup_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
@@ -6852,16 +6853,24 @@ pub const DataServer = struct {
             if (snapshot.plan.phase == .closing and snapshot.owner.mode == .closed and snapshot.owner.independent_receipt == null) {
                 if (self.api_server_cfg.node_config) |config| {
                     if (config.storage.artifacts.connection != null) {
-                        self.retained_owner_sweep.busy = true;
+                        const scope: model.ArchiveScope = .{ .resource = snapshot.plan.resource, .generation = snapshot.plan.generation, .plan = snapshot.plan.id, .group = snapshot.owner.group, .revision = snapshot.owner.revision };
+                        if (!self.retained_archive_backoff.due(scope, self.backgroundMonotonicNs())) continue;
                         const receipt = self.exportRetainedOwnerPage(owner_alloc, snapshot, context) catch |err| {
+                            self.retained_archive_backoff.failed(self.alloc, scope, self.backgroundMonotonicNs()) catch {};
                             self.recordRetainedOwnerFailure(owner_alloc, snapshot, err, context) catch {};
                             std.log.warn("retained archive handoff deferred group={d} err={s}", .{ snapshot.owner.group, @errorName(err) });
                             continue;
                         };
                         if (receipt != null) {
                             if (!self.retainedMaintenanceLeader(snapshot.owner.group)) return error.GroupLeaderUnavailable;
-                            _ = try self.status_source.systemCatalog(owner_alloc, context, .{ .retained_owner_archive = .{ .resource = snapshot.plan.resource, .generation = snapshot.plan.generation, .plan = snapshot.plan.id, .group = snapshot.owner.group, .revision = snapshot.owner.revision } });
+                            _ = self.status_source.systemCatalog(owner_alloc, context, .{ .retained_owner_archive = scope }) catch |err| {
+                                self.retained_archive_backoff.failed(self.alloc, scope, self.backgroundMonotonicNs()) catch {};
+                                self.recordRetainedOwnerFailure(owner_alloc, snapshot, err, context) catch {};
+                                continue;
+                            };
                         }
+                        self.retained_archive_backoff.succeeded(scope);
+                        self.retained_owner_sweep.busy = true;
                         continue;
                     }
                 }
@@ -10282,6 +10291,7 @@ pub const DataServer = struct {
         var protocol_activation_it = self.data_raft_protocol_activations.valueIterator();
         while (protocol_activation_it.next()) |entry| entry.*.release(self.alloc);
         self.data_raft_protocol_activations.deinit(self.alloc);
+        self.retained_archive_backoff.deinit(self.alloc);
         self.local_split_key_cache.deinit(self.alloc);
         self.local_group_status_cache.clear(self.alloc);
         self.runtime_status_disk_usage_cache.deinit(self.alloc);

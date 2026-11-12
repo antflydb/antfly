@@ -3338,9 +3338,18 @@ pub const DB = struct {
     pub const tryLockApplyForPortableRuntime = local_mutation.tryLockApplyForPortableRuntime;
 
     fn lockApplySharedForPortableRuntime(self: *DB) !void {
+        return self.lockApplySharedForPortableRuntimeControlled(null);
+    }
+    fn lockApplySharedForPortableRuntimeControlled(self: *DB, operation: ?@import("../retained_series_reader.zig").Control) !void {
         try self.enforcePortableRuntimeGate();
-        lockApplyShared(self);
+        if (operation) |admission| {
+            while (!self.core.tryLockApplyShared()) {
+                try admission.check();
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+            }
+        } else lockApplyShared(self);
         errdefer self.core.unlockApplyShared();
+        if (operation) |admission| try admission.check();
         try self.enforcePortableRuntimeGate();
         // A failed split may have withdrawn only some graph owners. Keep the
         // live handle closed to reads until the durable retirement is repaired.
@@ -42893,16 +42902,20 @@ pub const DB = struct {
     /// Native-owner private retained relation reader. Host admission supplies
     /// dataset authorization, read-index and a bounded owner/session lifetime.
     pub fn openRetainedSeriesRead(self: *DB, alloc: Allocator, query: @import("../retained_series_reader.zig").Query) !*@import("../retained_series_reader.zig").Session {
+        return self.openRetainedSeriesReadControlled(alloc, query, .{});
+    }
+    pub fn openRetainedSeriesReadControlled(self: *DB, alloc: Allocator, query: @import("../retained_series_reader.zig").Query, operation: @import("../retained_series_reader.zig").Control) !*@import("../retained_series_reader.zig").Session {
+        try operation.check();
         var policy = try self.local_execution.row_policy_gate.enterRawRead();
         errdefer policy.release();
-        try self.lockApplySharedForPortableRuntime();
+        try self.lockApplySharedForPortableRuntimeControlled(operation);
         defer self.core.unlockApplyShared();
         const namespace = @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace);
         var partition: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(&namespace, &partition, .{});
         if (!std.mem.eql(u8, &partition, &query.fence.partition)) return error.IdentityNamespaceMismatch;
         const txn = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
-        const session = try @import("../retained_series_reader.zig").Session.open(alloc, txn, query, self.root_incarnation);
+        const session = try @import("../retained_series_reader.zig").Session.openControlled(alloc, txn, query, self.root_incarnation, operation);
         session.row_policy_lease = policy;
         return session;
     }

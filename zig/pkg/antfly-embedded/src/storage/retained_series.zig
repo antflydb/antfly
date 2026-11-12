@@ -315,6 +315,7 @@ const MutableBucket = struct {
 pub const Engine = struct {
     alloc: A,
     spec: Spec,
+    read_control: @import("retained_series_read_contract.zig").Control = .{},
 
     fn key(self: Engine, a: A, suffix: []const u8) ![]u8 {
         return std.fmt.allocPrint(a, "{s}{s}:{x:0>16}:{s}", .{ prefix, std.fmt.bytesToHex(self.spec.id, .lower), self.spec.generation, suffix });
@@ -1008,6 +1009,7 @@ pub const Engine = struct {
         return self.scanWhere(a, txn, start_ns, end_ns, admitted_ns, after, limit, null, null);
     }
     pub fn scanWhere(self: Engine, a: A, txn: anytype, start_ns: i128, end_ns: i128, admitted_ns: i128, after: ?[]const u8, limit: usize, dimensions_json: ?[]const u8, first_after: ?@import("../retained_dataset_types.zig").RowKey) !Page {
+        try self.read_control.check();
         if (limit == 0 or limit > max_changes or start_ns >= end_ns or try self.spec.bucket(start_ns) != start_ns or try self.spec.bucket(end_ns) != end_ns) return error.RetainedSeriesResolutionMismatch;
         const cut = try self.snapshotCursor(txn);
         const state = try self.load(a, txn);
@@ -1031,6 +1033,7 @@ pub const Engine = struct {
     /// A closed owner exports through the last physical bucket, including
     /// future observations. A committed archive frontier may split a bucket.
     pub fn scanArchive(self: Engine, a: A, txn: anytype, request: @import("retained_series_read_contract.zig").ArchiveStart, after: ?[]const u8, limit: usize) !Page {
+        try self.read_control.check();
         if (limit == 0 or limit > max_changes) return error.RetainedSeriesBatchTooLarge;
         const state = try self.load(a, txn);
         const closed = try state.closureCut();
@@ -1067,7 +1070,12 @@ pub const Engine = struct {
         defer cur.close();
         var entry = try cur.seekAtOrAfter(seek);
         var visited: usize = 0;
+        var target_buffer: [256]u8 = undefined;
+        var next_buffer: [256]u8 = undefined;
+        var dimension_hash: Id = undefined;
+        if (dimensions_json) |dimensions| std.crypto.hash.sha2.Sha256.hash(dimensions, &dimension_hash, .{});
         while (entry) |e| {
+            try self.read_control.check();
             if (visited == 128 * 1024) return error.RetainedSeriesBatchTooLarge;
             visited += 1;
             if (!std.mem.startsWith(u8, e.key, p)) break;
@@ -1078,7 +1086,7 @@ pub const Engine = struct {
                 const biased = std.fmt.parseInt(u128, e.key[p.len..][0..32], 16) catch return error.RetainedSeriesCorrupt;
                 const timestamp: i128 = @bitCast(biased ^ (@as(u128, 1) << 127));
                 if (end_ns) |end| if (timestamp >= end) break;
-                const target = try self.bucketKey(a, .{ .timestamp_ns = timestamp, .dimensions = dimensions, .values = &.{} });
+                const target = try std.fmt.bufPrint(&target_buffer, "{s}{x:0>32}:{s}", .{ p, biased, std.fmt.bytesToHex(dimension_hash, .lower) });
                 switch (std.mem.order(u8, e.key, target)) {
                     .lt => {
                         entry = try cur.seekAtOrAfter(target);
@@ -1087,7 +1095,7 @@ pub const Engine = struct {
                     .gt => {
                         const next_time = try std.math.add(i128, timestamp, self.spec.interval_ns);
                         const next_bias = @as(u128, @bitCast(next_time)) ^ (@as(u128, 1) << 127);
-                        entry = try cur.seekAtOrAfter(try std.fmt.allocPrint(a, "{s}{x:0>32}:", .{ p, next_bias }));
+                        entry = try cur.seekAtOrAfter(try std.fmt.bufPrint(&next_buffer, "{s}{x:0>32}:", .{ p, next_bias }));
                         continue;
                     },
                     .eq => {},

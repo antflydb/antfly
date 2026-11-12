@@ -4667,6 +4667,15 @@ pub fn storageOwnerRetainedQueryJson(owner: ?*anyopaque, request: *const kernel_
     return .ok;
 }
 
+fn retainedReadControl(control: *const backups_api.BackupOperationControl) antfly.capi_dependencies.storage_retained_series_reader.Control {
+    return .{ .deadline_ns = control.deadline_ns, .cancellation_ctx = control, .is_cancelled_fn = struct {
+        fn canceled(raw: *const anyopaque) bool {
+            const operation: *const backups_api.BackupOperationControl = @ptrCast(@alignCast(raw));
+            return operation.cancellation.isCancelled();
+        }
+    }.canceled };
+}
+
 pub fn storageOwnerRetainedReadOpen(owner: ?*anyopaque, request: *const kernel_owner_abi.ControlledJsonOperationRequest, out_session: *?*anyopaque) callconv(.c) kernel_owner_abi.Status {
     out_session.* = null;
     if (request.version != kernel_owner_abi.query_abi_version) return .invalid_abi;
@@ -4678,7 +4687,7 @@ pub fn storageOwnerRetainedReadOpen(owner: ?*anyopaque, request: *const kernel_o
     defer parsed.deinit();
     const control: backups_api.BackupOperationControl = .{ .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else std.math.maxInt(u64), .cancellation = ownerQueryCancellation(request) };
     control.ensureActive() catch |err| return storageOwnerStatusFromError(err);
-    const session = handle.db.openRetainedSeriesRead(handle.alloc, parsed.value) catch |err| return storageOwnerStatusFromError(err);
+    const session = handle.db.openRetainedSeriesReadControlled(handle.alloc, parsed.value, retainedReadControl(&control)) catch |err| return storageOwnerStatusFromError(err);
     control.ensureActive() catch |err| {
         session.close();
         return storageOwnerStatusFromError(err);
@@ -4696,11 +4705,9 @@ pub fn storageRetainedReadNextJson(raw: ?*anyopaque, request: *const kernel_owne
     defer parsed.deinit();
     const control: backups_api.BackupOperationControl = .{ .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else std.math.maxInt(u64), .cancellation = ownerQueryCancellation(request) };
     control.ensureActive() catch |err| return storageOwnerStatusFromError(err);
-    const page = session.next(parsed.value.limit) catch |err| return storageOwnerStatusFromError(err);
-    var root_buffer: [40]u8 = undefined;
-    const response = std.json.Stringify.valueAlloc(session.alloc, .{ .root_incarnation = std.fmt.bufPrint(&root_buffer, "{d}", .{session.root_incarnation}) catch unreachable, .page = page }, .{}) catch |err| return storageOwnerStatusFromError(err);
+    const response = session.nextJson(parsed.value.limit, retainedReadControl(&control)) catch |err| return storageOwnerStatusFromError(err);
     control.ensureActive() catch |err| {
-        session.alloc.free(response);
+        session.memory.backing.free(response);
         return storageOwnerStatusFromError(err);
     };
     out.* = .{ .ptr = response.ptr, .len = response.len };

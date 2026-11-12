@@ -386,7 +386,43 @@ def test_retained_quorum_failover_and_archive_handoff(tmp_path, monkeypatch):
             )["rows"]
             assert len(observed) == 1 and observed[0][0] == observed[0][1], observed
             checkpoint = float(observed[0][0])
+            objects.terminate()
+            objects.wait(timeout=15)
             call("POST", path + "/close", {"expected_revision": active["revision"]})
+
+            def archive_failures():
+                return sum(
+                    log_path.read_text(errors="replace").count(
+                        "retained archive handoff deferred group="
+                    )
+                    for log_path in cluster.log_paths
+                )
+
+            eventually(archive_failures)
+            baseline = archive_failures()
+            time.sleep(2.5)
+            assert archive_failures() - baseline <= 3, (
+                "failed exports bypass retry backoff"
+            )
+            blocked = call("GET", path)
+            assert blocked["phase"] == "closing"
+            assert blocked["source_released"] is False
+            objects = subprocess.Popen(
+                [
+                    "minio",
+                    "server",
+                    "--address",
+                    f"127.0.0.1:{port}",
+                    str(tmp_path / "objects"),
+                ],
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            eventually(
+                lambda: requests.get(endpoint + "/minio/health/ready", timeout=2).ok,
+                timeout=20,
+            )
             eventually(
                 lambda: call("GET", path), lambda value: value["phase"] == "closed"
             )

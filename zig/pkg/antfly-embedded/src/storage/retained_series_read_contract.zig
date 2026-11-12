@@ -41,3 +41,16 @@ pub const Request = union(enum) {
         include_latest: bool = false,
     },
 };
+
+/// Borrowed for one synchronous call only; never retained by a read session.
+/// Boolean callbacks keep cancellation portable across compiled owners.
+pub const Control = struct {
+    deadline_ns: u64 = @import("std").math.maxInt(u64),
+    cancellation_ctx: ?*const anyopaque = null,
+    is_cancelled_fn: ?*const fn (*const anyopaque) bool = null,
+
+    pub fn check(self: @This()) !void {
+        if (self.is_cancelled_fn) |probe| if (probe(self.cancellation_ctx orelse return error.InvalidRetainedReadQuery)) return error.Canceled;
+        if (self.deadline_ns != @import("std").math.maxInt(u64) and @import("antfly_platform").time.monotonicNs() >= self.deadline_ns) return error.Timeout;
+    }
+};

@@ -23,7 +23,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Older owners must reject their operation identifiers before dispatch.
 // Version 90 also fences certified graph document-key descriptor domains.
 // Version 91 fences selected-role merge-readiness projection responses.
-pub const abi_version: u32 = 91;
+// Version 92 combines retained owner descriptors with bounded controlled native readers.
+pub const abi_version: u32 = 92;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

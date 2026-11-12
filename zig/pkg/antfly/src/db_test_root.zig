@@ -15,6 +15,7 @@
 
 test {
     _ = @import("antfly_local_sources").storage_retained_series_capture;
+    _ = @import("antfly_local_sources").storage_retained_series_reader;
     _ = @import("antfly_local_sources").storage_db_authority_invalidation;
     _ = @import("antfly_local_sources").storage_db_schema_registry;
     _ = @import("antfly_local_sources").storage_db_row_policy_gate;
