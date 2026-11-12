@@ -6952,6 +6952,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-authority-invalidation-test", "Verify cohort invalidation across schema and policy publication")
         .dependOn(&addFilteredTestRunArtifact(b, authority_invalidation_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
+    const inference_evaluation_tests = b.addTest(.{
+        .name = "inference-evaluation-storage-tests",
+        .root_module = db_test_mod,
+        .filters = &.{
+            "full_index reuses unchanged",
+            "paper evaluation producer upgrades require explicit reprocess",
+            "dense enrichment skips unchanged",
+            "sparse enrichment skips unchanged source hash",
+            "templated dense artifact reuse follows the resolved model revision",
+            "source vector table rejects delayed enrichment",
+            "full effort filtered recall matches eligible cosine oracle",
+            "full effort exhausts",
+            "subgroup native lifecycle",
+            "global subgroup plan preserves native lifecycle",
+            "hbc search charges estimated quantized scan bytes to node admission",
+            "small quantized complete snapshot validates authoritative leaf assignments",
+            "quantized native routing serves exact complete coverage across delta and reopen",
+            "searchWithRequest applies filter prefix and distance bounds",
+        },
+        .max_rss = 12 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("inference-evaluation-storage-test", "Verify unchanged-input reuse, revision fencing, and filtered vector recall")
+        .dependOn(&addFilteredTestRunArtifact(b, inference_evaluation_tests).step);
+
     const repair_publication_tests = b.addTest(.{
         .name = "artifact-repair-publication-tests",
         .root_module = db_test_mod,
