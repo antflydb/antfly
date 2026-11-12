@@ -1167,6 +1167,197 @@ fn runDenseVectorUpdateDeleteScenario(allocator: Allocator, path: []const u8, io
     try handle.db.batch(.{ .writes = &.{.{ .key = "dv-doc-2", .value = "{\"marker\":\"dv-doc-marker-v3\",\"_embeddings\":{\"dv_idx\":[0.5,0.5]}}" }}, .sync_level = .full_index });
 }
 
+/// #1216 crash-sim: deleting a `.native_catalog`-backed dense index must
+/// never leave the catalog saying the index is gone while its own HBC
+/// metadata (dims, root node, postings), held under a fixed name-derived
+/// scope in `native_catalog_backend.Backend`, survives underneath --
+/// exactly the ordering `removeWithAtomicMutation`'s dense branch depends
+/// on: `HBCIndex.deleteNativeCatalogScopeForRemoval` (one durable
+/// `native_catalog_backend.deleteAllForScope` batch) must complete before
+/// the catalog-removal commit (`persistCatalogExcludingWithAtomicMutation`)
+/// becomes durable.
+///
+/// Setup (admitting "img" at dims=3, writing one document, draining to
+/// idle) runs on plain `std.testing.io`, fully durable, *before* the swept
+/// region starts, so the harness's barrier discovery only ever sees the
+/// reopen and the delete itself -- the scope-delete batch's own sync and
+/// the catalog-removal commit's own sync, plus whatever reopen/reload
+/// needs (reads, harmless to interrupt). A broader sweep that also crossed
+/// the *initial* admission's own commit surfaced a second, separate
+/// finding (a crash during first-ever admission can similarly split
+/// "scope has fresh metadata" from "catalog has the config" -- a creation-
+/// side atomicity question, not this delete-side one); narrowing to the
+/// delete keeps this scenario pinned to exactly what #1216 and this fix
+/// are about.
+fn runDenseNativeCatalogDimensionDeleteScenario(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    _ = checkpoints;
+    {
+        var setup = try openDbWithIo(allocator, path, std.testing.io, true);
+        defer setup.close();
+        _ = try setup.db.admitManagedIndex(.{
+            .name = "img",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+        });
+        try setup.db.batch(.{ .writes = &.{.{ .key = "old", .value = "{\"body\":\"old document\",\"_embeddings\":{\"img\":[1,0,0]}}" }} });
+        try setup.db.runUntilIdle();
+    }
+
+    var handle = try openDbWithIo(allocator, path, io, false);
+    defer handle.close();
+    _ = try handle.db.deleteIndex("img");
+}
+
+/// Reopens with ordinary IO (matching every other scenario's post-crash
+/// check) and asserts the only two consistent outcomes: either "img" is
+/// still configured -- the delete never became durable, or only its
+/// scope-delete half did -- in which case the catalog's own config (still
+/// dims=3) must still open and search cleanly, or "img" is gone and its
+/// scope is provably clean, proven by re-admitting it at a *different*
+/// dims (4) and writing/searching through it. A `DimensionMismatch` (or
+/// any other error) from either branch is exactly the bug: the catalog
+/// disagreeing with the native-catalog metadata a reopen or re-admission
+/// actually finds.
+fn checkDenseNativeCatalogDimensionDeleteInvariant(
+    allocator: Allocator,
+    path: []const u8,
+    outcome: ?CrashOutcome,
+    checkpoints: []const Checkpoint,
+) anyerror!void {
+    _ = outcome;
+    _ = checkpoints;
+    var handle = try openDbWithIo(allocator, path, std.testing.io, false);
+    defer handle.close();
+
+    if (handle.db.core.index_manager.get("img") != null) {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "img",
+            .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 8 } },
+            .limit = 8,
+        });
+        result.deinit();
+        return;
+    }
+
+    // The delete completed (or its catalog-removal half did). Deletion
+    // schedules generated-artifact cleanup on the durable repair owner;
+    // join it before reusing the name, same as the #1216 regression test
+    // ("lite external dense dimension replacement keeps writes
+    // available"), so a nonblocking `.busy` response (lease contention)
+    // is never mistaken for the stale-scope bug this scenario exists to
+    // catch.
+    handle.db.backend_runtime.durable_jobs.drainOwner(handle.db.repair_cleanup_owner_id);
+    for (0..20) |_| {
+        if ((try handle.db.advanceGeneratedArtifactCleanupPage("img")) == .idle) break;
+    }
+
+    _ = try handle.db.admitManagedIndex(.{
+        .name = "img",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":4,\"external\":true}",
+    });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "new", .value = "{\"body\":\"new document\",\"_embeddings\":{\"img\":[0,1,0,0]}}" }} });
+    try handle.db.runUntilIdle();
+    var result = try handle.db.search(allocator, .{
+        .index_name = "img",
+        .query = .{ .dense_knn = .{ .vector = &.{ 0, 1, 0, 0 }, .k = 8 } },
+        .limit = 8,
+    });
+    result.deinit();
+}
+
+/// #1216, both directions: the unnarrowed sweep, crossing the *initial*
+/// admission's own commit as well as the delete's. Covers the creation-
+/// side half of the bug (a crash between seeding fresh native-catalog
+/// metadata and committing the admission's catalog config can orphan that
+/// metadata) in addition to everything
+/// `runDenseNativeCatalogDimensionDeleteScenario` already covers on the
+/// delete side -- the admission-side fix
+/// (`IndexManager.fresh_admission_name`, set by `addWithOptions` and read
+/// by `openConfiguredIndexDetached`'s dense_vector branch to wipe an
+/// orphan scope before seeding fresh metadata) is what makes crashing
+/// during the *first* admission self-heal on retry instead of surfacing a
+/// stale, mismatched generation's dims.
+fn runDenseNativeCatalogDimensionAdmitAndDeleteScenario(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    _ = checkpoints;
+    var handle = try openDbWithIo(allocator, path, io, true);
+    defer handle.close();
+
+    _ = try handle.db.admitManagedIndex(.{
+        .name = "img",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+    });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "old", .value = "{\"body\":\"old document\",\"_embeddings\":{\"img\":[1,0,0]}}" }} });
+    try handle.db.runUntilIdle();
+
+    _ = try handle.db.deleteIndex("img");
+}
+
+/// Reopens with ordinary IO and asserts the only two consistent outcomes,
+/// now covering a crash anywhere in the whole admit-write-delete sequence
+/// (including the very first admission's own commit, where "img" may not
+/// durably exist in the catalog at all yet): either "img" is configured --
+/// opening/searching it with whatever dims the catalog currently holds
+/// must work -- or "img" is absent and admitting it fresh, at a dims that
+/// deliberately differs from every dims this scenario ever used (4, never
+/// 3), must succeed cleanly. A `DimensionMismatch` from the second branch
+/// means a stale, orphaned generation (from an interrupted first admission
+/// or an interrupted delete) survived under the scope with no catalog
+/// entry to account for it.
+fn checkDenseNativeCatalogDimensionAdmitAndDeleteInvariant(
+    allocator: Allocator,
+    path: []const u8,
+    outcome: ?CrashOutcome,
+    checkpoints: []const Checkpoint,
+) anyerror!void {
+    _ = outcome;
+    _ = checkpoints;
+    // Unlike the delete-only scenario, this one's swept region starts at
+    // the very first `createWithOptions`, so "before barrier 0, power loss
+    // drops unsynced writes" can mean the file itself never became
+    // durable. Nothing was ever acknowledged in that case -- an absent
+    // file is as consistent an outcome as an empty one -- so there is
+    // nothing to verify.
+    var handle = openDbWithIo(allocator, path, std.testing.io, false) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer handle.close();
+
+    // `run` above only ever admits "img" at dims=3 (the re-admission below,
+    // at dims=4, is reached only when the catalog has no entry at all), so
+    // a live catalog entry here is always dims=3.
+    if (handle.db.core.index_manager.get("img") != null) {
+        var result = try handle.db.search(allocator, .{
+            .index_name = "img",
+            .query = .{ .dense_knn = .{ .vector = &.{ 1, 0, 0 }, .k = 8 } },
+            .limit = 8,
+        });
+        result.deinit();
+        return;
+    }
+
+    handle.db.backend_runtime.durable_jobs.drainOwner(handle.db.repair_cleanup_owner_id);
+    for (0..20) |_| {
+        if ((try handle.db.advanceGeneratedArtifactCleanupPage("img")) == .idle) break;
+    }
+
+    _ = try handle.db.admitManagedIndex(.{
+        .name = "img",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":4,\"external\":true}",
+    });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "new", .value = "{\"body\":\"new document\",\"_embeddings\":{\"img\":[0,1,0,0]}}" }} });
+    try handle.db.runUntilIdle();
+    var result = try handle.db.search(allocator, .{
+        .index_name = "img",
+        .query = .{ .dense_knn = .{ .vector = &.{ 0, 1, 0, 0 }, .k = 8 } },
+        .limit = 8,
+    });
+    result.deinit();
+}
+
 /// Sparse analog of `runDenseVectorAddIndexMidScenario`: same bug, same
 /// fix, same shape, with a `sparse_vector` index and the flat
 /// `{"<token id>": <weight>}` `_embeddings` wire shape instead of a dense
@@ -2214,6 +2405,26 @@ test "crash sweep: dense vector update and delete" {
         .via_db = true,
         .search_index = "body_text",
         .search_field = "body",
+    }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep: dense native-catalog dimension replacement delete (#1216)" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "dense-native-catalog-dimension-delete",
+        .run = runDenseNativeCatalogDimensionDeleteScenario,
+        .custom_check = checkDenseNativeCatalogDimensionDeleteInvariant,
+    }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep: dense native-catalog dimension replacement admit and delete (#1216)" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "dense-native-catalog-dimension-admit-and-delete",
+        .run = runDenseNativeCatalogDimensionAdmitAndDeleteScenario,
+        .custom_check = checkDenseNativeCatalogDimensionAdmitAndDeleteInvariant,
     }, .{});
     defer report.deinit();
     try reportFailures(&report);

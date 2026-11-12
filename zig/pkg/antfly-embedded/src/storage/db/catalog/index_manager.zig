@@ -25,6 +25,7 @@ const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const full_text_index_defaults = @import("../../../common/full_text_index_defaults.zig");
 const native_artifact_sink = @import("../../native_artifact_sink.zig");
+const native_catalog_backend = @import("../../native_catalog_backend.zig");
 const native_backup = @import("../native_backup.zig");
 const process_memory = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
@@ -1403,6 +1404,20 @@ pub const IndexManager = struct {
     resolver_catalog_projection_dictionary: std.atomic.Value(bool) = .init(false),
     alloc: Allocator,
     base_path: []u8,
+    /// Owned copy of `IndexBackendOptions.native_catalog_scratch_dir`. See
+    /// `persistent.PersistentIndexOptions.scratch_dir`.
+    native_catalog_scratch_dir: ?[]u8 = null,
+    /// #1216 (creation side): borrowed, set only by `addWithOptions`
+    /// (never by anything reopen uses) for the duration of its one call
+    /// into `openConfiguredIndexWithAuthorization`, and cleared
+    /// immediately after. `openConfiguredIndexDetached`'s dense_vector
+    /// branch reads it to tell a genuinely fresh admission apart from a
+    /// normal reopen -- `self.get(cfg.name)` cannot make that distinction
+    /// from inside the shared open path, since the index being opened is,
+    /// by construction, absent from the open-indexes list in *either*
+    /// case at that point. Must be set/read/cleared only while
+    /// `catalog_mutex` is held, which both call sites already do.
+    fresh_admission_name: ?[]const u8 = null,
     byte_range: docstore_mod.ByteRange,
     relaxed_split_durability: bool,
     leann_replication: bool = false,
@@ -3359,6 +3374,9 @@ pub const IndexManager = struct {
         const native_read_scratch = try native_read_scratch_pool.Pool.create(alloc, resource_manager);
         errdefer native_read_scratch.destroy();
 
+        const native_catalog_scratch_dir: ?[]u8 = if (opts.native_catalog_scratch_dir) |dir| try alloc.dupe(u8, dir) else null;
+        errdefer if (native_catalog_scratch_dir) |dir| alloc.free(dir);
+
         var owned_vector_block_storage: ?*lsm_backend_mod.NativeStorage = null;
         errdefer if (owned_vector_block_storage) |storage| {
             storage.deinit();
@@ -3419,6 +3437,7 @@ pub const IndexManager = struct {
         return .{
             .alloc = alloc,
             .base_path = try alloc.dupe(u8, base_path),
+            .native_catalog_scratch_dir = native_catalog_scratch_dir,
             .byte_range = .{ .start = "", .end = "" },
             .relaxed_split_durability = false,
             .leann_replication = opts.leann_replication,
@@ -7460,6 +7479,7 @@ pub const IndexManager = struct {
             self.alloc.destroy(storage);
         }
         self.alloc.free(self.base_path);
+        if (self.native_catalog_scratch_dir) |dir| self.alloc.free(dir);
         self.native_read_scratch.destroy();
         // PR #957 review on the #938 escalation commit: the process-wide
         // ResourceManager's replay-document-not-visible tracker is keyed in
@@ -13166,6 +13186,13 @@ pub const IndexManager = struct {
             try self.appendOpenedIndex(opened);
             entry.* = null;
         } else {
+            // #1216 (creation side): line 13109's `self.has(cfg.name)` check
+            // above already proved no live index of this name exists
+            // anywhere -- this call can only be reached by a fresh
+            // admission, never a reopen. See `fresh_admission_name`'s doc
+            // comment.
+            self.fresh_admission_name = stored_cfg.name;
+            defer self.fresh_admission_name = null;
             try self.openConfiguredIndexWithAuthorization(
                 store,
                 stored_cfg,
@@ -15175,6 +15202,15 @@ pub const IndexManager = struct {
                     owned_embedding_names.items,
                 );
                 defer artifact_cleanup.deinit();
+                // #1216: a native-catalog HBC index's own metadata (dims,
+                // root node, postings) lives under a fixed, name-derived
+                // scope, independent of the generated-artifact cleanup
+                // above. Clear it durably before the catalog mutation below
+                // makes this index's removal visible, so a crash between
+                // the two can never leave the catalog saying "img" is gone
+                // while its stale dims survive underneath a later
+                // re-admission -- see `HBCIndex.deleteNativeCatalogScopeForRemoval`.
+                try entry.index.deleteNativeCatalogScopeForRemoval();
                 const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
                 try self.persistCatalogExcludingWithAtomicMutation(store, name, commit_mutation);
                 const replicated_leann = if (entry.index.leann) |leann_store| leann_store.isReplicated() else false;
@@ -23944,6 +23980,7 @@ pub const IndexManager = struct {
                     .main_no_sync = self.relaxed_split_durability,
                     .main_no_meta_sync = self.relaxed_split_durability,
                     .wal_no_sync = self.relaxed_split_durability,
+                    .scratch_dir = if (self.text_main_backend == .native_catalog) self.native_catalog_scratch_dir else null,
                 };
                 var persistent = openTextPersistentIndexWithRetry(self.alloc, persistent_opts) catch |err| {
                     std.log.warn("full_text open failed step=persistent_open name={s} err={s}", .{
@@ -24153,6 +24190,30 @@ pub const IndexManager = struct {
 
                 const zpath = try self.alloc.dupeSentinel(u8, path, 0);
                 defer self.alloc.free(zpath);
+
+                // #1216 (creation side): a crash between a fresh admission's
+                // native-catalog metadata seed (just below, inside
+                // `HBCIndex.openWithLsmOptions`) and that admission's own
+                // catalog-config commit (back in `addWithOptions`, after
+                // this call returns) leaves scope records under this name
+                // with no catalog entry to own them. A later retry -- same
+                // name, any dims -- must not resurrect that orphaned
+                // generation's metadata as if it were live
+                // (`openWithLsmOptions`'s loaded-metadata path has no way
+                // to tell "orphan" from "legitimate", and a dims mismatch
+                // between the orphan and the retry's config surfaces as a
+                // spurious `DimensionMismatch`). Gated on
+                // `fresh_admission_name`, not `self.get`, precisely because
+                // a normal reopen reaches this same call with no way to
+                // tell it apart otherwise -- see that field's doc comment.
+                if (self.dense_storage_backend == .native_catalog and
+                    self.fresh_admission_name != null and
+                    std.mem.eql(u8, self.fresh_admission_name.?, cfg.name))
+                {
+                    if (self.dense_main_native_catalog_sink) |sink| {
+                        try native_catalog_backend.deleteAllForScope(self.alloc, sink, path);
+                    }
+                }
 
                 const index = try self.alloc.create(hbc_mod.HBCIndex);
                 var index_owned = true;

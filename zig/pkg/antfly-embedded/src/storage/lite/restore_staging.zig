@@ -131,6 +131,18 @@ fn inspectInput(allocator: Allocator, input_path: []const u8, options: preflight
     try options.cancellation.check();
     var source = try openInputFile(io, input_path);
     defer source.close(io);
+    // §8.7 row 4 (lite-single-commit-write-path.md's shared-lock-region
+    // migration) does not reach this lock: it excludes a concurrent
+    // *backup writer still streaming bytes* into `input_path`, proven by
+    // the matching test ("...rejects same-size native source changes
+    // since admission" and the "busy.afb" case below), not a Lite
+    // writer's commit. At this point the format of `input_path` is not
+    // even known yet (the magic-byte check is further down) -- it may be
+    // a `.afb` bundle or a portable backup that was never a Lite database
+    // at all, so there is no `shared_lock_region.zig` region for it to
+    // join; the thing excluded against never opens one either (a backup
+    // writer streams this file with a plain kernel lock of its own, not
+    // through `inode_lock.zig`/`PathWriterLock`). Stays a kernel lock.
     if (!try source.tryLock(io, .shared)) return error.WriterLocked;
     defer source.unlock(io);
     try checkInputLimit(io, source, options.max_input_bytes);
@@ -519,6 +531,12 @@ fn stageAfbRestoreBackupWithOptions(
     defer source.close(io);
     // Pin the source before reading any admission metadata. Native extraction
     // rereads the manifest and must consume the inventory checked below.
+    // Stays a kernel lock, not a region pin -- same reasoning as
+    // `inspectInput`'s own identical lock above: `path` is a `.afb`
+    // backup archive (not yet known whether native or portable), never a
+    // live Lite database with a `shared_lock_region.zig` region of its
+    // own, and what this excludes against (a backup writer mid-stream)
+    // never opens one either.
     if (!try source.tryLock(io, .shared)) return error.WriterLocked;
     defer source.unlock(io);
     try checkInputLimit(io, source, options.max_input_bytes);

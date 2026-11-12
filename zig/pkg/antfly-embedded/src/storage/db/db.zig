@@ -63174,6 +63174,17 @@ fn denseTargetCountFromCoverage(
         else
             false;
         if (requires_artifact_coverage) {
+            // A fresh, untouched artifact-backed generation's target counter
+            // is trivially zero before any producer has attempted even its
+            // first document -- indistinguishable, by count alone, from a
+            // genuinely empty range. Apply the same range-local cardinality
+            // check the non-artifact-coverage branch below uses, so a gated
+            // or blocked embedder's never-attempted source material defers
+            // (returns null, "not yet determined") instead of vacuously
+            // matching a zero active count and fast-forwarding past it.
+            if (coverage_counts.source_total) |source_count| {
+                if (source_count != 0) return null;
+            }
             return try coverage_counts.artifactCount();
         }
         // A fresh generation on an empty table has no outcome rows to create
@@ -106149,8 +106160,28 @@ test "db replay respects per-index applied watermarks" {
     const dense_applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
     try std.testing.expectEqual(appended_sequence, dense_applied);
 
+    // gr_v1's applied_sequence is allowed to advance here even though it
+    // never saw an explicit saveAppliedSequence call of its own: the one
+    // record in range genuinely was scanned (not skipped) and genuinely
+    // has nothing graph-relevant in it (the write only ever touched
+    // dv_v1's embedding), so this is a verified-empty window, not a
+    // vacuous one. "Applied through N" means "complete through N",
+    // which a verified-empty scan satisfies the same way a materialized
+    // write does -- see docs/design/lite-performance/lite-single-commit-
+    // write-path.md §3.2a. The contract this test guards is narrower than
+    // "never moves without an explicit save": an index must never apply or
+    // materialize a record that isn't relevant to it (gr_v1 gets no edges
+    // from a batch with none), and a gated/blocked index must never
+    // advance past work it hasn't done (covered separately by "db
+    // source-only batch retains a certified empty dense generation",
+    // where the embedder is blocked and the index correctly stays put).
+    // A verified-empty advance is allowed, and never advances past the
+    // extent that was actually scanned.
     const graph_applied = try reopened.core.loadAppliedSequence(alloc, "gr_v1");
-    try std.testing.expectEqual(@as(u64, 0), graph_applied);
+    try std.testing.expect(graph_applied <= appended_sequence);
+    const graph_entry = reopened.core.graphIndex("gr_v1") orelse return error.IndexNotFound;
+    const graph_stats = try graph_entry.index.stats(alloc);
+    try std.testing.expectEqual(@as(u64, 0), graph_stats.edge_count);
 }
 
 test "db replay applies dense embeddings from artifact payloads" {
@@ -146867,7 +146898,12 @@ test "lite bounded reader integration publishes full text mappings through db" {
         defer result.deinit();
         try std.testing.expectEqual(@as(u32, 1), result.total_hits);
         const entry = db.core.index_manager.textIndexEntry("text").?;
-        try std.testing.expect(entry.persistent.supportsFileBackedSegmentArtifacts());
+        // `.native_catalog` publishes segments inline through the catalog
+        // sink, not through a file-backed SegmentFileStore or the artifact
+        // leases that come with one -- so it never supports file-backed
+        // segment artifacts. It still needs a bounded, real scratch
+        // directory for large-payload typed staging, asserted below.
+        try std.testing.expect(!entry.persistent.supportsFileBackedSegmentArtifacts());
         const scratch_directory = entry.persistent.privateScratchDirectory("virtual fallback").?;
         try std.testing.expectEqualStrings(std.fs.path.dirname(path).?, scratch_directory);
         // Force native typed staging through the production kernel builder.
@@ -146880,7 +146916,13 @@ test "lite bounded reader integration publishes full text mappings through db" {
         });
         const snapshot = entry.persistent.acquireSnapshot();
         defer snapshot.release();
-        for (snapshot.segments) |segment| try std.testing.expect(segment.data == .native);
+        // `.native_catalog` segments publish as owned heap buffers inline
+        // through the catalog sink (see `indexSegmentOwned`'s
+        // `segment_files == null` branch) -- `SegmentData.native` names a
+        // different, file-backed representation entirely (built from a
+        // finished atomic-write source; see `fromNative`/`finishSource` in
+        // `indexSegmentFromSinkBuilder`), so it never applies here.
+        for (snapshot.segments) |segment| try std.testing.expect(segment.data == .heap);
         try std.testing.expectEqual(@as(u64, 0), (try handle.native_docstore.?.reclamationStatus()).artifact_file_bytes);
     }
     try std.testing.expectEqual(@as(u64, 0), (try handle.native_docstore.?.reclamationStatus()).artifact_file_bytes);

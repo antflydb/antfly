@@ -320,11 +320,31 @@ pub const Entry = struct {
     /// instance on this inode -- not just the one that committed -- can
     /// read it): the most recently committed `commit_sequence`, used to
     /// detect a writer instance operating against a stale base (an old
-    /// generation/header it never refreshed). Not populated or read by
-    /// this module itself; reserved here, next to `reader_pins`, so the
-    /// two in-process additions don't collide on the struct layout.
+    /// generation/header it never refreshed). Populated under the
+    /// publishing commit's own exclusion (`NativeFile.publishCheckpoint`);
+    /// read lock-free via a monotonic compare, never regressed by an older
+    /// commit's publish racing a newer one. See
+    /// `publishCommittedSequence`/`committedSequence` below.
     last_committed_sequence: std.atomic.Value(u64) = .init(0),
 };
+
+/// Publishes `sequence` as this inode's own latest known-durable commit,
+/// monotonically: a concurrent publish of an older sequence (e.g. a stale
+/// writer that is only now discovering/reporting what it already knew)
+/// never regresses a newer one already recorded. Called once per durable
+/// checkpoint publish, from the publishing `NativeFile` itself.
+pub fn publishCommittedSequence(entry: *Entry, sequence: u64) void {
+    var current = entry.last_committed_sequence.load(.monotonic);
+    while (sequence > current) {
+        current = entry.last_committed_sequence.cmpxchgWeak(current, sequence, .monotonic, .monotonic) orelse return;
+    }
+}
+
+/// This inode's latest known-durable commit sequence in this process (0 if
+/// nothing has published yet). See `publishCommittedSequence`.
+pub fn committedSequence(entry: *Entry) u64 {
+    return entry.last_committed_sequence.load(.monotonic);
+}
 
 /// One live reader's pinned sequence(s), registered in `Entry.reader_pins`.
 /// Mirrors `shared_lock_region.Region`'s own data/metadata split so a

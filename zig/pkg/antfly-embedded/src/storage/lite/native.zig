@@ -27,27 +27,15 @@ const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const resource_manager_mod = @import("../resource_manager.zig");
 const maintenance = @import("../maintenance.zig");
-const writer_queue = @import("writer_queue.zig");
 const inode_lock = @import("inode_lock.zig");
 const redo_log = @import("redo_log.zig");
 const redo_overlay = @import("redo_overlay.zig");
-// Step 1 of docs/design/lite-performance/lite-single-commit-write-path.md
-// §8 (the shared mmap lock region replacing inode_lock.zig's flock
-// registry). Not yet called from anywhere below -- this import exists
-// only so its own tests are reachable from this root module, the same
-// convention `inode_lock`/`writer_queue` above already follow. Later
-// steps wire real callers in as §8.3/§8.4 land and §8.7's migration
-// begins.
+// docs/design/lite-performance/lite-single-commit-write-path.md §8: the
+// shared mmap lock region replacing `inode_lock.zig`'s flock registry and
+// (§8.7's migration) `writer_queue.zig`'s own file-based CLH ticket queue,
+// deleted once every constructor that used it moved onto the region's own
+// ticket ring.
 const shared_lock_region = @import("shared_lock_region.zig");
-// Zig's lazy container analysis never looks inside an `@import` whose
-// result is never referenced, so an unused top-level `const` alone (unlike
-// `inode_lock`/`writer_queue` above, both used extensively below) does not
-// reach its test blocks at all. This forces that analysis so the step-1
-// region/writer-lock tests are discoverable from this module; delete once
-// a later step gives this module a real, referencing caller.
-comptime {
-    _ = shared_lock_region;
-}
 const wal_trace = @import("../write_amplification_trace.zig");
 pub const allocator_v4 = @import("allocator_v4.zig");
 
@@ -1020,26 +1008,41 @@ const recovery_agenda = @import("recovery_agenda.zig");
 // `flushTransactionWrites`/`persistAllocator` cycle, in particular) still
 // gets the one-sync manifest path instead of always falling back to the
 // two-sync presynced one.
-// Antfly is unreleased, so no old layout is preserved: a v3/v7 (pre-v8) or
-// v4/v8 (single-run manifest) file is refused by `decodeHeader`'s version
-// check (surfaced as `error.UnsupportedNativeFormatVersion`), not migrated.
-pub const magic = "AFLITE\x05P";
-const unpacked_v4_magic = "AFLITE\x05N";
-const indexed_magic = "AFLITE\x09P";
-/// docs/design/lite-performance/lite-single-commit-write-path.md §9.5:
-/// the log-structured commit format bump. Distinct from
-/// `format_version`/`indexed_format_version` (a redo-log file never uses
-/// the v8/v9 manifest machinery those gate -- see
-/// `NativeFile.manifest_commits_enabled`), so this version counter is its
-/// own family, bumped independently as the redo-log wire format changes.
-/// Build step (c): orthogonal to `indexed_reclamation` for now (a redo-log
-/// file is always created with `indexed_reclamation = false`); combining
-/// the two is unvalidated and not yet supported.
-const redo_log_magic = "AFLITE\x0bP";
-pub const format_version: u32 = 5;
-pub const indexed_format_version: u32 = 9;
-pub const redo_log_format_version: u32 = 1;
+// Antfly is unreleased, so no old layout is preserved: any file written by
+// a build before this version bump -- v3/v7 (pre-v8), v4/v8 (single-run
+// manifest), or any of the v5/v9/redo-v1 three-way magic split that
+// preceded the unified feature-flags header below -- is refused by
+// `decodeHeader`'s magic/version checks (surfaced as
+// `error.InvalidNativeMagic`/`error.UnsupportedNativeFormatVersion`), not
+// migrated.
+//
+// docs/design/lite-performance/lite-single-commit-write-path.md §9.5/§9.7a:
+// a file's mode (indexed reclamation, redo-log commit, record packing) used
+// to be encoded as which of several magic byte strings `encodeHeader`
+// chose, with `decodeHeader` inferring the mode back from a magic
+// equality check -- so two modes could never be combined (redo log and
+// indexed reclamation specifically: `docstore.zig`'s `createWithOptions`
+// and `NativeFile.createWithRedoLog(OwnedIo)` both refused the
+// combination, since there was no single magic that meant both). This is
+// replaced by one magic that means only "an aflite native file, format
+// `format_version`", plus an explicit `feature_flags` word (see
+// `feature_flags_offset`) carrying each mode as its own bit -- extensible
+// to a fourth/fifth mode without ever needing another magic string or
+// another priority-ordered branch.
+pub const magic = "AFLITE\x0cP";
+pub const format_version: u32 = 10;
 pub const default_page_size: u32 = 4096;
+
+/// §9.5/§9.7a: explicit, independently-encoded mode bits, read from/written
+/// to `feature_flags_offset`. Replaces the old magic-implied mode
+/// inference (see `magic`'s own doc comment) -- a mode's bit is set (or
+/// not) based purely on the `Header` field it corresponds to, never on
+/// which other bits are also set, so any combination round-trips exactly
+/// as written. Add new bits here as new modes are introduced; never reuse
+/// a retired bit's position (none are retired yet).
+const feature_flag_redo_log: u32 = 1 << 0;
+const feature_flag_indexed_reclamation: u32 = 1 << 1;
+const feature_flag_packed_records: u32 = 1 << 2;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
     const alloc = std.testing.allocator;
@@ -2050,11 +2053,16 @@ const version_offset: usize = 8;
 const page_size_offset: usize = 12;
 const header_size_offset: usize = 16;
 const reader_epoch_namespace_offset: usize = 24;
-/// §9.1/§9.5: only meaningful (and only written) when the header's magic
-/// is `redo_log_magic`. Fixed for the file's lifetime once set at creation
-/// (`NativeFile.enableRedoLog`) -- the log region never grows or moves.
+/// §9.1/§9.5: only meaningful (and only written) when `feature_flags`'s
+/// `feature_flag_redo_log` bit is set. Fixed for the file's lifetime once
+/// set at creation (`NativeFile.enableRedoLog`) -- the log region never
+/// grows or moves.
 const redo_log_offset_offset: usize = 56;
 const redo_log_capacity_offset: usize = 64;
+/// §9.5/§9.7a: the explicit mode-bits word (`feature_flag_*`). Placed
+/// right after `redo_log_capacity` (which ends at byte 72); the next new
+/// field after this one belongs at byte 76.
+const feature_flags_offset: usize = 72;
 const header_checksum_offset: usize = header_size - 4;
 const page_crc_offset: usize = 12;
 
@@ -4559,34 +4567,35 @@ pub const PathWriterLock = struct {
     /// Admission owns this scope. Closing/yielding the kernel lease drops all
     /// idle anchors; escaped readers retain independent marker references.
     reader_registration_batch: ?ReaderCoordinator.RegistrationBatch = null,
-    /// FIFO turn held while this lease is open. Released after the kernel
-    /// lease so the next queued writer finds the sidecar free.
-    queue_turn: ?writer_queue.Turn = null,
-    /// Set instead of `queue_turn` when the lease was taken with the queue idle.
-    queue_watch: ?writer_queue.Watch = null,
-    /// §8.2's shared mmap lock region, set by `fairWriterLockWithIo` (and,
-    /// as later steps migrate them, the other constructors) in place of
-    /// `queue_turn`/`queue_watch`. Heap-allocated (`std.heap.page_allocator`,
-    /// matching `inode_lock.Entry.region`'s own convention) rather than
-    /// stored by value, because unlike `inode_lock.Entry` (always accessed
-    /// through one `*Entry`, never copied) a `PathWriterLock` value is
-    /// copied and moved pervasively by its own callers (`var lease = held;`,
-    /// `self.retained = lease.*;`) -- a `Region` copied that way would let
-    /// two independent values both believe they own the one mapping/fd and
-    /// both try to tear it down.
+    /// §8.2's shared mmap lock region, set by whichever of this type's own
+    /// six constructors could use it -- `null` for a lease taken through
+    /// the single plain-flock fallback (§8.6: the region unusable for this
+    /// path, or `lockWriterPath`'s own CLI path, which never attempts the
+    /// region at all -- see its own doc comment). Heap-allocated
+    /// (`std.heap.page_allocator`, matching `inode_lock.Entry.region`'s own
+    /// convention) rather than stored by value, because unlike
+    /// `inode_lock.Entry` (always accessed through one `*Entry`, never
+    /// copied) a `PathWriterLock` value is copied and moved pervasively by
+    /// its own callers (`var lease = held;`, `self.retained = lease.*;`) --
+    /// a `Region` copied that way would let two independent values both
+    /// believe they own the one mapping/fd and both try to tear it down.
     ///
-    /// During this transitional step the region's own `writer_holder` CAS
-    /// is *not yet* the real safety authority: it only decides fairness
-    /// order among the constructors already migrated onto it (today, just
-    /// `fairWriterLockWithIo`), the same narrow role `writer_queue.Queue`'s
-    /// own ticket/turn played. The sidecar `flock` (`file` above) remains
-    /// the actual mutual-exclusion mechanism every constructor -- migrated
-    /// or not -- still takes, so a caller on the old path and a caller on
-    /// the new one still exclude each other correctly. Only once every
-    /// constructor (and every other remaining flock caller) has moved onto
-    /// the region does a later step retire the flock itself and let the
-    /// region's CAS become the real authority.
+    /// The region's own `writer_holder` CAS is *not* this lease's safety
+    /// authority by itself: the sidecar `flock` (`file` above), taken by
+    /// every constructor (region-backed or plain-flock fallback alike), is
+    /// what every caller actually excludes against, so a region-backed
+    /// lease and a plain-flock fallback lease on the same file still
+    /// correctly exclude each other. The region's CAS only decides
+    /// *fairness order* among the constructors that use it.
     region: ?*shared_lock_region.Region = null,
+    /// Whether `fairWriterLockWithIo` took a real region ticket to get
+    /// this lease rather than winning the ticketless fast path -- the
+    /// same `.queued` vs `.uncontended` admission-stats distinction
+    /// `writer_queue.zig`'s own `queue_turn` (a real turn) versus
+    /// `queue_watch` (an idle-queue bypass) used to carry before this
+    /// design moved off it. `false` for every other constructor (never
+    /// set by them).
+    contended: bool = false,
     /// When the kernel lease was first taken; kept across in-process handoffs.
     acquired_ns: i96 = 0,
     /// Where `close` records this holder's hold time. Cleared on handoff
@@ -4610,31 +4619,25 @@ pub const PathWriterLock = struct {
     }
 
     /// Whether a writer in another process has queued behind this lease.
-    /// Unknown (no queue) answers true so callers release instead of keeping it.
+    /// Unknown (no region -- the single plain-flock fallback, §8.6) answers
+    /// true so callers release instead of keeping it.
     pub fn othersWaiting(self: *const PathWriterLock) bool {
         if (self.region) |region| return region.othersWaiting();
-        const io = self.borrowed_io orelse return true;
-        if (self.queue_turn) |*turn| return turn.hasSuccessor(io);
-        if (self.queue_watch) |*watch| return watch.hasArrivals(io);
         return true;
     }
 
     /// Like `othersWaiting`, but true only for a waiter in a genuinely
-    /// different *process* -- see `writer_queue.Queue.
-    /// foreignTicketsIssuedSince`. Unlike `othersWaiting`, this process's
-    /// own background maintenance worker (or any other same-process
-    /// caller that reaches the queue through a path other than the one
-    /// holding this lease) never counts, since it registers a ticket
-    /// tagged with this same process's id. Callers that would otherwise
-    /// treat their own maintenance work as a hostile waiter -- starving it
-    /// by never releasing, since it only ever shows up as "someone is
-    /// queued" and never actually goes away on its own -- use this
-    /// instead.
+    /// different *process* -- see `Region.othersWaitingAcrossProcesses`.
+    /// Unlike `othersWaiting`, this process's own background maintenance
+    /// worker (or any other same-process caller that reaches the region
+    /// through a path other than the one holding this lease) never
+    /// counts, since its own ticket is tagged with this same process's
+    /// id. Callers that would otherwise treat their own maintenance work
+    /// as a hostile waiter -- starving it by never releasing, since it
+    /// only ever shows up as "someone is queued" and never actually goes
+    /// away on its own -- use this instead.
     pub fn othersWaitingAcrossProcesses(self: *const PathWriterLock, own_pid: u32) bool {
         if (self.region) |region| return region.othersWaitingAcrossProcesses(own_pid);
-        const io = self.borrowed_io orelse return true;
-        if (self.queue_turn) |*turn| return turn.hasForeignSuccessor(io, own_pid);
-        if (self.queue_watch) |*watch| return watch.hasForeignArrivals(io, own_pid);
         return true;
     }
 
@@ -4645,11 +4648,8 @@ pub const PathWriterLock = struct {
         // The hold ends when the descriptor (and its flock) is released, so
         // it covers reader-marker cleanup done under the lock, as handoffs do.
         self.endHold();
-        if (self.queue_turn) |*turn| turn.release(io);
-        if (self.queue_watch) |*watch| watch.release(io);
         if (self.region) |region| {
-            // Mirrors `turn.release(io)`'s own timing: held for this
-            // lease's whole lifetime, released only here.
+            // Released only here, held for this lease's whole lifetime.
             region.releaseWriter();
             region.close();
             std.heap.page_allocator.destroy(region);
@@ -6096,6 +6096,18 @@ pub const NativeFile = struct {
 
         const inode_entry = try inode_lock.open(io, path);
         errdefer inode_lock.unref(inode_entry, io);
+        // Eagerly establish (or attach to an already-cached) this inode's
+        // shared lock region here, at open time, instead of leaving its
+        // one-time create/validate cost (`Region.openSized`) to land
+        // lazily inside whichever call happens to be first to need it --
+        // which, for a writer, can be the first page-reusing commit
+        // (`acquireEpochReuseLock` -> `regionForInode`), landing region
+        // setup work inside a commit's own fault window. Every error is
+        // swallowed exactly like `regionForInode` already does: a region
+        // that can't be set up here just means every later caller's own
+        // region-mode fallback engages instead, never a reason to fail
+        // this open.
+        _ = inode_lock.ensureRegion(inode_entry, io) catch {};
 
         // Every read-only open used to ask `openDataFile` to take its
         // `.shared` kernel lock atomically at open, on its own fd, for
@@ -6164,7 +6176,10 @@ pub const NativeFile = struct {
             // the two, so there is no longer a reason to branch on it
             // here either.
             if (opts.reader_coordinator) |coordinator| {
-                const region = inode_lock.ensureRegion(inode_entry, io) catch null;
+                const region = inode_lock.ensureRegion(inode_entry, io) catch |err| region_blk: {
+                    if (!inode_lock.isRegionUnusable(err)) return err;
+                    break :region_blk null;
+                };
                 result.reader_fence = try coordinator.registerFull(file, region, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint());
             }
             errdefer if (result.reader_fence) |fence| opts.reader_coordinator.?.unregister(fence);
@@ -6215,10 +6230,13 @@ pub const NativeFile = struct {
     /// plumbing into `createWithRuntime` has no slot for this, so a field
     /// that only one of several constructors actually honored would be a
     /// silent trap for a caller using any of the others. `opts.indexed_reclamation`
-    /// must be `false`: combining indexed reclamation with a redo log is
-    /// unvalidated and not yet supported.
+    /// may be `true` or `false`: combining indexed reclamation with a redo
+    /// log is supported (§9, redo+indexed_reclamation work) -- `enableRedoLog`
+    /// reserves the log region's page-id span starting after whatever
+    /// pages `createWithIo`'s own bootstrap (indexed or not) already
+    /// allocated, rather than assuming a fixed `reserved_header_pages`
+    /// start.
     pub fn createWithRedoLog(allocator: Allocator, io: std.Io, path: []const u8, opts: CreateOptions, redo_log_capacity_bytes: u64) !NativeFile {
-        std.debug.assert(!opts.indexed_reclamation);
         var file = try createWithIo(allocator, io, path, opts);
         errdefer file.close();
         try file.enableRedoLog(redo_log_capacity_bytes);
@@ -6231,7 +6249,6 @@ pub const NativeFile = struct {
     /// default-for-new-files policy (docstore.zig's `Store.createWithOptions`)
     /// needs this: it is reached whenever a caller passes no `opts.io`.
     pub fn createWithRedoLogOwnedIo(allocator: Allocator, path: []const u8, opts: CreateOptions, redo_log_capacity_bytes: u64) !NativeFile {
-        std.debug.assert(!opts.indexed_reclamation);
         var file = try createWithOptions(allocator, path, opts);
         errdefer file.close();
         try file.enableRedoLog(redo_log_capacity_bytes);
@@ -6260,37 +6277,73 @@ pub const NativeFile = struct {
     /// this is a deliberately modest default, not a measured optimum.
     pub const default_redo_log_capacity_bytes: u64 = 512 * 1024;
 
-    /// Upgrades a freshly bootstrapped, ordinary (non-indexed) file to the
+    /// Upgrades a freshly bootstrapped file (indexed or not) to the
     /// redo-log format in place: reserves `redo_log_capacity_bytes`
     /// (rounded up to a whole number of pages) as a dedicated, zero-filled
-    /// byte region immediately after the header and both checkpoint slots
-    /// (§9.1 -- in-file, not a sibling file), reserves that same range's
-    /// page-id span so `PageAllocator` never hands any of it out as an
-    /// ordinary page, and rewrites the header and the active checkpoint
-    /// slot to record the region and switch magic/version (§9.5's format
+    /// byte region immediately after whatever pages the bootstrap commit
+    /// already covers (§9.1 -- in-file, not a sibling file; `reserved_header_pages`
+    /// for a plain bootstrap, more for an indexed one, whose own bootstrap
+    /// commit already allocated a free-map/ledger page -- using the
+    /// checkpoint's own `page_count` rather than a hardcoded
+    /// `reserved_header_pages` is what makes this correct for both),
+    /// reserves that same range's page-id span so `PageAllocator` never
+    /// hands any of it out as an ordinary page, and rewrites the header
+    /// and both checkpoint slots to record the region (§9.5's format
     /// bump). Must only be called once, on a file with no transaction in
-    /// flight and nothing durable yet beyond the bootstrap checkpoint.
+    /// flight and nothing durable yet beyond the bootstrap checkpoint --
+    /// both slots are still identical at that point (an indexed bootstrap
+    /// writes both explicitly; a plain one leaves slot 1 structurally
+    /// invalid until the first real commit), so writing both here keeps
+    /// them that way rather than leaving slot 1 stale with a `page_count`
+    /// that doesn't reserve the log region, which a tie in recovery's slot
+    /// selection could otherwise surface.
+    ///
+    /// For an indexed bootstrap specifically, bumping `page_count` alone
+    /// is not enough: `allocator_v4.State`'s own root page cross-checks
+    /// its `covered_pages` against the checkpoint's `page_count`
+    /// (`decodeRoot`), so the two must be re-persisted together. Reserve
+    /// the log region's page-id span through the real allocator instead
+    /// -- the same `allocateFresh`/`reserveTail` path every ordinary
+    /// commit's own fresh page allocation already uses -- so the
+    /// ledger's coverage and the checkpoint's `page_count` land in
+    /// lockstep, then let `persistAllocator` write the updated ledger the
+    /// same way a real commit would. A plain (non-indexed) bootstrap has
+    /// no such cross-check (`readFreePagesAlloc` tolerates a `page_count`
+    /// ahead of the free-map page's own last-written content), so it
+    /// keeps the simpler direct bump.
     fn enableRedoLog(self: *NativeFile, capacity_bytes: u64) !void {
         std.debug.assert(self.redo == null);
         const page_size: u64 = self.header.page_size;
         const log_pages = std.math.divCeil(u64, @max(capacity_bytes, 1), page_size) catch unreachable;
         const capacity = log_pages * page_size;
-        const offset = reserved_header_pages * page_size;
         const io = self.runtimeIo();
+
+        var checkpoint = self.header.checkpoints[self.header.active_checkpoint];
+        const offset = checkpoint.page_count * page_size;
 
         // Zero-filled, preallocated extent: `redo_log.replay`'s
         // end-of-region detection relies on untouched space reading back
         // as zero, exactly like every other page range this file grows.
         try self.file.setLength(io, offset + capacity);
 
-        var checkpoint = self.header.checkpoints[self.header.active_checkpoint];
-        checkpoint.page_count = reserved_header_pages + log_pages;
+        if (self.header.indexed_reclamation) {
+            var pages = try self.pageAllocatorFromFreeMap(checkpoint);
+            defer pages.deinit();
+            for (0..log_pages) |_| _ = try pages.allocateFresh();
+            checkpoint.free_map_root_page = try pages.allocate();
+            checkpoint.page_count = pages.next_page_id;
+            try pages.flush();
+            try self.persistAllocator(&pages, &checkpoint);
+        } else {
+            checkpoint.page_count += log_pages;
+        }
         var slot_buf: [max_page_size]u8 = undefined;
         const slot_page = slot_buf[0..page_size];
         encodeCheckpointSlotPage(slot_page, checkpoint);
-        try self.file.writePositionalAll(io, slot_page, slotPhysicalPage(self.header.active_checkpoint) * page_size);
+        try self.file.writePositionalAll(io, slot_page, slotPhysicalPage(0) * page_size);
+        try self.file.writePositionalAll(io, slot_page, slotPhysicalPage(1) * page_size);
         if (!self.no_sync) try self.file.sync(io);
-        self.header.checkpoints[self.header.active_checkpoint] = checkpoint;
+        self.header.checkpoints = .{ checkpoint, checkpoint };
 
         self.header.redo_log_offset = offset;
         self.header.redo_log_capacity = capacity;
@@ -6700,6 +6753,10 @@ pub const NativeFile = struct {
         // create.
         const inode_entry = try inode_lock.open(io, path);
         errdefer inode_lock.unref(inode_entry, io);
+        // See the matching comment in `openWithRuntime`: set the region up
+        // eagerly here too, so a freshly created file never defers that
+        // one-time cost into its first page-reusing commit either.
+        _ = inode_lock.ensureRegion(inode_entry, io) catch {};
 
         var result = NativeFile{
             .allocator = allocator,
@@ -6844,6 +6901,51 @@ pub const NativeFile = struct {
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
         self.namespace_directory_cache = .empty;
         self.header = header;
+    }
+
+    /// The real fix for the stale-writer corruption (`UnexpectedNativePageKind`
+    /// seen under sustained concurrent Lite load): a second `NativeFile`
+    /// instance on the same inode in this process -- most commonly a
+    /// maintenance turn's own detached snapshot (`refreshMaintenanceSnapshot`),
+    /// but potentially a writer-lease handoff's receiving instance too -- can
+    /// fall behind another instance's commits and still go on to allocate or
+    /// reuse pages out of its own now-stale free map. By the time
+    /// `publishCheckpoint`'s own backstop assertion would catch that, the
+    /// damage (a page another commit already made live has been reused and
+    /// overwritten) is already done. The fix is to catch it here instead,
+    /// before this instance gains the right to allocate or reuse anything:
+    /// every entry point that leads to `pageAllocatorFromFreeMap`/
+    /// `pageAllocatorFromFreeMapWithProof` for an ordinary write
+    /// (`beginTransaction`, which `reclaimPagesImpl` also funnels through)
+    /// or for vacuum (`vacuumWithCancel`) calls this first.
+    ///
+    /// If this instance's own base (its currently active checkpoint) is
+    /// behind the inode registry's shared, process-wide latest known-durable
+    /// sequence, refresh in place: re-read the header and checkpoint slots
+    /// from disk (cheap -- the same file's pages are already in the OS page
+    /// cache even for an unsynced ride-along commit) and pick the active
+    /// checkpoint exactly as a fresh open would, then reuse
+    /// `adoptIndexPublicationHeader`'s cache/ledger invalidation to rebind
+    /// this instance to it, exactly as a borrowed index writer rebinds to
+    /// its owner's newest header. Never truncates: unlike `open`'s own
+    /// recovery, this is not resolving a crash, so a rejected candidate's
+    /// tail is left alone for whichever instance still needs it.
+    fn refreshIfWriterBaseStale(self: *NativeFile) !void {
+        const entry = self.inode_lock_ref.load(.acquire) orelse return;
+        const latest = inode_lock.committedSequence(entry);
+        const base = self.activeCheckpoint().commit_sequence;
+        if (base >= latest) return;
+        const io = self.runtime();
+        var header_bytes: [header_size]u8 = undefined;
+        try readHeaderExactAt(self.file, io, &header_bytes);
+        var header = try decodeHeader(&header_bytes);
+        const file_size = (try self.file.stat(io)).size;
+        header.checkpoints = loadCheckpointSlots(self.file, io, header.page_size, file_size);
+        const recovered = try recoverActiveCheckpoint(self.file, io, header, file_size, false);
+        header.active_checkpoint = recovered.index;
+        const new_sequence = header.checkpoints[header.active_checkpoint].commit_sequence;
+        std.log.debug("lite: NativeFile instance refreshed a stale writer base (path={s} ptr={*} old_base={d} new_base={d} registry_latest={d})", .{ self.path, self, base, new_sequence, latest });
+        try self.adoptIndexPublicationHeader(header);
     }
 
     /// Carry pending lineage across identical runtime generations, or inherit
@@ -7105,7 +7207,7 @@ pub const NativeFile = struct {
             // A full-graph snapshot reader always retains metadata, region
             // slot or not -- `registerFull` handles both uniformly now,
             // regardless of `indexed_reclamation`.
-            reader.reader_fence = try self.reader_coordinator.?.registerFull(reader.file, self.regionForInode(), inode, reader.metadataReuseFrontier(), self.headerFingerprint());
+            reader.reader_fence = try self.reader_coordinator.?.registerFull(reader.file, try self.regionForInode(), inode, reader.metadataReuseFrontier(), self.headerFingerprint());
         }
         return reader;
     }
@@ -7375,17 +7477,19 @@ pub const NativeFile = struct {
     /// The shared lock region for this inode's registry entry, or `null`
     /// when there is no entry at all (a standalone/`externally_locked`-free
     /// file never registered, which has no registry `Entry` to carry a
-    /// region on) or the region itself cannot be used right now. Every
-    /// reader-fence/epoch-reuse caller treats a `null` region the same way:
-    /// fall back to inode-only kernel fencing, never fail the whole open or
-    /// commit over it. Interim posture before this file's own fallback
-    /// detection (migration row 5) distinguishes "genuinely unusable" from
-    /// "transient failure" here -- every error from `ensureRegion` is
-    /// treated as "no region" for now, which is always safe (never wrong,
-    /// only ever more conservative than necessary).
-    pub fn regionForInode(self: *NativeFile) ?*shared_lock_region.Region {
+    /// region on) or the region itself is genuinely unusable right now
+    /// (`inode_lock.isRegionUnusable`, the same check the writer side
+    /// shares) -- every reader-fence/epoch-reuse caller treats a `null`
+    /// region the same way: fall back to inode-only kernel fencing, never
+    /// fail the whole open or commit over it. Any other error (notably
+    /// `OutOfMemory`) propagates instead of being swallowed into a
+    /// fallback that would likely fail the same way.
+    pub fn regionForInode(self: *NativeFile) !?*shared_lock_region.Region {
         const entry = self.inode_lock_ref.load(.acquire) orelse return null;
-        return inode_lock.ensureRegion(entry, self.runtime()) catch null;
+        return inode_lock.ensureRegion(entry, self.runtime()) catch |err| {
+            if (inode_lock.isRegionUnusable(err)) return null;
+            return err;
+        };
     }
 
     /// Read-generation locks join the same-owner frontier only while
@@ -7417,7 +7521,7 @@ pub const NativeFile = struct {
         // below still blocks this process's own exclusive reuse either
         // way).
         if (self.reader_coordinator) |coordinator| {
-            self.reader_fence = try coordinator.registerEpoch(self.file, self.regionForInode(), (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint(), false);
+            self.reader_fence = try coordinator.registerEpoch(self.file, try self.regionForInode(), (try self.file.stat(self.runtime())).inode, sequence, owner.headerFingerprint(), false);
         }
         errdefer if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
         // Only a fence that actually got a live region slot (`Fence
@@ -7488,7 +7592,7 @@ pub const NativeFile = struct {
         // `epoch_window` at its already-cleared `null`, which
         // `reuseFrontier`/`metadataReuseFrontier` already treat as "no
         // additional frontier from this source."
-        if (self.regionForInode()) |region| self.epoch_window = .{ .data = region.minimumPinnedSequence(), .metadata = region.minimumMetadataPinnedSequence() };
+        if (try self.regionForInode()) |region| self.epoch_window = .{ .data = region.minimumPinnedSequence(), .metadata = region.minimumMetadataPinnedSequence() };
         return handle;
     }
     fn beginReaderWindow(self: *NativeFile) !bool {
@@ -7498,7 +7602,7 @@ pub const NativeFile = struct {
             return true;
         }
         const inode = (try self.file.stat(self.runtime())).inode;
-        const frontier = coordinator.beginWithMetadata(inode, self.headerFingerprint(), self.free_pages_verified, self.regionForInode());
+        const frontier = coordinator.beginWithMetadata(inode, self.headerFingerprint(), self.free_pages_verified, try self.regionForInode());
         errdefer coordinator.end();
         self.reader_window_previous_frontier = self.minimum_reader_sequence;
         if (frontier.data) |sequence| self.minimum_reader_sequence = @min(self.minimum_reader_sequence orelse sequence, sequence);
@@ -8389,6 +8493,24 @@ pub const NativeFile = struct {
         const previous_cancel = self.allocator_cancel_token;
         self.allocator_cancel_token = cancel;
         defer self.allocator_cancel_token = previous_cancel;
+        // §9 (redo + indexed reclamation): this commit builds a real page
+        // (persistAllocator's ledger/free-map write below) exactly like
+        // `checkpointRedoLog`'s own transaction, so it needs the same
+        // `checkpointing = true` guard for the same reason (see that
+        // function's own doc comment): `commitTransactionWithDurability`'s
+        // `syncIfRequired` skip and `publishCheckpoint`'s redo-log-record
+        // append both key off `self.redo.?.checkpointing` to tell "a real,
+        // physically-synced commit" apart from "a diverting one whose only
+        // durability barrier is the log append." Without this, a reclaim
+        // commit on a redo-log file is misclassified as diverting -- its
+        // real page work's own sync gets skipped and an empty, spurious
+        // log record is appended for a sequence the log has no logical
+        // mutation to replay for, corrupting the log's sequence
+        // continuity on the next reopen.
+        if (self.redo) |*redo| redo.checkpointing = true;
+        defer if (self.redo) |*redo| {
+            redo.checkpointing = false;
+        };
         try self.beginTransaction();
         errdefer self.abortTransaction();
         const before = self.activeCheckpoint();
@@ -12122,11 +12244,12 @@ pub const NativeFile = struct {
         // on the same path in an `externally_locked` setup).
         const data_lock = try self.acquireInodeLock(.exclusive, false, false, "vacuumWithCancel");
         defer data_lock.release(self.runtimeIo());
+        try self.refreshIfWriterBaseStale();
         // Replaces the old namespace-directory scan: a live pin in the
         // region's reader table (any reader, indexed or not -- the region
         // doesn't distinguish) refuses the vacuum rather than rewriting
         // pages a reader may still need.
-        if (self.regionForInode()) |region| if (region.minimumPinnedSequence() != null) return error.WouldBlock;
+        if (try self.regionForInode()) |region| if (region.minimumPinnedSequence() != null) return error.WouldBlock;
         var image = try self.prepareVacuum(cancel);
         defer image.deinit();
         try self.publishVacuum(&image);
@@ -13306,6 +13429,41 @@ pub const NativeFile = struct {
         return self.pageAllocatorFromFreeMapWithProof(checkpoint, !self.artifact_lease_transaction);
     }
 
+    /// §9 (redo + indexed reclamation): a diverting commit (this file has
+    /// a redo log and this is not `checkpointRedoLog`'s own transaction)
+    /// never builds a real copy-on-write page for its logical roots (see
+    /// `flushTransactionWrites`'s own `diverting` check), so loading the
+    /// `allocator_v4.State` ledger, verifying free pages, or draining a
+    /// retirement backlog for it would be pure, repeated wasted work on
+    /// every foreground commit -- exactly the per-commit cost
+    /// `checkpointRedoLog`'s own batched, undiverted transaction exists to
+    /// amortize instead (same `pageAllocatorFromFreeMap` call, reached
+    /// through `transactionWrites` there too, but with `checkpointing =
+    /// true` so the real indexed branch runs). Only `transactionWrites`
+    /// takes this shortcut: a direct caller like `reclaimPagesImpl` (owner
+    /// background retirement) or `initializeIndexedAllocator` (bootstrap)
+    /// calls `pageAllocatorFromFreeMap(WithProof)` itself and always gets
+    /// the real ledger -- this only ever defers page work for the
+    /// ordinary per-write commit path, never for an explicit
+    /// reclaim/maintenance pass, which must keep draining whatever
+    /// `checkpointRedoLog` already retired regardless of this file's
+    /// redo-log state.
+    ///
+    /// The one page-shaped exception a diverting commit still makes --
+    /// `stageMutation`'s own external value chains, written through this
+    /// same allocator at stage time -- only ever needs a fresh page id,
+    /// never a reused one and never ledger bookkeeping, so an empty free
+    /// list with no ledger attached serves it exactly as well as the real
+    /// thing would, at a fraction of the cost.
+    fn pageAllocatorForDivertingCommit(self: *NativeFile, checkpoint: CheckpointSlot) !PageAllocator {
+        return .{
+            .file = self,
+            .free_pages = try self.allocator.alloc(u64, 0),
+            .append_only = true,
+            .next_page_id = self.manifestSafeNextPageId(checkpoint.page_count),
+        };
+    }
+
     fn pageAllocatorFromFreeMapWithProof(self: *NativeFile, checkpoint: CheckpointSlot, require_reuse_proof: bool) !PageAllocator {
         // Read leases and their retirement must not force a whole-file proof.
         // Unverified housekeeping only extends the file; no existing page is
@@ -14021,7 +14179,19 @@ pub const NativeFile = struct {
         if (self.transaction_writes) |writes| return writes;
         const writes = try self.allocator.create(TransactionWrites);
         errdefer self.allocator.destroy(writes);
-        writes.* = .{ .pages = try self.pageAllocatorFromFreeMap(self.activeCheckpoint()), .value_arena = std.heap.ArenaAllocator.init(self.allocator) };
+        const checkpoint = self.activeCheckpoint();
+        // §9 (redo + indexed reclamation): the same `diverting` condition
+        // `flushTransactionWrites` computes later for this same
+        // transaction -- known here too, since `self.redo` and
+        // `checkpointing` are both file-level state, not something this
+        // specific call discovers. See `pageAllocatorForDivertingCommit`'s
+        // own doc comment for why only this call site (not
+        // `reclaimPagesImpl`, not bootstrap) takes the shortcut.
+        const diverting = self.redo != null and !self.redo.?.checkpointing;
+        writes.* = .{
+            .pages = if (diverting) try self.pageAllocatorForDivertingCommit(checkpoint) else try self.pageAllocatorFromFreeMap(checkpoint),
+            .value_arena = std.heap.ArenaAllocator.init(self.allocator),
+        };
         self.transaction_writes = writes;
         self.transaction_writes_generation +%= 1;
         return writes;
@@ -14468,6 +14638,7 @@ pub const NativeFile = struct {
         // `reconcilePublicationUncertainty`. Only a disk that is still
         // failing (or an inconsistent latch) falls through to the refusal.
         if (self.checkpoint_publication_uncertain) try self.reconcilePublicationUncertainty();
+        try self.refreshIfWriterBaseStale();
         self.transaction_header = self.header;
         self.artifact_lease_transaction = false;
         self.allocator_certificate_staged = false;
@@ -15062,7 +15233,42 @@ pub const NativeFile = struct {
     /// would then re-verify a stale entry list an unrelated, possibly
     /// already-overwritten commit wrote. `false` resets all four to the
     /// safe presynced default before anything else.
+    /// Publishes this handle's own just-durable commit sequence to the
+    /// per-inode registry entry (shared, in this process, by every other
+    /// `NativeFile` instance on the same inode), so any of them can tell
+    /// whether its own in-memory header/allocator state is stale relative
+    /// to what another instance already committed -- the writer-side twin
+    /// of the on-disk stale-base check. A no-op if this handle never
+    /// registered with the registry (e.g. a bare test construction).
+    fn publishCommittedSequenceToInode(self: *NativeFile) void {
+        if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.publishCommittedSequence(entry, self.activeCheckpoint().commit_sequence);
+    }
+
     fn publishCheckpoint(self: *NativeFile, proposed: CheckpointSlot, manifest_prepared: bool, hooks: ?SyncLockHooks) !void {
+        // Backstop only: the real fix is `refreshIfWriterBaseStale`, called
+        // from every entry point that gains the right to allocate or reuse
+        // a page (`beginTransaction`, which `reclaimPagesImpl` also funnels
+        // through, and `vacuumWithCancel`) *before* any allocation happens.
+        // By the time a stale instance reaches publication, it has already
+        // reused and overwritten pages out of its own stale free map --
+        // refusing the publish here is too late to prevent the corruption,
+        // only to detect that it already happened. This must never fire;
+        // if it does, something upstream failed to refresh (or a new path
+        // reaches `publishCheckpoint` without going through one of the
+        // guarded entry points above), and that is a hard bug, not a
+        // transient condition to retry around. Panics rather than
+        // returning a catchable error, so it can never be silently
+        // swallowed by a broad catch anywhere between here and a test
+        // harness.
+        if (self.transaction_header == null) {
+            if (self.inode_lock_ref.load(.acquire)) |entry| {
+                const base = self.activeCheckpoint().commit_sequence;
+                const latest = inode_lock.committedSequence(entry);
+                if (base < latest) {
+                    std.debug.panic("lite: stale writer base reached publishCheckpoint (path={s} base={d} latest={d} proposed_seq={d})", .{ self.path, base, latest, proposed.commit_sequence });
+                }
+            }
+        }
         var checkpoint = proposed;
         if (!manifest_prepared) {
             checkpoint.presynced = true;
@@ -15187,6 +15393,7 @@ pub const NativeFile = struct {
                 state.released_data_pages = 0;
                 state.retired_inline_bytes = 0;
             }
+            self.publishCommittedSequenceToInode();
             return;
         }
         const next_slot: u8 = if (self.header.active_checkpoint == 0) 1 else 0;
@@ -15258,6 +15465,7 @@ pub const NativeFile = struct {
             state.released_data_pages = 0;
             state.retired_inline_bytes = 0;
         }
+        self.publishCommittedSequenceToInode();
     }
 
     fn notifyPublication(self: *NativeFile) void {
@@ -15765,19 +15973,20 @@ pub fn create(io: std.Io, path: []const u8) !void {
     try fs_paths.syncDirPortable(io, std.fs.path.dirname(create_target) orelse ".");
 }
 
-/// Deliberately not migrated onto the region: this owns a fresh `io_impl`
-/// (CLI backup/export/import's "no caller-supplied `Io`" path), and a
+/// Deliberately stays on the single plain-flock fallback (§8.6) rather
+/// than ever attempting the region: this owns a fresh `io_impl` (CLI
+/// backup/export/import's "no caller-supplied `Io`" path), and a
 /// `Region` caches whatever `Io` opened it (`Region.io`, used later by
 /// `close`) for that handle's whole lifetime -- but `PathWriterLock`
 /// values, `io_impl` included, are copied/moved pervasively by their own
 /// callers (see `PathWriterLock.region`'s own doc comment), which would
 /// leave a `Region` opened here pointing at a stale address the moment
 /// this function's own `io_impl` local gets copied into the value this
-/// returns. `lockWriterPathWithIo`, migrated below, has no such problem:
-/// its `io` is always borrowed from a caller who owns their own `Io`
-/// instance stably, never a freshly-created local about to move. A CLI
-/// single-shot nonblocking attempt has little to gain from the region's
-/// own fairness anyway.
+/// returns. `lockWriterPathWithIo` has no such problem: its `io` is
+/// always borrowed from a caller who owns their own `Io` instance
+/// stably, never a freshly-created local about to move. A CLI single-
+/// shot nonblocking attempt has little to gain from the region's own
+/// fairness anyway.
 pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
     var io_impl = threaded_io_limits.initService(allocator);
     errdefer io_impl.deinit();
@@ -15870,40 +16079,39 @@ pub fn waitPathLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, wr
 }
 
 /// FIFO cross-process writer admission. Fairness order is decided by
-/// `shared_lock_region`'s own ticket (§8.2), not `writer_queue` -- the
-/// first of this design's six constructors to migrate onto it. The sidecar
-/// `flock`, taken after the region grants this lease its turn, is still the
-/// *actual* safety authority: the other five constructors haven't moved
-/// onto the region yet, so it alone is what every caller, old path or new,
-/// still excludes against (see `PathWriterLock.region`'s own doc comment).
-/// When nobody is queued, an uncontended writer skips the ticket entirely.
-/// An expired deadline still permits that immediate acquisition. `wait_io`
+/// `shared_lock_region`'s own ticket (§8.2). The sidecar `flock`, taken
+/// after the region grants this lease its turn, is still the *actual*
+/// safety authority (see `PathWriterLock.region`'s own doc comment), so
+/// a lease taken through this path and one taken through the single
+/// plain-flock fallback below still correctly exclude each other. When
+/// nobody is queued, an uncontended writer skips the ticket entirely. An
+/// expired deadline still permits that immediate acquisition. `wait_io`
 /// must be able to run a concurrent kernel wait.
 ///
-/// Falls back to `fairWriterLockLegacy` (today's `writer_queue`-based
-/// implementation, unchanged) whenever the region itself can't be used --
-/// the same set of conditions that already sent the old implementation to
-/// `plainWriterLockUntil`, plus the region's own "can't use it here"
-/// errors. §8.6's own dedicated fallback flag (detected once at open and
-/// recorded on `inode_lock.Entry`, not re-probed on every acquire) is a
-/// later step; this is a narrower, call-by-call version of the same idea.
+/// Falls back to the single plain-flock path (§8.6: no FIFO fairness, as
+/// SQLite behaves on NFS) whenever the region itself can't be used --
+/// the same set of conditions `plainWriterLockUntil` itself already
+/// treats as "no region here" for its own internal wait, plus the
+/// region's own "can't use it here" errors. That fallback is simply
+/// calling `plainWriterLockUntil` directly, with no ticket taken at
+/// all, since a lease it returns already blocks on the real sidecar
+/// lock the same way a ticket-won lease's own second half does.
 pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
     const pid = antfly_platform.process.currentId() orelse 0;
-    // A read-only or otherwise uncooperative filesystem (the same
-    // conditions that already send the legacy implementation to
-    // `plainWriterLockUntil`), proven corruption, or exhausted liveness
-    // slots fall back to the proven legacy path rather than surfacing a
-    // region-specific error to callers that have never had to handle one.
-    // Anything else (notably `OutOfMemory`) propagates instead of being
-    // swallowed into a fallback that would likely fail the same way. See
+    // A read-only or otherwise uncooperative filesystem, proven
+    // corruption, or exhausted liveness slots fall back to the single
+    // plain-flock path rather than surfacing a region-specific error to
+    // callers that have never had to handle one. Anything else (notably
+    // `OutOfMemory`) propagates instead of being swallowed into a
+    // fallback that would likely fail the same way. See
     // `inode_lock.isRegionUnusable`'s own doc comment: every migrated
     // caller, writer or reader side, shares this one check.
     var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
-        if (inode_lock.isRegionUnusable(err)) return fairWriterLockLegacy(allocator, io, wait_io, path, deadline_ns);
+        if (inode_lock.isRegionUnusable(err)) return plainWriterLockUntil(allocator, io, wait_io, path, deadline_ns);
         return err;
     };
     errdefer region.close();
-    region.acquireWriterFairBounded(wait_io, pid, .{ .nanoseconds = deadline_ns }) catch |err| switch (err) {
+    const contended = region.acquireWriterFairBounded(wait_io, pid, .{ .nanoseconds = deadline_ns }) catch |err| switch (err) {
         error.Timeout => return error.FileBusy,
         error.Canceled => return error.Canceled,
     };
@@ -15920,71 +16128,24 @@ pub fn fairWriterLockWithIo(allocator: Allocator, io: std.Io, wait_io: std.Io, p
     const owned_region = try std.heap.page_allocator.create(shared_lock_region.Region);
     owned_region.* = region;
     lease.region = owned_region;
-    lease.acquired_ns = std.Io.Clock.awake.now(io).nanoseconds;
-    return lease;
-}
-
-/// Today's `writer_queue`-based FIFO cross-process writer admission,
-/// unchanged -- `fairWriterLockWithIo`'s own fallback for when the region
-/// can't be used (see its doc comment).
-fn fairWriterLockLegacy(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
-    const lock_path = try writerLockPathAlloc(allocator, io, path);
-    defer allocator.free(lock_path);
-    var queue = writer_queue.Queue.open(allocator, io, lock_path) catch |err| switch (err) {
-        // Without a writable queue directory there is nobody to be fair to;
-        // keep the plain kernel wait. The queue name always fits when the
-        // sidecar's does; a full path at the platform limit still falls back.
-        error.AccessDenied, error.ReadOnlyFileSystem, error.PermissionDenied, error.NameTooLong => return plainWriterLockUntil(allocator, io, wait_io, path, deadline_ns),
-        else => return err,
-    };
-    var queue_owned = true;
-    defer if (queue_owned) queue.close(io);
-
-    var tail = try queue.lockTail(wait_io, deadline_ns);
-    var tail_held = true;
-    defer if (tail_held) tail.release(io);
-    if (try queue.isIdle(io, &tail)) {
-        // Holding the tail means no ticket can be issued ahead of us.
-        if (acquireWriterLock(allocator, io, path)) |held| {
-            queue_owned = false;
-            return .{
-                .io_impl = undefined,
-                .borrowed_io = io,
-                .file = held.file,
-                .queue_watch = .{ .queue = queue, .mark = tail.next },
-                .acquired_ns = std.Io.Clock.awake.now(io).nanoseconds,
-            };
-        } else |err| if (err != error.WouldBlock and err != error.FileBusy) return err;
-    }
-    // A zero or spent budget may only take an uncontended lease.
-    if (deadline_ns - std.Io.Clock.awake.now(io).nanoseconds <= 0) return error.FileBusy;
-    var ticket = try queue.enqueue(io, &tail);
-    tail.release(io);
-    tail_held = false;
-
-    try queue.awaitTurn(wait_io, &ticket, deadline_ns);
-    var turn: writer_queue.Turn = .{ .queue = queue, .ticket = ticket };
-    queue_owned = false;
-    errdefer turn.release(io);
-    // Our turn: only readers or a writer that bypassed the queue can still
-    // hold the sidecar, and only one queued writer ever waits here.
-    var lease = try plainWriterLockUntil(allocator, io, wait_io, path, deadline_ns);
-    lease.queue_turn = turn;
+    lease.contended = contended;
     lease.acquired_ns = std.Io.Clock.awake.now(io).nanoseconds;
     return lease;
 }
 
 /// Nonblocking writer acquisition that never jumps the FIFO: returns
 /// `error.WouldBlock` while any writer is queued or holds a turn. §8.2's
-/// "try" mode (`region.tryAcquireWriterFair`), the second of this
-/// design's six constructors to migrate (after `fairWriterLockWithIo`);
-/// falls back to the unchanged `writer_queue`-based implementation
-/// (renamed `tryFairWriterLockLegacy`) when the region can't be used, the
-/// same `inode_lock.isRegionUnusable` check every migrated caller shares.
+/// "try" mode (`region.tryAcquireWriterFair`). Falls back to
+/// `lockWriterPathWithIo` (the single plain-flock fallback's own
+/// nonblocking attempt, §8.6) when the region can't be used, the same
+/// `inode_lock.isRegionUnusable` check every migrated caller shares --
+/// that call already jumps straight to a bare nonblocking kernel attempt
+/// when it finds the region unusable too, so there is nothing further
+/// for this function's own fallback to add.
 pub fn tryFairWriterLockWithIo(allocator: Allocator, io: std.Io, path: []const u8) !PathWriterLock {
     const pid = antfly_platform.process.currentId() orelse 0;
     var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
-        if (inode_lock.isRegionUnusable(err)) return tryFairWriterLockLegacy(allocator, io, path);
+        if (inode_lock.isRegionUnusable(err)) return lockWriterPathWithIo(allocator, io, path);
         return err;
     };
     if (!region.tryAcquireWriterFair(pid)) {
@@ -16004,23 +16165,6 @@ pub fn tryFairWriterLockWithIo(allocator: Allocator, io: std.Io, path: []const u
         .region = owned_region,
         .acquired_ns = std.Io.Clock.awake.now(io).nanoseconds,
     };
-}
-
-/// Today's `writer_queue`-based nonblocking try, unchanged --
-/// `tryFairWriterLockWithIo`'s own fallback for when the region can't be
-/// used (see its doc comment).
-fn tryFairWriterLockLegacy(allocator: Allocator, io: std.Io, path: []const u8) !PathWriterLock {
-    const lock_path = try writerLockPathAlloc(allocator, io, path);
-    defer allocator.free(lock_path);
-    var queue = writer_queue.Queue.open(allocator, io, lock_path) catch |err| switch (err) {
-        error.AccessDenied, error.ReadOnlyFileSystem, error.PermissionDenied, error.NameTooLong => return lockWriterPathWithIo(allocator, io, path),
-        else => return err,
-    };
-    defer queue.close(io);
-    var tail = try queue.tryLockTail(io);
-    defer tail.release(io);
-    if (!try queue.isIdle(io, &tail)) return error.WouldBlock;
-    return .{ .io_impl = undefined, .borrowed_io = io, .file = (try acquireWriterLock(allocator, io, path)).file, .acquired_ns = std.Io.Clock.awake.now(io).nanoseconds };
 }
 
 const PathRegionForWait = struct { entry: *inode_lock.Entry, region: *shared_lock_region.Region };
@@ -16044,24 +16188,23 @@ fn pathRegionForWait(io: std.Io, path: []const u8) !PathRegionForWait {
     return .{ .entry = entry, .region = region };
 }
 
+/// The region-based wait when one is available; otherwise (region
+/// unusable, or not yet applicable -- the region is genuinely optional
+/// here, unlike `fairWriterLockWithIo`'s own ticket) the single plain-
+/// flock fallback's own OS-lock-queue wait (`waitPathLockWithIo`), §8.6.
+/// Every caller of this function -- region-backed or not -- ends up
+/// here for the one, real, authoritative kernel lease.
 fn plainWriterLockUntil(allocator: Allocator, io: std.Io, wait_io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
-    // `null` when the region can't be used here -- `inode_lock.open`'s
-    // own `statFile` on the *data* file (not the sidecar `acquireWriterLock`
-    // below creates on demand) can fail with `FileNotFound` on a caller's
-    // first-ever acquire, before that data file exists yet, which is not
-    // the "this filesystem/region can't be used at all" condition
-    // `inode_lock.isRegionUnusable` means -- falls back to the legacy
-    // OS-lock-queue wait below either way. Anything else (notably
-    // `OutOfMemory`) propagates instead of being swallowed into a
-    // fallback that would likely fail the same way, the same posture
-    // every other migrated constructor's own `isRegionUnusable` check
-    // takes.
-    const cached: ?PathRegionForWait = blk: {
-        break :blk pathRegionForWait(wait_io, path) catch |err| {
-            if (err != error.FileNotFound and !inode_lock.isRegionUnusable(err)) return err;
-            break :blk null;
-        };
-    };
+    // Set up lazily, on the first retry only -- never on a warm,
+    // uncontended call that wins `acquireWriterLock` below on its very
+    // first attempt. An earlier version of this call set this up
+    // unconditionally, up front, which added `inode_lock.open`'s own
+    // `statFile` syscall to every single acquisition, uncontended or
+    // not; that silently cost this design's own "0 syscalls on a warm
+    // write" property and tightened enough margin on a few busy-timeout
+    // tests to make them flake.
+    var cached: ?PathRegionForWait = null;
+    var cache_attempted = false;
     defer if (cached) |c| inode_lock.unref(c.entry, wait_io);
 
     var backoff_ns: i96 = 50 * std.time.ns_per_us;
@@ -16070,6 +16213,28 @@ fn plainWriterLockUntil(allocator: Allocator, io: std.Io, wait_io: std.Io, path:
             return .{ .io_impl = undefined, .borrowed_io = io, .file = held.file };
         } else |err| if (err != error.WouldBlock and err != error.FileBusy) return err;
         if (deadline_ns - std.Io.Clock.awake.now(io).nanoseconds <= 0) return error.FileBusy;
+        if (!cache_attempted) {
+            cache_attempted = true;
+            // `null` when the region can't be used here --
+            // `inode_lock.open`'s own `statFile` on the *data* file (not
+            // the sidecar `acquireWriterLock` above creates on demand)
+            // can fail with `FileNotFound` on a caller's first-ever
+            // acquire, before that data file exists yet, which is not
+            // the "this filesystem/region can't be used at all"
+            // condition `inode_lock.isRegionUnusable` means -- falls
+            // back to the single plain-flock path's own OS-lock-queue
+            // wait below either way. Anything else (notably
+            // `OutOfMemory`) propagates instead of being swallowed into
+            // a fallback that would likely fail the same way, the same
+            // posture every other migrated constructor's own
+            // `isRegionUnusable` check takes.
+            cached = blk: {
+                break :blk pathRegionForWait(wait_io, path) catch |err| {
+                    if (err != error.FileNotFound and !inode_lock.isRegionUnusable(err)) return err;
+                    break :blk null;
+                };
+            };
+        }
         if (cached) |c| {
             // A real wake signal (or a short internal re-check step, not
             // a dumb poll) on the region's own futex -- loop straight
@@ -16160,45 +16325,66 @@ pub fn lockReaderPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
 
 /// `acquirePathLeaseAssumeLocked`'s reader-admission wait, migrated off the
 /// kernel's blocking `.shared` lock queue (`waitPathLockWithIo(...,
-/// writer=false, ...)`), the last reader path still parked there. Unlike
-/// `fairWriterLockWithIo`, this is *not* a FIFO-ticket wait: a reader
-/// needs no ordering against other readers, and the region has no
-/// general "a writer released" signal a non-ticket-holding waiter can
-/// correctly wait on today -- `writer_release_epoch` is bumped and woken
-/// by `releaseWriter` only when a writer ticket is already queued (§8.2's
-/// own FIFO mechanism), never on an uncontended release, so a reader
-/// parked on it could wait past a release that had no queued ticket to
-/// wake it for. Until the region grows a dedicated release-notification
-/// word some non-ticket waiter can use (a design question for whoever
-/// extends §8.2, not resolved here), this retries its own non-blocking
-/// `lockReaderPathWithIo` attempt on a short bounded backoff instead of
-/// parking in the kernel's wait queue at all -- still removes the
-/// kernel-level block, at the cost of a capped poll interval rather than
-/// an instant wake. Falls back to the legacy blocking wait entirely when
-/// the region itself can't be used (`inode_lock.isRegionUnusable`), the
-/// same posture `fairWriterLockWithIo` already takes for its own callers;
-/// this function never attaches the opened region to the returned lease
-/// (`PathWriterLock.region` is writer-only -- `close()` unconditionally
-/// calls `releaseWriter()` on it whenever set, which a reader must never
-/// trigger), it only probes usability.
+/// writer=false, ...)`), the last reader path still parked there.
+///
+/// A reader's admission at this layer does not need exclusion from a
+/// writer at all: the store is copy-on-write (a commit never mutates a
+/// page an already-pinned reader can see; it lands on a fresh
+/// checkpoint slot/pages instead), and every real caller of this path --
+/// plain reads, status/index-list, and the `.maintain`-access snapshot
+/// copy -- only ever treats the returned lease as an admission
+/// throttle/reference, never as a signal that "no writer is mid-commit"
+/// (confirmed by tracing every caller: none inspects writer state
+/// through this lease, and the one place that genuinely needs real
+/// cross-process writer exclusion, `replaceWithPreparedGeneration`'s
+/// generation swap, already gets it independently through
+/// `enterMaintenanceWriter`/`tryWriterLeaseAssumeLocked`'s own exclusive
+/// re-acquisition, unrelated to this gate). The kernel `.shared`-vs-
+/// `.exclusive` wait this replaces was a holdover from flock's own
+/// semantics being the only coordination mechanism available before the
+/// region existed, not a correctness requirement.
+///
+/// So in region mode this never waits at all: open the region (to prove
+/// it's usable), and succeed immediately with no kernel lock -- `file =
+/// null` on the returned lease, nothing to release on `close()`. It does
+/// not claim or pin a region reader slot either: there is no commit
+/// generation to protect yet at this point (the caller hasn't opened the
+/// `NativeFile`, let alone read a header), so a slot held for this
+/// lease's -- potentially long-lived, re-admitted-per-query -- lifetime
+/// would consume one of the region's fixed 1024 slots for no protective
+/// effect, risking exhaustion for genuinely pinned NativeFile-level
+/// readers. The actual safety guarantee (pinning a real commit sequence)
+/// is `NativeFile.acquireReaderFence`'s job, already region-backed, once
+/// a real generation exists to pin. `PathWriterLock` has no field to
+/// stash a claimed slot index on for later release even if one were
+/// wanted here, and `.region` is writer-only (`close()` unconditionally
+/// calls `releaseWriter()` on it whenever set) -- not something a reader
+/// lease may ever populate.
+///
+/// Falls back to exactly the pre-migration two-step dance (one
+/// non-blocking `lockReaderPathWithIo` try, then one real blocking
+/// `waitPathLockWithIo`) entirely when the region itself can't be used
+/// (`inode_lock.isRegionUnusable`), the same posture `fairWriterLockWithIo`
+/// already takes for its own callers -- `lockReaderPathWithIo`'s kernel
+/// `.shared` lock remains the correctness authority there, unchanged,
+/// including `waitPathLockWithIo`'s own `error.FileNotFound`/
+/// `error.ConcurrencyUnavailable` cases, which this propagates rather
+/// than retrying itself: `acquirePathLeaseAssumeLocked`'s own outer loop
+/// already retries the whole admission attempt after those, and
+/// duplicating that retry here would just nest two copies of the same
+/// backoff.
 pub fn fairReaderLockWithIo(allocator: Allocator, io: std.Io, path: []const u8, deadline_ns: i96) !PathWriterLock {
-    {
-        var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
-            if (inode_lock.isRegionUnusable(err)) return waitPathLockWithIo(allocator, io, path, false, deadline_ns);
-            return err;
-        };
-        region.close();
-    }
-    var backoff_ns: i96 = 50 * std.time.ns_per_us;
-    while (true) {
-        if (lockReaderPathWithIo(allocator, io, path)) |held| return held else |err| {
-            if (err != error.WouldBlock and err != error.FileBusy) return err;
+    var region = shared_lock_region.Region.open(std.heap.page_allocator, io, path) catch |err| {
+        if (inode_lock.isRegionUnusable(err)) {
+            return lockReaderPathWithIo(allocator, io, path) catch |lock_err| {
+                if (lock_err != error.WouldBlock and lock_err != error.FileBusy) return lock_err;
+                return waitPathLockWithIo(allocator, io, path, false, deadline_ns);
+            };
         }
-        const remaining = deadline_ns - std.Io.Clock.awake.now(io).nanoseconds;
-        if (remaining <= 0) return error.FileBusy;
-        try io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake);
-        backoff_ns = @min(backoff_ns * 2, 4 * std.time.ns_per_ms);
-    }
+        return err;
+    };
+    region.close();
+    return .{ .io_impl = undefined, .borrowed_io = io, .file = null };
 }
 
 fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode, wait_for_reader_lock: bool) !LockFile {
@@ -16380,7 +16566,7 @@ pub fn inspect(_: Allocator, io: std.Io, path: []const u8) !InspectReport {
     const active = header.checkpoints[recovered.index];
     return .{
         .valid = true,
-        .format_version = if (header.indexed_reclamation) indexed_format_version else format_version,
+        .format_version = format_version,
         .page_size = header.page_size,
         .active_checkpoint = recovered.index,
         .commit_sequence = active.commit_sequence,
@@ -16439,8 +16625,8 @@ pub fn copyStableSnapshot(allocator: Allocator, source_path: []const u8, dest_pa
 pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     @memset(out, 0);
     const is_redo_log = header.redo_log_capacity != 0;
-    @memcpy(out[magic_offset..][0..magic.len], if (is_redo_log) redo_log_magic else if (header.indexed_reclamation) indexed_magic else if (header.packed_records) magic else unpacked_v4_magic);
-    std.mem.writeInt(u32, out[version_offset..][0..4], if (is_redo_log) redo_log_format_version else if (header.indexed_reclamation) indexed_format_version else format_version, .little);
+    @memcpy(out[magic_offset..][0..magic.len], magic);
+    std.mem.writeInt(u32, out[version_offset..][0..4], format_version, .little);
     std.mem.writeInt(u32, out[page_size_offset..][0..4], header.page_size, .little);
     std.mem.writeInt(u32, out[header_size_offset..][0..4], header_size, .little);
     if (header.indexed_reclamation) @memcpy(out[reader_epoch_namespace_offset..][0..32], &header.reader_epoch_namespace);
@@ -16453,6 +16639,16 @@ pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     // omitted from the encoded bytes whenever `redo_log_capacity == 0`.
     std.mem.writeInt(u64, out[redo_log_offset_offset..][0..8], header.redo_log_offset, .little);
     std.mem.writeInt(u64, out[redo_log_capacity_offset..][0..8], header.redo_log_capacity, .little);
+    // §9.5/§9.7a: each mode is its own bit, set purely from this header's
+    // own field -- never implied by, or overriding, another bit -- so any
+    // combination (redo log plus indexed reclamation included) round-trips
+    // exactly as written, unlike the old magic-selection priority chain
+    // this replaces.
+    var flags: u32 = 0;
+    if (is_redo_log) flags |= feature_flag_redo_log;
+    if (header.indexed_reclamation) flags |= feature_flag_indexed_reclamation;
+    if (header.packed_records) flags |= feature_flag_packed_records;
+    std.mem.writeInt(u32, out[feature_flags_offset..][0..4], flags, .little);
     std.mem.writeInt(u32, out[header_checksum_offset..][0..4], headerChecksum(out), .little);
 }
 
@@ -16466,14 +16662,10 @@ pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
 pub fn decodeHeader(raw: []const u8) !Header {
     if (raw.len < header_size) return error.TruncatedNativeHeader;
     const header_raw = raw[0..header_size];
-    const is_redo_log = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], redo_log_magic);
-    const indexed_reclamation = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
-    const has_packed_records = is_redo_log or indexed_reclamation or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic);
-    if (!has_packed_records and !std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], unpacked_v4_magic)) return error.InvalidNativeMagic;
+    if (!std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic)) return error.InvalidNativeMagic;
 
     const version = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
-    const expected_version = if (is_redo_log) redo_log_format_version else if (indexed_reclamation) indexed_format_version else format_version;
-    if (version != expected_version) return error.UnsupportedNativeFormatVersion;
+    if (version != format_version) return error.UnsupportedNativeFormatVersion;
 
     const encoded_header_size = std.mem.readInt(u32, header_raw[header_size_offset..][0..4], .little);
     if (encoded_header_size != header_size) return error.InvalidNativeHeaderSize;
@@ -16484,9 +16676,15 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const page_size = std.mem.readInt(u32, header_raw[page_size_offset..][0..4], .little);
     if (!validPageSize(page_size)) return error.InvalidNativePageSize;
 
+    // §9.5/§9.7a: each mode bit is read back independently -- no priority
+    // chain, no bit implying or overriding another -- the direct inverse
+    // of `encodeHeader`'s write above.
+    const flags = std.mem.readInt(u32, header_raw[feature_flags_offset..][0..4], .little);
+    const indexed_reclamation = flags & feature_flag_indexed_reclamation != 0;
+
     return .{
         .reader_epoch_namespace = if (indexed_reclamation) header_raw[reader_epoch_namespace_offset..][0..32].* else @splat(0),
-        .packed_records = has_packed_records,
+        .packed_records = flags & feature_flag_packed_records != 0,
         .indexed_reclamation = indexed_reclamation,
         .page_size = page_size,
         .active_checkpoint = 0,
@@ -18191,7 +18389,7 @@ test "lite native indexed open refuses a pre-v8 format version" {
     }
     {
         var raw_version: [4]u8 = undefined;
-        std.mem.writeInt(u32, &raw_version, indexed_format_version - 1, .little);
+        std.mem.writeInt(u32, &raw_version, format_version - 1, .little);
         var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
         defer raw.close(std.testing.io);
         try raw.writePositionalAll(std.testing.io, &raw_version, version_offset);
@@ -21807,7 +22005,8 @@ test "lite unpacked v3 remains readable and vacuum explicitly adopts packed sign
     try std.testing.expect(file.header.packed_records);
     var header: [header_size]u8 = undefined;
     try readHeaderExactAt(file.file, std.testing.io, &header);
-    try std.testing.expect(!std.mem.eql(u8, header[0..magic.len], unpacked_v4_magic));
+    const flags = std.mem.readInt(u32, header[feature_flags_offset..][0..4], .little);
+    try std.testing.expect(flags & feature_flag_packed_records != 0);
     try std.testing.expect((try decodeHeader(&header)).packed_records);
     const value = (try file.getDocumentAlloc(alloc, "b")).?;
     defer alloc.free(value);
@@ -26637,7 +26836,7 @@ test "lite reader registration path lease close retains only escaped snapshot pr
     lease.close();
     held = false;
     try std.testing.expectEqual(@as(usize, 0), coordinator.registration_batches);
-    const region = reader.regionForInode().?;
+    const region = (try reader.regionForInode()).?;
     try std.testing.expect(region.minimumMetadataPinnedSequence() != null);
     reader.close();
     reader_open = false;
@@ -26649,7 +26848,7 @@ test "lite reader registration path lease close retains only escaped snapshot pr
     // pinned," rather than reading a dangling `region`.
     var probe = try NativeFile.openWithIo(a, io, path, .{ .read_only = true });
     defer probe.close();
-    try std.testing.expectEqual(@as(?u64, null), probe.regionForInode().?.minimumMetadataPinnedSequence());
+    try std.testing.expectEqual(@as(?u64, null), (try probe.regionForInode()).?.minimumMetadataPinnedSequence());
 }
 
 /// Blocks (via `poll`, a portable sleep with no extra syscall declared just
@@ -26731,7 +26930,7 @@ test "lite reader fence across a forked child: writer withholds pages the child 
         // before this child claims anything through the inherited region,
         // the same ordering `shared_lock_region.zig`'s own fork tests use.
         var reader = NativeFile.openWithIo(a, io, path, .{ .read_only = true }) catch crossProcessParkForever();
-        const region = reader.regionForInode() orelse crossProcessParkForever();
+        const region = (reader.regionForInode() catch crossProcessParkForever()) orelse crossProcessParkForever();
         region.reclaimLivenessAfterFork() catch crossProcessParkForever();
         var child_coordinator = ReaderCoordinator.init(a, io);
         reader.reader_coordinator = &child_coordinator;
@@ -26754,7 +26953,7 @@ test "lite reader fence across a forked child: writer withholds pages the child 
     // cross-process pin, not just kernel-lock fencing.
     try std.testing.expectEqual(@as(u8, 1), report[0]);
 
-    const region = writer.regionForInode().?;
+    const region = (try writer.regionForInode()).?;
     try std.testing.expect(region.minimumPinnedSequence() != null);
     const before = (try writer.allocatorStats()).?.reused_pages;
     value[0] = 'b';
@@ -26779,7 +26978,7 @@ test "lite reader fence across a forked child: writer withholds pages the child 
     try std.testing.expect((try writer.check()).valid);
 }
 
-test "lite fairReaderLockWithIo succeeds immediately when uncontended and gives up at its own deadline when a writer holds the lease" {
+test "lite fairReaderLockWithIo never waits on a writer in region mode, uncontended or not" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -26790,18 +26989,60 @@ test "lite fairReaderLockWithIo succeeds immediately when uncontended and gives 
         var file = try NativeFile.createWithIo(a, io, path, .{ .no_sync = true });
         file.close();
     }
-    // Uncontended: the first `lockReaderPathWithIo` attempt inside
-    // `fairReaderLockWithIo` must succeed outright, never reaching its own
-    // backoff loop.
+    const short_deadline = std.Io.Clock.awake.now(io).nanoseconds + 2 * std.time.ns_per_s;
+    // Uncontended: succeeds immediately, no kernel lock taken at all --
+    // `lease.file == null` is the direct evidence (a kernel-lock-backed
+    // lease, the fallback path's own shape, always has a non-null file).
+    {
+        var lease = try fairReaderLockWithIo(a, io, path, short_deadline);
+        try std.testing.expect(lease.file == null);
+        lease.close();
+    }
+    // Contended: a writer holds the real exclusive sidecar lease the
+    // whole time. A reader admitted through the region needs no
+    // exclusion from it at all (copy-on-write; the actual safety
+    // guarantee is NativeFile.acquireReaderFence's pin, not this gate),
+    // so this must still succeed immediately -- never wait, let alone
+    // give up at the deadline.
+    var writer_lease = try lockWriterPathWithIo(a, io, path);
+    defer writer_lease.close();
+    const started = std.Io.Clock.awake.now(io).nanoseconds;
+    const deadline = started + 150 * std.time.ns_per_ms;
+    var lease = try fairReaderLockWithIo(a, io, path, deadline);
+    try std.testing.expect(lease.file == null);
+    lease.close();
+    const elapsed = std.Io.Clock.awake.now(io).nanoseconds - started;
+    try std.testing.expect(elapsed < 50 * std.time.ns_per_ms);
+}
+
+test "lite fairReaderLockWithIo falls back to the legacy blocking wait when the region is unusable" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A filename long enough that the region's own sidecar
+    // (`<path>.aflite-lock`) exceeds the platform's single-component
+    // limit, same trigger as the reader-fence alias test -- the data
+    // file itself opens fine, only the region is unusable.
+    var name: [250]u8 = @splat('f');
+    @memcpy(name[243..], ".aflite");
+    const path = try testPath(a, tmp, &name);
+    defer a.free(path);
+    {
+        var file = try NativeFile.createWithIo(a, io, path, .{ .no_sync = true });
+        file.close();
+    }
+    // Uncontended: the legacy kernel-lock path still succeeds outright.
     {
         const deadline = std.Io.Clock.awake.now(io).nanoseconds + 2 * std.time.ns_per_s;
         var lease = try fairReaderLockWithIo(a, io, path, deadline);
+        try std.testing.expect(lease.file != null);
         lease.close();
     }
     // Contended: a writer holds the lease for longer than this call's own
-    // deadline, so it must actually wait (not fail on the first attempt)
-    // and then give up right around the deadline -- not instantly, and
-    // not hung past it either.
+    // deadline, so the legacy fallback must actually wait (not fail on
+    // the first attempt) and give up right around the deadline -- not
+    // instantly, and not hung past it either.
     var writer_lease = try lockWriterPathWithIo(a, io, path);
     defer writer_lease.close();
     const started = std.Io.Clock.awake.now(io).nanoseconds;

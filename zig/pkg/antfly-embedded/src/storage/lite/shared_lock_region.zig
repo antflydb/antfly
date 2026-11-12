@@ -15,14 +15,18 @@
 
 //! Steps 1 through 3 of `docs/design/lite-performance/lite-single-commit-write-path.md`
 //! §8: the shared mmap region (§8.1), the writer lock (§8.2), the reader
-//! table (§8.3), and liveness/recovery (§8.4). §8.7's migration table is
-//! now underway on the reader side: `reader_epochs.zig` is deleted,
-//! `reader_coordinator.zig`'s `Coordinator` claims and pins a slot here
-//! per reader instead of writing a file marker, and `native.zig`'s
-//! `acquireReaderFence`/`acquireEpochReuseLock` read this region directly.
-//! The writer-lane/fairness rows of the same table are a separate,
-//! concurrently landing migration (`writer_queue.zig`, `PathWriterLock`'s
-//! writer-side constructors) -- not this file's own scope.
+//! table (§8.3), and liveness/recovery (§8.4). §8.7's migration table has
+//! landed on both sides: on the reader side, `reader_epochs.zig` is
+//! deleted, `reader_coordinator.zig`'s `Coordinator` claims and pins a
+//! slot here per reader instead of writing a file marker, and
+//! `native.zig`'s `acquireReaderFence`/`acquireEpochReuseLock` read this
+//! region directly; on the writer side, `PathWriterLock`'s own six
+//! constructors are all migrated (one, `lockWriterPath`'s CLI path,
+//! deliberately stays on the single plain-flock fallback, §8.6 -- see its
+//! own doc comment) and `writer_queue.zig` is deleted. The writer-lane
+//! fairness row of the same table (`capi/lite_connection.zig`'s
+//! `WriterLane`/`QueuedMutex`/`Owner`) is a separate, concurrently landing
+//! migration -- not this file's own scope.
 //!
 //! One `<db>.aflite-lock` file, memory-mapped `MAP_SHARED` by every process
 //! with the database open (SQLite's `-shm`, LMDB's `lock.mdb`). The steady,
@@ -774,7 +778,19 @@ pub const Region = struct {
             };
             fresh.header_checksum = headerChecksum(&fresh);
             try setup_file.writePositionalAll(io, std.mem.asBytes(&fresh), 0);
-            try setup_file.sync(io);
+            // Deliberately no `sync(io)` here: the region is a disposable
+            // coordination aid, not a durable record -- a torn or missing
+            // header is caught by `isValidHeader`'s checksum check and
+            // simply rebuilt (under `ensureNoLivePeer`'s liveness proof)
+            // the next time anything opens it, exactly like any other
+            // corruption this same function already tolerates. Durability
+            // of this header buys nothing but an fsync's latency, and
+            // landing that fsync inside whichever caller's first
+            // page-reusing commit happens to need the region first
+            // (`NativeFile.openWithRuntime`/`createWithRuntime` now call
+            // `ensureRegion` eagerly at open/create time specifically to
+            // avoid that) would reintroduce the exact cost this comment
+            // is here to rule back out.
         }
 
         // Re-read the header fresh: `need_init` above may have just set
@@ -1082,9 +1098,18 @@ pub const Region = struct {
     /// Needs `io` (unlike `acquireWriter`) specifically to check it and
     /// the deadline; not safe to call from a freshly forked child, for
     /// the same reason `acquireWriter`'s own doc comment gives.
-    pub fn acquireWriterFairBounded(self: *Region, io: Io, pid: u32, deadline: Io.Timestamp) error{ Timeout, Canceled }!void {
+    ///
+    /// Returns whether this acquisition was genuinely contended (took a
+    /// real ticket) rather than winning the ticketless fast path --
+    /// `native.zig`'s own `fairWriterLockWithIo` has no other way to
+    /// tell a caller like `capi/lite_connection.zig`'s own admission
+    /// stats whether this lease was `.queued` or `.uncontended`, the
+    /// same distinction `writer_queue.zig`'s own `queue_turn` (a real
+    /// turn) versus `queue_watch` (an idle-queue bypass) used to carry on
+    /// the returned lease itself before this design moved off it.
+    pub fn acquireWriterFairBounded(self: *Region, io: Io, pid: u32, deadline: Io.Timestamp) error{ Timeout, Canceled }!bool {
         const hdr = self.header();
-        if (hdr.writer_ticket_head.load(.monotonic) == @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))) and self.tryAcquireWriter(pid)) return;
+        if (hdr.writer_ticket_head.load(.monotonic) == @as(u32, @truncate(hdr.writer_ticket_tail.load(.monotonic))) and self.tryAcquireWriter(pid)) return false;
         const my_ticket: u32 = while (true) {
             if (!self.ringHasRoom()) {
                 if (Io.Clock.now(.awake, io).compare(.gte, deadline)) return error.Timeout;
@@ -1113,7 +1138,7 @@ pub const Region = struct {
         while (true) {
             if (self.tryAcquireWriter(pid)) {
                 self.advanceHeadPastAbandoned();
-                return;
+                return true;
             }
             if (Io.Clock.now(.awake, io).compare(.gte, deadline)) {
                 // Our own turn, but we're giving it up: step aside
@@ -2662,6 +2687,82 @@ test "shared lock region: a kill -9'd reader's pin is cleared by the frontier sc
     try std.testing.expectEqual(child_slot, reclaimed);
 }
 
+// Ports writer_queue.zig's own "foreignTicketsIssuedSince distinguishes
+// a different process's ticket from this one's own" to the region's
+// ticket ring: `othersWaitingAcrossProcesses`'s whole reason to exist
+// over `othersWaiting` (`WriterLane.checkin`'s own real caller -- its
+// background maintenance worker reaching the region through a different
+// path than the lease it's deciding whether to release). A real second
+// *thread* (not a fork, which always gets its own, different pid) gives
+// this same process a second, genuinely queued ticket under the same
+// pid to tell apart from a truly foreign one.
+test "shared lock region: othersWaitingAcrossProcesses distinguishes a foreign ticket from this process's own" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-foreign-ticket.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var region = try Region.open(a, io, db_path);
+    defer region.close();
+
+    const own_pid: u32 = @bitCast(std.c.getpid());
+    try std.testing.expect(region.tryAcquireWriterFair(own_pid)); // ticketless hold; nobody queued yet.
+
+    const SameProcessWaiter = struct {
+        fn run(r: *Region, pid: u32) void {
+            const thread_io = std.testing.io;
+            // Bounded (generous, matching this file's own other waits),
+            // not `acquireWriter`'s plain indefinite wait: this runs on
+            // a real OS thread with no `reapBounded`-style external
+            // force-kill available if something is ever actually wrong,
+            // so the bound has to come from the call itself.
+            _ = r.acquireWriterFairBounded(thread_io, pid, Io.Clock.now(.awake, thread_io).addDuration(.fromSeconds(10))) catch return;
+            r.releaseWriter();
+        }
+    };
+    var same_pid_thread = try std.Thread.spawn(.{}, SameProcessWaiter.run, .{ &region, own_pid });
+
+    // Give the thread a real chance to be genuinely queued (not just
+    // about to try), same margin the two-process test above uses.
+    try io.sleep(.fromMilliseconds(20), .awake);
+    try std.testing.expect(region.othersWaiting());
+    // Not a *foreign* waiter: the only queued ticket is this same
+    // process's own, reached through a different caller.
+    try std.testing.expect(!region.othersWaitingAcrossProcesses(own_pid));
+
+    // Now a genuinely different process queues behind it.
+    var ready_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&ready_fds));
+    const child_pid = std.c.fork();
+    if (child_pid == 0) {
+        _ = std.posix.system.close(ready_fds[0]);
+        const my_pid: u32 = @bitCast(std.c.getpid());
+        var sig: [1]u8 = .{1};
+        _ = std.c.write(ready_fds[1], @ptrCast(&sig), 1);
+        region.acquireWriter(my_pid);
+        region.releaseWriter();
+        std.c._exit(0);
+    }
+    _ = std.posix.system.close(ready_fds[1]);
+    defer _ = std.posix.system.close(ready_fds[0]);
+    var sig: [1]u8 = undefined;
+    try readBounded(ready_fds[0], &sig, 2000);
+    try io.sleep(.fromMilliseconds(20), .awake);
+
+    try std.testing.expect(region.othersWaitingAcrossProcesses(own_pid));
+
+    // Release the original ticketless hold: the FIFO cascades through
+    // the same-pid thread's own ticket first, then the foreign child's.
+    region.releaseWriter();
+    same_pid_thread.join();
+    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child_pid, 2000));
+}
+
 test "shared lock region: tryAcquireWriterFair succeeds uncontended and refuses when anyone is queued" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -2699,8 +2800,9 @@ test "shared lock region: acquireWriterFairBounded succeeds once free and times 
     defer region.close();
 
     const pid: u32 = 4242;
-    // Uncontended: succeeds well within a generous deadline.
-    try region.acquireWriterFairBounded(io, pid, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5)));
+    // Uncontended: succeeds well within a generous deadline, and reports
+    // that correctly (not contended).
+    try std.testing.expectEqual(false, try region.acquireWriterFairBounded(io, pid, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5))));
     // Still held by `pid`'s own hold above (never released): a short
     // deadline against a genuinely busy word must time out, bounded,
     // not hang.
@@ -2708,8 +2810,11 @@ test "shared lock region: acquireWriterFairBounded succeeds once free and times 
     try std.testing.expectError(error.Timeout, region.acquireWriterFairBounded(io, pid + 1, short_deadline));
     region.releaseWriter();
     // Free again: a fresh bounded acquire succeeds, proving the timed-out
-    // attempt above didn't leave the region in a bad state.
-    try region.acquireWriterFairBounded(io, pid + 1, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5)));
+    // attempt above didn't leave the region in a bad state. Uncontended
+    // again: the previous attempt's own phase-2 timeout already stepped
+    // itself aside (advancing head to match tail) before returning, so
+    // nothing is left queued for this call to find.
+    try std.testing.expectEqual(false, try region.acquireWriterFairBounded(io, pid + 1, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5))));
     region.releaseWriter();
 }
 
@@ -2829,7 +2934,7 @@ test "shared lock region: an abandoned ticket does not wedge an earlier or a lat
     // Child 1's own release just advanced head past ticket 1's abandoned
     // flag. The region must be left in a sane, usable state -- not
     // wedged -- for whoever comes next.
-    try region.acquireWriterFairBounded(io, own_pid, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5)));
+    _ = try region.acquireWriterFairBounded(io, own_pid, std.Io.Clock.now(.awake, io).addDuration(.fromSeconds(5)));
     region.releaseWriter();
 }
 

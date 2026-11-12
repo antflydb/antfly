@@ -3164,10 +3164,9 @@ pub const LiteResolvedOpenOptions = struct {
     /// Meaningless on `open` (only `create` reaches it).
     use_redo_log: ?bool = null,
     /// `null` keeps the existing default (`reclamation.Options.page_reuse
-    /// = true`). `use_redo_log = true` combined with an unset or `true`
-    /// `page_reuse` here is a caller error (see `use_redo_log`'s own doc
-    /// comment) -- set this to `false` explicitly to use redo-log.
-    /// Meaningless on `open` (only `create` reaches it).
+    /// = true`). Combines with `use_redo_log = true` without restriction
+    /// (see `use_redo_log`'s own doc comment). Meaningless on `open`
+    /// (only `create` reaches it).
     page_reuse: ?bool = null,
 };
 
@@ -5324,6 +5323,67 @@ pub fn antfly_db_batch_json(
         .len = response.len,
     };
     return .ok;
+}
+
+/// Binary counterpart to `antfly_db_batch_json`: `request_buf` is the
+/// length-prefixed wire encoding documented in `capi/batch_wire.zig` and the
+/// public header, instead of a JSON object. Parsing is zero-copy (every write
+/// key/value and delete key borrows directly from `request_buf`, which the
+/// `antfly_slice` contract already requires stay valid for the call) and does
+/// no per-field allocation, unlike the JSON path's `std.json` tree plus one
+/// `dupe` per field. Transforms and graph writes/deletes are JSON-only; this
+/// entry point only carries writes, deletes, and the sync-level option.
+pub fn antfly_db_batch_wire(
+    handle_ptr: ?*anyopaque,
+    request_buf: capi.Slice,
+    out_buf: *capi.Buffer,
+) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_batch_wire), .{ .name = "antfly_db_batch_wire" }), .{ handle_ptr, request_buf, out_buf });
+    capi.clearLastError();
+    var guard = enterHandle(handle_ptr, .write) orelse return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": invalid or closed database handle");
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return capi.ensureError(code, @src().fn_name);
+    }
+    defer guard.leave();
+    const handle = guard.handle;
+    const batch_wire = @import("batch_wire.zig");
+    var decoded = batch_wire.decodeBatchRequest(handle.alloc, request_buf.bytes()) catch |err| return capi.mapError(err);
+    defer decoded.deinit(handle.alloc);
+
+    const receipt_scope = beginOutcomeReceipts(guard.lock_handle);
+    defer receipt_scope.end();
+    var primary_committed = false;
+    const req = decoded.asRequest();
+    trackedBatchWithWriterLaneHook(handle.database(), db_mod.types.fromPublicMutation(req), &primary_committed, handle.selected_table_name, writerLaneHookFromGuard(&guard)) catch |err| return batchFailureCode(err, primary_committed);
+    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, .{
+        .inserted = @as(u32, @intCast(decoded.writes.len)),
+        .deleted = @as(u32, @intCast(decoded.deletes.len)),
+    }) catch
+        return capi.recordError(.stalled, "batch committed; its response could not be encoded; do not retry the batch");
+    out_buf.* = .{
+        .ptr = response.ptr,
+        .len = response.len,
+    };
+    return .ok;
+}
+
+/// `antfly_db_batch_wire` that also returns the outcome receipt in the same
+/// call, like `antfly_db_batch_json_with_receipt`. `receipt_out` is filled
+/// only on ANTFLY_OUTCOME_UNKNOWN with a receipt; the caller frees it.
+pub fn antfly_db_batch_wire_with_receipt(
+    handle_ptr: ?*anyopaque,
+    request_buf: capi.Slice,
+    out_buf: *capi.Buffer,
+    receipt_out: ?*capi.Buffer,
+) callconv(.c) capi.ErrorCode {
+    if (comptime @import("../storage/engine_selection.zig").enabled)
+        return @call(.auto, @extern(*const @TypeOf(antfly_db_batch_wire_with_receipt), .{ .name = "antfly_db_batch_wire_with_receipt" }), .{ handle_ptr, request_buf, out_buf, receipt_out });
+    if (receipt_out) |out| out.* = .{};
+    const code = antfly_db_batch_wire(handle_ptr, request_buf, out_buf);
+    copyLastReceipt(code, receipt_out);
+    return code;
 }
 
 pub fn antfly_db_resolve_intents(
@@ -11235,6 +11295,8 @@ comptime {
         "antfly_db_write_transaction",
         "antfly_db_batch",
         "antfly_db_batch_json",
+        "antfly_db_batch_wire",
+        "antfly_db_batch_wire_with_receipt",
         "antfly_db_resolve_intents",
         "antfly_db_get_transaction_status",
         "antfly_db_get_commit_version",

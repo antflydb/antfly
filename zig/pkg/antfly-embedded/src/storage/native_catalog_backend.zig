@@ -123,6 +123,35 @@ pub const Sink = struct {
     submitDeferred: ?*const fn (ptr: *anyopaque, scope: []const u8, mutations: []const Mutation) anyerror!Pending = null,
 };
 
+/// Durably removes every entry currently committed under `scope`, so a
+/// later `Backend.init` for the same scope -- e.g. after the index that
+/// owned it is deleted and a differently-configured index of the same name
+/// is re-admitted -- starts from nothing instead of resurrecting the
+/// deleted generation's stale records (dims, root node, postings, ...).
+/// `durable = true`: the caller (index removal) must call this, and let it
+/// complete, before committing the catalog mutation that makes the index's
+/// removal visible, so a crash between the two can never leave the catalog
+/// saying the index is gone while its stale scope survives underneath a
+/// later re-admission. A no-op when nothing is committed under `scope`.
+pub fn deleteAllForScope(allocator: Allocator, sink: Sink, scope: []const u8) !void {
+    const loaded = try sink.loadAllAlloc(sink.ptr, allocator, scope);
+    defer {
+        for (loaded) |entry| {
+            if (entry.namespace) |n| allocator.free(n);
+            allocator.free(entry.key);
+            allocator.free(entry.value);
+        }
+        allocator.free(loaded);
+    }
+    if (loaded.len == 0) return;
+    const mutations = try allocator.alloc(Mutation, loaded.len);
+    defer allocator.free(mutations);
+    for (loaded, 0..) |entry, i| {
+        mutations[i] = .{ .namespace = entry.namespace, .key = entry.key, .is_delete = true };
+    }
+    try sink.submit(sink.ptr, scope, mutations, true);
+}
+
 const State = struct {
     tree: ordered.Tree = .empty,
 
@@ -864,7 +893,32 @@ const TestSink = struct {
     fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry {
         const self: *TestSink = @ptrCast(@alignCast(ptr));
         _ = scope;
-        return try allocator.dupe(Entry, self.entries.items);
+        // `Sink.loadAllAlloc`'s contract: every returned entry's bytes are
+        // allocated with `allocator` and freed by the caller. A shallow
+        // `allocator.dupe(Entry, ...)` only copies the struct slice --
+        // each entry's `namespace`/`key`/`value` would still alias this
+        // sink's own `self.entries` storage, which the caller then frees
+        // out from under it (and this sink double-frees again on its own
+        // `deinit`/overwrite). Deep-copy every field.
+        const out = try allocator.alloc(Entry, self.entries.items.len);
+        var copied: usize = 0;
+        errdefer {
+            for (out[0..copied]) |entry| {
+                if (entry.namespace) |n| allocator.free(n);
+                allocator.free(entry.key);
+                allocator.free(entry.value);
+            }
+            allocator.free(out);
+        }
+        for (self.entries.items, 0..) |entry, i| {
+            out[i] = .{
+                .namespace = if (entry.namespace) |n| try allocator.dupe(u8, n) else null,
+                .key = try allocator.dupe(u8, entry.key),
+                .value = try allocator.dupe(u8, entry.value),
+            };
+            copied += 1;
+        }
+        return out;
     }
 
     fn sink(self: *TestSink) Sink {
