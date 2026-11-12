@@ -49,8 +49,13 @@ alone. The common single-BERT profile borrows input until normalization and
 retains the ASCII fast path.
 
 Ordinary encoding, reused buffers, and padded/unpadded model inputs use the same
-profile. Protected added tokens are recognized before normalizing surrounding
-text. Offset encoding keeps a checked ASCII fast path. Unicode and non-local
+profile. WordPiece `normalized: false` markers are protected before normalizing
+surrounding text; normalized added-token spellings compile through the same
+profile at load and match afterward, including absent and empty normalizers.
+Identity profiles borrow input without a normalization copy. They stay separate
+from the subword model's vocabulary. Equal normalized spellings choose the lowest
+token ID, and empty markers are ignored. Both immutable matchers retain the single-token fast path.
+Offset encoding keeps a checked ASCII fast path. Unicode and non-local
 steps carry byte-to-source intervals through decomposition, composition,
 replacement, and protected tokens, preserving the source spans needed by NER.
 Spans cover the complete consumed source units: composed characters include

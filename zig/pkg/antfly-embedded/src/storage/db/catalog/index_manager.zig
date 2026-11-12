@@ -6087,6 +6087,8 @@ pub const IndexManager = struct {
         /// generation numbers borrowed from the mutable manager.
         artifact_catalogs: ?@import("../artifact_inventory.zig").Catalogs = null,
         catalog_empty: [3]bool = @splat(false),
+        publication_catalog_digests: [8][32]u8 = undefined,
+        publication_catalog_digest_count: usize = 0,
         /// Artifact-only text indexes consume generated records, not base rows.
         has_text_consumers: bool = false,
         text_requires_root: bool = true,
@@ -6099,6 +6101,8 @@ pub const IndexManager = struct {
         /// Per-row planning only substitutes the document identity and removes
         /// consumers already satisfied by explicit/direct vectors.
         generated_templates: []enrichment_types.GeneratedEnrichmentRequest,
+        /// Constant-time publication membership, compiled once per catalog.
+        generated_definitions: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
         /// Catalog-wide completion requirements include projections and
         /// resolver/promotion work that never appears in the provider queue.
         completion_plan: ?@import("../artifact_completion_plan.zig").Plan = null,
@@ -6118,6 +6122,7 @@ pub const IndexManager = struct {
             if (self.group_sources) |*plan| plan.deinit();
             if (self.completion_plan) |*plan| plan.deinit();
             if (self.artifact_catalogs) |*catalogs| catalogs.deinit(self.alloc);
+            self.generated_definitions.deinit(self.alloc);
             for (self.text_fields) |field| self.alloc.free(field);
             if (self.text_fields.len != 0) self.alloc.free(self.text_fields);
             for (self.dense_fields) |field| {
@@ -6169,6 +6174,36 @@ pub const IndexManager = struct {
                 } else if (!std.mem.eql(u8, bytes, @field(actual, field))) return false;
             }
             return true;
+        }
+
+        /// Exact catalog identity, including legacy absent encodings of empty
+        /// catalogs. Hashing happens once when the immutable plan is compiled.
+        pub fn publicationCatalogDigest(self: *const WritePlanSnapshot, txn: anytype) ![32]u8 {
+            const inventory = @import("../artifact_inventory.zig");
+            if (try inventory.publicationIdentity(txn)) |identity| {
+                for (self.publication_catalog_digests[0..self.publication_catalog_digest_count]) |digest|
+                    if (std.mem.eql(u8, &identity.digest, &digest)) return digest;
+                return error.EnrichmentSourceChanged;
+            }
+            const current = try inventory.catalogs(txn);
+            if (!self.matchesArtifactInventory(current)) return error.EnrichmentSourceChanged;
+            return current.digest();
+        }
+
+        fn compilePublicationCatalogDigests(self: *WritePlanSnapshot) void {
+            for (0..8) |mask| {
+                var catalogs = self.artifact_catalogs.?;
+                var valid = true;
+                inline for (.{ "indexes", "enrichments", "resolvers" }, 0..) |field, i| {
+                    if (mask & (@as(usize, 1) << i) != 0) {
+                        if (!self.catalog_empty[i]) valid = false;
+                        @field(catalogs, field) = "";
+                    }
+                }
+                if (!valid) continue;
+                self.publication_catalog_digests[self.publication_catalog_digest_count] = catalogs.digest();
+                self.publication_catalog_digest_count += 1;
+            }
         }
 
         fn cloneDense(alloc: Allocator, entry: DenseIndex) !DenseFieldWritePlan {
@@ -6684,7 +6719,10 @@ pub const IndexManager = struct {
             errdefer alloc.free(identity);
             try external_spaces.put(alloc, name, identity);
         }
-        return .{
+        var generated_definitions: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+        errdefer generated_definitions.deinit(alloc);
+        for (generated_templates) |template| try generated_definitions.put(alloc, @import("../artifact_producer_input.zig").definitionDigest(template), {});
+        var result: WritePlanSnapshot = .{
             .alloc = alloc,
             .generation = self.writePlanGeneration(),
             .external_vector_spaces = external_spaces,
@@ -6700,12 +6738,15 @@ pub const IndexManager = struct {
             .sparse_fields = sparse_fields,
             .graph_fields = graph_fields,
             .generated_templates = generated_templates,
+            .generated_definitions = generated_definitions,
             .group_sources = group_sources,
             .completion_plan = completion_plan,
             .chunk_dependents = chunk_dependents,
             .text_requires_root = text_requires_root,
             .text_fields = try text_fields.toOwnedSlice(alloc),
         };
+        result.compilePublicationCatalogDigests();
+        return result;
     }
 
     const WritePlanSnapshotEpoch = struct {
