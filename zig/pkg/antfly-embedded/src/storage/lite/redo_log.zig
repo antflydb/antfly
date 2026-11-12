@@ -317,6 +317,22 @@ pub fn replay(
             return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
         }
 
+        if (pos == 0 and last_sequence != null and header.commit_sequence <= last_sequence.?) {
+            // Superseded, not corrupt: a structurally valid, correctly
+            // checksummed record whose sequence the checkpoint baseline
+            // already covers. This is exactly what a crash strictly
+            // between a checkpoint's new slot becoming durable and this
+            // log's own now-stale prefix being zeroed leaves behind (the
+            // checkpoint already reflects this record; only its bytes in
+            // the log are stale). Recognizable only at the very first
+            // record position (`pos == 0`, i.e. nothing has been accepted
+            // yet this replay): once any record has been accepted, a
+            // sequence that doesn't continue from it is a genuine break
+            // mid-stream, not a leftover generation, and still falls
+            // through to the ordinary corrupt-record check below.
+            return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .end_of_region };
+        }
+
         if (last_sequence) |last| {
             if (header.commit_sequence != last + 1) {
                 return .{ .valid_count = count, .valid_bytes = pos, .last_sequence = last_sequence, .stop_reason = .corrupt_record };
@@ -445,12 +461,25 @@ test "replay resumes continuity from a checkpoint baseline" {
     try testing.expectEqual(@as(u64, 2), outcome.valid_count);
     try testing.expectEqual(StopReason.end_of_region, outcome.stop_reason);
 
-    // A baseline that disagrees with the first record's sequence must be
-    // rejected as corrupt (continuity against the checkpoint, not just
-    // continuity between records).
-    const bad = try replay(testing.allocator, region.file, io, 0, capacity, 999, null, null);
-    try testing.expectEqual(@as(u64, 0), bad.valid_count);
-    try testing.expectEqual(StopReason.corrupt_record, bad.stop_reason);
+    // A baseline that leaves a genuine *gap* before the first record
+    // (expects 6, finds 11 -- records 6..10 are simply missing, not
+    // explained by any checkpoint) is still rejected as corrupt:
+    // continuity against the checkpoint still matters, just not in the
+    // direction the next case covers.
+    const gap = try replay(testing.allocator, region.file, io, 0, capacity, 5, null, null);
+    try testing.expectEqual(@as(u64, 0), gap.valid_count);
+    try testing.expectEqual(StopReason.corrupt_record, gap.stop_reason);
+
+    // A baseline *at or ahead of* the first record's sequence, by
+    // contrast, is the superseded-not-corrupt case this module's own
+    // design doc calls out: exactly what a crash between a checkpoint's
+    // new slot becoming durable and this log's own stale prefix being
+    // zeroed leaves behind. The checkpoint already covers this record;
+    // only its bytes are stale. Benign, not corrupt -- no valid record
+    // past the checkpoint, but an ordinary clean end, not a failure.
+    const superseded = try replay(testing.allocator, region.file, io, 0, capacity, 12, null, null);
+    try testing.expectEqual(@as(u64, 0), superseded.valid_count);
+    try testing.expectEqual(StopReason.end_of_region, superseded.stop_reason);
 }
 
 test "writer rejects out-of-order sequence" {
