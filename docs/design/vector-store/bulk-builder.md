@@ -474,6 +474,28 @@ fix. One read-only inventory observation is recorded in the raw conditions.
 These focused runs establish final-runtime correctness and scale; they do not
 establish a repeatable small elapsed-time gain over the earlier repetitions.
 
+## Main integration after scale qualification
+
+Main through `05fdfbdd71` (#1642) was merged after the fully scaled v68
+qualification. Its changes affect exhaustive/full-effort search, embedding reuse,
+tokenization and ranked graph starts. Bulk construction, source handoff, native
+serialization and the measured ANN mode are unchanged. The appended-test conflict
+was resolved by retaining both the bulk regressions and the new full-effort oracle.
+
+Post-merge checks passed: 19 exhaustive-recall/embedding-reuse tests, 272 vector
+library tests, 94 tokenizer tests with two skips, 35 bulk tests plus nine owner
+checks, and 24 native tests with one guarded S3 skip. Production and CLI checks
+passed. Two tokenizer harness issues were fixed without changing tokenization or
+golden expectations: the test target now sets its fixture working directory, and
+the BERT allocation-failure fixture disables OS-dependent in-place growth.
+
+One complete post-merge 1M import qualified at 149.924 seconds native and
+221.547 seconds whole probe, with all recall and scored counts unchanged.
+The post-merge publication check took 31.214 seconds and matched the full immutable
+segment hashes. This is integration verification, not a repeated performance
+comparison. The 10M result remains explicitly bound to v68; no post-merge 10M
+rerun is claimed. The qualification report records both source snapshots.
+
 ## Core-builder repetitions before the complete metadata-owner drain
 
 The v67 runtime included the durable metadata handoff and eligible-file pass,

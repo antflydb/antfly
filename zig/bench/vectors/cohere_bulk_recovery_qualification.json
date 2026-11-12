@@ -1,6 +1,6 @@
 {
-  "schema_version": 2,
-  "captured_utc": "2026-11-12T10:03:11.825688+00:00",
+  "schema_version": 3,
+  "captured_utc": "2026-11-12T11:04:15.792493+00:00",
   "toolchain": {
     "zig": "0.17.0",
     "python": "3.12.11",
@@ -34,8 +34,9 @@
     "adaptive_projection_run_ceiling": 1024,
     "compact_ordinal_regions_default": false,
     "private_metadata_owner_drain": true,
-    "current_one_million_trials": 1,
-    "current_ten_million_trials": 1
+    "fully_scaled_one_million_trials": 1,
+    "fully_scaled_ten_million_trials": 1,
+    "post_main_one_million_trials": 1
   },
   "scope": {
     "operation": "Complete native build call including identity, source/checkpoint work, clustering, and artifact candidate; excludes fixture framing, final metadata CAS, and reopened recall",
@@ -44,7 +45,7 @@
     "phase_timers": "Nested attribution counters; do not sum them as disjoint elapsed phases",
     "memory": "Allocator peaks cover private vector source/dense phases, not all runtime quotas or process RSS. Whole-probe RSS includes fixture framing and recall and varies substantially; no consistent RSS reduction is claimed."
   },
-  "source_seal_qualification": "Current final runtime includes explicit durable recovery-manifest seal. v66 publication/1M data predates that metadata-only change. Its failed10M WriteFailed attempt is preserved separately and never counts as qualification.",
+  "source_seal_qualification": "The fully scaled v68 baseline includes the complete source metadata-owner drain. The final main integration is separately recorded; no post-main10M run is claimed. The failed v66 WriteFailed attempt remains unqualified.",
   "verification": {
     "production": "v68 make build and CLI help passed",
     "lsm": "v68 639 passed,1 skipped,0 failures/leaks",
@@ -58,716 +59,6 @@
     "timeout_checker": "v64 8 passed (task process checks escalated)",
     "native_integration": "v68 24 passed,1 guarded S3 skipped including physical source inventory; final build summary recorded separately",
     "combined_build": "v68 110/110steps succeeded; earlier v66 broad build146/146 succeeded"
-  },
-  "current_source": {
-    "base": "163684f71c1de016c11f57c3517cfc9b044f6123",
-    "merged_main": "ab4016ae27",
-    "runtime_abi": 89,
-    "reader_protocol": 103,
-    "files": {
-      "docs/design/vector-store/bulk-builder.md": "486bd6bb866c748b8314f1201734e947604f321d07a271a7f3c38b295add8485",
-      "docs/design/vector-store/bulk-source-storage.md": "c96450af7505fc1c73306ced0b8c293135c0bb0c55d99ef343bd4d79c3c5dffd",
-      "zig/REMOTE_TABLE_SERVING.md": "b6c8bde5ca8dc5e8dd8f660516dd52e9dc1ff679b2262d6290c10e433ed67399",
-      "zig/bench/vectors/bench_bulk_pipeline.py": "9c589986ce921584e40e1bb6102475c18b2958ec6c0ec6b1a6a84c1df7947fa9",
-      "zig/bench/vectors/prepare_framed_cohere.py": "5fdbdf557c46d55e0fb72188f14d924f5de07c3df25faf5ecc357166c057bbb1",
-      "zig/bench/vectors/prepare_raw_recall.py": "678e54381bc213c6ff44138d81a584f09dc99841b008a8c1fc19332abb22ede1",
-      "zig/bench/vectors/test_bulk_pipeline.py": "7810e998d1dbbd624b35563cca15fff154516762de1844da4949b919889133ef",
-      "zig/lib/vectorindex/src/bulk_identity.zig": "a4b07a25aa91dbf4b4da3fa5d2be000c2c255249db05d5afada1df6a29efa2cd",
-      "zig/lib/vectorindex/src/bulk_spool.zig": "82ddac3cda989d8b37da69245ae3a27de2865562c2ab964746ec86395353e1a6",
-      "zig/lib/vectorindex/src/hbc_index.zig": "8ec6de68daf2f561495c6abf2b18c46da3ee7d87753b72a68af99fbb19b42be1",
-      "zig/lib/vectorindex/src/hbc_runtime.zig": "94ee3746f395aeb898709592f8212b00d4b5252d15e3a0a1fdd453154a4aae29",
-      "zig/lib/vectorindex/src/mod.zig": "57fc88bcdab7db2ed90c9f3028b98b01210095cabb5e7532961659e8bf072b68",
-      "zig/lib/vectorindex/src/types.zig": "f6677d095c169665dcf4fa44b1cb0a960e284372a183d352a3c3cc0687d32a9d",
-      "zig/pkg/antfly-embedded/src/metadata/lake_index_catalog.zig": "ffe68bf6b56919f493501efb6ae6d1881358173e35e079860b167edb96001c39",
-      "zig/pkg/antfly-embedded/src/runtime_failure_abi.zig": "94b6072a3854e60211ce34df4193fd3c09dcd3e96f4b707eccf221a94fde922c",
-      "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_cursor.zig": "e3e73f4076cd4a4b369a93404800efe1122f411603a520562ae0acb02bddb526",
-      "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_page.zig": "9c0147661ad2a255f6008d0d5fb32c399ad720fd4b57a356fbd1e62087cd02be",
-      "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_vector.zig": "1d1b1f9a7fdc0d68aceeb72a95207349440719f1b0ed6de0711e96aea489c812",
-      "zig/pkg/antfly-embedded/src/sql/memory_budget.zig": "82081d85893c9f5b88d80e84adb59abc0b585eb37cf19b5e83199234408fb5d3",
-      "zig/pkg/antfly-embedded/src/storage/hbc_adapter.zig": "93d8c7413490a5d4baaf21e303e3469a494cc3a840d7115c35e24d216c554837",
-      "zig/pkg/antfly-embedded/src/storage/lsm_backend.zig": "e9ccb56a0cd5c3ffcd48a57f5bfde0901eb148328ddda52946792d1a8e5e3c55",
-      "zig/pkg/antfly-embedded/src/storage/lsm_backend/compaction.zig": "16b645360db8eb98b74f1796546bec5ad1f9d120215d09b7d9a5d743a677808a",
-      "zig/pkg/antfly-embedded/src/storage/lsm_backend/runtime.zig": "f63d7eb603acb0fb0ba14358b19caa4e29345b7c61fba6d0d307265b2ff04ffa",
-      "zig/pkg/antfly-embedded/src/storage/rowsource/types.zig": "d7ab1781bfb0ba81ce48a46014adca770a2e8d7edd566ee6cb3ea2ec702702bc",
-      "zig/pkg/antfly/build/benches.zig": "9e077c1291ff0b597ff2f92f2fed958b21aca72a03103fb0723940c1a4640aa1",
-      "zig/pkg/antfly/build/lake_execution_tests.zig": "3e048c3afb1b2e2eeea0cb3515767fee14bfec2dfe7c27705b25f11a180e92ee",
-      "zig/pkg/antfly/src/api/lake_bulk_stage.zig": "3686ab75b751360043e7622d399ba0395bca5be355ff6e228fc5684252c8324c",
-      "zig/pkg/antfly/src/api/lake_bulk_work.zig": "bac802a94df5a345e632068e243de65b16ae29836eec31e37c1f4c43169525ba",
-      "zig/pkg/antfly/src/api/lake_execution_build_impl.zig": "de4c59d1c6e5045ea5eada5fb11c5c5fd81b6b50caeb0689a177f9bc0852a504",
-      "zig/pkg/antfly/src/api/lake_execution_native_test.zig": "2e06665356a64738d83f835d40924ae3508209735ce3c92dab7b726f2357d9a9",
-      "zig/pkg/antfly/src/api/lake_execution_probe_metrics.zig": "1f0f0e6a3ddf20f2a1be9734481426cb30b44fdc1d187ac4b54b5ea95172d48a",
-      "zig/pkg/antfly/src/api/lake_execution_qualification_support.zig": "e1e3f747a41eb668f5199b53c136ccbbfb13320f0a20e807e86b766f08357479",
-      "zig/pkg/antfly/src/api/lake_execution_runtime_probe.zig": "76486cda443b5cf361ab983104290f298823f35ac3d075d9a8f404fb63bd7ee4",
-      "zig/pkg/antfly/src/api/lake_execution_values.zig": "588a6022bb41880ca8f9a64e7f32373260ee5653d65d7b1d1a8d8c6d271658e1",
-      "zig/pkg/antfly/src/api/lake_index_gc.zig": "3cfa88de0d47c2a5efc102657ec929a0d7049ce21c1d3caa53f5cd1faca5b0cf",
-      "zig/pkg/antfly/src/api/lake_index_gc_progress.zig": "aed5ece592eb383c5bdf8a5a02fb4190cb8abd8902a6315af2c1bc0b19e52de0",
-      "zig/pkg/antfly/src/api/lake_index_native_dense.zig": "3c0d3d48d33c7d4c66d0bd6890e5720fe3ba5494b3801e7712eb0aa043b602bb",
-      "zig/pkg/antfly/src/api/lake_index_native_directory.zig": "113e5780acc9240714bfab20b340f2b07f3030969b8192a0b8a08936837d2b8b",
-      "zig/pkg/antfly/src/api/lake_index_native_files.zig": "8076c98a7108b5438874ae52abf1c818bd15afe72bbd80ac9cc902e53bf59b3d",
-      "zig/pkg/antfly/src/api/lake_index_row_source.zig": "015d6ff2b218dccd6654b2adcfc21445b8a40c6730faee709028b58b027fd48d",
-      "zig/pkg/antfly/src/api/lake_row_identity_build.zig": "e06af6eba45d67297d9698979ba6236f3d2085c08d78fa88239aa10181805bae",
-      "zig/pkg/antfly/src/api/lake_row_input_recipes.zig": "1068b51b518196d68b6a1cebb30df2e037b0acbd3c4841b0b29dcdb11c63beb9",
-      "zig/pkg/antfly/src/api/testdata/lake_vectors_missing.parquet": "3e366bf3a330239419b1c071a06dfe7bc4920277ef31cfb7b5a539b6d1e23153",
-      "zig/pkg/antfly/src/lake_execution_provider_probe_root.zig": "569710718f66aa62ab99eb98f9261c18a25beebe6c58aad696d14ee2370181fc",
-      "zig/tools/bench_hbc_publication.zig": "7493df081ed159f1e370c4af99b4e14ecc41385453a069c1626ecee3d1d3de0b"
-    },
-    "fingerprint": "0dd1c8e95fc8062ee424e7e5a9625766b94e805ccc90616201f9f037c981db8d",
-    "executables": {
-      "qualification-v68-probe": "c2c6d70707d704f4ff184af93d67228f6878f08062754fb2c6df2c8522992b32",
-      "publication-v68": "5a3a132512959b77f1aed38ad7eef0b992f401949dd5a3e98c3810a98908f122"
-    },
-    "note": "Snapshot before final qualification. Docs/evidence may change afterward; production sources must remain identical."
-  },
-  "current_complete_10m": {
-    "executable": "zig/.benchmark-results/bulk-builder/qualification-v68-probe",
-    "executable_sha256": "c2c6d70707d704f4ff184af93d67228f6878f08062754fb2c6df2c8522992b32",
-    "parquet": "zig/.benchmark-results/bulk-builder/cohere-10m-input",
-    "parquet_bytes": 31326939213,
-    "parquet_sha256": null,
-    "source_fixture": {
-      "format": "AFOBJ001",
-      "dataset": "VectorDBBench Cohere Large 10M",
-      "files": [
-        {
-          "name": "train-00-of-10.parquet",
-          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-00-of-10.parquet",
-          "bytes": 3132712656,
-          "sha256": "a61cfaeef5ef00bf6e4bfa41e76375c56a9262049d26cfe85accbda1c4235ddb",
-          "etag": "\"fa67c7cffb98c268625d480ab1de8fa3-374\"",
-          "version": "T..E1dkvxBIKg8axg2BAGqkqjOBgmzbg"
-        },
-        {
-          "name": "train-01-of-10.parquet",
-          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-01-of-10.parquet",
-          "bytes": 3132688995,
-          "sha256": "1e73bedcbf453111717b0a18077b45010953edca1f33fe761e49fd71d3870f9d",
-          "etag": "\"1e09a7e47e277e35a30b2e0e6e3a4beb-374\"",
-          "version": "YDYYu9lbsIdKq7DDRdC.xnIHfcYQC_x8"
-        },
-        {
-          "name": "train-02-of-10.parquet",
-          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-02-of-10.parquet",
-          "bytes": 3132687596,
-          "sha256": "e288ada17a746ca093e6bac8c9c20e2b96700d1065907e33efe81d938a63801c",
-          "etag": "\"e1eb2854d008db53e2204b682bddb55d-374\"",
-          "version": "9e35e44_Tdv0wQUDBInm2xzziOF9QOvG"
-        },
-        {
-          "name": "train-03-of-10.parquet",
-          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-03-of-10.parquet",
-          "bytes": 3132679477,
-          "sha256": "1862dbe0aab0a39ceecbd2b13edd152fb60f50ff75ead8718d4cda2c4b81370d",
-          "etag": "\"7922f6efabf9a7b6e07a9b1533dc0bf1-374\"",
-          "version": "p6XOvTTAQQbw.FRcOGngb5hcZRtGvqwr"
-        },
-        {
-          "name": "train-04-of-10.parquet",
-          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-04-of-10.parquet",
-          "bytes": 3132702312,
-          "sha256": "4d9d3e7d9a6ceb116a28a921c0de5e94845f5daf10fdf848558621d49e5c1a54",
-          "etag": "\"ccee8e54b646123b986cb2766fa25a5a-374\"",
-          "version": "kqzls1lgi7gdnrw6mR6WrYt8xLKV77wI"
-        },
-        {
-          "name": "train-05-of-10.parquet",
-          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-05-of-10.parquet",
-          "bytes": 3132683521,
-          "sha256": "6760a8347859a5b4dc97ad6ec25acc3e8d94ec6dee3cccb773436b252d445a37",
-          "etag": "\"d3bd2a8a358fb6f1925284b66528780b-374\"",
-          "version": "z1FKdEW2QwkduF7kpegqphQ8xi3vjHHg"
-        },
-        {
-          "name": "train-06-of-10.parquet",
-          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-06-of-10.parquet",
-          "bytes": 3132691091,
-          "sha256": "5968a585c2587d7856aa81404bf8cd59647f6332ef957bf978b380413fca3c0a",
-          "etag": "\"6ddaa047e7f563bd55f07fb2dfe95450-374\"",
-          "version": "HgBcKI5.svg5FaaTpqzPkcmp1eOrbfQP"
-        },
-        {
-          "name": "train-07-of-10.parquet",
-          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-07-of-10.parquet",
-          "bytes": 3132692641,
-          "sha256": "ebc61b3298f9d89a354d979d447a499cb5f094421d266a33ae1d2050ecfe6d9d",
-          "etag": "\"425ef3e83380ed6076e2b0e0e4b60e97-374\"",
-          "version": "ca_z5iF4hpyiitgrHA3WpfyIUS5NcUjr"
-        },
-        {
-          "name": "train-08-of-10.parquet",
-          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-08-of-10.parquet",
-          "bytes": 3132694246,
-          "sha256": "c0c53b7270bd703b9f66929f77fdca2f84af96c4fd4bfba540dba4e30f5eb081",
-          "etag": "\"87411bafc73861764209bc3328dda21b-374\"",
-          "version": "pU4OWduPwdXcBhVoprfcaUAs_7N3FCAq"
-        },
-        {
-          "name": "train-09-of-10.parquet",
-          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-09-of-10.parquet",
-          "bytes": 3132706678,
-          "sha256": "8e413b470207ac09d553bb6ee7bc5ae056ac121a583d7e9d63f041a2d1cf52b6",
-          "etag": "\"ab9e966c1193d0bd5c5cdecb9bc7c424-374\"",
-          "version": "a.RgT8WCscPn8mPJleheGbOPz8VzyS6."
-        }
-      ],
-      "source_uri": "file://zig/.benchmark-results/bulk-builder/cohere-10m-input"
-    },
-    "platform": "macOS-27.0.1-arm64-arm-64bit",
-    "logical_cpus": 14,
-    "algorithm": "lloyd",
-    "dims": 768,
-    "input_allowance": 42949672960,
-    "identity_spill_allowance": 8589934592,
-    "trials": 1,
-    "variants": [
-      "prebound_parents"
-    ],
-    "ground_truth": {
-      "source_sha256": null,
-      "query_parquet_sha256": "a3b0416f2e7eb0e932a0f15f75ed25c76d53777cd7e52d74b1b2e62066f46a4c",
-      "sources": [
-        {
-          "name": "train-00-of-10.parquet",
-          "rows": 1000000,
-          "sha256": "a61cfaeef5ef00bf6e4bfa41e76375c56a9262049d26cfe85accbda1c4235ddb"
-        },
-        {
-          "name": "train-01-of-10.parquet",
-          "rows": 1000000,
-          "sha256": "1e73bedcbf453111717b0a18077b45010953edca1f33fe761e49fd71d3870f9d"
-        },
-        {
-          "name": "train-02-of-10.parquet",
-          "rows": 1000000,
-          "sha256": "e288ada17a746ca093e6bac8c9c20e2b96700d1065907e33efe81d938a63801c"
-        },
-        {
-          "name": "train-03-of-10.parquet",
-          "rows": 1000000,
-          "sha256": "1862dbe0aab0a39ceecbd2b13edd152fb60f50ff75ead8718d4cda2c4b81370d"
-        },
-        {
-          "name": "train-04-of-10.parquet",
-          "rows": 1000000,
-          "sha256": "4d9d3e7d9a6ceb116a28a921c0de5e94845f5daf10fdf848558621d49e5c1a54"
-        },
-        {
-          "name": "train-05-of-10.parquet",
-          "rows": 1000000,
-          "sha256": "6760a8347859a5b4dc97ad6ec25acc3e8d94ec6dee3cccb773436b252d445a37"
-        },
-        {
-          "name": "train-06-of-10.parquet",
-          "rows": 1000000,
-          "sha256": "5968a585c2587d7856aa81404bf8cd59647f6332ef957bf978b380413fca3c0a"
-        },
-        {
-          "name": "train-07-of-10.parquet",
-          "rows": 1000000,
-          "sha256": "ebc61b3298f9d89a354d979d447a499cb5f094421d266a33ae1d2050ecfe6d9d"
-        },
-        {
-          "name": "train-08-of-10.parquet",
-          "rows": 1000000,
-          "sha256": "c0c53b7270bd703b9f66929f77fdca2f84af96c4fd4bfba540dba4e30f5eb081"
-        },
-        {
-          "name": "train-09-of-10.parquet",
-          "rows": 1000000,
-          "sha256": "8e413b470207ac09d553bb6ee7bc5ae056ac121a583d7e9d63f041a2d1cf52b6"
-        }
-      ],
-      "vectors": 10000000,
-      "dims": 768,
-      "queries": 100,
-      "k": 100,
-      "metric": "squared_l2",
-      "normalization": "none",
-      "accumulation": "float64",
-      "exact_scan_ns": 62595019625,
-      "preparation_ns": 78007314084,
-      "outputs": {
-        "queries.f32": "ecf5188847af048a077f497acbd251d0554f753f2561eb1603b99dbe671131b7",
-        "truth.u64": "997e980c47630ade53ee7a748283a9e3269dead9e8fa80d2818e5721ef34de25"
-      },
-      "numpy": "2.5.4"
-    },
-    "operation_scope": "Complete native build call including identity, source/checkpoint work, clustering, and artifact candidate; excludes fixture framing, final metadata CAS, and reopened recall",
-    "subprocess_scope": "Entire probe including fixture framing, source opening, construction, reopen, raw recall, and teardown",
-    "results": [
-      {
-        "trial": 0,
-        "variant": "prebound_parents",
-        "fused": true,
-        "compact": false,
-        "prebind_parents": true,
-        "process_exit_code": 0,
-        "qualified": true,
-        "subprocess_wall_ns": 1853347762625,
-        "subprocess_user_ns": 1061429992000,
-        "subprocess_system_ns": 358171392000,
-        "subprocess_peak_rss_bytes": 4536270848,
-        "load_before": [
-          10.3046875,
-          9.2822265625,
-          9.84521484375
-        ],
-        "load_after": [
-          11.00732421875,
-          11.71044921875,
-          10.751953125
-        ],
-        "log": "zig/.benchmark-results/bulk-builder/pipeline-v68-10m/lloyd-0-prebound_parents.log",
-        "vectors": 10000000,
-        "dims": 768,
-        "algorithm": "lloyd",
-        "total_ns": 1671738962000,
-        "reopened_hits": 10,
-        "checkpoints": 2,
-        "logical_identity": true,
-        "build_mode": {
-          "caller": "fast",
-          "caller_value": 1,
-          "provider": 1,
-          "provider_is_test": false
-        },
-        "phases": [
-          {
-            "names": [
-              "identity",
-              "fragments",
-              "spool",
-              "aggregate",
-              "ordered",
-              "text",
-              "sparse",
-              "dense",
-              "bulk_tee",
-              "bulk_receipt",
-              "dense_ingest",
-              "dense_cluster",
-              "dense_checkpoint",
-              "dense_upload"
-            ],
-            "ns": [
-              654558917000,
-              0,
-              0,
-              167000,
-              291000,
-              566000,
-              189000,
-              504853944000,
-              64018827000,
-              512261685000,
-              12000,
-              446711373000,
-              27911041000,
-              13637511000
-            ],
-            "calls": [
-              1,
-              0,
-              0,
-              1,
-              1,
-              1,
-              1,
-              1,
-              3770,
-              1,
-              1,
-              1,
-              1,
-              1
-            ]
-          }
-        ],
-        "work": [
-          {
-            "identity_census_verified": true,
-            "identity_read_bytes": 240000000,
-            "identity_written_bytes": 360000000,
-            "identity_merge_inputs": 32,
-            "projection_cache_peak_bytes": 685,
-            "owned_index_count": 0,
-            "partition_bytes": 184896060340,
-            "partition_read_bytes": 216716060340,
-            "compact_rows": 0,
-            "projection_commit_ns": 31103407000,
-            "save_node_ns": 0,
-            "update_parent_ns": 0,
-            "update_parent_calls": 0,
-            "training_ns": 73610173000,
-            "routing_ns": 288821555000,
-            "allocator_peak_bytes": 56808054
-          }
-        ],
-        "source_reuse": [
-          {
-            "runs": 153,
-            "reused_runs": 153,
-            "reused_bytes": 31551639070,
-            "new_bytes": 0
-          }
-        ],
-        "projection": [
-          {
-            "runs": 582,
-            "bytes": 2688259211
-          }
-        ],
-        "memory": [
-          {
-            "dense_allocator_peak_bytes": 214404617,
-            "source_allocator_peak_bytes": 43946903,
-            "max_vector_allocator_peak_bytes": 214404617
-          }
-        ],
-        "recall": [
-          {
-            "queries": 100,
-            "probes": 512,
-            "k": 100,
-            "hits": 6100,
-            "recall": 0.61,
-            "scored": 4877634,
-            "elapsed_ns": 29894014000
-          },
-          {
-            "queries": 100,
-            "probes": 1024,
-            "k": 100,
-            "hits": 7200,
-            "recall": 0.72,
-            "scored": 9772196,
-            "elapsed_ns": 15282409000
-          },
-          {
-            "queries": 100,
-            "probes": 2048,
-            "k": 100,
-            "hits": 8237,
-            "recall": 0.8237,
-            "scored": 19568938,
-            "elapsed_ns": 24119739000
-          },
-          {
-            "queries": 100,
-            "probes": 4096,
-            "k": 100,
-            "hits": 8996,
-            "recall": 0.8996,
-            "scored": 39137008,
-            "elapsed_ns": 27464020000
-          },
-          {
-            "queries": 100,
-            "probes": 8192,
-            "k": 100,
-            "hits": 9479,
-            "recall": 0.9479,
-            "scored": 78146479,
-            "elapsed_ns": 26440759000
-          },
-          {
-            "queries": 100,
-            "probes": 16384,
-            "k": 100,
-            "hits": 9683,
-            "recall": 0.9683,
-            "scored": 155512385,
-            "elapsed_ns": 35416514000
-          }
-        ],
-        "cache_retention_target_bytes": 16777216,
-        "cache_target_exceeded": false
-      }
-    ],
-    "median_total_ns": {
-      "prebound_parents": 1671738962000
-    },
-    "median_subprocess_cpu_ns": {
-      "prebound_parents": 1419601384000
-    }
-  },
-  "current_complete_1m_optimized": {
-    "executable": "zig/.benchmark-results/bulk-builder/qualification-v68-probe",
-    "executable_sha256": "c2c6d70707d704f4ff184af93d67228f6878f08062754fb2c6df2c8522992b32",
-    "parquet": "zig/.benchmark-results/cohere-1m/parquet/train.parquet",
-    "parquet_bytes": 3131995162,
-    "parquet_sha256": "de6b84eb08fc5203a56eef619970a14f5cae08d0a0ae0bcd23b8058d7045f381",
-    "source_fixture": null,
-    "platform": "macOS-27.0.1-arm64-arm-64bit",
-    "logical_cpus": 14,
-    "algorithm": "lloyd",
-    "dims": 768,
-    "input_allowance": 4294967296,
-    "identity_spill_allowance": null,
-    "trials": 1,
-    "variants": [
-      "prebound_parents"
-    ],
-    "ground_truth": {
-      "vectors": 1000000,
-      "dims": 768,
-      "queries": 100,
-      "k": 100,
-      "metric": "squared_l2",
-      "normalization": "none",
-      "accumulation": "float64",
-      "exact_scan_ns": 7147362750,
-      "outputs": {
-        "queries.f32": "77e11737740de02c77d64eeac80b393cfa16ba86fbbd85a2f8554f282407f821",
-        "truth.u64": "1e81bead6d24e20f58666b70ed31a6c0158527fc17ced968e2cdded7c45f6bd5"
-      },
-      "numpy": "2.5.4",
-      "source_sha256": "de6b84eb08fc5203a56eef619970a14f5cae08d0a0ae0bcd23b8058d7045f381",
-      "query_parquet_sha256": "a2ec76c907da22e5533ce31c1105e4fd4d3c4597915a7771d5e41897a95ecbed"
-    },
-    "operation_scope": "Complete native build call including identity, source/checkpoint work, clustering, and artifact candidate; excludes fixture framing, final metadata CAS, and reopened recall",
-    "subprocess_scope": "Entire probe including fixture framing, source opening, construction, reopen, raw recall, and teardown",
-    "results": [
-      {
-        "trial": 0,
-        "variant": "prebound_parents",
-        "fused": true,
-        "compact": false,
-        "prebind_parents": true,
-        "process_exit_code": 0,
-        "qualified": true,
-        "subprocess_wall_ns": 197031758959,
-        "subprocess_user_ns": 123169705000,
-        "subprocess_system_ns": 45618593000,
-        "subprocess_peak_rss_bytes": 708739072,
-        "load_before": [
-          8.4365234375,
-          9.1748046875,
-          10.03515625
-        ],
-        "load_after": [
-          9.9970703125,
-          9.1904296875,
-          9.81982421875
-        ],
-        "log": "zig/.benchmark-results/bulk-builder/pipeline-v68-optimized/lloyd-0-prebound_parents.log",
-        "vectors": 1000000,
-        "dims": 768,
-        "algorithm": "lloyd",
-        "total_ns": 143499317000,
-        "reopened_hits": 10,
-        "checkpoints": 2,
-        "logical_identity": true,
-        "build_mode": {
-          "caller": "fast",
-          "caller_value": 1,
-          "provider": 1,
-          "provider_is_test": false
-        },
-        "phases": [
-          {
-            "names": [
-              "identity",
-              "fragments",
-              "spool",
-              "aggregate",
-              "ordered",
-              "text",
-              "sparse",
-              "dense",
-              "bulk_tee",
-              "bulk_receipt",
-              "dense_ingest",
-              "dense_cluster",
-              "dense_checkpoint",
-              "dense_upload"
-            ],
-            "ns": [
-              60710407000,
-              0,
-              0,
-              11000,
-              45000,
-              60000,
-              50000,
-              35077357000,
-              7084505000,
-              47670488000,
-              10000,
-              30734519000,
-              1698783000,
-              1489075000
-            ],
-            "calls": [
-              1,
-              0,
-              0,
-              1,
-              1,
-              1,
-              1,
-              1,
-              377,
-              1,
-              1,
-              1,
-              1,
-              1
-            ]
-          }
-        ],
-        "work": [
-          {
-            "identity_census_verified": true,
-            "identity_read_bytes": 12000000,
-            "identity_written_bytes": 24000000,
-            "identity_merge_inputs": 4,
-            "projection_cache_peak_bytes": 685,
-            "owned_index_count": 0,
-            "partition_bytes": 13484934160,
-            "partition_read_bytes": 16666934160,
-            "compact_rows": 0,
-            "projection_commit_ns": 2528298000,
-            "save_node_ns": 0,
-            "update_parent_ns": 0,
-            "update_parent_calls": 0,
-            "training_ns": 7377038000,
-            "routing_ns": 17113007000,
-            "allocator_peak_bytes": 54177741
-          }
-        ],
-        "source_reuse": [
-          {
-            "runs": 16,
-            "reused_runs": 16,
-            "reused_bytes": 3155157339,
-            "new_bytes": 0
-          }
-        ],
-        "projection": [
-          {
-            "runs": 60,
-            "bytes": 263759900
-          }
-        ],
-        "memory": [
-          {
-            "dense_allocator_peak_bytes": 54177741,
-            "source_allocator_peak_bytes": 39924108,
-            "max_vector_allocator_peak_bytes": 54177741
-          }
-        ],
-        "recall": [
-          {
-            "queries": 100,
-            "probes": 512,
-            "k": 100,
-            "hits": 8500,
-            "recall": 0.85,
-            "scored": 4862910,
-            "elapsed_ns": 9690981000
-          },
-          {
-            "queries": 100,
-            "probes": 1024,
-            "k": 100,
-            "hits": 9336,
-            "recall": 0.9336,
-            "scored": 9734804,
-            "elapsed_ns": 9173447000
-          },
-          {
-            "queries": 100,
-            "probes": 2048,
-            "k": 100,
-            "hits": 9758,
-            "recall": 0.9758,
-            "scored": 19424194,
-            "elapsed_ns": 9372118000
-          },
-          {
-            "queries": 100,
-            "probes": 4096,
-            "k": 100,
-            "hits": 9898,
-            "recall": 0.9898,
-            "scored": 38548203,
-            "elapsed_ns": 9875511000
-          },
-          {
-            "queries": 100,
-            "probes": 8192,
-            "k": 100,
-            "hits": 9916,
-            "recall": 0.9916,
-            "scored": 75782229,
-            "elapsed_ns": 11140787000
-          }
-        ],
-        "cache_retention_target_bytes": 16777216,
-        "cache_target_exceeded": false
-      }
-    ],
-    "median_total_ns": {
-      "prebound_parents": 143499317000
-    },
-    "median_subprocess_cpu_ns": {
-      "prebound_parents": 168788298000
-    }
-  },
-  "current_publication_10m": {
-    "executable_sha256": "5a3a132512959b77f1aed38ad7eef0b992f401949dd5a3e98c3810a98908f122",
-    "projection_runs": 582,
-    "projection_bytes": 2688259211,
-    "results": [
-      {
-        "mode": "adaptive",
-        "trial": 0,
-        "exit_code": 0,
-        "subprocess_wall_ns": 28898000250,
-        "user_ns": 15786644000,
-        "system_ns": 6175646000,
-        "peak_rss_bytes": 363429888,
-        "load_before": [
-          7.61083984375,
-          9.1240234375,
-          10.0498046875
-        ],
-        "load_after": [
-          8.3876953125,
-          9.17822265625,
-          10.04150390625
-        ],
-        "log": "zig/.benchmark-results/bulk-builder/publication-10m-v68-0-adaptive.log",
-        "qualified": true,
-        "result": {
-          "mode": "adaptive",
-          "dims": 768,
-          "vectors": 10000000,
-          "publication_ns": 28197319167,
-          "run_entry_limit": 65536,
-          "initial_peak_bytes": 172982072,
-          "publication_peak_bytes": 214091078,
-          "projection_runs_before": 582,
-          "projection_runs_after": 582,
-          "allocator_peak_bytes": 214091078,
-          "allocator_limit_bytes": 268435456,
-          "cache_bytes": 16777216,
-          "exact_source_loads": 0,
-          "metadata_samples": 100,
-          "segments": 1,
-          "current_sha256": "12580d812e52e94e9281f8ba88bed92c4c39c758c6728771f910a3f779824a41",
-          "builtin_is_test": false,
-          "optimize": "fast"
-        },
-        "segment_content": {
-          "segment-1.afps": {
-            "bytes": 3739924279,
-            "sha256": "5c170cb428b585e7ac274a817a6e16c5e1456f693f5dbac00cbd60b26d43602a"
-          }
-        }
-      }
-    ],
-    "scope": "Final reviewed publication. Immutable segment SHA256 checks run in the parent after each child exits and before the next child starts, outside both child timers. Final adaptive output check; the five-trial component comparison is retained separately as v67. Publication allocator window is measured separately from pre-sampling and whole-process ownership. Fresh disposable clones of the same sealed 10M projection. Publication timer includes consolidation when enabled; subprocess includes open, metadata sampling, reopen and verification. Shared workstation. No own builds or cleanup during measurements."
   },
   "publication_input_verified_hashes": {
     "captured_utc": "2026-11-12T10:01:02.666267+00:00",
@@ -7891,6 +7182,34 @@
         "warning: native lake construction deferred stage=dense_build generation=1 err=WriteFailed",
         "error: WriteFailed"
       ]
+    },
+    {
+      "scope": "Final post-main1M check",
+      "log": "zig/.benchmark-results/bulk-builder/pipeline-v69-optimized/lloyd-0-prebound_parents.log",
+      "sha256": "a69e1e2fda34bdf07837074229d2c367aff1c596a4aaadb5a8d9a5276cf7a677",
+      "records": [
+        "PARQUET_BULK_BUILD_MODE {\"caller\":\"fast\",\"caller_value\":1,\"provider\":1,\"provider_is_test\":false}",
+        "PARQUET_BULK_WORK {\"identity_census_verified\":true,\"identity_read_bytes\":12000000,\"identity_written_bytes\":24000000,\"identity_merge_inputs\":4,\"projection_cache_peak_bytes\":685,\"owned_index_count\":0,\"partition_bytes\":13484934160,\"partition_read_bytes\":16666934160,\"compact_rows\":0,\"projection_commit_ns\":2511371000,\"save_node_ns\":0,\"update_parent_ns\":0,\"update_parent_calls\":0,\"training_ns\":7309099000,\"routing_ns\":18516428000,\"allocator_peak_bytes\":54178861}",
+        "PARQUET_BULK_PROJECTION {\"runs\":60,\"bytes\":263759900}",
+        "PARQUET_BULK_SOURCE {\"runs\":16,\"reused_runs\":16,\"reused_bytes\":3155157339,\"new_bytes\":0}",
+        "PARQUET_BULK_MEMORY {\"dense_allocator_peak_bytes\":54178861,\"source_allocator_peak_bytes\":39924108,\"max_vector_allocator_peak_bytes\":54178861}",
+        "PARQUET_BULK algorithm=lloyd vectors=1000000 dims=768 total_ns=149924429000 reopened_hits=10 checkpoints=2 logical_identity=true",
+        "PARQUET_BULK_PHASES {\"names\":[\"identity\",\"fragments\",\"spool\",\"aggregate\",\"ordered\",\"text\",\"sparse\",\"dense\",\"bulk_tee\",\"bulk_receipt\",\"dense_ingest\",\"dense_cluster\",\"dense_checkpoint\",\"dense_upload\"],\"ns\":[63909143000,0,0,11000,44000,73000,26000,37734105000,8313239000,48238936000,0,32286899000,2454867000,1786644000],\"calls\":[1,0,0,1,1,1,1,1,377,1,1,1,1,1]}",
+        "PARQUET_BULK_RECALL {\"queries\":100,\"probes\":512,\"k\":100,\"hits\":8500,\"recall\":0.85,\"scored\":4862910,\"elapsed_ns\":14583737000}",
+        "PARQUET_BULK_RECALL {\"queries\":100,\"probes\":1024,\"k\":100,\"hits\":9336,\"recall\":0.9336,\"scored\":9734804,\"elapsed_ns\":10644600000}",
+        "PARQUET_BULK_RECALL {\"queries\":100,\"probes\":2048,\"k\":100,\"hits\":9758,\"recall\":0.9758,\"scored\":19424194,\"elapsed_ns\":11623815000}",
+        "PARQUET_BULK_RECALL {\"queries\":100,\"probes\":4096,\"k\":100,\"hits\":9898,\"recall\":0.9898,\"scored\":38548203,\"elapsed_ns\":12271064000}",
+        "PARQUET_BULK_RECALL {\"queries\":100,\"probes\":8192,\"k\":100,\"hits\":9916,\"recall\":0.9916,\"scored\":75782229,\"elapsed_ns\":16510740000}"
+      ]
+    },
+    {
+      "scope": "Final post-main publication output check",
+      "log": "zig/.benchmark-results/bulk-builder/publication-10m-v69-0-adaptive.log",
+      "sha256": "539ddc61ab70fd1f77f616d2c7d8bb678fb1f23b9a39a70281c74a5655c85ce9",
+      "records": [
+        "HBC_PUBLICATION_STARTED",
+        "HBC_PUBLICATION {\"mode\":\"adaptive\",\"dims\":768,\"vectors\":10000000,\"publication_ns\":31213528000,\"run_entry_limit\":65536,\"initial_peak_bytes\":172982072,\"publication_peak_bytes\":214091078,\"projection_runs_before\":582,\"projection_runs_after\":582,\"allocator_peak_bytes\":214091078,\"allocator_limit_bytes\":268435456,\"cache_bytes\":16777216,\"exact_source_loads\":0,\"metadata_samples\":100,\"segments\":1,\"current_sha256\":\"12580d812e52e94e9281f8ba88bed92c4c39c758c6728771f910a3f779824a41\",\"builtin_is_test\":false,\"optimize\":\"fast\"}"
+      ]
     }
   ],
   "source_reclamation_regression": {
@@ -7925,6 +7244,1092 @@
       "scope": "Read-only sum of nominal file lengths before the unqualified v66 WriteFailed. Not an allocated-block measurement or throughput qualification. Retired bulk/run metadata held file pins for superseded ingest SSTs after sealing."
     }
   },
-  "runtime_source_validation": "All captured production/test/tool source hashes match frozen v68 inputs. Design/review documents and this evidence report were finalized afterward.",
-  "current_ten_million_recall_and_scored_counts_equal_v67": true
+  "runtime_source_validation": "Fully scaled v68 runtime/test/tool hashes matched its qualified inputs at commit9e039f0945. After merging main05fdfbdd, final artifacts and1M/publication verification are separately bound to the post-main source snapshot. Only design/review/evidence documents changed after final verification.",
+  "post_main_integration": {
+    "merged_main": "05fdfbdd71c6a7af1359fc49d68d421b1dd6e36a",
+    "source": {
+      "base": "f96e9fc1b5c5e83bf7af5a28e172a43c3c44b98c",
+      "merged_main": "05fdfbdd71c6a7af1359fc49d68d421b1dd6e36a",
+      "runtime_abi": 89,
+      "reader_protocol": 103,
+      "files": {
+        "zig/bench/vectors/bench_bulk_pipeline.py": "9c589986ce921584e40e1bb6102475c18b2958ec6c0ec6b1a6a84c1df7947fa9",
+        "zig/bench/vectors/prepare_framed_cohere.py": "5fdbdf557c46d55e0fb72188f14d924f5de07c3df25faf5ecc357166c057bbb1",
+        "zig/bench/vectors/prepare_raw_recall.py": "678e54381bc213c6ff44138d81a584f09dc99841b008a8c1fc19332abb22ede1",
+        "zig/bench/vectors/test_bulk_pipeline.py": "7810e998d1dbbd624b35563cca15fff154516762de1844da4949b919889133ef",
+        "zig/build_support/antfly/dependencies.zig": "9bc4c120d0a5c03291e34ac1b0d0b671fa5b23ec34343a3ca9ba49d368fec8ac",
+        "zig/lib/tokenizer/src/hf_tokenizer.zig": "4f1f69372a4508919a85a7bc89482475db1990614e7f416b5e37a5946ac105c5",
+        "zig/lib/tokenizer/src/unicode_nfc_data.zig": "d2331db5bf53cb705aa699f0585cfa3957d1d6499a1b2b4b1ae36136cbeb49ef",
+        "zig/lib/tokenizer/src/unicode_normalizer.zig": "d355b14129515df3a4cb8a4dce88f8dfd457b1fa23be466fce08b024c4916f0d",
+        "zig/lib/tokenizer/src/unicode_punctuation_data.zig": "6ec15744f1331ba8efc9cbdbfc99df7f1ce654acc95017a399ff550dcacc35fb",
+        "zig/lib/tokenizer/tools/generate_unicode_nfc.py": "044c9c467c042c67df705343206d8a4017a42194da5cbc9d5feb3f75e364a17d",
+        "zig/lib/tokenizer/tools/generate_unicode_punctuation.py": "524f5415ac5ab63ac3cdd03954c5a76f18eb2c8e8479f19c2324166288cc2e5f",
+        "zig/lib/vectorindex/src/bulk_identity.zig": "a4b07a25aa91dbf4b4da3fa5d2be000c2c255249db05d5afada1df6a29efa2cd",
+        "zig/lib/vectorindex/src/bulk_spool.zig": "82ddac3cda989d8b37da69245ae3a27de2865562c2ab964746ec86395353e1a6",
+        "zig/lib/vectorindex/src/hbc_index.zig": "3efb539edb78ee421d103b9ad4bfcc6ca79c6071b4c45a8b20e8805a40a1f5b8",
+        "zig/lib/vectorindex/src/hbc_runtime.zig": "94ee3746f395aeb898709592f8212b00d4b5252d15e3a0a1fdd453154a4aae29",
+        "zig/lib/vectorindex/src/mod.zig": "57fc88bcdab7db2ed90c9f3028b98b01210095cabb5e7532961659e8bf072b68",
+        "zig/lib/vectorindex/src/types.zig": "f6677d095c169665dcf4fa44b1cb0a960e284372a183d352a3c3cc0687d32a9d",
+        "zig/pkg/antfly-embedded/src/metadata/lake_index_catalog.zig": "ffe68bf6b56919f493501efb6ae6d1881358173e35e079860b167edb96001c39",
+        "zig/pkg/antfly-embedded/src/runtime_failure_abi.zig": "94b6072a3854e60211ce34df4193fd3c09dcd3e96f4b707eccf221a94fde922c",
+        "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_cursor.zig": "e3e73f4076cd4a4b369a93404800efe1122f411603a520562ae0acb02bddb526",
+        "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_page.zig": "9c0147661ad2a255f6008d0d5fb32c399ad720fd4b57a356fbd1e62087cd02be",
+        "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_vector.zig": "1d1b1f9a7fdc0d68aceeb72a95207349440719f1b0ed6de0711e96aea489c812",
+        "zig/pkg/antfly-embedded/src/sql/memory_budget.zig": "82081d85893c9f5b88d80e84adb59abc0b585eb37cf19b5e83199234408fb5d3",
+        "zig/pkg/antfly-embedded/src/storage/db/db.zig": "cb2588d0f62baef205dbd043d1702e6de5fd012d56f3e8fb09dd4c5aad2a75b3",
+        "zig/pkg/antfly-embedded/src/storage/db/mutation_materialization.zig": "744713d09872ddd6d24f85ffcd74ac156668d78d388893044eb14acd8de1955e",
+        "zig/pkg/antfly-embedded/src/storage/hbc_adapter.zig": "e200c7dce4321310b1c1ba20bac1d10e88daa97e905d400868c2127e863a7f1d",
+        "zig/pkg/antfly-embedded/src/storage/lsm_backend.zig": "e9ccb56a0cd5c3ffcd48a57f5bfde0901eb148328ddda52946792d1a8e5e3c55",
+        "zig/pkg/antfly-embedded/src/storage/lsm_backend/compaction.zig": "16b645360db8eb98b74f1796546bec5ad1f9d120215d09b7d9a5d743a677808a",
+        "zig/pkg/antfly-embedded/src/storage/lsm_backend/runtime.zig": "f63d7eb603acb0fb0ba14358b19caa4e29345b7c61fba6d0d307265b2ff04ffa",
+        "zig/pkg/antfly-embedded/src/storage/rowsource/types.zig": "d7ab1781bfb0ba81ce48a46014adca770a2e8d7edd566ee6cb3ea2ec702702bc",
+        "zig/pkg/antfly/build/api_tests.zig": "41bf9152b9316420d48160dbce644ff11a1d463c50966124dc76829b318753cd",
+        "zig/pkg/antfly/build/benches.zig": "9e077c1291ff0b597ff2f92f2fed958b21aca72a03103fb0723940c1a4640aa1",
+        "zig/pkg/antfly/build/lake_execution_tests.zig": "3e048c3afb1b2e2eeea0cb3515767fee14bfec2dfe7c27705b25f11a180e92ee",
+        "zig/pkg/antfly/build/tests.zig": "c537f024b82e230c67d7e7c7a05d6ca1a6a3fc3aea5758cd8bc7fe48835093a2",
+        "zig/pkg/antfly/src/api/integration_test.zig": "a3d1c08441187a011507dcc00e3042ee0a0486bef15a796dc9d1cce3fd0df58d",
+        "zig/pkg/antfly/src/api/lake_bulk_stage.zig": "3686ab75b751360043e7622d399ba0395bca5be355ff6e228fc5684252c8324c",
+        "zig/pkg/antfly/src/api/lake_bulk_work.zig": "bac802a94df5a345e632068e243de65b16ae29836eec31e37c1f4c43169525ba",
+        "zig/pkg/antfly/src/api/lake_execution_build_impl.zig": "de4c59d1c6e5045ea5eada5fb11c5c5fd81b6b50caeb0689a177f9bc0852a504",
+        "zig/pkg/antfly/src/api/lake_execution_native_test.zig": "2e06665356a64738d83f835d40924ae3508209735ce3c92dab7b726f2357d9a9",
+        "zig/pkg/antfly/src/api/lake_execution_probe_metrics.zig": "1f0f0e6a3ddf20f2a1be9734481426cb30b44fdc1d187ac4b54b5ea95172d48a",
+        "zig/pkg/antfly/src/api/lake_execution_qualification_support.zig": "e1e3f747a41eb668f5199b53c136ccbbfb13320f0a20e807e86b766f08357479",
+        "zig/pkg/antfly/src/api/lake_execution_runtime_probe.zig": "76486cda443b5cf361ab983104290f298823f35ac3d075d9a8f404fb63bd7ee4",
+        "zig/pkg/antfly/src/api/lake_execution_values.zig": "588a6022bb41880ca8f9a64e7f32373260ee5653d65d7b1d1a8d8c6d271658e1",
+        "zig/pkg/antfly/src/api/lake_index_gc.zig": "3cfa88de0d47c2a5efc102657ec929a0d7049ce21c1d3caa53f5cd1faca5b0cf",
+        "zig/pkg/antfly/src/api/lake_index_gc_progress.zig": "aed5ece592eb383c5bdf8a5a02fb4190cb8abd8902a6315af2c1bc0b19e52de0",
+        "zig/pkg/antfly/src/api/lake_index_native_dense.zig": "3c0d3d48d33c7d4c66d0bd6890e5720fe3ba5494b3801e7712eb0aa043b602bb",
+        "zig/pkg/antfly/src/api/lake_index_native_directory.zig": "113e5780acc9240714bfab20b340f2b07f3030969b8192a0b8a08936837d2b8b",
+        "zig/pkg/antfly/src/api/lake_index_native_files.zig": "8076c98a7108b5438874ae52abf1c818bd15afe72bbd80ac9cc902e53bf59b3d",
+        "zig/pkg/antfly/src/api/lake_index_row_source.zig": "015d6ff2b218dccd6654b2adcfc21445b8a40c6730faee709028b58b027fd48d",
+        "zig/pkg/antfly/src/api/lake_row_identity_build.zig": "e06af6eba45d67297d9698979ba6236f3d2085c08d78fa88239aa10181805bae",
+        "zig/pkg/antfly/src/api/lake_row_input_recipes.zig": "1068b51b518196d68b6a1cebb30df2e037b0acbd3c4841b0b29dcdb11c63beb9",
+        "zig/pkg/antfly/src/api/query_post_processing.zig": "2b091e32d0f3dc6af0e680777499a6d07531c5d19ada5d0238807e60e9f254ff",
+        "zig/pkg/antfly/src/api/table_reads.zig": "907cd10628673066b89aedda708a4d643025295ab5f360588068c765619729a7",
+        "zig/pkg/antfly/src/api/testdata/lake_vectors_missing.parquet": "3e366bf3a330239419b1c071a06dfe7bc4920277ef31cfb7b5a539b6d1e23153",
+        "zig/pkg/antfly/src/lake_execution_provider_probe_root.zig": "569710718f66aa62ab99eb98f9261c18a25beebe6c58aad696d14ee2370181fc",
+        "zig/pkg/antfly/src/storage/local_query_provider.zig": "848f9521ab161975a5bb468b3ab8e53cd191eb8ef9441e9c7909063817f491ee",
+        "zig/tools/bench_hbc_publication.zig": "7493df081ed159f1e370c4af99b4e14ecc41385453a069c1626ecee3d1d3de0b"
+      },
+      "fingerprint": "7524d01399032711b06123442700199ea8dd08457f95a4a64a227d5cb1a132f1",
+      "executables": {
+        "qualification-v69-probe": "7e7e4446ae201137b679418ce5e2af5b7bf9d8a1bed5ff619a90c21e5816dab2",
+        "publication-v69": "8c9ed5d43224c00db10e4afc4beb6158fd061ebdc1846157f0c93f331c00b2a3"
+      },
+      "scope": "Post-main integration. Main adds exhaustive-search/tokenizer/embedding-reuse/graph fixes; bulk construction, source handoff, native serialization and benchmark ANN behavior are unchanged. Tokenizer-only harness fixes preserve production behavior. Full10M corpus qualification remains separately bound to v68; this revision receives final1M and publication-output checks."
+    },
+    "one_million_check": {
+      "executable": "zig/.benchmark-results/bulk-builder/qualification-v69-probe",
+      "executable_sha256": "7e7e4446ae201137b679418ce5e2af5b7bf9d8a1bed5ff619a90c21e5816dab2",
+      "parquet": "zig/.benchmark-results/cohere-1m/parquet/train.parquet",
+      "parquet_bytes": 3131995162,
+      "parquet_sha256": "de6b84eb08fc5203a56eef619970a14f5cae08d0a0ae0bcd23b8058d7045f381",
+      "source_fixture": null,
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "logical_cpus": 14,
+      "algorithm": "lloyd",
+      "dims": 768,
+      "input_allowance": 4294967296,
+      "identity_spill_allowance": null,
+      "trials": 1,
+      "variants": [
+        "prebound_parents"
+      ],
+      "ground_truth": {
+        "vectors": 1000000,
+        "dims": 768,
+        "queries": 100,
+        "k": 100,
+        "metric": "squared_l2",
+        "normalization": "none",
+        "accumulation": "float64",
+        "exact_scan_ns": 7147362750,
+        "outputs": {
+          "queries.f32": "77e11737740de02c77d64eeac80b393cfa16ba86fbbd85a2f8554f282407f821",
+          "truth.u64": "1e81bead6d24e20f58666b70ed31a6c0158527fc17ced968e2cdded7c45f6bd5"
+        },
+        "numpy": "2.5.4",
+        "source_sha256": "de6b84eb08fc5203a56eef619970a14f5cae08d0a0ae0bcd23b8058d7045f381",
+        "query_parquet_sha256": "a2ec76c907da22e5533ce31c1105e4fd4d3c4597915a7771d5e41897a95ecbed"
+      },
+      "operation_scope": "Complete native build call including identity, source/checkpoint work, clustering, and artifact candidate; excludes fixture framing, final metadata CAS, and reopened recall",
+      "subprocess_scope": "Entire probe including fixture framing, source opening, construction, reopen, raw recall, and teardown",
+      "results": [
+        {
+          "trial": 0,
+          "variant": "prebound_parents",
+          "fused": true,
+          "compact": false,
+          "prebind_parents": true,
+          "process_exit_code": 0,
+          "qualified": true,
+          "subprocess_wall_ns": 221546817792,
+          "subprocess_user_ns": 124484058000,
+          "subprocess_system_ns": 54750310000,
+          "subprocess_peak_rss_bytes": 2073214976,
+          "load_before": [
+            7.28466796875,
+            8.30810546875,
+            9.05517578125
+          ],
+          "load_after": [
+            8.12060546875,
+            8.203125,
+            8.8310546875
+          ],
+          "log": "zig/.benchmark-results/bulk-builder/pipeline-v69-optimized/lloyd-0-prebound_parents.log",
+          "vectors": 1000000,
+          "dims": 768,
+          "algorithm": "lloyd",
+          "total_ns": 149924429000,
+          "reopened_hits": 10,
+          "checkpoints": 2,
+          "logical_identity": true,
+          "build_mode": {
+            "caller": "fast",
+            "caller_value": 1,
+            "provider": 1,
+            "provider_is_test": false
+          },
+          "phases": [
+            {
+              "names": [
+                "identity",
+                "fragments",
+                "spool",
+                "aggregate",
+                "ordered",
+                "text",
+                "sparse",
+                "dense",
+                "bulk_tee",
+                "bulk_receipt",
+                "dense_ingest",
+                "dense_cluster",
+                "dense_checkpoint",
+                "dense_upload"
+              ],
+              "ns": [
+                63909143000,
+                0,
+                0,
+                11000,
+                44000,
+                73000,
+                26000,
+                37734105000,
+                8313239000,
+                48238936000,
+                0,
+                32286899000,
+                2454867000,
+                1786644000
+              ],
+              "calls": [
+                1,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                377,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          ],
+          "work": [
+            {
+              "identity_census_verified": true,
+              "identity_read_bytes": 12000000,
+              "identity_written_bytes": 24000000,
+              "identity_merge_inputs": 4,
+              "projection_cache_peak_bytes": 685,
+              "owned_index_count": 0,
+              "partition_bytes": 13484934160,
+              "partition_read_bytes": 16666934160,
+              "compact_rows": 0,
+              "projection_commit_ns": 2511371000,
+              "save_node_ns": 0,
+              "update_parent_ns": 0,
+              "update_parent_calls": 0,
+              "training_ns": 7309099000,
+              "routing_ns": 18516428000,
+              "allocator_peak_bytes": 54178861
+            }
+          ],
+          "source_reuse": [
+            {
+              "runs": 16,
+              "reused_runs": 16,
+              "reused_bytes": 3155157339,
+              "new_bytes": 0
+            }
+          ],
+          "projection": [
+            {
+              "runs": 60,
+              "bytes": 263759900
+            }
+          ],
+          "memory": [
+            {
+              "dense_allocator_peak_bytes": 54178861,
+              "source_allocator_peak_bytes": 39924108,
+              "max_vector_allocator_peak_bytes": 54178861
+            }
+          ],
+          "recall": [
+            {
+              "queries": 100,
+              "probes": 512,
+              "k": 100,
+              "hits": 8500,
+              "recall": 0.85,
+              "scored": 4862910,
+              "elapsed_ns": 14583737000
+            },
+            {
+              "queries": 100,
+              "probes": 1024,
+              "k": 100,
+              "hits": 9336,
+              "recall": 0.9336,
+              "scored": 9734804,
+              "elapsed_ns": 10644600000
+            },
+            {
+              "queries": 100,
+              "probes": 2048,
+              "k": 100,
+              "hits": 9758,
+              "recall": 0.9758,
+              "scored": 19424194,
+              "elapsed_ns": 11623815000
+            },
+            {
+              "queries": 100,
+              "probes": 4096,
+              "k": 100,
+              "hits": 9898,
+              "recall": 0.9898,
+              "scored": 38548203,
+              "elapsed_ns": 12271064000
+            },
+            {
+              "queries": 100,
+              "probes": 8192,
+              "k": 100,
+              "hits": 9916,
+              "recall": 0.9916,
+              "scored": 75782229,
+              "elapsed_ns": 16510740000
+            }
+          ],
+          "cache_retention_target_bytes": 16777216,
+          "cache_target_exceeded": false
+        }
+      ],
+      "median_total_ns": {
+        "prebound_parents": 149924429000
+      },
+      "median_subprocess_cpu_ns": {
+        "prebound_parents": 179234368000
+      }
+    },
+    "publication_output_check": {
+      "executable_sha256": "8c9ed5d43224c00db10e4afc4beb6158fd061ebdc1846157f0c93f331c00b2a3",
+      "projection_runs": 582,
+      "projection_bytes": 2688259211,
+      "results": [
+        {
+          "mode": "adaptive",
+          "trial": 0,
+          "exit_code": 0,
+          "subprocess_wall_ns": 32037125417,
+          "user_ns": 16312082000,
+          "system_ns": 7529583000,
+          "peak_rss_bytes": 296763392,
+          "load_before": [
+            7.34423828125,
+            8.439453125,
+            9.13134765625
+          ],
+          "load_after": [
+            7.3095703125,
+            8.33056640625,
+            9.0673828125
+          ],
+          "log": "zig/.benchmark-results/bulk-builder/publication-10m-v69-0-adaptive.log",
+          "qualified": true,
+          "result": {
+            "mode": "adaptive",
+            "dims": 768,
+            "vectors": 10000000,
+            "publication_ns": 31213528000,
+            "run_entry_limit": 65536,
+            "initial_peak_bytes": 172982072,
+            "publication_peak_bytes": 214091078,
+            "projection_runs_before": 582,
+            "projection_runs_after": 582,
+            "allocator_peak_bytes": 214091078,
+            "allocator_limit_bytes": 268435456,
+            "cache_bytes": 16777216,
+            "exact_source_loads": 0,
+            "metadata_samples": 100,
+            "segments": 1,
+            "current_sha256": "12580d812e52e94e9281f8ba88bed92c4c39c758c6728771f910a3f779824a41",
+            "builtin_is_test": false,
+            "optimize": "fast"
+          },
+          "segment_content": {
+            "segment-1.afps": {
+              "bytes": 3739924279,
+              "sha256": "5c170cb428b585e7ac274a817a6e16c5e1456f693f5dbac00cbd60b26d43602a"
+            }
+          }
+        }
+      ],
+      "scope": "Final reviewed publication. Immutable segment SHA256 checks run in the parent after each child exits and before the next child starts, outside both child timers. Final adaptive output check; the five-trial component comparison is retained separately as v67. Publication allocator window is measured separately from pre-sampling and whole-process ownership. Fresh disposable clones of the same sealed 10M projection. Publication timer includes consolidation when enabled; subprocess includes open, metadata sampling, reopen and verification. Shared workstation. No own builds or cleanup during measurements."
+    },
+    "scope": "Main #1642 changes exhaustive/full-effort search, embedding reuse, tokenization and ranked graph starts. Bulk construction/source handoff/native codecs and measured ANN mode are unchanged. Final1M and publication checks match recall/scored counts and full segment bytes. Full10M remains version-bound to v68; it was not repeated after these unrelated/full-effort changes.",
+    "verification": {
+      "inference_evaluation_storage": "19 passed including full-effort filtered cosine oracle across dimensions/selectivity and embedding reuse/revision contracts",
+      "bulk": "35 plus9 supporting owner checks passed",
+      "native": "24 passed,1 guarded S3 skip",
+      "vector_library": "272 passed",
+      "tokenizer": "94 passed,2 skipped after two test-harness fixes",
+      "production": "Final build and CLI help passed"
+    },
+    "test_harness_fixes": [
+      {
+        "file": "zig/build_support/antfly/dependencies.zig",
+        "failure": "Golden fixture FileNotFound when invoked from repository root; same binary passed from zig/",
+        "fix": "Set tokenizer test working directory to b.path(\".\")"
+      },
+      {
+        "file": "zig/lib/tokenizer/src/unicode_normalizer.zig",
+        "failure": "BERT checkAllAllocationFailures returned NondeterministicMemoryUsage with OS-dependent in-place resize/remap",
+        "fix": "Test fixture copies allocator vtable with noResize/noRemap; every growth allocation is fault-enumerated. Production normalization and golden expectations unchanged."
+      }
+    ],
+    "quality_and_scored_counts_equal_v68": true,
+    "immutable_segment_bytes_equal_v68": true
+  },
+  "fully_scaled_source": {
+    "base": "163684f71c1de016c11f57c3517cfc9b044f6123",
+    "merged_main": "ab4016ae27",
+    "runtime_abi": 89,
+    "reader_protocol": 103,
+    "files": {
+      "docs/design/vector-store/bulk-builder.md": "486bd6bb866c748b8314f1201734e947604f321d07a271a7f3c38b295add8485",
+      "docs/design/vector-store/bulk-source-storage.md": "c96450af7505fc1c73306ced0b8c293135c0bb0c55d99ef343bd4d79c3c5dffd",
+      "zig/REMOTE_TABLE_SERVING.md": "b6c8bde5ca8dc5e8dd8f660516dd52e9dc1ff679b2262d6290c10e433ed67399",
+      "zig/bench/vectors/bench_bulk_pipeline.py": "9c589986ce921584e40e1bb6102475c18b2958ec6c0ec6b1a6a84c1df7947fa9",
+      "zig/bench/vectors/prepare_framed_cohere.py": "5fdbdf557c46d55e0fb72188f14d924f5de07c3df25faf5ecc357166c057bbb1",
+      "zig/bench/vectors/prepare_raw_recall.py": "678e54381bc213c6ff44138d81a584f09dc99841b008a8c1fc19332abb22ede1",
+      "zig/bench/vectors/test_bulk_pipeline.py": "7810e998d1dbbd624b35563cca15fff154516762de1844da4949b919889133ef",
+      "zig/lib/vectorindex/src/bulk_identity.zig": "a4b07a25aa91dbf4b4da3fa5d2be000c2c255249db05d5afada1df6a29efa2cd",
+      "zig/lib/vectorindex/src/bulk_spool.zig": "82ddac3cda989d8b37da69245ae3a27de2865562c2ab964746ec86395353e1a6",
+      "zig/lib/vectorindex/src/hbc_index.zig": "8ec6de68daf2f561495c6abf2b18c46da3ee7d87753b72a68af99fbb19b42be1",
+      "zig/lib/vectorindex/src/hbc_runtime.zig": "94ee3746f395aeb898709592f8212b00d4b5252d15e3a0a1fdd453154a4aae29",
+      "zig/lib/vectorindex/src/mod.zig": "57fc88bcdab7db2ed90c9f3028b98b01210095cabb5e7532961659e8bf072b68",
+      "zig/lib/vectorindex/src/types.zig": "f6677d095c169665dcf4fa44b1cb0a960e284372a183d352a3c3cc0687d32a9d",
+      "zig/pkg/antfly-embedded/src/metadata/lake_index_catalog.zig": "ffe68bf6b56919f493501efb6ae6d1881358173e35e079860b167edb96001c39",
+      "zig/pkg/antfly-embedded/src/runtime_failure_abi.zig": "94b6072a3854e60211ce34df4193fd3c09dcd3e96f4b707eccf221a94fde922c",
+      "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_cursor.zig": "e3e73f4076cd4a4b369a93404800efe1122f411603a520562ae0acb02bddb526",
+      "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_page.zig": "9c0147661ad2a255f6008d0d5fb32c399ad720fd4b57a356fbd1e62087cd02be",
+      "zig/pkg/antfly-embedded/src/serverless/query/lake_parquet_vector.zig": "1d1b1f9a7fdc0d68aceeb72a95207349440719f1b0ed6de0711e96aea489c812",
+      "zig/pkg/antfly-embedded/src/sql/memory_budget.zig": "82081d85893c9f5b88d80e84adb59abc0b585eb37cf19b5e83199234408fb5d3",
+      "zig/pkg/antfly-embedded/src/storage/hbc_adapter.zig": "93d8c7413490a5d4baaf21e303e3469a494cc3a840d7115c35e24d216c554837",
+      "zig/pkg/antfly-embedded/src/storage/lsm_backend.zig": "e9ccb56a0cd5c3ffcd48a57f5bfde0901eb148328ddda52946792d1a8e5e3c55",
+      "zig/pkg/antfly-embedded/src/storage/lsm_backend/compaction.zig": "16b645360db8eb98b74f1796546bec5ad1f9d120215d09b7d9a5d743a677808a",
+      "zig/pkg/antfly-embedded/src/storage/lsm_backend/runtime.zig": "f63d7eb603acb0fb0ba14358b19caa4e29345b7c61fba6d0d307265b2ff04ffa",
+      "zig/pkg/antfly-embedded/src/storage/rowsource/types.zig": "d7ab1781bfb0ba81ce48a46014adca770a2e8d7edd566ee6cb3ea2ec702702bc",
+      "zig/pkg/antfly/build/benches.zig": "9e077c1291ff0b597ff2f92f2fed958b21aca72a03103fb0723940c1a4640aa1",
+      "zig/pkg/antfly/build/lake_execution_tests.zig": "3e048c3afb1b2e2eeea0cb3515767fee14bfec2dfe7c27705b25f11a180e92ee",
+      "zig/pkg/antfly/src/api/lake_bulk_stage.zig": "3686ab75b751360043e7622d399ba0395bca5be355ff6e228fc5684252c8324c",
+      "zig/pkg/antfly/src/api/lake_bulk_work.zig": "bac802a94df5a345e632068e243de65b16ae29836eec31e37c1f4c43169525ba",
+      "zig/pkg/antfly/src/api/lake_execution_build_impl.zig": "de4c59d1c6e5045ea5eada5fb11c5c5fd81b6b50caeb0689a177f9bc0852a504",
+      "zig/pkg/antfly/src/api/lake_execution_native_test.zig": "2e06665356a64738d83f835d40924ae3508209735ce3c92dab7b726f2357d9a9",
+      "zig/pkg/antfly/src/api/lake_execution_probe_metrics.zig": "1f0f0e6a3ddf20f2a1be9734481426cb30b44fdc1d187ac4b54b5ea95172d48a",
+      "zig/pkg/antfly/src/api/lake_execution_qualification_support.zig": "e1e3f747a41eb668f5199b53c136ccbbfb13320f0a20e807e86b766f08357479",
+      "zig/pkg/antfly/src/api/lake_execution_runtime_probe.zig": "76486cda443b5cf361ab983104290f298823f35ac3d075d9a8f404fb63bd7ee4",
+      "zig/pkg/antfly/src/api/lake_execution_values.zig": "588a6022bb41880ca8f9a64e7f32373260ee5653d65d7b1d1a8d8c6d271658e1",
+      "zig/pkg/antfly/src/api/lake_index_gc.zig": "3cfa88de0d47c2a5efc102657ec929a0d7049ce21c1d3caa53f5cd1faca5b0cf",
+      "zig/pkg/antfly/src/api/lake_index_gc_progress.zig": "aed5ece592eb383c5bdf8a5a02fb4190cb8abd8902a6315af2c1bc0b19e52de0",
+      "zig/pkg/antfly/src/api/lake_index_native_dense.zig": "3c0d3d48d33c7d4c66d0bd6890e5720fe3ba5494b3801e7712eb0aa043b602bb",
+      "zig/pkg/antfly/src/api/lake_index_native_directory.zig": "113e5780acc9240714bfab20b340f2b07f3030969b8192a0b8a08936837d2b8b",
+      "zig/pkg/antfly/src/api/lake_index_native_files.zig": "8076c98a7108b5438874ae52abf1c818bd15afe72bbd80ac9cc902e53bf59b3d",
+      "zig/pkg/antfly/src/api/lake_index_row_source.zig": "015d6ff2b218dccd6654b2adcfc21445b8a40c6730faee709028b58b027fd48d",
+      "zig/pkg/antfly/src/api/lake_row_identity_build.zig": "e06af6eba45d67297d9698979ba6236f3d2085c08d78fa88239aa10181805bae",
+      "zig/pkg/antfly/src/api/lake_row_input_recipes.zig": "1068b51b518196d68b6a1cebb30df2e037b0acbd3c4841b0b29dcdb11c63beb9",
+      "zig/pkg/antfly/src/api/testdata/lake_vectors_missing.parquet": "3e366bf3a330239419b1c071a06dfe7bc4920277ef31cfb7b5a539b6d1e23153",
+      "zig/pkg/antfly/src/lake_execution_provider_probe_root.zig": "569710718f66aa62ab99eb98f9261c18a25beebe6c58aad696d14ee2370181fc",
+      "zig/tools/bench_hbc_publication.zig": "7493df081ed159f1e370c4af99b4e14ecc41385453a069c1626ecee3d1d3de0b"
+    },
+    "fingerprint": "0dd1c8e95fc8062ee424e7e5a9625766b94e805ccc90616201f9f037c981db8d",
+    "executables": {
+      "qualification-v68-probe": "c2c6d70707d704f4ff184af93d67228f6878f08062754fb2c6df2c8522992b32",
+      "publication-v68": "5a3a132512959b77f1aed38ad7eef0b992f401949dd5a3e98c3810a98908f122"
+    },
+    "note": "Snapshot before final qualification. Docs/evidence may change afterward; production sources must remain identical."
+  },
+  "fully_scaled_complete_10m": {
+    "executable": "zig/.benchmark-results/bulk-builder/qualification-v68-probe",
+    "executable_sha256": "c2c6d70707d704f4ff184af93d67228f6878f08062754fb2c6df2c8522992b32",
+    "parquet": "zig/.benchmark-results/bulk-builder/cohere-10m-input",
+    "parquet_bytes": 31326939213,
+    "parquet_sha256": null,
+    "source_fixture": {
+      "format": "AFOBJ001",
+      "dataset": "VectorDBBench Cohere Large 10M",
+      "files": [
+        {
+          "name": "train-00-of-10.parquet",
+          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-00-of-10.parquet",
+          "bytes": 3132712656,
+          "sha256": "a61cfaeef5ef00bf6e4bfa41e76375c56a9262049d26cfe85accbda1c4235ddb",
+          "etag": "\"fa67c7cffb98c268625d480ab1de8fa3-374\"",
+          "version": "T..E1dkvxBIKg8axg2BAGqkqjOBgmzbg"
+        },
+        {
+          "name": "train-01-of-10.parquet",
+          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-01-of-10.parquet",
+          "bytes": 3132688995,
+          "sha256": "1e73bedcbf453111717b0a18077b45010953edca1f33fe761e49fd71d3870f9d",
+          "etag": "\"1e09a7e47e277e35a30b2e0e6e3a4beb-374\"",
+          "version": "YDYYu9lbsIdKq7DDRdC.xnIHfcYQC_x8"
+        },
+        {
+          "name": "train-02-of-10.parquet",
+          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-02-of-10.parquet",
+          "bytes": 3132687596,
+          "sha256": "e288ada17a746ca093e6bac8c9c20e2b96700d1065907e33efe81d938a63801c",
+          "etag": "\"e1eb2854d008db53e2204b682bddb55d-374\"",
+          "version": "9e35e44_Tdv0wQUDBInm2xzziOF9QOvG"
+        },
+        {
+          "name": "train-03-of-10.parquet",
+          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-03-of-10.parquet",
+          "bytes": 3132679477,
+          "sha256": "1862dbe0aab0a39ceecbd2b13edd152fb60f50ff75ead8718d4cda2c4b81370d",
+          "etag": "\"7922f6efabf9a7b6e07a9b1533dc0bf1-374\"",
+          "version": "p6XOvTTAQQbw.FRcOGngb5hcZRtGvqwr"
+        },
+        {
+          "name": "train-04-of-10.parquet",
+          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-04-of-10.parquet",
+          "bytes": 3132702312,
+          "sha256": "4d9d3e7d9a6ceb116a28a921c0de5e94845f5daf10fdf848558621d49e5c1a54",
+          "etag": "\"ccee8e54b646123b986cb2766fa25a5a-374\"",
+          "version": "kqzls1lgi7gdnrw6mR6WrYt8xLKV77wI"
+        },
+        {
+          "name": "train-05-of-10.parquet",
+          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-05-of-10.parquet",
+          "bytes": 3132683521,
+          "sha256": "6760a8347859a5b4dc97ad6ec25acc3e8d94ec6dee3cccb773436b252d445a37",
+          "etag": "\"d3bd2a8a358fb6f1925284b66528780b-374\"",
+          "version": "z1FKdEW2QwkduF7kpegqphQ8xi3vjHHg"
+        },
+        {
+          "name": "train-06-of-10.parquet",
+          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-06-of-10.parquet",
+          "bytes": 3132691091,
+          "sha256": "5968a585c2587d7856aa81404bf8cd59647f6332ef957bf978b380413fca3c0a",
+          "etag": "\"6ddaa047e7f563bd55f07fb2dfe95450-374\"",
+          "version": "HgBcKI5.svg5FaaTpqzPkcmp1eOrbfQP"
+        },
+        {
+          "name": "train-07-of-10.parquet",
+          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-07-of-10.parquet",
+          "bytes": 3132692641,
+          "sha256": "ebc61b3298f9d89a354d979d447a499cb5f094421d266a33ae1d2050ecfe6d9d",
+          "etag": "\"425ef3e83380ed6076e2b0e0e4b60e97-374\"",
+          "version": "ca_z5iF4hpyiitgrHA3WpfyIUS5NcUjr"
+        },
+        {
+          "name": "train-08-of-10.parquet",
+          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-08-of-10.parquet",
+          "bytes": 3132694246,
+          "sha256": "c0c53b7270bd703b9f66929f77fdca2f84af96c4fd4bfba540dba4e30f5eb081",
+          "etag": "\"87411bafc73861764209bc3328dda21b-374\"",
+          "version": "pU4OWduPwdXcBhVoprfcaUAs_7N3FCAq"
+        },
+        {
+          "name": "train-09-of-10.parquet",
+          "url": "https://assets.zilliz.com/benchmark/cohere_large_10m/train-09-of-10.parquet",
+          "bytes": 3132706678,
+          "sha256": "8e413b470207ac09d553bb6ee7bc5ae056ac121a583d7e9d63f041a2d1cf52b6",
+          "etag": "\"ab9e966c1193d0bd5c5cdecb9bc7c424-374\"",
+          "version": "a.RgT8WCscPn8mPJleheGbOPz8VzyS6."
+        }
+      ],
+      "source_uri": "file://zig/.benchmark-results/bulk-builder/cohere-10m-input"
+    },
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "logical_cpus": 14,
+    "algorithm": "lloyd",
+    "dims": 768,
+    "input_allowance": 42949672960,
+    "identity_spill_allowance": 8589934592,
+    "trials": 1,
+    "variants": [
+      "prebound_parents"
+    ],
+    "ground_truth": {
+      "source_sha256": null,
+      "query_parquet_sha256": "a3b0416f2e7eb0e932a0f15f75ed25c76d53777cd7e52d74b1b2e62066f46a4c",
+      "sources": [
+        {
+          "name": "train-00-of-10.parquet",
+          "rows": 1000000,
+          "sha256": "a61cfaeef5ef00bf6e4bfa41e76375c56a9262049d26cfe85accbda1c4235ddb"
+        },
+        {
+          "name": "train-01-of-10.parquet",
+          "rows": 1000000,
+          "sha256": "1e73bedcbf453111717b0a18077b45010953edca1f33fe761e49fd71d3870f9d"
+        },
+        {
+          "name": "train-02-of-10.parquet",
+          "rows": 1000000,
+          "sha256": "e288ada17a746ca093e6bac8c9c20e2b96700d1065907e33efe81d938a63801c"
+        },
+        {
+          "name": "train-03-of-10.parquet",
+          "rows": 1000000,
+          "sha256": "1862dbe0aab0a39ceecbd2b13edd152fb60f50ff75ead8718d4cda2c4b81370d"
+        },
+        {
+          "name": "train-04-of-10.parquet",
+          "rows": 1000000,
+          "sha256": "4d9d3e7d9a6ceb116a28a921c0de5e94845f5daf10fdf848558621d49e5c1a54"
+        },
+        {
+          "name": "train-05-of-10.parquet",
+          "rows": 1000000,
+          "sha256": "6760a8347859a5b4dc97ad6ec25acc3e8d94ec6dee3cccb773436b252d445a37"
+        },
+        {
+          "name": "train-06-of-10.parquet",
+          "rows": 1000000,
+          "sha256": "5968a585c2587d7856aa81404bf8cd59647f6332ef957bf978b380413fca3c0a"
+        },
+        {
+          "name": "train-07-of-10.parquet",
+          "rows": 1000000,
+          "sha256": "ebc61b3298f9d89a354d979d447a499cb5f094421d266a33ae1d2050ecfe6d9d"
+        },
+        {
+          "name": "train-08-of-10.parquet",
+          "rows": 1000000,
+          "sha256": "c0c53b7270bd703b9f66929f77fdca2f84af96c4fd4bfba540dba4e30f5eb081"
+        },
+        {
+          "name": "train-09-of-10.parquet",
+          "rows": 1000000,
+          "sha256": "8e413b470207ac09d553bb6ee7bc5ae056ac121a583d7e9d63f041a2d1cf52b6"
+        }
+      ],
+      "vectors": 10000000,
+      "dims": 768,
+      "queries": 100,
+      "k": 100,
+      "metric": "squared_l2",
+      "normalization": "none",
+      "accumulation": "float64",
+      "exact_scan_ns": 62595019625,
+      "preparation_ns": 78007314084,
+      "outputs": {
+        "queries.f32": "ecf5188847af048a077f497acbd251d0554f753f2561eb1603b99dbe671131b7",
+        "truth.u64": "997e980c47630ade53ee7a748283a9e3269dead9e8fa80d2818e5721ef34de25"
+      },
+      "numpy": "2.5.4"
+    },
+    "operation_scope": "Complete native build call including identity, source/checkpoint work, clustering, and artifact candidate; excludes fixture framing, final metadata CAS, and reopened recall",
+    "subprocess_scope": "Entire probe including fixture framing, source opening, construction, reopen, raw recall, and teardown",
+    "results": [
+      {
+        "trial": 0,
+        "variant": "prebound_parents",
+        "fused": true,
+        "compact": false,
+        "prebind_parents": true,
+        "process_exit_code": 0,
+        "qualified": true,
+        "subprocess_wall_ns": 1853347762625,
+        "subprocess_user_ns": 1061429992000,
+        "subprocess_system_ns": 358171392000,
+        "subprocess_peak_rss_bytes": 4536270848,
+        "load_before": [
+          10.3046875,
+          9.2822265625,
+          9.84521484375
+        ],
+        "load_after": [
+          11.00732421875,
+          11.71044921875,
+          10.751953125
+        ],
+        "log": "zig/.benchmark-results/bulk-builder/pipeline-v68-10m/lloyd-0-prebound_parents.log",
+        "vectors": 10000000,
+        "dims": 768,
+        "algorithm": "lloyd",
+        "total_ns": 1671738962000,
+        "reopened_hits": 10,
+        "checkpoints": 2,
+        "logical_identity": true,
+        "build_mode": {
+          "caller": "fast",
+          "caller_value": 1,
+          "provider": 1,
+          "provider_is_test": false
+        },
+        "phases": [
+          {
+            "names": [
+              "identity",
+              "fragments",
+              "spool",
+              "aggregate",
+              "ordered",
+              "text",
+              "sparse",
+              "dense",
+              "bulk_tee",
+              "bulk_receipt",
+              "dense_ingest",
+              "dense_cluster",
+              "dense_checkpoint",
+              "dense_upload"
+            ],
+            "ns": [
+              654558917000,
+              0,
+              0,
+              167000,
+              291000,
+              566000,
+              189000,
+              504853944000,
+              64018827000,
+              512261685000,
+              12000,
+              446711373000,
+              27911041000,
+              13637511000
+            ],
+            "calls": [
+              1,
+              0,
+              0,
+              1,
+              1,
+              1,
+              1,
+              1,
+              3770,
+              1,
+              1,
+              1,
+              1,
+              1
+            ]
+          }
+        ],
+        "work": [
+          {
+            "identity_census_verified": true,
+            "identity_read_bytes": 240000000,
+            "identity_written_bytes": 360000000,
+            "identity_merge_inputs": 32,
+            "projection_cache_peak_bytes": 685,
+            "owned_index_count": 0,
+            "partition_bytes": 184896060340,
+            "partition_read_bytes": 216716060340,
+            "compact_rows": 0,
+            "projection_commit_ns": 31103407000,
+            "save_node_ns": 0,
+            "update_parent_ns": 0,
+            "update_parent_calls": 0,
+            "training_ns": 73610173000,
+            "routing_ns": 288821555000,
+            "allocator_peak_bytes": 56808054
+          }
+        ],
+        "source_reuse": [
+          {
+            "runs": 153,
+            "reused_runs": 153,
+            "reused_bytes": 31551639070,
+            "new_bytes": 0
+          }
+        ],
+        "projection": [
+          {
+            "runs": 582,
+            "bytes": 2688259211
+          }
+        ],
+        "memory": [
+          {
+            "dense_allocator_peak_bytes": 214404617,
+            "source_allocator_peak_bytes": 43946903,
+            "max_vector_allocator_peak_bytes": 214404617
+          }
+        ],
+        "recall": [
+          {
+            "queries": 100,
+            "probes": 512,
+            "k": 100,
+            "hits": 6100,
+            "recall": 0.61,
+            "scored": 4877634,
+            "elapsed_ns": 29894014000
+          },
+          {
+            "queries": 100,
+            "probes": 1024,
+            "k": 100,
+            "hits": 7200,
+            "recall": 0.72,
+            "scored": 9772196,
+            "elapsed_ns": 15282409000
+          },
+          {
+            "queries": 100,
+            "probes": 2048,
+            "k": 100,
+            "hits": 8237,
+            "recall": 0.8237,
+            "scored": 19568938,
+            "elapsed_ns": 24119739000
+          },
+          {
+            "queries": 100,
+            "probes": 4096,
+            "k": 100,
+            "hits": 8996,
+            "recall": 0.8996,
+            "scored": 39137008,
+            "elapsed_ns": 27464020000
+          },
+          {
+            "queries": 100,
+            "probes": 8192,
+            "k": 100,
+            "hits": 9479,
+            "recall": 0.9479,
+            "scored": 78146479,
+            "elapsed_ns": 26440759000
+          },
+          {
+            "queries": 100,
+            "probes": 16384,
+            "k": 100,
+            "hits": 9683,
+            "recall": 0.9683,
+            "scored": 155512385,
+            "elapsed_ns": 35416514000
+          }
+        ],
+        "cache_retention_target_bytes": 16777216,
+        "cache_target_exceeded": false
+      }
+    ],
+    "median_total_ns": {
+      "prebound_parents": 1671738962000
+    },
+    "median_subprocess_cpu_ns": {
+      "prebound_parents": 1419601384000
+    }
+  },
+  "fully_scaled_complete_1m": {
+    "executable": "zig/.benchmark-results/bulk-builder/qualification-v68-probe",
+    "executable_sha256": "c2c6d70707d704f4ff184af93d67228f6878f08062754fb2c6df2c8522992b32",
+    "parquet": "zig/.benchmark-results/cohere-1m/parquet/train.parquet",
+    "parquet_bytes": 3131995162,
+    "parquet_sha256": "de6b84eb08fc5203a56eef619970a14f5cae08d0a0ae0bcd23b8058d7045f381",
+    "source_fixture": null,
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "logical_cpus": 14,
+    "algorithm": "lloyd",
+    "dims": 768,
+    "input_allowance": 4294967296,
+    "identity_spill_allowance": null,
+    "trials": 1,
+    "variants": [
+      "prebound_parents"
+    ],
+    "ground_truth": {
+      "vectors": 1000000,
+      "dims": 768,
+      "queries": 100,
+      "k": 100,
+      "metric": "squared_l2",
+      "normalization": "none",
+      "accumulation": "float64",
+      "exact_scan_ns": 7147362750,
+      "outputs": {
+        "queries.f32": "77e11737740de02c77d64eeac80b393cfa16ba86fbbd85a2f8554f282407f821",
+        "truth.u64": "1e81bead6d24e20f58666b70ed31a6c0158527fc17ced968e2cdded7c45f6bd5"
+      },
+      "numpy": "2.5.4",
+      "source_sha256": "de6b84eb08fc5203a56eef619970a14f5cae08d0a0ae0bcd23b8058d7045f381",
+      "query_parquet_sha256": "a2ec76c907da22e5533ce31c1105e4fd4d3c4597915a7771d5e41897a95ecbed"
+    },
+    "operation_scope": "Complete native build call including identity, source/checkpoint work, clustering, and artifact candidate; excludes fixture framing, final metadata CAS, and reopened recall",
+    "subprocess_scope": "Entire probe including fixture framing, source opening, construction, reopen, raw recall, and teardown",
+    "results": [
+      {
+        "trial": 0,
+        "variant": "prebound_parents",
+        "fused": true,
+        "compact": false,
+        "prebind_parents": true,
+        "process_exit_code": 0,
+        "qualified": true,
+        "subprocess_wall_ns": 197031758959,
+        "subprocess_user_ns": 123169705000,
+        "subprocess_system_ns": 45618593000,
+        "subprocess_peak_rss_bytes": 708739072,
+        "load_before": [
+          8.4365234375,
+          9.1748046875,
+          10.03515625
+        ],
+        "load_after": [
+          9.9970703125,
+          9.1904296875,
+          9.81982421875
+        ],
+        "log": "zig/.benchmark-results/bulk-builder/pipeline-v68-optimized/lloyd-0-prebound_parents.log",
+        "vectors": 1000000,
+        "dims": 768,
+        "algorithm": "lloyd",
+        "total_ns": 143499317000,
+        "reopened_hits": 10,
+        "checkpoints": 2,
+        "logical_identity": true,
+        "build_mode": {
+          "caller": "fast",
+          "caller_value": 1,
+          "provider": 1,
+          "provider_is_test": false
+        },
+        "phases": [
+          {
+            "names": [
+              "identity",
+              "fragments",
+              "spool",
+              "aggregate",
+              "ordered",
+              "text",
+              "sparse",
+              "dense",
+              "bulk_tee",
+              "bulk_receipt",
+              "dense_ingest",
+              "dense_cluster",
+              "dense_checkpoint",
+              "dense_upload"
+            ],
+            "ns": [
+              60710407000,
+              0,
+              0,
+              11000,
+              45000,
+              60000,
+              50000,
+              35077357000,
+              7084505000,
+              47670488000,
+              10000,
+              30734519000,
+              1698783000,
+              1489075000
+            ],
+            "calls": [
+              1,
+              0,
+              0,
+              1,
+              1,
+              1,
+              1,
+              1,
+              377,
+              1,
+              1,
+              1,
+              1,
+              1
+            ]
+          }
+        ],
+        "work": [
+          {
+            "identity_census_verified": true,
+            "identity_read_bytes": 12000000,
+            "identity_written_bytes": 24000000,
+            "identity_merge_inputs": 4,
+            "projection_cache_peak_bytes": 685,
+            "owned_index_count": 0,
+            "partition_bytes": 13484934160,
+            "partition_read_bytes": 16666934160,
+            "compact_rows": 0,
+            "projection_commit_ns": 2528298000,
+            "save_node_ns": 0,
+            "update_parent_ns": 0,
+            "update_parent_calls": 0,
+            "training_ns": 7377038000,
+            "routing_ns": 17113007000,
+            "allocator_peak_bytes": 54177741
+          }
+        ],
+        "source_reuse": [
+          {
+            "runs": 16,
+            "reused_runs": 16,
+            "reused_bytes": 3155157339,
+            "new_bytes": 0
+          }
+        ],
+        "projection": [
+          {
+            "runs": 60,
+            "bytes": 263759900
+          }
+        ],
+        "memory": [
+          {
+            "dense_allocator_peak_bytes": 54177741,
+            "source_allocator_peak_bytes": 39924108,
+            "max_vector_allocator_peak_bytes": 54177741
+          }
+        ],
+        "recall": [
+          {
+            "queries": 100,
+            "probes": 512,
+            "k": 100,
+            "hits": 8500,
+            "recall": 0.85,
+            "scored": 4862910,
+            "elapsed_ns": 9690981000
+          },
+          {
+            "queries": 100,
+            "probes": 1024,
+            "k": 100,
+            "hits": 9336,
+            "recall": 0.9336,
+            "scored": 9734804,
+            "elapsed_ns": 9173447000
+          },
+          {
+            "queries": 100,
+            "probes": 2048,
+            "k": 100,
+            "hits": 9758,
+            "recall": 0.9758,
+            "scored": 19424194,
+            "elapsed_ns": 9372118000
+          },
+          {
+            "queries": 100,
+            "probes": 4096,
+            "k": 100,
+            "hits": 9898,
+            "recall": 0.9898,
+            "scored": 38548203,
+            "elapsed_ns": 9875511000
+          },
+          {
+            "queries": 100,
+            "probes": 8192,
+            "k": 100,
+            "hits": 9916,
+            "recall": 0.9916,
+            "scored": 75782229,
+            "elapsed_ns": 11140787000
+          }
+        ],
+        "cache_retention_target_bytes": 16777216,
+        "cache_target_exceeded": false
+      }
+    ],
+    "median_total_ns": {
+      "prebound_parents": 143499317000
+    },
+    "median_subprocess_cpu_ns": {
+      "prebound_parents": 168788298000
+    }
+  },
+  "fully_scaled_publication_output_check": {
+    "executable_sha256": "5a3a132512959b77f1aed38ad7eef0b992f401949dd5a3e98c3810a98908f122",
+    "projection_runs": 582,
+    "projection_bytes": 2688259211,
+    "results": [
+      {
+        "mode": "adaptive",
+        "trial": 0,
+        "exit_code": 0,
+        "subprocess_wall_ns": 28898000250,
+        "user_ns": 15786644000,
+        "system_ns": 6175646000,
+        "peak_rss_bytes": 363429888,
+        "load_before": [
+          7.61083984375,
+          9.1240234375,
+          10.0498046875
+        ],
+        "load_after": [
+          8.3876953125,
+          9.17822265625,
+          10.04150390625
+        ],
+        "log": "zig/.benchmark-results/bulk-builder/publication-10m-v68-0-adaptive.log",
+        "qualified": true,
+        "result": {
+          "mode": "adaptive",
+          "dims": 768,
+          "vectors": 10000000,
+          "publication_ns": 28197319167,
+          "run_entry_limit": 65536,
+          "initial_peak_bytes": 172982072,
+          "publication_peak_bytes": 214091078,
+          "projection_runs_before": 582,
+          "projection_runs_after": 582,
+          "allocator_peak_bytes": 214091078,
+          "allocator_limit_bytes": 268435456,
+          "cache_bytes": 16777216,
+          "exact_source_loads": 0,
+          "metadata_samples": 100,
+          "segments": 1,
+          "current_sha256": "12580d812e52e94e9281f8ba88bed92c4c39c758c6728771f910a3f779824a41",
+          "builtin_is_test": false,
+          "optimize": "fast"
+        },
+        "segment_content": {
+          "segment-1.afps": {
+            "bytes": 3739924279,
+            "sha256": "5c170cb428b585e7ac274a817a6e16c5e1456f693f5dbac00cbd60b26d43602a"
+          }
+        }
+      }
+    ],
+    "scope": "Final reviewed publication. Immutable segment SHA256 checks run in the parent after each child exits and before the next child starts, outside both child timers. Final adaptive output check; the five-trial component comparison is retained separately as v67. Publication allocator window is measured separately from pre-sampling and whole-process ownership. Fresh disposable clones of the same sealed 10M projection. Publication timer includes consolidation when enabled; subprocess includes open, metadata sampling, reopen and verification. Shared workstation. No own builds or cleanup during measurements."
+  },
+  "fully_scaled_ten_million_recall_and_scored_counts_equal_v67": true
 }
