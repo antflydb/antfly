@@ -294,6 +294,16 @@ consumer index's readiness before using the new space. A successful request
 that starts a bounded pass is not proof that the whole table has migrated.
 Source updates, deletions, and producer generations fence delayed work at
 publication, so a late response must pass the current source and producer guards.
+Each explicit embedding reprocess advances a document/producer epoch that is
+never reset by model configuration changes or rollbacks. The epoch is checked
+in the transaction that publishes a vector;
+unchanged source bytes and an identical model revision do not make an old A
+completion part of a later A reprocess generation. Synchronous repair retries
+also bind computed work to the target captured before inference. A changed
+producer definition fences older completions even when the source bytes and
+model revision stay the same. Cleanup and coverage updates carry the same
+source and reprocess guards, so obsolete work cannot retire a newer vector
+or credit that work as ready.
 
 `publication_policy: "atomic"` controls validation and activation of a new index
 generation. It does not make arbitrary producer mapping edits a transaction
