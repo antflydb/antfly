@@ -76,30 +76,45 @@ A model-aware source field can hold a versioned local file reference:
 }
 ```
 
-The file must be visible at the same absolute path to storage and inference.
-Standalone desktop deployments share that filesystem. Configure an explicit
-`remote_content.security.allowed_paths` allowlist in storage and the worker's
-content-security allowlist when inference runs separately. Storage acquires the
-current remote-content policy on every extraction, including continuation and
-repair; the worker independently authorizes the open descriptor. Both lexical
-path boundaries and canonical descriptor paths are checked, including symlink
-escapes. Empty or omitted path allowlists deny access. Worker policy remains
-an independent ceiling: storage policy reload cannot grant paths the worker
-does not allow.
+The file must be visible at the absolute path on the inference host. Storage
+checks the lexical path against its current `remote_content.security.allowed_paths`
+policy before each dispatch, including continuation and repair. The inference
+reader independently checks both the lexical path and the canonical open
+descriptor path, rejecting symlink escapes and nonregular files. Empty or omitted
+path allowlists deny access. Standalone inference inherits a fresh trusted
+snapshot of the storage policy on each request, including requests sent through
+the supervised worker. Explicit inference content-security configuration retains
+precedence; separately deployed inference must configure its own allowlist.
+Storage does not open the file and need not mount the inference filesystem.
 
 The worker verifies the caller's SHA-256 using a 256 KiB streaming buffer and
 retains the descriptor for that request. Media parsing uses the existing paged
 range reader; the file size can exceed `max_download_size_bytes`, which bounds
 individual ranges. A fixed 64-entry process-local verification cache avoids
 rehashing unchanged files on continuation pages. Cache hits still reopen and
-authorize the file and compare inode, size, mtime and ctime. Cache misses and
-metadata changes require a fresh hash; receipts never survive process restart.
-No file contents or decoded media are retained by this cache.
+authorize the file and compare inode, size, mtime and ctime. Concurrent cold
+requests for the same file share one verification; unrelated files verify
+independently. The cache records the actual digest independently of the caller's
+claim, so incorrect claims cannot trigger repeated scans of unchanged bytes.
+At most 64 distinct verifications can be outstanding; saturation returns a
+retryable resource error. Cancelled waiters release their slots. Cache misses
+and metadata changes require a fresh hash; receipts never survive process
+restart. No file contents or decoded media are retained by this cache.
 
 Checks around each range read and at request completion reject modifications
 with `SourceVersionChanged`, including when read-ahead served the final bytes.
 This relies on a filesystem that updates mtime/ctime for writes; it is not a
 snapshot against a privileged writer or a filesystem that conceals mutations.
-As with other local-file fetches, explicit hard I/O deadlines fail with
-`FileTimeoutUnsupported`; cancellation is checked between file operations.
+Server requests retain their execution deadline while a supervised process
+boundary covers filesystem operations, including open, stat, reads and close.
+Embedded callers can supply their execution-control boundary; generic callers
+without one receive `FileTimeoutUnsupported` for finite hard I/O deadlines.
+Cancellation is checked between operations and while waiting for verification.
 Use a source object for local media: a plain `file://` string remains text.
+
+The transport regression benchmark streams a 128 MiB fixture without allocating
+the whole file. It checks one cold hash, warm paging with a 32 KiB allocator,
+three 4 KiB reads across the file, and reuse after an incorrect digest claim.
+On the development machine the cold verification took 648 ms and the warm open
+plus reads took 1 ms, using 1,646 allocator bytes. These are local filesystem
+measurements, excluding media decoding and model execution.

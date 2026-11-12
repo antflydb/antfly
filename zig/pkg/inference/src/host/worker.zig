@@ -136,6 +136,7 @@ pub fn invokeProvider(client: *Client, context: *const bridge.ProviderInvokeCont
     defer if (document_key) |key| client.unregisterDocumentStore(key);
     var input = try wire.ProviderInput.init(arena.allocator(), context);
     input.options.document_store = document_key;
+    input.options.content_security_json = context.content_security_json.slice() orelse try client.content_security_source.copy(arena.allocator());
     const data = try std.json.Stringify.valueAlloc(arena.allocator(), input.options, .{});
     const response = try client.invokePayload(.provider, data, .{ .body_segments = input.body.segments }, control.view());
     defer response.deinit();
@@ -182,7 +183,9 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
     for (source_params, params) |param, *out| out.* = .{ .name = param.name.slice(), .value = param.value.slice() };
     const document_key = try client.registerDocumentStore(context.document_store);
     defer if (document_key) |key| client.unregisterDocumentStore(key);
+    const security_json = context.content_security_json.slice() orelse try client.content_security_source.copy(alloc);
     const data = try std.json.Stringify.valueAlloc(alloc, wire.Http{
+        .content_security_json = security_json,
         .document_store = document_key,
         .route = route,
         .method = context.request.method,
@@ -238,6 +241,7 @@ pub const Client = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
     create_json: []u8,
+    content_security_source: bridge.ContentSecuritySource = .{},
     environment: std.process.Environ.Map,
     mutex: std.Io.Mutex = .init,
     worker: ?*Worker = null,
@@ -292,7 +296,7 @@ pub const Client = struct {
             try environment.put(entry.name, entry.value);
         }
         const self = try alloc.create(Client);
-        self.* = .{ .alloc = alloc, .io = io, .create_json = json, .environment = environment };
+        self.* = .{ .alloc = alloc, .io = io, .create_json = json, .environment = environment, .content_security_source = context.content_security_source };
         return self;
     }
 
@@ -804,6 +808,7 @@ const Child = struct {
                     .abi_version = bridge.abi_version,
                     .handle = state,
                     .operation = provider.operation,
+                    .content_security_json = .init(provider.content_security_json),
                     .request_json = .init(media.metadata),
                     .deadline_ns = provider.deadline_ns orelse 0,
                     .has_deadline = @intFromBool(provider.deadline_ns != null),
@@ -862,6 +867,7 @@ const Child = struct {
                 try host.linkedInferenceHandleHttp(&.{
                     .abi_version = bridge.abi_version,
                     .route_handle = route_handle,
+                    .content_security_json = .init(incoming.content_security_json),
                     .request = &view,
                     .document_store = if (documents) |binding| binding.view() else .{},
                     .cancellation = .{ .context = request, .is_cancelled = cancelled },

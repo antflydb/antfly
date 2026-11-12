@@ -50,6 +50,7 @@ pub const LinkedInferenceState = struct {
     worker: ?*worker_runtime.Client = null,
     warm_models: ResolvedWarmModels,
     content_security: ?std.json.Parsed(scraping.ContentSecurityConfig),
+    content_security_source: inference_bridge.ContentSecuritySource = .{},
     s3_credentials: ?std.json.Parsed(scraping.S3CredentialsConfig),
     runtime_config: std.json.Parsed(InferenceRuntimeConfig),
     owned_models_dir: ?[]u8,
@@ -807,7 +808,9 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
     const use_worker = !supervised and !@import("builtin").is_test and
         runtime_config.value.embedded_enabled and
         context.execution_host == .server and
-        inference.backends.BackendRuntime.availableHasUninterruptibleCalls();
+        (inference.backends.BackendRuntime.availableHasUninterruptibleCalls() or
+            context.content_security_source.acquire != null or
+            (if (content_security) |parsed| if (parsed.value.allowed_paths) |paths| paths.len != 0 else false else false));
 
     const state = try alloc.create(LinkedInferenceState);
     errdefer alloc.destroy(state);
@@ -887,6 +890,7 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
         .node = undefined,
         .warm_models = warm_models,
         .content_security = content_security,
+        .content_security_source = context.content_security_source,
         .s3_credentials = s3_credentials,
         .runtime_config = runtime_config,
         .owned_models_dir = owned_models_dir,
@@ -976,6 +980,9 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         context.out_response_json.* = .init(json);
         return;
     }
+    const owned_security = if (context.content_security_json.slice() == null) try state.content_security_source.copy(state.alloc) else null;
+    defer if (owned_security) |bytes| state.alloc.free(bytes);
+    const security_json = context.content_security_json.slice() orelse owned_security;
     const operation = std.enums.fromInt(inference_bridge.ProviderOperation, context.operation) orelse
         return error.UnsupportedOperation;
     const request_json = context.request_json.slice();
@@ -1006,6 +1013,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
     };
     var progress_adapter = ProgressAdapter{ .view = context.progress };
     const execution_control = inference.InferenceExecutionControl{
+        .content_security_json = security_json,
         .document_store = context.document_store,
         .deadline_ns = deadline_ns,
         // Give any model's current native call time to reach a safe boundary
@@ -2129,6 +2137,13 @@ fn localInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         defer response.alloc.free(response.header_views);
         return response.response;
     }
+    const owned_security = try route.owner.content_security_source.copy(context.allocator);
+    defer if (owned_security) |bytes| context.allocator.free(bytes);
+    var security_json = owned_security;
+    if (security_json) |*bytes| try context.setData("antfly.content_security_json", @ptrCast(bytes), null);
+    defer if (security_json != null) {
+        if (context.data) |*data| _ = data.remove("antfly.content_security_json");
+    };
     return route.handler.invoke(context);
 }
 
@@ -2166,6 +2181,10 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
     var http_context = httpx.Context.init(alloc, state.io, &http_request);
     defer http_context.deinit();
     http_context.params = params;
+    const owned_security = if (context.content_security_json.slice() == null and state.worker == null) try state.content_security_source.copy(alloc) else null;
+    defer if (owned_security) |bytes| alloc.free(bytes);
+    var security_json = context.content_security_json.slice() orelse owned_security;
+    if (security_json) |*bytes| try http_context.setData("antfly.content_security_json", @ptrCast(@constCast(bytes)), null);
     if (context.document_store.configured()) try http_context.setData("antfly.document_store", @ptrCast(@constCast(&context.document_store)), null);
     runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
     var response = if (state.worker) |worker| remote: {
@@ -4440,4 +4459,79 @@ test "linked embedding audio MIME hints match public and native grouped vectors"
     const grouped = inference.embedding_gemma2_pipeline;
     try std.testing.expectError(error.AudioTooLarge, grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{ .{ .text = "Describe this tone" }, .{ .audio = .{ .bytes = padded, .decode_options = .{ .mime_hint = "audio/mpeg" } } } } }, .{ .max_audio_decode_working_bytes = 1 }, loaded.embeddingExecutionLock(), node.bindExecutionControl(std.testing.io, .{})));
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "local source policy reload reaches the real provider ABI with finite deadlines" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "media", .data = "0123456789" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const uri = try std.fmt.allocPrint(a, "file://{s}/media", .{root});
+    defer a.free(uri);
+    const paths = [_][]u8{root};
+    const allowed = try std.json.Stringify.valueAlloc(a, .{ .allowed_paths = paths }, .{});
+    defer a.free(allowed);
+    const Publisher = struct {
+        json: []const u8 = "{\"allowed_paths\":[]}",
+        failed: bool = false,
+        fn acquire(raw: ?*anyopaque, out: *inference_bridge.String) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.failed) return inference_bridge.statusFromError(error.ResourceTemporarilyUnavailable);
+            out.* = .init(self.json);
+            return .ok;
+        }
+        fn release(_: ?*anyopaque, _: inference_bridge.String) callconv(.c) void {}
+    };
+    var publisher: Publisher = .{};
+    var out: ?*anyopaque = null;
+    const handle = try linkedInferenceCreate(&.{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = root.ptr,
+        .data_dir_len = root.len,
+        .models_dir = .init(root),
+        .ml_dir = .init(root),
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = 0,
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .init("{\"allowed_paths\":[]}"),
+        .s3_credentials_json = .{},
+        .runtime_config_json = .init("{}"),
+        .executor = .init(&io),
+        .out_handle = &out,
+        .execution_host = .embedded,
+        .content_security_source = .{ .context = &publisher, .acquire = Publisher.acquire, .release = Publisher.release },
+    });
+    defer linkedInferenceDestroy(handle);
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    // Admission uses a local test owner; request decoding and callback dispatch
+    // remain the production ABI implementation, including policy acquisition.
+    state.node.deinit();
+    state.node = try inference.server.Node.init(a, .{ .models_dir = root, .native_call_policy = .in_process, .content_security = .{ .allowed_paths = &.{} } });
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("0123456789", &digest, .{});
+    const version = std.fmt.bytesToHex(digest, .lower);
+    const request = try std.json.Stringify.valueAlloc(a, ChunkInputRequest{ .model = "", .input = .{ .source = .{ .uri = uri, .mime_type = "video/mp4", .version = &version, .version_kind = .file_sha256, .length = 10 } }, .config = .{ .provider = .antfly, .page = true, .max_chunks = 1, .embedding = .{ .model = "" } } }, .{});
+    defer a.free(request);
+    var response: ?*anyopaque = null;
+    var json: inference_bridge.String = undefined;
+    const invoke = inference_bridge.ProviderInvokeContext{ .abi_version = inference_bridge.abi_version, .handle = handle, .operation = @backingInt(inference_bridge.ProviderOperation.chunk_input), .request_json = .init(request), .deadline_ns = platform_time.monotonicNs() + 60 * std.time.ns_per_s, .has_deadline = 1, .out_response_handle = &response, .out_response_json = &json };
+    try std.testing.expectError(error.PathNotAllowed, linkedInferenceInvokeProvider(&invoke));
+    publisher.json = allowed;
+    try std.testing.expectError(error.InvalidChunkModel, linkedInferenceInvokeProvider(&invoke));
+    publisher.json = "{\"allowed_paths\":[]}";
+    try std.testing.expectError(error.PathNotAllowed, linkedInferenceInvokeProvider(&invoke));
+    publisher.failed = true;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, linkedInferenceInvokeProvider(&invoke));
+    try std.testing.expect(response == null);
 }
