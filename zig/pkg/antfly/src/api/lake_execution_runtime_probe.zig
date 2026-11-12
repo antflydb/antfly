@@ -280,6 +280,36 @@ fn runParquet(io: std.Io, uri: []const u8) !void {
     defer binding.deinit(a);
     var source = try local.serverless_query_lake_serving.ServingSource.openWithContext(a, .{ .storage_mode = .relational, .external_base_source = binding }, source_options.lakeOptions(), context);
     defer source.deinit();
+    const InputFile = struct { uri: []const u8, bytes: u64, version: []const u8, etag: []const u8 };
+    const input_files = try a.alloc(InputFile, source.inventory.files.len);
+    defer a.free(input_files);
+    for (input_files, source.inventory.files) |*file, entry| file.* = .{ .uri = entry.object_uri, .bytes = entry.byte_len, .version = entry.version_id, .etag = entry.etag };
+    const input_json = try std.json.Stringify.valueAlloc(a, .{ .files = input_files }, .{});
+    defer a.free(input_json);
+    // Pending publication and provider admission bind this inventory's source
+    // signature. Qualification must check the full set, including vectorless files.
+    std.debug.print("PARQUET_BULK_INVENTORY {s}\n", .{input_json});
+    if (std.c.getenv("ANTFLY_LAKE_BULK_EXPECTED_INVENTORY")) |raw| {
+        const expected_bytes = try cwd.readFileAlloc(io, std.mem.span(raw), a, .limited(16 * 1024 * 1024));
+        defer a.free(expected_bytes);
+        var expected = try std.json.parseFromSlice([]const InputFile, a, expected_bytes, .{});
+        defer expected.deinit();
+        if (expected.value.len != input_files.len) return error.ProbeSourceInventoryMismatch;
+        const matched = try a.alloc(bool, expected.value.len);
+        defer a.free(matched);
+        @memset(matched, false);
+        for (input_files) |actual| {
+            const position = for (expected.value, 0..) |admitted, i| {
+                if (!matched[i] and std.mem.eql(u8, actual.uri, admitted.uri)) break i;
+            } else return error.ProbeSourceInventoryMismatch;
+            const admitted = expected.value[position];
+            if (actual.bytes != admitted.bytes) return error.ProbeSourceInventoryMismatch;
+            if (actual.version.len != 0) {
+                if (!std.mem.eql(u8, actual.version, admitted.version) or (actual.etag.len != 0 and !std.mem.eql(u8, actual.etag, admitted.etag))) return error.ProbeSourceInventoryMismatch;
+            } else if (admitted.etag.len == 0 or !std.mem.eql(u8, actual.etag, admitted.etag)) return error.ProbeSourceInventoryMismatch;
+            matched[position] = true;
+        }
+    }
     const pending = try publication.beginWithLocator(a, io, state.table, &source, store.identity, context, 100, 1000, store.locator);
     defer a.free(pending);
     const reopen_only = support.enabled("ANTFLY_LAKE_BULK_REOPEN_ONLY");

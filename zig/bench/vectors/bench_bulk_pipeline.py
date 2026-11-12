@@ -62,6 +62,54 @@ def write_report(path, report):
     os.replace(temporary, path)
 
 
+def probe_environment():
+    # A case owns every probe control. Preserve ordinary credentials/proxies,
+    # but do not inherit stale local-source, compact, resume or headroom modes.
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("ANTFLY_LAKE_BULK_", "ANTFLY_LAKE_PROBE_"))
+    }
+
+
+BULK_PHASE_NAMES = (
+    "identity",
+    "fragments",
+    "spool",
+    "aggregate",
+    "ordered",
+    "text",
+    "sparse",
+    "dense",
+    "bulk_tee",
+    "bulk_receipt",
+    "dense_ingest",
+    "dense_cluster",
+    "dense_checkpoint",
+    "dense_upload",
+)
+
+
+def validate_phases(
+    records, required=("identity", "dense_cluster", "dense_checkpoint")
+):
+    if len(records) != 1:
+        raise ValueError("missing or duplicate phase records")
+    phase = records[0]
+    names, times, calls = (phase.get(key) for key in ("names", "ns", "calls"))
+    if (
+        not all(isinstance(value, list) for value in (names, times, calls))
+        or not all(isinstance(name, str) for name in names)
+        or not set(required).issubset(names)
+        or len(names) != len(set(names))
+        or len(names) != len(times)
+        or len(names) != len(calls)
+        or any(type(value) is not int or value < 0 for value in times + calls)
+    ):
+        raise ValueError("incomplete or invalid phase attribution")
+    return dict(zip(names, calls))
+
+
 def validate_recall(records, truth):
     if not 5 <= len(records) <= 9 or [r["probes"] for r in records] != [
         512 << i for i in range(len(records))
@@ -207,7 +255,7 @@ def main():
                     raise ValueError("benchmark executable changed after preflight")
             validate_truth(args.recall, truth_manifest, args.dims)
             env = dict(
-                os.environ,
+                probe_environment(),
                 ANTFLY_LAKE_BULK_RECALL_DIR=str(args.recall.resolve()),
                 ANTFLY_LAKE_BULK_DIMS=str(args.dims),
                 ANTFLY_LAKE_BULK_INPUT_BYTES=str(args.allowance),
@@ -334,18 +382,7 @@ def main():
                 if len(records["PARQUET_BULK_WORK"]) != 1:
                     raise RuntimeError(f"missing construction work evidence: {log}")
                 validate_recall(records["PARQUET_BULK_RECALL"], truth_manifest)
-                phases = records["PARQUET_BULK_PHASES"]
-                if (
-                    len(phases) != 1
-                    or not {"identity", "dense_cluster", "dense_checkpoint"}.issubset(
-                        phases[0]["names"]
-                    )
-                    or len(phases[0]["names"]) != len(set(phases[0]["names"]))
-                    or len(phases[0]["names"]) != len(phases[0]["ns"])
-                    or len(phases[0]["names"]) != len(phases[0]["calls"])
-                    or any(v < 0 for v in phases[0]["ns"] + phases[0]["calls"])
-                ):
-                    raise RuntimeError(f"incomplete phase attribution: {log}")
+                validate_phases(records["PARQUET_BULK_PHASES"])
                 if (
                     len(records["PARQUET_BULK_SOURCE"]) != 1
                     or records["PARQUET_BULK_SOURCE"][0]["new_bytes"] != 0

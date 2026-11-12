@@ -22,7 +22,9 @@
     "leaked": 0,
     "skip": "guarded S3-compatible service test",
     "build_steps_succeeded": 87,
-    "build_steps_total": 87
+    "build_steps_total": 87,
+    "validated_revision": "014f2243ef94f63c55f5003fb4aff4de5bdef830",
+    "merged_main": "25a794d6c77955c249a9691686a70323d2f95c7c"
   },
   "offline_harness_validation": {
     "passed": 5,
@@ -684,5 +686,2811 @@
         ]
       }
     ]
+  },
+  "fresh_review": {
+    "fixed": [
+      "Snapshot and re-exec owned controller; run owned executable/worker/validator/recall files; verify hashes again after qualification",
+      "Drain surviving process groups after leader reaping; retry Darwin zombie-leader race and make cleanup idempotent",
+      "Share phase validation with filesystem runner; require full GCS phase contract, typed counters, variant work, memory/source evidence and verification-only reopen invariants",
+      "Use the already verified framed source descriptor instead of rereading mutable fixture metadata",
+      "Snapshot and hash reopen descriptors/catalogs, case descriptors and generated native configuration",
+      "Sanitize inherited probe flags; explicitly record noncompact case environment",
+      "Route controller SIGTERM through process-group cleanup",
+      "Attest and admit complete native source inventory, including vectorless objects, before construction",
+      "Copy and hash reopen case/catalog inputs; make case and native config read-only and verify them after execution",
+      "Clear stale bulk/probe environment flags and record explicit case settings",
+      "Handle controller SIGTERM through the owned worker-group cleanup path",
+      "Check native expected inventory before constructing any publication; reject extra vectorless sources before work"
+    ],
+    "regression_tests_passed": 26,
+    "existing_pipeline_tests_passed": 13,
+    "pre_fix_cleanup_reproduction": {
+      "leader_exit_code": 0,
+      "descendant_kept_running_after_cleanup": true,
+      "heartbeat_bytes_before": 2,
+      "heartbeat_bytes_after": 21
+    },
+    "harness_regression_tests_passed": 13
+  },
+  "post_merge_100k": {
+    "qualified": true,
+    "binary_sha256": "14e4af8671e1edd640b8275b9635ccd5afdcaef16bb5021ac01aa60931f99ff0",
+    "workspace_revision": "014f2243ef94f63c55f5003fb4aff4de5bdef830",
+    "tracked_diff_sha256": "d725e768b40cc8d290252cd3ae9bc91b9c4c32f1eab371d8508d0409aa303461",
+    "frozen_inputs_sha256": {
+      "probe": "14e4af8671e1edd640b8275b9635ccd5afdcaef16bb5021ac01aa60931f99ff0",
+      "gcs_bulk_local.py": "75e60729f6e4d8b7b6b2fa3d3f80f7316399ac067ec295f12aa2ebb74f85c2b1",
+      "gcs_bulk_worker.py": "1c2f3173d2b2de7dd6860705c968dfd6658cdac43e4bd0d6a43953e26bd331b5",
+      "bench_bulk_pipeline.py": "4488d07035c06da73582f8679eff3625f3baa41df2e9730ddbcbebdb55d0d5aa",
+      "recall/prepare.json": "fd1747a55c84fb83bbb945ce3cc17310bcb1f70356c2d1124a0933fd6f1750d3",
+      "recall/queries.f32": "7d441d28c0640889f7d61fcfaa9878e2ff21a4af706e1ab2580d32c83035e0e3",
+      "recall/truth.u64": "c75a775b26a865ae5307c98b43e7f7835470f67afd8f8ecd0a5ee40249b10292"
+    },
+    "source_binding": {
+      "bytes": 290728759,
+      "sha256": "90c34801b7fc9757ed4a441dd401044b0a5cd1aa684127be04941c586dd48f6f",
+      "fixture": null
+    },
+    "source_generations": [
+      {
+        "name": "bulk-qualification/20261112-cohere-100k-90c34801/source/train.parquet",
+        "generation": "1794500890721348"
+      }
+    ],
+    "attempts": [
+      {
+        "stage": "build",
+        "exit_code": 0,
+        "wall_ns": 629540621250,
+        "user_seconds": 13.562371,
+        "system_seconds": 7.980148,
+        "peak_rss_bytes": 755712000,
+        "pod_network_bytes": null,
+        "records": {
+          "PARQUET_BULK_BUILD_MODE": [
+            {
+              "caller": "fast",
+              "caller_value": 1,
+              "provider": 1,
+              "provider_is_test": false
+            }
+          ],
+          "PARQUET_BULK_RECEIPT": [
+            {
+              "name": "emb",
+              "manifest": "sha256:98654ac7055169d8b7bd6d36e82b574fd128d15cb588759d2fca9e473a497ab5:graph:e99a3964c9e5a55b2191160b95c63b4cb59823afd8730de604d10ef08b0c6601:0000000000000001ad755e4bcef74ccb",
+              "phase": "source",
+              "rows": 100000
+            },
+            {
+              "name": "emb",
+              "manifest": "sha256:eb52d3ca58aa35e140494afab29eae6ccba4bb2f90e600b9526a07395885952d:graph:e99a3964c9e5a55b2191160b95c63b4cb59823afd8730de604d10ef08b0c6601:0000000000000001ad755e4bcef74ccb",
+              "phase": "tree",
+              "rows": 100000
+            }
+          ],
+          "PARQUET_BULK_INPUT": [
+            {
+              "rows": 0,
+              "resumed": true
+            }
+          ],
+          "PARQUET_BULK_WORK": [
+            {
+              "identity_census_verified": true,
+              "identity_read_bytes": 0,
+              "identity_written_bytes": 1200000,
+              "identity_merge_inputs": 0,
+              "projection_cache_peak_bytes": 685,
+              "owned_index_count": 0,
+              "partition_bytes": 1030955272,
+              "partition_read_bytes": 1349155272,
+              "compact_rows": 0,
+              "projection_commit_ns": 332183000,
+              "save_node_ns": 0,
+              "update_parent_ns": 0,
+              "update_parent_calls": 0,
+              "training_ns": 919783000,
+              "routing_ns": 2364742000,
+              "allocator_peak_bytes": 53475836
+            }
+          ],
+          "PARQUET_BULK_PROJECTION": [
+            {
+              "runs": 8,
+              "bytes": 27038758
+            }
+          ],
+          "PARQUET_BULK_SOURCE": [
+            {
+              "runs": 2,
+              "reused_runs": 2,
+              "reused_bytes": 315512750,
+              "new_bytes": 0
+            }
+          ],
+          "PARQUET_BULK_MEMORY": [
+            {
+              "dense_allocator_peak_bytes": 53475836,
+              "source_allocator_peak_bytes": 39504883,
+              "max_vector_allocator_peak_bytes": 53475836
+            }
+          ],
+          "PARQUET_BULK_PHASES": [
+            {
+              "names": [
+                "identity",
+                "fragments",
+                "spool",
+                "aggregate",
+                "ordered",
+                "text",
+                "sparse",
+                "dense",
+                "bulk_tee",
+                "bulk_receipt",
+                "dense_ingest",
+                "dense_cluster",
+                "dense_checkpoint",
+                "dense_upload"
+              ],
+              "ns": [
+                155581573000,
+                0,
+                0,
+                11000,
+                68000,
+                78000,
+                42000,
+                30148462000,
+                12707517000,
+                105230801000,
+                1000,
+                4177263000,
+                189206000,
+                13222071000
+              ],
+              "calls": [
+                1,
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                40,
+                1,
+                1,
+                1,
+                1,
+                1
+              ]
+            }
+          ],
+          "PARQUET_BULK_RECALL": [
+            {
+              "queries": 10,
+              "probes": 512,
+              "k": 100,
+              "hits": 977,
+              "recall": 0.977,
+              "scored": 489396,
+              "elapsed_ns": 266542069000
+            },
+            {
+              "queries": 10,
+              "probes": 1024,
+              "k": 100,
+              "hits": 989,
+              "recall": 0.989,
+              "scored": 943739,
+              "elapsed_ns": 2049227000
+            },
+            {
+              "queries": 10,
+              "probes": 2048,
+              "k": 100,
+              "hits": 989,
+              "recall": 0.989,
+              "scored": 1000000,
+              "elapsed_ns": 799729000
+            },
+            {
+              "queries": 10,
+              "probes": 4096,
+              "k": 100,
+              "hits": 989,
+              "recall": 0.989,
+              "scored": 1000000,
+              "elapsed_ns": 764014000
+            },
+            {
+              "queries": 10,
+              "probes": 8192,
+              "k": 100,
+              "hits": 989,
+              "recall": 0.989,
+              "scored": 1000000,
+              "elapsed_ns": 689986000
+            }
+          ],
+          "PARQUET_BULK_SERVING_CACHE": [
+            {
+              "hits": 0,
+              "misses": 2616,
+              "stored_bytes": 67108864,
+              "protected_stored_bytes": 67108864,
+              "evictions": 1052,
+              "disk_unavailable": null,
+              "disk_init_attempts": 1,
+              "disk_init_failures": 0,
+              "disk_hits": 17245,
+              "mapping_hits": 0,
+              "disk_bytes": 4520315783,
+              "provider_reads": 1308,
+              "provider_bytes": 336282973,
+              "completed_queries": 0,
+              "query_total_ns": 0,
+              "query_publication_ns": 0,
+              "query_search_ns": 0,
+              "query_hydration_ns": 0,
+              "query_delivery_ns": 0
+            }
+          ]
+        },
+        "native_ns": 299899435000,
+        "checkpoints": 2
+      }
+    ],
+    "limits": "Single shared-workstation pair; no own compilation/staging/GC during construction. Small synthetic correctness cases overlapped serving recall only, so query/child-wall times are not isolated comparisons."
+  },
+  "fresh_variant_validation": {
+    "scope": "synthetic 1024-row GCS correctness only; overlapped larger serving recall",
+    "cases": [
+      {
+        "variant": "control",
+        "qualified": true,
+        "attempts": [
+          {
+            "stage": "build",
+            "exit_code": 0,
+            "wall_ns": 25981814875,
+            "user_seconds": 0.18342,
+            "system_seconds": 0.12673399999999999,
+            "peak_rss_bytes": 54853632,
+            "pod_network_bytes": null,
+            "records": {
+              "PARQUET_BULK_BUILD_MODE": [
+                {
+                  "caller": "fast",
+                  "caller_value": 1,
+                  "provider": 1,
+                  "provider_is_test": false
+                }
+              ],
+              "PARQUET_BULK_INPUT": [
+                {
+                  "rows": 1024,
+                  "resumed": false
+                }
+              ],
+              "PARQUET_BULK_RECEIPT": [
+                {
+                  "name": "emb",
+                  "manifest": "sha256:e3b45469c3d75735ba7ed579b71da61f1867b800f363f22a72c36132b6c11dea:graph:b7ff2e280b51364d0a303908f4e9f7ca75b5f0ee6c9ab1cfc65b28bc3af24ad4:00000000000000014e465cd26e44f744",
+                  "phase": "source",
+                  "rows": 1024
+                },
+                {
+                  "name": "emb",
+                  "manifest": "sha256:33a96d531e4adb081c5a18672731d2938384ac17040565b3c57b119c806ee9f5:graph:b7ff2e280b51364d0a303908f4e9f7ca75b5f0ee6c9ab1cfc65b28bc3af24ad4:00000000000000014e465cd26e44f744",
+                  "phase": "tree",
+                  "rows": 1024
+                }
+              ],
+              "PARQUET_BULK_WORK": [
+                {
+                  "identity_census_verified": true,
+                  "identity_read_bytes": 0,
+                  "identity_written_bytes": 12288,
+                  "identity_merge_inputs": 0,
+                  "projection_cache_peak_bytes": 3316035,
+                  "owned_index_count": 0,
+                  "partition_bytes": 0,
+                  "partition_read_bytes": 3258368,
+                  "compact_rows": 0,
+                  "projection_commit_ns": 2589000,
+                  "save_node_ns": 0,
+                  "update_parent_ns": 3323000,
+                  "update_parent_calls": 11,
+                  "training_ns": 2275000,
+                  "routing_ns": 2029000,
+                  "allocator_peak_bytes": 12035686
+                }
+              ],
+              "PARQUET_BULK_PROJECTION": [
+                {
+                  "runs": 2,
+                  "bytes": 412046
+                }
+              ],
+              "PARQUET_BULK_SOURCE": [
+                {
+                  "runs": 1,
+                  "reused_runs": 1,
+                  "reused_bytes": 3231301,
+                  "new_bytes": 0
+                }
+              ],
+              "PARQUET_BULK_MEMORY": [
+                {
+                  "dense_allocator_peak_bytes": 12035686,
+                  "source_allocator_peak_bytes": 0,
+                  "max_vector_allocator_peak_bytes": 12035686
+                }
+              ],
+              "PARQUET_BULK_PHASES": [
+                {
+                  "names": [
+                    "identity",
+                    "fragments",
+                    "spool",
+                    "aggregate",
+                    "ordered",
+                    "text",
+                    "sparse",
+                    "dense",
+                    "bulk_tee",
+                    "bulk_receipt",
+                    "dense_ingest",
+                    "dense_cluster",
+                    "dense_checkpoint",
+                    "dense_upload"
+                  ],
+                  "ns": [
+                    3919327000,
+                    0,
+                    0,
+                    10000,
+                    42000,
+                    69000,
+                    42000,
+                    9203411000,
+                    0,
+                    0,
+                    44910000,
+                    15194000,
+                    3085000,
+                    2021175000
+                  ],
+                  "calls": [
+                    1,
+                    0,
+                    0,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    0,
+                    1,
+                    1,
+                    1,
+                    1
+                  ]
+                }
+              ],
+              "PARQUET_BULK_RECALL": [
+                {
+                  "queries": 2,
+                  "probes": 512,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 610307000
+                },
+                {
+                  "queries": 2,
+                  "probes": 1024,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 4560000
+                },
+                {
+                  "queries": 2,
+                  "probes": 2048,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 4632000
+                },
+                {
+                  "queries": 2,
+                  "probes": 4096,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 4515000
+                },
+                {
+                  "queries": 2,
+                  "probes": 8192,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 4368000
+                }
+              ],
+              "PARQUET_BULK_SERVING_CACHE": [
+                {
+                  "hits": 0,
+                  "misses": 50,
+                  "stored_bytes": 3633086,
+                  "protected_stored_bytes": 3633086,
+                  "evictions": 0,
+                  "disk_unavailable": null,
+                  "disk_init_attempts": 1,
+                  "disk_init_failures": 0,
+                  "disk_hits": 0,
+                  "mapping_hits": 0,
+                  "disk_bytes": 0,
+                  "provider_reads": 25,
+                  "provider_bytes": 3633086,
+                  "completed_queries": 0,
+                  "query_total_ns": 0,
+                  "query_publication_ns": 0,
+                  "query_search_ns": 0,
+                  "query_hydration_ns": 0,
+                  "query_delivery_ns": 0
+                }
+              ]
+            },
+            "native_ns": 18600366000,
+            "checkpoints": 2
+          }
+        ],
+        "frozen_inputs_sha256": {
+          "probe": "14e4af8671e1edd640b8275b9635ccd5afdcaef16bb5021ac01aa60931f99ff0",
+          "gcs_bulk_local.py": "389e7e985fadf92043a37e761df66121e5977e84d83c7d810d4d1447fb72ed8d",
+          "gcs_bulk_worker.py": "1c2f3173d2b2de7dd6860705c968dfd6658cdac43e4bd0d6a43953e26bd331b5",
+          "bench_bulk_pipeline.py": "4488d07035c06da73582f8679eff3625f3baa41df2e9730ddbcbebdb55d0d5aa",
+          "recall/prepare.json": "bba57c5108ea1140f3ae3f07655f2741249b2d19001369a6c2283e03699c8293",
+          "recall/queries.f32": "fd18db97871a9e2ff3b74d783741d1859327aa555df2b85d673e1d3a9b5e93cc",
+          "recall/truth.u64": "74f2debbc33bf7c5dff7b97c29d58300ff5d71797e16b76c5e29c6d06c3ad7d6"
+        }
+      },
+      {
+        "variant": "incremental",
+        "qualified": true,
+        "attempts": [
+          {
+            "stage": "build",
+            "exit_code": 0,
+            "wall_ns": 24072866750,
+            "user_seconds": 0.230427,
+            "system_seconds": 0.14460399999999998,
+            "peak_rss_bytes": 62406656,
+            "pod_network_bytes": null,
+            "records": {
+              "PARQUET_BULK_BUILD_MODE": [
+                {
+                  "caller": "fast",
+                  "caller_value": 1,
+                  "provider": 1,
+                  "provider_is_test": false
+                }
+              ],
+              "PARQUET_BULK_INPUT": [
+                {
+                  "rows": 1024,
+                  "resumed": false
+                }
+              ],
+              "PARQUET_BULK_MEMORY": [
+                {
+                  "dense_allocator_peak_bytes": 9111352,
+                  "source_allocator_peak_bytes": 0,
+                  "max_vector_allocator_peak_bytes": 9111352
+                }
+              ],
+              "PARQUET_BULK_PHASES": [
+                {
+                  "names": [
+                    "identity",
+                    "fragments",
+                    "spool",
+                    "aggregate",
+                    "ordered",
+                    "text",
+                    "sparse",
+                    "dense",
+                    "bulk_tee",
+                    "bulk_receipt",
+                    "dense_ingest",
+                    "dense_cluster",
+                    "dense_checkpoint",
+                    "dense_upload"
+                  ],
+                  "ns": [
+                    3550094000,
+                    3352326000,
+                    67224000,
+                    10000,
+                    31000,
+                    64000,
+                    42000,
+                    5738050000,
+                    0,
+                    0,
+                    2218353000,
+                    0,
+                    3999000,
+                    3122240000
+                  ],
+                  "calls": [
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    0,
+                    1,
+                    0,
+                    1,
+                    1
+                  ]
+                }
+              ],
+              "PARQUET_BULK_RECALL": [
+                {
+                  "queries": 2,
+                  "probes": 512,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 2305278000
+                },
+                {
+                  "queries": 2,
+                  "probes": 1024,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 5377000
+                },
+                {
+                  "queries": 2,
+                  "probes": 2048,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 4815000
+                },
+                {
+                  "queries": 2,
+                  "probes": 4096,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 4600000
+                },
+                {
+                  "queries": 2,
+                  "probes": 8192,
+                  "k": 100,
+                  "hits": 197,
+                  "recall": 0.985,
+                  "scored": 2048,
+                  "elapsed_ns": 4676000
+                }
+              ],
+              "PARQUET_BULK_SERVING_CACHE": [
+                {
+                  "hits": 0,
+                  "misses": 70,
+                  "stored_bytes": 3818225,
+                  "protected_stored_bytes": 3818225,
+                  "evictions": 0,
+                  "disk_unavailable": null,
+                  "disk_init_attempts": 1,
+                  "disk_init_failures": 0,
+                  "disk_hits": 0,
+                  "mapping_hits": 0,
+                  "disk_bytes": 0,
+                  "provider_reads": 35,
+                  "provider_bytes": 3818225,
+                  "completed_queries": 0,
+                  "query_total_ns": 0,
+                  "query_publication_ns": 0,
+                  "query_search_ns": 0,
+                  "query_hydration_ns": 0,
+                  "query_delivery_ns": 0
+                }
+              ]
+            },
+            "native_ns": 15397057000,
+            "checkpoints": 0
+          }
+        ],
+        "frozen_inputs_sha256": {
+          "probe": "14e4af8671e1edd640b8275b9635ccd5afdcaef16bb5021ac01aa60931f99ff0",
+          "gcs_bulk_local.py": "389e7e985fadf92043a37e761df66121e5977e84d83c7d810d4d1447fb72ed8d",
+          "gcs_bulk_worker.py": "1c2f3173d2b2de7dd6860705c968dfd6658cdac43e4bd0d6a43953e26bd331b5",
+          "bench_bulk_pipeline.py": "4488d07035c06da73582f8679eff3625f3baa41df2e9730ddbcbebdb55d0d5aa",
+          "recall/prepare.json": "bba57c5108ea1140f3ae3f07655f2741249b2d19001369a6c2283e03699c8293",
+          "recall/queries.f32": "fd18db97871a9e2ff3b74d783741d1859327aa555df2b85d673e1d3a9b5e93cc",
+          "recall/truth.u64": "74f2debbc33bf7c5dff7b97c29d58300ff5d71797e16b76c5e29c6d06c3ad7d6"
+        }
+      }
+    ]
+  },
+  "inventory_regression_before_early_admission": {
+    "status": "qualified",
+    "scope": "synthetic inventory-bound GCS correctness, not performance",
+    "cases": [
+      {
+        "case": "source",
+        "worker_exit_code": 0,
+        "frozen_inputs_sha256": {
+          "probe": "fe07489fd64db95d724185a8ba882e945aa071811c4c86283c8a3c8b229692ab",
+          "gcs_bulk_local.py": "fe8cad2812b698a14fdace4e29b56f4f445044e4ba8fb5a7e89722c4ab8a8cf3",
+          "gcs_bulk_worker.py": "d5b6312c074b362932137604ab013c1964ff1ca806795586f102b3621fcb0381",
+          "bench_bulk_pipeline.py": "4488d07035c06da73582f8679eff3625f3baa41df2e9730ddbcbebdb55d0d5aa",
+          "recall/prepare.json": "bba57c5108ea1140f3ae3f07655f2741249b2d19001369a6c2283e03699c8293",
+          "recall/queries.f32": "fd18db97871a9e2ff3b74d783741d1859327aa555df2b85d673e1d3a9b5e93cc",
+          "recall/truth.u64": "74f2debbc33bf7c5dff7b97c29d58300ff5d71797e16b76c5e29c6d06c3ad7d6"
+        },
+        "result": {
+          "config": {
+            "case": "inventory-source",
+            "binary": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/inventory-check-source/inputs/probe",
+            "bucket": "colony-import-sources-antfly-dev-01",
+            "prefix": "bulk-qualification/inventory-check-9831c60994ee",
+            "source_prefix": "bulk-qualification/20261112-review-fallback-ba7d594e/source",
+            "source_objects": [
+              {
+                "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source/train.parquet",
+                "bytes": 2909639,
+                "version": "1794509503506737",
+                "etag": "CLHSguyMg5gDEAE="
+              }
+            ],
+            "rows": 1024,
+            "variant": "optimized",
+            "interrupt": 1,
+            "auth": "adc",
+            "recall": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/inventory-check-source/inputs/recall",
+            "work": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/inventory-check-source/case",
+            "allowance": 4294967296,
+            "identity_allowance": 8388608
+          },
+          "qualified": true,
+          "attempts": [
+            {
+              "stage": "interrupt",
+              "exit_code": 1,
+              "wall_ns": 10747081084,
+              "user_seconds": 0.087909,
+              "system_seconds": 0.07321899999999999,
+              "peak_rss_bytes": 43368448,
+              "pod_network_bytes": null,
+              "records": {
+                "PARQUET_BULK_BUILD_MODE": [
+                  {
+                    "caller": "fast",
+                    "caller_value": 1,
+                    "provider": 1,
+                    "provider_is_test": false
+                  }
+                ],
+                "PARQUET_BULK_INVENTORY": [
+                  {
+                    "files": [
+                      {
+                        "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source/train.parquet",
+                        "bytes": 2909639,
+                        "version": "",
+                        "etag": "CLHSguyMg5gDEAE="
+                      }
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_RECEIPT": [
+                  {
+                    "name": "emb",
+                    "manifest": "sha256:d84a53ce4bf9f209fd2cc71d76629bf3f883b930a782b406e0b7a9bce7673052:graph:1ca354c33719bf5645f32083bef6071c6c998560ae5a33a331d2de12d5fedf36:00000000000000012b1bca848739cbe0",
+                    "phase": "source",
+                    "rows": 1024
+                  }
+                ],
+                "PARQUET_BULK_FAILURE_PHASES": [
+                  {
+                    "error_name": "Cancelled",
+                    "cause": null,
+                    "elapsed_ns": 9683383000,
+                    "names": [
+                      "identity",
+                      "fragments",
+                      "spool",
+                      "aggregate",
+                      "ordered",
+                      "text",
+                      "sparse",
+                      "dense",
+                      "bulk_tee",
+                      "bulk_receipt",
+                      "dense_ingest",
+                      "dense_cluster",
+                      "dense_checkpoint",
+                      "dense_upload"
+                    ],
+                    "ns": [
+                      3229445000,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      2215000,
+                      4640496000,
+                      0,
+                      0,
+                      0,
+                      0
+                    ],
+                    "calls": [
+                      1,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      1,
+                      1,
+                      0,
+                      0,
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              },
+              "retained_receipt": {
+                "name": "emb",
+                "manifest": "sha256:d84a53ce4bf9f209fd2cc71d76629bf3f883b930a782b406e0b7a9bce7673052:graph:1ca354c33719bf5645f32083bef6071c6c998560ae5a33a331d2de12d5fedf36:00000000000000012b1bca848739cbe0",
+                "phase": "source",
+                "rows": 1024
+              },
+              "retained_catalog_sha256": "76e4c88342ac7296053edb91182a4e9d33e4e7409d43afcf726f6a2db90225f1"
+            },
+            {
+              "stage": "resume",
+              "exit_code": 0,
+              "wall_ns": 25735420208,
+              "user_seconds": 0.080163,
+              "system_seconds": 0.111594,
+              "peak_rss_bytes": 72613888,
+              "pod_network_bytes": null,
+              "records": {
+                "PARQUET_BULK_BUILD_MODE": [
+                  {
+                    "caller": "fast",
+                    "caller_value": 1,
+                    "provider": 1,
+                    "provider_is_test": false
+                  }
+                ],
+                "PARQUET_BULK_INVENTORY": [
+                  {
+                    "files": [
+                      {
+                        "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source/train.parquet",
+                        "bytes": 2909639,
+                        "version": "",
+                        "etag": "CLHSguyMg5gDEAE="
+                      }
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_RESUME": [
+                  {
+                    "name": "emb",
+                    "manifest": "sha256:d84a53ce4bf9f209fd2cc71d76629bf3f883b930a782b406e0b7a9bce7673052:graph:1ca354c33719bf5645f32083bef6071c6c998560ae5a33a331d2de12d5fedf36:00000000000000012b1bca848739cbe0",
+                    "phase": "source",
+                    "rows": 1024
+                  }
+                ],
+                "PARQUET_BULK_INPUT": [
+                  {
+                    "rows": 0,
+                    "resumed": true
+                  }
+                ],
+                "PARQUET_BULK_WORK": [
+                  {
+                    "identity_census_verified": true,
+                    "identity_read_bytes": 0,
+                    "identity_written_bytes": 12288,
+                    "identity_merge_inputs": 0,
+                    "projection_cache_peak_bytes": 3316035,
+                    "owned_index_count": 0,
+                    "partition_bytes": 0,
+                    "partition_read_bytes": 3258368,
+                    "compact_rows": 0,
+                    "projection_commit_ns": 2335000,
+                    "save_node_ns": 0,
+                    "update_parent_ns": 0,
+                    "update_parent_calls": 0,
+                    "training_ns": 2309000,
+                    "routing_ns": 2073000,
+                    "allocator_peak_bytes": 9674490
+                  }
+                ],
+                "PARQUET_BULK_PROJECTION": [
+                  {
+                    "runs": 2,
+                    "bytes": 412293
+                  }
+                ],
+                "PARQUET_BULK_RECEIPT": [
+                  {
+                    "name": "emb",
+                    "manifest": "sha256:6a176a1cf8b1429510fa3d4ade00258a1de1cfc7799018a96811116b47061a27:graph:1ca354c33719bf5645f32083bef6071c6c998560ae5a33a331d2de12d5fedf36:00000000000000012b1bca848739cbe0",
+                    "phase": "tree",
+                    "rows": 1024
+                  }
+                ],
+                "PARQUET_BULK_SOURCE": [
+                  {
+                    "runs": 1,
+                    "reused_runs": 1,
+                    "reused_bytes": 3231301,
+                    "new_bytes": 0
+                  }
+                ],
+                "PARQUET_BULK_MEMORY": [
+                  {
+                    "dense_allocator_peak_bytes": 9674490,
+                    "source_allocator_peak_bytes": 0,
+                    "max_vector_allocator_peak_bytes": 9674490
+                  }
+                ],
+                "PARQUET_BULK_PHASES": [
+                  {
+                    "names": [
+                      "identity",
+                      "fragments",
+                      "spool",
+                      "aggregate",
+                      "ordered",
+                      "text",
+                      "sparse",
+                      "dense",
+                      "bulk_tee",
+                      "bulk_receipt",
+                      "dense_ingest",
+                      "dense_cluster",
+                      "dense_checkpoint",
+                      "dense_upload"
+                    ],
+                    "ns": [
+                      96985000,
+                      0,
+                      0,
+                      10000,
+                      49000,
+                      61000,
+                      36000,
+                      13039618000,
+                      0,
+                      0,
+                      0,
+                      11519000,
+                      3297000,
+                      2648976000
+                    ],
+                    "calls": [
+                      1,
+                      0,
+                      0,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      0,
+                      0,
+                      1,
+                      1,
+                      1,
+                      1
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_RECALL": [
+                  {
+                    "queries": 2,
+                    "probes": 512,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 554654000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 1024,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4626000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 2048,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4658000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 4096,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4579000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 8192,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4651000
+                  }
+                ],
+                "PARQUET_BULK_SERVING_CACHE": [
+                  {
+                    "hits": 0,
+                    "misses": 50,
+                    "stored_bytes": 3633098,
+                    "protected_stored_bytes": 3633098,
+                    "evictions": 0,
+                    "disk_unavailable": null,
+                    "disk_init_attempts": 1,
+                    "disk_init_failures": 0,
+                    "disk_hits": 0,
+                    "mapping_hits": 0,
+                    "disk_bytes": 0,
+                    "provider_reads": 25,
+                    "provider_bytes": 3633098,
+                    "completed_queries": 0,
+                    "query_total_ns": 0,
+                    "query_publication_ns": 0,
+                    "query_search_ns": 0,
+                    "query_hydration_ns": 0,
+                    "query_delivery_ns": 0
+                  }
+                ]
+              },
+              "native_ns": 19683193000,
+              "checkpoints": 1
+            }
+          ],
+          "network_scope": "Linux process network namespace interfaces, including control traffic; unavailable on macOS; not object-store payload bytes",
+          "scratch_sample": {
+            "case_nominal_bytes": 3155877,
+            "host_filesystem_min_free_bytes": 108593876992,
+            "interval_seconds": 2,
+            "scope": "case directory nominal lengths only; host free-space includes unrelated work, native /tmp scratch not attributed"
+          }
+        }
+      },
+      {
+        "case": "tree",
+        "worker_exit_code": 0,
+        "frozen_inputs_sha256": {
+          "probe": "fe07489fd64db95d724185a8ba882e945aa071811c4c86283c8a3c8b229692ab",
+          "gcs_bulk_local.py": "fe8cad2812b698a14fdace4e29b56f4f445044e4ba8fb5a7e89722c4ab8a8cf3",
+          "gcs_bulk_worker.py": "d5b6312c074b362932137604ab013c1964ff1ca806795586f102b3621fcb0381",
+          "bench_bulk_pipeline.py": "4488d07035c06da73582f8679eff3625f3baa41df2e9730ddbcbebdb55d0d5aa",
+          "recall/prepare.json": "bba57c5108ea1140f3ae3f07655f2741249b2d19001369a6c2283e03699c8293",
+          "recall/queries.f32": "fd18db97871a9e2ff3b74d783741d1859327aa555df2b85d673e1d3a9b5e93cc",
+          "recall/truth.u64": "74f2debbc33bf7c5dff7b97c29d58300ff5d71797e16b76c5e29c6d06c3ad7d6"
+        },
+        "result": {
+          "config": {
+            "case": "inventory-tree",
+            "binary": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/inventory-check-tree/inputs/probe",
+            "bucket": "colony-import-sources-antfly-dev-01",
+            "prefix": "bulk-qualification/inventory-check-b9d14e6080c6",
+            "source_prefix": "bulk-qualification/20261112-review-fallback-ba7d594e/source",
+            "source_objects": [
+              {
+                "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source/train.parquet",
+                "bytes": 2909639,
+                "version": "1794509503506737",
+                "etag": "CLHSguyMg5gDEAE="
+              }
+            ],
+            "rows": 1024,
+            "variant": "optimized",
+            "interrupt": 2,
+            "auth": "adc",
+            "recall": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/inventory-check-tree/inputs/recall",
+            "work": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/inventory-check-tree/case",
+            "allowance": 4294967296,
+            "identity_allowance": 8388608
+          },
+          "qualified": true,
+          "attempts": [
+            {
+              "stage": "interrupt",
+              "exit_code": 1,
+              "wall_ns": 19770938500,
+              "user_seconds": 0.10096899999999999,
+              "system_seconds": 0.085792,
+              "peak_rss_bytes": 49364992,
+              "pod_network_bytes": null,
+              "records": {
+                "PARQUET_BULK_BUILD_MODE": [
+                  {
+                    "caller": "fast",
+                    "caller_value": 1,
+                    "provider": 1,
+                    "provider_is_test": false
+                  }
+                ],
+                "PARQUET_BULK_INVENTORY": [
+                  {
+                    "files": [
+                      {
+                        "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source/train.parquet",
+                        "bytes": 2909639,
+                        "version": "",
+                        "etag": "CLHSguyMg5gDEAE="
+                      }
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_RECEIPT": [
+                  {
+                    "name": "emb",
+                    "manifest": "sha256:b7c168b7aba0035d96456806ebffd4e982e6039343fce8d54b4891d9b93c96e8:graph:08ec2510b0c30b7fb36593dc6b320d43281d1f5933e5ff0f9a514c9ae8e389ae:0000000000000001765ac350350e5283",
+                    "phase": "source",
+                    "rows": 1024
+                  },
+                  {
+                    "name": "emb",
+                    "manifest": "sha256:db79beb67f2e96c9431dd302fc3f1d1c53bd8297c5b29ddcd5a9e38ad2329796:graph:08ec2510b0c30b7fb36593dc6b320d43281d1f5933e5ff0f9a514c9ae8e389ae:0000000000000001765ac350350e5283",
+                    "phase": "tree",
+                    "rows": 1024
+                  }
+                ],
+                "PARQUET_BULK_INPUT": [
+                  {
+                    "rows": 0,
+                    "resumed": true
+                  }
+                ],
+                "PARQUET_BULK_WORK": [
+                  {
+                    "identity_census_verified": true,
+                    "identity_read_bytes": 0,
+                    "identity_written_bytes": 12288,
+                    "identity_merge_inputs": 0,
+                    "projection_cache_peak_bytes": 685,
+                    "owned_index_count": 0,
+                    "partition_bytes": 0,
+                    "partition_read_bytes": 3258368,
+                    "compact_rows": 0,
+                    "projection_commit_ns": 2458000,
+                    "save_node_ns": 0,
+                    "update_parent_ns": 0,
+                    "update_parent_calls": 0,
+                    "training_ns": 2283000,
+                    "routing_ns": 2021000,
+                    "allocator_peak_bytes": 6307503
+                  }
+                ],
+                "PARQUET_BULK_PROJECTION": [
+                  {
+                    "runs": 3,
+                    "bytes": 412861
+                  }
+                ],
+                "PARQUET_BULK_FAILURE_PHASES": [
+                  {
+                    "error_name": "Cancelled",
+                    "cause": null,
+                    "elapsed_ns": 18876437000,
+                    "names": [
+                      "identity",
+                      "fragments",
+                      "spool",
+                      "aggregate",
+                      "ordered",
+                      "text",
+                      "sparse",
+                      "dense",
+                      "bulk_tee",
+                      "bulk_receipt",
+                      "dense_ingest",
+                      "dense_cluster",
+                      "dense_checkpoint",
+                      "dense_upload"
+                    ],
+                    "ns": [
+                      4321631000,
+                      0,
+                      0,
+                      11000,
+                      37000,
+                      62000,
+                      34000,
+                      2385974000,
+                      2263000,
+                      10258445000,
+                      8000,
+                      11173000,
+                      0,
+                      0
+                    ],
+                    "calls": [
+                      1,
+                      0,
+                      0,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              },
+              "retained_receipt": {
+                "name": "emb",
+                "manifest": "sha256:db79beb67f2e96c9431dd302fc3f1d1c53bd8297c5b29ddcd5a9e38ad2329796:graph:08ec2510b0c30b7fb36593dc6b320d43281d1f5933e5ff0f9a514c9ae8e389ae:0000000000000001765ac350350e5283",
+                "phase": "tree",
+                "rows": 1024
+              },
+              "retained_catalog_sha256": "4ec0aadaacda45c1cc2411f86afb94c4e8f52288268f771aff8b7656746c4ecb"
+            },
+            {
+              "stage": "resume",
+              "exit_code": 0,
+              "wall_ns": 16764315875,
+              "user_seconds": 0.056568,
+              "system_seconds": 0.072791,
+              "peak_rss_bytes": 52363264,
+              "pod_network_bytes": null,
+              "records": {
+                "PARQUET_BULK_BUILD_MODE": [
+                  {
+                    "caller": "fast",
+                    "caller_value": 1,
+                    "provider": 1,
+                    "provider_is_test": false
+                  }
+                ],
+                "PARQUET_BULK_INVENTORY": [
+                  {
+                    "files": [
+                      {
+                        "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source/train.parquet",
+                        "bytes": 2909639,
+                        "version": "",
+                        "etag": "CLHSguyMg5gDEAE="
+                      }
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_RESUME": [
+                  {
+                    "name": "emb",
+                    "manifest": "sha256:db79beb67f2e96c9431dd302fc3f1d1c53bd8297c5b29ddcd5a9e38ad2329796:graph:08ec2510b0c30b7fb36593dc6b320d43281d1f5933e5ff0f9a514c9ae8e389ae:0000000000000001765ac350350e5283",
+                    "phase": "tree",
+                    "rows": 1024
+                  }
+                ],
+                "PARQUET_BULK_INPUT": [
+                  {
+                    "rows": 0,
+                    "resumed": true
+                  }
+                ],
+                "PARQUET_BULK_SOURCE": [
+                  {
+                    "runs": 1,
+                    "reused_runs": 1,
+                    "reused_bytes": 3231301,
+                    "new_bytes": 0
+                  }
+                ],
+                "PARQUET_BULK_MEMORY": [
+                  {
+                    "dense_allocator_peak_bytes": 757094,
+                    "source_allocator_peak_bytes": 0,
+                    "max_vector_allocator_peak_bytes": 757094
+                  }
+                ],
+                "PARQUET_BULK_PHASES": [
+                  {
+                    "names": [
+                      "identity",
+                      "fragments",
+                      "spool",
+                      "aggregate",
+                      "ordered",
+                      "text",
+                      "sparse",
+                      "dense",
+                      "bulk_tee",
+                      "bulk_receipt",
+                      "dense_ingest",
+                      "dense_cluster",
+                      "dense_checkpoint",
+                      "dense_upload"
+                    ],
+                    "ns": [
+                      127787000,
+                      0,
+                      0,
+                      3000,
+                      33000,
+                      40000,
+                      9000,
+                      4070169000,
+                      0,
+                      0,
+                      3000,
+                      0,
+                      303766000,
+                      1776215000
+                    ],
+                    "calls": [
+                      1,
+                      0,
+                      0,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      0,
+                      0,
+                      1,
+                      0,
+                      1,
+                      1
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_RECALL": [
+                  {
+                    "queries": 2,
+                    "probes": 512,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 739886000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 1024,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4713000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 2048,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4391000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 4096,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4346000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 8192,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4505000
+                  }
+                ],
+                "PARQUET_BULK_SERVING_CACHE": [
+                  {
+                    "hits": 0,
+                    "misses": 50,
+                    "stored_bytes": 3633099,
+                    "protected_stored_bytes": 3633099,
+                    "evictions": 0,
+                    "disk_unavailable": null,
+                    "disk_init_attempts": 1,
+                    "disk_init_failures": 0,
+                    "disk_hits": 0,
+                    "mapping_hits": 0,
+                    "disk_bytes": 0,
+                    "provider_reads": 25,
+                    "provider_bytes": 3633099,
+                    "completed_queries": 0,
+                    "query_total_ns": 0,
+                    "query_publication_ns": 0,
+                    "query_search_ns": 0,
+                    "query_hydration_ns": 0,
+                    "query_delivery_ns": 0
+                  }
+                ]
+              },
+              "native_ns": 9482797000,
+              "checkpoints": 0
+            }
+          ],
+          "network_scope": "Linux process network namespace interfaces, including control traffic; unavailable on macOS; not object-store payload bytes",
+          "scratch_sample": {
+            "case_nominal_bytes": 3157886,
+            "host_filesystem_min_free_bytes": 108562145280,
+            "interval_seconds": 2,
+            "scope": "case directory nominal lengths only; host free-space includes unrelated work, native /tmp scratch not attributed"
+          }
+        }
+      },
+      {
+        "case": "extra-vectorless",
+        "worker_exit_code": 1,
+        "frozen_inputs_sha256": {
+          "probe": "fe07489fd64db95d724185a8ba882e945aa071811c4c86283c8a3c8b229692ab",
+          "gcs_bulk_local.py": "fe8cad2812b698a14fdace4e29b56f4f445044e4ba8fb5a7e89722c4ab8a8cf3",
+          "gcs_bulk_worker.py": "d5b6312c074b362932137604ab013c1964ff1ca806795586f102b3621fcb0381",
+          "bench_bulk_pipeline.py": "4488d07035c06da73582f8679eff3625f3baa41df2e9730ddbcbebdb55d0d5aa",
+          "recall/prepare.json": "bba57c5108ea1140f3ae3f07655f2741249b2d19001369a6c2283e03699c8293",
+          "recall/queries.f32": "fd18db97871a9e2ff3b74d783741d1859327aa555df2b85d673e1d3a9b5e93cc",
+          "recall/truth.u64": "74f2debbc33bf7c5dff7b97c29d58300ff5d71797e16b76c5e29c6d06c3ad7d6"
+        },
+        "result": {
+          "config": {
+            "case": "inventory-extra-vectorless",
+            "binary": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/inventory-check-extra-vectorless/inputs/probe",
+            "bucket": "colony-import-sources-antfly-dev-01",
+            "prefix": "bulk-qualification/inventory-check-9ae16b825b78",
+            "source_prefix": "bulk-qualification/inventory-negative-aa5a1168153e/source",
+            "source_objects": [
+              {
+                "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/inventory-negative-aa5a1168153e/source/train.parquet",
+                "bytes": 2909639,
+                "version": "1794513693342277",
+                "etag": "CMX08bmcg5gDEAE="
+              }
+            ],
+            "rows": 1024,
+            "variant": "optimized",
+            "interrupt": null,
+            "auth": "adc",
+            "recall": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/inventory-check-extra-vectorless/inputs/recall",
+            "work": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/inventory-check-extra-vectorless/case",
+            "allowance": 4294967296,
+            "identity_allowance": 8388608
+          },
+          "qualified": false,
+          "attempts": [
+            {
+              "stage": "build",
+              "exit_code": 0,
+              "wall_ns": 31679575792,
+              "user_seconds": 0.14357999999999999,
+              "system_seconds": 0.134767,
+              "peak_rss_bytes": 56213504,
+              "pod_network_bytes": null,
+              "records": {
+                "PARQUET_BULK_BUILD_MODE": [
+                  {
+                    "caller": "fast",
+                    "caller_value": 1,
+                    "provider": 1,
+                    "provider_is_test": false
+                  }
+                ],
+                "PARQUET_BULK_INVENTORY": [
+                  {
+                    "files": [
+                      {
+                        "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/inventory-negative-aa5a1168153e/source/train.parquet",
+                        "bytes": 2909639,
+                        "version": "",
+                        "etag": "CMX08bmcg5gDEAE="
+                      },
+                      {
+                        "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/inventory-negative-aa5a1168153e/source/zzz-vectorless.parquet",
+                        "bytes": 500,
+                        "version": "",
+                        "etag": "CJnYrLucg5gDEAE="
+                      }
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_RECEIPT": [
+                  {
+                    "name": "emb",
+                    "manifest": "sha256:5e72830cca0f62ec6031d95f096d34972131f17692349b31ea476a1e5305572b:graph:205d0e9ade89a7824a03aa8dffd810c447d7179abdda250272f310c973d1d111:0000000000000001c512deab78a55b7b",
+                    "phase": "source",
+                    "rows": 1024
+                  },
+                  {
+                    "name": "emb",
+                    "manifest": "sha256:5b52883d16bd4f6bc2357f7b61d90b55e3b18347469e1fd9868a42873c67acb5:graph:205d0e9ade89a7824a03aa8dffd810c447d7179abdda250272f310c973d1d111:0000000000000001c512deab78a55b7b",
+                    "phase": "tree",
+                    "rows": 1024
+                  }
+                ],
+                "PARQUET_BULK_INPUT": [
+                  {
+                    "rows": 0,
+                    "resumed": true
+                  }
+                ],
+                "PARQUET_BULK_WORK": [
+                  {
+                    "identity_census_verified": true,
+                    "identity_read_bytes": 0,
+                    "identity_written_bytes": 12288,
+                    "identity_merge_inputs": 0,
+                    "projection_cache_peak_bytes": 685,
+                    "owned_index_count": 0,
+                    "partition_bytes": 0,
+                    "partition_read_bytes": 3258368,
+                    "compact_rows": 0,
+                    "projection_commit_ns": 2679000,
+                    "save_node_ns": 0,
+                    "update_parent_ns": 0,
+                    "update_parent_calls": 0,
+                    "training_ns": 2378000,
+                    "routing_ns": 2031000,
+                    "allocator_peak_bytes": 6307503
+                  }
+                ],
+                "PARQUET_BULK_PROJECTION": [
+                  {
+                    "runs": 3,
+                    "bytes": 412861
+                  }
+                ],
+                "PARQUET_BULK_SOURCE": [
+                  {
+                    "runs": 1,
+                    "reused_runs": 1,
+                    "reused_bytes": 3231301,
+                    "new_bytes": 0
+                  }
+                ],
+                "PARQUET_BULK_MEMORY": [
+                  {
+                    "dense_allocator_peak_bytes": 6307503,
+                    "source_allocator_peak_bytes": 13764250,
+                    "max_vector_allocator_peak_bytes": 13764250
+                  }
+                ],
+                "PARQUET_BULK_PHASES": [
+                  {
+                    "names": [
+                      "identity",
+                      "fragments",
+                      "spool",
+                      "aggregate",
+                      "ordered",
+                      "text",
+                      "sparse",
+                      "dense",
+                      "bulk_tee",
+                      "bulk_receipt",
+                      "dense_ingest",
+                      "dense_cluster",
+                      "dense_checkpoint",
+                      "dense_upload"
+                    ],
+                    "ns": [
+                      3425909000,
+                      0,
+                      0,
+                      10000,
+                      38000,
+                      65000,
+                      35000,
+                      10661167000,
+                      2290000,
+                      3440082000,
+                      9000,
+                      11780000,
+                      35688000,
+                      6517459000
+                    ],
+                    "calls": [
+                      1,
+                      0,
+                      0,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      2,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_RECALL": [
+                  {
+                    "queries": 2,
+                    "probes": 512,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 498270000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 1024,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4185000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 2048,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4137000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 4096,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4267000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 8192,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4237000
+                  }
+                ],
+                "PARQUET_BULK_SERVING_CACHE": [
+                  {
+                    "hits": 0,
+                    "misses": 50,
+                    "stored_bytes": 3633103,
+                    "protected_stored_bytes": 3633103,
+                    "evictions": 0,
+                    "disk_unavailable": null,
+                    "disk_init_attempts": 1,
+                    "disk_init_failures": 0,
+                    "disk_hits": 0,
+                    "mapping_hits": 0,
+                    "disk_bytes": 0,
+                    "provider_reads": 25,
+                    "provider_bytes": 3633103,
+                    "completed_queries": 0,
+                    "query_total_ns": 0,
+                    "query_publication_ns": 0,
+                    "query_search_ns": 0,
+                    "query_hydration_ns": 0,
+                    "query_delivery_ns": 0
+                  }
+                ]
+              }
+            }
+          ],
+          "network_scope": "Linux process network namespace interfaces, including control traffic; unavailable on macOS; not object-store payload bytes"
+        },
+        "extra_file_rejected": true,
+        "other_construction_contracts_pass_with_full_inventory": true
+      }
+    ]
+  },
+  "final_inventory_admission_and_recovery": {
+    "status": "qualified",
+    "scope": "synthetic final admission/recovery correctness, not performance",
+    "cases": [
+      {
+        "case": "source",
+        "worker_exit_code": 0,
+        "frozen_inputs_sha256": {
+          "probe": "f20d140203fe6f5341646126a9cd2883f9552637596ce3c61be75fb53faed81b",
+          "gcs_bulk_local.py": "f651b455bfd7b4bca4c6d7ac8c5eb88beb987ff99808e4d08799ec60e5f56771",
+          "gcs_bulk_worker.py": "65c6fe6d960754a2ab8a3fe434ecb1d97008dfc03ff6265fab21e32246b7edf3",
+          "bench_bulk_pipeline.py": "3c463fe14a8267087082541ec59e19c482b01993a3a57f1365ba0ee5e0866696",
+          "recall/prepare.json": "bba57c5108ea1140f3ae3f07655f2741249b2d19001369a6c2283e03699c8293",
+          "recall/queries.f32": "fd18db97871a9e2ff3b74d783741d1859327aa555df2b85d673e1d3a9b5e93cc",
+          "recall/truth.u64": "74f2debbc33bf7c5dff7b97c29d58300ff5d71797e16b76c5e29c6d06c3ad7d6"
+        },
+        "result": {
+          "config": {
+            "case": "admission-source",
+            "binary": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-source/inputs/probe",
+            "bucket": "colony-import-sources-antfly-dev-01",
+            "prefix": "bulk-qualification/admission-check-4133695ad8bd",
+            "source_prefix": "bulk-qualification/20261112-review-fallback-ba7d594e/source",
+            "source_objects": [
+              {
+                "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source/train.parquet",
+                "bytes": 2909639,
+                "version": "1794509503506737",
+                "etag": "CLHSguyMg5gDEAE="
+              }
+            ],
+            "rows": 1024,
+            "variant": "optimized",
+            "interrupt": 1,
+            "auth": "adc",
+            "recall": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-source/inputs/recall",
+            "work": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-source/case",
+            "allowance": 4294967296,
+            "identity_allowance": 8388608
+          },
+          "native_config_sha256": "5aa75053ecb71b3e6a54521f832151bf18d117b62a7bf1aa0459c171ee7cabf1",
+          "expected_inventory_sha256": "f239ca777d725fb89a922aa79281220d31eb8a9f8f0af76c3a0bb1f325285f21",
+          "qualified": true,
+          "attempts": [
+            {
+              "stage": "interrupt",
+              "exit_code": 1,
+              "wall_ns": 13113841667,
+              "user_seconds": 0.08925999999999999,
+              "system_seconds": 0.07149799999999999,
+              "peak_rss_bytes": 43417600,
+              "pod_network_bytes": null,
+              "probe_environment": {
+                "ANTFLY_LAKE_BULK_CONFIG": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-source/case/config.json",
+                "ANTFLY_LAKE_BULK_EXPECTED_INVENTORY": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-source/case/expected-inventory.json",
+                "ANTFLY_LAKE_BULK_PARQUET": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source",
+                "ANTFLY_LAKE_BULK_CATALOG": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-source/case/catalog.json",
+                "ANTFLY_LAKE_BULK_DIMS": "768",
+                "ANTFLY_LAKE_BULK_INPUT_BYTES": "4294967296",
+                "ANTFLY_LAKE_BULK_IDENTITY_SPILL_BYTES": "8388608",
+                "ANTFLY_LAKE_BULK_ALGORITHM": "lloyd",
+                "ANTFLY_LAKE_BULK_FUSED": "1",
+                "ANTFLY_LAKE_BULK_PREBIND": "1",
+                "ANTFLY_LAKE_BULK_CHECKPOINT": "1",
+                "ANTFLY_LAKE_BULK_COMPACT": "0",
+                "ANTFLY_LAKE_BULK_INTERRUPT": "1"
+              },
+              "records": {
+                "PARQUET_BULK_BUILD_MODE": [
+                  {
+                    "caller": "fast",
+                    "caller_value": 1,
+                    "provider": 1,
+                    "provider_is_test": false
+                  }
+                ],
+                "PARQUET_BULK_INVENTORY": [
+                  {
+                    "files": [
+                      {
+                        "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source/train.parquet",
+                        "bytes": 2909639,
+                        "version": "",
+                        "etag": "CLHSguyMg5gDEAE="
+                      }
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_RECEIPT": [
+                  {
+                    "name": "emb",
+                    "manifest": "sha256:f77df1eabe9aa3529aaf7a7f0d88caa6e90ce84c33beca458fad8016a33f9407:graph:5456aac2da1c03500dc9e8414bda6f4cd8bed8ffc8e0883dfe0fc2c7a54f5106:000000000000000113cd753c45dd6c2f",
+                    "phase": "source",
+                    "rows": 1024
+                  }
+                ],
+                "PARQUET_BULK_FAILURE_PHASES": [
+                  {
+                    "error_name": "Cancelled",
+                    "cause": null,
+                    "elapsed_ns": 11836255000,
+                    "names": [
+                      "identity",
+                      "fragments",
+                      "spool",
+                      "aggregate",
+                      "ordered",
+                      "text",
+                      "sparse",
+                      "dense",
+                      "bulk_tee",
+                      "bulk_receipt",
+                      "dense_ingest",
+                      "dense_cluster",
+                      "dense_checkpoint",
+                      "dense_upload"
+                    ],
+                    "ns": [
+                      4312491000,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      2268000,
+                      5502767000,
+                      0,
+                      0,
+                      0,
+                      0
+                    ],
+                    "calls": [
+                      1,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      1,
+                      1,
+                      0,
+                      0,
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              },
+              "retained_receipt": {
+                "name": "emb",
+                "manifest": "sha256:f77df1eabe9aa3529aaf7a7f0d88caa6e90ce84c33beca458fad8016a33f9407:graph:5456aac2da1c03500dc9e8414bda6f4cd8bed8ffc8e0883dfe0fc2c7a54f5106:000000000000000113cd753c45dd6c2f",
+                "phase": "source",
+                "rows": 1024
+              },
+              "retained_catalog_sha256": "37f2ec54cd10152f37037910aa314e028f5b24cf451d35e6739ddd39da06aeef"
+            },
+            {
+              "stage": "resume",
+              "exit_code": 0,
+              "wall_ns": 24515125959,
+              "user_seconds": 0.079576,
+              "system_seconds": 0.10725699999999999,
+              "peak_rss_bytes": 58523648,
+              "pod_network_bytes": null,
+              "probe_environment": {
+                "ANTFLY_LAKE_BULK_CONFIG": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-source/case/config.json",
+                "ANTFLY_LAKE_BULK_EXPECTED_INVENTORY": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-source/case/expected-inventory.json",
+                "ANTFLY_LAKE_BULK_PARQUET": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source",
+                "ANTFLY_LAKE_BULK_CATALOG": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-source/case/catalog.json",
+                "ANTFLY_LAKE_BULK_DIMS": "768",
+                "ANTFLY_LAKE_BULK_INPUT_BYTES": "4294967296",
+                "ANTFLY_LAKE_BULK_IDENTITY_SPILL_BYTES": "8388608",
+                "ANTFLY_LAKE_BULK_ALGORITHM": "lloyd",
+                "ANTFLY_LAKE_BULK_FUSED": "1",
+                "ANTFLY_LAKE_BULK_PREBIND": "1",
+                "ANTFLY_LAKE_BULK_CHECKPOINT": "1",
+                "ANTFLY_LAKE_BULK_COMPACT": "0",
+                "ANTFLY_LAKE_BULK_RESUME": "1",
+                "ANTFLY_LAKE_BULK_RECALL_DIR": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-source/inputs/recall"
+              },
+              "records": {
+                "PARQUET_BULK_BUILD_MODE": [
+                  {
+                    "caller": "fast",
+                    "caller_value": 1,
+                    "provider": 1,
+                    "provider_is_test": false
+                  }
+                ],
+                "PARQUET_BULK_INVENTORY": [
+                  {
+                    "files": [
+                      {
+                        "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source/train.parquet",
+                        "bytes": 2909639,
+                        "version": "",
+                        "etag": "CLHSguyMg5gDEAE="
+                      }
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_RESUME": [
+                  {
+                    "name": "emb",
+                    "manifest": "sha256:f77df1eabe9aa3529aaf7a7f0d88caa6e90ce84c33beca458fad8016a33f9407:graph:5456aac2da1c03500dc9e8414bda6f4cd8bed8ffc8e0883dfe0fc2c7a54f5106:000000000000000113cd753c45dd6c2f",
+                    "phase": "source",
+                    "rows": 1024
+                  }
+                ],
+                "PARQUET_BULK_INPUT": [
+                  {
+                    "rows": 0,
+                    "resumed": true
+                  }
+                ],
+                "PARQUET_BULK_WORK": [
+                  {
+                    "identity_census_verified": true,
+                    "identity_read_bytes": 0,
+                    "identity_written_bytes": 12288,
+                    "identity_merge_inputs": 0,
+                    "projection_cache_peak_bytes": 3316035,
+                    "owned_index_count": 0,
+                    "partition_bytes": 0,
+                    "partition_read_bytes": 3258368,
+                    "compact_rows": 0,
+                    "projection_commit_ns": 2257000,
+                    "save_node_ns": 0,
+                    "update_parent_ns": 0,
+                    "update_parent_calls": 0,
+                    "training_ns": 2275000,
+                    "routing_ns": 2007000,
+                    "allocator_peak_bytes": 9673578
+                  }
+                ],
+                "PARQUET_BULK_PROJECTION": [
+                  {
+                    "runs": 2,
+                    "bytes": 412293
+                  }
+                ],
+                "PARQUET_BULK_RECEIPT": [
+                  {
+                    "name": "emb",
+                    "manifest": "sha256:4e180e2fcc88317ab050629609f04a3148e398306c298d9a644fe14182e3964c:graph:5456aac2da1c03500dc9e8414bda6f4cd8bed8ffc8e0883dfe0fc2c7a54f5106:000000000000000113cd753c45dd6c2f",
+                    "phase": "tree",
+                    "rows": 1024
+                  }
+                ],
+                "PARQUET_BULK_SOURCE": [
+                  {
+                    "runs": 1,
+                    "reused_runs": 1,
+                    "reused_bytes": 3231301,
+                    "new_bytes": 0
+                  }
+                ],
+                "PARQUET_BULK_MEMORY": [
+                  {
+                    "dense_allocator_peak_bytes": 9673578,
+                    "source_allocator_peak_bytes": 0,
+                    "max_vector_allocator_peak_bytes": 9673578
+                  }
+                ],
+                "PARQUET_BULK_PHASES": [
+                  {
+                    "names": [
+                      "identity",
+                      "fragments",
+                      "spool",
+                      "aggregate",
+                      "ordered",
+                      "text",
+                      "sparse",
+                      "dense",
+                      "bulk_tee",
+                      "bulk_receipt",
+                      "dense_ingest",
+                      "dense_cluster",
+                      "dense_checkpoint",
+                      "dense_upload"
+                    ],
+                    "ns": [
+                      118063000,
+                      0,
+                      0,
+                      11000,
+                      38000,
+                      63000,
+                      33000,
+                      11814462000,
+                      0,
+                      0,
+                      0,
+                      11496000,
+                      3156000,
+                      2263931000
+                    ],
+                    "calls": [
+                      1,
+                      0,
+                      0,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      0,
+                      0,
+                      1,
+                      1,
+                      1,
+                      1
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_RECALL": [
+                  {
+                    "queries": 2,
+                    "probes": 512,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 412369000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 1024,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4546000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 2048,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4527000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 4096,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4816000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 8192,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4370000
+                  }
+                ],
+                "PARQUET_BULK_SERVING_CACHE": [
+                  {
+                    "hits": 0,
+                    "misses": 50,
+                    "stored_bytes": 3633086,
+                    "protected_stored_bytes": 3633086,
+                    "evictions": 0,
+                    "disk_unavailable": null,
+                    "disk_init_attempts": 1,
+                    "disk_init_failures": 0,
+                    "disk_hits": 0,
+                    "mapping_hits": 0,
+                    "disk_bytes": 0,
+                    "provider_reads": 25,
+                    "provider_bytes": 3633086,
+                    "completed_queries": 0,
+                    "query_total_ns": 0,
+                    "query_publication_ns": 0,
+                    "query_search_ns": 0,
+                    "query_hydration_ns": 0,
+                    "query_delivery_ns": 0
+                  }
+                ]
+              },
+              "native_ns": 18399280000,
+              "checkpoints": 1
+            }
+          ],
+          "network_scope": "Linux process network namespace interfaces, including control traffic; unavailable on macOS; not object-store payload bytes",
+          "scratch_sample": {
+            "case_nominal_bytes": 2107923,
+            "host_filesystem_min_free_bytes": 102231613440,
+            "interval_seconds": 2,
+            "scope": "case directory nominal lengths only; host free-space includes unrelated work, native /tmp scratch not attributed"
+          }
+        }
+      },
+      {
+        "case": "tree",
+        "worker_exit_code": 0,
+        "frozen_inputs_sha256": {
+          "probe": "f20d140203fe6f5341646126a9cd2883f9552637596ce3c61be75fb53faed81b",
+          "gcs_bulk_local.py": "f651b455bfd7b4bca4c6d7ac8c5eb88beb987ff99808e4d08799ec60e5f56771",
+          "gcs_bulk_worker.py": "65c6fe6d960754a2ab8a3fe434ecb1d97008dfc03ff6265fab21e32246b7edf3",
+          "bench_bulk_pipeline.py": "3c463fe14a8267087082541ec59e19c482b01993a3a57f1365ba0ee5e0866696",
+          "recall/prepare.json": "bba57c5108ea1140f3ae3f07655f2741249b2d19001369a6c2283e03699c8293",
+          "recall/queries.f32": "fd18db97871a9e2ff3b74d783741d1859327aa555df2b85d673e1d3a9b5e93cc",
+          "recall/truth.u64": "74f2debbc33bf7c5dff7b97c29d58300ff5d71797e16b76c5e29c6d06c3ad7d6"
+        },
+        "result": {
+          "config": {
+            "case": "admission-tree",
+            "binary": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-tree/inputs/probe",
+            "bucket": "colony-import-sources-antfly-dev-01",
+            "prefix": "bulk-qualification/admission-check-973174c0863d",
+            "source_prefix": "bulk-qualification/20261112-review-fallback-ba7d594e/source",
+            "source_objects": [
+              {
+                "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source/train.parquet",
+                "bytes": 2909639,
+                "version": "1794509503506737",
+                "etag": "CLHSguyMg5gDEAE="
+              }
+            ],
+            "rows": 1024,
+            "variant": "optimized",
+            "interrupt": 2,
+            "auth": "adc",
+            "recall": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-tree/inputs/recall",
+            "work": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-tree/case",
+            "allowance": 4294967296,
+            "identity_allowance": 8388608
+          },
+          "native_config_sha256": "ab330387b4aa4734a0b142a460cf4bdd6eaa27842dd105600a395550eb810fa8",
+          "expected_inventory_sha256": "f239ca777d725fb89a922aa79281220d31eb8a9f8f0af76c3a0bb1f325285f21",
+          "qualified": true,
+          "attempts": [
+            {
+              "stage": "interrupt",
+              "exit_code": 1,
+              "wall_ns": 17219825792,
+              "user_seconds": 0.100396,
+              "system_seconds": 0.084685,
+              "peak_rss_bytes": 48594944,
+              "pod_network_bytes": null,
+              "probe_environment": {
+                "ANTFLY_LAKE_BULK_CONFIG": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-tree/case/config.json",
+                "ANTFLY_LAKE_BULK_EXPECTED_INVENTORY": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-tree/case/expected-inventory.json",
+                "ANTFLY_LAKE_BULK_PARQUET": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source",
+                "ANTFLY_LAKE_BULK_CATALOG": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-tree/case/catalog.json",
+                "ANTFLY_LAKE_BULK_DIMS": "768",
+                "ANTFLY_LAKE_BULK_INPUT_BYTES": "4294967296",
+                "ANTFLY_LAKE_BULK_IDENTITY_SPILL_BYTES": "8388608",
+                "ANTFLY_LAKE_BULK_ALGORITHM": "lloyd",
+                "ANTFLY_LAKE_BULK_FUSED": "1",
+                "ANTFLY_LAKE_BULK_PREBIND": "1",
+                "ANTFLY_LAKE_BULK_CHECKPOINT": "1",
+                "ANTFLY_LAKE_BULK_COMPACT": "0",
+                "ANTFLY_LAKE_BULK_INTERRUPT": "2"
+              },
+              "records": {
+                "PARQUET_BULK_BUILD_MODE": [
+                  {
+                    "caller": "fast",
+                    "caller_value": 1,
+                    "provider": 1,
+                    "provider_is_test": false
+                  }
+                ],
+                "PARQUET_BULK_INVENTORY": [
+                  {
+                    "files": [
+                      {
+                        "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source/train.parquet",
+                        "bytes": 2909639,
+                        "version": "",
+                        "etag": "CLHSguyMg5gDEAE="
+                      }
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_RECEIPT": [
+                  {
+                    "name": "emb",
+                    "manifest": "sha256:25b963e9849f108e80ee1b3a37df226156adf8e1694f102b0bcc1794d9427ef4:graph:5ed62e139dcc665bf966f0720740333efebbe2c54659f07cae3baeda42de54df:00000000000000017f9830fda34aac05",
+                    "phase": "source",
+                    "rows": 1024
+                  },
+                  {
+                    "name": "emb",
+                    "manifest": "sha256:a995358593fff6f69f355db1868d3caa4fd343268c7bb71c26e16db974b10f1d:graph:5ed62e139dcc665bf966f0720740333efebbe2c54659f07cae3baeda42de54df:00000000000000017f9830fda34aac05",
+                    "phase": "tree",
+                    "rows": 1024
+                  }
+                ],
+                "PARQUET_BULK_INPUT": [
+                  {
+                    "rows": 0,
+                    "resumed": true
+                  }
+                ],
+                "PARQUET_BULK_WORK": [
+                  {
+                    "identity_census_verified": true,
+                    "identity_read_bytes": 0,
+                    "identity_written_bytes": 12288,
+                    "identity_merge_inputs": 0,
+                    "projection_cache_peak_bytes": 685,
+                    "owned_index_count": 0,
+                    "partition_bytes": 0,
+                    "partition_read_bytes": 3258368,
+                    "compact_rows": 0,
+                    "projection_commit_ns": 2481000,
+                    "save_node_ns": 0,
+                    "update_parent_ns": 0,
+                    "update_parent_calls": 0,
+                    "training_ns": 2310000,
+                    "routing_ns": 2064000,
+                    "allocator_peak_bytes": 6307503
+                  }
+                ],
+                "PARQUET_BULK_PROJECTION": [
+                  {
+                    "runs": 3,
+                    "bytes": 412861
+                  }
+                ],
+                "PARQUET_BULK_FAILURE_PHASES": [
+                  {
+                    "error_name": "Cancelled",
+                    "cause": null,
+                    "elapsed_ns": 16157099000,
+                    "names": [
+                      "identity",
+                      "fragments",
+                      "spool",
+                      "aggregate",
+                      "ordered",
+                      "text",
+                      "sparse",
+                      "dense",
+                      "bulk_tee",
+                      "bulk_receipt",
+                      "dense_ingest",
+                      "dense_cluster",
+                      "dense_checkpoint",
+                      "dense_upload"
+                    ],
+                    "ns": [
+                      4106168000,
+                      0,
+                      0,
+                      10000,
+                      37000,
+                      59000,
+                      30000,
+                      3273033000,
+                      2217000,
+                      6842772000,
+                      9000,
+                      11282000,
+                      0,
+                      0
+                    ],
+                    "calls": [
+                      1,
+                      0,
+                      0,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              },
+              "retained_receipt": {
+                "name": "emb",
+                "manifest": "sha256:a995358593fff6f69f355db1868d3caa4fd343268c7bb71c26e16db974b10f1d:graph:5ed62e139dcc665bf966f0720740333efebbe2c54659f07cae3baeda42de54df:00000000000000017f9830fda34aac05",
+                "phase": "tree",
+                "rows": 1024
+              },
+              "retained_catalog_sha256": "d069c8b336147386471a719e63e80091ed306d813999c925e4b1697507497b33"
+            },
+            {
+              "stage": "resume",
+              "exit_code": 0,
+              "wall_ns": 21005667500,
+              "user_seconds": 0.057394,
+              "system_seconds": 0.069198,
+              "peak_rss_bytes": 54788096,
+              "pod_network_bytes": null,
+              "probe_environment": {
+                "ANTFLY_LAKE_BULK_CONFIG": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-tree/case/config.json",
+                "ANTFLY_LAKE_BULK_EXPECTED_INVENTORY": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-tree/case/expected-inventory.json",
+                "ANTFLY_LAKE_BULK_PARQUET": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source",
+                "ANTFLY_LAKE_BULK_CATALOG": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-tree/case/catalog.json",
+                "ANTFLY_LAKE_BULK_DIMS": "768",
+                "ANTFLY_LAKE_BULK_INPUT_BYTES": "4294967296",
+                "ANTFLY_LAKE_BULK_IDENTITY_SPILL_BYTES": "8388608",
+                "ANTFLY_LAKE_BULK_ALGORITHM": "lloyd",
+                "ANTFLY_LAKE_BULK_FUSED": "1",
+                "ANTFLY_LAKE_BULK_PREBIND": "1",
+                "ANTFLY_LAKE_BULK_CHECKPOINT": "1",
+                "ANTFLY_LAKE_BULK_COMPACT": "0",
+                "ANTFLY_LAKE_BULK_RESUME": "1",
+                "ANTFLY_LAKE_BULK_RECALL_DIR": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-tree/inputs/recall"
+              },
+              "records": {
+                "PARQUET_BULK_BUILD_MODE": [
+                  {
+                    "caller": "fast",
+                    "caller_value": 1,
+                    "provider": 1,
+                    "provider_is_test": false
+                  }
+                ],
+                "PARQUET_BULK_INVENTORY": [
+                  {
+                    "files": [
+                      {
+                        "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source/train.parquet",
+                        "bytes": 2909639,
+                        "version": "",
+                        "etag": "CLHSguyMg5gDEAE="
+                      }
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_RESUME": [
+                  {
+                    "name": "emb",
+                    "manifest": "sha256:a995358593fff6f69f355db1868d3caa4fd343268c7bb71c26e16db974b10f1d:graph:5ed62e139dcc665bf966f0720740333efebbe2c54659f07cae3baeda42de54df:00000000000000017f9830fda34aac05",
+                    "phase": "tree",
+                    "rows": 1024
+                  }
+                ],
+                "PARQUET_BULK_INPUT": [
+                  {
+                    "rows": 0,
+                    "resumed": true
+                  }
+                ],
+                "PARQUET_BULK_SOURCE": [
+                  {
+                    "runs": 1,
+                    "reused_runs": 1,
+                    "reused_bytes": 3231301,
+                    "new_bytes": 0
+                  }
+                ],
+                "PARQUET_BULK_MEMORY": [
+                  {
+                    "dense_allocator_peak_bytes": 756806,
+                    "source_allocator_peak_bytes": 0,
+                    "max_vector_allocator_peak_bytes": 756806
+                  }
+                ],
+                "PARQUET_BULK_PHASES": [
+                  {
+                    "names": [
+                      "identity",
+                      "fragments",
+                      "spool",
+                      "aggregate",
+                      "ordered",
+                      "text",
+                      "sparse",
+                      "dense",
+                      "bulk_tee",
+                      "bulk_receipt",
+                      "dense_ingest",
+                      "dense_cluster",
+                      "dense_checkpoint",
+                      "dense_upload"
+                    ],
+                    "ns": [
+                      354155000,
+                      0,
+                      0,
+                      2000,
+                      35000,
+                      38000,
+                      13000,
+                      6113057000,
+                      0,
+                      0,
+                      2000,
+                      0,
+                      251661000,
+                      3020058000
+                    ],
+                    "calls": [
+                      1,
+                      0,
+                      0,
+                      1,
+                      1,
+                      1,
+                      1,
+                      1,
+                      0,
+                      0,
+                      1,
+                      0,
+                      1,
+                      1
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_RECALL": [
+                  {
+                    "queries": 2,
+                    "probes": 512,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 515270000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 1024,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4663000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 2048,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4846000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 4096,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4808000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 8192,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4609000
+                  }
+                ],
+                "PARQUET_BULK_SERVING_CACHE": [
+                  {
+                    "hits": 0,
+                    "misses": 50,
+                    "stored_bytes": 3633089,
+                    "protected_stored_bytes": 3633089,
+                    "evictions": 0,
+                    "disk_unavailable": null,
+                    "disk_init_attempts": 1,
+                    "disk_init_failures": 0,
+                    "disk_hits": 0,
+                    "mapping_hits": 0,
+                    "disk_bytes": 0,
+                    "provider_reads": 25,
+                    "provider_bytes": 3633089,
+                    "completed_queries": 0,
+                    "query_total_ns": 0,
+                    "query_publication_ns": 0,
+                    "query_search_ns": 0,
+                    "query_hydration_ns": 0,
+                    "query_delivery_ns": 0
+                  }
+                ]
+              },
+              "native_ns": 14140884000,
+              "checkpoints": 0
+            }
+          ],
+          "network_scope": "Linux process network namespace interfaces, including control traffic; unavailable on macOS; not object-store payload bytes",
+          "scratch_sample": {
+            "case_nominal_bytes": 3421756,
+            "host_filesystem_min_free_bytes": 102142877696,
+            "interval_seconds": 2,
+            "scope": "case directory nominal lengths only; host free-space includes unrelated work, native /tmp scratch not attributed"
+          }
+        }
+      },
+      {
+        "case": "reopen",
+        "worker_exit_code": 0,
+        "frozen_inputs_sha256": {
+          "probe": "f20d140203fe6f5341646126a9cd2883f9552637596ce3c61be75fb53faed81b",
+          "gcs_bulk_local.py": "f651b455bfd7b4bca4c6d7ac8c5eb88beb987ff99808e4d08799ec60e5f56771",
+          "gcs_bulk_worker.py": "65c6fe6d960754a2ab8a3fe434ecb1d97008dfc03ff6265fab21e32246b7edf3",
+          "bench_bulk_pipeline.py": "3c463fe14a8267087082541ec59e19c482b01993a3a57f1365ba0ee5e0866696",
+          "recall/prepare.json": "bba57c5108ea1140f3ae3f07655f2741249b2d19001369a6c2283e03699c8293",
+          "recall/queries.f32": "fd18db97871a9e2ff3b74d783741d1859327aa555df2b85d673e1d3a9b5e93cc",
+          "recall/truth.u64": "74f2debbc33bf7c5dff7b97c29d58300ff5d71797e16b76c5e29c6d06c3ad7d6",
+          "reopen/case.json": "f46f95e995b30f1914895b58364747f1a87d4af1068a917099d77f961b20e8e8",
+          "reopen/catalog.json": "17c71417afd1d74dadb8d23ca4993c1bbdac7e631ba58be631a7ee9d7f92dffc"
+        },
+        "result": {
+          "config": {
+            "case": "admission-reopen",
+            "binary": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-reopen/inputs/probe",
+            "bucket": "colony-import-sources-antfly-dev-01",
+            "prefix": "bulk-qualification/admission-check-973174c0863d",
+            "source_prefix": "bulk-qualification/20261112-review-fallback-ba7d594e/source",
+            "source_objects": [
+              {
+                "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source/train.parquet",
+                "bytes": 2909639,
+                "version": "1794509503506737",
+                "etag": "CLHSguyMg5gDEAE="
+              }
+            ],
+            "rows": 1024,
+            "variant": "optimized",
+            "interrupt": null,
+            "auth": "adc",
+            "recall": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-reopen/inputs/recall",
+            "work": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-reopen/case",
+            "allowance": 4294967296,
+            "identity_allowance": 8388608,
+            "reopen_catalog": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-reopen/inputs/reopen/catalog.json"
+          },
+          "native_config_sha256": "5c8d23cfadd240fbcaf45a6aa0f23dc46b0212ab33392d64441c3d01f20d212e",
+          "expected_inventory_sha256": "f239ca777d725fb89a922aa79281220d31eb8a9f8f0af76c3a0bb1f325285f21",
+          "qualified": true,
+          "attempts": [
+            {
+              "stage": "reopen",
+              "exit_code": 0,
+              "wall_ns": 7397822333,
+              "user_seconds": 0.038555,
+              "system_seconds": 0.037211999999999995,
+              "peak_rss_bytes": 63815680,
+              "pod_network_bytes": null,
+              "probe_environment": {
+                "ANTFLY_LAKE_BULK_CONFIG": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-reopen/case/config.json",
+                "ANTFLY_LAKE_BULK_EXPECTED_INVENTORY": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-reopen/case/expected-inventory.json",
+                "ANTFLY_LAKE_BULK_PARQUET": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source",
+                "ANTFLY_LAKE_BULK_CATALOG": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-reopen/case/catalog.json",
+                "ANTFLY_LAKE_BULK_RECALL_DIR": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-reopen/inputs/recall",
+                "ANTFLY_LAKE_BULK_DIMS": "768",
+                "ANTFLY_LAKE_BULK_INPUT_BYTES": "4294967296",
+                "ANTFLY_LAKE_BULK_IDENTITY_SPILL_BYTES": "8388608",
+                "ANTFLY_LAKE_BULK_ALGORITHM": "lloyd",
+                "ANTFLY_LAKE_BULK_FUSED": "1",
+                "ANTFLY_LAKE_BULK_PREBIND": "1",
+                "ANTFLY_LAKE_BULK_CHECKPOINT": "1",
+                "ANTFLY_LAKE_BULK_COMPACT": "0",
+                "ANTFLY_LAKE_BULK_REOPEN_ONLY": "1"
+              },
+              "records": {
+                "PARQUET_BULK_BUILD_MODE": [
+                  {
+                    "caller": "fast",
+                    "caller_value": 1,
+                    "provider": 1,
+                    "provider_is_test": false
+                  }
+                ],
+                "PARQUET_BULK_INVENTORY": [
+                  {
+                    "files": [
+                      {
+                        "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/20261112-review-fallback-ba7d594e/source/train.parquet",
+                        "bytes": 2909639,
+                        "version": "",
+                        "etag": "CLHSguyMg5gDEAE="
+                      }
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_PHASES": [
+                  {
+                    "names": [
+                      "identity",
+                      "fragments",
+                      "spool",
+                      "aggregate",
+                      "ordered",
+                      "text",
+                      "sparse",
+                      "dense",
+                      "bulk_tee",
+                      "bulk_receipt",
+                      "dense_ingest",
+                      "dense_cluster",
+                      "dense_checkpoint",
+                      "dense_upload"
+                    ],
+                    "ns": [
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0
+                    ],
+                    "calls": [
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0
+                    ]
+                  }
+                ],
+                "PARQUET_BULK_RECALL": [
+                  {
+                    "queries": 2,
+                    "probes": 512,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 569310000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 1024,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4723000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 2048,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4723000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 4096,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4536000
+                  },
+                  {
+                    "queries": 2,
+                    "probes": 8192,
+                    "k": 100,
+                    "hits": 197,
+                    "recall": 0.985,
+                    "scored": 2048,
+                    "elapsed_ns": 4794000
+                  }
+                ],
+                "PARQUET_BULK_SERVING_CACHE": [
+                  {
+                    "hits": 0,
+                    "misses": 50,
+                    "stored_bytes": 3633089,
+                    "protected_stored_bytes": 3633089,
+                    "evictions": 0,
+                    "disk_unavailable": null,
+                    "disk_init_attempts": 1,
+                    "disk_init_failures": 0,
+                    "disk_hits": 0,
+                    "mapping_hits": 0,
+                    "disk_bytes": 0,
+                    "provider_reads": 25,
+                    "provider_bytes": 3633089,
+                    "completed_queries": 0,
+                    "query_total_ns": 0,
+                    "query_publication_ns": 0,
+                    "query_search_ns": 0,
+                    "query_hydration_ns": 0,
+                    "query_delivery_ns": 0
+                  }
+                ]
+              },
+              "native_ns": 0,
+              "checkpoints": 0,
+              "build_timing_available": false
+            }
+          ],
+          "network_scope": "Linux process network namespace interfaces, including control traffic; unavailable on macOS; not object-store payload bytes",
+          "scratch_sample": {
+            "case_nominal_bytes": 2626994,
+            "host_filesystem_min_free_bytes": 102095560704,
+            "interval_seconds": 2,
+            "scope": "case directory nominal lengths only; host free-space includes unrelated work, native /tmp scratch not attributed"
+          }
+        }
+      },
+      {
+        "case": "extra-vectorless",
+        "worker_exit_code": 1,
+        "frozen_inputs_sha256": {
+          "probe": "f20d140203fe6f5341646126a9cd2883f9552637596ce3c61be75fb53faed81b",
+          "gcs_bulk_local.py": "f651b455bfd7b4bca4c6d7ac8c5eb88beb987ff99808e4d08799ec60e5f56771",
+          "gcs_bulk_worker.py": "65c6fe6d960754a2ab8a3fe434ecb1d97008dfc03ff6265fab21e32246b7edf3",
+          "bench_bulk_pipeline.py": "3c463fe14a8267087082541ec59e19c482b01993a3a57f1365ba0ee5e0866696",
+          "recall/prepare.json": "bba57c5108ea1140f3ae3f07655f2741249b2d19001369a6c2283e03699c8293",
+          "recall/queries.f32": "fd18db97871a9e2ff3b74d783741d1859327aa555df2b85d673e1d3a9b5e93cc",
+          "recall/truth.u64": "74f2debbc33bf7c5dff7b97c29d58300ff5d71797e16b76c5e29c6d06c3ad7d6"
+        },
+        "result": {
+          "config": {
+            "case": "admission-extra-vectorless",
+            "binary": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-extra-vectorless/inputs/probe",
+            "bucket": "colony-import-sources-antfly-dev-01",
+            "prefix": "bulk-qualification/admission-check-5d6c04646887",
+            "source_prefix": "bulk-qualification/inventory-negative-aa5a1168153e/source",
+            "source_objects": [
+              {
+                "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/inventory-negative-aa5a1168153e/source/train.parquet",
+                "bytes": 2909639,
+                "version": "1794513693342277",
+                "etag": "CMX08bmcg5gDEAE="
+              }
+            ],
+            "rows": 1024,
+            "variant": "optimized",
+            "interrupt": null,
+            "auth": "adc",
+            "recall": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-extra-vectorless/inputs/recall",
+            "work": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-extra-vectorless/case",
+            "allowance": 4294967296,
+            "identity_allowance": 8388608
+          },
+          "native_config_sha256": "a78b7ef016f7fe3f0998bc1a53e7b986b4d73d96ff2fd44d962711d01b20104b",
+          "expected_inventory_sha256": "4e873128869ea76ae063471e2590cb4e9e89311a341b38ab15a0523da03f62e5",
+          "qualified": false,
+          "attempts": [
+            {
+              "stage": "build",
+              "exit_code": 1,
+              "wall_ns": 769265375,
+              "user_seconds": 0.00492,
+              "system_seconds": 0.006332,
+              "peak_rss_bytes": 13926400,
+              "pod_network_bytes": null,
+              "probe_environment": {
+                "ANTFLY_LAKE_BULK_CONFIG": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-extra-vectorless/case/config.json",
+                "ANTFLY_LAKE_BULK_EXPECTED_INVENTORY": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-extra-vectorless/case/expected-inventory.json",
+                "ANTFLY_LAKE_BULK_PARQUET": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/inventory-negative-aa5a1168153e/source",
+                "ANTFLY_LAKE_BULK_CATALOG": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-extra-vectorless/case/catalog.json",
+                "ANTFLY_LAKE_BULK_RECALL_DIR": "/Users/ajroetker/go/src/github.com/antflydb/antfly/.worktrees/test-gcs-bulk-qualification/zig/.benchmark-results/gcs-bulk/admission-check-extra-vectorless/inputs/recall",
+                "ANTFLY_LAKE_BULK_DIMS": "768",
+                "ANTFLY_LAKE_BULK_INPUT_BYTES": "4294967296",
+                "ANTFLY_LAKE_BULK_IDENTITY_SPILL_BYTES": "8388608",
+                "ANTFLY_LAKE_BULK_ALGORITHM": "lloyd",
+                "ANTFLY_LAKE_BULK_FUSED": "1",
+                "ANTFLY_LAKE_BULK_PREBIND": "1",
+                "ANTFLY_LAKE_BULK_CHECKPOINT": "1",
+                "ANTFLY_LAKE_BULK_COMPACT": "0"
+              },
+              "records": {
+                "PARQUET_BULK_BUILD_MODE": [
+                  {
+                    "caller": "fast",
+                    "caller_value": 1,
+                    "provider": 1,
+                    "provider_is_test": false
+                  }
+                ],
+                "PARQUET_BULK_INVENTORY": [
+                  {
+                    "files": [
+                      {
+                        "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/inventory-negative-aa5a1168153e/source/train.parquet",
+                        "bytes": 2909639,
+                        "version": "",
+                        "etag": "CMX08bmcg5gDEAE="
+                      },
+                      {
+                        "uri": "gs://colony-import-sources-antfly-dev-01/bulk-qualification/inventory-negative-aa5a1168153e/source/zzz-vectorless.parquet",
+                        "bytes": 500,
+                        "version": "",
+                        "etag": "CJnYrLucg5gDEAE="
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ],
+          "network_scope": "Linux process network namespace interfaces, including control traffic; unavailable on macOS; not object-store payload bytes"
+        },
+        "rejected_before_construction": true
+      }
+    ]
+  },
+  "final_validation": {
+    "base_revision": "014f2243ef94f63c55f5003fb4aff4de5bdef830",
+    "native_source_diff_sha256": "5931d09882c752a7bfe279bcffc686b01a54980c215c1c0fc78b3c3f05b55af5",
+    "probe_source_sha256": "cba62cb95dd80b10de40cb89a6c75344d616f4717761f0518f51929668013ce4",
+    "probe_binary_sha256": "f20d140203fe6f5341646126a9cd2883f9552637596ce3c61be75fb53faed81b",
+    "build_steps_succeeded": 87,
+    "build_steps_total": 87,
+    "native_tests_passed": 27,
+    "native_tests_skipped": 1,
+    "native_tests_failed": 0,
+    "native_tests_leaked": 0,
+    "python_regression_tests_passed": 26
   }
 }

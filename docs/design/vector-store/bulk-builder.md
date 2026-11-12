@@ -702,3 +702,20 @@ can still decline the optional spool and use the existing required gather path.
 This converts repeated random cloud navigation into sequential remote scans plus
 bounded local sorting and seeks. Read-count comparisons and remote timing must
 be reported separately; neither establishes a full managed-table import rate.
+
+
+The final publication scope also covers completed-tree and serving-generation
+uploads. A subsequent 100K local-to-GCS operation completed and qualified in
+299.9 seconds, compared with 374.7 seconds for source-checkpoint scheduling alone;
+final dense upload decreased from 44.1 to 13.2 seconds. Both had the same private
+allocator peaks, source reuse and ten-query recall/scored counts. These remain
+single-pair WAN observations, not same-region throughput estimates.
+
+Qualification inputs form an owned execution snapshot: executable, Python
+controller/worker/validator, oracle inputs, case descriptor and any retained
+reopen catalog. Probe settings are explicit rather than inherited. The probe
+attests the entire source inventory and checks its admitted immutable revisions
+before construction; vectorless files cannot silently alter identity work while
+preserving embedding count and recall. Receipt checks bind the exact interrupted
+manifest and require skipped input replay/clustering after restart. These testing
+contracts are separate from production catalog CAS, Raft and power-loss recovery.

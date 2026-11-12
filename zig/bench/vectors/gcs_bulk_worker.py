@@ -55,9 +55,52 @@ def parse_records(text):
     return records
 
 
+def validate_inventory(cfg, records):
+    inventories = records.get("PARQUET_BULK_INVENTORY", [])
+    if len(inventories) != 1 or not isinstance(inventories[0].get("files"), list):
+        raise RuntimeError("missing or duplicate native source inventory")
+    files = inventories[0]["files"]
+    if any(
+        not isinstance(file, dict)
+        or not isinstance(file.get("uri"), str)
+        or not isinstance(file.get("version"), str)
+        or not isinstance(file.get("etag", ""), str)
+        or type(file.get("bytes")) is not int
+        or file["bytes"] < 0
+        for file in files
+    ):
+        raise RuntimeError("invalid native source inventory")
+    expected = cfg["source_objects"]
+    if len(files) != len(expected):
+        raise RuntimeError(
+            "native source inventory differs from admitted immutable objects"
+        )
+    for observed, admitted in zip(
+        sorted(files, key=lambda file: file["uri"]),
+        sorted(expected, key=lambda file: file["uri"]),
+    ):
+        if observed["uri"] != admitted["uri"] or observed["bytes"] != admitted["bytes"]:
+            raise RuntimeError(
+                "native source inventory differs from admitted immutable objects"
+            )
+        # Prefix readers can bind a strong JSON metadata ETag instead of an
+        # explicit generation. GCS resolves that conditional revision to its
+        # generation before fetching bytes; compare the admitted alias too.
+        if observed["version"]:
+            if observed["version"] != admitted["version"] or (
+                observed.get("etag") and observed["etag"] != admitted.get("etag")
+            ):
+                raise RuntimeError(
+                    "native source generation differs from admitted object"
+                )
+        elif not admitted.get("etag") or observed.get("etag") != admitted["etag"]:
+            raise RuntimeError("native source has no admitted immutable revision")
+
+
 def validate_interruption(cfg, row, text, catalog):
     phase = "source" if cfg["interrupt"] == 1 else "tree"
     records = parse_records(text)
+    validate_inventory(cfg, records)
     receipts = records.get("PARQUET_BULK_RECEIPT", [])
     expected_phases = ["source"] if phase == "source" else ["source", "tree"]
     construction = (catalog.get("checkpoint") or {}).get("construction", [])
@@ -90,6 +133,169 @@ def validate_resume(records, receipt):
         or (receipt["phase"] == "tree" and records.get("PARQUET_BULK_WORK"))
     ):
         raise RuntimeError("resume repeated completed construction work")
+
+
+def nonnegative_counts(record, fields):
+    return all(type(record.get(key)) is int and record[key] >= 0 for key in fields)
+
+
+def validate_evidence(cfg, row, receipt=None):
+    from bench_bulk_pipeline import BULK_PHASE_NAMES, validate_phases
+
+    records = row["records"]
+    validate_inventory(cfg, records)
+    modes = records.get("PARQUET_BULK_BUILD_MODE", [])
+    if (
+        len(modes) != 1
+        or modes[0].get("caller") != "fast"
+        or modes[0].get("provider_is_test") is not False
+        or any(
+            type(modes[0].get(key)) is not int or modes[0][key] != 1
+            for key in ("caller_value", "provider")
+        )
+    ):
+        raise RuntimeError("mixed or non-release compilation")
+    calls = validate_phases(records.get("PARQUET_BULK_PHASES", []), BULK_PHASE_NAMES)
+    if cfg.get("reopen_catalog"):
+        if (
+            row["native_ns"] != 0
+            or row["checkpoints"] != 0
+            or any(calls.values())
+            or any(
+                records.get(name)
+                for name in (
+                    "PARQUET_BULK_INPUT",
+                    "PARQUET_BULK_RESUME",
+                    "PARQUET_BULK_RECEIPT",
+                    "PARQUET_BULK_WORK",
+                    "PARQUET_BULK_PROJECTION",
+                    "PARQUET_BULK_SOURCE",
+                )
+            )
+        ):
+            raise RuntimeError("verification-only reopen performed construction")
+        return
+    if any(
+        calls[name] != 1
+        for name in (
+            "identity",
+            "dense",
+            "dense_ingest",
+            "dense_checkpoint",
+            "dense_upload",
+        )
+    ):
+        raise RuntimeError("missing or repeated construction phase")
+    inputs = records.get("PARQUET_BULK_INPUT", [])
+    if (
+        len(inputs) != 1
+        or not nonnegative_counts(inputs[0], ("rows",))
+        or type(inputs[0].get("resumed")) is not bool
+    ):
+        raise RuntimeError("invalid dense input evidence")
+    if stage_resume := receipt is not None:
+        validate_resume(records, receipt)
+    else:
+        fused = cfg["variant"] == "optimized"
+        bulk = cfg["variant"] != "incremental"
+        if (
+            calls["dense_cluster"] != int(bulk)
+            or bool(calls["bulk_tee"]) != fused
+            or calls["bulk_receipt"] != int(fused)
+        ):
+            raise RuntimeError("construction phases do not match the requested variant")
+        if records.get("PARQUET_BULK_INPUT") != [
+            dict(rows=0 if fused else cfg["rows"], resumed=fused)
+        ]:
+            raise RuntimeError(
+                "dense input evidence does not match the requested variant"
+            )
+    if cfg["variant"] != "incremental":
+        expected = (
+            []
+            if stage_resume and receipt["phase"] == "tree"
+            else ["tree"]
+            if stage_resume
+            else ["source", "tree"]
+        )
+        saved = records.get("PARQUET_BULK_RECEIPT", [])
+        if (
+            [value.get("phase") for value in saved] != expected
+            or row["checkpoints"] != len(expected)
+            or any(
+                value.get("name") != "emb" or value.get("rows") != cfg["rows"]
+                for value in saved
+            )
+        ):
+            raise RuntimeError("incomplete construction receipt evidence")
+    elif row["checkpoints"] != 0 or records.get("PARQUET_BULK_RECEIPT"):
+        raise RuntimeError("incremental case unexpectedly used bulk receipts")
+    memory = records.get("PARQUET_BULK_MEMORY", [])
+    fields = (
+        "dense_allocator_peak_bytes",
+        "source_allocator_peak_bytes",
+        "max_vector_allocator_peak_bytes",
+    )
+    if (
+        len(memory) != 1
+        or not nonnegative_counts(memory[0], fields)
+        or memory[0][fields[0]] == 0
+        or any(memory[0][key] > 256 * 1024**2 for key in fields)
+        or memory[0][fields[2]] != max(memory[0][fields[0]], memory[0][fields[1]])
+    ):
+        raise RuntimeError("missing memory evidence or private quota exceeded")
+    if cfg["variant"] == "incremental":
+        if any(
+            records.get(name)
+            for name in (
+                "PARQUET_BULK_WORK",
+                "PARQUET_BULK_PROJECTION",
+                "PARQUET_BULK_SOURCE",
+            )
+        ):
+            raise RuntimeError("incremental case unexpectedly emitted bulk work")
+        return
+    source = records.get("PARQUET_BULK_SOURCE", [])
+    if (
+        len(source) != 1
+        or not nonnegative_counts(
+            source[0], ("runs", "reused_runs", "reused_bytes", "new_bytes")
+        )
+        or source[0]["runs"] <= 0
+        or source[0]["new_bytes"] != 0
+        or source[0]["reused_runs"] != source[0]["runs"]
+        or source[0]["reused_bytes"] <= 0
+    ):
+        raise RuntimeError("exact source was not fully reused")
+    if not (stage_resume and receipt["phase"] == "tree"):
+        work = records.get("PARQUET_BULK_WORK", [])
+        fields = (
+            "identity_read_bytes",
+            "identity_written_bytes",
+            "identity_merge_inputs",
+            "projection_cache_peak_bytes",
+            "owned_index_count",
+            "partition_bytes",
+            "partition_read_bytes",
+            "compact_rows",
+            "projection_commit_ns",
+            "save_node_ns",
+            "update_parent_ns",
+            "update_parent_calls",
+            "training_ns",
+            "routing_ns",
+            "allocator_peak_bytes",
+        )
+        if (
+            len(work) != 1
+            or not nonnegative_counts(work[0], fields)
+            or work[0].get("identity_census_verified") is not True
+            or work[0]["owned_index_count"] != 0
+            or work[0]["identity_merge_inputs"] > 32
+        ):
+            raise RuntimeError("unverified or unbounded identity construction")
+        if cfg["variant"] == "optimized" and work[0]["update_parent_calls"] != 0:
+            raise RuntimeError("preassigned parents were rewritten")
 
 
 def main():
@@ -142,10 +348,20 @@ def main():
         },
     )
     Path("config.json").write_text(json.dumps(config))
+    Path("config.json").chmod(0o400)
+    config_hash = hashlib.sha256(Path("config.json").read_bytes()).hexdigest()
+    Path("expected-inventory.json").write_text(json.dumps(cfg["source_objects"]))
+    Path("expected-inventory.json").chmod(0o400)
+    inventory_hash = hashlib.sha256(
+        Path("expected-inventory.json").read_bytes()
+    ).hexdigest()
+    from bench_bulk_pipeline import probe_environment
+
     env = dict(
-        os.environ,
+        probe_environment(),
         BULK_GCS_BEARER=token,
         ANTFLY_LAKE_BULK_CONFIG=str(root / "config.json"),
+        ANTFLY_LAKE_BULK_EXPECTED_INVENTORY=str(root / "expected-inventory.json"),
         ANTFLY_LAKE_BULK_PARQUET="gs://" + cfg["bucket"] + "/" + cfg["source_prefix"],
         ANTFLY_LAKE_BULK_CATALOG=str(root / "catalog.json"),
         ANTFLY_LAKE_BULK_RECALL_DIR=cfg["recall"],
@@ -160,12 +376,15 @@ def main():
         ANTFLY_LAKE_BULK_FUSED="1" if cfg["variant"] == "optimized" else "0",
         ANTFLY_LAKE_BULK_PREBIND="1" if cfg["variant"] == "optimized" else "0",
         ANTFLY_LAKE_BULK_CHECKPOINT="1",
+        ANTFLY_LAKE_BULK_COMPACT="0",
     )
     if cfg.get("reopen_catalog"):
         shutil.copyfile(cfg["reopen_catalog"], root / "catalog.json")
         env["ANTFLY_LAKE_BULK_REOPEN_ONLY"] = "1"
     report = dict(
         config=cfg,
+        native_config_sha256=config_hash,
+        expected_inventory_sha256=inventory_hash,
         qualified=False,
         attempts=[],
         network_scope="Linux process network namespace interfaces, including control traffic; unavailable on macOS; not object-store payload bytes",
@@ -230,14 +449,27 @@ def main():
             system_seconds=usage.ru_stime,
             peak_rss_bytes=usage.ru_maxrss * (1 if sys.platform == "darwin" else 1024),
             pod_network_bytes=network() - before if before is not None else None,
+            probe_environment={
+                key: value
+                for key, value in env.items()
+                if key.startswith(("ANTFLY_LAKE_BULK_", "ANTFLY_LAKE_PROBE_"))
+            },
         )
         report["attempts"].append(row)
         atomic(root / "result.json", report)
+        if hashlib.sha256(Path("config.json").read_bytes()).hexdigest() != config_hash:
+            raise RuntimeError("native configuration changed during execution")
+        if (
+            hashlib.sha256(Path("expected-inventory.json").read_bytes()).hexdigest()
+            != inventory_hash
+        ):
+            raise RuntimeError("expected inventory changed during execution")
         text = (root / (stage + ".log")).read_text()
         if token and token in text:
             raise RuntimeError("credential appeared in child log")
         row["records"] = parse_records(text)
         atomic(root / "result.json", report)
+        validate_inventory(cfg, row["records"])
         if stage == "interrupt":
             catalog = json.loads((root / "catalog.json").read_text())
             retained_receipt = validate_interruption(cfg, row, text, catalog)
@@ -260,57 +492,9 @@ def main():
         truth = json.loads((Path(cfg["recall"]) / "prepare.json").read_text())
         validate_recall(row["records"].get("PARQUET_BULK_RECALL", []), truth)
 
+        validate_evidence(cfg, row, retained_receipt if stage == "resume" else None)
         if cfg.get("reopen_catalog"):
             row["build_timing_available"] = False
-            continue
-        records = row["records"]
-        modes = records.get("PARQUET_BULK_BUILD_MODE", [])
-        if len(modes) != 1 or modes[0] != dict(
-            caller="fast", caller_value=1, provider=1, provider_is_test=False
-        ):
-            raise RuntimeError("mixed or non-release compilation")
-        phases = records.get("PARQUET_BULK_PHASES", [])
-        if (
-            len(phases) != 1
-            or len(phases[0]["names"]) != len(set(phases[0]["names"]))
-            or len(phases[0]["names"]) != len(phases[0]["ns"])
-            or len(phases[0]["names"]) != len(phases[0]["calls"])
-            or any(value < 0 for value in phases[0]["ns"] + phases[0]["calls"])
-        ):
-            raise RuntimeError("incomplete phase attribution")
-        memory = records.get("PARQUET_BULK_MEMORY", [])
-        if len(memory) != 1 or any(
-            memory[0][key] > 256 * 1024**2
-            for key in ("dense_allocator_peak_bytes", "source_allocator_peak_bytes")
-        ):
-            raise RuntimeError("missing memory evidence or private quota exceeded")
-        if stage == "resume":
-            validate_resume(records, retained_receipt)
-        if cfg["variant"] != "incremental":
-            source = records.get("PARQUET_BULK_SOURCE", [])
-            if (
-                len(source) != 1
-                or source[0]["runs"] <= 0
-                or source[0]["new_bytes"] != 0
-                or source[0]["reused_runs"] != source[0]["runs"]
-                or source[0]["reused_bytes"] <= 0
-            ):
-                raise RuntimeError("exact source was not fully reused")
-            # A completed-tree resume intentionally does no new clustering.
-            if cfg.get("interrupt") != 2:
-                work = records.get("PARQUET_BULK_WORK", [])
-                if (
-                    len(work) != 1
-                    or not work[0].get("identity_census_verified")
-                    or work[0]["owned_index_count"] != 0
-                    or work[0]["identity_merge_inputs"] > 32
-                ):
-                    raise RuntimeError("unverified or unbounded identity construction")
-                if (
-                    cfg["variant"] == "optimized"
-                    and work[0]["update_parent_calls"] != 0
-                ):
-                    raise RuntimeError("preassigned parents were rewritten")
 
     stop.set()
     sampler.join()

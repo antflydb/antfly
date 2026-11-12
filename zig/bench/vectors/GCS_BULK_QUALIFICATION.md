@@ -159,3 +159,63 @@ and returned 197/200 oracle hits at all five widths. Cache collection overlapped
 these correctness checks; their elapsed times are not performance evidence. The
 final native build passed 87/87 steps, with 27 tests passed, one guarded S3 test
 skipped, and no failures or leaks. All 18 Python regression tests passed.
+
+
+## Final publication and reproducibility checks
+
+After merging main through `25a794d6c7`, the same 100K GCS corpus qualified in
+299.899 seconds of native construction. Identity took 155.582 seconds, source
+receipt 105.231 seconds, dense construction 30.148 seconds, and final dense upload
+13.222 seconds. The checkpoint-only version took 374.675 seconds overall and
+44.081 seconds for final dense upload. Dense/source allocator peaks remained
+53,475,836 / 39,504,883 bytes, and all 315,512,750 source bytes were reused.
+Recall and scored counts match the earlier fixed ten-query observations exactly.
+This is another single shared-workstation WAN observation. No experiment-owned
+compilation, staging or cache collection overlapped construction. Small synthetic
+control/incremental correctness checks overlapped serving recall only; child wall
+and query timings are therefore not isolated comparisons.
+
+Each controller now copies the executable, controller, worker, validator and
+recall inputs into its owned output directory and re-execs the copied controller.
+Verification-only reopen also copies the retained case descriptor and catalog.
+The case descriptor and generated native configuration are read-only and hashed;
+all copied input hashes are checked again before qualification. The workspace Git
+revision is context, not proof of an executable's compilation revision. The
+executable hash identifies the actual frozen artifact. Frozen input size is
+recorded separately from sampled child scratch.
+
+Both runners clear inherited bulk/probe flags before applying a case's settings.
+Local-file overrides, compact mode, resume flags and headroom experiments cannot
+silently change a GCS variant. The GCS worker records its explicit probe settings.
+SIGTERM follows the same cleanup path as timeout/interrupt, signals the owned
+worker group and reaps its leader. Cleanup also signals surviving descendants
+when the group leader has already exited and is safe to call repeatedly.
+
+The native probe emits the actual complete Parquet inventory. Qualification
+matches file URIs, lengths and immutable revisions against the admitted objects,
+including files that emit no vectors. An explicit generation is checked directly;
+a prefix reader's metadata ETag must match the admitted alias that GCS resolves
+conditionally to that generation. The probe checks the owned expected inventory
+before beginning construction, and the worker checks the emitted inventory too.
+Unexpected vectorless files therefore fail admission even when vector count and
+recall would otherwise pass. This is probe-only admission; no publication format
+or production source-pinning semantics change.
+
+The shared phase validator requires complete, unique, typed nonnegative counters.
+GCS checks also require variant-specific input/work/receipt evidence and reject
+construction hidden in verification-only reopen. Offline regressions exercise
+live-file mutation after snapshot, late validator imports, leader-exit descendants,
+SIGTERM through the actual snapshotted controller, inherited probe flags, empty
+phase arrays, malformed counters and generation/ETag mismatches.
+
+
+Final live GCS admission checks passed for source receipt, completed-tree receipt
+and verification-only reopen with the owned expected inventory. A separate
+source prefix containing an extra vectorless Parquet file was rejected before
+construction: no pending catalog, dense input, clustering work or receipt was
+created. Before early admission was added, that same negative fixture completed
+native construction and recall and would satisfy all other qualification
+contracts when both files were admitted; this isolates the inventory regression.
+The recorded report retains both observations. Final validation passed all 87
+build steps, 27 native tests (one guarded S3 skip, no failures/leaks), and all 26
+Python regressions. These synthetic checks are correctness evidence only.
