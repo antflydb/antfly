@@ -1726,6 +1726,91 @@ crash_consistency_test.zig:3235-3263), which must keep not firing:
    merge/retirement, to catch the same class of idle-flush-timer
    starvation bug §7.1 found, in the new code path.
 
+### 9.6a ReadGeneration visibility, part 1: a versioned overlay (in-process)
+
+A `ReadGeneration` (docstore.zig) wraps a *second*, independently-opened
+`NativeFile` that builds its own `RedoCommitState` via its own
+`recoverRedoLog` and is never refreshed afterward -- `observeReadCheckpoint`
+only updates the wrapper's tracked `CheckpointSlot`, never that second
+instance's internal header/overlay. A key written after the generation
+opened is invisible through it even though it is definitely live
+through the writer's own `self.file` (confirmed by direct reproduction:
+`generation.file`'s own checkpoint sequence stays frozen at 0 while the
+live writer's reaches 1, and `redoOverlayEntry`'s pinned-checkpoint
+guard -- correctly, by its own contract -- then refuses to show the
+generation anything). This is not specific to WS5/replay-lanes; it is
+general to every read that goes through a `ReadGeneration` on a
+redo-log file once more than one write happens without a generation
+rotation.
+
+The fix, per the coordinator's design (SQLite's WAL read-mark model): a
+versioned overlay, shared per inode per process (owned by
+`inode_lock.Entry`, next to `shared_lock_region.Region` -- the same
+"one registry entry, one resource, shared by every same-process
+opener" shape that field already establishes), where each entry
+carries the `commit_sequence` that wrote it and superseded versions
+are kept exactly as long as some reader might still need them. A
+read generation's view becomes `(checkpoint C, read mark M)`: tree
+pages as of `C`, overlay versions with `sequence <= M` (newest such
+version per key), with `observeReadCheckpoint`/generation refresh
+advancing `M` without reopening.
+
+**Landed so far: the versioned-chain primitive and its single-instance,
+point-in-time-correct resolution -- not yet the cross-instance sharing
+that actually fixes `ReadGeneration`.** `LogicalOverlayEntry` became
+`VersionedOverlayEntry` (`native.zig`): each entry now carries its own
+`sequence` and an `older` pointer to the version it superseded, so
+`logical_overlay`'s map always points at a key's *newest* version, and
+`VersionedOverlayEntry.resolve(at_or_before)` walks the chain to find
+the newest version whose `sequence <= at_or_before` -- `null` only
+when even the oldest version postdates the query, meaning the real
+tree (which had not yet had this key diverted away from it, at that
+point) is the correct fallback. `redoOverlayEntry` dropped its old
+"must equal the live checkpoint exactly" guard in favor of this walk,
+so it is now correct for an arbitrary pinned `CheckpointSlot`, not
+just the current one -- proven directly by a new test, "lite redo log
+versioned overlay lets a pinned older checkpoint see its own value
+after a newer overwrite" (put v1, checkpoint; put v2; read at the
+*old* checkpoint sees v1, at the *current* one sees v2, and a
+checkpoint from before the key existed at all correctly falls through
+rather than finding anything). `appendLogicalMutation` and the replay
+decoder (`decodeLogicalMutationsPayload`, now taking the record's own
+`commit_sequence`) both push a new version onto the existing chain
+instead of replacing it in place. `checkpointRedoLog` still discards
+the *entire* chain for every key once its checkpoint lands (not
+per-version reclaim yet): every version up to that checkpoint is
+subsumed by its own copy-on-write pages, which already give any older
+pin the same point-in-time correctness the chain gave it, by the
+ordinary mechanism every non-redo-log pin has always used.
+
+Found and fixed one bug landing this (worth recording precisely,
+since it cost real debugging time): tagging a version with the
+transaction's final `commit_sequence` cannot read
+`self.activeCheckpoint().commit_sequence + 1` from inside
+`flushTransactionWrites` -- `stageMutation` provisionally increments
+`self.header.checkpoints[active].commit_sequence` on *every* staged
+mutation (bookkeeping for undo/savepoints, "collapsed to one revision"
+at actual commit time), so `self.header` reflects however many
+mutations this transaction has staged so far, not the one true final
+sequence. The correct source is `self.transaction_header` (the
+snapshot taken once at `beginTransaction`, which `stageMutation` never
+touches): `self.transaction_header.?.checkpoints[...].commit_sequence
++ 1`.
+
+**Not yet done**: the `inode_lock.Entry`-resident shared structure
+itself (so a writer's `self.file` and every `ReadGeneration.file` on
+the same inode reference the *same* overlay instead of each building
+an independent copy), per-version reclaim keyed on durable-checkpoint-
+coverage plus `minimumPinnedSequence()` (today's mechanism for that
+frontier is already `commit_sequence`-keyed, the right kind of number,
+but split between a Store-private in-process half and a cross-process
+region half that only sees *coordinated* readers -- a real gap to
+resolve as part of wiring this up, not just plumbing), and
+`observeReadCheckpoint` actually advancing a generation's read mark
+against that shared structure. `ReadGeneration` itself is still
+unfixed; WS5's `error.ReplayIndexUnavailable` failure (and the general
+class it represents) remains open until that lands.
+
 ### 9.7a Point 3: threading the option, and holding back the default
 
 The option is threaded the whole way: `capi/db.zig`'s

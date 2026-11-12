@@ -1886,15 +1886,6 @@ pub const Store = struct {
 
     pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !Store {
         const policy = try reclamation.Policy.init(opts.reclamation);
-        const minimum = native.NativeFile.minimumOwnerStorageBytes(opts.reclamation.page_reuse);
-        if (opts.reclamation.max_storage_bytes != 0 and minimum > opts.reclamation.max_storage_bytes) return error.LiteStorageBudgetExceeded;
-        const available = if (opts.reclamation.capacity_probe) |probe|
-            try probe.available(probe.context, path)
-        else if (opts.io == null and antfly_platform.filesystem.capacity_supported)
-            (try antfly_platform.filesystem.capacity(std.fs.path.dirname(path) orelse ".")).available_bytes
-        else
-            null;
-        if (available) |bytes| if (bytes < minimum +| opts.reclamation.disk_headroom_bytes) return error.LiteInsufficientDiskSpace;
         const native_opts = native.CreateOptions{
             .exclusive = opts.exclusive,
             .no_sync = opts.no_sync,
@@ -1908,11 +1899,35 @@ pub const Store = struct {
         // silent fallback.
         if (opts.use_redo_log == true and native_opts.indexed_reclamation) return error.InvalidArgument;
         const use_redo_log = (opts.use_redo_log orelse false) and !native_opts.indexed_reclamation;
+        // §9.7a: `default_redo_log_capacity_bytes` (8 MiB) is reserved
+        // eagerly, in full, the moment the file is created -- it is real
+        // physical file size from byte zero, not amortized content. A
+        // caller with a small configured `max_storage_bytes` (tests in
+        // particular: reclamation budget/sizing tests use budgets as
+        // small as 256 KiB) would otherwise get a file that is already
+        // over budget before a single document is ever written. Scale
+        // the reservation down under a tight budget instead -- a quarter
+        // of the budget, floored at 64 KiB so there is still a usable log
+        // -- rather than the flat default; an unbounded (`0`) budget, the
+        // common/production case, keeps the full default untouched.
+        const redo_log_capacity_bytes = if (opts.reclamation.max_storage_bytes != 0)
+            @min(native.NativeFile.default_redo_log_capacity_bytes, @max(opts.reclamation.max_storage_bytes / 4, 64 * 1024))
+        else
+            native.NativeFile.default_redo_log_capacity_bytes;
+        const minimum = native.NativeFile.minimumOwnerStorageBytes(opts.reclamation.page_reuse) +| (if (use_redo_log) redo_log_capacity_bytes else 0);
+        if (opts.reclamation.max_storage_bytes != 0 and minimum > opts.reclamation.max_storage_bytes) return error.LiteStorageBudgetExceeded;
+        const available = if (opts.reclamation.capacity_probe) |probe|
+            try probe.available(probe.context, path)
+        else if (opts.io == null and antfly_platform.filesystem.capacity_supported)
+            (try antfly_platform.filesystem.capacity(std.fs.path.dirname(path) orelse ".")).available_bytes
+        else
+            null;
+        if (available) |bytes| if (bytes < minimum +| opts.reclamation.disk_headroom_bytes) return error.LiteInsufficientDiskSpace;
         var file = if (use_redo_log)
             (if (opts.io) |io|
-                try native.NativeFile.createWithRedoLog(allocator, io, path, native_opts, native.NativeFile.default_redo_log_capacity_bytes)
+                try native.NativeFile.createWithRedoLog(allocator, io, path, native_opts, redo_log_capacity_bytes)
             else
-                try native.NativeFile.createWithRedoLogOwnedIo(allocator, path, native_opts, native.NativeFile.default_redo_log_capacity_bytes))
+                try native.NativeFile.createWithRedoLogOwnedIo(allocator, path, native_opts, redo_log_capacity_bytes))
         else if (opts.io) |io|
             try native.NativeFile.createWithIo(allocator, io, path, native_opts)
         else
