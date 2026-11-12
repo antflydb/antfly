@@ -1204,7 +1204,19 @@ test "lite reclamation budget rejects a mutation before exhausting capacity" {
     const path = try testPath(alloc, tmp, "reclamation-budget.aflite");
     defer alloc.free(path);
     const limit = 64 * 4096;
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false, .max_storage_bytes = limit } });
+    // §9 (redo + indexed reclamation): gated under redo -- a diverting
+    // commit advances `checkpoint.page_count` on its own, directly, for
+    // its external value chain (`NativeFile.pageAllocatorForDivertingCommit`),
+    // and `checkpointRedoLog`'s own automatic, opportunistic trigger
+    // (`maybeAutoCheckpointRedoLog`, called right after this file's
+    // *own* commit already durably published) can itself hit this exact
+    // budget. That combination exposed two bugs now fixed: the free
+    // map's decode no longer requires `covered_page_count ==
+    // checkpoint.page_count` for a redo-log file (`decodeFreeMapAlloc`'s
+    // `allow_behind`), and `maybeAutoCheckpointRedoLog`'s own failure no
+    // longer retroactively fails a commit that already durably
+    // published before that opportunistic checkpoint ever ran.
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .use_redo_log = true, .reclamation = .{ .page_reuse = false, .enabled = false, .max_storage_bytes = limit } });
     defer store.close();
     var value: [8192]u8 = @splat('a');
     var accepted: usize = 0;

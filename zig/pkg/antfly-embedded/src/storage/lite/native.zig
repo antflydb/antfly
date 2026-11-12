@@ -13647,7 +13647,7 @@ pub const NativeFile = struct {
 
         const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
         defer self.allocator.free(payload);
-        const free_map = try decodeFreeMapAlloc(self.allocator, payload, checkpoint.page_count);
+        const free_map = try decodeFreeMapAlloc(self.allocator, payload, checkpoint.page_count, self.header.redo_log_capacity != 0);
         return free_map.free_pages;
     }
 
@@ -14017,7 +14017,7 @@ pub const NativeFile = struct {
 
         const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
         defer self.allocator.free(payload);
-        const free_map = try decodeFreeMapAlloc(self.allocator, payload, checkpoint.page_count);
+        const free_map = try decodeFreeMapAlloc(self.allocator, payload, checkpoint.page_count, self.header.redo_log_capacity != 0);
         defer self.allocator.free(free_map.free_pages);
 
         for (free_map.free_pages) |page_id| {
@@ -15155,11 +15155,28 @@ pub const NativeFile = struct {
     /// synchronously, rather than the log filling out from under it.
     /// Moving this onto an async/idle/owner-only trigger is follow-up
     /// work; it does not change this function's own correctness.
+    ///
+    /// Every caller reaches this *after* its own commit has already
+    /// durably published (`publishCheckpoint`, just above either call
+    /// site) -- unlike `publishCheckpoint`'s own preemptive branch, where
+    /// running a real checkpoint instead of a log append is the only way
+    /// that specific commit completes at all, nothing here is required
+    /// for the commit that got us this far: it is purely opportunistic
+    /// backpressure for whichever commit hits the log next. A failure --
+    /// `error.LiteStorageBudgetExceeded` reached indexed_reclamation's
+    /// checkpoint-time page work the moment this design let real
+    /// page/allocator work defer to `checkpointRedoLog`, same as a
+    /// transient disk-space or I/O error -- must never retroactively turn
+    /// an already-durable write into a failure the caller then (wrongly)
+    /// aborts. Swallowed exactly like the idle-timer trigger
+    /// (`Store.maybeCheckpointRedoLogOnIdleTurn`) swallows the same call:
+    /// the log is simply left a little fuller than ideal, for that timer
+    /// or a future commit crossing this same bound to retry.
     fn maybeAutoCheckpointRedoLog(self: *NativeFile) anyerror!void {
         const redo: *RedoCommitState = if (self.redo) |*r| r else return;
         if (redo.checkpointing) return;
         if (redo.writer.remaining() >= redo.writer.capacity / 4) return;
-        try self.checkpointRedoLog();
+        self.checkpointRedoLog() catch {};
     }
 
     /// WS1(b) single-fsync commits. A first attempt measured a
@@ -17847,13 +17864,29 @@ fn encodeFreeMapAlloc(allocator: Allocator, page_size: u32, covered_page_count: 
     return payload;
 }
 
-fn decodeFreeMapAlloc(allocator: Allocator, raw: []const u8, checkpoint_page_count: u64) !FreeMap {
+/// `allow_behind` is for a redo-log file only: a diverting commit (§9)
+/// advances `checkpoint.page_count` on its own, directly, to hand out
+/// fresh page ids for external value chains (`pageAllocatorForDivertingCommit`)
+/// without ever touching this free map -- that is the entire point of
+/// deferring real page/allocator work to `checkpointRedoLog`'s own
+/// batched build. So between two real checkpoints, `checkpoint.page_count`
+/// legitimately runs ahead of the free map's own `covered_page_count`;
+/// every page in that gap is one a diverting commit already claimed and
+/// wrote for real, never reachable through this free map, which is
+/// exactly how an already-allocated (non-free) page behaves here anyway.
+/// A free map that claims to cover *more* than the checkpoint's own
+/// page_count is a different story -- that is always invalid, redo or
+/// not, since no page beyond page_count exists yet for anything to be
+/// free within.
+fn decodeFreeMapAlloc(allocator: Allocator, raw: []const u8, checkpoint_page_count: u64, allow_behind: bool) !FreeMap {
     if (raw.len < free_map_header_size) return error.TruncatedNativeFreeMap;
     const version = std.mem.readInt(u32, raw[0..4], .little);
     if (version != free_map_format_version) return error.InvalidNativeFreeMap;
     const free_page_count = std.mem.readInt(u32, raw[4..8], .little);
     const covered_page_count = std.mem.readInt(u64, raw[8..16], .little);
-    if (covered_page_count != checkpoint_page_count) return error.InvalidNativeFreeMap;
+    if (if (allow_behind) covered_page_count > checkpoint_page_count else covered_page_count != checkpoint_page_count) {
+        return error.InvalidNativeFreeMap;
+    }
     const expected_len = free_map_header_size + @as(usize, free_page_count) * 8;
     if (raw.len != expected_len) return error.InvalidNativeFreeMap;
 
