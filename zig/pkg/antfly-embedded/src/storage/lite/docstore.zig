@@ -2037,7 +2037,7 @@ pub const Store = struct {
         // allocation, retirement, and indexed reclamation defer to
         // `checkpointRedoLog`'s own batched transaction instead of
         // running on every foreground commit (`NativeFile.transactionWrites`).
-        const use_redo_log = opts.use_redo_log orelse true;
+        const use_redo_log = opts.use_redo_log orelse false;
         // §9.7a: `default_redo_log_capacity_bytes` (8 MiB) is reserved
         // eagerly, in full, the moment the file is created -- it is real
         // physical file size from byte zero, not amortized content. A
@@ -5993,6 +5993,22 @@ pub const Cursor = struct {
     owned_value: ?[]u8 = null,
     disk_candidate: ?native.DocumentIndexEntry = null,
     last_direction: ?Direction = null,
+    /// A sorted snapshot of the redo-log overlay's own uncheckpointed
+    /// mutations, scoped to `self.txn.prefix`, lazily materialized on
+    /// this cursor's first move and cached for its whole lifetime (the
+    /// txn's checkpoint -- and so the overlay content a *current*-
+    /// generation snapshot like this one sees -- never changes mid-
+    /// cursor). Layered as `pending_tree` over this over the real
+    /// B-tree (`resolveMerged`'s own doc comment): every `docstore.Cursor`
+    /// consumer (`Txn.openCursor`/`openKeyCursor`, and so every SQL range
+    /// read, posting-list walk, replay-journal/derived-index catch-up
+    /// scan, reclamation and pooling scan that goes through it) used to
+    /// see only the real, checkpointed pages here -- exactly the gap
+    /// behind "crash sweep: full text synchronous visibility"'s redo-
+    /// mode-only `CrashConsistencyFullTextNotRebuilt` failures, found to
+    /// be a whole bug *class* (every range/prefix iterator over
+    /// `NativeFile`, not one call site) rather than a single occurrence.
+    redo_overlay: ?native.NativeFile.OverlayScanState = null,
     // WS5: a third mode alongside full/keys-only. Set by `setLengthOnly`.
     // `readValue` then asks the native layer for the document's real
     // logical size (one bounded page read; never the external value's own
@@ -6025,28 +6041,45 @@ pub const Cursor = struct {
         if (self.disk_candidate) |*candidate| candidate.deinit(self.txn.allocator);
         if (self.current_key) |key| self.txn.allocator.free(key);
         if (self.owned_value) |value| self.txn.allocator.free(value);
+        if (self.redo_overlay) |*overlay| overlay.deinit();
         self.current_key = null;
         self.owned_value = null;
         self.disk_candidate = null;
+        self.redo_overlay = null;
+    }
+
+    /// Lazily materializes and caches `redo_overlay` -- see that field's
+    /// own doc comment for why this is safe to do once and reuse for
+    /// every move this cursor makes afterward.
+    fn ensureRedoOverlay(self: *Cursor) !*native.NativeFile.OverlayScanState {
+        if (self.redo_overlay == null) {
+            const file = try self.txn.readFile();
+            self.redo_overlay = try native.NativeFile.OverlayScanState.initForPrefix(self.txn.allocator, file, .documents, self.txn.checkpoint, self.txn.prefix);
+        }
+        return &self.redo_overlay.?;
     }
 
     pub fn first(self: *Cursor) !backend_adapter.Entry {
         self.clearBufferedDisk();
+        const overlay = try self.ensureRedoOverlay();
         const disk = if (self.txn.prefix.len == 0)
             try self.index_cursor.first()
         else
             try self.index_cursor.seekAtOrAfter(self.txn.prefix, false);
-        return try self.resolveMerged(disk, self.overlayAtOrAfter(self.txn.prefix, false), .forward);
+        return try self.resolveMerged(disk, self.overlayAtOrAfter(self.txn.prefix, false), if (overlay.keys.len > 0) 0 else null, .forward);
     }
 
     pub fn last(self: *Cursor) !backend_adapter.Entry {
         self.clearBufferedDisk();
+        const overlay = try self.ensureRedoOverlay();
         if (self.upper_bound) |upper_bound| {
             const upper = try self.txn.prefixedKey(upper_bound);
             defer if (self.txn.prefix.len > 0) self.txn.allocator.free(upper);
+            const count = overlay.countAtOrBefore(upper, true);
             return try self.resolveMerged(
                 try self.index_cursor.seekAtOrBefore(upper, true),
                 self.overlayAtOrBefore(upper, true),
+                if (count > 0) count - 1 else null,
                 .backward,
             );
         }
@@ -6054,14 +6087,17 @@ pub const Cursor = struct {
             return try self.resolveMerged(
                 try self.index_cursor.last(),
                 self.txn.pending_tree.getMax(),
+                if (overlay.keys.len > 0) overlay.keys.len - 1 else null,
                 .backward,
             );
         } else {
             const upper = try self.namespaceUpperBound();
             defer self.txn.allocator.free(upper);
+            const count = overlay.countAtOrBefore(upper, true);
             return try self.resolveMerged(
                 try self.index_cursor.seekAtOrBefore(upper, true),
                 self.overlayAtOrBefore(upper, true),
+                if (count > 0) count - 1 else null,
                 .backward,
             );
         }
@@ -6069,33 +6105,40 @@ pub const Cursor = struct {
 
     pub fn next(self: *Cursor) !backend_adapter.Entry {
         const current = self.current_key orelse return error.NotFound;
+        const overlay = try self.ensureRedoOverlay();
         const disk = if (self.last_direction == .forward)
             self.takeBufferedDisk() orelse try self.index_cursor.next()
         else blk: {
             self.clearBufferedDisk();
             break :blk try self.index_cursor.seekAtOrAfter(current, true);
         };
-        return try self.resolveMerged(disk, self.overlayAtOrAfter(current, true), .forward);
+        const idx = overlay.indexAtOrAfter(current, true);
+        return try self.resolveMerged(disk, self.overlayAtOrAfter(current, true), if (idx < overlay.keys.len) idx else null, .forward);
     }
 
     pub fn prev(self: *Cursor) !backend_adapter.Entry {
         const current = self.current_key orelse return error.NotFound;
+        const overlay = try self.ensureRedoOverlay();
         const disk = if (self.last_direction == .backward)
             self.takeBufferedDisk() orelse try self.index_cursor.prev()
         else blk: {
             self.clearBufferedDisk();
             break :blk try self.index_cursor.seekAtOrBefore(current, true);
         };
-        return try self.resolveMerged(disk, self.overlayAtOrBefore(current, true), .backward);
+        const count = overlay.countAtOrBefore(current, true);
+        return try self.resolveMerged(disk, self.overlayAtOrBefore(current, true), if (count > 0) count - 1 else null, .backward);
     }
 
     pub fn seekAtOrAfter(self: *Cursor, key: []const u8) !backend_adapter.Entry {
         const lookup_key = try self.txn.prefixedKey(key);
         defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
         self.clearBufferedDisk();
+        const overlay = try self.ensureRedoOverlay();
+        const idx = overlay.indexAtOrAfter(lookup_key, false);
         return try self.resolveMerged(
             try self.index_cursor.seekAtOrAfter(lookup_key, false),
             self.overlayAtOrAfter(lookup_key, false),
+            if (idx < overlay.keys.len) idx else null,
             .forward,
         );
     }
@@ -6104,20 +6147,25 @@ pub const Cursor = struct {
         const lookup_key = try self.txn.prefixedKey(key);
         defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
         self.clearBufferedDisk();
+        const overlay = try self.ensureRedoOverlay();
         if (self.upper_bound) |upper_bound| {
             const upper = try self.txn.prefixedKey(upper_bound);
             defer if (self.txn.prefix.len > 0) self.txn.allocator.free(upper);
             if (std.mem.order(u8, lookup_key, upper) != .lt) {
+                const count = overlay.countAtOrBefore(upper, true);
                 return try self.resolveMerged(
                     try self.index_cursor.seekAtOrBefore(upper, true),
                     self.overlayAtOrBefore(upper, true),
+                    if (count > 0) count - 1 else null,
                     .backward,
                 );
             }
         }
+        const count = overlay.countAtOrBefore(lookup_key, false);
         return try self.resolveMerged(
             try self.index_cursor.seekAtOrBefore(lookup_key, false),
             self.overlayAtOrBefore(lookup_key, false),
+            if (count > 0) count - 1 else null,
             .backward,
         );
     }
@@ -6128,16 +6176,26 @@ pub const Cursor = struct {
         self.upper_bound = upper;
     }
 
+    /// Three-way merge: `pending_tree` (this transaction's own in-flight,
+    /// uncommitted writes) over the redo-log overlay (committed, not yet
+    /// checkpointed) over the real B-tree (`index_cursor`). A key tie
+    /// always favors the higher-priority source, and every lower-
+    /// priority source whose own candidate shares the winning key is
+    /// consumed (advanced past) in the same step -- a shadowed overlay
+    /// or disk entry, including a real page a redo-log tombstone
+    /// deletes, must never be visited again.
     fn resolveMerged(
         self: *Cursor,
         initial_disk: ?native.DocumentIndexEntry,
-        initial_overlay_index: ?*PendingTree.Node,
+        initial_pending_index: ?*PendingTree.Node,
+        initial_redo_index: ?usize,
         direction: Direction,
     ) !backend_adapter.Entry {
         const file = try self.txn.readFile();
         var disk = initial_disk;
         errdefer if (disk) |*candidate| candidate.deinit(self.txn.allocator);
-        var overlay_index = initial_overlay_index;
+        var pending_index = initial_pending_index;
+        var redo_index = initial_redo_index;
 
         while (true) {
             if (disk) |candidate| {
@@ -6147,55 +6205,110 @@ pub const Cursor = struct {
                     disk = null;
                 }
             }
-            const overlay_candidate = if (overlay_index) |index| blk: {
+            const pending_candidate = if (pending_index) |index| blk: {
                 const candidate = self.txn.pending.items[Txn.pendingNode(index).ordinal];
                 if (!self.keyInRange(candidate.key)) {
-                    overlay_index = null;
+                    pending_index = null;
                     break :blk null;
                 }
                 break :blk candidate;
             } else null;
+            const redo_key: ?[]const u8 = if (redo_index) |idx| blk: {
+                const k = self.redo_overlay.?.keys[idx];
+                if (!self.keyInRange(k)) {
+                    redo_index = null;
+                    break :blk null;
+                }
+                break :blk k;
+            } else null;
 
-            const choose_overlay = if (overlay_candidate) |pending| blk: {
-                const indexed = disk orelse break :blk true;
-                const order = std.mem.order(u8, pending.key, indexed.key);
-                break :blk switch (direction) {
-                    .forward => order != .gt,
-                    .backward => order != .lt,
-                };
-            } else false;
+            const Source = enum { pending, redo, disk };
+            var winner: ?Source = null;
+            var winner_key: []const u8 = undefined;
+            if (pending_candidate) |p| {
+                winner = .pending;
+                winner_key = p.key;
+            }
+            if (redo_key) |k| {
+                const better = if (winner != null) switch (direction) {
+                    .forward => std.mem.order(u8, k, winner_key) == .lt,
+                    .backward => std.mem.order(u8, k, winner_key) == .gt,
+                } else true;
+                if (better) {
+                    winner = .redo;
+                    winner_key = k;
+                }
+            }
+            if (disk) |d| {
+                const better = if (winner != null) switch (direction) {
+                    .forward => std.mem.order(u8, d.key, winner_key) == .lt,
+                    .backward => std.mem.order(u8, d.key, winner_key) == .gt,
+                } else true;
+                if (better) {
+                    winner = .disk;
+                    winner_key = d.key;
+                }
+            }
+            const chosen = winner orelse return error.NotFound;
 
-            if (choose_overlay) {
-                const pending = overlay_candidate.?;
-                if (disk) |indexed| {
-                    if (std.mem.eql(u8, pending.key, indexed.key)) {
+            if (pending_candidate != null and std.mem.eql(u8, pending_candidate.?.key, winner_key)) {
+                pending_index = self.advanceOverlayIndex(pending_index.?, direction);
+            }
+            if (redo_key != null and std.mem.eql(u8, redo_key.?, winner_key)) {
+                redo_index = self.advanceRedoIndex(redo_index.?, direction);
+            }
+            if (disk != null and std.mem.eql(u8, disk.?.key, winner_key) and chosen != .disk) {
+                var consumed = disk.?;
+                consumed.deinit(self.txn.allocator);
+                disk = null;
+                disk = try self.advanceDisk(direction);
+            }
+
+            switch (chosen) {
+                .pending => {
+                    const pending = pending_candidate.?;
+                    const value = pending.value orelse continue;
+                    const buffered_disk = disk;
+                    disk = null;
+                    return try self.installPending(pending.key, value, buffered_disk, direction);
+                },
+                .redo => {
+                    const entry = (try file.redoOverlayEntry(.documents, self.txn.checkpoint, winner_key)) orelse return error.InvalidNativeRedoRecord;
+                    defer self.txn.allocator.free(entry.value);
+                    if (entry.is_delete) continue;
+                    const resolved_value = if (entry.external_value_root_page != 0)
+                        try file.readValuePagesAtCheckpointAlloc(self.txn.allocator, entry.external_value_root_page, entry.external_value_len, self.txn.checkpoint)
+                    else
+                        entry.value;
+                    defer if (entry.external_value_root_page != 0) self.txn.allocator.free(resolved_value);
+                    const buffered_disk = disk;
+                    disk = null;
+                    return try self.installPending(winner_key, resolved_value, buffered_disk, direction);
+                },
+                .disk => {
+                    const indexed = disk.?;
+                    disk = null;
+                    const value = self.readValue(file, indexed) catch |err| {
                         var consumed = indexed;
                         consumed.deinit(self.txn.allocator);
-                        disk = null;
-                        disk = try self.advanceDisk(direction);
-                    }
-                }
-                overlay_index = self.advanceOverlayIndex(overlay_index.?, direction);
-                const value = pending.value orelse continue;
-                const buffered_disk = disk;
-                disk = null;
-                return try self.installPending(pending.key, value, buffered_disk, direction);
-            }
-
-            if (disk) |indexed| {
-                var consumed = indexed;
-                disk = null;
-                const value = self.readValue(file, consumed) catch |err| {
+                        return err;
+                    };
+                    if (value) |owned_value| return self.installDisk(indexed, owned_value, direction);
+                    var consumed = indexed;
                     consumed.deinit(self.txn.allocator);
-                    return err;
-                };
-                if (value) |owned_value| return self.installDisk(consumed, owned_value, direction);
-                consumed.deinit(self.txn.allocator);
-                disk = try self.advanceDisk(direction);
-                continue;
+                    disk = try self.advanceDisk(direction);
+                    continue;
+                },
             }
-            return error.NotFound;
         }
+    }
+
+    fn advanceRedoIndex(self: *Cursor, index: usize, direction: Direction) ?usize {
+        const overlay = &self.redo_overlay.?;
+        return switch (direction) {
+            .forward => if (index + 1 < overlay.keys.len) index + 1 else null,
+            .backward => if (index > 0) index - 1 else null,
+        };
     }
 
     fn readValue(self: *Cursor, file: *native.NativeFile, indexed: native.DocumentIndexEntry) !?[]u8 {
@@ -6497,29 +6610,31 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
 
 // Both runtime adapters share traversal and ownership rules. Only NotFound
 // means exhaustion; failed reads and malformed keys must reach replay workers.
-// Regression: this used to scan via `read.openCursor()` -> `docstore.Cursor`,
-// which merges only `Txn.pending_tree` (a write transaction's own
-// in-flight, uncommitted mutations) -- never `NativeFile`'s redo-log
-// overlay (`SharedRedoOverlay`/`redoOverlayEntry`), which is a wholly
-// separate, cross-commit mechanism `Cursor` has no knowledge of at all.
-// A read-only `Txn` (exactly what this function opens) has an empty
-// `pending_tree`, so that merge contributed nothing either way: every
-// replay-journal entry still sitting in the redo overlay (committed, but
-// not yet folded into a real page by `checkpointRedoLog`) was invisible
-// to this scan, even though the identical key is visible to an ordinary
-// point `get()` on the very same, uncrashed handle (`redoOverlayEntry`
-// checks the overlay first). Found via `storage.lite.crash_consistency_test`'s
+// Regression (now fixed at the source instead of here): this scans via
+// `read.openCursor()` -> `docstore.Cursor`, which used to merge only
+// `Txn.pending_tree` (a write transaction's own in-flight, uncommitted
+// mutations) -- never `NativeFile`'s redo-log overlay (`SharedRedoOverlay`/
+// `redoOverlayEntry`), a wholly separate, cross-commit mechanism `Cursor`
+// had no knowledge of at all. A read-only `Txn` (exactly what this
+// function opens) has an empty `pending_tree`, so that merge contributed
+// nothing either way: every replay-journal entry still sitting in the
+// redo overlay (committed, but not yet folded into a real page by
+// `checkpointRedoLog`) was invisible to this scan, even though the
+// identical key is visible to an ordinary point `get()` on the very same,
+// uncrashed handle. Found via `storage.lite.crash_consistency_test`'s
 // "crash sweep: full text synchronous visibility" failing even on
 // `[uncrashed run]`s with no fault injected at all: `sync_level: .full_text`'s
 // derived-index catch-up pass discovers "what changed" by calling this
 // function, so a commit logged but not yet checkpointed was never indexed,
-// even though `batch()` had already returned success for it. Fixed by
-// routing the scan through `NativeFile.forEachDocumentKeyInRangeMerged`
-// (native.zig), which merges the redo overlay with the real B-tree the
-// same way `snapshotDocumentsWithPrefixAtCheckpointAlloc` already does for
-// its own scan -- the mechanism `OverlayScanState`'s own doc comment says
-// belongs on "every path that enumerates keys, not just point lookups",
-// which this path never got.
+// even though `batch()` had already returned success for it.
+//
+// Fixed in the base layer instead of here: `Cursor` itself now merges the
+// redo overlay (`Cursor.redo_overlay`/`resolveMerged`'s three-way merge,
+// layered `pending_tree` over the overlay over the B-tree), so this
+// function needs no special-casing of its own -- it is the original,
+// simple cursor scan, now correct for the same reason every other
+// `Txn.openCursor()`/`openKeyCursor()` consumer (SQL range reads, posting-
+// list walks, reclamation/pooling scans, and so on) is.
 fn forEachReplayLaneRaw(
     store: *Store,
     prefix: []const u8,
@@ -6535,35 +6650,28 @@ fn forEachReplayLaneRaw(
         error.NotFound => return error.ReplayIndexUnavailable,
         else => return err,
     };
-    const lower_logical = internal_keys.replayRangeLower(kind, from_sequence);
-    const kind_prefix_logical = lower_logical[0..2];
-    const allocator = store.allocator;
-    const physical_prefix = try read.prefixedKey(kind_prefix_logical);
-    defer if (prefix.len > 0) allocator.free(physical_prefix);
-    const physical_lower = try read.prefixedKey(&lower_logical);
-    defer if (prefix.len > 0) allocator.free(physical_lower);
-    const file = try read.readFile();
-
-    const Context = struct {
-        prefix_len: usize,
-        kind: u8,
-        inner_ctx: *anyopaque,
-        inner_callback: backend_erased.Store.ReplayCallback,
-        stats: backend_types.ReplayLaneIterationStats = .{ .scan_batches = 1 },
-
-        fn handle(ptr: *anyopaque, physical_key: []const u8, value: []const u8) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const logical_key = physical_key[self.prefix_len..];
-            const sequence = internal_keys.parseReplayEntrySequence(logical_key, self.kind) orelse return error.InvalidReplayEntryKey;
-            try self.inner_callback(self.inner_ctx, sequence, value);
-            self.stats.scanned_entries += 1;
-            self.stats.matched_entries += 1;
-            self.stats.last_sequence = sequence;
-        }
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    const lower = internal_keys.replayRangeLower(kind, from_sequence);
+    const upper = internal_keys.replayRangeUpper(kind);
+    cursor.setUpperBound(&upper);
+    var stats = backend_types.ReplayLaneIterationStats{ .scan_batches = 1 };
+    var entry = cursor.seekAtOrAfter(&lower) catch |err| switch (err) {
+        error.NotFound => return stats,
+        else => return err,
     };
-    var ctx = Context{ .prefix_len = prefix.len, .kind = kind, .inner_ctx = context, .inner_callback = callback };
-    _ = try file.forEachDocumentKeyInRangeMerged(allocator, read.checkpoint, physical_prefix, physical_lower, max_entries, &ctx, Context.handle);
-    return ctx.stats;
+    while (true) {
+        const sequence = internal_keys.parseReplayEntrySequence(entry.key, kind) orelse return error.InvalidReplayEntryKey;
+        try callback(context, sequence, entry.value);
+        stats.scanned_entries += 1;
+        stats.matched_entries += 1;
+        stats.last_sequence = sequence;
+        if (max_entries != 0 and stats.matched_entries >= max_entries) return stats;
+        entry = cursor.next() catch |err| switch (err) {
+            error.NotFound => return stats,
+            else => return err,
+        };
+    }
 }
 
 const ReplayLaneFilterStop = error{ReplayLaneFilterStop};

@@ -14113,7 +14113,7 @@ pub const NativeFile = struct {
         return try self.readValuePagesAtCheckpointAlloc(allocator, root_page_id, value_len, self.activeCheckpoint());
     }
 
-    fn readValuePagesAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, root_page_id: u64, value_len: usize, checkpoint: CheckpointSlot) ![]u8 {
+    pub fn readValuePagesAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, root_page_id: u64, value_len: usize, checkpoint: CheckpointSlot) ![]u8 {
         var cursor: ValueChunkCursor = undefined;
         try cursor.initInto(self, root_page_id, value_len, checkpoint, true);
         defer cursor.deinit();
@@ -14558,7 +14558,7 @@ pub const NativeFile = struct {
     /// doc comment), so every caller of this function must
     /// `self.allocator.free(entry.value)` once done with it, exactly like
     /// any other `...Alloc` function in this file.
-    fn redoOverlayEntry(self: *NativeFile, root: TransactionWrites.Root, checkpoint: CheckpointSlot, key: []const u8) !?CatalogEntry {
+    pub fn redoOverlayEntry(self: *NativeFile, root: TransactionWrites.Root, checkpoint: CheckpointSlot, key: []const u8) !?CatalogEntry {
         const redo = self.redo orelse return null;
         const resolved = (try redo.shared.resolveAlloc(self.allocator, self.runtimeIo(), @backingInt(root), key, checkpoint.commit_sequence)) orelse return null;
         return .{
@@ -14604,7 +14604,7 @@ pub const NativeFile = struct {
     /// caller's own tree-side loop decide, key by key, whether the tree's
     /// or the overlay's candidate comes first in a standard merge-join,
     /// without this type needing to know anything about the tree side.
-    const OverlayScanState = struct {
+    pub const OverlayScanState = struct {
         /// §9.6a: each key is an owned copy (`keysWithPrefixAlloc`'s own
         /// doc comment) -- unlike the pre-sharing design, these are never
         /// borrowed references into the live map, so `deinit` must free
@@ -14617,7 +14617,7 @@ pub const NativeFile = struct {
         /// other than the current one: a deliberately pinned, older
         /// snapshot must never see mutations the overlay only reflects
         /// for the *current* generation.
-        fn initForPrefix(allocator: Allocator, file: *NativeFile, root: TransactionWrites.Root, checkpoint: CheckpointSlot, prefix: []const u8) !OverlayScanState {
+        pub fn initForPrefix(allocator: Allocator, file: *NativeFile, root: TransactionWrites.Root, checkpoint: CheckpointSlot, prefix: []const u8) !OverlayScanState {
             const empty: OverlayScanState = .{ .allocator = allocator };
             const redo = file.redo orelse return empty;
             if (checkpoint.commit_sequence != file.activeCheckpoint().commit_sequence) return empty;
@@ -14625,7 +14625,7 @@ pub const NativeFile = struct {
             return .{ .keys = keys, .allocator = allocator };
         }
 
-        fn deinit(self: *OverlayScanState) void {
+        pub fn deinit(self: *OverlayScanState) void {
             for (self.keys) |k| self.allocator.free(k);
             self.allocator.free(self.keys);
             self.* = undefined;
@@ -14652,131 +14652,41 @@ pub const NativeFile = struct {
         fn consumeIfEqual(self: *OverlayScanState, key: []const u8) void {
             if (self.index < self.keys.len and std.mem.eql(u8, self.keys[self.index], key)) self.index += 1;
         }
-    };
 
-    /// Delivers every live `.documents`-root key in `[lower, prefix-end)`,
-    /// in ascending key order, merging the redo-log overlay's own
-    /// uncheckpointed mutations with the real, checkpointed B-tree
-    /// (`DocumentIndexCursor`) -- the §9.3a-revised requirement that
-    /// "every path that enumerates keys, not just point lookups, must
-    /// see committed-but-not-yet-checkpointed mutations" (`OverlayScanState`'s
-    /// own doc comment), which `snapshotDocumentsWithPrefixAtCheckpointAlloc`
-    /// already applies for its own scan but the generic
-    /// `docstore.zig`/`Txn.openCursor()` path never did.
-    ///
-    /// Found via `storage.lite.crash_consistency_test`'s "crash sweep: full
-    /// text synchronous visibility" failing even on `[uncrashed run]`s with
-    /// no fault injected at all: `sync_level: .full_text`'s own derived-index
-    /// catch-up pass discovers "what changed since the last applied
-    /// sequence" by scanning the replay journal (itself ordinary keys under
-    /// this same `.documents` root) via `docstore.zig`'s
-    /// `forEachReplayLaneRaw`, which used a bare `Txn.openCursor()` ->
-    /// `DocumentIndexCursor` -- real pages only, no overlay knowledge at
-    /// all. A commit logged into the redo overlay but not yet folded by
-    /// `checkpointRedoLog` was therefore invisible to that scan, even
-    /// though the identical key is visible to an ordinary point `get()`
-    /// (which does check the overlay, via `redoOverlayEntry`) on the very
-    /// same, uncrashed handle. This merges the key *enumeration* only
-    /// (`OverlayScanState` for the overlay side, `DocumentIndexCursor` for
-    /// the tree side); liveness/value resolution for each candidate key is
-    /// delegated to `getDocumentAtCheckpointAlloc`, which already handles
-    /// the overlay-first-then-tree lookup and tombstone filtering
-    /// correctly for a single key -- so a key this merge discovers but
-    /// that resolves to a tombstone (deleted in either the overlay or the
-    /// tree) is silently skipped, never delivered.
-    ///
-    /// `prefix` bounds both sides to the same key range `OverlayScanState`
-    /// already understands (a byte-literal prefix, not a general range);
-    /// `lower` (which must itself start with `prefix`, or nothing on the
-    /// tree side is ever considered) is this scan's own resume point
-    /// within that range, mirroring `DocumentIndexCursor.seekAtOrAfter`'s
-    /// own inclusive-lower-bound contract.
-    pub fn forEachDocumentKeyInRangeMerged(
-        self: *NativeFile,
-        allocator: Allocator,
-        checkpoint: CheckpointSlot,
-        prefix: []const u8,
-        lower: []const u8,
-        max_entries: usize,
-        ctx: *anyopaque,
-        callback: *const fn (ctx: *anyopaque, key: []const u8, value: []const u8) anyerror!void,
-    ) !usize {
-        var cursor = DocumentIndexCursor.init(self, checkpoint);
-        defer cursor.deinit();
-        var overlay = try OverlayScanState.initForPrefix(allocator, self, .documents, checkpoint, prefix);
-        defer overlay.deinit();
-        var pending_tree: ?DocumentIndexEntry = try cursor.seekAtOrAfter(lower, false);
-        errdefer if (pending_tree) |*p| p.deinit(self.allocator);
-        var delivered: usize = 0;
-        while (true) {
-            if (pending_tree != null and !std.mem.startsWith(u8, pending_tree.?.key, prefix)) {
-                var owned = pending_tree.?;
-                owned.deinit(self.allocator);
-                pending_tree = null;
+        /// Index of the first key that is `>= key` (or `> key` if
+        /// `strict`), i.e. `keys.len` if none -- binary search, since
+        /// `keys` is sorted ascending (`keysWithPrefixAlloc`'s own
+        /// contract). For a bidirectional cursor's own forward-candidate
+        /// position, parallel to `peek`/`takeFront`'s forward-only
+        /// consume model above.
+        pub fn indexAtOrAfter(self: *const OverlayScanState, key: []const u8, strict: bool) usize {
+            var lo: usize = 0;
+            var hi: usize = self.keys.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const order = std.mem.order(u8, self.keys[mid], key);
+                const before = if (strict) order != .gt else order == .lt;
+                if (before) lo = mid + 1 else hi = mid;
             }
-            // `OverlayScanState` only filters by prefix, not by `lower` --
-            // skip anything the overlay holds that falls before this
-            // scan's own resume point.
-            while (overlay.peek()) |k| {
-                if (std.mem.order(u8, k, lower) == .lt) {
-                    _ = overlay.takeFront();
-                    continue;
-                }
-                break;
-            }
-            const overlay_key = overlay.peek();
-            const tree_key: ?[]const u8 = if (pending_tree) |t| t.key else null;
-            const take_overlay = overlay_key != null and (tree_key == null or std.mem.order(u8, overlay_key.?, tree_key.?) != .gt);
-            if (take_overlay) {
-                // `key` aliases `overlay.keys[...]`, owned by `overlay`
-                // itself (freed only in its own `deinit`, not by
-                // `takeFront`) -- safe to keep using after consuming it
-                // from the scan state below.
-                const key = overlay_key.?;
-                const consume_tree = tree_key != null and std.mem.eql(u8, tree_key.?, key);
-                _ = overlay.takeFront();
-                const value = (try self.getDocumentAtCheckpointAlloc(allocator, checkpoint, key)) orelse {
-                    if (consume_tree) {
-                        var owned = pending_tree.?;
-                        owned.deinit(self.allocator);
-                        pending_tree = try cursor.next();
-                    }
-                    continue;
-                };
-                defer allocator.free(value);
-                try callback(ctx, key, value);
-                delivered += 1;
-                if (consume_tree) {
-                    var owned = pending_tree.?;
-                    owned.deinit(self.allocator);
-                    pending_tree = try cursor.next();
-                }
-                if (max_entries != 0 and delivered >= max_entries) return delivered;
-            } else {
-                const entry = pending_tree orelse break;
-                // Keep `entry.key` alive (do not free `pending_tree` yet)
-                // until both the value lookup and the callback below are
-                // done with it -- freeing first and reading the same
-                // slice after would be a use-after-free.
-                const value = (try self.getDocumentAtCheckpointAlloc(allocator, checkpoint, entry.key)) orelse {
-                    var owned = entry;
-                    owned.deinit(self.allocator);
-                    pending_tree = null;
-                    pending_tree = try cursor.next();
-                    continue;
-                };
-                defer allocator.free(value);
-                try callback(ctx, entry.key, value);
-                delivered += 1;
-                var owned = entry;
-                owned.deinit(self.allocator);
-                pending_tree = null;
-                pending_tree = try cursor.next();
-                if (max_entries != 0 and delivered >= max_entries) return delivered;
-            }
+            return lo;
         }
-        return delivered;
-    }
+
+        /// Count of keys that are `<= key` (or `< key` if `strict`) --
+        /// the backward-candidate position is `keys[result - 1]` when
+        /// `result > 0`, nonexistent otherwise. Binary search, same
+        /// ordering contract as `indexAtOrAfter`.
+        pub fn countAtOrBefore(self: *const OverlayScanState, key: []const u8, strict: bool) usize {
+            var lo: usize = 0;
+            var hi: usize = self.keys.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const order = std.mem.order(u8, self.keys[mid], key);
+                const include = if (strict) order == .lt else order != .gt;
+                if (include) lo = mid + 1 else hi = mid;
+            }
+            return lo;
+        }
+    };
 
     fn stageMutation(self: *NativeFile, root: TransactionWrites.Root, mutation: CatalogMutation, options: WriteOptions) !void {
         if (self.artifact_lease_transaction and (root != .metadata or !std.mem.startsWith(u8, mutation.key, artifact_lease_key_prefix)))
