@@ -37978,6 +37978,14 @@ pub const DB = struct {
                     .status = .clean,
                     .generation = checkpoint.generation + @intFromBool(checkpoint.status == .rebuilding),
                     .config_hash = types.indexConfigHash(entry.config),
+                    // Certify the exact count this loop already verified
+                    // matches the live index (line above gates on it): a
+                    // clean checkpoint with no published_count can never be
+                    // filled in later, since the only other writer
+                    // (finalizeCoveredDenseProjectionCheckpointClaimed)
+                    // requires status == .rebuilding, which this call just
+                    // left behind for good.
+                    .published_count = artifact_target_count,
                 });
             }
         }
@@ -63125,7 +63133,29 @@ fn denseTargetCountForIndexContextWithCoverage(
     // vectors. Their durable artifact counter remains authoritative.
     if (ctx.index_manager.denseIndex(index_name)) |entry| {
         if (densePublicationTargetUsesArtifactCounter(entry)) {
-            return try DB.loadDenseArtifactTargetCounter(ctx.alloc, ctx.store, index_name);
+            const artifact_count = try DB.loadDenseArtifactTargetCounter(ctx.alloc, ctx.store, index_name);
+            if (artifact_count != null and artifact_count.? == 0) {
+                // A fresh/untouched artifact-backed generation's counter is
+                // trivially zero before any producer (enrichment, for a
+                // chunk/embedding-name generator) has written even its
+                // first artifact -- indistinguishable, by count alone,
+                // from a genuinely empty corpus. Same defense
+                // denseTargetCountFromCoverage's bootstrap branch applies
+                // to the non-artifact-counter path: check the range-local
+                // source cardinality before trusting a zero counter as
+                // the real target, so a managed admission whose chunked
+                // embeddings simply haven't been produced yet can never
+                // be certified "clean, 0 published" while source material
+                // is still waiting on enrichment (finalizeCoveredDense-
+                // ProjectionCheckpointClaimed trusted this zero
+                // unconditionally and could never re-certify once that
+                // vacuous match left `.clean` behind).
+                const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return null;
+                const coverage_counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, index_name, generation, ctx.index_manager.byte_range, ctx);
+                const source_total = coverage_counts.source_total orelse return null;
+                if (source_total != 0) return null;
+            }
+            return artifact_count;
         }
     }
     const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return null;
