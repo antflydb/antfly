@@ -1713,6 +1713,13 @@ test "shared lock region: contended handoff reports lock syscalls and latency" {
         futex_wait: u64,
         futex_wake: u64,
         latency_ns_total: u64,
+        // Per-iteration latency samples, not just the sum above: a mean
+        // alone hides the tail a fairness mechanism most needs to bound.
+        // Sent whole (not pre-reduced in the child) so the parent can sort
+        // the *combined* sample from both children before taking the
+        // median/p99, not two separately-computed percentiles averaged
+        // together (which is not the same statistic).
+        latencies_ns: [handoffs_per_child]u64,
     };
 
     var report_fds: [2]std.c.fd_t = undefined;
@@ -1728,6 +1735,7 @@ test "shared lock region: contended handoff reports lock syscalls and latency" {
             testResetWriterFutexCounters();
             const my_pid: u32 = @bitCast(std.c.getpid());
             var latency_ns_total: u64 = 0;
+            var latencies_ns: [handoffs_per_child]u64 = undefined;
             var h: u32 = 0;
             while (h < handoffs_per_child) : (h += 1) {
                 var start_ts: std.c.timespec = undefined;
@@ -1737,7 +1745,9 @@ test "shared lock region: contended handoff reports lock syscalls and latency" {
                 _ = std.c.clock_gettime(.MONOTONIC, &end_ts);
                 const start_ns = @as(i64, start_ts.sec) * std.time.ns_per_s + start_ts.nsec;
                 const end_ns = @as(i64, end_ts.sec) * std.time.ns_per_s + end_ts.nsec;
-                latency_ns_total += @intCast(end_ns - start_ns);
+                const this_latency_ns: u64 = @intCast(end_ns - start_ns);
+                latencies_ns[h] = this_latency_ns;
+                latency_ns_total += this_latency_ns;
                 // Hold briefly, like real commit work (raw `nanosleep`,
                 // not `io.sleep`: no `Io` in a forked child, same reason
                 // as the two-process test above) -- without this, both
@@ -1754,6 +1764,7 @@ test "shared lock region: contended handoff reports lock syscalls and latency" {
                 .futex_wait = counters.wait,
                 .futex_wake = counters.wake,
                 .latency_ns_total = latency_ns_total,
+                .latencies_ns = latencies_ns,
             };
             _ = std.c.write(report_fds[1], @ptrCast(&report), @sizeOf(HandoffReport));
             std.c._exit(0);
@@ -1767,6 +1778,11 @@ test "shared lock region: contended handoff reports lock syscalls and latency" {
     var total_wait: u64 = 0;
     var total_wake: u64 = 0;
     var total_latency_ns: u64 = 0;
+    // Every child's own samples, combined: percentiles over the pooled
+    // set, not an average of two separately-computed percentiles (not
+    // the same statistic, and would hide one child getting starved more
+    // than the other).
+    var all_latencies_ns: [n_children * handoffs_per_child]u64 = undefined;
     var got: u8 = 0;
     while (got < n_children) : (got += 1) {
         var report: HandoffReport = undefined;
@@ -1780,12 +1796,17 @@ test "shared lock region: contended handoff reports lock syscalls and latency" {
         total_wait += report.futex_wait;
         total_wake += report.futex_wake;
         total_latency_ns += report.latency_ns_total;
+        @memcpy(all_latencies_ns[got * handoffs_per_child ..][0..handoffs_per_child], &report.latencies_ns);
     }
 
     try std.testing.expect(total_completed > 0);
     const wait_per_handoff = @as(f64, @floatFromInt(total_wait)) / @as(f64, @floatFromInt(total_completed));
     const wake_per_handoff = @as(f64, @floatFromInt(total_wake)) / @as(f64, @floatFromInt(total_completed));
     const latency_us_per_handoff = @as(f64, @floatFromInt(total_latency_ns)) / @as(f64, @floatFromInt(total_completed)) / 1000.0;
+    std.mem.sort(u64, &all_latencies_ns, {}, std.sort.asc(u64));
+    const median_ns = all_latencies_ns[all_latencies_ns.len / 2];
+    const p99_index = @min(all_latencies_ns.len - 1, (all_latencies_ns.len * 99) / 100);
+    const p99_ns = all_latencies_ns[p99_index];
     // §8.8's own report: the writer word takes no `fcntl` lock at all on
     // this path (liveness is only ever probed for a *dead* holder, never
     // on the happy path a plain handoff takes) and no `flock` either (the
@@ -1793,8 +1814,8 @@ test "shared lock region: contended handoff reports lock syscalls and latency" {
     // migration step does not touch) -- both genuinely zero, not merely
     // unmeasured, so printed as constants rather than counted.
     std.debug.print(
-        "shared lock region contended handoff report: handoffs={d} futex_wait/handoff={d:.2} futex_wake/handoff={d:.2} fcntl/handoff=0 flock/handoff=0 latency_us/handoff={d:.1}\n",
-        .{ total_completed, wait_per_handoff, wake_per_handoff, latency_us_per_handoff },
+        "shared lock region contended handoff report: handoffs={d} futex_wait/handoff={d:.2} futex_wake/handoff={d:.2} fcntl/handoff=0 flock/handoff=0 latency_us/handoff(mean)={d:.1} latency_us(median)={d:.1} latency_us(p99)={d:.1}\n",
+        .{ total_completed, wait_per_handoff, wake_per_handoff, latency_us_per_handoff, @as(f64, @floatFromInt(median_ns)) / 1000.0, @as(f64, @floatFromInt(p99_ns)) / 1000.0 },
     );
 
     // A correct implementation's own handoff is a small, bounded number of
@@ -1805,6 +1826,7 @@ test "shared lock region: contended handoff reports lock syscalls and latency" {
     try std.testing.expect(wait_per_handoff < 10);
     try std.testing.expect(wake_per_handoff < 10);
     try std.testing.expect(latency_us_per_handoff < 500_000);
+    try std.testing.expect(p99_ns < 500 * std.time.ns_per_ms);
 }
 
 test "shared lock region opens, initializes, and round-trips the writer lock uncontended" {
