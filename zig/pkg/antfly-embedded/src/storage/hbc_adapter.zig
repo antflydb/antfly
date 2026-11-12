@@ -25872,7 +25872,8 @@ fn testNativeSubgroupLifecycleMode(directory_mode: HBCConfig.CentroidDirectoryMo
         var complete = try idx.searchProfiledRequest(.{ .query = &.{ 1, 0, 0 }, .k = 10, .search_effort = 1 });
         defer complete.results.deinit();
         try std.testing.expectEqual(@as(u64, 0), complete.profile.subgroup_vectors_skipped);
-        try std.testing.expectEqual(@as(u64, 128), complete.profile.approx_vectors_scored);
+        try std.testing.expectEqual(@as(u64, 0), complete.profile.approx_vectors_scored);
+        try std.testing.expectEqual(@as(u64, 128), complete.profile.exact_vectors_scored);
         for (baseline.results.items.items, complete.results.items.items) |a, b| {
             try std.testing.expectEqual(a.vector_id, b.vector_id);
             try std.testing.expectEqual(a.distance, b.distance);
@@ -28496,7 +28497,8 @@ test "flat rabitq full effort exhausts an underfilled published directory" {
     defer profiled.results.deinit();
 
     try std.testing.expect(profiled.profile.leaves_explored > estimated_leaves);
-    try std.testing.expectEqual(stats.active_count, profiled.profile.approx_vectors_scored);
+    try std.testing.expectEqual(@as(u64, 0), profiled.profile.approx_vectors_scored);
+    try std.testing.expectEqual(stats.active_count, profiled.profile.exact_vectors_scored);
     try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_bound_stops);
     try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_frontier_remaining);
     try std.testing.expectEqual(vectorindex_search_results.CandidateCoverage.exhausted, profiled.results.candidate_coverage);
@@ -28513,7 +28515,8 @@ test "flat rabitq full effort exhausts an underfilled published directory" {
     });
     defer repeated.results.deinit();
     try std.testing.expectEqual(published_directory, idx.flat_centroid_directory);
-    try std.testing.expectEqual(stats.active_count, repeated.profile.approx_vectors_scored);
+    try std.testing.expectEqual(@as(u64, 0), repeated.profile.approx_vectors_scored);
+    try std.testing.expectEqual(stats.active_count, repeated.profile.exact_vectors_scored);
 }
 
 test "tree full effort exhausts underfilled leaves beyond estimated width" {
@@ -28552,7 +28555,8 @@ test "tree full effort exhausts underfilled leaves beyond estimated width" {
     defer profiled.results.deinit();
 
     try std.testing.expect(profiled.profile.leaves_explored > estimated_leaves);
-    try std.testing.expectEqual(stats.active_count, profiled.profile.approx_vectors_scored);
+    try std.testing.expectEqual(@as(u64, 0), profiled.profile.approx_vectors_scored);
+    try std.testing.expectEqual(stats.active_count, profiled.profile.exact_vectors_scored);
     try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_bound_stops);
     try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_frontier_remaining);
     try std.testing.expectEqual(vectorindex_search_results.CandidateCoverage.exhausted, profiled.results.candidate_coverage);
@@ -36207,9 +36211,12 @@ test "full effort filtered recall matches eligible cosine oracle across dimensio
                         const query = vectors[(count + q) * dims ..][0..dims];
                         for (oracle[0..eligible_count], eligible[0..eligible_count]) |*entry, id| entry.* = .{ .id = id, .distance = Scored.distanceTo(query, items[@intCast(id - 1)].vector) };
                         std.mem.sort(Scored, oracle[0..eligible_count], {}, Scored.less);
-                        var result = try idx.searchWithRequest(.{ .query = query, .k = 10, .search_effort = 1, .filter_ids = eligible[0..eligible_count], .load_metadata = false });
-                        defer result.deinit();
-                        const hits = result.getHits();
+                        var result = try idx.searchProfiledRequest(.{ .query = query, .k = 10, .search_effort = 1, .filter_ids = eligible[0..eligible_count], .load_metadata = false });
+                        defer result.results.deinit();
+                        const hits = result.results.getHits();
+                        try std.testing.expectEqual(@as(u64, 0), result.profile.approx_vectors_scored);
+                        try std.testing.expectEqual(@as(u64, 0), result.profile.leaf_payload_missing);
+                        try std.testing.expectEqual(@as(u64, @intCast(eligible_count)), result.profile.exact_vectors_scored);
                         try std.testing.expectEqual(@min(@as(usize, 10), eligible_count), hits.len);
                         for (hits, oracle[0..hits.len]) |hit, expected| try std.testing.expectEqual(expected.id, hit.vector_id);
                     }

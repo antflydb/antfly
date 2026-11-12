@@ -4819,7 +4819,7 @@ fn scoreLeafMemberIds(
         }
     }
 
-    if (self.config.use_quantization) {
+    if (approximate_scoring and self.config.use_quantization) {
         if (!leaf_has_fresh_stored_payload) {
             profile.leaf_payload_stale += 1;
         } else {

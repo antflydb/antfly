@@ -13,13 +13,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Ordered Unigram normalization for the released GLiNER2.5 tokenizers.
+//! Ordered normalization profiles for WordPiece, BPE, and Unigram tokenizers.
 //! Unicode canonical decomposition/composition follows Unicode 15.0.0.
 const std = @import("std");
 const data = @import("unicode_nfc_data.zig");
 
 pub const Step = union(enum) {
     nfc,
+    nfd,
+    lowercase,
+    strip_accents,
+    bert: Bert,
+    literal_replace: struct { pattern: []u8, content: []u8 },
     whitespace_replace,
     spaces_replace,
     precompiled: Precompiled,
@@ -29,9 +34,15 @@ pub const Step = union(enum) {
 pub const Profile = struct {
     steps: [32]Step = undefined,
     len: usize = 0,
+    wordpiece: bool = false,
 
     pub fn parse(self: *Profile, allocator: std.mem.Allocator, value: std.json.Value) !void {
-        try self.parseDepth(allocator, value, 0);
+        try self.parseDepth(allocator, value, 0, false);
+    }
+
+    pub fn parseWordPiece(self: *Profile, allocator: std.mem.Allocator, value: std.json.Value) !void {
+        self.wordpiece = true;
+        try self.parseDepth(allocator, value, 0, true);
     }
 
     fn append(self: *Profile, step: Step) !void {
@@ -46,7 +57,7 @@ pub const Profile = struct {
         return value.bool;
     }
 
-    fn parseDepth(self: *Profile, allocator: std.mem.Allocator, value: std.json.Value, depth: usize) anyerror!void {
+    fn parseDepth(self: *Profile, allocator: std.mem.Allocator, value: std.json.Value, depth: usize, wordpiece: bool) anyerror!void {
         if (depth >= 16 or value != .object) return error.InvalidTokenizerNormalizer;
         const obj = value.object;
         const kind = obj.get("type") orelse return error.InvalidTokenizerNormalizer;
@@ -54,7 +65,7 @@ pub const Profile = struct {
         if (std.mem.eql(u8, kind.string, "Sequence")) {
             const children = obj.get("normalizers") orelse return error.InvalidTokenizerNormalizer;
             if (children != .array) return error.InvalidTokenizerNormalizer;
-            for (children.array.items) |child| try self.parseDepth(allocator, child, depth + 1);
+            for (children.array.items) |child| try self.parseDepth(allocator, child, depth + 1, wordpiece);
         } else if (std.mem.eql(u8, kind.string, "Precompiled")) {
             const encoded = obj.get("precompiled_charsmap") orelse return error.UnsupportedTokenizerNormalizer;
             if (encoded != .string) return error.InvalidTokenizerNormalizer;
@@ -62,6 +73,24 @@ pub const Profile = struct {
             const map = try Precompiled.init(allocator, encoded.string);
             errdefer allocator.free(map.bytes);
             try self.append(.{ .precompiled = map });
+        } else if (wordpiece and std.mem.eql(u8, kind.string, "BertNormalizer")) {
+            const lowercase = try boolean(obj, "lowercase", true);
+            const strip_accents = if (obj.get("strip_accents")) |setting|
+                if (setting == .null) lowercase else try boolean(obj, "strip_accents", lowercase)
+            else
+                lowercase;
+            try self.append(.{ .bert = .{
+                .lowercase = lowercase,
+                .strip_accents = strip_accents,
+                .clean_text = try boolean(obj, "clean_text", true),
+                .handle_chinese_chars = try boolean(obj, "handle_chinese_chars", true),
+            } });
+        } else if (wordpiece and std.mem.eql(u8, kind.string, "Lowercase")) {
+            try self.append(.lowercase);
+        } else if (wordpiece and std.mem.eql(u8, kind.string, "StripAccents")) {
+            try self.append(.strip_accents);
+        } else if (wordpiece and std.mem.eql(u8, kind.string, "NFD")) {
+            try self.append(.nfd);
         } else if (std.mem.eql(u8, kind.string, "NFC")) {
             try self.append(.nfc);
         } else if (std.mem.eql(u8, kind.string, "Strip")) {
@@ -70,6 +99,17 @@ pub const Profile = struct {
             const pattern = obj.get("pattern") orelse return error.InvalidTokenizerNormalizer;
             const content = obj.get("content") orelse return error.InvalidTokenizerNormalizer;
             if (pattern != .object or content != .string) return error.InvalidTokenizerNormalizer;
+            if (pattern.object.get("String")) |literal| {
+                if (!wordpiece) return error.UnsupportedTokenizerNormalizer;
+                if (literal != .string) return error.InvalidTokenizerNormalizer;
+                if (literal.string.len == 0) return error.UnsupportedTokenizerNormalizer;
+                const owned_pattern = try allocator.dupe(u8, literal.string);
+                errdefer allocator.free(owned_pattern);
+                const owned_content = try allocator.dupe(u8, content.string);
+                errdefer allocator.free(owned_content);
+                try self.append(.{ .literal_replace = .{ .pattern = owned_pattern, .content = owned_content } });
+                return;
+            }
             const regex = pattern.object.get("Regex") orelse return error.UnsupportedTokenizerNormalizer;
             if (regex != .string) return error.InvalidTokenizerNormalizer;
             if (std.mem.eql(u8, regex.string, " {2,}") and std.mem.eql(u8, content.string, " ")) {
@@ -85,26 +125,60 @@ pub const Profile = struct {
     pub fn deinit(self: *Profile, allocator: std.mem.Allocator) void {
         for (self.steps[0..self.len]) |step| switch (step) {
             .precompiled => |map| allocator.free(map.bytes),
+            .literal_replace => |value| {
+                allocator.free(value.pattern);
+                allocator.free(value.content);
+            },
             else => {},
         };
         self.len = 0;
     }
 
-    pub fn normalize(self: *const Profile, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-        var owned = try allocator.dupe(u8, text);
-        errdefer allocator.free(owned);
+    /// Only local character transforms may reuse byte positions after the
+    /// encoder checks their output. Replacements/composition can change source
+    /// provenance even if later steps restore the original final bytes.
+    pub fn supportsByteAlignedOffsets(self: *const Profile) bool {
+        for (self.steps[0..self.len]) |step| switch (step) {
+            .bert, .lowercase, .strip_accents => {},
+            else => return false,
+        };
+        return true;
+    }
+
+    pub fn normalizeAligned(self: *const Profile, allocator: std.mem.Allocator, text: []const u8) !AlignedText {
+        var current = try AlignedText.fromSource(allocator, text);
+        errdefer current.deinit(allocator);
         for (self.steps[0..self.len]) |step| {
+            const next = try normalizeAlignedStep(allocator, &current, step);
+            current.deinit(allocator);
+            current = next;
+        }
+        return current;
+    }
+
+    pub fn normalize(self: *const Profile, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        // Borrow the source until the first step produces output. The common
+        // single-BERT profile performs one normalization allocation, no copy.
+        var owned: ?[]u8 = null;
+        errdefer if (owned) |value| allocator.free(value);
+        for (self.steps[0..self.len]) |step| {
+            const input = owned orelse text;
             const next = switch (step) {
-                .nfc => try nfc(allocator, owned),
-                .precompiled => |map| try map.normalize(allocator, owned),
-                .spaces_replace => try collapseSpaces(allocator, owned),
-                .whitespace_replace => try replaceWhitespace(allocator, owned),
-                .strip => |flags| try strip(allocator, owned, flags.left, flags.right),
+                .nfc => try nfcWithProfile(allocator, input, self.wordpiece),
+                .nfd => try nfdWithProfile(allocator, input, self.wordpiece),
+                .lowercase => try (Bert{ .strip_accents = false, .clean_text = false }).normalize(allocator, input),
+                .strip_accents => try stripAccents(allocator, input),
+                .bert => |profile| try profile.normalize(allocator, input),
+                .literal_replace => |value| try std.mem.replaceOwned(u8, allocator, input, value.pattern, value.content),
+                .precompiled => |map| try map.normalize(allocator, input),
+                .spaces_replace => try collapseSpaces(allocator, input),
+                .whitespace_replace => try replaceWhitespace(allocator, input),
+                .strip => |flags| try strip(allocator, input, flags.left, flags.right),
             };
-            allocator.free(owned);
+            if (owned) |value| allocator.free(value);
             owned = next;
         }
-        return owned;
+        return owned orelse try allocator.dupe(u8, text);
     }
 };
 
@@ -237,6 +311,23 @@ fn decompose(allocator: std.mem.Allocator, cp: u21, units: *std.ArrayListUnmanag
     } else try units.append(allocator, .{ .cp = cp, .class = combiningClass(cp), .order = units.items.len });
 }
 
+fn decomposeWordPiece(allocator: std.mem.Allocator, cp: u21, units: *std.ArrayListUnmanaged(Unit)) std.mem.Allocator.Error!void {
+    if (inRanges(cp, &data.bert_decomposition_ignored)) {
+        try units.append(allocator, .{ .cp = cp, .class = 0, .order = units.items.len });
+        return;
+    }
+    const start = units.items.len;
+    try decompose(allocator, cp, units);
+    for (units.items[start..]) |*unit| {
+        if (inRanges(unit.cp, &data.bert_combining_zero)) unit.class = 0;
+    }
+}
+
+fn composeWordPiece(a: u21, b: u21) ?u21 {
+    const cp = compose(a, b) orelse return null;
+    return if (inRanges(cp, &data.bert_decomposition_ignored)) null else cp;
+}
+
 fn compose(a: u21, b: u21) ?u21 {
     if (a >= 0x1100 and a < 0x1100 + 19 and b >= 0x1161 and b < 0x1161 + 21)
         return 0xac00 + ((a - 0x1100) * 21 + b - 0x1161) * 28;
@@ -252,12 +343,14 @@ fn compose(a: u21, b: u21) ?u21 {
     return if (lo < data.compositions.len and data.compositions[lo].pair == pair) data.compositions[lo].cp else null;
 }
 
-pub fn nfc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+fn decomposedUnits(allocator: std.mem.Allocator, text: []const u8, wordpiece: bool) !std.ArrayListUnmanaged(Unit) {
     const view = try std.unicode.Utf8View.init(text);
     var iter = view.iterator();
     var units = std.ArrayListUnmanaged(Unit).empty;
-    defer units.deinit(allocator);
-    while (iter.nextCodepoint()) |cp| try decompose(allocator, cp, &units);
+    errdefer units.deinit(allocator);
+    while (iter.nextCodepoint()) |cp| {
+        if (wordpiece) try decomposeWordPiece(allocator, cp, &units) else try decompose(allocator, cp, &units);
+    }
     // Canonical ordering must be stable. An explicit original-order key lets
     // the O(n log n) sort avoid quadratic insertion work on long mark runs.
     var run: usize = 0;
@@ -266,13 +359,46 @@ pub fn nfc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
         run = i + 1;
     };
     std.mem.sort(Unit, units.items[run..], {}, Unit.less);
+    return units;
+}
+
+pub fn nfd(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return nfdWithProfile(allocator, text, false);
+}
+
+fn nfdWithProfile(allocator: std.mem.Allocator, text: []const u8, wordpiece: bool) ![]u8 {
+    var units = try decomposedUnits(allocator, text, wordpiece);
+    defer units.deinit(allocator);
+    var output = std.ArrayListUnmanaged(u8).empty;
+    errdefer output.deinit(allocator);
+    for (units.items) |unit| try appendCodepoint(allocator, &output, unit.cp);
+    return output.toOwnedSlice(allocator);
+}
+
+fn stripAccents(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var output = std.ArrayListUnmanaged(u8).empty;
+    errdefer output.deinit(allocator);
+    var iter = (try std.unicode.Utf8View.init(text)).iterator();
+    while (iter.nextCodepoint()) |cp| {
+        if (!inRanges(cp, &data.strip_accents_marks)) try appendCodepoint(allocator, &output, cp);
+    }
+    return output.toOwnedSlice(allocator);
+}
+
+pub fn nfc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return nfcWithProfile(allocator, text, false);
+}
+
+fn nfcWithProfile(allocator: std.mem.Allocator, text: []const u8, wordpiece: bool) ![]u8 {
+    var units = try decomposedUnits(allocator, text, wordpiece);
+    defer units.deinit(allocator);
     var written: usize = 0;
     var starter: ?usize = null;
     var last_class: u8 = 0;
     for (units.items) |unit| {
         if (starter) |position| {
             if (last_class == 0 or last_class < unit.class) {
-                if (compose(units.items[position].cp, unit.cp)) |composed| {
+                if (if (wordpiece) composeWordPiece(units.items[position].cp, unit.cp) else compose(units.items[position].cp, unit.cp)) |composed| {
                     units.items[position].cp = composed;
                     continue;
                 }
@@ -413,6 +539,18 @@ test "SentencePiece precompiled normalization rewrites Unicode and deletes contr
     const normalized = try map.normalize(allocator, "你好，世界！ Ａ e\u{301}\x01🙂");
     defer allocator.free(normalized);
     try std.testing.expectEqualStrings("你好,世界! A é🙂", normalized);
+    for ([_][]const u8{ "你好，世界！ Ａ e\u{301}\x01🙂", "e\u{301}\u{327}", "e\u{301}\u{327}\u{300}" }) |source| {
+        var input = try AlignedText.fromSource(allocator, source);
+        defer input.deinit(allocator);
+        var aligned = try normalizeAlignedStep(allocator, &input, .{ .precompiled = map });
+        defer aligned.deinit(allocator);
+        const plain = try map.normalize(allocator, source);
+        defer allocator.free(plain);
+        try std.testing.expectEqualStrings(plain, aligned.text);
+        for (aligned.spans) |span| {
+            try std.testing.expect(span[0] <= span[1] and span[1] <= source.len);
+        }
+    }
     // A short grapheme consumes the entire cluster on the FIRST prefix match.
     const short_cluster = try map.normalize(allocator, "e\u{301}\u{327}");
     defer allocator.free(short_cluster);
@@ -431,6 +569,7 @@ pub const Bert = struct {
     lowercase: bool = true,
     strip_accents: bool = true,
     clean_text: bool = true,
+    handle_chinese_chars: bool = false,
 
     pub fn normalize(self: Bert, allocator: std.mem.Allocator, text: []const u8) ![]u8 {
         var output = std.ArrayListUnmanaged(u8).empty;
@@ -461,12 +600,17 @@ pub const Bert = struct {
                     cp = ' ';
                 } else if (inRanges(cp, &data.controls)) continue;
             }
+            const chinese = self.handle_chinese_chars and isChineseChar(cp);
+            if (chinese) {
+                try flushBertMarks(allocator, &output, &marks);
+                try output.append(allocator, ' ');
+            }
             const identity = [_]u21{cp};
             const lowered = if (self.lowercase) lowercaseCodepoint(cp) orelse &identity else &identity;
             for (lowered) |value| {
                 if (self.strip_accents and value >= 0x80) {
                     units.clearRetainingCapacity();
-                    try decompose(allocator, value, &units);
+                    try decomposeWordPiece(allocator, value, &units);
                     for (units.items) |unit| {
                         // Canonical ordering precedes Mn removal, including
                         // the uncommon retained spacing combining marks.
@@ -482,6 +626,10 @@ pub const Bert = struct {
                     try flushBertMarks(allocator, &output, &marks);
                     try appendCodepoint(allocator, &output, value);
                 }
+            }
+            if (chinese) {
+                try flushBertMarks(allocator, &output, &marks);
+                try output.append(allocator, ' ');
             }
         }
         try flushBertMarks(allocator, &output, &marks);
@@ -533,6 +681,9 @@ fn exerciseBertNormalization(allocator: std.mem.Allocator) !void {
         .{ .text = "x\u{fe0f}", .expected = "x" },
         .{ .text = "x\u{1d16d}\u{1d165}", .expected = "x\u{1d165}\u{1d16d}" },
         .{ .text = "ASCII\ttext\n", .expected = "ascii text " },
+        .{ .text = "a\u{2028}b\u{2029}c", .expected = "a b c" },
+        .{ .text = "hello\u{7fd}", .expected = "hello\u{7fd}" },
+        .{ .text = "\u{11938}", .expected = "\u{11938}" },
         .{ .text = "a\u{e000}b\u{378}c", .expected = "ab\u{378}c" },
     };
     for (cases) |case| {
@@ -545,4 +696,264 @@ fn exerciseBertNormalization(allocator: std.mem.Allocator) !void {
 test "BERT normalization honors Unicode categories and independent configuration" {
     try exerciseBertNormalization(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseBertNormalization, .{});
+}
+
+pub fn isChineseChar(cp: u21) bool {
+    return inRanges(cp, &data.chinese);
+}
+
+/// Each normalized byte retains the source interval that produced it. This
+/// storage is request-local and needed only when callers request offsets after
+/// nontrivial normalization; ordinary token counts use the allocation-light path.
+pub const AlignedText = struct {
+    text: []u8,
+    spans: [][2]u32,
+
+    pub fn deinit(self: *AlignedText, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.spans);
+        self.* = undefined;
+    }
+
+    fn fromSource(allocator: std.mem.Allocator, text: []const u8) !AlignedText {
+        if (text.len > std.math.maxInt(u32)) return error.InputTooLong;
+        const copy = try allocator.dupe(u8, text);
+        errdefer allocator.free(copy);
+        const spans = try allocator.alloc([2]u32, text.len);
+        errdefer allocator.free(spans);
+        var iter = (try std.unicode.Utf8View.init(text)).iterator();
+        while (iter.i < text.len) {
+            const start = iter.i;
+            _ = iter.nextCodepoint().?;
+            @memset(spans[start..iter.i], .{ @intCast(start), @intCast(iter.i) });
+        }
+        return .{ .text = copy, .spans = spans };
+    }
+
+    pub fn sourceRange(self: *const AlignedText, start: usize, end: usize) [2]u32 {
+        if (start == end) {
+            const point = if (start < self.spans.len) self.spans[start][0] else if (start > 0) self.spans[start - 1][1] else 0;
+            return .{ point, point };
+        }
+        var span = self.spans[start];
+        for (self.spans[start + 1 .. end]) |next| span = joinSpans(span, next);
+        return span;
+    }
+};
+
+fn joinSpans(a: [2]u32, b: [2]u32) [2]u32 {
+    return .{ @min(a[0], b[0]), @max(a[1], b[1]) };
+}
+
+const AlignedBuilder = struct {
+    text: std.ArrayListUnmanaged(u8) = .empty,
+    spans: std.ArrayListUnmanaged([2]u32) = .empty,
+    last_source_byte: ?usize = null,
+
+    fn extendPreviousSpan(self: *@This(), span: [2]u32) void {
+        // A deleted trailing accent still belongs to the preceding source
+        // grapheme. Skip synthetic Han spaces, which have empty provenance.
+        if (self.last_source_byte) |index| self.spans.items[index] = joinSpans(self.spans.items[index], span);
+    }
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        self.text.deinit(allocator);
+        self.spans.deinit(allocator);
+    }
+    fn append(self: *@This(), allocator: std.mem.Allocator, bytes: []const u8, span: [2]u32) !void {
+        try self.text.appendSlice(allocator, bytes);
+        try self.spans.appendNTimes(allocator, span, bytes.len);
+        if (bytes.len > 0 and span[0] != span[1]) self.last_source_byte = self.spans.items.len - 1;
+    }
+    fn codepoint(self: *@This(), allocator: std.mem.Allocator, cp: u21, span: [2]u32) !void {
+        var bytes: [4]u8 = undefined;
+        const len = try std.unicode.utf8Encode(cp, &bytes);
+        try self.append(allocator, bytes[0..len], span);
+    }
+    fn copy(self: *@This(), allocator: std.mem.Allocator, source: *const AlignedText, start: usize, end: usize) !void {
+        try self.text.appendSlice(allocator, source.text[start..end]);
+        const base = self.spans.items.len;
+        try self.spans.appendSlice(allocator, source.spans[start..end]);
+        for (source.spans[start..end], 0..) |span, i| {
+            if (span[0] != span[1]) self.last_source_byte = base + i;
+        }
+    }
+    fn finish(self: *@This(), allocator: std.mem.Allocator) !AlignedText {
+        const text = try self.text.toOwnedSlice(allocator);
+        errdefer allocator.free(text);
+        return .{ .text = text, .spans = try self.spans.toOwnedSlice(allocator) };
+    }
+};
+
+fn normalizeAlignedStep(a: std.mem.Allocator, source: *const AlignedText, step: Step) !AlignedText {
+    switch (step) {
+        .bert => |profile| {
+            var transformed = try alignedCharacters(a, source, profile, false);
+            if (!profile.strip_accents) return transformed;
+            defer transformed.deinit(a);
+            return alignedCanonical(a, &transformed, false, true);
+        },
+        .lowercase => return alignedCharacters(a, source, .{ .strip_accents = false, .clean_text = false }, false),
+        .strip_accents => return alignedCharacters(a, source, .{ .lowercase = false, .strip_accents = false, .clean_text = false }, true),
+        .nfc => return alignedCanonical(a, source, true, false),
+        .nfd => return alignedCanonical(a, source, false, false),
+        else => {},
+    }
+    var out = AlignedBuilder{};
+    defer out.deinit(a);
+    switch (step) {
+        .literal_replace => |replacement| {
+            var cursor: usize = 0;
+            while (std.mem.indexOfPos(u8, source.text, cursor, replacement.pattern)) |start| {
+                try out.copy(a, source, cursor, start);
+                cursor = start + replacement.pattern.len;
+                try out.append(a, replacement.content, source.sourceRange(start, cursor));
+            }
+            try out.copy(a, source, cursor, source.text.len);
+        },
+        .strip => |flags| {
+            var first: ?usize = null;
+            var last: usize = 0;
+            var iter = (try std.unicode.Utf8View.init(source.text)).iterator();
+            while (iter.i < source.text.len) {
+                const start = iter.i;
+                if (!whitespace(iter.nextCodepoint().?)) {
+                    if (first == null) first = start;
+                    last = iter.i;
+                }
+            }
+            const start = if (flags.left) first orelse source.text.len else 0;
+            try out.copy(a, source, start, if (flags.right) @max(start, last) else source.text.len);
+        },
+        .spaces_replace, .whitespace_replace => {
+            const spaces_only = step == .spaces_replace;
+            var iter = (try std.unicode.Utf8View.init(source.text)).iterator();
+            while (iter.i < source.text.len) {
+                const start = iter.i;
+                const cp = iter.nextCodepoint().?;
+                var count: usize = 1;
+                if (if (spaces_only) cp == ' ' else whitespace(cp)) {
+                    while (iter.i < source.text.len) {
+                        var next = iter;
+                        const value = next.nextCodepoint().?;
+                        if (!(if (spaces_only) value == ' ' else whitespace(value))) break;
+                        iter = next;
+                        count += 1;
+                    }
+                    if (spaces_only or count >= 2 or cp == '\n' or cp == '\r' or cp == '\t') {
+                        try out.append(a, " ", source.sourceRange(start, iter.i));
+                        continue;
+                    }
+                }
+                try out.copy(a, source, start, iter.i);
+            }
+        },
+        .precompiled => |map| {
+            var graphemes = @import("antfly_grapheme").Iterator{ .text = source.text };
+            var cursor: usize = 0;
+            while (try graphemes.next()) |cluster| {
+                const end = cursor + cluster.len;
+                if (cluster.len < 6) {
+                    if (try map.transform(cluster)) |replacement| {
+                        try out.append(a, replacement, source.sourceRange(cursor, end));
+                        cursor = end;
+                        continue;
+                    }
+                }
+                while (cursor < end) {
+                    const len = try std.unicode.utf8ByteSequenceLength(source.text[cursor]);
+                    const cp = source.text[cursor..][0..len];
+                    try out.append(a, (try map.transform(cp)) orelse cp, source.sourceRange(cursor, cursor + len));
+                    cursor += len;
+                }
+            }
+        },
+        else => unreachable,
+    }
+    return out.finish(a);
+}
+
+fn alignedCharacters(a: std.mem.Allocator, source: *const AlignedText, profile: Bert, strip_marks: bool) !AlignedText {
+    var out = AlignedBuilder{};
+    defer out.deinit(a);
+    var iter = (try std.unicode.Utf8View.init(source.text)).iterator();
+    while (iter.i < source.text.len) {
+        const start = iter.i;
+        var cp = iter.nextCodepoint().?;
+        const span = source.sourceRange(start, iter.i);
+        if (profile.clean_text) {
+            if (cp < 0x80) {
+                if (cp == '\t' or cp == '\n' or cp == '\r') cp = ' ' else if (cp < 0x20 or cp == 0x7f) continue;
+            } else {
+                if (cp == 0xfffd) continue;
+                if (inRanges(cp, &data.spaces)) cp = ' ' else if (inRanges(cp, &data.controls)) continue;
+            }
+        }
+        if (strip_marks and inRanges(cp, &data.strip_accents_marks)) {
+            out.extendPreviousSpan(span);
+            continue;
+        }
+        const chinese = profile.handle_chinese_chars and isChineseChar(cp);
+        if (chinese) try out.append(a, " ", .{ span[0], span[0] });
+        const identity = [_]u21{if (profile.lowercase and cp < 0x80) std.ascii.toLower(@intCast(cp)) else cp};
+        const lowered = if (profile.lowercase and cp >= 0x80) lowercaseCodepoint(cp) orelse &identity else &identity;
+        for (lowered) |value| try out.codepoint(a, value, span);
+        if (chinese) try out.append(a, " ", .{ span[1], span[1] });
+    }
+    return out.finish(a);
+}
+
+fn alignedCanonical(a: std.mem.Allocator, source: *const AlignedText, composing: bool, strip_marks: bool) !AlignedText {
+    const MappedUnit = struct {
+        unit: Unit,
+        span: [2]u32,
+        fn less(_: void, left: @This(), right: @This()) bool {
+            return Unit.less({}, left.unit, right.unit);
+        }
+    };
+    var units = std.ArrayListUnmanaged(MappedUnit).empty;
+    defer units.deinit(a);
+    var scratch = std.ArrayListUnmanaged(Unit).empty;
+    defer scratch.deinit(a);
+    var iter = (try std.unicode.Utf8View.init(source.text)).iterator();
+    while (iter.i < source.text.len) {
+        const start = iter.i;
+        const cp = iter.nextCodepoint().?;
+        scratch.clearRetainingCapacity();
+        try decomposeWordPiece(a, cp, &scratch);
+        for (scratch.items) |unit| try units.append(a, .{ .unit = .{ .cp = unit.cp, .class = unit.class, .order = units.items.len }, .span = source.sourceRange(start, iter.i) });
+    }
+    var run: usize = 0;
+    for (units.items, 0..) |mapped, i| if (mapped.unit.class == 0) {
+        std.mem.sort(MappedUnit, units.items[run..i], {}, MappedUnit.less);
+        run = i + 1;
+    };
+    std.mem.sort(MappedUnit, units.items[run..], {}, MappedUnit.less);
+    var written: usize = 0;
+    var starter: ?usize = null;
+    var last_class: u8 = 0;
+    for (units.items) |mapped| {
+        const unit = mapped.unit;
+        if (composing) if (starter) |position| {
+            if (last_class == 0 or last_class < unit.class) {
+                if (composeWordPiece(units.items[position].unit.cp, unit.cp)) |composed| {
+                    units.items[position].unit.cp = composed;
+                    units.items[position].span = joinSpans(units.items[position].span, mapped.span);
+                    continue;
+                }
+            }
+        };
+        if (unit.class == 0) starter = written;
+        units.items[written] = mapped;
+        written += 1;
+        last_class = unit.class;
+    }
+    var out = AlignedBuilder{};
+    defer out.deinit(a);
+    for (units.items[0..written]) |mapped| {
+        if (strip_marks and inRanges(mapped.unit.cp, &data.nonspacing_marks)) {
+            out.extendPreviousSpan(mapped.span);
+        } else try out.codepoint(a, mapped.unit.cp, mapped.span);
+    }
+    return out.finish(a);
 }

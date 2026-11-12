@@ -5149,22 +5149,22 @@ pub const ProvisionedTableReadSource = struct {
                 .merged = true,
             };
             defer meta.deinit(alloc);
+            // Distributed graph execution can cross table boundaries. Do not
+            // retain the source table's admission while acquiring a target
+            // table: opposing A -> B and B -> A traversals can otherwise form
+            // a lock-order cycle behind queued Raft apply operations. The base
+            // result is fully materialized, so release its admission before
+            // model calls and fanout and let each worker hold exactly one table at a time.
+            prepared.releaseActivity();
+
             // Resolve $query_results from the final ranked and pruned page.
-            try applyQueryPostProcessing(
+            try query_post_processing.applyHitPostProcessing(
                 alloc,
                 graph_req,
                 &merged,
                 &meta,
                 routed.managedReadRuntimeConfig().forTable(table_name),
             );
-
-            // Distributed graph execution can cross table boundaries. Do not
-            // retain the source table's admission while acquiring a target
-            // table: opposing A -> B and B -> A traversals can otherwise form
-            // a lock-order cycle behind queued Raft apply operations. The base
-            // result is fully materialized, so release its admission before
-            // fanout and let each worker hold exactly one table at a time.
-            prepared.releaseActivity();
 
             var worker_ctx = ProvisionedGraphWorkerContext.init(routed);
             const worker = worker_ctx.worker();
@@ -5194,6 +5194,7 @@ pub const ProvisionedTableReadSource = struct {
                 else => return err,
             };
             try checkQueryDeadline(graph_req);
+            try query_post_processing.applyGraphPostProcessing(alloc, graph_req, &merged, &meta, routed.managedReadRuntimeConfig().forTable(table_name));
             meta.took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms));
             return try query_api.encodeQueryResponsesWithDelivery(alloc, table_name, graph_req, meta, merged, delivery);
         }
@@ -7769,7 +7770,7 @@ pub const HostedProvisionedTableReadSource = struct {
             };
             defer meta.deinit(alloc);
             // Resolve $query_results from the final ranked and pruned page.
-            try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
+            try query_post_processing.applyHitPostProcessing(alloc, graph_req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
 
             const worker = hostedGraphWorker(self);
             const graph_results = distributed_graph.executeCrossRangeWithMatchAnchors(
@@ -7786,6 +7787,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
             try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, null, null, consistency);
             try checkQueryDeadline(graph_req);
+            try query_post_processing.applyGraphPostProcessing(alloc, graph_req, &merged, &meta, self.managedReadRuntimeConfig().forTable(table_name));
             meta.took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms));
             return try query_api.encodeQueryResponsesWithDelivery(alloc, table_name, graph_req, meta, merged, delivery);
         }
@@ -33403,6 +33405,22 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 1), neighbors.len);
             try std.testing.expectEqualStrings("evidence:right", neighbors[0].key);
             try serving.await(io_impl.io());
+
+            // A graph-only evaluation uses the produced cross-range bindings,
+            // rather than trying to evaluate the empty retrieval result.
+            var evaluated_req = try query_api.parseQueryRequest(alloc, null, "docs",
+                \\{"limit":2,"graph_queries":{"customers":{"index":"relations_graph","match":{"anchor":"customer","nodes":{"customer":{}},"edges":[]},"return":{"bindings":["customer"],"include_documents":true,"fields":["title"],"limit":2}}},"evaluate":{"graph_query":"customers","scope":"candidates","candidate_count":10,"compute":{"label":{"field":"customer.document.title"}},"where":{"eq":[{"ref":"label"},{"literal":"right"}]}}}
+            );
+            defer evaluated_req.deinit(alloc);
+            var evaluated_response = (try hosted.source().query(alloc, "docs", evaluated_req.req, .read_index)).?;
+            defer evaluated_response.deinit(alloc);
+            var evaluated = try ant_json.parseFromSlice(metadata_openapi.QueryResponses, alloc, evaluated_response.json, .{});
+            defer evaluated.deinit();
+            const evaluated_cell = evaluated.value.responses.?[0];
+            const bindings = evaluated_cell.graph_results.?.map.get("customers").?.graph_bindings_result;
+            try std.testing.expectEqual(@as(usize, 1), bindings.rows.len);
+            try std.testing.expectEqualStrings("zdoc:a", bindings.rows[0].map.get("customer").?.?.key);
+            try std.testing.expectEqualStrings("right", bindings.computed.?[0].map.get("label").?.string);
         }
 
         test "provisioned read cache keys entries by lsm root generation" {

@@ -137,7 +137,7 @@ pub const HfTokenizer = struct {
     /// without explicit wrap tokens must not be wrapped with those defaults.
     wrap_specials_explicit: bool,
     do_lowercase: bool,
-    bert_normalizer: ?unicode_normalizer.Bert = null,
+    wordpiece_normalizer: unicode_normalizer.Profile = .{},
     /// BertNormalizer.handle_chinese_chars: pad every Han-ideograph codepoint
     /// with spaces before pre-tokenization, matching HF's `_is_chinese_char`.
     /// Only ever set from a `BertNormalizer` block (not `Lowercase`).
@@ -820,29 +820,36 @@ pub const HfTokenizer = struct {
 
     pub fn encodeWithOffsets(self: *HfTokenizer, allocator: std.mem.Allocator, text: []const u8) !?EncodingWithOffsets {
         if (text.len > std.math.maxInt(u32)) return null;
-        // The normalizer can compose/reorder codepoints and collapse spaces.
-        // Until normalized alignment tracking is implemented, do not expose
-        // offsets from the unnormalized fast path. GLiNER owns its word maps.
         if (self.unigram_normalizer.len != 0 or self.bpe_normalizer.len != 0) return null;
-        if (self.bert_normalizer) |normalizer| {
-            // Existing WordPiece offsets are valid only when normalization
-            // preserves the source bytes apart from ASCII case. Otherwise the
-            // caller must use the exact counting path without invented offsets.
-            const normalized = try normalizer.normalize(allocator, text);
-            defer allocator.free(normalized);
-            if (normalized.len != text.len) return null;
-            for (normalized, text) |actual, original| {
-                const expected = if (normalizer.clean_text and (original == '\t' or original == '\n' or original == '\r'))
-                    ' '
-                else if (normalizer.lowercase)
-                    std.ascii.toLower(original)
-                else
-                    original;
-                if (actual != expected) return null;
-            }
-        }
         if (self.model_type == .word_piece and self.pre_tokenizer_type == .bert) {
-            return try self.encodeWordPieceWithOffsets(allocator, text);
+            const protected = self.findNextAddedToken(text, 0) != null;
+            if (self.wordpiece_normalizer.len == 0 and !protected)
+                return try self.encodeWordPieceWithOffsets(allocator, text);
+            var ascii = true;
+            for (text) |byte| if (byte >= 0x80) {
+                ascii = false;
+                break;
+            };
+            if (ascii and !protected and self.wordpiece_normalizer.supportsByteAlignedOffsets()) {
+                const normalized = try self.wordpiece_normalizer.normalize(allocator, text);
+                defer allocator.free(normalized);
+                if (normalized.len == text.len) {
+                    var aligned = true;
+                    for (normalized, text) |actual, original| {
+                        if (actual == original) continue;
+                        if (actual == ' ' and (original == '\t' or original == '\n' or original == '\r')) continue;
+                        if (actual < 0x80 and std.ascii.toLower(actual) == std.ascii.toLower(original)) continue;
+                        aligned = false;
+                        break;
+                    }
+                    if (aligned and self.findNextAddedToken(normalized, 0) == null)
+                        return try self.encodeWordPieceWithOffsets(allocator, normalized);
+                }
+            }
+            // Unicode rewrites and non-local steps retain exact source ranges
+            // through normalization. Model consumers such as NER need these
+            // spans; exact IDs alone cannot substitute for entity locations.
+            return try self.encodeAlignedWordPiece(allocator, text);
         }
         if (self.model_type == .unigram and self.pre_tokenizer_type == .metaspace and self.metaspace_split) {
             return try self.encodeUnigramWithOffsets(allocator, text);
@@ -1039,7 +1046,7 @@ pub const HfTokenizer = struct {
         if (root.object.get("normalizer")) |norm| {
             if (norm == .object) {
                 try self.parseNormalizer(norm.object, options.strict_unigram_normalizer);
-            } else if (options.strict_unigram_normalizer and self.model_type == .unigram and norm != .null)
+            } else if (norm != .null and (self.model_type == .word_piece or (options.strict_unigram_normalizer and self.model_type == .unigram)))
                 return error.InvalidTokenizerNormalizer;
         }
 
@@ -1489,6 +1496,15 @@ pub const HfTokenizer = struct {
     }
 
     fn parseNormalizer(self: *HfTokenizer, obj: std.json.ObjectMap, strict_unigram: bool) anyerror!void {
+        if (self.model_type == .word_piece) {
+            var profile = unicode_normalizer.Profile{};
+            errdefer profile.deinit(self.allocator);
+            // Keep the complete ordered program, or reject it. Flattening a
+            // Sequence to flags can silently drop or reorder supported steps.
+            try profile.parseWordPiece(self.allocator, .{ .object = obj });
+            self.wordpiece_normalizer = profile;
+            return;
+        }
         if (self.model_type == .unigram) {
             // Parse transactionally. A legacy Sequence may have supported
             // steps before Precompiled/Lowercase; retaining just that prefix
@@ -1548,11 +1564,6 @@ pub const HfTokenizer = struct {
                     } else {
                         self.do_lowercase = true;
                     }
-                    self.bert_normalizer = .{
-                        .lowercase = self.do_lowercase,
-                        .strip_accents = if (obj.get("strip_accents")) |v| (if (v == .bool) v.bool else self.do_lowercase) else self.do_lowercase,
-                        .clean_text = if (obj.get("clean_text")) |v| (if (v == .bool) v.bool else true) else true,
-                    };
                     if (obj.get("handle_chinese_chars")) |hcc| {
                         self.handle_chinese_chars = switch (hcc) {
                             .bool => hcc.bool,
@@ -1877,6 +1888,12 @@ pub const HfTokenizer = struct {
         const cache_reader = self.enterBpeCacheRead();
         defer if (cache_reader) |cache| self.leaveBpeCacheRead(cache);
 
+        if (self.wordpiece_normalizer.len != 0) {
+            var ids = std.ArrayListUnmanaged(i32).empty;
+            errdefer ids.deinit(allocator);
+            try self.encodeNormalizedProfile(allocator, text, &ids, &self.wordpiece_normalizer);
+            return ids.toOwnedSlice(allocator);
+        }
         if (self.bpe_normalizer.len != 0) {
             var ids = std.ArrayListUnmanaged(i32).empty;
             errdefer ids.deinit(allocator);
@@ -1896,11 +1913,7 @@ pub const HfTokenizer = struct {
         var owned: ?[]u8 = null;
         defer if (owned) |buf| allocator.free(buf);
         var normalized: []const u8 = text;
-        if (self.bert_normalizer) |normalizer| {
-            const value = try normalizer.normalize(allocator, normalized);
-            owned = value;
-            normalized = value;
-        } else if (self.do_lowercase) {
+        if (self.do_lowercase) {
             const lowered = try toLowerAlloc(allocator, normalized);
             owned = lowered;
             normalized = lowered;
@@ -1927,23 +1940,21 @@ pub const HfTokenizer = struct {
         const cache_reader = self.enterBpeCacheRead();
         defer if (cache_reader) |cache| self.leaveBpeCacheRead(cache);
 
+        if (self.wordpiece_normalizer.len != 0)
+            return self.encodeNormalizedProfile(allocator, text, ids, &self.wordpiece_normalizer);
         if (self.bpe_normalizer.len != 0)
             return self.encodeNormalizedBpe(allocator, text, ids);
         if (self.unigram_normalizer.len != 0)
             return self.encodeNormalizedUnigram(allocator, text, null, ids);
 
-        if (self.bert_normalizer == null and !self.do_lowercase and self.replace_space_with == null) {
+        if (!self.do_lowercase and self.replace_space_with == null) {
             return self.encodeWithAddedTokens(allocator, text, ids);
         }
 
         var owned: ?[]u8 = null;
         defer if (owned) |buf| allocator.free(buf);
         var normalized: []const u8 = text;
-        if (self.bert_normalizer) |normalizer| {
-            const value = try normalizer.normalize(allocator, normalized);
-            owned = value;
-            normalized = value;
-        } else if (self.do_lowercase) {
+        if (self.do_lowercase) {
             const lowered = try toLowerAlloc(allocator, normalized);
             owned = lowered;
             normalized = lowered;
@@ -3891,6 +3902,16 @@ pub const HfTokenizer = struct {
         text: []const u8,
         ids: *std.ArrayListUnmanaged(i32),
     ) !void {
+        return self.encodeNormalizedProfile(allocator, text, ids, &self.bpe_normalizer);
+    }
+
+    fn encodeNormalizedProfile(
+        self: *HfTokenizer,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        ids: *std.ArrayListUnmanaged(i32),
+        profile: *const unicode_normalizer.Profile,
+    ) !void {
         // Protect structural tokens before normalizing the text between them,
         // matching the checkpoint's normalized=false added-token markers.
         var cursor: usize = 0;
@@ -3901,7 +3922,7 @@ pub const HfTokenizer = struct {
                 continue;
             }
             const end = self.findNextAddedToken(text, cursor) orelse text.len;
-            const normalized = try self.bpe_normalizer.normalize(allocator, text[cursor..end]);
+            const normalized = try profile.normalize(allocator, text[cursor..end]);
             defer allocator.free(normalized);
             try self.encodeWithAddedTokens(allocator, normalized, ids);
             cursor = end;
@@ -4064,6 +4085,46 @@ pub const HfTokenizer = struct {
         return result;
     }
 
+    fn encodeAlignedWordPiece(self: *HfTokenizer, allocator: std.mem.Allocator, text: []const u8) !RawWordPieceEncoding {
+        var result = RawWordPieceEncoding{};
+        errdefer result.deinit(allocator);
+        var cursor: usize = 0;
+        while (cursor < text.len) {
+            if (self.matchAddedTokenAt(text[cursor..])) |match| {
+                try result.ids.append(allocator, match.id);
+                try result.offsets.append(allocator, .{ @intCast(cursor), @intCast(cursor + match.len) });
+                cursor += match.len;
+                continue;
+            }
+            const end = self.findNextAddedToken(text, cursor) orelse text.len;
+            var normalized = try self.wordpiece_normalizer.normalizeAligned(allocator, text[cursor..end]);
+            defer normalized.deinit(allocator);
+            if (normalized.text.len > std.math.maxInt(u32)) return error.InputTooLong;
+            var position: usize = 0;
+            while (position < normalized.text.len) {
+                if (self.matchAddedTokenAt(normalized.text[position..])) |match| {
+                    const span = normalized.sourceRange(position, position + match.len);
+                    try result.ids.append(allocator, match.id);
+                    try result.offsets.append(allocator, .{ @intCast(cursor + span[0]), @intCast(cursor + span[1]) });
+                    position += match.len;
+                    continue;
+                }
+                const next = self.findNextAddedToken(normalized.text, position) orelse normalized.text.len;
+                var raw = try self.encodeWordPieceWithOffsets(allocator, normalized.text[position..next]);
+                defer raw.deinit(allocator);
+                try result.ids.appendSlice(allocator, raw.ids.items);
+                try result.offsets.ensureUnusedCapacity(allocator, raw.offsets.items.len);
+                for (raw.offsets.items) |offset| {
+                    const span = normalized.sourceRange(position + offset[0], position + offset[1]);
+                    result.offsets.appendAssumeCapacity(.{ @intCast(cursor + span[0]), @intCast(cursor + span[1]) });
+                }
+                position = next;
+            }
+            cursor = end;
+        }
+        return result;
+    }
+
     fn encodeUnigramWithOffsets(self: *HfTokenizer, allocator: std.mem.Allocator, text: []const u8) !RawWordPieceEncoding {
         const words = try metaspacePreTokenizeWithOffsets(
             allocator,
@@ -4115,6 +4176,7 @@ pub const HfTokenizer = struct {
             @memcpy(prefix_buf[0..prefix.len], prefix);
         }
 
+        const initial_count = ids.items.len;
         var start: usize = 0;
         while (start < word.len) {
             var end = word.len;
@@ -4152,6 +4214,8 @@ pub const HfTokenizer = struct {
             }
 
             if (!found) {
+                // WordPiece rejects the whole word if any suffix is unknown.
+                ids.shrinkRetainingCapacity(initial_count);
                 try ids.append(allocator, self.special.unk_id);
                 return;
             }
@@ -4194,6 +4258,7 @@ pub const HfTokenizer = struct {
             @memcpy(prefix_buf[0..prefix.len], prefix);
         }
 
+        const initial_count = result.ids.items.len;
         var start: usize = 0;
         while (start < lookup_word.len) {
             var end = lookup_word.len;
@@ -4232,6 +4297,8 @@ pub const HfTokenizer = struct {
             }
 
             if (!found) {
+                result.ids.shrinkRetainingCapacity(initial_count);
+                result.offsets.shrinkRetainingCapacity(initial_count);
                 try result.ids.append(allocator, self.special.unk_id);
                 try result.offsets.append(allocator, .{ @intCast(word_start), @intCast(word_start + word.len) });
                 return;
@@ -7396,13 +7463,8 @@ pub const HfTokenizer = struct {
 
     fn encodeForModelWithPadding(ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize, padded: bool) anyerror!@import("tokenizer.zig").EncodeResult {
         const self: *HfTokenizer = @ptrCast(@alignCast(ptr));
-        if (self.model_type == .word_piece and self.pre_tokenizer_type == .bert) {
-            var raw = try self.encodeWordPieceWithOffsets(allocator, text);
-            defer raw.deinit(allocator);
-            return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, max_length, padded);
-        }
-        if (self.model_type == .unigram and self.pre_tokenizer_type == .metaspace and self.metaspace_split and self.unigram_normalizer.len == 0) {
-            var raw = try self.encodeUnigramWithOffsets(allocator, text);
+        if (try self.encodeWithOffsets(allocator, text)) |encoded| {
+            var raw = encoded;
             defer raw.deinit(allocator);
             return HfTokenizer.wrapModelEncodingWithOffsets(self, allocator, raw.ids.items, raw.offsets.items, max_length, padded);
         }
@@ -7893,6 +7955,7 @@ pub const HfTokenizer = struct {
 
     pub fn deinitSelf(self: *HfTokenizer) void {
         const allocator = self.allocator;
+        self.wordpiece_normalizer.deinit(allocator);
         self.unigram_normalizer.deinit(allocator);
         self.bpe_normalizer.deinit(allocator);
         for (self.arena_strings.items) |s| {
@@ -8003,16 +8066,7 @@ fn adjustedOffset(pos: usize, prefix_len: usize, word_len: usize) usize {
 /// HF tokenizers' `_is_chinese_char`: CJK Unified Ideographs and the
 /// Extension A-F / Compatibility blocks. Deliberately narrower than "any CJK
 /// script" — it does not cover hiragana/katakana/hangul, matching HF exactly.
-fn isChineseChar(cp: u21) bool {
-    return (cp >= 0x4E00 and cp <= 0x9FFF) or
-        (cp >= 0x3400 and cp <= 0x4DBF) or
-        (cp >= 0x20000 and cp <= 0x2A6DF) or
-        (cp >= 0x2A700 and cp <= 0x2B73F) or
-        (cp >= 0x2B740 and cp <= 0x2B81F) or
-        (cp >= 0x2B820 and cp <= 0x2CEAF) or
-        (cp >= 0xF900 and cp <= 0xFAFF) or
-        (cp >= 0x2F800 and cp <= 0x2FA1F);
-}
+const isChineseChar = unicode_normalizer.isChineseChar;
 
 /// Non-ASCII whitespace for the BERT pre-tokenizer. ASCII whitespace is
 /// handled by the existing `std.ascii.isWhitespace` fast path; this reuses
@@ -12668,4 +12722,157 @@ test "raw token bytes retain metaspace and split byte fallback without sequence 
     const byte = try tokenizer.tokenBytes(a, 5);
     defer a.free(byte);
     try std.testing.expectEqualSlices(u8, &.{0xc3}, byte);
+}
+
+const ordered_wordpiece_model =
+    \\{"model":{"type":"WordPiece","unk_token":"[UNK]","continuing_subword_prefix":"##","max_input_chars_per_word":100,"vocab":{"[PAD]":0,"hello":1,"HELLO":2,"world":3,"WORLD":4,"cafe":5,"café":6,"Café":7,"世":8,"界":9,"世界":10,"##world":11,"é":12,"e":13,"##́":14,"[UNK]":100,"[CLS]":101,"[SEP]":102}},"pre_tokenizer":{"type":"BertPreTokenizer"},"post_processor":{"type":"BertProcessing","cls":["[CLS]",101],"sep":["[SEP]",102]},"added_tokens":[{"id":101,"content":"[CLS]","normalized":false,"special":true},{"id":50,"content":"hello world","normalized":true,"special":false}],"normalizer":
+;
+
+fn checkOrderedWordPiece(a: std.mem.Allocator, normalizer: []const u8, text: []const u8, expected: []const i32) !void {
+    const json = try std.fmt.allocPrint(a, "{s}{s}}}", .{ ordered_wordpiece_model, normalizer });
+    defer a.free(json);
+    const tok = try HfTokenizer.loadFromBytes(a, json);
+    defer tok.deinitSelf();
+    const ids = try tok.tokenizer().encode(a, text);
+    defer a.free(ids);
+    try std.testing.expectEqualSlices(i32, expected, ids);
+    var reused = std.ArrayListUnmanaged(i32).empty;
+    defer reused.deinit(a);
+    try tok.tokenizer().encodeInto(a, text, &reused);
+    try std.testing.expectEqualSlices(i32, expected, reused.items);
+    {
+        var offsets = (try tok.encodeWithOffsets(a, text)) orelse return error.TestUnexpectedResult;
+        defer offsets.deinit(a);
+        try std.testing.expectEqualSlices(i32, expected, offsets.ids.items);
+        for (offsets.offsets.items) |span| {
+            try std.testing.expect(span[0] <= span[1] and span[1] <= text.len);
+        }
+    }
+    inline for (.{ true, false }) |padded| {
+        var model = if (padded)
+            try tok.tokenizer().encodeForModel(a, text, expected.len + 4)
+        else
+            try tok.tokenizer().encodeForModelUnpadded(a, text, expected.len + 4);
+        defer model.deinit();
+        try std.testing.expectEqual(@as(i32, 101), model.ids[0]);
+        try std.testing.expectEqualSlices(i32, expected, model.ids[1 .. expected.len + 1]);
+        try std.testing.expectEqual(@as(i32, 102), model.ids[expected.len + 1]);
+        for (model.attention_mask[0 .. expected.len + 2]) |mask| try std.testing.expectEqual(@as(i32, 1), mask);
+        for (model.attention_mask[expected.len + 2 ..]) |mask| try std.testing.expectEqual(@as(i32, 0), mask);
+    }
+}
+
+test "ordered WordPiece normalizers preserve sequence semantics across encoding paths" {
+    // Independent reference: tokenizers==0.22.1 with the identical model.
+    // Both orders of BERT/Lowercase preserve an earlier transformation.
+    const cases = [_]struct { normalizer: []const u8, text: []const u8, ids: []const i32 }{
+        .{ .normalizer =
+        \\{"type":"Sequence","normalizers":[{"type":"BertNormalizer","lowercase":false,"strip_accents":false,"handle_chinese_chars":false},{"type":"Lowercase"}]}
+        , .text = "HELLO", .ids = &.{1} },
+        .{ .normalizer =
+        \\{"type":"Sequence","normalizers":[{"type":"Lowercase"},{"type":"BertNormalizer","lowercase":false,"strip_accents":false,"handle_chinese_chars":false}]}
+        , .text = "HELLO", .ids = &.{1} },
+        .{ .normalizer =
+        \\{"type":"Sequence","normalizers":[{"type":"Replace","pattern":{"String":"HELLO"},"content":"world"},{"type":"Lowercase"}]}
+        , .text = "HELLO", .ids = &.{3} },
+        .{ .normalizer =
+        \\{"type":"Sequence","normalizers":[{"type":"Lowercase"},{"type":"Replace","pattern":{"String":"HELLO"},"content":"world"}]}
+        , .text = "HELLO", .ids = &.{1} },
+        .{ .normalizer =
+        \\{"type":"Sequence","normalizers":[{"type":"BertNormalizer","lowercase":false,"strip_accents":null,"handle_chinese_chars":false},{"type":"Lowercase"}]}
+        , .text = "Café", .ids = &.{6} },
+        .{ .normalizer =
+        \\{"type":"Sequence","normalizers":[{"type":"NFD"},{"type":"Sequence","normalizers":[{"type":"Lowercase"},{"type":"StripAccents"}]}]}
+        , .text = "Café", .ids = &.{5} },
+        .{ .normalizer =
+        \\{"type":"StripAccents"}
+        , .text = "Café", .ids = &.{7} },
+        .{ .normalizer =
+        \\{"type":"Sequence","normalizers":[{"type":"BertNormalizer","lowercase":false,"strip_accents":false},{"type":"Lowercase"}]}
+        , .text = "Café 世界", .ids = &.{ 6, 8, 9 } },
+        .{ .normalizer =
+        \\{"type":"Sequence","normalizers":[{"type":"BertNormalizer","lowercase":false,"strip_accents":false},{"type":"Replace","pattern":{"String":" 世 "},"content":"HELLO"},{"type":"Lowercase"}]}
+        , .text = "世", .ids = &.{1} },
+        .{ .normalizer =
+        \\{"type":"Sequence","normalizers":[{"type":"BertNormalizer"},{"type":"Replace","pattern":{"String":"cafe"},"content":"HELLO"}]}
+        , .text = "Café", .ids = &.{2} },
+        .{ .normalizer =
+        \\{"type":"Sequence","normalizers":[{"type":"BertNormalizer","lowercase":false},{"type":"Lowercase"}]}
+        , .text = "[CLS]HELLO", .ids = &.{ 101, 1 } },
+    };
+    for (cases) |case| try checkOrderedWordPiece(std.testing.allocator, case.normalizer, case.text, case.ids);
+    try checkOrderedWordPiece(std.testing.allocator,
+        \\{"type":"Sequence","normalizers":[{"type":"BertNormalizer"},{"type":"Replace","pattern":{"String":" "},"content":""}]}
+    , "HELLO\u{2028}WORLD\u{2029}", &.{ 1, 11 });
+    try checkOrderedWordPiece(std.testing.allocator,
+        \\{"type":"BertNormalizer"}
+    , "hello\u{7fd}", &.{100});
+    try checkOrderedWordPiece(std.testing.allocator,
+        \\{"type":"BertNormalizer"}
+    , "hello\u{2b820}", &.{100});
+    // A normalized added token can span multiple pre-tokenizer words.
+    try checkOrderedWordPiece(std.testing.allocator,
+        \\{"type":"Lowercase"}
+    , "HELLO WORLD", &.{50});
+}
+
+fn orderedWordPieceAllocationFailures(a: std.mem.Allocator) !void {
+    try checkOrderedWordPiece(a,
+        \\{"type":"Sequence","normalizers":[{"type":"BertNormalizer"},{"type":"Replace","pattern":{"String":"cafe"},"content":"HELLO"},{"type":"Lowercase"}]}
+    , "Café", &.{1});
+}
+
+test "ordered WordPiece profiles clean up allocation failures and reject partial programs" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, orderedWordPieceAllocationFailures, .{});
+    const json = ordered_wordpiece_model ++
+        \\{"type":"Sequence","normalizers":[{"type":"Lowercase"},{"type":"UnknownNormalizer"}]}}
+    ;
+    try std.testing.expectError(error.UnsupportedTokenizerNormalizer, HfTokenizer.loadFromBytes(std.testing.allocator, json));
+}
+
+test "WordPiece offsets retain source spans through Unicode sequences and replacement" {
+    const a = std.testing.allocator;
+    // IDs checked against tokenizers==0.22.1. Source spans cover complete
+    // consumed units, including combining marks and literal replacements.
+    const cases = [_]struct { normalizer: []const u8, text: []const u8, ids: []const i32, spans: []const [2]u32 }{
+        .{ .normalizer =
+        \\{"type":"Sequence","normalizers":[{"type":"BertNormalizer","lowercase":false},{"type":"Lowercase"}]}
+        , .text = "HELLO", .ids = &.{1}, .spans = &.{.{ 0, 5 }} },
+        .{ .normalizer =
+        \\{"type":"BertNormalizer"}
+        , .text = "Café 世界", .ids = &.{ 5, 8, 9 }, .spans = &.{ .{ 0, 5 }, .{ 6, 9 }, .{ 9, 12 } } },
+        .{ .normalizer =
+        \\{"type":"BertNormalizer"}
+        , .text = "cafe\u{301}", .ids = &.{5}, .spans = &.{.{ 0, 6 }} },
+        .{ .normalizer =
+        \\{"type":"BertNormalizer"}
+        , .text = "世\u{301}", .ids = &.{8}, .spans = &.{.{ 0, 5 }} },
+        .{ .normalizer =
+        \\{"type":"StripAccents"}
+        , .text = "cafe\u{301}", .ids = &.{5}, .spans = &.{.{ 0, 6 }} },
+        .{ .normalizer =
+        \\{"type":"Replace","pattern":{"String":"HELLO"},"content":"worldworld"}
+        , .text = "HELLO", .ids = &.{ 3, 11 }, .spans = &.{ .{ 0, 5 }, .{ 0, 5 } } },
+        .{ .normalizer =
+        \\{"type":"NFC"}
+        , .text = "é", .ids = &.{12}, .spans = &.{.{ 0, 3 }} },
+        .{ .normalizer =
+        \\{"type":"NFD"}
+        , .text = "é", .ids = &.{ 13, 14 }, .spans = &.{ .{ 0, 2 }, .{ 0, 2 } } },
+    };
+    for (cases) |case| {
+        const json = try std.fmt.allocPrint(a, "{s}{s}}}", .{ ordered_wordpiece_model, case.normalizer });
+        defer a.free(json);
+        const tok = try HfTokenizer.loadFromBytes(a, json);
+        defer tok.deinitSelf();
+        var raw = (try tok.encodeWithOffsets(a, case.text)) orelse return error.TestUnexpectedResult;
+        defer raw.deinit(a);
+        try std.testing.expectEqualSlices(i32, case.ids, raw.ids.items);
+        try std.testing.expectEqual(case.spans.len, raw.offsets.items.len);
+        for (case.spans, raw.offsets.items) |expected, actual| try std.testing.expectEqualSlices(u32, &expected, &actual);
+        var model = try tok.tokenizer().encodeForModel(a, case.text, case.ids.len + 2);
+        defer model.deinit();
+        try std.testing.expect(model.offsets != null);
+        for (case.spans, model.offsets.?[1 .. case.ids.len + 1]) |expected, actual| try std.testing.expectEqualSlices(u32, &expected, &actual);
+    }
 }

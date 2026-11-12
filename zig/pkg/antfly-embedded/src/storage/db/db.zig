@@ -99305,16 +99305,19 @@ test "db terminal enrichment markers do not resurrect across rollback recreation
 }
 
 test "db templated dense artifact reuse follows the resolved model revision" {
-    try testDenseRevisionReuse(.write);
-    try testDenseRevisionReuse(.enrichments);
-    try testDenseRevisionReuse(.full_index);
+    for ([_]bool{ false, true }) |parts| {
+        try testDenseRevisionReuse(.write, parts);
+        try testDenseRevisionReuse(.enrichments, parts);
+        try testDenseRevisionReuse(.full_index, parts);
+    }
 }
 
-fn testDenseRevisionReuse(sync_level: types.SyncLevel) !void {
+fn testDenseRevisionReuse(sync_level: types.SyncLevel, with_parts: bool) !void {
     const a = std.testing.allocator;
     const Probe = struct {
         revision: u8 = 1,
         calls: usize = 0,
+        flip_after_capture: bool = false,
         fn equivalent(_: *anyopaque, _: []const u8) bool {
             return true;
         }
@@ -99330,7 +99333,12 @@ fn testDenseRevisionReuse(sync_level: types.SyncLevel) !void {
         }
         fn caps(ptr: *anyopaque, _: Allocator, _: []const u8) !@import("antfly_inference_work").InferenceCapabilities {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(self.revision), .batch = .{ .mode = .native, .max_items = 32 } };
+            const revision = self.revision;
+            if (self.flip_after_capture) {
+                self.flip_after_capture = false;
+                self.revision += 1;
+            }
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(revision), .batch = .{ .mode = .native, .max_items = 32 } };
         }
         fn batch(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8, _: u32) ![]const []const f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -99351,7 +99359,7 @@ fn testDenseRevisionReuse(sync_level: types.SyncLevel) !void {
     var probe = Probe{};
     var directory = try TestDirectory.init("model-revision-reuse");
     defer directory.cleanup();
-    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "revision-test", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_parts_fn = Probe.parts, .text_parts_equivalent_fn = Probe.equivalent, .dense_embed_batch_fn = Probe.batch, .capabilities_fn = Probe.caps } } });
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "revision-test", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.single, .dense_embed_parts_fn = if (with_parts) Probe.parts else null, .text_parts_equivalent_fn = Probe.equivalent, .dense_embed_batch_fn = Probe.batch, .capabilities_fn = Probe.caps } } });
     defer db.close();
     try db.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"passage: {{body}}\",\"embedding_name\":\"model\"}}" });
     for (0..3) |version| {
@@ -99369,6 +99377,110 @@ fn testDenseRevisionReuse(sync_level: types.SyncLevel) !void {
     const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(a, encoded);
     defer a.free(vector);
     try std.testing.expectEqual(@as(f32, 2), vector[0]);
+    if (sync_level != .write) {
+        // Capture the retained generation, then change it before reuse commits.
+        // Both rendered text and content-parts paths must revalidate the lease.
+        probe.flip_after_capture = true;
+        try std.testing.expectError(error.EnrichmentSourceChanged, db.batch(.{
+            .writes = &.{.{ .key = "doc", .value = "{\"body\":\"same passage\",\"version\":3}" }},
+            .sync_level = sync_level,
+        }));
+        try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    }
+}
+
+test "db paper evaluation producer upgrades require explicit reprocess and async writes retain published vectors" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        revision: u8 = 1,
+        fail: bool = false,
+        calls: usize = 0,
+        fn embed(raw: *anyopaque, alloc: Allocator, _: []const u8, text: []const u8, _: u32) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.fail) return error.PermanentPromptFailure;
+            return alloc.dupe(f32, &.{ if (self.revision == 1) 1 else 0, if (self.revision == 2) 1 else 0, if (std.mem.eql(u8, text, "changed")) 2 else 1 });
+        }
+        fn caps(raw: *anyopaque, _: Allocator, _: []const u8) !@import("antfly_inference_work").InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .task = .embed, .input_modalities = .{ .text = true }, .input_granularity = .chunk, .output = .embedding, .model_revision = @splat(self.revision) };
+        }
+        fn config(revision: u8) types.EnrichmentConfig {
+            return .{ .name = "vectors", .kind = .embedding, .field = "body", .expected_dims = 3, .producer_json = if (revision == 1) "{\"version\":1,\"provider\":\"antfly\",\"model\":\"A\",\"dimensions\":3}" else "{\"version\":1,\"provider\":\"antfly\",\"model\":\"B\",\"dimensions\":3}" };
+        }
+        fn check(alloc: Allocator, database: *DB, doc: []const u8, expected: []const f32) !u64 {
+            const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc, "vectors");
+            defer alloc.free(key);
+            const bytes = try database.core.store.get(alloc, key);
+            defer alloc.free(bytes);
+            const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, bytes);
+            defer alloc.free(vector);
+            try std.testing.expectEqualSlices(f32, expected, vector);
+            return (try enrichment_artifact_codec.sourceHash(bytes)).?;
+        }
+        fn reprocess(alloc: Allocator, database: *DB) !void {
+            var cursor: ?[]u8 = null;
+            defer if (cursor) |value| alloc.free(value);
+            var total: usize = 0;
+            for (0..8) |_| {
+                var page = try database.reprocessDocumentArtifactRange(alloc, "vectors", .{ .from_key = cursor orelse "", .resume_from_key = cursor != null, .limit = 1 });
+                defer page.deinit(alloc);
+                try std.testing.expectEqual(@as(usize, 0), page.failed);
+                total += page.reprocessed;
+                try database.runUntilIdle();
+                const next = if (page.next_key) |value| try alloc.dupe(u8, value) else null;
+                if (cursor) |value| alloc.free(value);
+                cursor = next;
+                if (cursor == null) break;
+            } else return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 3), total);
+            const stats = try database.stats(alloc);
+            defer types.freeDBStats(alloc, stats);
+            for (stats.indexes) |index| if (std.mem.eql(u8, index.name, "semantic")) {
+                try std.testing.expect(index.publication_target_ready);
+                try std.testing.expect(index.coverage_summary_ready);
+                return;
+            };
+            return error.TestUnexpectedResult;
+        }
+    };
+    var directory = try TestDirectory.init("paper-evaluation-contracts");
+    defer directory.cleanup();
+    var probe = Probe{};
+    var db = try DB.open(a, directory.path(), .{ .start_optional_runtime_workers = false, .start_index_workers = false, .enrichment = .{ .owner_id = "paper-contract", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.embed, .capabilities_fn = Probe.caps } } });
+    defer db.close();
+    try db.addEnrichment(Probe.config(1));
+    try db.addIndex(.{ .name = "semantic", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"sources\":[{\"artifact\":\"vectors\"}],\"publication_policy\":\"atomic\"}" });
+    try db.batch(.{ .writes = &.{ .{ .key = "doc:a", .value = "{\"body\":\"original\"}" }, .{ .key = "doc:b", .value = "{\"body\":\"original\"}" }, .{ .key = "doc:c", .value = "{\"body\":\"original\"}" } }, .sync_level = .full_index });
+    const first_a_hash = try Probe.check(a, &db, "doc:a", &.{ 1, 0, 1 });
+    probe.revision = 2;
+    _ = try db.upsertEnrichment(Probe.config(2));
+    try db.runUntilIdle();
+    // Definition replacement alone is not an atomic table-wide space migration.
+    _ = try Probe.check(a, &db, "doc:a", &.{ 1, 0, 1 });
+    _ = try Probe.check(a, &db, "doc:b", &.{ 1, 0, 1 });
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"original\",\"metadata\":1}" }}, .sync_level = .full_index });
+    _ = try Probe.check(a, &db, "doc:a", &.{ 0, 1, 1 });
+    _ = try Probe.check(a, &db, "doc:b", &.{ 1, 0, 1 });
+    try Probe.reprocess(a, &db);
+    for ([_][]const u8{ "doc:a", "doc:b", "doc:c" }) |key| _ = try Probe.check(a, &db, key, &.{ 0, 1, 1 });
+    probe.revision = 1;
+    _ = try db.upsertEnrichment(Probe.config(1));
+    try Probe.reprocess(a, &db);
+    const new_a_hash = try Probe.check(a, &db, "doc:a", &.{ 1, 0, 1 });
+    try std.testing.expect(first_a_hash != new_a_hash);
+    // An acknowledged async source write can still expose the prior vector.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"changed\"}" }}, .sync_level = .write });
+    _ = try Probe.check(a, &db, "doc:a", &.{ 1, 0, 1 });
+    try db.runUntilIdle();
+    _ = try Probe.check(a, &db, "doc:a", &.{ 1, 0, 2 });
+    // Model-gated writes must fail before publishing the new primary source.
+    probe.fail = true;
+    try std.testing.expectError(error.PermanentPromptFailure, db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"rejected\"}" }}, .sync_level = .enrichments }));
+    const source = (try db.get(a, "doc:a")) orelse return error.TestUnexpectedResult;
+    defer a.free(source);
+    try std.testing.expectEqualStrings("{\"body\":\"changed\"}", source);
+    _ = try Probe.check(a, &db, "doc:a", &.{ 1, 0, 2 });
 }
 
 test "db templated dense backfill batches rendered text and preserves media" {

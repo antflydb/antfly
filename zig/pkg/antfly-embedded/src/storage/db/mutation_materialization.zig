@@ -6291,6 +6291,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         defer alloc.free(retained_key);
                         if (try storedOrPendingEmbeddingSourceHashImpl(db, shared_pending_writes, retained_key, request.expected_dims)) |existing_hash| {
                             if (existing_hash == source_hash) {
+                                try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
                                 try appendForConsumers(alloc, dense_embeddings, request.doc_key, null, retained_key, &.{}, consumer_indexes);
                                 return;
                             }
@@ -6340,6 +6341,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const source_hash = enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source_text.?, generation.revision);
                 if (try storedOrPendingEmbeddingSourceHashImpl(db, shared_pending_writes, artifact_key, request.expected_dims)) |existing_hash| {
                     if (existing_hash == source_hash) {
+                        try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
                         try appendForConsumers(alloc, dense_embeddings, request.doc_key, null, artifact_key, &.{}, consumer_indexes);
                         return;
                     }
