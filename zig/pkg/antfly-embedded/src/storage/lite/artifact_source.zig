@@ -284,6 +284,16 @@ pub const Registry = struct {
         self.mutex.lockUncancelable(runtime);
         defer self.mutex.unlock(runtime);
         const guard = self.publication_guard orelse return error.ReadOnly;
+        // §8.7 row 4 does not reach `publication_guard` either: its
+        // exclusive hold only serializes "a new artifact-lease marker
+        // becomes visible in this directory" against `MarkerSweep.run`'s
+        // own concurrent reap of crash-leftover markers (both in this
+        // same process, via `self.mutex` above, and across processes, via
+        // this kernel lock) -- a directory-visibility race between two
+        // *artifact-lease* bookkeeping operations, unrelated to Lite
+        // reader-vs-writer page consistency (which the shared lock region
+        // answers through `NativeFile.acquireReaderFence`, not this
+        // guard). Stays a kernel lock.
         try guard.lock(runtime, .exclusive);
         defer guard.unlock(runtime);
         return std.Io.Dir.cwd().createFile(runtime, path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true, .permissions = .fromMode(0o600) });
@@ -703,6 +713,10 @@ pub const MarkerSweep = struct {
         // A new marker is visible before createFile has acquired its lock.
         // Coordinate that window with every sweeper in the directory, even
         // when another Store or process owns the marker's artifact root.
+        // Stays a kernel lock, not a region pin -- see `createMarker`'s
+        // own comment on this same `publication_guard`: this is
+        // artifact-lease directory-visibility serialization, unrelated to
+        // §8.7's reader-vs-writer migration.
         try guard.lock(runtime, .exclusive);
         defer guard.unlock(runtime);
         if (self.iterator == null) {
