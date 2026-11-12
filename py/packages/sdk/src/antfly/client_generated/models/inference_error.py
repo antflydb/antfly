@@ -21,6 +21,9 @@ class InferenceError:
         reason (InferenceErrorReason | Unset): Machine-readable capacity source when the failure is retryable
         retryable (bool | Unset): Whether retrying the request may succeed
         retry_after_ms (int | Unset): Minimum retry delay in milliseconds
+        budget (str | Unset): Blocking inference budget (host, backend, combined, scratch, or kv), when known
+        required_bytes (int | Unset): Required working-set bytes, including resident resources, for the blocking budget
+        limit_bytes (int | Unset): Configured bytes allowed by the blocking budget
         input_index (int | Unset): Input whose atomic extraction validation or decoding failed, when known
         stage (str | Unset): Extraction failure stage, when known
     """
@@ -30,6 +33,9 @@ class InferenceError:
     reason: InferenceErrorReason | Unset = UNSET
     retryable: bool | Unset = UNSET
     retry_after_ms: int | Unset = UNSET
+    budget: str | Unset = UNSET
+    required_bytes: int | Unset = UNSET
+    limit_bytes: int | Unset = UNSET
     input_index: int | Unset = UNSET
     stage: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -46,6 +52,12 @@ class InferenceError:
         retryable = self.retryable
 
         retry_after_ms = self.retry_after_ms
+
+        budget = self.budget
+
+        required_bytes = self.required_bytes
+
+        limit_bytes = self.limit_bytes
 
         input_index = self.input_index
 
@@ -66,6 +78,12 @@ class InferenceError:
             field_dict["retryable"] = retryable
         if retry_after_ms is not UNSET:
             field_dict["retry_after_ms"] = retry_after_ms
+        if budget is not UNSET:
+            field_dict["budget"] = budget
+        if required_bytes is not UNSET:
+            field_dict["required_bytes"] = required_bytes
+        if limit_bytes is not UNSET:
+            field_dict["limit_bytes"] = limit_bytes
         if input_index is not UNSET:
             field_dict["input_index"] = input_index
         if stage is not UNSET:
@@ -91,6 +109,12 @@ class InferenceError:
 
         retry_after_ms = d.pop("retry_after_ms", UNSET)
 
+        budget = d.pop("budget", UNSET)
+
+        required_bytes = d.pop("required_bytes", UNSET)
+
+        limit_bytes = d.pop("limit_bytes", UNSET)
+
         input_index = d.pop("input_index", UNSET)
 
         stage = d.pop("stage", UNSET)
@@ -101,6 +125,9 @@ class InferenceError:
             reason=reason,
             retryable=retryable,
             retry_after_ms=retry_after_ms,
+            budget=budget,
+            required_bytes=required_bytes,
+            limit_bytes=limit_bytes,
             input_index=input_index,
             stage=stage,
         )

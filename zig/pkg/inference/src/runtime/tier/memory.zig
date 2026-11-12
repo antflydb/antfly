@@ -793,6 +793,28 @@ pub const AdmissionFailure = struct {
     mutex: std.atomic.Mutex = .unlocked,
     value: ?AdmissionAmounts.LimitExceeded = null,
 
+    /// Retry boundaries redirect attempts here. Success discards speculative
+    /// failures; only the operation's terminal error updates its parent sink.
+    /// Do not move a capture after borrowing sink().
+    pub const Capture = struct {
+        parent: ?*AdmissionFailure,
+        failure: AdmissionFailure = .{},
+
+        pub fn init(parent: ?*AdmissionFailure) Capture {
+            return .{ .parent = parent };
+        }
+
+        pub fn sink(self: *Capture) ?*AdmissionFailure {
+            return if (self.parent != null) &self.failure else null;
+        }
+
+        pub fn publish(self: *Capture, err: anyerror) void {
+            if (err == error.ResourceLimitExceeded) if (self.parent) |parent| {
+                parent.record(self.failure.snapshot());
+            };
+        }
+    };
+
     pub fn record(self: *AdmissionFailure, value: ?AdmissionAmounts.LimitExceeded) void {
         spinLockAdmission(&self.mutex);
         defer self.mutex.unlock();
@@ -817,6 +839,13 @@ pub const AdmissionRequest = struct {
     limit_exceeded: ?*?AdmissionAmounts.LimitExceeded = null,
     failure: ?*AdmissionFailure = null,
 };
+
+fn publishAdmissionFailure(requests: []const AdmissionRequest, err: anyerror, failure: ?AdmissionAmounts.LimitExceeded) void {
+    if (err != error.ResourceLimitExceeded) return;
+    for (requests) |request| {
+        if (request.failure) |sink| sink.record(failure);
+    }
+}
 
 // Shared by reservation and cumulative request validation, so neither path
 // can omit required residency or confuse an impossible plan with contention.
@@ -844,14 +873,14 @@ const AdmissionPlan = struct {
         return plan;
     }
 
-    fn validateDomains(self: *const AdmissionPlan, requests: []const AdmissionRequest) !void {
+    fn validateDomains(self: *const AdmissionPlan, requests: []const AdmissionRequest, failure: *?AdmissionAmounts.LimitExceeded) !void {
         for (0..backend_class_count) |index| {
             if (!self.active_backends[index]) continue;
             if (self.required.by_backend[index].firstLimitExceeded(self.limits_by_backend[index]) catch return error.ResourceLimitExceeded) |exceeded| {
+                failure.* = exceeded;
                 for (requests) |request| {
                     if (backendClassIndex(request.backend_class) == index) {
                         if (request.limit_exceeded) |out| out.* = exceeded;
-                        if (request.failure) |failure| failure.record(exceeded);
                     }
                 }
                 return error.ResourceLimitExceeded;
@@ -859,7 +888,7 @@ const AdmissionPlan = struct {
         }
     }
 
-    fn validateShared(self: *const AdmissionPlan, requests: []const AdmissionRequest, shared: SharedAdmissionLimits) !void {
+    fn validateShared(self: *const AdmissionPlan, requests: []const AdmissionRequest, shared: SharedAdmissionLimits, failure: *?AdmissionAmounts.LimitExceeded) !void {
         const required = self.required.total() catch return error.ResourceLimitExceeded;
         if (required.firstLimitExceeded(.{
             .host_limit_bytes = shared.host_limit_bytes,
@@ -867,9 +896,9 @@ const AdmissionPlan = struct {
             .kv_limit_bytes = shared.kv_limit_bytes,
             .scratch_limit_bytes = shared.scratch_limit_bytes,
         }) catch return error.ResourceLimitExceeded) |exceeded| {
+            failure.* = exceeded;
             for (requests) |request| {
                 if (request.limit_exceeded) |out| out.* = exceeded;
-                if (request.failure) |failure| failure.record(exceeded);
             }
             return error.ResourceLimitExceeded;
         }
@@ -1223,9 +1252,17 @@ pub const AdmissionController = struct {
     /// Check an operation's entire owned working set without charging it again.
     /// No live-memory probe or occupancy check belongs in intrinsic feasibility.
     pub fn validateRequests(self: *AdmissionController, requests: []const AdmissionRequest) !void {
+        var failure: ?AdmissionAmounts.LimitExceeded = null;
+        return self.validateRequestPlan(requests, &failure) catch |err| {
+            publishAdmissionFailure(requests, err, failure);
+            return err;
+        };
+    }
+
+    fn validateRequestPlan(self: *AdmissionController, requests: []const AdmissionRequest, failure: *?AdmissionAmounts.LimitExceeded) !void {
         const plan = try AdmissionPlan.init(requests);
-        try plan.validateDomains(requests);
-        try plan.validateShared(requests, self.sharedLimitsSnapshot());
+        try plan.validateDomains(requests, failure);
+        try plan.validateShared(requests, self.sharedLimitsSnapshot(), failure);
     }
 
     pub fn tryAcquireRequestsWithPressure(
@@ -1234,9 +1271,23 @@ pub const AdmissionController = struct {
         check_live_memory: bool,
         pressure: *?AdmissionPressure,
     ) !AdmissionLease {
+        var failure: ?AdmissionAmounts.LimitExceeded = null;
+        return self.acquireRequestPlan(requests, check_live_memory, pressure, &failure) catch |err| {
+            publishAdmissionFailure(requests, err, failure);
+            return err;
+        };
+    }
+
+    fn acquireRequestPlan(
+        self: *AdmissionController,
+        requests: []const AdmissionRequest,
+        check_live_memory: bool,
+        pressure: *?AdmissionPressure,
+        failure: *?AdmissionAmounts.LimitExceeded,
+    ) !AdmissionLease {
         pressure.* = null;
         const plan = try AdmissionPlan.init(requests);
-        try plan.validateDomains(requests);
+        try plan.validateDomains(requests, failure);
         const amounts_by_backend = plan.amounts_by_backend;
         const limits_by_backend = plan.limits_by_backend;
         const active_backends = plan.active_backends;
@@ -1259,7 +1310,7 @@ pub const AdmissionController = struct {
 
             // Shared limits can tighten concurrently; inspect them only under
             // the accounting lock, before testing aggregate occupancy.
-            try plan.validateShared(requests, self.shared_limits);
+            try plan.validateShared(requests, self.shared_limits, failure);
 
             const next = addAdmissionAmounts(self.admitted, amounts) orelse
                 return error.ResourceLimitExceeded;

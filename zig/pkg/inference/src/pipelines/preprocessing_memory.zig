@@ -53,7 +53,6 @@ fn reserveBudget(budget: *memory.RunBudget, bytes: usize) !void {
 
 pub const Scope = struct {
     owner: AdmittedAllocator,
-    session: ?sessions.Session,
     budget: ?*memory.RunBudget,
     borrowed_budget_bytes: usize,
     budget_bytes: usize = 0,
@@ -61,7 +60,7 @@ pub const Scope = struct {
     started: bool = false,
 
     pub fn init(backing: std.mem.Allocator, session: ?sessions.Session, credit: Credit, budget: ?*memory.RunBudget) @This() {
-        return .{ .owner = .{ .backing = backing, .prepaid_host_bytes = credit.process_bytes }, .session = session, .budget = budget, .borrowed_budget_bytes = credit.budget_bytes };
+        return .{ .owner = .{ .backing = backing, .session = session, .prepaid_host_bytes = credit.process_bytes }, .budget = budget, .borrowed_budget_bytes = credit.budget_bytes };
     }
 
     pub fn allocator(self: *@This()) !std.mem.Allocator {
@@ -84,7 +83,7 @@ pub const Scope = struct {
         const budget_growth = required_budget -| self.budget_bytes;
         if (self.budget) |budget| try reserveBudget(budget, budget_growth);
         errdefer if (self.budget) |budget| budget.release(.{ .kind = .scratch, .tier = .host, .bytes = budget_growth });
-        const lease = if (self.session) |session| (try session.admitHostPreprocessOwned(amount, owned)).lease else null;
+        const lease = if (self.owner.session) |session| (try session.admitHostPreprocessOwned(amount, owned)).lease else null;
         // Offline callers may have only a local run budget and no session.
         // A local lease gives those reservations the same owned cleanup path.
         const result = lease orelse try self.local_controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = amount }, false);
@@ -454,4 +453,25 @@ test "preprocessing admission growth refunds both budgets after a resident worki
     try scope.trim();
     try std.testing.expectEqualDeep(weights.amounts, controller.snapshot());
     try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+}
+
+test "preprocessing admission discards recovered proposals without losing terminal diagnostics" {
+    var controller = memory.AdmissionController{};
+    const limits = memory.Limits{ .host_limit_bytes = 100 * 1024 };
+    var weights = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 90 * 1024 }, false);
+    defer weights.release();
+    var failure = memory.AdmissionFailure{};
+    const session = sessions.Session{ .ptr = &controller, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = limits, .static_workspace_bytes = 0, .required_residency = weights.amounts, .failure = &failure, .check_live_memory = false } };
+    var scope = Scope.init(std.testing.allocator, session, .{}, null);
+    defer scope.deinit();
+    const a = try scope.allocator();
+    const first = try a.alloc(u8, 512);
+    try std.testing.expect(failure.snapshot() == null);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 20 * 1024));
+    try std.testing.expectEqual(error.ResourceLimitExceeded, scope.failure(error.OutOfMemory));
+    try std.testing.expect(failure.snapshot().?.requested_bytes > limits.host_limit_bytes);
+    try std.testing.expectEqual(limits.host_limit_bytes, failure.snapshot().?.limit_bytes);
+    a.free(first);
+    try scope.trim();
+    try std.testing.expectEqualDeep(weights.amounts, controller.snapshot());
 }

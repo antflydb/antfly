@@ -15530,9 +15530,17 @@ paths:
 
         writing fails after the HTTP response starts, the server instead emits
 
-        an `event: error` frame whose data is a plain-text error message, then
+        an `event: error` frame and closes without a `[DONE]` frame. Permanent
 
-        closes the stream without a `[DONE]` frame.
+        inference-budget failures carry a JSON `Error` object with
+
+        `error: MODEL_RESOURCE_LIMIT`, `retryable: false`, and, when known,
+
+        `budget`, `required_bytes`, and `limit_bytes`. The HTTP status remains
+
+        unchanged once streaming starts. Clients must also accept plain-text
+
+        error frames from older servers and other failure paths.
 
 
         ## Input Format
@@ -54990,6 +54998,21 @@ components:
           type: integer
           minimum: 0
           description: Minimum retry delay in milliseconds
+        budget:
+          type: string
+          description: Blocking inference budget (host, backend, combined, scratch, or kv), when known
+        required_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Required working-set bytes, including resident resources, for the blocking budget
+        limit_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Configured bytes allowed by the blocking budget
         input_index:
           type: integer
           minimum: 0

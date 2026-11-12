@@ -58,7 +58,11 @@ type InferenceAPIError struct {
 	// InputIndex and Stage identify an atomic extraction validation failure.
 	InputIndex *int
 	Stage      string
-	prefix     string
+	// Budget details are present when the server identifies a blocking limit.
+	Budget        string
+	RequiredBytes *int64
+	LimitBytes    *int64
+	prefix        string
 }
 
 func (e *InferenceAPIError) Error() string {
@@ -70,13 +74,16 @@ func (e *InferenceAPIError) Error() string {
 
 func newInferenceAPIError(statusCode int, prefix string, payload *oapi.InferenceError) *InferenceAPIError {
 	return &InferenceAPIError{
-		StatusCode: statusCode,
-		Code:       payload.Error,
-		Message:    inferenceErrorDetail(payload),
-		Retryable:  payload.Retryable,
-		InputIndex: payload.InputIndex,
-		Stage:      payload.Stage,
-		prefix:     prefix,
+		StatusCode:    statusCode,
+		Code:          payload.Error,
+		Message:       inferenceErrorDetail(payload),
+		Retryable:     payload.Retryable,
+		InputIndex:    payload.InputIndex,
+		Stage:         payload.Stage,
+		Budget:        payload.Budget,
+		RequiredBytes: payload.RequiredBytes,
+		LimitBytes:    payload.LimitBytes,
+		prefix:        prefix,
 	}
 }
 
@@ -175,6 +182,10 @@ func (c *InferenceClient) GenerateStream(
 	done := false
 	err = scanSSE(resp.Body, func(event, data string) (bool, error) {
 		if event == "error" {
+			var payload oapi.InferenceError
+			if json.Unmarshal([]byte(data), &payload) == nil && (payload.Error != "" || payload.Message != "") {
+				return false, newInferenceAPIError(resp.StatusCode, "generation stream failed", &payload)
+			}
 			return false, fmt.Errorf("generation stream failed: %s", data)
 		}
 		if strings.TrimSpace(data) == "[DONE]" {

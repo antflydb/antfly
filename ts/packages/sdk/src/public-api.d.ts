@@ -5288,8 +5288,12 @@ export interface paths {
          *     token deltas. Each event contains a `ChatCompletionChunk` object.
          *     A successful stream ends with `data: [DONE]`. If generation or stream
          *     writing fails after the HTTP response starts, the server instead emits
-         *     an `event: error` frame whose data is a plain-text error message, then
-         *     closes the stream without a `[DONE]` frame.
+         *     an `event: error` frame and closes without a `[DONE]` frame. Permanent
+         *     inference-budget failures carry a JSON `Error` object with
+         *     `error: MODEL_RESOURCE_LIMIT`, `retryable: false`, and, when known,
+         *     `budget`, `required_bytes`, and `limit_bytes`. The HTTP status remains
+         *     unchanged once streaming starts. Clients must also accept plain-text
+         *     error frames from older servers and other failure paths.
          *
          *     ## Input Format
          *
@@ -24313,6 +24317,18 @@ export interface components {
             retryable?: boolean;
             /** @description Minimum retry delay in milliseconds */
             retry_after_ms?: number;
+            /** @description Blocking inference budget (host, backend, combined, scratch, or kv), when known */
+            budget?: string;
+            /**
+             * Format: int64
+             * @description Required working-set bytes, including resident resources, for the blocking budget
+             */
+            required_bytes?: number;
+            /**
+             * Format: int64
+             * @description Configured bytes allowed by the blocking budget
+             */
+            limit_bytes?: number;
             /** @description Input whose atomic extraction validation or decoding failed, when known */
             input_index?: number;
             /** @description Extraction failure stage, when known */

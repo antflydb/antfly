@@ -32104,6 +32104,12 @@ pub const InferenceError = struct {
     retryable: ?bool = null,
     /// Minimum retry delay in milliseconds
     retry_after_ms: ?i64 = null,
+    /// Blocking inference budget (host, backend, combined, scratch, or kv), when known
+    budget: ?[]const u8 = null,
+    /// Required working-set bytes, including resident resources, for the blocking budget
+    required_bytes: ?i64 = null,
+    /// Configured bytes allowed by the blocking budget
+    limit_bytes: ?i64 = null,
     /// Input whose atomic extraction validation or decoding failed, when known
     input_index: ?i64 = null,
     /// Extraction failure stage, when known
@@ -32116,6 +32122,9 @@ pub const InferenceError = struct {
         .{ "reason", "reason", true },
         .{ "retryable", "retryable", true },
         .{ "retry_after_ms", "retry_after_ms", true },
+        .{ "budget", "budget", true },
+        .{ "required_bytes", "required_bytes", true },
+        .{ "limit_bytes", "limit_bytes", true },
         .{ "input_index", "input_index", true },
         .{ "stage", "stage", true },
     };
@@ -32146,6 +32155,18 @@ pub const InferenceError = struct {
         }
         if (self.retry_after_ms) |value| {
             try jw.objectField("retry_after_ms");
+            try jw.write(value);
+        }
+        if (self.budget) |value| {
+            try jw.objectField("budget");
+            try jw.write(value);
+        }
+        if (self.required_bytes) |value| {
+            try jw.objectField("required_bytes");
+            try jw.write(value);
+        }
+        if (self.limit_bytes) |value| {
+            try jw.objectField("limit_bytes");
             try jw.write(value);
         }
         if (self.input_index) |value| {

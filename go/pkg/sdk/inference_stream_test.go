@@ -181,3 +181,40 @@ func TestInferenceClientGenerateStreamHonorsContextCancellation(t *testing.T) {
 	})
 	assert.ErrorIs(t, err, context.Canceled)
 }
+
+func TestInferenceClientGenerateStreamPreservesPermanentBudgetDetails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: error\ndata: {\"error\":\"MODEL_RESOURCE_LIMIT\",\"message\":\"working set exceeds host budget\",\"retryable\":false,\"budget\":\"host\",\"required_bytes\":110,\"limit_bytes\":100}\n\n")
+	}))
+	defer server.Close()
+	client, err := NewInferenceClient(server.URL, server.Client())
+	require.NoError(t, err)
+	err = client.GenerateStream(context.Background(), oapi.InferenceGenerateRequest{Model: "test"}, func(oapi.InferenceGenerateChunk) error {
+		t.Fatal("error event must not yield a chunk")
+		return nil
+	})
+	var failure *InferenceAPIError
+	require.ErrorAs(t, err, &failure)
+	assert.Equal(t, http.StatusOK, failure.StatusCode)
+	assert.Equal(t, "MODEL_RESOURCE_LIMIT", failure.Code)
+	require.NotNil(t, failure.Retryable)
+	assert.False(t, *failure.Retryable)
+	assert.Equal(t, "host", failure.Budget)
+	require.NotNil(t, failure.RequiredBytes)
+	require.NotNil(t, failure.LimitBytes)
+	assert.Equal(t, int64(110), *failure.RequiredBytes)
+	assert.Equal(t, int64(100), *failure.LimitBytes)
+}
+
+func TestInferenceClientGenerateStreamAcceptsLegacyError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: error\ndata: legacy failure\n\n")
+	}))
+	defer server.Close()
+	client, err := NewInferenceClient(server.URL, server.Client())
+	require.NoError(t, err)
+	err = client.GenerateStream(context.Background(), oapi.InferenceGenerateRequest{Model: "test"}, func(oapi.InferenceGenerateChunk) error { return nil })
+	require.EqualError(t, err, "generation stream failed: legacy failure")
+}
