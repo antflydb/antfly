@@ -1467,30 +1467,26 @@ pub const CreateOptions = struct {
     /// See `OpenOptions.ride_along_idle_ns`.
     ride_along_idle_ns: ?u64 = null,
     /// docs/design/lite-performance/lite-single-commit-write-path.md §9,
-    /// point 3. `null` (the current default) is the legacy copy-on-write
-    /// commit path. `true` opts a new file into redo-log; it combines with
-    /// `reclamation.page_reuse` (indexed reclamation) without restriction
-    /// -- per-commit page allocation, retirement, and reclamation defer to
-    /// `checkpointRedoLog`'s own batched transaction in that case, rather
-    /// than running on every foreground commit. `false` is the same as
-    /// the default, spelled out.
+    /// point 3. `null` (the current default) opts a new file into
+    /// redo-log; `false` explicitly asks for the legacy copy-on-write
+    /// commit path instead. `true` is the same as the default, spelled
+    /// out. Combines with `reclamation.page_reuse` (indexed reclamation)
+    /// without restriction -- per-commit page allocation, retirement, and
+    /// reclamation defer to `checkpointRedoLog`'s own batched transaction
+    /// in that case, rather than running on every foreground commit.
     ///
-    /// Not yet flipped to default-on for every new file, despite that
-    /// being point 3's original ask: doing so surfaced 13 failures across
-    /// `storage.lite.docstore.test`'s reclamation/replay/maintenance
-    /// suites alone (reclamation's page-growth-based assessment heuristics,
-    /// vacuum/replay-cleanup's assumption that a commit's pages are already
-    /// physically written by the time retirement/replay code looks at
-    /// them, allocation-failure-injection tests whose expected failure
-    /// point shifts along with the allocation pattern) -- none audited or
-    /// adapted for a commit that defers its physical build to the next
-    /// checkpoint. Flipping the default before that audit risks shipping
-    /// exactly the kind of regression this design's own review process
-    /// already caught once (the logical-mutation rewrite, the overlay/scan
-    /// merge-join, and the two `fetchPut`-vs-`getOrPut` memory-corruption
-    /// fixes this same pass also found). Opt-in via `true` is fully
-    /// supported and gated by the same crash-sim/native coverage as the
-    /// legacy path; only the *default* is being held back.
+    /// Flipped to default-on (§9.6c): the original 13-failure audit
+    /// turned out to be two real bugs, both now fixed, not 13 unaudited
+    /// assumptions -- (1) the log-full/OutcomeUnknown cluster
+    /// (`RedoCommitState.pendingRecordLen`'s preemptive check, and the
+    /// page-shaped fallback for a bare commit's own diverted pages,
+    /// which the logical-only `checkpointRedoLog` fold never touched);
+    /// (2) `ReadGeneration`'s independent, never-refreshed overlay copy
+    /// (fixed by `redo_overlay.zig`'s per-inode sharing). One failure
+    /// (the budget test's `error.InvalidNativeFreeMap`) remains open,
+    /// owned by the free-map/allocator-under-redo work rather than this
+    /// option itself. Legacy (`false`) stays fully supported and tested,
+    /// same crash-sim/native coverage as before.
     use_redo_log: ?bool = null,
 };
 
@@ -1914,16 +1910,17 @@ pub const Store = struct {
             .writer_lock_marker = opts.writer_lock_marker,
             .indexed_reclamation = opts.reclamation.page_reuse,
         };
-        // Point 3: redo-log is opt-in for now (see `CreateOptions.use_redo_log`'s
-        // doc comment for why the default stays legacy copy-on-write).
-        // Redo-log commit and indexed page reclamation are no longer
-        // mutually exclusive (§9, redo+indexed_reclamation work): a
-        // caller may set both `use_redo_log = true` and
+        // Point 3: redo-log is the default for a new file now (see
+        // `CreateOptions.use_redo_log`'s own doc comment, §9.6c, for why
+        // the earlier 13-failure audit held this back and what actually
+        // needed fixing). Redo-log commit and indexed page reclamation
+        // are no longer mutually exclusive (§9, redo+indexed_reclamation
+        // work): a caller may have both this and
         // `reclamation.page_reuse = true` together -- per-commit page
         // allocation, retirement, and indexed reclamation defer to
         // `checkpointRedoLog`'s own batched transaction instead of
         // running on every foreground commit (`NativeFile.transactionWrites`).
-        const use_redo_log = opts.use_redo_log orelse false;
+        const use_redo_log = opts.use_redo_log orelse true;
         // §9.7a: `default_redo_log_capacity_bytes` (8 MiB) is reserved
         // eagerly, in full, the moment the file is created -- it is real
         // physical file size from byte zero, not amortized content. A
