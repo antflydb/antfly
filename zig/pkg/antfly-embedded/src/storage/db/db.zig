@@ -63174,6 +63174,17 @@ fn denseTargetCountFromCoverage(
         else
             false;
         if (requires_artifact_coverage) {
+            // A fresh, untouched artifact-backed generation's target counter
+            // is trivially zero before any producer has attempted even its
+            // first document -- indistinguishable, by count alone, from a
+            // genuinely empty range. Apply the same range-local cardinality
+            // check the non-artifact-coverage branch below uses, so a gated
+            // or blocked embedder's never-attempted source material defers
+            // (returns null, "not yet determined") instead of vacuously
+            // matching a zero active count and fast-forwarding past it.
+            if (coverage_counts.source_total) |source_count| {
+                if (source_count != 0) return null;
+            }
             return try coverage_counts.artifactCount();
         }
         // A fresh generation on an empty table has no outcome rows to create
@@ -146867,7 +146878,12 @@ test "lite bounded reader integration publishes full text mappings through db" {
         defer result.deinit();
         try std.testing.expectEqual(@as(u32, 1), result.total_hits);
         const entry = db.core.index_manager.textIndexEntry("text").?;
-        try std.testing.expect(entry.persistent.supportsFileBackedSegmentArtifacts());
+        // `.native_catalog` publishes segments inline through the catalog
+        // sink, not through a file-backed SegmentFileStore or the artifact
+        // leases that come with one -- so it never supports file-backed
+        // segment artifacts. It still needs a bounded, real scratch
+        // directory for large-payload typed staging, asserted below.
+        try std.testing.expect(!entry.persistent.supportsFileBackedSegmentArtifacts());
         const scratch_directory = entry.persistent.privateScratchDirectory("virtual fallback").?;
         try std.testing.expectEqualStrings(std.fs.path.dirname(path).?, scratch_directory);
         // Force native typed staging through the production kernel builder.
@@ -146880,7 +146896,13 @@ test "lite bounded reader integration publishes full text mappings through db" {
         });
         const snapshot = entry.persistent.acquireSnapshot();
         defer snapshot.release();
-        for (snapshot.segments) |segment| try std.testing.expect(segment.data == .native);
+        // `.native_catalog` segments publish as owned heap buffers inline
+        // through the catalog sink (see `indexSegmentOwned`'s
+        // `segment_files == null` branch) -- `SegmentData.native` names a
+        // different, file-backed representation entirely (built from a
+        // finished atomic-write source; see `fromNative`/`finishSource` in
+        // `indexSegmentFromSinkBuilder`), so it never applies here.
+        for (snapshot.segments) |segment| try std.testing.expect(segment.data == .heap);
         try std.testing.expectEqual(@as(u64, 0), (try handle.native_docstore.?.reclamationStatus()).artifact_file_bytes);
     }
     try std.testing.expectEqual(@as(u64, 0), (try handle.native_docstore.?.reclamationStatus()).artifact_file_bytes);

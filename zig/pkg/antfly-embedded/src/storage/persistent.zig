@@ -132,6 +132,12 @@ pub const PersistentIndexOptions = struct {
     /// Required when `main_backend == .native_catalog`. See
     /// `native_catalog_backend.Sink`.
     main_native_catalog_sink: ?NativeCatalogSink = null,
+    /// A real host directory for bounded staging spill when this index has
+    /// no `SegmentFileStore` (always true for `.native_catalog`, which
+    /// publishes segments inline through the catalog sink instead of
+    /// file-backed artifacts). Borrowed: the caller (Lite's `Handle`) must
+    /// outlive this index. See `privateScratchDirectory`.
+    scratch_dir: ?[]const u8 = null,
 
     pub fn resolvedWalBackend(self: PersistentIndexOptions) wal_mod.StorageBackend {
         return self.wal_backend orelse switch (self.main_backend) {
@@ -1117,6 +1123,9 @@ pub const PersistentIndex = struct {
     main_store: backend_erased.NamespaceStore,
     main_store_owner: MainStoreOwner,
     segment_files: ?SegmentFileStore,
+    /// Set only when `segment_files == null` (the `.native_catalog` case).
+    /// See `PersistentIndexOptions.scratch_dir` and `privateScratchDirectory`.
+    scratch_dir: ?[]const u8 = null,
     retired_segment_file_deleter: ?*RetiredSegmentFileDeleter = null,
     retirement_reconcile_pending: bool = false,
     active_rebuild_page: ?*RebuildPage = null,
@@ -1211,7 +1220,7 @@ pub const PersistentIndex = struct {
 
     pub fn privateScratchDirectory(self: *const PersistentIndex, fallback: []const u8) ?[]const u8 {
         if (self.segment_files) |store| return store.storage.privateScratchDirectory(fallback);
-        return fallback;
+        return self.scratch_dir orelse fallback;
     }
 
     pub fn supportsFileBackedSegmentArtifacts(self: *const PersistentIndex) bool {
@@ -1774,6 +1783,7 @@ pub const PersistentIndex = struct {
             .main_store = opened_main.store,
             .main_store_owner = opened_main.owner,
             .segment_files = segment_files,
+            .scratch_dir = if (segment_files == null) opts.scratch_dir else null,
             .wal = wal,
             .committed_lsn = committed_lsn,
             .main_backend = opts.main_backend,
