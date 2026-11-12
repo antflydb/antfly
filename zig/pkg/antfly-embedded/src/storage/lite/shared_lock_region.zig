@@ -62,7 +62,18 @@ const magic: [8]u8 = "AFLLOCK1".*;
 // enables. A v1 region is simply rebuilt (the file is a disposable
 // locking aid, not a migrated artifact), same as any other
 // magic/version mismatch.
-const format_version: u32 = 2;
+// v3 (this bump): §9.3b's cross-process WAL index adds four live,
+// mutable fields after `writer_release_epoch` -- `log_checkpoint_sequence`,
+// `log_durable_sequence`, `log_durable_offset` (all `Value(u64)`) and
+// `log_generation` (`Value(u32)`, a seqlock word guarding the first three
+// as one consistent triple) -- growing `header_bytes` from 64 to 96. None
+// of this is covered by `header_checksum` (see that function's own
+// comment: only offsets 16..32 are), so the bump exists solely to make
+// room, not because anything checksum-relevant changed. A v2 region is
+// rebuilt on open the same way a v1 region was when v2 landed (see the
+// comment above this constant's previous value) -- same
+// magic/version-mismatch policy as always, not a migrated format.
+const format_version: u32 = 3;
 
 /// Fixed size of the header itself. The header's own `region_bytes` and
 /// `max_readers` fields (not this constant) are the source of truth for
@@ -70,7 +81,7 @@ const format_version: u32 = 2;
 /// header -- but `max_readers` itself is fixed forever at a region's
 /// first creation; see `max_readers`'s own doc comment for why this
 /// module deliberately does not support growing it later.
-const header_bytes = 64;
+const header_bytes = 96;
 
 /// `Header` is the first `header_bytes` of the region, native-endian (the
 /// region is only ever read by the same machine that wrote it -- unlike
@@ -137,7 +148,7 @@ const Header = extern struct {
     /// `reader_slot_released`, already proven correct for exactly this
     /// "wait for the next release, not a specific value" pattern.
     writer_release_epoch: std.atomic.Value(u32),
-    /// Sized so the named fields above sum to exactly `header_bytes` (64)
+    /// Sized so the named fields above sum to exactly `header_bytes`,
     /// with no implicit trailing struct padding: `std.mem.asBytes`
     /// includes any such padding, and Zig's struct-literal initialization
     /// does not guarantee it is stable (let alone zero) across separate
@@ -146,6 +157,53 @@ const Header = extern struct {
     /// every reopen. `== header_bytes` below (not `<=`) keeps that
     /// invariant enforced at compile time for any future field addition.
     _reserved: [4]u8 = @splat(0),
+
+    // -- §9.3b: the cross-process WAL index. Also live/mutable, also
+    // excluded from `header_checksum` for the same reason as the fields
+    // above -- these change on every durable log append, not just at
+    // creation. Appended after `_reserved` (not interleaved with the v2
+    // fields above) so every v2 byte offset is unchanged; only the
+    // region's total size grows.
+    //
+    // Published together, as one consistent triple, by
+    // `publishLogState` -- a seqlock (`log_generation`), not three
+    // independent atomics a reader could observe torn across: the
+    // writer bumps `log_generation` to odd, stores the three values
+    // (plain stores; the surrounding release/acquire pair on
+    // `log_generation` is what makes them visible together, not their
+    // own ordering), then bumps `log_generation` back to even.
+    // `readLogState` retries whenever it observes an odd generation or a
+    // generation that changed between its two reads. No syscall either
+    // way -- same "atomic stores into the mmap, nothing else" property
+    // every other steady-state path in this file already has.
+    /// The on-disk checkpoint sequence this log is currently relative to
+    /// (`RedoCommitState.checkpoint_sequence` in native.zig): what a
+    /// fresh reopen's `redo_log.replay` would use as `start_after_sequence`.
+    /// Advances only when a real checkpoint lands (`checkpointRedoLog`),
+    /// not on an ordinary redo commit.
+    log_checkpoint_sequence: std.atomic.Value(u64),
+    /// The highest `commit_sequence` durably appended to the log (synced,
+    /// not just written) -- `RedoCommitState.durable_sequence`. Advances
+    /// on every durable commit.
+    log_durable_sequence: std.atomic.Value(u64),
+    /// Byte offset, relative to the log region's own `base_offset`
+    /// (`NativeFile.header.redo_log_offset`, read directly from the data
+    /// file by any opener -- not duplicated here), of the durable end of
+    /// the log -- `RedoCommitState.writer.tail` right after the append
+    /// that made `log_durable_sequence` durable. A cross-process reader
+    /// reads log bytes `[its own last-applied offset, log_durable_offset)`
+    /// to catch up incrementally.
+    log_durable_offset: std.atomic.Value(u64),
+    /// Seqlock word guarding the triple above: even when stable, odd
+    /// while a publish is in progress. 32 bits, matching every other
+    /// futex-shaped word in this header, though nothing waits on this one
+    /// (a reader retries instead of blocking -- the window it could ever
+    /// observe odd is three plain stores long).
+    log_generation: std.atomic.Value(u32),
+    /// Pads the WAL-index fields to a multiple of 8, mirroring
+    /// `_immutable_reserved`/`_reserved`'s own reasoning: no implicit
+    /// compiler-inserted padding anywhere in this struct.
+    _log_reserved: [4]u8 = @splat(0),
 };
 
 comptime {
@@ -775,6 +833,10 @@ pub const Region = struct {
                 .writer_ticket_head = .init(0),
                 .reader_slot_released = .init(0),
                 .writer_release_epoch = .init(0),
+                .log_checkpoint_sequence = .init(0),
+                .log_durable_sequence = .init(0),
+                .log_durable_offset = .init(0),
+                .log_generation = .init(0),
             };
             fresh.header_checksum = headerChecksum(&fresh);
             try setup_file.writePositionalAll(io, std.mem.asBytes(&fresh), 0);
@@ -1676,6 +1738,53 @@ pub const Region = struct {
             if (min == null or seq < min.?) min = seq;
         }
         return min;
+    }
+
+    /// §9.3b's cross-process WAL index: `publishLogState`'s own consistent
+    /// snapshot of `(log_checkpoint_sequence, log_durable_sequence,
+    /// log_durable_offset)`.
+    pub const LogState = struct {
+        checkpoint_sequence: u64,
+        durable_sequence: u64,
+        durable_offset: u64,
+    };
+
+    /// Publishes the writer's current log state as one consistent triple,
+    /// via a seqlock on `log_generation` -- not three independent atomic
+    /// stores a reader could observe torn across. Called by the writer
+    /// right after a durable log append (or after a real checkpoint lands
+    /// and/or reclaims log space), never on any other path: no new
+    /// syscalls, just atomic stores into the already-mapped region,
+    /// exactly like every other steady-state write this file makes.
+    pub fn publishLogState(self: *Region, state: LogState) void {
+        const hdr = self.header();
+        _ = hdr.log_generation.fetchAdd(1, .release);
+        hdr.log_checkpoint_sequence.store(state.checkpoint_sequence, .monotonic);
+        hdr.log_durable_sequence.store(state.durable_sequence, .monotonic);
+        hdr.log_durable_offset.store(state.durable_offset, .monotonic);
+        _ = hdr.log_generation.fetchAdd(1, .release);
+    }
+
+    /// Reads the triple `publishLogState` last published, retrying (no
+    /// syscall, no blocking -- a plain spin) whenever the seqlock proves
+    /// the read straddled a concurrent publish. The window a publish holds
+    /// the generation odd is three plain stores long, so this never spins
+    /// more than a handful of times even under real contention; VOPR-safe
+    /// by construction (no `std.Io`, no real time, nothing but atomic
+    /// loads).
+    pub fn readLogState(self: *const Region) LogState {
+        const hdr = self.header();
+        while (true) {
+            const before = hdr.log_generation.load(.acquire);
+            if (before & 1 != 0) continue;
+            const state: LogState = .{
+                .checkpoint_sequence = hdr.log_checkpoint_sequence.load(.monotonic),
+                .durable_sequence = hdr.log_durable_sequence.load(.monotonic),
+                .durable_offset = hdr.log_durable_offset.load(.monotonic),
+            };
+            const after = hdr.log_generation.load(.acquire);
+            if (before == after) return state;
+        }
     }
 };
 
@@ -3236,4 +3345,108 @@ test "shared lock region: the ticket ring refuses to grow past max_readers outst
     try std.testing.expect(region.ringHasRoom());
     try std.testing.expect(region.tryAcquireWriterFair(own_pid));
     region.releaseWriter();
+}
+
+test "shared lock region: Header stays exactly header_bytes with the §9.3b WAL-index fields added" {
+    // Mechanical sentinel: `comptime { std.debug.assert(@sizeOf(Header)
+    // == header_bytes); }` above already enforces this at compile time,
+    // but a regression there is a compile error, not a test failure --
+    // this test exists so `zig build test`'s normal reporting surfaces
+    // the intent in a test name too, matching the file's own convention
+    // of also exercising every comptime invariant through a named test.
+    try std.testing.expectEqual(@as(usize, 96), @sizeOf(Header));
+}
+
+test "shared lock region: publishLogState/readLogState round-trip a consistent triple" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-log-state.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var region = try Region.open(a, io, db_path);
+    defer region.close();
+
+    // Fresh region: everything starts at zero.
+    const fresh = region.readLogState();
+    try std.testing.expectEqual(@as(u64, 0), fresh.checkpoint_sequence);
+    try std.testing.expectEqual(@as(u64, 0), fresh.durable_sequence);
+    try std.testing.expectEqual(@as(u64, 0), fresh.durable_offset);
+
+    region.publishLogState(.{ .checkpoint_sequence = 7, .durable_sequence = 41, .durable_offset = 4096 });
+    const after = region.readLogState();
+    try std.testing.expectEqual(@as(u64, 7), after.checkpoint_sequence);
+    try std.testing.expectEqual(@as(u64, 41), after.durable_sequence);
+    try std.testing.expectEqual(@as(u64, 4096), after.durable_offset);
+
+    // A second publish fully overwrites the triple, not a merge.
+    region.publishLogState(.{ .checkpoint_sequence = 7, .durable_sequence = 42, .durable_offset = 4224 });
+    const again = region.readLogState();
+    try std.testing.expectEqual(@as(u64, 7), again.checkpoint_sequence);
+    try std.testing.expectEqual(@as(u64, 42), again.durable_sequence);
+    try std.testing.expectEqual(@as(u64, 4224), again.durable_offset);
+}
+
+test "shared lock region: readLogState sees publishLogState across a second handle" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-log-state-shared.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    var writer_side = try Region.open(a, io, db_path);
+    defer writer_side.close();
+    var reader_side = try Region.open(a, io, db_path);
+    defer reader_side.close();
+
+    writer_side.publishLogState(.{ .checkpoint_sequence = 3, .durable_sequence = 9, .durable_offset = 512 });
+    const seen = reader_side.readLogState();
+    try std.testing.expectEqual(@as(u64, 3), seen.checkpoint_sequence);
+    try std.testing.expectEqual(@as(u64, 9), seen.durable_sequence);
+    try std.testing.expectEqual(@as(u64, 512), seen.durable_offset);
+}
+
+test "shared lock region: a v2 region is rebuilt on open by a v3 binary" {
+    // Same posture as the existing corrupt-header tests: an old
+    // format_version is just another kind of "fails isValidHeader",
+    // rebuilt from scratch when no live peer holds it (no migration --
+    // this region is a disposable coordination aid, never a migrated
+    // artifact).
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-v2.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+    const region_path = try std.fmt.allocPrint(a, "{s}.aflite-lock", .{db_path});
+    defer a.free(region_path);
+
+    {
+        var region = try Region.open(a, io, db_path);
+        region.close();
+    }
+    // Downgrade the on-disk `format_version` directly, as a v2 writer
+    // would have left it. `isValidHeader`'s version check runs before
+    // its checksum check, so this alone fails validation regardless of
+    // the (otherwise still-valid) checksum.
+    {
+        const f = try Io.Dir.cwd().openFile(io, region_path, .{ .mode = .read_write });
+        defer f.close(io);
+        const old_version: u32 = 2;
+        try f.writePositionalAll(io, std.mem.asBytes(&old_version), 8);
+    }
+
+    var region = try Region.open(a, io, db_path);
+    defer region.close();
+    try std.testing.expectEqual(@as(u32, 3), region.header().format_version);
+    const state = region.readLogState();
+    try std.testing.expectEqual(@as(u64, 0), state.checkpoint_sequence);
 }
