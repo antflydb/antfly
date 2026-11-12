@@ -102,6 +102,7 @@ pub const RunAdmission = struct {
     backend_class: memory.BackendClass,
     limits: memory.Limits,
     static_workspace_bytes: usize,
+    required_residency: memory.AdmissionAmounts = .{},
     backend_workspace_reserved: bool = false,
     model_profile: ModelProfile = .{},
     /// Serving sessions must retain the default live-memory pressure check.
@@ -148,19 +149,19 @@ pub const RunAdmission = struct {
             std.log.warn("test-only forced inference run admission denial", .{});
             return error.ResourceTemporarilyUnavailable;
         }
-        return self.controller.tryAcquireWithPressure(
-            self.backend_class,
-            self.limits,
-            amounts,
-            self.check_live_memory,
-            pressure,
-        ) catch |err| {
+        return self.controller.tryAcquireRequestsWithPressure(&.{.{
+            .backend_class = self.backend_class,
+            .limits = self.limits,
+            .amounts = amounts,
+            .required_residency = self.required_residency,
+        }}, self.check_live_memory, pressure) catch |err| {
             // Controller locks are released before inspecting OS memory or
             // emitting diagnostics. Sessions share the manager's sampler gate.
             if (self.denial_observer) |observer| observer.record(observer.context, err, pressure.*, .{
                 .backend_class = self.backend_class,
                 .limits = self.limits,
                 .amounts = amounts,
+                .required_residency = self.required_residency,
             });
             return err;
         };

@@ -1808,6 +1808,11 @@ fn evaluateNodeFiltersAlloc(
         @memset(decisions, true);
         return decisions;
     }
+    // Prefix-only filters need no document evaluator or intermediate batches.
+    if (filter.filter_query_json == null) {
+        for (nodes, 0..) |node, i| decisions[i] = passesPrefixFilter(node.key, filter);
+        return decisions;
+    }
     const active = evaluator orelse return error.UnsupportedNodeFilterQuery;
     if (active.batch_func) |batch_func| {
         var query_nodes = std.ArrayListUnmanaged(node_identity.Ref).empty;
@@ -1821,10 +1826,6 @@ fn evaluateNodeFiltersAlloc(
             try query_indexes.append(alloc, i);
         }
         if (query_nodes.items.len == 0) return decisions;
-        if (filter.filter_query_json == null) {
-            for (query_indexes.items) |i| decisions[i] = true;
-            return decisions;
-        }
         const evaluated = try batch_func(active.ctx, alloc, query_nodes.items, filter);
         defer alloc.free(evaluated);
         if (evaluated.len != query_nodes.items.len) return error.InvalidQueryResult;
@@ -5875,5 +5876,37 @@ test "conjunctive reverse expansion honors explicit source tags from the incomin
         defer freeMatches(alloc, matches);
         try std.testing.expectEqual(case.count, matches.len);
         if (matches.len != 0) try std.testing.expectEqualStrings("entities", matches[0].bindings[0].table.?);
+    }
+}
+
+test "prefix-only pattern hops run without a document evaluator" {
+    const Reader = struct {
+        const edges = [_]graph_mod.Edge{
+            .{ .source = "User:5904:", .target = "User:1:", .edge_type = "FRIEND", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+            .{ .source = "User:5904:", .target = "User:2:", .edge_type = "FRIEND", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+            .{ .source = "User:5904:", .target = "User:3:", .edge_type = "FRIEND", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+            .{ .source = "User:5904:", .target = "Other:4:", .edge_type = "FRIEND", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" },
+        };
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, _: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            return @constCast(edges[0..]);
+        }
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+    };
+    const matches = try matchPatternWithEdgeReader(std.testing.allocator, Reader{}, &.{"User:5904:"}, &.{
+        .{ .alias = "start", .node_filter = .{ .filter_prefix = "User:5904:" } },
+        .{ .alias = "end", .node_filter = .{ .filter_prefix = "User:" }, .edge = .{ .types = &.{"FRIEND"}, .min_hops = 1, .max_hops = 1 } },
+    }, .{ .max_results = 1000, .include_paths = false });
+    defer freeMatches(std.testing.allocator, matches);
+    try std.testing.expectEqual(@as(usize, 3), matches.len);
+    for (matches) |match| try std.testing.expect(std.mem.startsWith(u8, match.bindings[1].key, "User:"));
+}
+
+test "batch prefix filtering bypasses document evaluation and query filters fail explicitly" {
+    const refs = [_]node_identity.Ref{ .{ .key = "User:1:" }, .{ .key = "Other:2:" } };
+    for ([_]?FilterEvaluator{ null, .{} }) |evaluator| {
+        const decisions = try evaluateNodeFiltersAlloc(std.testing.allocator, &refs, .{ .filter_prefix = "User:" }, evaluator);
+        defer std.testing.allocator.free(decisions);
+        try std.testing.expectEqualSlices(bool, &.{ true, false }, decisions);
+        try std.testing.expectError(error.UnsupportedNodeFilterQuery, evaluateNodeFiltersAlloc(std.testing.allocator, &refs, .{ .filter_query_json = "{}" }, evaluator));
     }
 }

@@ -235,6 +235,7 @@ const InferenceRuntimeConfigWire = struct {
 
     audio_readers: []const antfly.transcribing.NamedConfig = &.{},
     embedded_enabled: bool = true,
+    worker_executable: ?[]const u8 = null,
     worker_environment: []const struct { name: []const u8, value: []const u8 } = &.{},
     resources: platform.resource_policy.Resources = .{},
     generation_batching: platform.inference_settings.GenerationBatching = .{},
@@ -5681,9 +5682,15 @@ pub fn runFromIterator(
     if (cli.inference_scratch_budget_mb) |value| inference_resource_policy.inference.memory.max_scratch_bytes = try mibToBytes(value);
     const audio_readers = if (loaded_cfg) |cfg| try cfg.transcribers.hostedReaders(alloc) else try alloc.alloc(antfly.transcribing.NamedConfig, 0);
     defer alloc.free(audio_readers);
+    // The CLI knows it implements `inference _worker`. Supply its OS path
+    // explicitly: the inference owner is a static archive and cannot infer
+    // whether its final linker host is this CLI or an embedding application.
+    const worker_executable = std.process.executablePathAlloc(init.io, alloc) catch null;
+    defer if (worker_executable) |path| alloc.free(path);
     const inference_runtime_config_json = try std.json.Stringify.valueAlloc(alloc, InferenceRuntimeConfigWire{
         .audio_readers = audio_readers,
         .embedded_enabled = embedded_inference_enabled,
+        .worker_executable = worker_executable,
         .worker_environment = worker_environment.items,
         .resources = inference_resource_policy,
         .generation_batching = configured_inference.generation_batching,

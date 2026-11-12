@@ -3548,6 +3548,17 @@ pub const LoadedModel = struct {
         if (!std.meta.eql(self.managed_publication, try managed_receipt.publicationGeneration(self.allocator, self.publicationIo(control), self.model_dir))) return error.ModelArtifactsChanging;
     }
 
+    /// These sessions must coexist: evicting the primary model cannot make
+    /// room for one of its own encoders. Keep this separate from global
+    /// occupancy, which may include reclaimable models or concurrent requests.
+    fn requiredSessionResidency(self: *const LoadedModel) !runtime.tier.memory.AdmissionAmounts {
+        var amounts = runtime.tier.memory.AdmissionAmounts{};
+        for ([_]?runtime.tier.memory.AdmissionLease{ self.resource_lease, self.vision_resource_lease, self.audio_resource_lease, self.text_projection_resource_lease, self.visual_projection_resource_lease, self.audio_projection_resource_lease }) |slot| {
+            if (slot) |lease| amounts = try amounts.merge(lease.amounts);
+        }
+        return amounts;
+    }
+
     fn ensureOptionalSessionWithControl(
         self: *LoadedModel,
         kind: DeclaredOptionalSessionKind,
@@ -3586,6 +3597,7 @@ pub const LoadedModel = struct {
             control,
             .{ .path = self.model_dir, .publication = self.managed_publication },
             null,
+            try self.requiredSessionResidency(),
         );
         defer loaded.deinit();
         try self.verifyOwnerPublication(control);
@@ -4786,6 +4798,7 @@ fn attachSessionRunAdmission(
         .backend_class = backend_class,
         .limits = limits,
         .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
+        .required_residency = resident,
         .model_profile = sessionRunAdmissionModelProfile(backend_runtime, man, qwen_cfg),
     };
 }
@@ -6308,6 +6321,9 @@ pub const ModelManager = struct {
         var remaining: [2]runtime.tier.memory.AdmissionRequest = undefined;
         for (requests, 0..) |request, i| {
             remaining[i] = request.resources;
+            if (request.session.run_admission) |admission| {
+                remaining[i].required_residency = try remaining[i].required_residency.merge(admission.required_residency);
+            }
             if (request.session.generation_workspace) |workspace| {
                 result.workspace[i] = try workspace.acquire(&remaining[i].amounts);
             }
@@ -7541,6 +7557,7 @@ pub const ModelManager = struct {
             control,
             selected,
             borrowed,
+            .{},
         );
     }
 
@@ -7553,6 +7570,7 @@ pub const ModelManager = struct {
         control: ?InferenceExecutionControl,
         selected: ResolvedModel,
         borrowed: ?*PublishedArtifacts,
+        required_residency: runtime.tier.memory.AdmissionAmounts,
     ) !ManagedSession {
         if (control) |active| try active.update(.loading_model, 0, 1);
         const io = if (control) |active| active.io orelse source_session_manager.io orelse std.Options.debug_io else source_session_manager.io orelse std.Options.debug_io;
@@ -7637,11 +7655,12 @@ pub const ModelManager = struct {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
-                resource_lease = self.acquireAmountsWithEviction(
-                    admissionBackendClassForRuntime(backend_runtime),
-                    admission_limits,
-                    admission_plan.peak,
-                ) catch |err| {
+                resource_lease = self.acquireRequestsWithEviction(&.{.{
+                    .backend_class = admissionBackendClassForRuntime(backend_runtime),
+                    .limits = admission_limits,
+                    .amounts = admission_plan.peak,
+                    .required_residency = required_residency,
+                }}) catch |err| {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
@@ -7693,6 +7712,7 @@ pub const ModelManager = struct {
                         null,
                         self,
                     );
+                    loaded.session.run_admission.?.required_residency = try resident_amounts.merge(required_residency);
                 }
                 try bound.finish(&construction_proof);
                 return loaded.take();
@@ -20244,4 +20264,32 @@ test "model processor resampling fences declared and implicit image routes" {
     try std.testing.expectEqual(siglip, imagePreprocessingRevision(manifest, artifacts));
     inputs[0] = "audio";
     try std.testing.expectEqual(artifacts, imagePreprocessingRevision(manifest, artifacts));
+}
+
+test "generation admission includes required model residency without charging it twice" {
+    const memory = runtime.tier.memory;
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    const controller = manager.admissionController();
+    controller.configureSharedLimits(.{});
+    const limits = memory.Limits{ .host_limit_bytes = 100 };
+    var resident = try controller.tryAcquire(.gpu, limits, .{ .host_weight_bytes = 90 }, false);
+    defer resident.release();
+    const session = backends.Session{
+        .ptr = controller,
+        .vtable = undefined,
+        .run_admission = .{ .controller = controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 0, .required_residency = resident.amounts },
+    };
+    var exceeded: ?memory.AdmissionAmounts.LimitExceeded = null;
+    var request = GenerationAdmissionRequest{ .session = session, .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = .{ .host_weight_bytes = 20 }, .limit_exceeded = &exceeded } };
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&.{request}));
+    try std.testing.expectEqual(@as(usize, 110), exceeded.?.requested_bytes);
+    try std.testing.expectEqual(@as(usize, 100), exceeded.?.limit_bytes);
+    try std.testing.expect(!manager.memoryAdmissionDiagnostic().retryable);
+    request.resources.limits.host_limit_bytes = 110;
+    var admitted = try manager.acquireGenerationResources(&.{request});
+    defer admitted.release();
+    try std.testing.expectEqual(@as(usize, 110), controller.snapshot().hostTotalBytes());
+    try std.testing.expect(exceeded == null);
 }

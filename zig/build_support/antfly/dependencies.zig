@@ -1269,6 +1269,9 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         worker_transport_tests.dependOn(&b.addRunArtifact(tests).step);
     }
 
+    const worker_discovery_tests = b.addTest(.{ .root_module = inference_host_mod, .filters = &.{"worker discovery prefers the CLI OS path"} });
+    worker_transport_tests.dependOn(&b.addRunArtifact(worker_discovery_tests).step);
+
     // Native products always reuse the compiled Apache owners. Source-only
     // targets keep their own target implementation without a product toggle.
     const shared_inference_core = (target.result.os.tag == .macos or target.result.os.tag == .linux) and

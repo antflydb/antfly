@@ -744,6 +744,11 @@ pub const AdmissionRequest = struct {
     backend_class: BackendClass,
     limits: Limits,
     amounts: AdmissionAmounts,
+    /// Already admitted residency required by this operation. Used only for
+    /// intrinsic feasibility, never charged again. Callers must own its leases.
+    required_residency: AdmissionAmounts = .{},
+    /// Optional request-local diagnostic; never retained by the controller.
+    limit_exceeded: ?*?AdmissionAmounts.LimitExceeded = null,
 };
 
 /// A bounded sub-ledger for KV/scratch already charged by a model's resident
@@ -1097,13 +1102,25 @@ pub const AdmissionController = struct {
         pressure: *?AdmissionPressure,
     ) !AdmissionLease {
         pressure.* = null;
+        for (requests) |request| if (request.limit_exceeded) |out| {
+            out.* = null;
+        };
         var amounts_by_backend = emptyAdmissionAmountsByBackend();
+        var required_by_backend = emptyAdmissionAmountsByBackend();
+        var required_total: AdmissionAmounts = .{};
         var limits_by_backend = [_]Limits{ .{}, .{} };
         var active_backends = [_]bool{ false, false };
         var amounts: AdmissionAmounts = .{};
 
         for (requests) |request| {
+            // A component cannot run without its parent model. Test that
+            // minimum working set before treating other leases as contention.
+            const required = request.amounts.merge(request.required_residency) catch
+                return error.ResourceLimitExceeded;
             const index = backendClassIndex(request.backend_class);
+            required_by_backend[index] = required_by_backend[index].merge(required) catch
+                return error.ResourceLimitExceeded;
+            required_total = required_total.merge(required) catch return error.ResourceLimitExceeded;
             amounts_by_backend[index] = amounts_by_backend[index].merge(request.amounts) catch
                 return error.ResourceLimitExceeded;
             limits_by_backend[index] = if (active_backends[index])
@@ -1126,8 +1143,16 @@ pub const AdmissionController = struct {
         // request and cause needless eviction and retries.
         for (0..backend_class_count) |index| {
             if (!active_backends[index]) continue;
-            if ((amounts_by_backend[index].firstLimitExceeded(limits_by_backend[index]) catch
-                return error.ResourceLimitExceeded) != null) return error.ResourceLimitExceeded;
+            if (required_by_backend[index].firstLimitExceeded(limits_by_backend[index]) catch
+                return error.ResourceLimitExceeded) |exceeded|
+            {
+                for (requests) |request| {
+                    if (backendClassIndex(request.backend_class) == index) {
+                        if (request.limit_exceeded) |out| out.* = exceeded;
+                    }
+                }
+                return error.ResourceLimitExceeded;
+            }
         }
 
         // Publish a provisional reservation while holding only the in-memory
@@ -1140,10 +1165,17 @@ pub const AdmissionController = struct {
 
             // Shared limits can tighten concurrently; inspect them only under
             // the accounting lock, before testing aggregate occupancy.
-            try checkAdmissionLimit(request_host, request_host, self.shared_limits.host_limit_bytes);
-            try checkAdmissionLimit(request_combined, request_combined, self.shared_limits.unified_limit_bytes);
-            try checkAdmissionLimit(request_kv, request_kv, self.shared_limits.kv_limit_bytes);
-            try checkAdmissionLimit(request_scratch, request_scratch, self.shared_limits.scratch_limit_bytes);
+            if (required_total.firstLimitExceeded(.{
+                .host_limit_bytes = self.shared_limits.host_limit_bytes,
+                .combined_limit_bytes = self.shared_limits.unified_limit_bytes,
+                .kv_limit_bytes = self.shared_limits.kv_limit_bytes,
+                .scratch_limit_bytes = self.shared_limits.scratch_limit_bytes,
+            }) catch return error.ResourceLimitExceeded) |exceeded| {
+                for (requests) |request| if (request.limit_exceeded) |out| {
+                    out.* = exceeded;
+                };
+                return error.ResourceLimitExceeded;
+            }
 
             const next = addAdmissionAmounts(self.admitted, amounts) orelse
                 return error.ResourceLimitExceeded;
@@ -2038,10 +2070,7 @@ fn deriveLimitsForBackend(backend: BackendClass, info: SystemMemoryInfo) Limits 
             // headroom. The live pressure check sees only materialized bytes;
             // this stable cap also protects concurrent reservations that have
             // not reached memory.current/MemAvailable yet.
-            const host_limit = @min(
-                clampBytes(safe_pool / 2, gib(2), gib(8)),
-                safe_pool,
-            );
+            const host_limit = safe_pool;
             break :blk .{
                 .host_limit_bytes = host_limit,
                 .backend_limit_bytes = 0,
@@ -2057,17 +2086,17 @@ fn deriveLimitsForBackend(backend: BackendClass, info: SystemMemoryInfo) Limits 
             };
         },
         .gpu => blk: {
-            var combined = clampBytes(safe_pool / 2, gib(6), gib(12));
-            // Metal uses unified memory; discrete Linux GPU residency is not
-            // constrained by the process cgroup's host-memory limit.
-            if (builtin.os.tag == .macos) combined = @min(combined, safe_pool);
-            const host_limit = @min(
+            const combined = if (builtin.os.tag == .macos) safe_pool else clampBytes(safe_pool / 2, gib(6), gib(12));
+            // Unified-memory model weights and lazy media encoders share the
+            // physical host pool. A staging fraction sized for discrete GPUs
+            // artificially caps that working set even when RAM is available.
+            const host_limit = if (builtin.os.tag == .macos) safe_pool else @min(
                 clampBytes(combined / 4, gib(1), gib(3)),
                 safe_pool,
             );
             break :blk .{
                 .host_limit_bytes = host_limit,
-                .backend_limit_bytes = @min(
+                .backend_limit_bytes = if (builtin.os.tag == .macos) safe_pool else @min(
                     clampBytes((combined * 3) / 4, gib(4), gib(9)),
                     combined,
                 ),
@@ -4703,7 +4732,8 @@ test "derive gpu limits keeps combined cap sane" {
         .available_bytes = gib(40),
     });
     try std.testing.expect(limits.combined_limit_bytes >= gib(6));
-    try std.testing.expect(limits.combined_limit_bytes <= gib(12));
+    const upper_bound = if (builtin.os.tag == .macos) gib(40) - liveHostMemoryHeadroom(gib(64)) else gib(12);
+    try std.testing.expect(limits.combined_limit_bytes <= upper_bound);
     try std.testing.expect(limits.backend_limit_bytes <= limits.combined_limit_bytes);
 }
 
@@ -4907,4 +4937,39 @@ test "managed PJRT metadata residency cannot refund a newer pressure epoch" {
     resident.release();
     try std.testing.expectEqual(next, controller.live_pending_bytes);
     try std.testing.expectEqual(capacity, controller.live_capacity_bytes);
+}
+
+test "required model residency distinguishes impossible media loads from contention" {
+    var controller = AdmissionController{};
+    const limits = Limits{ .host_limit_bytes = 100, .combined_limit_bytes = 200 };
+    var model = try controller.tryAcquire(.gpu, limits, .{ .host_weight_bytes = 90 }, false);
+    defer model.release();
+    var exceeded: ?AdmissionAmounts.LimitExceeded = null;
+    const request = AdmissionRequest{ .backend_class = .gpu, .limits = limits, .amounts = .{ .host_weight_bytes = 20 }, .required_residency = model.amounts, .limit_exceeded = &exceeded };
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquireRequests(&.{request}, false));
+    try std.testing.expectEqual(AdmissionAmounts.LimitExceeded{ .limit = .host, .requested_bytes = 110, .limit_bytes = 100 }, exceeded.?);
+    // The same occupancy is temporary if the resident model is unrelated.
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.gpu, limits, request.amounts, false));
+    var fitting = request;
+    fitting.amounts.host_weight_bytes = 10;
+    var encoder = try controller.tryAcquireRequests(&.{fitting}, false);
+    defer encoder.release();
+    try std.testing.expectEqual(@as(?AdmissionAmounts.LimitExceeded, null), exceeded);
+    try std.testing.expectEqual(@as(usize, 100), controller.snapshot().hostTotalBytes());
+}
+
+test "unified memory default admits Gemma weights and media encoder in the shared pool" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const limits = deriveLimitsForBackend(.gpu, .{ .total_bytes = gib(36), .available_bytes = gib(36) });
+    const safe_pool = gib(36) - liveHostMemoryHeadroom(gib(36));
+    try std.testing.expectEqual(safe_pool, limits.host_limit_bytes);
+    try std.testing.expectEqual(safe_pool, limits.combined_limit_bytes);
+    var controller = AdmissionController{};
+    controller.configureSharedLimits(.{ .host_limit_bytes = safe_pool, .unified_limit_bytes = safe_pool });
+    var weights = try controller.tryAcquire(.gpu, limits, .{ .host_weight_bytes = 5315805258 }, false);
+    defer weights.release();
+    var encoder = try controller.tryAcquireRequests(&.{.{ .backend_class = .gpu, .limits = limits, .amounts = .{ .host_weight_bytes = 991552256 }, .required_residency = weights.amounts }}, false);
+    defer encoder.release();
+    const capped = applyLimitOverrides(limits, .{ .host_limit_bytes = 5423376736 });
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquireRequests(&.{.{ .backend_class = .gpu, .limits = capped, .amounts = .{ .host_weight_bytes = 991552256 }, .required_residency = weights.amounts }}, false));
 }
