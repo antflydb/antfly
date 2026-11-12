@@ -1271,11 +1271,29 @@ pub const WriterLane = struct {
     /// generation moved on since; leave it alone and let the ordinary
     /// path decide) is taken.
     pub fn takeParkedForStore(self: *WriterLane, connection: *Connection) ?native.PathWriterLock {
+        return self.takeParkedForRoot(connection.owner.current);
+    }
+
+    /// Like `takeParkedForStore`, for a caller with no `*Connection` of
+    /// its own to check -- `Owner.acquireMaintenancePathLeaseAssumeLocked`
+    /// -- just the owner's own current root, which is exactly what
+    /// `takeParkedForStore` ultimately compares `last_root` against
+    /// anyway (`connection.owner.current`). Without this,
+    /// `acquireMaintenancePathLeaseAssumeLocked` had no way to reclaim a
+    /// lease this same lane already parked for this same process after a
+    /// foreground write -- see that function's own doc comment for the
+    /// region-mode version of the self-deadlock `takeParkedForStore`
+    /// itself already exists to prevent on the regular write path: with
+    /// nothing else running to ever trigger `checkin`'s own release
+    /// condition, a fresh region-backed acquisition attempt waits on a
+    /// `writer_holder` this exact process is never going to let go of on
+    /// its own, for the whole of the caller's own budget.
+    pub fn takeParkedForRoot(self: *WriterLane, current_root: ?*h.Handle) ?native.PathWriterLock {
         const io = h.handleLockIo();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const lease = self.parked orelse return null;
-        if (self.last_root == null or self.last_root != connection.owner.current) return null;
+        if (self.last_root == null or self.last_root != current_root) return null;
         self.parked = null;
         return lease;
     }
@@ -1995,11 +2013,30 @@ pub const Owner = struct {
     /// turns alongside foreground writers, otherwise a continuously occupied
     /// kernel queue prevents index replay from ever acquiring its lease.
     /// Reclamation and detached-proof reacquisition remain nonblocking.
+    ///
+    /// Checks `writer_lane.takeParkedForRoot` right after `takeRetained`,
+    /// before ever falling back to a fresh `fairWriterLockWithIo` call:
+    /// a foreground write just before this one leaves its own lease
+    /// *parked* on the lane (not released -- see `WriterLane.checkin`'s
+    /// own doc comment), and with no other process or in-process waiter
+    /// around to ever trigger that lane's release condition, a fresh
+    /// acquisition attempt here would wait out its own full budget on a
+    /// `writer_holder` this same process is already holding and has no
+    /// other reason to ever let go of -- the region-mode shape of the
+    /// same self-deadlock `takeParkedForStore` already guards the
+    /// regular write path against.
     fn acquireMaintenancePathLeaseAssumeLocked(self: *Owner) !native.PathWriterLock {
         if (self.stopping.load(.acquire)) return error.Canceled;
         const io = h.handleLockIo();
         const stats = &self.publication_stats.maintenance_lease;
         if (self.gate.mutex.takeRetained()) |held| {
+            var lease = held;
+            stats.recordAcquired(.handoff, 0);
+            wal_trace.recordOp(.maintenance_lease_acquired);
+            lease.startHold(stats);
+            return self.withReadRegistrationBatch(lease);
+        }
+        if (self.writer_lane.takeParkedForRoot(self.current)) |held| {
             var lease = held;
             stats.recordAcquired(.handoff, 0);
             wal_trace.recordOp(.maintenance_lease_acquired);
@@ -2030,9 +2067,20 @@ pub const Owner = struct {
 
     /// Caller holds the gate. Nonblocking: reuses a lease kept for a queued
     /// thread, otherwise refuses while another process is queued.
+    /// Checks `writer_lane.takeParkedForRoot` alongside `takeRetained`
+    /// before `tryFairWriterLockWithIo`'s own fresh, nonblocking attempt
+    /// -- see `acquireMaintenancePathLeaseAssumeLocked`'s own doc
+    /// comment for the self-deadlock this guards against. Less severe
+    /// here (a nonblocking attempt fails fast with `WouldBlock` rather
+    /// than hanging out a multi-second budget), but reusing the lane's
+    /// own already-parked lease is still strictly better than refusing a
+    /// reclamation turn that a lease sitting right there could serve.
     fn tryWriterLeaseAssumeLocked(self: *Owner) !native.PathWriterLock {
         const stats = &self.publication_stats.maintenance_lease;
         var lease = if (self.gate.mutex.takeRetained()) |held| blk: {
+            stats.recordAcquired(.handoff, 0);
+            break :blk held;
+        } else if (self.writer_lane.takeParkedForRoot(self.current)) |held| blk: {
             stats.recordAcquired(.handoff, 0);
             break :blk held;
         } else blk: {
