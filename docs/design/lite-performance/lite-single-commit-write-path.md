@@ -1950,6 +1950,86 @@ drains and pages become reusable.
 failure and the general class it represented depended on exactly this
 cross-instance sharing landing.
 
+### 9.6c Point 3 continued: the log-full/OutcomeUnknown cluster
+
+Investigating item 3 (re-running `storage.lite.docstore.test` with the
+default temporarily flipped, reverted before committing -- the real
+flip is still item 4, gated on (2)) found 6 failures, not the
+`error.ReplayIndexUnavailable` case this section originally expected:
+five surfaced as `error.OutcomeUnknown` from `redo_log.zig`'s
+`error.LogFull` inside `appendRecord`, reached via `publishCheckpoint`/
+`publishBareCommit`/`putDocumentBatch`/`putDocument` -- several
+existing reclamation/budget tests call `store.file.putDocument`
+directly in a loop, bypassing `Store` (and so its background idle-timer
+checkpoint trigger) entirely. Root cause: `maybeAutoCheckpointRedoLog`'s
+25%-remaining check is reactive, run *after* a commit's own
+`appendRecord` already succeeded, to decide whether the *next* commit
+needs a checkpoint first -- it cannot protect the commit that is
+currently failing.
+
+Fixed (design rule: a log-full condition must be decided before
+anything is appended, never surfaced as `OutcomeUnknown`, since it is
+knowable in advance): a new `RedoCommitState.pendingRecordLen()`
+returns the exact byte length `appendRecord` would write right now
+(framing included); both call sites (`publishCheckpoint`'s durable
+branch, and `commitTransactionWithDurability`'s ride-along/deferred
+branch) check it against `redo.writer.remaining()` *before* calling
+`appendRecord` at all. If it doesn't fit, they call `checkpointRedoLog()`
+and then return immediately, skipping the append (and the now-stale
+`checkpoint`/`next` value's own publication) entirely -- never a
+partial append. This is safe specifically because the current commit's
+own mutations are already staged in `redo.shared` by the time either
+call site runs (`flushTransactionWrites`'s diversion loop always runs
+first), so `checkpointRedoLog`'s fold necessarily covers them too:
+there is nothing left to log once it returns. If `checkpointRedoLog`
+itself fails (e.g. no disk space to allocate the real pages it needs),
+that error propagates unchanged -- `redo.shared`/`redo.writer` are
+untouched by a failed checkpoint attempt, so the log stays intact and
+the caller sees a clean, pre-decision error rather than a torn append,
+matching what these tests' own names already expect (deferral, retry,
+resume when capacity returns). `checkpointRedoLog`'s signature changed
+from an inferred `!void` to an explicit `anyerror!void` to break a
+dependency loop Zig's error-set inference otherwise reports once
+`commitTransactionWithDurability` calls it directly (it already called
+it transitively, through `maybeAutoCheckpointRedoLog`, without issue --
+the loop only appears once the call is unconditional on this new path).
+
+Confirmed fixed (3 of the 5): "reclamation writer busy retries gate
+image copies until publication is available", "reclamation low disk
+defers rewriting and resumes when capacity returns", "reclamation
+issue1431 canceled automatic rewrites retry without file growth" all
+pass now.
+
+Not yet fixed -- a different, deeper issue each, both now surfacing
+their *real* failure mode instead of a generic `OutcomeUnknown`:
+- "reclamation stale quota estimates expire after roots shrink" now
+  fails with `error.LiteStorageBudgetExceeded` instead. Writes 128 KiB
+  documents (so each commit's own record, not the log's small
+  budget-scaled capacity, is the relevant size) and derives its own
+  `max_storage_bytes` cap from a physical file size measured partway
+  through -- exactly the kind of timing assumption §9.7a's own "second
+  audit" paragraph already flagged as unaudited for redo-log mode (a
+  commit's physical footprint no longer lands at the same point in the
+  test's own timeline once checkpoints happen eagerly rather than per
+  commit).
+- "reclamation retries reuse estimates and reassess changed roots when
+  admitted" fails on `std.testing.expect(!std.meta.eql(checkpoint,
+  store.file.activeCheckpoint()))` -- it assumes any committed mutation
+  changes the active checkpoint slot, which is true for the legacy
+  path but not for a redo-log commit that only appends to the log
+  without ever running `checkpointRedoLog` (the whole point of
+  deferring the physical build). The same unaudited-assumption
+  category, not a new bug from this fix.
+- "reclamation budget rejects a mutation before exhausting capacity"'s
+  `error.InvalidNativeFreeMap` (expected `error.LiteStorageBudgetExceeded`)
+  is unchanged by this fix -- most likely free-map handling under redo
+  plus a budget, overlapping with (2)'s indexed-reclamation work rather
+  than this cluster.
+
+Verified the fix itself does not regress already-landed work:
+`-Dtest-filter="redo"` (18/18) and `-Dtest-filter="reuse"` (235/235)
+both still pass with the default back to legacy.
+
 ### 9.7a Point 3: threading the option, and holding back the default
 
 The option is threaded the whole way: `capi/db.zig`'s
