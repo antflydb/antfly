@@ -424,7 +424,6 @@ comptime {
     _ = @import("antfly_local_sources").storage_lite_native;
     _ = @import("antfly_local_sources").storage_lite_native_catalog_sink;
     _ = @import("antfly_local_sources").storage_lite_path_lock_wait;
-    _ = @import("antfly_local_sources").storage_lite_writer_queue;
     _ = @import("antfly_local_sources").storage_lite_paths;
     _ = @import("antfly_local_sources").storage_lite_read_workspace;
     _ = @import("antfly_local_sources").storage_lite_reader_coordinator;

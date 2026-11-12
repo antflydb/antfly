@@ -93,6 +93,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const shared_lock_region = @import("shared_lock_region.zig");
+const redo_overlay = @import("redo_overlay.zig");
 
 pub const Mode = enum { shared, exclusive };
 
@@ -285,7 +286,193 @@ pub const Entry = struct {
     /// path, exactly like `ensureFd`'s existing lazy-reopen pattern after
     /// `entry.fd` goes back to `null`.
     region: ?shared_lock_region.Region = null,
+    /// §9.6a: the redo-log's in-process versioned overlay, shared the
+    /// same way `region` is -- one instance per inode, referenced by
+    /// every `NativeFile` (writer or `ReadGeneration` reader) open on
+    /// this path in this process, instead of each independently
+    /// replaying the log into its own copy (which is what made a
+    /// `ReadGeneration` blind to anything written after it opened: its
+    /// own, unshared copy never saw a later commit at all). Populated
+    /// once, by whichever caller reaches `ensureRedoOverlay` first (see
+    /// that function); `rebind` does not clear this, unlike `region` --
+    /// a generation swap keeps the same logical content, just a new
+    /// path/fd, and the overlay is addressed by inode via this `Entry`,
+    /// never by path directly.
+    redo_overlay: ?redo_overlay.SharedRedoOverlay = null,
+    /// The in-process half of the reuse-safety frontier: every live,
+    /// same-process reader that can dereference tree pages at a fixed
+    /// checkpoint registers its own pinned sequence here, guarded by
+    /// `mutex` like every other field above. This exists alongside (not
+    /// instead of) `region`'s cross-process reader table and docstore.zig's
+    /// own `Store.reader_frontier` atomic: those two already cover their
+    /// own reader categories (a coordinated reader via `region`, a
+    /// `ReadGeneration` pin via `reader_frontier`), but neither one is
+    /// reachable by a reader that opens its own plain, uncoordinated
+    /// `NativeFile` directly (e.g. `captureFullReadSnapshot`'s reader, used
+    /// by vacuum's own verification snapshot) -- that reader never claims a
+    /// region slot and is a different `NativeFile` instance than whatever
+    /// `Store.reader_frontier` is wired into. `minimumReaderSequence`/
+    /// `minimumMetadataReaderSequence` combine this registry with
+    /// `region`'s own answer so every caller has one place to ask,
+    /// regardless of which mechanism a given reader happens to use.
+    reader_pins: std.ArrayListUnmanaged(ReaderPin) = .empty,
+    /// Published by the writer side on every commit (inode-wide, so every
+    /// instance on this inode -- not just the one that committed -- can
+    /// read it): the most recently committed `commit_sequence`, used to
+    /// detect a writer instance operating against a stale base (an old
+    /// generation/header it never refreshed). Populated under the
+    /// publishing commit's own exclusion (`NativeFile.publishCheckpoint`);
+    /// read lock-free via a monotonic compare, never regressed by an older
+    /// commit's publish racing a newer one. See
+    /// `publishCommittedSequence`/`committedSequence` below.
+    last_committed_sequence: std.atomic.Value(u64) = .init(0),
+    /// Defense in depth, not a lock: the `NativeFile` instance (as
+    /// `@intFromPtr`, 0 for none yet) that most recently began a
+    /// transaction against this inode, claimed by `NativeFile
+    /// .beginTransaction` right after it refreshes a stale base and
+    /// checked back by `NativeFile.publishCheckpoint`'s own backstop
+    /// assertion. The actual exclusivity invariant -- at most one writer
+    /// between begin and publish -- is the writer-lease admission gate in
+    /// capi/lite_connection.zig (`WriterLane`/`Owner`); this field only
+    /// observes whether that invariant held, by recording the latest
+    /// claimant and letting a later publish notice if a *different*
+    /// instance has since begun its own transaction before this one
+    /// reached publish. Not itself synchronizing anything: a true
+    /// violation can still slip past this check in the other interleaving
+    /// (the second instance's own publish lands first, observing itself as
+    /// the latest claimant), so this is a backstop that fails loud in the
+    /// common case, not a proof of correctness.
+    active_writer: std.atomic.Value(usize) = .init(0),
 };
+
+/// Claims `file_ptr` (the caller's own `@intFromPtr(self)`) as this
+/// inode's most recent transaction claimant. See `active_writer`'s own
+/// doc comment; called once per `NativeFile.beginTransaction`.
+pub fn claimActiveWriter(entry: *Entry, file_ptr: usize) void {
+    entry.active_writer.store(file_ptr, .release);
+}
+
+/// Panics if a *different*, nonzero claimant has since begun its own
+/// transaction on this inode. See `active_writer`'s own doc comment for
+/// why this is a backstop, not a lock.
+pub fn assertActiveWriter(entry: *Entry, file_ptr: usize) void {
+    const current = entry.active_writer.load(.acquire);
+    if (current != 0 and current != file_ptr) {
+        std.debug.panic("lite: NativeFile publishing without holding the writer lease (self=0x{x} active_writer=0x{x})", .{ file_ptr, current });
+    }
+}
+
+/// Publishes `sequence` as this inode's own latest known-durable commit,
+/// monotonically: a concurrent publish of an older sequence (e.g. a stale
+/// writer that is only now discovering/reporting what it already knew)
+/// never regresses a newer one already recorded. Called once per durable
+/// checkpoint publish, from the publishing `NativeFile` itself.
+pub fn publishCommittedSequence(entry: *Entry, sequence: u64) void {
+    var current = entry.last_committed_sequence.load(.monotonic);
+    while (sequence > current) {
+        current = entry.last_committed_sequence.cmpxchgWeak(current, sequence, .monotonic, .monotonic) orelse return;
+    }
+}
+
+/// This inode's latest known-durable commit sequence in this process (0 if
+/// nothing has published yet). See `publishCommittedSequence`.
+pub fn committedSequence(entry: *Entry) u64 {
+    return entry.last_committed_sequence.load(.monotonic);
+}
+
+/// One live reader's pinned sequence(s), registered in `Entry.reader_pins`.
+/// Mirrors `shared_lock_region.Region`'s own data/metadata split so a
+/// reader that only dereferences one domain can pin just that one; most
+/// callers (a full snapshot reader) pin both to the same value.
+pub const ReaderPin = struct {
+    data: ?u64 = null,
+    metadata: ?u64 = null,
+};
+
+/// Registers a live pin, under `entry.mutex`. Callers must do this
+/// *before* reading whatever checkpoint/root they are about to dereference
+/// pages through (or re-validate afterward that it didn't change) -- see
+/// this function's callers in native.zig for the exact ordering each one
+/// uses. `allocator` is always `std.heap.page_allocator`: like `region`/
+/// `redo_overlay`, this registry's own bookkeeping outlives, and is shared
+/// across, whichever individual caller populated or last referenced it.
+pub fn pinReader(entry: *Entry, io: Io, pin: ReaderPin) !void {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    try entry.reader_pins.append(std.heap.page_allocator, pin);
+}
+
+/// Removes exactly one pin matching `pin` (the same values `pinReader` was
+/// given), not every pin that happens to share those values.
+pub fn unpinReader(entry: *Entry, io: Io, pin: ReaderPin) void {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    for (entry.reader_pins.items, 0..) |p, i| {
+        if (std.meta.eql(p, pin)) {
+            _ = entry.reader_pins.swapRemove(i);
+            return;
+        }
+    }
+}
+
+/// The minimum `.data` pin currently registered in this registry alone
+/// (never combined with `region`'s own answer -- callers that want the
+/// full picture call both this and `region.minimumPinnedSequence()` and
+/// take the smaller, exactly like every other term in `NativeFile.
+/// reuseFrontier` already does). `null` if no pin carries a `.data` value.
+pub fn minimumReaderSequence(entry: *Entry, io: Io) ?u64 {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    var min: ?u64 = null;
+    for (entry.reader_pins.items) |p| if (p.data) |s| {
+        if (min == null or s < min.?) min = s;
+    };
+    return min;
+}
+
+/// The metadata analogue of `minimumReaderSequence`.
+pub fn minimumMetadataReaderSequence(entry: *Entry, io: Io) ?u64 {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    var min: ?u64 = null;
+    for (entry.reader_pins.items) |p| if (p.metadata) |s| {
+        if (min == null or s < min.?) min = s;
+    };
+    return min;
+}
+
+/// Lazily populates (once per `Entry`, shared by every reference to it)
+/// and returns this inode's shared redo-log overlay. If it is already
+/// populated, `populate` is never called -- the existing overlay already
+/// reflects every commit made so far, kept current by every writer's own
+/// `appendVersion` calls against the same shared instance, so a second (or
+/// later) opener on this inode must not replay the log again, which would
+/// either duplicate versions or race the live writer's own in-flight
+/// appends. `entry.mutex` serializes concurrent first-use the same way it
+/// already serializes every other field above, including `region`.
+pub fn ensureRedoOverlay(
+    entry: *Entry,
+    io: Io,
+    ctx: anytype,
+    populate: *const fn (@TypeOf(ctx), *redo_overlay.SharedRedoOverlay, std.mem.Allocator) anyerror!void,
+) !*redo_overlay.SharedRedoOverlay {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    if (entry.redo_overlay == null) {
+        entry.redo_overlay = redo_overlay.SharedRedoOverlay{};
+        errdefer {
+            entry.redo_overlay.?.deinit(std.heap.page_allocator);
+            entry.redo_overlay = null;
+        }
+        // Like `region` above: this registry's own bookkeeping always
+        // uses `std.heap.page_allocator`, never a caller-supplied one --
+        // the overlay outlives, and is shared across, whichever
+        // individual NativeFile happened to populate or last reference
+        // it, so it cannot safely be tied to any one of their allocators.
+        try populate(ctx, &entry.redo_overlay.?, std.heap.page_allocator);
+    }
+    return &entry.redo_overlay.?;
+}
 
 /// Lazily opens (once per `Entry`, shared by every reference to it) and
 /// returns this inode's shared lock region. `entry.mutex` serializes
@@ -589,6 +776,7 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
     var destroy = false;
     var fd: ?Io.File = null;
     var region: ?shared_lock_region.Region = null;
+    var overlay: ?redo_overlay.SharedRedoOverlay = null;
     {
         entry.mutex.lockUncancelable(io);
         defer entry.mutex.unlock(io);
@@ -602,6 +790,8 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
             entry.state = .none;
             region = entry.region;
             entry.region = null;
+            overlay = entry.redo_overlay;
+            entry.redo_overlay = null;
         }
     }
     if (destroy) _ = registry.remove(entry.inode);
@@ -609,7 +799,9 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
     if (destroy) {
         if (fd) |held| held.close(io);
         if (region) |*r| r.close();
+        if (overlay) |*o| o.deinit(page);
         page.free(entry.path);
+        entry.reader_pins.deinit(page);
         entry.debug_outstanding.deinit(page);
         page.destroy(entry);
     }

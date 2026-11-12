@@ -27,6 +27,7 @@ const apply_state = @import("../db/derived/apply_state.zig");
 const replay_reference = @import("../db/derived/replay_reference.zig");
 const internal_keys = @import("../internal_keys.zig");
 const native = @import("native.zig");
+const inode_lock = @import("inode_lock.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 pub const reclamation = @import("reclamation.zig");
 const maintenance = @import("../maintenance.zig");
@@ -1773,6 +1774,16 @@ pub const Store = struct {
     ride_along_idle_ns: u64 = 50 * std.time.ns_per_ms,
     ride_along_byte_threshold: usize = 1024 * 1024,
     ride_along_flush_started: std.atomic.Value(bool) = .init(false),
+    /// Set once `ensureRideAlongFlushStarted`'s `concurrent()` call fails --
+    /// this `Io` cannot run a real background task at all (e.g. a single-
+    /// worker test runtime), so retrying it on every future ride-along
+    /// stage would only repeat the same failure. Correctness never depends
+    /// on this succeeding either way: `Ticket.waitSequence`'s own bounded
+    /// wait-then-drive loop is every ride-along waiter's fallback
+    /// regardless (see that function's doc comment); this flag only saves
+    /// the repeated failed attempt once it's known hopeless for this
+    /// Store's lifetime.
+    ride_along_flush_unavailable: std.atomic.Value(bool) = .init(false),
     /// Guards only the one-time `ride_along_flush_future` spawn below --
     /// deliberately not `self.mutex`/`lockStoreExclusive`'s broader
     /// store-exclusive lock, which `ensureRideAlongFlushStarted` used to
@@ -2206,6 +2217,29 @@ pub const Store = struct {
     // Called with read_mutex held. Pins are ordered by published sequence.
     fn pinInitializedReadGeneration(self: *Store, pin: *ReadPin) !*ReadGeneration {
         const generation = self.read_generation.?;
+        // §9.6a: register this pin's own fixed snapshot sequence with the
+        // shared redo overlay *before* any of this function's own state
+        // mutations below, so a failure here (allocation only -- `pin`
+        // itself never fails otherwise) leaves nothing to unwind. This is
+        // the in-process half of `minimumPinnedSequence`, scoped to the
+        // overlay specifically (see `SharedRedoOverlay.pin`'s own doc
+        // comment for why this is a separate, narrower tracker rather than
+        // the existing cross-process mechanism): without it, `reclaim`
+        // could drop a version this generation's own readers still need.
+        if (generation.file.redo) |*redo| try redo.shared.pin(std.heap.page_allocator, self.file.runtime(), pin.sequence);
+        // Reader-pin registry (inode_lock.Entry.reader_pins): registers
+        // this same fixed sequence as a general page-reuse pin, not just
+        // a redo-overlay one -- `generation.file` is a plain,
+        // uncoordinated reader for an indexed_reclamation store (it never
+        // claims a `region` slot; see that registry's own doc comment),
+        // so without this it would be invisible to `reuseFrontier`'s
+        // combined computation beyond whatever `self.reader_frontier`
+        // already covers for this exact case. Registered on the same
+        // inode-keyed `Entry` `generation.file`/`self.file` both resolve
+        // to.
+        if (generation.file.inode_lock_ref.load(.acquire)) |entry| {
+            try inode_lock.pinReader(entry, self.file.runtime(), .{ .data = pin.sequence, .metadata = pin.sequence });
+        }
         // An idle connection must not fence reclamation. Only actual read
         // transactions hold the inode lock, including streams between calls.
         if (generation.scoped_reader_lock and pin.kernel_reader) {
@@ -2280,6 +2314,21 @@ pub const Store = struct {
         if (!generation.retired) self.reader_frontier.store(if (generation.first_pin) |first| first.sequence else std.math.maxInt(u64), .release);
         const reclaim = generation.references == 0 and generation.retired;
         self.read_mutex.unlock(io);
+        // §9.6a: mirror image of `pinInitializedReadGeneration`'s own
+        // `pin` call -- releases this pin's hold on the shared overlay,
+        // then opportunistically reclaims whatever that newly-advanced
+        // floor now permits (passing `0` leaves `durable_checkpoint_sequence`
+        // itself unchanged -- `reclaim`'s own `@max` -- while still
+        // recomputing the floor against the just-updated pin set; see
+        // `reclaim`'s own doc comment for why this is also worth doing
+        // right after `checkpointRedoLog` publishes, not only here).
+        if (generation.file.redo) |*redo| {
+            redo.shared.unpin(io, pin.sequence);
+            redo.shared.reclaim(std.heap.page_allocator, io, 0);
+        }
+        if (generation.file.inode_lock_ref.load(.acquire)) |entry| {
+            inode_lock.unpinReader(entry, io, .{ .data = pin.sequence, .metadata = pin.sequence });
+        }
         self.readMetadataAllocator().destroy(pin);
         if (reclaim) {
             // Only the last releaser owns this unreachable generation. Preserve
@@ -3301,7 +3350,37 @@ pub const Store = struct {
         pub fn waitSequence(self: Ticket) !u64 {
             const io = self.store.file.runtime();
             self.store.commit_mutex.lockUncancelable(io);
-            while (!self.request.done) self.store.commit_ready.waitUncancelable(io, &self.store.commit_mutex);
+            while (!self.request.done) {
+                if (self.request.ride_along) {
+                    // A ride-along ticket never leads its own group (see
+                    // `ride_along`'s own doc comment), so its wait must
+                    // never depend on anyone *else* existing to eventually
+                    // lead one -- `ensureRideAlongFlushStarted`'s spawned
+                    // `concurrent()` idle-flush task may fail to start, or
+                    // this `Io` may not support real background concurrency
+                    // at all (a single-worker test runtime). Bound the wait
+                    // by the same `ride_along_idle_ns` the idle-flush timer
+                    // itself uses; if still unresolved once that elapses,
+                    // become this group's own driver. The waiter is then
+                    // its own idle flush -- `forceDrainDurable` is a no-op
+                    // if someone else (a foreground leader, or that same
+                    // idle-flush task, running fine after all) is already
+                    // draining, so racing it is always safe.
+                    self.store.commit_ready.waitTimeout(io, &self.store.commit_mutex, .{ .duration = .{
+                        .raw = .fromNanoseconds(@intCast(self.store.ride_along_idle_ns)),
+                        .clock = .awake,
+                    } }) catch |err| {
+                        self.store.commit_mutex.unlock(io);
+                        return err;
+                    };
+                    if (self.request.done) break;
+                    self.store.commit_mutex.unlock(io);
+                    self.store.forceDrainDurable();
+                    self.store.commit_mutex.lockUncancelable(io);
+                } else {
+                    self.store.commit_ready.waitUncancelable(io, &self.store.commit_mutex);
+                }
+            }
             const result = self.request.result;
             const sequence = self.request.committed_sequence;
             self.store.commit_mutex.unlock(io);
@@ -3461,6 +3540,31 @@ pub const Store = struct {
     /// queue cannot silently delay reuse past when it should be eligible.
     pub fn ensureDurableForReuse(self: *Store) void {
         self.forceDrainDurable();
+        // `forceDrainDurable` is a no-op when another thread is already
+        // draining the queue -- its own doc comment: "which will pick up
+        // anything currently queued just the same". That is true for an
+        // ordinary foreground caller, who shares this one commit queue
+        // with whoever is leading it regardless of who actually drives it.
+        // It is *not* true for this call's own two callers
+        // (`Owner.acquireMaintenancePathLeaseAssumeLocked`/
+        // `tryWriterLeaseAssumeLocked`, handing the writer-lane lease to a
+        // *different* `NativeFile` instance -- the detached maintenance
+        // snapshot): they are about to treat "nothing is pending on this
+        // Store" as proof that nothing is concurrently touching
+        // `self.file`, so a drive already in flight on another thread
+        // right now (`commit_draining` still true, someone else's
+        // `driveMutationCoordinator` actively running) must actually
+        // finish -- not just be "covered" -- before this call returns.
+        // Otherwise the lease handoff below proceeds while that drive's
+        // own `commitTransactionWithDurability`/`publishCheckpoint` is
+        // still executing, racing maintenance's own commits on the same
+        // inode (two `NativeFile` instances publishing concurrently --
+        // the stale-writer corruption `refreshIfWriterBaseStale`/
+        // `publishCheckpoint`'s backstop assertion exist to catch).
+        const io = self.file.runtime();
+        self.commit_mutex.lockUncancelable(io);
+        while (self.commit_draining) self.commit_ready.waitUncancelable(io, &self.commit_mutex);
+        self.commit_mutex.unlock(io);
     }
 
     /// Durability barrier (c): force any ride-along work through, then
@@ -3474,6 +3578,7 @@ pub const Store = struct {
 
     fn ensureRideAlongFlushStarted(self: *Store) void {
         if (self.ride_along_flush_started.load(.acquire)) return;
+        if (self.ride_along_flush_unavailable.load(.acquire)) return;
         if (self.read_only) return;
         // Guarded by `ride_along_flush_start_mutex`, not the store-exclusive
         // lock (`lockStoreExclusive`/`tryLockStoreExclusive`): that lock is
@@ -3493,7 +3598,20 @@ pub const Store = struct {
         platform_sync.lockYielding(&self.ride_along_flush_start_mutex);
         defer self.ride_along_flush_start_mutex.unlock();
         if (self.ride_along_flush_started.load(.acquire)) return;
-        self.ride_along_flush_future = self.file.runtime().concurrent(rideAlongFlushLoop, .{self}) catch return;
+        if (self.ride_along_flush_unavailable.load(.acquire)) return;
+        self.ride_along_flush_future = self.file.runtime().concurrent(rideAlongFlushLoop, .{self}) catch {
+            // This `Io` cannot run a real background task at all (no real
+            // concurrency -- e.g. a single-worker test runtime). Record
+            // that instead of silently leaving `ride_along_flush_started`
+            // false with nothing left to ever retry it: `Ticket
+            // .waitSequence`'s own bounded wait-then-drive loop (see its
+            // doc comment) is every ride-along waiter's correctness
+            // fallback regardless, so this flag exists only to stop
+            // repeating a doomed `concurrent()` call on every future
+            // `stageRideAlong`, never to gate correctness.
+            self.ride_along_flush_unavailable.store(true, .release);
+            return;
+        };
         self.ride_along_flush_started.store(true, .release);
     }
 
@@ -3569,8 +3687,9 @@ pub const Store = struct {
         if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return;
         const redo = self.file.redo orelse return;
         if (redo.checkpointing) return;
+        const io = self.file.runtime();
         var overlay_entries: u64 = 0;
-        for (redo.logical_overlay) |map| overlay_entries += map.count();
+        for (0..3) |root_idx| overlay_entries += redo.shared.count(io, @intCast(root_idx));
         // Idle: this call only happens on `rideAlongFlushLoop`'s own
         // periodic wake, which already implies nothing more pressing woke
         // it sooner -- any non-empty overlay reaching this point has had at
@@ -3578,7 +3697,7 @@ pub const Store = struct {
         // run, so it is cheap to clear opportunistically rather than
         // leaving it to grow (and the next reopen's replay to cover)
         // indefinitely.
-        const has_overlay_work = overlay_entries != 0 or redo.overlay.count() != 0;
+        const has_overlay_work = overlay_entries != 0 or redo.shared.pagesCount(io) != 0;
         // Threshold: byte usage past the halfway point, well before the
         // emergency 25%-remaining backpressure (`maybeAutoCheckpointRedoLog`)
         // would ever fire. Checked independently of `has_overlay_work`: a
@@ -8405,8 +8524,9 @@ test "lite redo-log idle-flush timer checkpoints an uncheckpointed overlay witho
     const hasOverlayWork = struct {
         fn run(s: *Store) bool {
             const redo = s.file.redo orelse return false;
-            for (redo.logical_overlay) |map| if (map.count() != 0) return true;
-            return redo.overlay.count() != 0;
+            const io = s.file.runtime();
+            for (0..3) |root_idx| if (redo.shared.count(io, @intCast(root_idx)) != 0) return true;
+            return redo.shared.pagesCount(io) != 0;
         }
     }.run;
     try std.testing.expect(hasOverlayWork(&store));
@@ -8422,6 +8542,57 @@ test "lite redo-log idle-flush timer checkpoints an uncheckpointed overlay witho
     var read = try store.beginRead();
     defer read.abort();
     try std.testing.expectEqualStrings("landed via redo log", try read.get("idle-checkpoint-doc"));
+}
+
+test "lite ride-along ticket resolves within the idle window even if the idle-flush task never starts" {
+    // Regression: a lone ride-along ticket's own wait must never depend on
+    // `ensureRideAlongFlushStarted`'s spawned `concurrent()` task actually
+    // running. Observed live (issue1431's maintenance-replay path, under a
+    // debugger attached to the stuck process): with no later `stageRideAlong`
+    // call and no foreground write to lead the queue, a lone ride-along
+    // ticket's `wait()` hung indefinitely because the idle-flush task never
+    // got scheduled at all -- only one thread existed in the whole process.
+    // Simulated here with `ride_along_flush_unavailable` set directly
+    // (an `Io` with no real background concurrency, e.g. a single-worker
+    // runtime, would reach the same state through `ensureRideAlongFlushStarted`'s
+    // own `concurrent()` failure) rather than constructing a broken `Io`.
+    // `Ticket.waitSequence`'s own bounded wait-then-drive loop must resolve
+    // the ticket regardless, within about `ride_along_idle_ns`.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "ride-along-no-flush-task.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{});
+    defer store.close();
+    store.ride_along_idle_ns = 20 * std.time.ns_per_ms;
+    store.ride_along_flush_unavailable.store(true, .release);
+
+    const Context = struct {
+        fn apply(_: *anyopaque, file: *native.NativeFile) !void {
+            try file.putDocument("no-flush-task", "rode along anyway");
+        }
+    };
+    var ctx: u8 = 0;
+    const started_ns = antfly_platform.time.monotonicNs();
+    const ticket = try store.stageRideAlong(.{ .context = &ctx, .apply = Context.apply });
+    // Never started: `ensureRideAlongFlushStarted` must bail out on the
+    // `ride_along_flush_unavailable` check before ever attempting
+    // `concurrent()` again.
+    try std.testing.expect(!store.ride_along_flush_started.load(.acquire));
+    try ticket.wait();
+    const elapsed_ns = antfly_platform.time.monotonicNs() -| started_ns;
+    // Resolved by the waiter's own bounded wait-then-drive, not a
+    // background task: bounded by roughly `ride_along_idle_ns`, with
+    // generous slack for scheduling jitter under load -- never
+    // indefinitely.
+    try std.testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+
+    var reopened = try Store.open(alloc, path, true);
+    defer reopened.close();
+    const value = try reopened.file.getDocumentAlloc(alloc, "no-flush-task");
+    defer if (value) |bytes| alloc.free(bytes);
+    try std.testing.expectEqualStrings("rode along anyway", value orelse return error.TestExpectedEqual);
 }
 
 test "lite ride-along undurable-bytes threshold triggers exactly 1 sync" {

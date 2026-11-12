@@ -175,6 +175,8 @@ Each kind of ride-along work is safe to lose in a crash because it can be recomp
 
 **One journal entry per commit, shared by every lane.** The CPU agent's `document_index` key trace found a primary-only write (no managed indexes at all) still appending a `replayEntryKey` copy and a paired `replayLatestSequenceKey` marker per active consumer hint -- five of each in that fixture, dominating the per-commit page count (6.8 pages/write). `writeReplayEntries` (`storage/lite/docstore.zig`) now writes exactly one physical entry per commit, under the `replay_all_kind` lane; it no longer fans the payload out (filtered per hint, via `encodeReplayPayloadForHint`) into a separate key per active hint, and no longer writes a per-hint `replayLatestSequenceKey` at all. A hint-specific lane read (`forEachReplayLaneFrom(hint_ordinal, ...)`) now always resolves to `forEachReplayLane`'s filtering wrapper around the single "all" lane: it scans that lane by sequence, checks the entry's hint bitmask cheaply (`encodedRecordHintMask`, no decode, before deciding whether to do the real decode+filter work), and only for a match does it decode, project through the same `encodeReplayPayloadForHint` that used to run at write time, and hand the caller byte-identical output to before -- now computed lazily on the entries a catch-up scan actually visits, not on every commit regardless of whether anything ever reads that lane. `storage/docstore.zig`'s `latestReplaySequenceForOrdinal` (the cross-backend debt/target-sequence probe) falls back to the single producer head sequence (`lastReplaySequence`) when the per-hint marker key is absent, which is now always true for Lite; a backend that still writes the per-hint marker (unaffected -- this change is Lite-only) keeps its exact answer. The credit ledger charges exactly one record per append now (previously an upper bound across every active lane); retirement's own per-lane deletion loop is unaffected (it already deletes by physical key range per lane and simply finds nothing in a hint lane going forward). Two existing lite-side tests asserted the old per-lane physical shape directly (`expectLedgerMatchesScanForTest` scanning every hint lane for its own copy; a retirement-clamp test reading a per-hint key's raw bytes) and were updated to the new one-entry reality rather than reflecting a now-nonexistent write.
 
+**`applied_sequence` means "complete through N", not "touched N".** A consumer's applied watermark advancing to N asserts that every record up to N is accounted for -- either materialized (relevant, and applied) or verified irrelevant (scanned under this consumer's hint and found not to apply). The shared lane makes the second case common: a consumer with no relevant record anywhere in a range still has its own records-not-mine genuinely scanned and hint-filtered (`replay_hint_filter_skips`) before `canAdvanceDerivedToTargetAfterReplayAsync` credits the range, exactly like the dense certified-empty generation (`ensureDensePostingCoverageByName`) credits a generation with zero embeddings once its artifact counter is proven to match. A verified-empty advance is therefore not vacuous and not a bug: it never advances past the extent that was actually scanned, and an index that is gated or blocked (never attempted, not merely found irrelevant) still correctly stays put -- see `db.zig`'s `"db replay respects per-index applied watermarks"` (verified-empty, allowed to advance) against `"db source-only batch retains a certified empty dense generation"` (gated, must not advance).
+
 **Co-located per-commit metadata keys.** `GlobalReplayKind.next_sequence` moved from ordinal `0x02` to `0x58`, immediately next to `outcome_receipt` (`0x55`), `journal_format_version` (`0x56`) and `journal_credit_ledger` (`0x57`) in `storage/internal_keys.zig`. These are the per-commit metadata keys written on (or near) every append -- the producer's head sequence, the exported-write receipt, and the credit ledger -- and previously sorted far apart from each other, interleaved with dozens of other, far less frequently written, replay-metadata key families (`artifact_presence`, `terminal_failure_*`, `graph_contender`, etc.). Four consecutive ordinals guarantee the same B-tree leaf regardless of which of those other families a given store happens to have populated.
 
 **Crash invariant.** Ride-along work may be lost at a crash. Acknowledged work may not, and credits may not leak.
@@ -1797,19 +1799,236 @@ snapshot taken once at `beginTransaction`, which `stageMutation` never
 touches): `self.transaction_header.?.checkpoints[...].commit_sequence
 + 1`.
 
-**Not yet done**: the `inode_lock.Entry`-resident shared structure
-itself (so a writer's `self.file` and every `ReadGeneration.file` on
-the same inode reference the *same* overlay instead of each building
-an independent copy), per-version reclaim keyed on durable-checkpoint-
-coverage plus `minimumPinnedSequence()` (today's mechanism for that
-frontier is already `commit_sequence`-keyed, the right kind of number,
-but split between a Store-private in-process half and a cross-process
-region half that only sees *coordinated* readers -- a real gap to
-resolve as part of wiring this up, not just plumbing), and
-`observeReadCheckpoint` actually advancing a generation's read mark
-against that shared structure. `ReadGeneration` itself is still
-unfixed; WS5's `error.ReplayIndexUnavailable` failure (and the general
-class it represents) remains open until that lands.
+**Landed since (§9.6b)**: the `inode_lock.Entry`-resident shared
+structure itself, per-version reclaim, and a separate, general
+in-process reader-pin registry that closes a related but distinct
+gap in the page-reuse frontier. See §9.6b for the full account.
+
+### 9.6b Cross-instance sharing, per-version reclaim, and the in-process reader-pin registry
+
+Landed: `redo_overlay.zig` (new, standalone module -- no `native.zig`/
+`inode_lock.zig` dependency, avoiding the import cycle `inode_lock.zig`
+holding one by value would otherwise create) holds `VersionedOverlayEntry`
+(moved here unchanged) and a new `SharedRedoOverlay`: three roots'
+worth of versioned maps, a page-shaped-write map (external value
+chains only), a `durable_checkpoint_sequence`, and a `pins` multiset
+(see below). `inode_lock.Entry` gained a `redo_overlay: ?SharedRedoOverlay`
+field, next to `region`, and `ensureRedoOverlay(entry, io, ctx, populate)`:
+lazily populates it once per `Entry` (so every `NativeFile` on this
+inode -- the live writer and every `ReadGeneration.file` alike --
+reference the *same* instance), running `populate` only for the
+genuine first opener. `RedoCommitState` (`native.zig`) now holds
+`shared: *SharedRedoOverlay` instead of its own `logical_overlay`/
+`overlay` maps; every read/write path that touched those (point reads,
+`checkpointRedoLog`'s fold/clear, `OverlayScanState`, `readBackingPages`'
+page-overlay check, `hasLiveDocumentOutsidePrefix`) now goes through
+`SharedRedoOverlay`'s own methods instead.
+
+`recoverRedoLog` is two-pass to make this safe: a cheap, metadata-only
+replay runs for *every* opener (using the function's own allocator) to
+get `outcome`/the final `CompactCheckpoint` -- every opener needs this
+for its own `redo.writer`/`self.header` regardless of who populates the
+shared overlay. `ensureRedoOverlay`'s own `populate` callback (invoked
+only for a genuine first opener) then runs a second, full replay
+directly into the shared structure, using `std.heap.page_allocator`
+unconditionally -- the structure outlives, and is shared across,
+whichever instance populated it, so it cannot be tied to any one
+caller's own allocator (the same rule `inode_lock.zig`'s own doc
+comment already establishes for `region`). A naive "replay once with
+the caller's allocator, then hand the result to the shared structure"
+alternative is unsafe for exactly this reason (allocator-ownership
+mismatch across instances) and was deliberately rejected.
+
+`resolveAlloc` (renamed from `resolve`) returns an owned copy of the
+resolved value, not a borrowed pointer into the chain: once the
+structure is shared across threads/instances, a reference held across
+the method's own `unlock` is a real use-after-free risk (a concurrent
+`reclaim` could free the exact node just resolved). Every caller in
+`native.zig` (`redoOverlayEntry` and its ten-odd call sites) was
+updated to free the returned value after use; `LiveRecordCursor.next`
+(whose own contract says a returned slice "remain[s] valid until the
+next call to `next()`") holds the value in a new `overlay_value` field
+instead of freeing it immediately, to match that contract.
+
+**Per-version reclaim** (`SharedRedoOverlay.reclaim`): a version is
+dropped once it is both covered by a durable checkpoint
+(`durable_checkpoint_sequence`) and strictly older than every live
+pin. `checkpointRedoLog` calls it (with the checkpoint that just
+landed, which covers everything it folded by construction) instead of
+unconditionally clearing every map, since a reader pinned to an older
+checkpoint may still need a version this checkpoint's own build also
+folded into real pages. When no pin is live at all, a key's chain
+collapsing to a single checkpoint-covered version is dropped
+*entirely* (the key itself removed, not just trimmed to one node):
+nothing could resolve to it instead of the real tree, which already
+has the same value as of the fold. (First landed without this last
+step -- the chain-trim-to-one-node-but-never-remove-the-key version
+left `count()` permanently non-zero after a checkpoint, breaking an
+existing integration test that asserted the overlay goes empty with no
+readers around; fixed by collecting keys to drop during the map
+iteration and removing them afterward, since this map's iterator does
+not tolerate a concurrent `fetchRemove` of the entry it is visiting.)
+
+**Pin tracking, a scoped decision**: `SharedRedoOverlay.pin`/`unpin`
+are a new, dedicated, in-process-only multiset on the structure
+itself, *not* routed through the existing `minimumPinnedSequence`/
+`shared_lock_region.zig`/`ReaderCoordinator` cross-process machinery.
+Reasoning: that machinery exists to let *coordinated* readers be seen
+cross-process; the overlay itself is never visible cross-process at
+all (it is a pure in-process cache of logged-but-not-yet-checkpointed
+mutations), so only the in-process half is ever relevant to it, and a
+narrower, dedicated tracker is safer to land under time pressure than
+restructuring code several other subsystems depend on. Wired into
+docstore.zig's `pinInitializedReadGeneration`/`releaseReadGeneration`
+(the same two functions already pin/unpin the general reader-pin
+registry below), guarded by `generation.file.redo != null`.
+
+**A separate, related gap, found while investigating a reported
+32-thread/maintenance data-corruption bug** (which turned out to have
+an unrelated root cause -- a stale writer instance -- fixed by the
+writer-side agent itself): `NativeFile.reuseFrontier`/
+`metadataReuseFrontier` already combine four inputs end to end
+(checkpoint floors, `epoch_window` from `region.minimumPinnedSequence`/
+`minimumMetadataPinnedSequence`, `minimum_reader_sequence` -- itself a
+region scan plus the `ReaderCoordinator`'s own in-process inode-only
+fence list -- and `Store.reader_frontier`, the `ReadGeneration`/
+`ReadPin` mechanism's direct atomic, independent of `region`). Every
+reader category traced by direct code reading (ordinary `Txn` reads/
+writes via `ReadPin`→`reader_frontier`, artifact leases via either
+`ReaderCoordinator.registerFull` or catalog-reachability,
+`forkBorrowedRead`'s documented parent-pin lifetime contract) turned
+out to already be covered by one of these. One genuine, if narrower,
+gap remained: a reader that opens its *own*, plain, uncoordinated
+`NativeFile` directly -- `captureFullReadSnapshot`'s own reader
+(`coordinated = self.reader_coordinator != null and self.durable_header
+== null and !self.read_only`, false in the common case of no
+`reader_coordinator` configured at all, which is also vacuum's own
+verification snapshot's path, since `performVacuum` calls exactly this)
+-- never claims a `region` slot and is a *different* `NativeFile`
+instance than whichever one `Store.reader_frontier` happens to be wired
+into, so none of the four existing terms reach it.
+
+Fixed with a second new addition to `inode_lock.Entry`:
+`reader_pins: std.ArrayListUnmanaged(ReaderPin)` (a `{ data: ?u64,
+metadata: ?u64 }` multiset, mirroring `region`'s own data/metadata
+split), `pinReader`/`unpinReader`, and `minimumReaderSequence`/
+`minimumMetadataReaderSequence` (the in-process-registry's own minimum
+alone -- callers combine it with `region`'s answer via `@min`, matching
+every other term already in `reuseFrontier`). `metadataReuseFrontier`/
+`reuseFrontier` each gained one more `@min` term reading this through
+`self.inode_lock_ref`. `captureFullReadSnapshot` pins *before* opening
+its own reader, using `self`'s own currently-known checkpoint sequence
+as the guard value: whatever the new reader actually resolves to a
+moment later can only be the same sequence or later (checkpoints never
+move backward), so this is always a safe, if momentarily conservative,
+lower bound -- closing the window a concurrent frontier computation
+could otherwise run through between "the checkpoint the new reader
+will depend on becomes real" and "a pin exists to protect it." The pin
+is released in `close()`, before `inode_lock.unref` (which can be the
+call that frees the `Entry` this pin lives on). Also wired into
+docstore.zig's `pinInitializedReadGeneration`/`releaseReadGeneration`
+(redundant with `reader_frontier` for that specific category, but
+gives every category one single mechanism to reason about going
+forward). A per-inode `last_committed_sequence: std.atomic.Value(u64)`
+field was reserved next to `reader_pins` for the writer-side agent's
+own stale-writer-instance detection (a different, unrelated fix); not
+populated or read by this module.
+
+New test: "lite uncoordinated snapshot reader pins its checkpoint and
+survives page reuse" (`native.zig`) -- opens a plain snapshot with no
+`reader_coordinator` configured anywhere, confirms its pin registers,
+drives many durable overwrites and a bounded number of reclamation
+attempts while the snapshot stays open (`reusable_pages` stays `0`
+throughout -- note this needs a *bounded* retry loop, not a
+`retirementNeedsService()`-driven one, since an externally-pinned
+backlog never resolves on its own the way crossing a durability
+barrier does), confirms the snapshot still reads its original,
+untouched page correctly, then closes it and confirms the same backlog
+drains and pages become reusable.
+
+`ReadGeneration` itself is now fixed: WS5's `error.ReplayIndexUnavailable`
+failure and the general class it represented depended on exactly this
+cross-instance sharing landing.
+
+### 9.6c Point 3 continued: the log-full/OutcomeUnknown cluster
+
+Investigating item 3 (re-running `storage.lite.docstore.test` with the
+default temporarily flipped, reverted before committing -- the real
+flip is still item 4, gated on (2)) found 6 failures, not the
+`error.ReplayIndexUnavailable` case this section originally expected:
+five surfaced as `error.OutcomeUnknown` from `redo_log.zig`'s
+`error.LogFull` inside `appendRecord`, reached via `publishCheckpoint`/
+`publishBareCommit`/`putDocumentBatch`/`putDocument` -- several
+existing reclamation/budget tests call `store.file.putDocument`
+directly in a loop, bypassing `Store` (and so its background idle-timer
+checkpoint trigger) entirely. Root cause: `maybeAutoCheckpointRedoLog`'s
+25%-remaining check is reactive, run *after* a commit's own
+`appendRecord` already succeeded, to decide whether the *next* commit
+needs a checkpoint first -- it cannot protect the commit that is
+currently failing.
+
+Fixed (design rule: a log-full condition must be decided before
+anything is appended, never surfaced as `OutcomeUnknown`, since it is
+knowable in advance): a new `RedoCommitState.pendingRecordLen()`
+returns the exact byte length `appendRecord` would write right now
+(framing included); both call sites (`publishCheckpoint`'s durable
+branch, and `commitTransactionWithDurability`'s ride-along/deferred
+branch) check it against `redo.writer.remaining()` *before* calling
+`appendRecord` at all. If it doesn't fit, they call `checkpointRedoLog()`
+and then return immediately, skipping the append (and the now-stale
+`checkpoint`/`next` value's own publication) entirely -- never a
+partial append. This is safe specifically because the current commit's
+own mutations are already staged in `redo.shared` by the time either
+call site runs (`flushTransactionWrites`'s diversion loop always runs
+first), so `checkpointRedoLog`'s fold necessarily covers them too:
+there is nothing left to log once it returns. If `checkpointRedoLog`
+itself fails (e.g. no disk space to allocate the real pages it needs),
+that error propagates unchanged -- `redo.shared`/`redo.writer` are
+untouched by a failed checkpoint attempt, so the log stays intact and
+the caller sees a clean, pre-decision error rather than a torn append,
+matching what these tests' own names already expect (deferral, retry,
+resume when capacity returns). `checkpointRedoLog`'s signature changed
+from an inferred `!void` to an explicit `anyerror!void` to break a
+dependency loop Zig's error-set inference otherwise reports once
+`commitTransactionWithDurability` calls it directly (it already called
+it transitively, through `maybeAutoCheckpointRedoLog`, without issue --
+the loop only appears once the call is unconditional on this new path).
+
+Confirmed fixed (3 of the 5): "reclamation writer busy retries gate
+image copies until publication is available", "reclamation low disk
+defers rewriting and resumes when capacity returns", "reclamation
+issue1431 canceled automatic rewrites retry without file growth" all
+pass now.
+
+Not yet fixed -- a different, deeper issue each, both now surfacing
+their *real* failure mode instead of a generic `OutcomeUnknown`:
+- "reclamation stale quota estimates expire after roots shrink" now
+  fails with `error.LiteStorageBudgetExceeded` instead. Writes 128 KiB
+  documents (so each commit's own record, not the log's small
+  budget-scaled capacity, is the relevant size) and derives its own
+  `max_storage_bytes` cap from a physical file size measured partway
+  through -- exactly the kind of timing assumption §9.7a's own "second
+  audit" paragraph already flagged as unaudited for redo-log mode (a
+  commit's physical footprint no longer lands at the same point in the
+  test's own timeline once checkpoints happen eagerly rather than per
+  commit).
+- "reclamation retries reuse estimates and reassess changed roots when
+  admitted" fails on `std.testing.expect(!std.meta.eql(checkpoint,
+  store.file.activeCheckpoint()))` -- it assumes any committed mutation
+  changes the active checkpoint slot, which is true for the legacy
+  path but not for a redo-log commit that only appends to the log
+  without ever running `checkpointRedoLog` (the whole point of
+  deferring the physical build). The same unaudited-assumption
+  category, not a new bug from this fix.
+- "reclamation budget rejects a mutation before exhausting capacity"'s
+  `error.InvalidNativeFreeMap` (expected `error.LiteStorageBudgetExceeded`)
+  is unchanged by this fix -- most likely free-map handling under redo
+  plus a budget, overlapping with (2)'s indexed-reclamation work rather
+  than this cluster.
+
+Verified the fix itself does not regress already-landed work:
+`-Dtest-filter="redo"` (18/18) and `-Dtest-filter="reuse"` (235/235)
+both still pass with the default back to legacy.
 
 ### 9.7a Point 3: threading the option, and holding back the default
 
