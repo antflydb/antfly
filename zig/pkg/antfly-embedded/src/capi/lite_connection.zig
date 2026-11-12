@@ -22,6 +22,7 @@ const h = @import("handles.zig");
 const api = @import("db.zig");
 const std = h.std;
 const native = h.lite_backend.native;
+const inode_lock = @import("../storage/lite/inode_lock.zig");
 const antfly_platform = @import("antfly_platform");
 const alloc = std.heap.c_allocator;
 
@@ -2038,6 +2039,23 @@ pub const Owner = struct {
         }
         if (self.writer_lane.takeParkedForRoot(self.current)) |held| {
             var lease = held;
+            // The foreground write that parked this lease may have staged
+            // ride-along work (enrichment/catalog bookkeeping) still
+            // sitting undriven in the store's own group-commit queue --
+            // nobody drives a ride-along request but a foreground leader,
+            // the idle-flush timer, or this exact barrier (`store
+            // .ensureDurableForReuse`, really just `forceDrainDurable`).
+            // Drain it now, before this lease is handed to maintenance:
+            // without this, that write's own `Ticket.waitSequence` could
+            // still be parked waiting on it, and once its own bounded wait
+            // (`ride_along_idle_ns`) elapses it drives the group itself --
+            // directly mutating `self.file` with no regard for whoever
+            // currently holds the writer lease, racing maintenance's own
+            // concurrent use of the very same file. Draining here, while
+            // nothing else can be concurrently admitted (this call already
+            // holds the owner gate), resolves that write's ticket itself
+            // and leaves nothing for its own wait to ever need to drive.
+            if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
             stats.recordAcquired(.handoff, 0);
             wal_trace.recordOp(.maintenance_lease_acquired);
             lease.startHold(stats);
@@ -2081,6 +2099,13 @@ pub const Owner = struct {
             stats.recordAcquired(.handoff, 0);
             break :blk held;
         } else if (self.writer_lane.takeParkedForRoot(self.current)) |held| blk: {
+            // See `acquireMaintenancePathLeaseAssumeLocked`'s own doc
+            // comment: drain any ride-along work this lease's parking
+            // writer left undriven before handing it off, so that
+            // write's own `Ticket.waitSequence` never needs to drive the
+            // group itself while this call is concurrently using the
+            // same file.
+            if (self.current.?.owned_lite_backend.?.native_docstore) |store| store.ensureDurableForReuse();
             stats.recordAcquired(.handoff, 0);
             break :blk held;
         } else blk: {
@@ -2314,7 +2339,23 @@ pub const Owner = struct {
         const file = &foreground.owned_lite_backend.?.native_docstore.?.file;
         if (self.maintenance_snapshot) |snapshot| {
             const captured = &snapshot.owned_lite_backend.?.native_docstore.?.file;
-            if ((!need_database or snapshot.db_live) and std.meta.eql(file.header, captured.header) and
+            // Header/inode equality alone is not enough: this snapshot is a
+            // separate NativeFile instance from `foreground`'s own, with its
+            // own in-memory allocator/ledger state, never updated by writes
+            // the *foreground* instance makes. Cross-check its own last-seen
+            // commit sequence against the per-inode registry's shared,
+            // process-wide latest -- published by every NativeFile instance
+            // on this inode after each durable commit (see
+            // `NativeFile.publishCommittedSequenceToInode`) -- so a snapshot
+            // another writer has since advanced past is never reused as
+            // though it were current: that is exactly the self-deadlock's
+            // physical-maintenance sibling, a maintenance reclaim staged
+            // against pages a later foreground commit already reused.
+            const captured_is_current = if (captured.inode_lock_ref.load(.acquire)) |entry|
+                captured.activeCheckpoint().commit_sequence >= inode_lock.committedSequence(entry)
+            else
+                true;
+            if (captured_is_current and (!need_database or snapshot.db_live) and std.meta.eql(file.header, captured.header) and
                 (try file.file.stat(file.runtime())).inode == (try captured.file.stat(captured.runtime())).inode)
             {
                 self.configureRetirementBudget(snapshot.owned_lite_backend.?.native_docstore.?);

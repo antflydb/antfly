@@ -6771,6 +6771,51 @@ pub const NativeFile = struct {
         self.header = header;
     }
 
+    /// The real fix for the stale-writer corruption (`UnexpectedNativePageKind`
+    /// seen under sustained concurrent Lite load): a second `NativeFile`
+    /// instance on the same inode in this process -- most commonly a
+    /// maintenance turn's own detached snapshot (`refreshMaintenanceSnapshot`),
+    /// but potentially a writer-lease handoff's receiving instance too -- can
+    /// fall behind another instance's commits and still go on to allocate or
+    /// reuse pages out of its own now-stale free map. By the time
+    /// `publishCheckpoint`'s own backstop assertion would catch that, the
+    /// damage (a page another commit already made live has been reused and
+    /// overwritten) is already done. The fix is to catch it here instead,
+    /// before this instance gains the right to allocate or reuse anything:
+    /// every entry point that leads to `pageAllocatorFromFreeMap`/
+    /// `pageAllocatorFromFreeMapWithProof` for an ordinary write
+    /// (`beginTransaction`, which `reclaimPagesImpl` also funnels through)
+    /// or for vacuum (`vacuumWithCancel`) calls this first.
+    ///
+    /// If this instance's own base (its currently active checkpoint) is
+    /// behind the inode registry's shared, process-wide latest known-durable
+    /// sequence, refresh in place: re-read the header and checkpoint slots
+    /// from disk (cheap -- the same file's pages are already in the OS page
+    /// cache even for an unsynced ride-along commit) and pick the active
+    /// checkpoint exactly as a fresh open would, then reuse
+    /// `adoptIndexPublicationHeader`'s cache/ledger invalidation to rebind
+    /// this instance to it, exactly as a borrowed index writer rebinds to
+    /// its owner's newest header. Never truncates: unlike `open`'s own
+    /// recovery, this is not resolving a crash, so a rejected candidate's
+    /// tail is left alone for whichever instance still needs it.
+    fn refreshIfWriterBaseStale(self: *NativeFile) !void {
+        const entry = self.inode_lock_ref.load(.acquire) orelse return;
+        const latest = inode_lock.committedSequence(entry);
+        const base = self.activeCheckpoint().commit_sequence;
+        if (base >= latest) return;
+        const io = self.runtime();
+        var header_bytes: [header_size]u8 = undefined;
+        try readHeaderExactAt(self.file, io, &header_bytes);
+        var header = try decodeHeader(&header_bytes);
+        const file_size = (try self.file.stat(io)).size;
+        header.checkpoints = loadCheckpointSlots(self.file, io, header.page_size, file_size);
+        const recovered = try recoverActiveCheckpoint(self.file, io, header, file_size, false);
+        header.active_checkpoint = recovered.index;
+        const new_sequence = header.checkpoints[header.active_checkpoint].commit_sequence;
+        std.log.debug("lite: NativeFile instance refreshed a stale writer base (path={s} ptr={*} old_base={d} new_base={d} registry_latest={d})", .{ self.path, self, base, new_sequence, latest });
+        try self.adoptIndexPublicationHeader(header);
+    }
+
     /// Carry pending lineage across identical runtime generations, or inherit
     /// a completed proof for append-only descendants of its captured base.
     /// The caller serializes publications; foreign headers, inode changes
@@ -11963,6 +12008,7 @@ pub const NativeFile = struct {
         // on the same path in an `externally_locked` setup).
         const data_lock = try self.acquireInodeLock(.exclusive, false, false, "vacuumWithCancel");
         defer data_lock.release(self.runtimeIo());
+        try self.refreshIfWriterBaseStale();
         // Replaces the old namespace-directory scan: a live pin in the
         // region's reader table (any reader, indexed or not -- the region
         // doesn't distinguish) refuses the vacuum rather than rewriting
@@ -14287,6 +14333,7 @@ pub const NativeFile = struct {
         // `reconcilePublicationUncertainty`. Only a disk that is still
         // failing (or an inconsistent latch) falls through to the refusal.
         if (self.checkpoint_publication_uncertain) try self.reconcilePublicationUncertainty();
+        try self.refreshIfWriterBaseStale();
         self.transaction_header = self.header;
         self.artifact_lease_transaction = false;
         self.allocator_certificate_staged = false;
@@ -14809,7 +14856,42 @@ pub const NativeFile = struct {
     /// would then re-verify a stale entry list an unrelated, possibly
     /// already-overwritten commit wrote. `false` resets all four to the
     /// safe presynced default before anything else.
+    /// Publishes this handle's own just-durable commit sequence to the
+    /// per-inode registry entry (shared, in this process, by every other
+    /// `NativeFile` instance on the same inode), so any of them can tell
+    /// whether its own in-memory header/allocator state is stale relative
+    /// to what another instance already committed -- the writer-side twin
+    /// of the on-disk stale-base check. A no-op if this handle never
+    /// registered with the registry (e.g. a bare test construction).
+    fn publishCommittedSequenceToInode(self: *NativeFile) void {
+        if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.publishCommittedSequence(entry, self.activeCheckpoint().commit_sequence);
+    }
+
     fn publishCheckpoint(self: *NativeFile, proposed: CheckpointSlot, manifest_prepared: bool, hooks: ?SyncLockHooks) !void {
+        // Backstop only: the real fix is `refreshIfWriterBaseStale`, called
+        // from every entry point that gains the right to allocate or reuse
+        // a page (`beginTransaction`, which `reclaimPagesImpl` also funnels
+        // through, and `vacuumWithCancel`) *before* any allocation happens.
+        // By the time a stale instance reaches publication, it has already
+        // reused and overwritten pages out of its own stale free map --
+        // refusing the publish here is too late to prevent the corruption,
+        // only to detect that it already happened. This must never fire;
+        // if it does, something upstream failed to refresh (or a new path
+        // reaches `publishCheckpoint` without going through one of the
+        // guarded entry points above), and that is a hard bug, not a
+        // transient condition to retry around. Panics rather than
+        // returning a catchable error, so it can never be silently
+        // swallowed by a broad catch anywhere between here and a test
+        // harness.
+        if (self.transaction_header == null) {
+            if (self.inode_lock_ref.load(.acquire)) |entry| {
+                const base = self.activeCheckpoint().commit_sequence;
+                const latest = inode_lock.committedSequence(entry);
+                if (base < latest) {
+                    std.debug.panic("lite: stale writer base reached publishCheckpoint (path={s} base={d} latest={d} proposed_seq={d})", .{ self.path, base, latest, proposed.commit_sequence });
+                }
+            }
+        }
         var checkpoint = proposed;
         if (!manifest_prepared) {
             checkpoint.presynced = true;
@@ -14878,6 +14960,7 @@ pub const NativeFile = struct {
                 state.released_data_pages = 0;
                 state.retired_inline_bytes = 0;
             }
+            self.publishCommittedSequenceToInode();
             return;
         }
         const next_slot: u8 = if (self.header.active_checkpoint == 0) 1 else 0;
@@ -14949,6 +15032,7 @@ pub const NativeFile = struct {
             state.released_data_pages = 0;
             state.retired_inline_bytes = 0;
         }
+        self.publishCommittedSequenceToInode();
     }
 
     fn notifyPublication(self: *NativeFile) void {

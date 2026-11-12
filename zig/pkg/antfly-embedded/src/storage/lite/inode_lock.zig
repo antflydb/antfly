@@ -285,7 +285,36 @@ pub const Entry = struct {
     /// path, exactly like `ensureFd`'s existing lazy-reopen pattern after
     /// `entry.fd` goes back to `null`.
     region: ?shared_lock_region.Region = null,
+    /// The highest commit sequence any `NativeFile` in this process has
+    /// durably published for this inode, so any other `NativeFile` instance
+    /// on the same inode (a maintenance turn's own detached snapshot, a
+    /// writer-lease handoff's receiving instance, ...) can tell whether its
+    /// own in-memory header/allocator state is still current before staging
+    /// or committing writes of its own -- the writer-side twin of the
+    /// on-disk stale-base check. Populated under the publishing commit's own
+    /// exclusion (`NativeFile.publishCheckpoint`); read lock-free via a
+    /// monotonic compare, never regressed by an older commit's publish
+    /// racing a newer one. See `publishCommittedSequence`/`committedSequence`.
+    last_committed_sequence: std.atomic.Value(u64) = .init(0),
 };
+
+/// Publishes `sequence` as this inode's own latest known-durable commit,
+/// monotonically: a concurrent publish of an older sequence (e.g. a stale
+/// writer that is only now discovering/reporting what it already knew)
+/// never regresses a newer one already recorded. Called once per durable
+/// checkpoint publish, from the publishing `NativeFile` itself.
+pub fn publishCommittedSequence(entry: *Entry, sequence: u64) void {
+    var current = entry.last_committed_sequence.load(.monotonic);
+    while (sequence > current) {
+        current = entry.last_committed_sequence.cmpxchgWeak(current, sequence, .monotonic, .monotonic) orelse return;
+    }
+}
+
+/// This inode's latest known-durable commit sequence in this process (0 if
+/// nothing has published yet). See `publishCommittedSequence`.
+pub fn committedSequence(entry: *Entry) u64 {
+    return entry.last_committed_sequence.load(.monotonic);
+}
 
 /// Lazily opens (once per `Entry`, shared by every reference to it) and
 /// returns this inode's shared lock region. `entry.mutex` serializes
