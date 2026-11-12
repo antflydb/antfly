@@ -300,7 +300,7 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
         # More than one native backfill/cleanup page, committed before install.
         values = ",".join(f"({i}, '{timestamp}', 'north')" for i in range(3, 503))
         sql("INSERT INTO sensors (id, recorded_at, site) VALUES " + values)
-        for batch in range(9):
+        for batch in range(18):
             values = ",".join(
                 f"({1000 + i}, '{timestamp}', 'site-{i}')"
                 for i in range(batch * 500, (batch + 1) * 500)
@@ -495,7 +495,11 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
                 "interval_ns": str(interval),
                 "mutable_for_ns": str(mutable_for),
                 "retention_ns": str(retention),
-                "measures": [{"name": "sum_id", "law": "sum", "field": "id"}],
+                "measures": [
+                    {"name": "sum_id", "law": "sum", "field": "id"},
+                    {"name": "avg_id", "law": "avg", "field": "id"},
+                    {"name": "n", "law": "count"},
+                ],
             },
         )
         overflow = wait_for(
@@ -514,10 +518,39 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             sql(
                 f"SELECT sum_id FROM retained_summary(public.overflow_sum, '{first_bucket}', '{first_bucket + interval}')"
             )
+
+        def check_overflow_projection():
+            selected = sql(
+                f"SELECT n, avg_id FROM retained_summary(public.overflow_sum, '{first_bucket}', '{first_bucket + interval}')"
+            )["rows"]
+            assert len(selected) == 1 and int(selected[0][0]) == 3
+            assert 1e308 < float(selected[0][1]) < 1.7976931348623157e308
+            counted = sql(
+                f"SELECT COUNT(*) FROM retained_summary(public.overflow_sum, '{first_bucket}', '{first_bucket + interval}')"
+            )["rows"]
+            assert int(counted[0][0]) == 1
+            with pytest.raises(OSError, match="400.*22003"):
+                sql(
+                    f"SELECT n FROM retained_summary(public.overflow_sum, '{first_bucket}', '{first_bucket + interval}') WHERE sum_id > 0"
+                )
+
+        check_overflow_projection()
         api(
             "POST",
             overflow_path + "/close",
-            {"expected_revision": overflow["revision"], "discard": True},
+            {"expected_revision": overflow["revision"]},
+        )
+        archived_overflow = wait_for(
+            lambda: api("GET", overflow_path),
+            lambda row: row["phase"] == "closed",
+            45,
+            server,
+        )
+        check_overflow_projection()
+        api(
+            "POST",
+            overflow_path + "/close",
+            {"expected_revision": archived_overflow["revision"], "discard": True},
         )
         wait_for(
             lambda: api("GET", overflow_path),
@@ -590,8 +623,8 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
                     break
                 assert after not in seen
                 seen.add(after)
-            assert len(collected) == 4501
-            assert len({tuple(row["dimensions"]) for row in collected}) == 4501
+            assert len(collected) == 9001
+            assert len({tuple(row["dimensions"]) for row in collected}) == 9001
             return collected
 
         read_all_pages()
@@ -675,6 +708,13 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
             server,
         )
         print("closed", closed, flush=True)
+        # More than 32 archive extents: the required OFFSET + LIMIT prefix
+        # crosses the first planning page without scanning the whole range.
+        across_pages = sql(
+            f"SELECT sample_count FROM retained_summary(public.sensor_counts, '{first_bucket}', '{first_bucket + interval}') LIMIT 1 OFFSET 8500"
+        )["rows"]
+        assert len(across_pages) == 1 and int(across_pages[0][0]) > 0
+
         assert api("POST", path + "/query", query)["rows"] == updated["rows"]
         sql("DROP TABLE sensors")
         stop(server)

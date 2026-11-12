@@ -27,6 +27,7 @@ const setting_catalog = @import("antfly_local_sources").sql_setting_catalog;
 
 test {
     _ = @import("sql_memory_owner.zig");
+    _ = @import("retained_sql_projection.zig");
 }
 
 // Parsed syntax equality excludes diagnostic positions and is charged to the
@@ -2527,7 +2528,11 @@ pub const Adapter = struct {
         // exposing any cursor; contention never produces mixed snapshots.
         for (0..8) |_| {
             try self.context.ensureActive();
-            if (try self.captureRetainedStatement(alloc, requests)) |read| return read;
+            const captured = self.captureRetainedStatement(alloc, requests) catch |err| switch (err) {
+                error.RetainedReadRestartRequired => continue,
+                else => return err,
+            };
+            if (captured) |read| return read;
         }
         return error.RetainedReadRestartRequired;
     }
@@ -2603,17 +2608,9 @@ pub const Adapter = struct {
         }
         const window = if (scan_request.order.len == 0 and scan_request.conditions.len == 0 and scan_request.primary_key == null) scan_request.ordered_window else null;
         const prefix = if (window) |maximum| maximum > 0 and maximum <= read.max_input_rows else false;
-        var request: read.Request = .{ .start_ns = try self.retainedBound(a, binding.definition.start), .end_ns = try self.retainedBound(a, binding.definition.end), .max_rows = if (prefix) @intCast(window.?) else read.max_input_rows, .dimensions_json = dimension_filter, .page = prefix };
-        var result = try read.readResolved(self.server, snapshot, definition, request, self.context);
-        // A bounded archive coverage page can end before the requested number
-        // of rows. Fall back to the complete admitted cut instead of silently
-        // treating that partial page as exhaustion.
-        if (prefix and result.next != null and result.rows.len < request.max_rows) {
-            result.deinit();
-            request.page = false;
-            request.max_rows = read.max_input_rows;
-            result = try read.readResolved(self.server, snapshot, definition, request, self.context);
-        }
+        const projection = try @import("retained_sql_projection.zig").Projection.init(a, summary, scan_request);
+        const request: read.Request = .{ .start_ns = try self.retainedBound(a, binding.definition.start), .end_ns = try self.retainedBound(a, binding.definition.end), .max_rows = if (prefix) @intCast(window.?) else read.max_input_rows, .dimensions_json = dimension_filter, .page = prefix };
+        var result = if (prefix) try read.readResolvedPrefix(self.server, snapshot, definition, request, self.context) else try read.readResolved(self.server, snapshot, definition, request, self.context);
         defer result.deinit();
         var native_owners: usize = 0;
         for (snapshot.owners) |owner| if (owner.independent_receipt == null) {
@@ -2631,21 +2628,13 @@ pub const Adapter = struct {
         }
         var rows: std.ArrayList(catalog.Row) = .empty;
         row_loop: for (result.rows) |row| {
-            const cost = @sizeOf(catalog.Row) + row.dimensions.len + table.columns.len * (@sizeOf(std.json.Value) + 32);
-            if (cost > budget.*) return error.SqlProgramLimitExceeded;
-            budget.* -= cost;
             const key = local.storage_retained_series_archive.key(row);
             if (scan_request.primary_key) |primary| if (!std.mem.eql(u8, primary, &key)) continue;
-            var values: std.json.ObjectMap = .empty;
-            try values.put(a, "bucket_start", .{ .string = try local.datetime.formatDateTimeSignedNsAlloc(a, row.start_ns) });
-            const dimensions = try std.json.parseFromSliceLeaky([]std.json.Value, a, row.dimensions, .{ .allocate = .alloc_always });
-            if (dimensions.len != summary.dimensions.len) return error.RetainedSeriesCorrupt;
-            for (summary.dimensions, dimensions) |name, value| try values.put(a, try a.dupe(u8, name), value);
-            for (summary.measures, row.metrics) |measure, metric| try values.put(a, try a.dupe(u8, measure.name), switch (try metric.finalize(measure.law)) {
-                .null => .null,
-                .integer => |value| .{ .integer = value },
-                .number => |value| .{ .float = value },
-            });
+            const cost = projection.rowCost(row);
+            if (cost > budget.*) return error.SqlProgramLimitExceeded;
+            budget.* -= cost;
+            const projected = try projection.project(a, row);
+            const values = projected.object;
             for (scan_request.conditions) |condition| {
                 const value = if (std.mem.eql(u8, condition.column, "_id")) std.json.Value{ .string = &key } else values.get(condition.column) orelse return error.InvalidSqlBackendResponse;
                 switch (condition.op) {

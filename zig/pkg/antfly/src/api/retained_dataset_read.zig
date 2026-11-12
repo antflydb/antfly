@@ -172,6 +172,7 @@ pub const Result = struct {
     arena: std.heap.ArenaAllocator,
     rows: []const series.Bucket,
     history: dataset.InitialHistory,
+    input_rows: usize = 0,
     captures: []const Capture = &.{},
     next: ?dataset.RowKey = null,
     fn allocationFailure(self: Result, err: anyerror) anyerror {
@@ -312,7 +313,7 @@ fn readBudgeted(a: A, snapshot: Snapshot, input: Request, context: operation.Req
         next_key = codec.key(rows.items[rows.items.len - 1]);
     }
     try context.ensureActive();
-    return .{ .arena = arena, .rows = rows.items, .history = summary.initial_history, .next = next_key };
+    return .{ .arena = arena, .rows = rows.items, .history = summary.initial_history, .input_rows = visited_rows, .next = next_key };
 }
 
 /// Capture authority after the caller has authorized the qualified dataset.
@@ -333,6 +334,16 @@ pub fn fetchReadCut(server: anytype, a: A, target: local.system_catalog_domain.T
 }
 
 pub fn readResolved(server: anytype, snapshot: Snapshot, definition: dataset.Definition, input: Request, request_context: operation.RequestContext) !Result {
+    return readResolvedOwned(server, snapshot, definition, input, request_context, false);
+}
+
+/// Complete one certified finite prefix, including short/empty coverage pages.
+/// All pages share one deadline and live working-memory/input-work ceiling.
+pub fn readResolvedPrefix(server: anytype, snapshot: Snapshot, definition: dataset.Definition, input: Request, request_context: operation.RequestContext) !Result {
+    return readResolvedOwned(server, snapshot, definition, input, request_context, true);
+}
+
+fn readResolvedOwned(server: anytype, snapshot: Snapshot, definition: dataset.Definition, input: Request, request_context: operation.RequestContext, prefix: bool) !Result {
     // A result owns its arena independently of the HTTP/SQL request arena.
     // Use the reclaiming server allocator so completed partitions release
     // actual memory and admission measures peak usage, not cumulative I/O.
@@ -340,13 +351,93 @@ pub fn readResolved(server: anytype, snapshot: Snapshot, definition: dataset.Def
     const budget = try backing.create(MemoryBudget);
     errdefer backing.destroy(budget);
     budget.* = .{ .backing = backing, .limit = max_result_bytes };
-    var result = readResolvedBudgeted(server, budget.allocator(), snapshot, definition, input, request_context) catch |err| {
+    var context = try request_context.platformDeadline();
+    context.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s);
+    const PageReader = struct {
+        server: @TypeOf(server),
+        snapshot: Snapshot,
+        definition: dataset.Definition,
+        pub fn page(self: @This(), a: A, request: Request, ctx: operation.RequestContext) !Result {
+            return readResolvedBudgeted(self.server, a, self.snapshot, self.definition, request, ctx);
+        }
+    };
+    var result = (if (prefix)
+        readPrefixBudgeted(budget.allocator(), input, context, PageReader{ .server = server, .snapshot = snapshot, .definition = definition })
+    else
+        readResolvedBudgeted(server, budget.allocator(), snapshot, definition, input, context)) catch |err| {
         std.debug.assert(budget.live == 0);
         return if (err == error.OutOfMemory and budget.denied) error.DatasetPageBudgetExceeded else err;
     };
     result.budget = budget;
     return result;
 }
+fn readPrefixBudgeted(a: A, input: Request, context: operation.RequestContext, reader: anytype) !Result {
+    if (!input.page or input.max_rows == 0 or input.max_rows > max_input_rows) return error.DatasetPageBudgetExceeded;
+    var arena = std.heap.ArenaAllocator.init(a);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
+    var rows: std.ArrayList(series.Bucket) = .empty;
+    var captures: std.ArrayList(Capture) = .empty;
+    var positions: std.AutoHashMapUnmanaged(owner_model.ArchiveScope, usize) = .empty;
+    defer positions.deinit(a);
+    var request = input;
+    var history: ?dataset.InitialHistory = null;
+    var row_bytes: usize = 0;
+    var input_rows: usize = 0;
+    var next: ?dataset.RowKey = null;
+    var previous = input.after;
+    var pages: usize = 0;
+    var expected_captures: ?usize = null;
+    while (rows.items.len < input.max_rows) {
+        try context.ensureActive();
+        if (pages == 8192) return error.DatasetPageBudgetExceeded;
+        pages += 1;
+        request.max_rows = input.max_rows - @as(u32, @intCast(rows.items.len));
+        var part = try reader.page(a, request, context);
+        defer part.deinit();
+        if (part.rows.len > request.max_rows or part.input_rows > max_input_rows - input_rows) return error.DatasetPageBudgetExceeded;
+        input_rows += part.input_rows;
+        if (history) |expected| {
+            if (expected != part.history) return error.RetainedOwnerPlanChanged;
+        } else history = part.history;
+        if (expected_captures) |expected| {
+            if (part.captures.len != expected) return error.RetainedReadRestartRequired;
+        } else expected_captures = part.captures.len;
+        for (part.captures) |capture| {
+            const slot = try positions.getOrPut(a, capture.scope);
+            if (slot.found_existing) {
+                const old = captures.items[slot.value_ptr.*];
+                // Never join prefixes observed at different native cuts.
+                if (!std.mem.eql(u8, old.table, capture.table) or !std.meta.eql(old.observation, capture.observation)) return error.RetainedReadRestartRequired;
+            } else {
+                if (captures.items.len == 4096) return error.SqlProgramLimitExceeded;
+                slot.value_ptr.* = captures.items.len;
+                var copy = capture;
+                copy.table = try owned.dupe(u8, capture.table);
+                try captures.append(owned, copy);
+            }
+        }
+        if (captures.items.len != expected_captures.?) return error.RetainedReadRestartRequired;
+        for (part.rows) |row| {
+            const key = codec.key(row);
+            if (previous) |last| if (std.mem.order(u8, &key, &last) != .gt) return error.RetainedSeriesCorrupt;
+            const cost = @sizeOf(series.Bucket) + row.dimensions.len + series.metricBytes(row.metrics);
+            if (cost > max_result_bytes - row_bytes) return error.DatasetPageBudgetExceeded;
+            row_bytes += cost;
+            try rows.append(owned, .{ .start_ns = row.start_ns, .dimensions = try owned.dupe(u8, row.dimensions), .rows = row.rows, .metrics = try series.ownMetrics(owned, row.metrics) });
+            previous = key;
+        }
+        next = part.next;
+        if (next) |key| {
+            if (request.after) |last| if (std.mem.order(u8, &key, &last) != .gt) return error.RetainedSeriesCorrupt;
+            if (previous) |last| if (std.mem.order(u8, &key, &last) == .lt) return error.RetainedSeriesCorrupt;
+            request.after = key;
+            previous = key;
+        } else break;
+    }
+    return .{ .arena = arena, .rows = rows.items, .history = history orelse return error.RetainedSeriesCorrupt, .input_rows = input_rows, .captures = captures.items, .next = next };
+}
+
 fn readResolvedBudgeted(server: anytype, a: A, snapshot: Snapshot, definition: dataset.Definition, input: Request, request_context: operation.RequestContext) !Result {
     var context = try request_context.platformDeadline();
     const now = @import("antfly_platform").time.monotonicNs();
@@ -683,4 +774,83 @@ test "retained owner native controls exact fanin stays inside one working alloca
     // Cumulative partition work exceeds peak usage because temporary buffers
     // return to the reclaiming backing allocator after each owner.
     try std.testing.expect(resolved.budget.?.total > resolved.budget.?.peak);
+}
+
+const PrefixTestReader = struct {
+    total: usize = 200_000,
+    chunk: usize = 256,
+    calls: usize = 0,
+    consumed: usize = 0,
+    empty_first: bool = true,
+    native: bool = false,
+    change_cut: bool = false,
+    omit_capture: bool = false,
+    stalled: bool = false,
+    work_per_page: ?usize = null,
+    pub fn page(self: *@This(), a: A, request: Request, ctx: operation.RequestContext) !Result {
+        try ctx.ensureActive();
+        if (!request.page) return error.UnexpectedCompleteRead;
+        self.calls += 1;
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const temp = arena.allocator();
+        var captures: []Capture = &.{};
+        if (self.native and !(self.omit_capture and self.calls > 1)) {
+            captures = try temp.alloc(Capture, 1);
+            const sequence: u64 = if (self.change_cut and self.calls > 1) 4 else 3;
+            captures[0] = .{ .table = try temp.dupe(u8, "source"), .scope = .{ .resource = 1, .generation = 1, .plan = @splat(1), .group = 11, .revision = 1 }, .observation = .{ .root = 1, .source_sequence = sequence, .admitted_ns = 0, .cursor = .{ .definition = @splat(2), .partition = @splat(3), .incarnation = 1, .sequence = sequence } } };
+        }
+        if (self.empty_first and self.calls == 1) return .{ .arena = arena, .rows = &.{}, .history = .retained_source_rows, .captures = captures, .next = dataset.rowKey(0, @splat(255)) };
+        if (self.stalled) return .{ .arena = arena, .rows = &.{}, .history = .retained_source_rows, .captures = captures, .next = request.after };
+        const first: usize = if (request.after) |key| @intCast(try dataset.rowKeyTimestamp(key)) else 0;
+        const count = @min(@min(self.chunk, request.max_rows), self.total - first);
+        const rows = try temp.alloc(series.Bucket, count);
+        for (rows, 0..) |*row, i| {
+            const metrics = try temp.alloc(series.Metric, 1);
+            metrics[0] = .{ .count = 1 };
+            row.* = .{ .start_ns = @intCast(first + i + 1), .dimensions = try temp.dupe(u8, "[]"), .rows = 1, .metrics = metrics };
+        }
+        self.consumed += count;
+        return .{ .arena = arena, .rows = rows, .history = .retained_source_rows, .captures = captures, .input_rows = self.work_per_page orelse count, .next = if (first + count < self.total) codec.key(rows[rows.len - 1]) else null };
+    }
+};
+
+test "retained owner native controls SQL prefix traverses short empty pages without a complete scan" {
+    const a = std.testing.allocator;
+    var memory: MemoryBudget = .{ .backing = a, .limit = max_result_bytes };
+    defer std.debug.assert(memory.live == 0);
+    var reader: PrefixTestReader = .{};
+    var result = try readPrefixBudgeted(memory.allocator(), .{ .start_ns = "0", .end_ns = "200001", .max_rows = 10001, .page = true }, .{}, &reader);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 10001), result.rows.len);
+    try std.testing.expectEqual(@as(usize, 10001), reader.consumed);
+    try std.testing.expectEqual(@as(usize, 41), reader.calls);
+    try std.testing.expectEqual(@as(i128, 10001), result.rows[10000].start_ns);
+    try std.testing.expectEqual(@as(i64, 1), result.rows[10000].metrics[0].count);
+    try std.testing.expectEqualStrings("[]", result.rows[10000].dimensions);
+    try std.testing.expect(result.next != null);
+    try std.testing.expect(memory.peak < max_result_bytes);
+}
+
+test "retained owner native controls SQL prefix preserves one native cut and rejects missing proofs" {
+    const a = std.testing.allocator;
+    const request: Request = .{ .start_ns = "0", .end_ns = "200001", .max_rows = 1000, .page = true };
+    var reader: PrefixTestReader = .{ .native = true };
+    var result = try readPrefixBudgeted(a, request, .{}, &reader);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.captures.len);
+    try std.testing.expectEqualStrings("source", result.captures[0].table);
+    var changed: PrefixTestReader = .{ .native = true, .change_cut = true };
+    try std.testing.expectError(error.RetainedReadRestartRequired, readPrefixBudgeted(a, request, .{}, &changed));
+    var missing: PrefixTestReader = .{ .native = true, .omit_capture = true };
+    try std.testing.expectError(error.RetainedReadRestartRequired, readPrefixBudgeted(a, request, .{}, &missing));
+    var work: PrefixTestReader = .{ .work_per_page = max_input_rows };
+    try std.testing.expectError(error.DatasetPageBudgetExceeded, readPrefixBudgeted(a, request, .{}, &work));
+    var stalled: PrefixTestReader = .{ .stalled = true };
+    try std.testing.expectError(error.RetainedSeriesCorrupt, readPrefixBudgeted(a, request, .{}, &stalled));
+    var limited: MemoryBudget = .{ .backing = a, .limit = 512 };
+    var bounded: PrefixTestReader = .{};
+    try std.testing.expectError(error.OutOfMemory, readPrefixBudgeted(limited.allocator(), request, .{}, &bounded));
+    try std.testing.expect(limited.denied);
+    try std.testing.expectEqual(@as(usize, 0), limited.live);
 }

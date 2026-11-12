@@ -942,3 +942,38 @@ test "retained series exact query reduction allocates once across partition canc
     try std.testing.expectEqual(@as(i64, 768), metric.count);
     try std.testing.expectEqual(@as(f64, 0x1p-1066), (try metric.finalize(.sum)).number);
 }
+
+test "retained series wide numeric batches flush one bucket inside a fixed allocation ceiling" {
+    var store = Store.init();
+    defer store.deinit();
+    const Budget = @import("antfly_platform").allocator.BoundedAllocator;
+    var memory: Budget = .{ .backing = a, .limit = 2 * 1024 * 1024 };
+    defer std.debug.assert(memory.live == 0);
+    var e = engine();
+    e.alloc = memory.allocator();
+    const laws: [32]series.Law = @splat(.avg);
+    e.spec.laws = &laws;
+    try ready(e, &store);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const changes = try temp.alloc(series.Change, 1024);
+    const tiny_value: f64 = @bitCast(@as(u64, 1));
+    const tiny: [32]?f64 = @splat(tiny_value);
+    const large: [32]?f64 = @splat(std.math.floatMax(f64));
+    for (changes, 0..) |*change, i| change.* = .{ .key = try std.fmt.allocPrint(temp, "row-{d}", .{i}), .after = .{ .timestamp_ns = 1, .dimensions = "[]", .values = if (i == 0) &tiny else &large } };
+    store.bucket_writes = 0;
+    try e.apply(&store, 1, 1, .mutation, changes);
+    try std.testing.expectEqual(@as(usize, 1), store.bucket_writes);
+    try std.testing.expect(memory.peak <= 2 * 1024 * 1024);
+    const page = try e.scan(temp, &store, 0, 10, 1, null, 10);
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expectEqual(@as(i64, 1024), page.rows[0].rows);
+    for (page.rows[0].metrics) |metric| {
+        try std.testing.expect(metric.exact_sum.?.len > 500);
+        try std.testing.expectEqual(@as(i64, 1024), metric.count);
+        const average = (try metric.finalize(.avg)).number;
+        try std.testing.expect(std.math.isFinite(average));
+        try std.testing.expect(average > 1e308);
+    }
+}

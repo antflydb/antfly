@@ -288,6 +288,30 @@ pub const Cursor = struct {
     }
 };
 
+/// Transient arithmetic belongs to a touched bucket, not its persisted codec.
+/// Numeric cells are parsed/allocated once and encoded only during flushing.
+const MutableBucket = struct {
+    bucket: Bucket,
+    exact: []?*ExactSum,
+
+    fn adjustNumeric(self: *MutableBucket, a: A, index: usize, input: f64, sign: i64) !void {
+        const metric = &self.bucket.metrics[index];
+        if (self.exact[index] == null) {
+            if (metric.exact_sum == null and metric.count - sign != 0) return error.RetainedSeriesDefinitionMismatch;
+            const previous = if (metric.exact_sum) |bytes| try ExactSum.parse(bytes) else ExactSum{};
+            const value = try a.create(ExactSum);
+            value.* = previous;
+            self.exact[index] = value;
+        }
+        var delta = try ExactSum.input(input);
+        if (sign < 0) delta.units = -delta.units;
+        const exact = self.exact[index].?;
+        exact.* = try exact.add(delta);
+        metric.sum = 0;
+        if (metric.count == 0 and exact.units != 0) return error.RetainedSeriesCorrupt;
+    }
+};
+
 pub const Engine = struct {
     alloc: A,
     spec: Spec,
@@ -452,15 +476,18 @@ pub const Engine = struct {
         if (!std.mem.startsWith(u8, entry.key, p)) return null;
         return try algebra.parseF64(entry.value);
     }
-    fn adjust(self: Engine, a: A, txn: anytype, document: []const u8, r: Row, sign: i64, touched: *std.StringHashMap(Bucket)) !void {
+    fn adjust(self: Engine, a: A, txn: anytype, document: []const u8, r: Row, sign: i64, touched: *std.StringHashMap(MutableBucket)) !void {
         try self.validateRow(r);
         const k = try self.bucketKey(a, r);
         const cached = try touched.getOrPut(k);
         if (!cached.found_existing) {
-            cached.value_ptr.* = (try self.readBucket(a, txn, k)) orelse Bucket{ .start_ns = try self.spec.bucket(r.timestamp_ns), .dimensions = r.dimensions, .metrics = try a.alloc(Metric, self.spec.laws.len) };
-            if (cached.value_ptr.rows == 0) @memset(cached.value_ptr.metrics, .{});
+            const bucket = (try self.readBucket(a, txn, k)) orelse Bucket{ .start_ns = try self.spec.bucket(r.timestamp_ns), .dimensions = r.dimensions, .metrics = try a.alloc(Metric, self.spec.laws.len) };
+            if (bucket.rows == 0) @memset(bucket.metrics, .{});
+            const exact = try a.alloc(?*ExactSum, self.spec.laws.len);
+            @memset(exact, null);
+            cached.value_ptr.* = .{ .bucket = bucket, .exact = exact };
         }
-        const b = cached.value_ptr;
+        const b = &cached.value_ptr.bucket;
         if (!std.mem.eql(u8, b.dimensions, r.dimensions) or b.metrics.len != self.spec.laws.len) return error.RetainedSeriesCorrupt;
         b.rows = std.math.add(i64, b.rows, sign) catch return error.RetainedSeriesNumericOverflow;
         if (b.rows < 0) return error.RetainedSeriesCorrupt;
@@ -473,19 +500,7 @@ pub const Engine = struct {
             if (m.count < 0) return error.RetainedSeriesCorrupt;
             switch (op) {
                 .count => {},
-                .sum, .avg => {
-                    // A rounded predecessor cannot be repaired without its
-                    // source evidence. Fail closed rather than certify it as
-                    // retractable; recreate that legacy generation explicitly.
-                    if (m.exact_sum == null and m.count - sign != 0) return error.RetainedSeriesDefinitionMismatch;
-                    const previous = if (m.exact_sum) |bytes| try ExactSum.parse(bytes) else ExactSum{};
-                    var delta_sum = try ExactSum.input(n);
-                    if (sign < 0) delta_sum.units = -delta_sum.units;
-                    const exact = try previous.add(delta_sum);
-                    m.exact_sum = try exact.encode(a);
-                    m.sum = 0;
-                    if (m.count == 0 and exact.units != 0) return error.RetainedSeriesCorrupt;
-                },
+                .sum, .avg => try cached.value_ptr.adjustNumeric(a, i, n, sign),
                 .min, .max => {
                     const support = try self.supportKey(a, k, i, n, document);
                     if (sign > 0) try txn.put(support, try algebra.encodeF64Alloc(a, n)) else try txn.delete(support);
@@ -496,15 +511,16 @@ pub const Engine = struct {
     /// Save each affected bucket once and resolve extrema after all support
     /// changes. A thousand observations in one bucket need one row write and
     /// one ordered seek per extrema law, not a thousand rewrites/seeks.
-    fn flushBuckets(self: Engine, a: A, txn: anytype, touched: *std.StringHashMap(Bucket)) !void {
+    fn flushBuckets(self: Engine, a: A, txn: anytype, touched: *std.StringHashMap(MutableBucket)) !void {
         var iterator = touched.iterator();
         while (iterator.next()) |entry| {
-            const b = entry.value_ptr;
+            const b = &entry.value_ptr.bucket;
             if (b.rows == 0) {
                 try txn.delete(entry.key_ptr.*);
                 continue;
             }
             for (self.spec.laws, b.metrics, 0..) |op, *metric, i| {
+                if (entry.value_ptr.exact[i]) |exact| metric.exact_sum = try exact.encode(a);
                 if (op == .min) metric.minimum = if (metric.count == 0) null else (try self.extremum(a, txn, entry.key_ptr.*, i, false)) orelse return error.RetainedSeriesCorrupt;
                 if (op == .max) metric.maximum = if (metric.count == 0) null else (try self.extremum(a, txn, entry.key_ptr.*, i, true)) orelse return error.RetainedSeriesCorrupt;
             }
@@ -746,7 +762,7 @@ pub const Engine = struct {
             now = @max(now, value.admitted_ns);
             try reservations.put(change.key, value);
         };
-        var touched = std.StringHashMap(Bucket).init(a);
+        var touched = std.StringHashMap(MutableBucket).init(a);
         var seen = std.StringHashMap(void).init(a);
         for (changes) |change| {
             if (change.key.len == 0 or change.key.len > 4096) return error.InvalidRetainedSeriesRow;
@@ -814,7 +830,7 @@ pub const Engine = struct {
         if (p.closed) return error.RetainedSeriesSourceClosed;
         if (p.draining) return error.RetainedSeriesSourceDraining;
         if (p.ready or !std.mem.eql(u8, expected_cursor, p.backfill_cursor)) return error.RetainedSeriesBackfillFence;
-        var touched = std.StringHashMap(Bucket).init(a);
+        var touched = std.StringHashMap(MutableBucket).init(a);
         var previous = expected_cursor;
         for (rows) |row| {
             if (row.before != null or row.after == null or row.key.len == 0 or row.key.len > 4096 or std.mem.order(u8, previous, row.key) != .lt) return error.RetainedSeriesBackfillFence;
@@ -1228,4 +1244,33 @@ fn sameContribution(spec: Spec, left: Row, right: Row) !bool {
     if (try spec.bucket(left.timestamp_ns) != try spec.bucket(right.timestamp_ns) or !std.mem.eql(u8, left.dimensions, right.dimensions)) return false;
     for (left.values, right.values) |l, r| if (l != r) return false;
     return true;
+}
+
+test "retained series touched numeric state updates and retracts without per-observation allocation" {
+    const a = std.testing.allocator;
+    var metrics = [_]Metric{.{}};
+    var slots = [_]?*ExactSum{null};
+    var touched: MutableBucket = .{ .bucket = .{ .start_ns = 0, .dimensions = "[]", .rows = 1, .metrics = &metrics }, .exact = &slots };
+    defer if (slots[0]) |value| a.destroy(value);
+    const tiny: f64 = @bitCast(@as(u64, 1));
+    metrics[0].count = 1;
+    try touched.adjustNumeric(a, 0, tiny, 1);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    for (0..1023) |_| {
+        metrics[0].count += 1;
+        try touched.adjustNumeric(failing.allocator(), 0, std.math.floatMax(f64), 1);
+    }
+    const encoded = try slots[0].?.encode(a);
+    defer a.free(encoded);
+    try std.testing.expect(encoded.len > 500);
+    try std.testing.expect(std.math.isFinite(slots[0].?.number(1024)));
+    try std.testing.expectEqual(slots[0].?.units, (try ExactSum.parse(encoded)).units);
+    for (0..1023) |_| {
+        metrics[0].count -= 1;
+        try touched.adjustNumeric(failing.allocator(), 0, std.math.floatMax(f64), -1);
+    }
+    try std.testing.expectEqual((try ExactSum.input(tiny)).units, slots[0].?.units);
+    metrics[0].count = 0;
+    try touched.adjustNumeric(failing.allocator(), 0, tiny, -1);
+    try std.testing.expectEqual(@as(@import("retained_exact_sum.zig").Int, 0), slots[0].?.units);
 }

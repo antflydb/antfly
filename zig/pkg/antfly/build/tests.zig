@@ -3218,6 +3218,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const retained_resource_tests = b.addTest(.{ .root_module = retained_resource_mod, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("retained-dataset-resource-test", "Verify independent retained resource identity and source dependency lifecycle").dependOn(&b.addRunArtifact(retained_resource_tests).step);
     const retained_series_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/retained_series_test_root.zig"), .target = target, .optimize = optimize });
+    retained_series_mod.addImport("antfly_platform", platform_mod);
     const retained_series_tests = b.addTest(.{ .root_module = retained_series_mod, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const retained_series_step = b.step("retained-series-test", "Run transactional retained aggregate, TTL fence and bounded feed contracts");
     retained_series_step.dependOn(&b.addRunArtifact(retained_series_tests).step);
