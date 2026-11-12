@@ -893,7 +893,32 @@ const TestSink = struct {
     fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]Entry {
         const self: *TestSink = @ptrCast(@alignCast(ptr));
         _ = scope;
-        return try allocator.dupe(Entry, self.entries.items);
+        // `Sink.loadAllAlloc`'s contract: every returned entry's bytes are
+        // allocated with `allocator` and freed by the caller. A shallow
+        // `allocator.dupe(Entry, ...)` only copies the struct slice --
+        // each entry's `namespace`/`key`/`value` would still alias this
+        // sink's own `self.entries` storage, which the caller then frees
+        // out from under it (and this sink double-frees again on its own
+        // `deinit`/overwrite). Deep-copy every field.
+        const out = try allocator.alloc(Entry, self.entries.items.len);
+        var copied: usize = 0;
+        errdefer {
+            for (out[0..copied]) |entry| {
+                if (entry.namespace) |n| allocator.free(n);
+                allocator.free(entry.key);
+                allocator.free(entry.value);
+            }
+            allocator.free(out);
+        }
+        for (self.entries.items, 0..) |entry, i| {
+            out[i] = .{
+                .namespace = if (entry.namespace) |n| try allocator.dupe(u8, n) else null,
+                .key = try allocator.dupe(u8, entry.key),
+                .value = try allocator.dupe(u8, entry.value),
+            };
+            copied += 1;
+        }
+        return out;
     }
 
     fn sink(self: *TestSink) Sink {
