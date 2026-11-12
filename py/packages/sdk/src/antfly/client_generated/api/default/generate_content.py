@@ -124,8 +124,10 @@ def sync_detailed(
     writing fails after the HTTP response starts, the server instead emits
     an `event: error` frame and closes without a `[DONE]` frame. Permanent
     inference-budget failures carry a JSON `Error` object with
-    `error: MODEL_RESOURCE_LIMIT`, `retryable: false`, and, when known,
-    `budget`, `required_bytes`, and `limit_bytes`. The HTTP status remains
+    `error: MODEL_RESOURCE_LIMIT` (admission policy) or
+    `error: MEMORY_BUDGET_EXCEEDED` (request working set), `retryable: false`,
+    and, when known, `budget`, `required_bytes`, and `limit_bytes`.
+    The HTTP status remains
     unchanged once streaming starts. Clients must also accept plain-text
     error frames from older servers and other failure paths.
 
@@ -194,8 +196,10 @@ def sync(
     writing fails after the HTTP response starts, the server instead emits
     an `event: error` frame and closes without a `[DONE]` frame. Permanent
     inference-budget failures carry a JSON `Error` object with
-    `error: MODEL_RESOURCE_LIMIT`, `retryable: false`, and, when known,
-    `budget`, `required_bytes`, and `limit_bytes`. The HTTP status remains
+    `error: MODEL_RESOURCE_LIMIT` (admission policy) or
+    `error: MEMORY_BUDGET_EXCEEDED` (request working set), `retryable: false`,
+    and, when known, `budget`, `required_bytes`, and `limit_bytes`.
+    The HTTP status remains
     unchanged once streaming starts. Clients must also accept plain-text
     error frames from older servers and other failure paths.
 
@@ -259,8 +263,10 @@ async def asyncio_detailed(
     writing fails after the HTTP response starts, the server instead emits
     an `event: error` frame and closes without a `[DONE]` frame. Permanent
     inference-budget failures carry a JSON `Error` object with
-    `error: MODEL_RESOURCE_LIMIT`, `retryable: false`, and, when known,
-    `budget`, `required_bytes`, and `limit_bytes`. The HTTP status remains
+    `error: MODEL_RESOURCE_LIMIT` (admission policy) or
+    `error: MEMORY_BUDGET_EXCEEDED` (request working set), `retryable: false`,
+    and, when known, `budget`, `required_bytes`, and `limit_bytes`.
+    The HTTP status remains
     unchanged once streaming starts. Clients must also accept plain-text
     error frames from older servers and other failure paths.
 
@@ -327,8 +333,10 @@ async def asyncio(
     writing fails after the HTTP response starts, the server instead emits
     an `event: error` frame and closes without a `[DONE]` frame. Permanent
     inference-budget failures carry a JSON `Error` object with
-    `error: MODEL_RESOURCE_LIMIT`, `retryable: false`, and, when known,
-    `budget`, `required_bytes`, and `limit_bytes`. The HTTP status remains
+    `error: MODEL_RESOURCE_LIMIT` (admission policy) or
+    `error: MEMORY_BUDGET_EXCEEDED` (request working set), `retryable: false`,
+    and, when known, `budget`, `required_bytes`, and `limit_bytes`.
+    The HTTP status remains
     unchanged once streaming starts. Clients must also accept plain-text
     error frames from older servers and other failure paths.
 

@@ -159,7 +159,7 @@ const AdmissionFailureScope = struct {
     }
 };
 
-const ModelResourceLimitPayload = struct {
+const InferenceBudgetFailurePayload = struct {
     @"error": []const u8 = "MODEL_RESOURCE_LIMIT",
     message: []const u8 = "request resource plan exceeds the configured inference budget",
     retryable: bool = false,
@@ -168,7 +168,7 @@ const ModelResourceLimitPayload = struct {
     limit_bytes: ?usize = null,
 };
 
-fn modelResourceLimitPayload(ctx: *const httpx.Context) ModelResourceLimitPayload {
+fn modelResourceLimitPayload(ctx: *const httpx.Context) InferenceBudgetFailurePayload {
     if (httpAdmissionFailure(ctx)) |failure| {
         if (failure.snapshot()) |exceeded| return .{
             .message = "request and required model residency exceed the configured inference budget",
@@ -43231,12 +43231,16 @@ fn writeInternalStreamError(
 }
 
 fn writeGenerationStreamError(ctx: *httpx.Context, writer: *httpx.Context.StreamWriter, err: anyerror) void {
-    if (err == error.ResourceLimitExceeded) {
+    if (err == error.ResourceLimitExceeded or err == error.MemoryBudgetExceeded) {
         // Headers may already be committed. Preserve the HTTP error contract
         // in the terminal event, without allocating during memory pressure.
         var buffer: [1024]u8 = undefined;
         var json = std.Io.Writer.fixed(&buffer);
-        std.json.Stringify.value(modelResourceLimitPayload(ctx), .{ .emit_null_optional_fields = false }, &json) catch return;
+        const payload = if (err == error.ResourceLimitExceeded) modelResourceLimitPayload(ctx) else InferenceBudgetFailurePayload{
+            .@"error" = "MEMORY_BUDGET_EXCEEDED",
+            .message = memory_budget_exceeded_message,
+        };
+        std.json.Stringify.value(payload, .{ .emit_null_optional_fields = false }, &json) catch return;
         writer.writeEvent("error", json.buffered()) catch {};
         return;
     }
@@ -52357,7 +52361,7 @@ test "streaming admission emits structured terminal budget details without alloc
     try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "[DONE]") == null);
     const data_start = std.mem.indexOf(u8, capture.bytes.items, "data: ").? + 6;
     const data_end = std.mem.indexOfPos(u8, capture.bytes.items, data_start, "\n\n").?;
-    const parsed = try std.json.parseFromSlice(ModelResourceLimitPayload, a, capture.bytes.items[data_start..data_end], .{});
+    const parsed = try std.json.parseFromSlice(InferenceBudgetFailurePayload, a, capture.bytes.items[data_start..data_end], .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", parsed.value.@"error");
     try std.testing.expect(!parsed.value.retryable);
@@ -52368,6 +52372,10 @@ test "streaming admission emits structured terminal budget details without alloc
     failure.failure.record(null);
     writeGenerationStreamError(&ctx, &writer, error.ResourceLimitExceeded);
     try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "required_bytes") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "\"retryable\":false") != null);
+    capture.bytes.clearRetainingCapacity();
+    writeGenerationStreamError(&ctx, &writer, error.MemoryBudgetExceeded);
+    try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "\"error\":\"MEMORY_BUDGET_EXCEEDED\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "\"retryable\":false") != null);
     capture.bytes.clearRetainingCapacity();
     writeGenerationStreamError(&ctx, &writer, error.PromptTooLong);

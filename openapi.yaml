@@ -15534,9 +15534,13 @@ paths:
 
         inference-budget failures carry a JSON `Error` object with
 
-        `error: MODEL_RESOURCE_LIMIT`, `retryable: false`, and, when known,
+        `error: MODEL_RESOURCE_LIMIT` (admission policy) or
 
-        `budget`, `required_bytes`, and `limit_bytes`. The HTTP status remains
+        `error: MEMORY_BUDGET_EXCEEDED` (request working set), `retryable: false`,
+
+        and, when known, `budget`, `required_bytes`, and `limit_bytes`.
+
+        The HTTP status remains
 
         unchanged once streaming starts. Clients must also accept plain-text
 
