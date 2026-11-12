@@ -6219,13 +6219,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const consumer_indexes: []const []const u8 = request.consumer_indexes;
             if (consumer_indexes.len == 0) return;
 
+            // Every dense path participates in the preparation-wide generation
+            // fence, including materialized and inline chunk batches.
+            const generation = if (memo) |cache_memo| try cache_memo.generation(dense_embedder, embedding_name) else try dense_embedder.captureTextGeneration(alloc, embedding_name);
+            const pinned_embedder = dense_embedder.withTextGeneration(generation);
+
             if (requestUsesChunkSource(request)) {
                 if (requestUsesPinnedMaterializedChunkArtifact(request)) {
-                    try computeDenseMaterializedChunkRequestImpl(alloc, db, runtime, request, artifact_writes, pending_deletes, dense_embeddings, skip_unchanged_artifacts, shared_pending_writes, appendForConsumers, dense_embedder, embedding_name, consumer_indexes);
+                    try computeDenseMaterializedChunkRequestImpl(alloc, db, runtime, request, artifact_writes, pending_deletes, dense_embeddings, skip_unchanged_artifacts, shared_pending_writes, appendForConsumers, pinned_embedder, embedding_name, consumer_indexes);
+                    try dense_embedder.requireTextGeneration(alloc, embedding_name, generation);
                     return;
                 }
-                const generation = try dense_embedder.captureTextGeneration(alloc, embedding_name);
-                const pinned_embedder = dense_embedder.withTextGeneration(generation);
                 var chunks_created: usize = 0;
                 const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, cache, &chunks_created);
                 defer freeChunkEmbeddingSources(alloc, sources);
@@ -6279,8 +6283,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return;
             }
 
-            const generation = if (memo) |cache_memo| try cache_memo.generation(dense_embedder, embedding_name) else try dense_embedder.captureTextGeneration(alloc, embedding_name);
-            const pinned_embedder = dense_embedder.withTextGeneration(generation);
             if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
                 const source_parts = try renderSourceParts(
                     alloc,

@@ -220,6 +220,22 @@ class ApacheBoundaryTests(unittest.TestCase):
         )
         self.assertTrue(any("unreviewed module" in error for error in errors))
 
+    def test_compress_module_traverses_sources_and_rejects_server_dependencies(self):
+        module = "zig/lib/compress/src/mod.zig"
+        decoder = "zig/lib/compress/src/zstd_native.zig"
+        sources = {module: 'const decoder = @import("zstd_native.zig");', decoder: ""}
+        seen, errors = self.check_fixture(
+            'const compress = @import("antfly_compress");', sources
+        )
+        self.assertIn(module, seen)
+        self.assertIn(decoder, seen)
+        self.assertEqual([], errors)
+        sources[decoder] = 'const server = @import("../../../pkg/antfly/src/main.zig");'
+        _, errors = self.check_fixture(
+            'const compress = @import("antfly_compress");', sources
+        )
+        self.assertTrue(any("server dependency" in error for error in errors))
+
     def test_cypher_modules_traverse_regex_and_reject_server_dependencies(self):
         graph = "zig/lib/cypher/root.zig"
         regex = "zig/lib/regex/src/captures.zig"

@@ -30939,6 +30939,8 @@ fn processMaterializedChunkDenseRequest(
     scope: *FailureScope,
 ) !void {
     if (try processOrderedChunkVectorRequest(runtime, request, dense_embedder, null, consumer_indexes)) return;
+    const generation = try dense_embedder.captureTextGenerationWithContext(runtime.alloc, embedding_artifact_name, assetProviderRequestContext(runtime));
+    const pinned_embedder = dense_embedder.withTextGeneration(generation);
     const source_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
     defer runtime.alloc.free(source_key);
     const source_digest = try currentRecordDigest(runtime, source_key);
@@ -31016,6 +31018,7 @@ fn processMaterializedChunkDenseRequest(
             request: enrichment_types.GeneratedEnrichmentRequest,
             prefix: []const u8,
             embedding_artifact_name: []const u8,
+            revision: ?[32]u8,
             chunk_texts: *std.ArrayListUnmanaged([]const u8),
             chunk_items: *std.ArrayListUnmanaged(ChunkedDenseWindowItem),
             cached_items: *std.ArrayListUnmanaged(CachedChunkDenseWindowItem),
@@ -31033,7 +31036,7 @@ fn processMaterializedChunkDenseRequest(
                 const text = (try chunkPayloadTextAlloc(ctx.runtime.alloc, value, ctx.request.source_field)) orelse return .@"continue";
                 var text_owned = true;
                 errdefer if (text_owned) ctx.runtime.alloc.free(text);
-                const source_hash = enrichment_artifact_codec.hashEmbeddingSourceForGeneration(text, ctx.request.producer_json, ctx.request.reprocess_generation);
+                const source_hash = retainedTextEmbeddingHashAtRevision(ctx.request, text, ctx.revision);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(ctx.runtime.alloc, key, ctx.embedding_artifact_name);
                 var embedding_key_owned = true;
                 errdefer if (embedding_key_owned) ctx.runtime.alloc.free(embedding_key);
@@ -31077,6 +31080,7 @@ fn processMaterializedChunkDenseRequest(
             .request = request,
             .prefix = prefix,
             .embedding_artifact_name = embedding_artifact_name,
+            .revision = generation.revision,
             .chunk_texts = &chunk_texts,
             .chunk_items = &chunk_items,
             .cached_items = &cached_items,
@@ -31086,8 +31090,9 @@ fn processMaterializedChunkDenseRequest(
         };
         try backend_scan.scanWithContext(&runtime.store, lower, upper_bound, .{}, &collect, Collect.scan);
 
+        try dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, assetProviderRequestContext(runtime));
         try processCachedChunkDenseItems(runtime, request, consumer_indexes, window, &cached_items, max_window_items, scope);
-        const complete = try flushChunkedDenseItems(runtime, dense_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope, &rejected_requests);
+        const complete = try flushChunkedDenseItems(runtime, pinned_embedder, embedding_artifact_name, request.expected_dims, consumer_indexes, &chunk_texts, &chunk_items, window, true, scope, &rejected_requests);
         if (!complete) return;
         if (rejected_requests.contains(requestFailureFingerprint(request))) return;
         try flushGeneratedReplayWindowIfNeededWithIdentity(runtime, window, max_window_items, scope.completedFingerprint());
@@ -31100,6 +31105,7 @@ fn processMaterializedChunkDenseRequest(
         lower = next_lower;
     }
 
+    try dense_embedder.requireTextGenerationWithContext(runtime.alloc, embedding_artifact_name, generation, assetProviderRequestContext(runtime));
     if (rejected_requests.contains(requestFailureFingerprint(request))) return;
     var source_guarded_in_window = false;
     for (existing_embedding_keys.items) |embedding_key| {

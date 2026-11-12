@@ -153164,17 +153164,21 @@ test "db paper evaluation rejects superseded A completion across synchronous sou
 test "db document extraction pins provider generation across batches rows and final preparation" {
     for ([_]bool{ false, true }) |sparse| {
         for ([_]types.SyncLevel{ .enrichments, .full_index }) |sync_level| {
-            for (std.meta.tags(DocumentGenerationCase)) |mode| try testDocumentGenerationPreparation(sparse, sync_level, mode);
+            for (std.meta.tags(ChunkGenerationShape)) |shape| {
+                for (std.meta.tags(DocumentGenerationCase)) |mode| try testDocumentGenerationPreparation(sparse, sync_level, mode, shape);
+            }
         }
     }
 }
 
+const ChunkGenerationShape = enum { extracted, inline_chunks, materialized_chunks };
+
 const DocumentGenerationCase = enum { stable, between_batches, between_rows, after_final };
 
-fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, mode: DocumentGenerationCase) !void {
+fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, mode: DocumentGenerationCase, shape: ChunkGenerationShape) !void {
     const alloc = std.testing.allocator;
     const Probe = struct {
-        sparse: bool,
+        change_after_checks: usize,
         change: bool,
         revision: u8 = 1,
         calls: usize = 0,
@@ -153185,7 +153189,7 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
                 self.checks_after_first += 1;
                 // The generation changes immediately AFTER the successful
                 // final check of the first batch, rather than during inference.
-                if (self.checks_after_first == (if (self.sparse) @as(usize, 1) else 2)) self.revision = 2;
+                if (self.checks_after_first == self.change_after_checks) self.revision = 2;
             }
             return result;
         }
@@ -153265,18 +153269,32 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
     }
     var directory = try TestDirectory.init("document-generation-preparation");
     defer directory.cleanup();
-    var probe = Probe{ .sparse = sparse, .change = mode != .stable };
+    const batch_boundary = mode == .between_batches or shape == .extracted;
+    var probe = Probe{ .change_after_checks = if (sparse)
+        (if (batch_boundary) @as(usize, 1) else 2)
+    else switch (shape) {
+        .extracted => 2,
+        .inline_chunks => if (batch_boundary) @as(usize, 2) else 3,
+        .materialized_chunks => if (batch_boundary) @as(usize, 3) else 4,
+    }, .change = mode != .stable };
     var db = try DB.open(alloc, directory.path(), .{
         .start_optional_runtime_workers = false,
         .start_index_workers = false,
         .enrichment = .{ .owner_id = "document-generation", .dense_embedder = .{ .ptr = &probe, .dense_embed_fn = Probe.dense, .dense_embed_batch_fn = Probe.denseBatch, .dense_embed_batch_with_context_fn = Probe.denseControlled, .capabilities_fn = Probe.caps, .foreground_bounded = true }, .sparse_embedder = .{ .ptr = &probe, .sparse_embed_fn = Probe.sparseOne, .sparse_embed_batch_fn = Probe.sparseBatch, .sparse_embed_batch_with_context_fn = Probe.sparseControlled, .cache_revision_fn = Probe.revisionFn, .foreground_bounded = true } },
     });
     defer db.close();
-    try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
-    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "text", .source_artifact_name = "units", .chunk_size = if (mode == .between_batches or mode == .stable) 256 else 4096 });
-    try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "text", .source_artifact_name = "chunks", .expected_dims = if (sparse) 0 else 3 });
-    try db.addIndex(.{ .name = "vector", .kind = if (sparse) .sparse_vector else .dense_vector, .config_json = if (sparse) "{\"field\":\"embedding\",\"embedding_name\":\"model\"}" else "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"model\"}" });
-    const doc_value = "{\"url\":\"data:text/plain;base64," ++
+    const chunk_size: u32 = if (mode == .between_batches or mode == .stable) 256 else 4096;
+    if (shape == .inline_chunks) {
+        const config = try std.fmt.allocPrint(alloc, "{{\"field\":\"embedding\",\"dims\":3,\"generator\":{{\"kind\":\"{s}\",\"source_field\":\"body\",\"chunk_name\":\"chunks\",\"chunk_size\":{d},\"embedding_name\":\"model\"}}}}", .{ if (sparse) "sparse_embedding" else "dense_embedding", chunk_size });
+        defer alloc.free(config);
+        try db.addIndex(.{ .name = "vector", .kind = if (sparse) .sparse_vector else .dense_vector, .config_json = config });
+    } else {
+        if (shape == .extracted) try db.addEnrichment(.{ .name = "units", .kind = .asset, .field = "url", .content_type = "application/json", .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}" });
+        try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = if (shape == .extracted) "text" else "body", .source_artifact_name = if (shape == .extracted) "units" else "", .chunk_size = chunk_size });
+        try db.addEnrichment(.{ .name = "model", .kind = .embedding, .field = "text", .source_artifact_name = "chunks", .expected_dims = if (sparse) 0 else 3 });
+        try db.addIndex(.{ .name = "vector", .kind = if (sparse) .sparse_vector else .dense_vector, .config_json = if (sparse) "{\"field\":\"embedding\",\"embedding_name\":\"model\"}" else "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"model\"}" });
+    }
+    const doc_value = if (shape != .extracted) "{\"body\":\"" ++ "alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. alpha beta gamma delta epsilon zeta. " ++ "\"}" else "{\"url\":\"data:text/plain;base64," ++
         "YWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4g" ++
         "\"}";
     const writes = [_]types.BatchWrite{ .{ .key = "doc:a", .value = doc_value }, .{ .key = "doc:b", .value = doc_value } };
@@ -153297,6 +153315,8 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
     try std.testing.expect(before > 1);
     // Retained units reuse stable vectors without reinference.
     try db.batch(request);
+    try std.testing.expectEqual(before, probe.calls);
+    try db.runUntilIdle();
     try std.testing.expectEqual(before, probe.calls);
     const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "chunks");
     defer alloc.free(prefix);

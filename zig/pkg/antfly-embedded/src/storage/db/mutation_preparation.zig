@@ -660,7 +660,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer source_indexes.deinit(alloc);
 
             for (sources.items, 0..) |source, i| {
-                const source_hash = if (request.input_kind == .inline_chunks and !source.has_metadata)
+                const source_hash = if (!source.has_metadata)
                     enrichment_runtime_mod.retainedTextEmbeddingHashAtRevision(request, source.text, generation.revision)
                 else
                     enrichment_artifact_codec.hashEmbeddingSourceForGeneration(source.text, request.producer_json, request.reprocess_generation);
