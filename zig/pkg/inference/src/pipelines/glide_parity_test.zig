@@ -16,7 +16,8 @@
 //! GLiDE prompt and token parity against the Python reference capture.
 //!
 //! `ANTFLY_GLIDE_REFERENCE` names a directory of reference captures
-//! (`fix04_cpu_fp32.json`, `fix08_cpu_fp32.json`, `trunc04_tokens.json`): each holds the
+//! (`fix04_cpu_fp32.json`, `fix08_cpu_fp32.json`, `fix2b_cpu_fp32.json`,
+//! `trunc04_tokens.json`; absent captures are skipped): each holds the
 //! reference `requests` (Fastino format), the checkpoint `model_dir`, and
 //! per prompt the exact `text` and token `ids`, in `decide_batch` order.
 //! `ANTFLY_GLIDE_MODELS_DIR` optionally replaces the recorded checkpoint
@@ -38,7 +39,7 @@ const Capture = struct {
 
 /// `trunc04_tokens.json` holds over-long encoder prompts (head/tail
 /// truncation) with whitespace runs that hit ModernBERT's added space tokens.
-pub const fixture_names = [_][]const u8{ "fix04_cpu_fp32.json", "fix08_cpu_fp32.json", "trunc04_tokens.json" };
+pub const fixture_names = [_][]const u8{ "fix04_cpu_fp32.json", "fix08_cpu_fp32.json", "fix2b_cpu_fp32.json", "trunc04_tokens.json" };
 
 pub fn referenceDir() ![]const u8 {
     return platform.env.getenv("ANTFLY_GLIDE_REFERENCE") orelse {

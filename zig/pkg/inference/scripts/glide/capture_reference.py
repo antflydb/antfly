@@ -37,12 +37,13 @@ question's option count.
 
     uv run zig/pkg/inference/scripts/glide/capture_reference.py \\
         --glide-04b ./models/GLiDE-0.4B --glide-08b ./models/GLiDE-0.8B \\
-        --out ./glide-reference
+        --glide-2b ./models/GLiDE-2B --out ./glide-reference
 
-writes into `--out`:
+writes into `--out` (one decision capture per checkpoint passed):
 
     fix04_cpu_fp32.json  GLiDE-0.4B decision capture
     fix08_cpu_fp32.json  GLiDE-0.8B decision capture
+    fix2b_cpu_fp32.json  GLiDE-2B decision capture
     trunc04_tokens.json  over-long GLiDE-0.4B prompts (head/tail truncation;
                          text and ids only, no weights loaded)
 
@@ -299,18 +300,24 @@ def main() -> None:
     parser.add_argument(
         "--glide-08b", type=Path, help="GLiDE-0.8B checkpoint directory"
     )
+    parser.add_argument("--glide-2b", type=Path, help="GLiDE-2B checkpoint directory")
     parser.add_argument(
         "--out", type=Path, required=True, help="fixture output directory"
     )
     parser.add_argument("--device", default="cpu", help="torch device (default: cpu)")
     parser.add_argument("--dtype", default="fp32", choices=("fp32", "bf16", "fp16"))
     args = parser.parse_args()
-    if args.glide_04b is None and args.glide_08b is None:
-        parser.error("pass --glide-04b and/or --glide-08b")
+    checkpoints = (
+        ("04", args.glide_04b),
+        ("08", args.glide_08b),
+        ("2b", args.glide_2b),
+    )
+    if all(model_dir is None for _, model_dir in checkpoints):
+        parser.error("pass at least one of --glide-04b, --glide-08b and --glide-2b")
 
     args.out.mkdir(parents=True, exist_ok=True)
     suffix = f"{args.device}_{args.dtype}"
-    for tag, model_dir in (("04", args.glide_04b), ("08", args.glide_08b)):
+    for tag, model_dir in checkpoints:
         if model_dir is None:
             continue
         model_dir = Path(os.path.abspath(model_dir))

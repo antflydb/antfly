@@ -11774,6 +11774,9 @@ fn estimateBaseModelLoadAdmission(
         if (try session_factory.glinerBoundaryResidentLoadAmounts(man, weights)) |resident| {
             return .{ .peak = resident.peak, .resident = resident.resident };
         }
+        if (try session_factory.glideDecoderResidentLoadAmounts(man, weights)) |resident| {
+            return .{ .peak = resident.peak, .resident = resident.resident };
+        }
     }
     if (backend_runtime.backend == .metal or backend_runtime.backend == .cuda) {
         const config = if (backend_runtime.backend == .cuda)

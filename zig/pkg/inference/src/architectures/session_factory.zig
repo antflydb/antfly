@@ -748,6 +748,28 @@ pub fn layaResidentLoadAmounts(mf: manifest_mod.ModelManifest, source_bytes: usi
     return .{ .peak = peak, .resident = resident };
 }
 
+/// GLiDE decoder checkpoints execute their BF16 projections directly from the
+/// mapped safetensors pages (no-copy Metal buffers). The lazy tier cache keeps
+/// those pages as host-resident weights, so the model reserves them as host
+/// weight bytes; charging them as backend weights too would make the first
+/// request buy the same pages again through cache credits. The backend share
+/// covers the small F32 tensors (norms, conv, gates), the shared zero bias,
+/// pipelines and staging. Measured on GLiDE-2B: 3.76 GB mapped weights and an
+/// 810 MB physical footprint including 5k-token activations.
+pub fn glideDecoderResidentLoadAmounts(mf: manifest_mod.ModelManifest, source_bytes: usize) !?GlinerBoundaryResidentLoadAmounts {
+    if (comptime !build_options.enable_metal) return null;
+    if (!mf.glide_declared or mf.glide_unsupported or mf.glide_backbone != .decoder or mf.usesGgufWeights()) return null;
+    const metadata: usize = 64 * 1024 * 1024;
+    const prepared: usize = 256 * 1024 * 1024;
+    const resident = runtime.tier.memory.AdmissionAmounts{
+        .host_weight_bytes = try std.math.add(usize, source_bytes, metadata),
+        .backend_weight_bytes = prepared,
+    };
+    var peak = resident;
+    peak.host_scratch_bytes = 4 * 1024 * 1024;
+    return .{ .peak = peak, .resident = resident };
+}
+
 pub fn prepareLayaResident(session: Session, control: ?InferenceExecutionControl) !void {
     if (comptime !build_options.enable_metal) return;
     if (session.vtable != &arch_vtable or !@import("../ops/laya_metal.zig").enabled()) return;
@@ -6109,6 +6131,31 @@ fn lightOnOcr4bBudgetPolicy(
         else => false,
     };
     if (!qualified) return null;
+    return residentBf16WeightsBudgetPolicy(model_weight_bytes);
+}
+
+/// GLiDE decoder checkpoints keep every projection resident, like the
+/// LightOnOCR-3 4B bundle that shares their Qwen3.5 backbone. GLiDE-2B's
+/// 3.8 GB of BF16 weights exceed the generic Metal weight cache on a 16 GB
+/// machine, so every decoder checkpoint is charged its exact weight bytes.
+fn glideDecoderBudgetPolicy(
+    model_weight_bytes: u64,
+    manifest: manifest_mod.ModelManifest,
+    arch_config: ArchConfig,
+) ?GpuHostedBudgetPolicy {
+    if (!manifest.glide_declared or manifest.glide_unsupported or manifest.glide_backbone != .decoder) return null;
+    if (manifest.usesGgufWeights() or model_weight_bytes == 0) return null;
+    const qwen35 = switch (arch_config) {
+        .gpt => |cfg| cfg.isQwen35(),
+        else => false,
+    };
+    if (!qwen35) return null;
+    return residentBf16WeightsBudgetPolicy(model_weight_bytes);
+}
+
+/// Mapped BF16 source on the host tier plus prepared GPU weights on the
+/// backend tier, with headroom for norms, staging and the readout.
+fn residentBf16WeightsBudgetPolicy(model_weight_bytes: u64) GpuHostedBudgetPolicy {
     const weights: usize = @intCast(@min(model_weight_bytes, std.math.maxInt(usize)));
     const host = weights +| mib(256);
     const device = weights +| gib(1);
@@ -6133,6 +6180,7 @@ fn sharedGpuHostedBudgetPolicy(
     // mapped source and prepared GPU weights before loading any projections.
     // Explicit serving limits are applied after this automatic floor.
     if (lightOnOcr4bBudgetPolicy(model_weight_bytes, manifest, arch_config)) |policy| return policy;
+    if (glideDecoderBudgetPolicy(model_weight_bytes, manifest, arch_config)) |policy| return policy;
     const prefer_f32_dense_tensors = shouldPreferGpuHostedF32DenseTensors(arch_config);
     const lazy_quant_budget_floor = if (shouldUseLargeGpuHostedLazyQuantBudgets(model_weight_bytes, manifest, quant_mode, false))
         recommendedGpuHostedLazyQuantBudgetFloor(model_weight_bytes, quant_mode)
@@ -6395,13 +6443,19 @@ fn makeGpuHostedComputeBackend(
 
 /// LightOnOCR3's tuned Qwen3.5 Metal kernels (deferred attention, vector
 /// loads, MPP projections) are specialised to these text geometries. GLiDE
-/// decoder checkpoints share the 0.8B geometry and qualify explicitly, so the
-/// fast GEMM route does not hinge on their unused vision config surviving.
+/// decoder checkpoints qualify explicitly, so the fast GEMM route does not
+/// hinge on their unused vision config surviving: GLiDE-0.8B shares the 0.8B
+/// geometry, and GLiDE-2B (2048/6144/24) is qualified for GLiDE only. GLiDE
+/// checkpoints also carry that vision config, so they are matched first.
 fn usesQwen35TunedMetalGeometry(self: *const ArchSession) bool {
     return switch (self.arch_config) {
-        .gpt => |cfg| (cfg.hasQwen35VisionArchitectureContract() or (self.glide_head != null and cfg.isQwen35())) and
-            ((cfg.hidden_size == 1024 and cfg.intermediate_size == 3584 and cfg.num_hidden_layers == 24) or
-                (cfg.hidden_size == 2560 and cfg.intermediate_size == 9216 and cfg.num_hidden_layers == 32)),
+        .gpt => |cfg| blk: {
+            const lighton = (cfg.hidden_size == 1024 and cfg.intermediate_size == 3584 and cfg.num_hidden_layers == 24) or
+                (cfg.hidden_size == 2560 and cfg.intermediate_size == 9216 and cfg.num_hidden_layers == 32);
+            if (self.glide_head != null and cfg.isQwen35())
+                break :blk lighton or (cfg.hidden_size == 2048 and cfg.intermediate_size == 6144 and cfg.num_hidden_layers == 24);
+            break :blk cfg.hasQwen35VisionArchitectureContract() and lighton;
+        },
         else => false,
     };
 }
@@ -13087,6 +13141,56 @@ test "LightOnOCR3 4B budget covers both weight domains and preserves explicit li
     try std.testing.expect(lightOnOcr4bBudgetPolicy(weight_bytes, manifest, .{ .gpt = small }) == null);
     const overridden = runtime.tier.memory.applyLimitOverrides(policy.budget_floor, .{ .backend_limit_bytes = 1 });
     try std.testing.expectEqual(@as(usize, 1), overridden.backend_limit_bytes);
+}
+
+test "GLiDE decoder budget charges the checkpoint's resident weights" {
+    const cfg = try gpt_mod.parseConfig(std.testing.allocator, @embedFile("../models/testdata/lightonocr3/config.json"));
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .classifier,
+        .config_model_arch = "qwen3_5",
+        .glide_declared = true,
+        .glide_backbone = .decoder,
+    };
+    // GLiDE-2B: above the generic 16 GB-machine weight cache.
+    const weight_bytes = 3_763_000_000;
+    const policy = glideDecoderBudgetPolicy(weight_bytes, manifest, .{ .gpt = cfg }).?;
+    try std.testing.expect(policy.shared_cache_floor.host_limit_bytes > weight_bytes);
+    try std.testing.expect(policy.shared_cache_floor.backend_limit_bytes > weight_bytes);
+    try std.testing.expect(!policy.prefer_f32_dense_tensors);
+    var encoder = manifest;
+    encoder.glide_backbone = .encoder;
+    try std.testing.expect(glideDecoderBudgetPolicy(weight_bytes, encoder, .{ .gpt = cfg }) == null);
+    var unsupported = manifest;
+    unsupported.glide_unsupported = true;
+    try std.testing.expect(glideDecoderBudgetPolicy(weight_bytes, unsupported, .{ .gpt = cfg }) == null);
+    var plain = manifest;
+    plain.glide_declared = false;
+    try std.testing.expect(glideDecoderBudgetPolicy(weight_bytes, plain, .{ .gpt = cfg }) == null);
+}
+
+test "GLiDE decoder load reserves mapped weights on the host tier only" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .classifier,
+        .config_model_arch = "qwen3_5",
+        .glide_declared = true,
+        .glide_backbone = .decoder,
+    };
+    const source_bytes: usize = 3_763_000_000;
+    const amounts = (try glideDecoderResidentLoadAmounts(manifest, source_bytes)).?;
+    // The lazy cache's host baseline covers every mapped projection, so the
+    // first request needs no cache credit for them.
+    try std.testing.expect(amounts.resident.host_weight_bytes >= source_bytes);
+    try std.testing.expect(amounts.resident.backend_weight_bytes < source_bytes / 4);
+    try std.testing.expect(amounts.peak.host_weight_bytes >= amounts.resident.host_weight_bytes);
+    var encoder = manifest;
+    encoder.glide_backbone = .encoder;
+    try std.testing.expect((try glideDecoderResidentLoadAmounts(encoder, source_bytes)) == null);
+    var unsupported = manifest;
+    unsupported.glide_unsupported = true;
+    try std.testing.expect((try glideDecoderResidentLoadAmounts(unsupported, source_bytes)) == null);
 }
 
 test "context generation keeps GGUF EOS defaults with a minimal model sidecar" {

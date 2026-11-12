@@ -41562,7 +41562,7 @@ static int termite_metal_try_lightonocr3_prefill_gate(termite_metal_decode_runti
                                                       size_t output_offset) {
     if (!termite_metal_lightonocr3_fast_projections(r) || rows < 32 || rows > 2048 ||
         slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || input == output || input_offset % 16 ||
-        output_offset % 4 || !((in == 1024 && out == 16) || (in == 2560 && out == 32)) ||
+        output_offset % 4 || !((in == 1024 && out == 16) || (in == 2048 && out == 16) || (in == 2560 && out == 32)) ||
         r->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_BF16 ||
         !r->linear_slot_prepared[slot] || r->linear_in_dims[slot] != in || r->linear_out_dims[slot] != out ||
         termite_metal_frame_env_enabled(r, TERMITE_METAL_FRAME_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS) ||
@@ -41707,7 +41707,10 @@ static int termite_metal_try_lightonocr3_mpp(termite_metal_decode_runtime *runti
                        (in_dim == 2560 && (out_dim == 1024 || out_dim == 4096 || out_dim == 8192 || out_dim == 9216)) ||
                        (in_dim == 1024 && (out_dim == 1024 || out_dim == 3072 || out_dim == 4096)) ||
                        (in_dim == 4096 && (out_dim == 1024 || out_dim == 2560 || out_dim == 4096)) ||
-                       (in_dim == 9216 && out_dim == 2560);
+                       (in_dim == 9216 && out_dim == 2560) ||
+                       // GLiDE-2B (Qwen3.5 2048/6144); no LightOnOCR-3 projection has these shapes.
+                       (in_dim == 2048 && (out_dim == 512 || out_dim == 2048 || out_dim == 4096 || out_dim == 6144)) ||
+                       (in_dim == 6144 && out_dim == 2048);
     if (!shape)
         return 0;
     const bool n32 = (in_dim == 4096 && out_dim == 4096) ||
