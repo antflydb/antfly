@@ -101,7 +101,9 @@ fn resolveRetainedOnPath(backend: catalog.Backend, alloc: std.mem.Allocator, ref
         var scoped = reference;
         scoped.name.namespace = entry.slice();
         return resolve(backend.ptr, alloc, scoped) catch |err| switch (err) {
-            error.CatalogNotFound => continue,
+            // A namespace may disappear after SET or statement preparation.
+            // Explicit qualification still takes the direct path above.
+            error.CatalogNotFound, error.NamespaceNotFound => continue,
             else => return err,
         };
     }
@@ -2240,12 +2242,11 @@ test "SQL retained source pgwire resolves namespaces and binds dataset authority
     const path_api = @import("../pgwire/search_path.zig");
     const Fixture = struct {
         calls: usize = 0,
-        denied: bool = false,
+        failure: anyerror = error.CatalogNotFound,
         fn resolve(raw: *anyopaque, _: std.mem.Allocator, reference: ast.RetainedTable) !catalog.Table {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
-            if (self.denied) return error.Forbidden;
-            if (!std.mem.eql(u8, reference.name.namespace.?, "analytics")) return error.CatalogNotFound;
+            if (!std.mem.eql(u8, reference.name.namespace.?, "analytics")) return self.failure;
             return .{ .id = 7, .physical_name = "retained:opaque", .schema_version = 1, .columns = &.{} };
         }
     };
@@ -2257,9 +2258,18 @@ test "SQL retained source pgwire resolves namespaces and binds dataset authority
     const reference: ast.RetainedTable = .{ .name = .{ .table = "stats" }, .start = .{ .string = "0" }, .end = .{ .string = "60" } };
     const table = try resolveRetainedOnPath(backend, std.testing.allocator, reference, &path);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
-    fixture.denied = true;
-    try std.testing.expectError(error.Forbidden, resolveRetainedOnPath(backend, std.testing.allocator, reference, &path));
-    try std.testing.expectEqual(@as(usize, 3), fixture.calls);
+    fixture.failure = error.NamespaceNotFound;
+    _ = try resolveRetainedOnPath(backend, std.testing.allocator, reference, &path);
+    try std.testing.expectEqual(@as(usize, 4), fixture.calls);
+    var explicit = reference;
+    explicit.name.namespace = "missing";
+    try std.testing.expectError(error.NamespaceNotFound, resolveRetainedOnPath(backend, std.testing.allocator, explicit, &path));
+    for ([_]anyerror{ error.Forbidden, error.DatabaseNotFound, error.CatalogGenerationChanged, error.RetainedSeriesNotReady }) |failure| {
+        fixture.failure = failure;
+        const before = fixture.calls;
+        try std.testing.expectError(failure, resolveRetainedOnPath(backend, std.testing.allocator, reference, &path));
+        try std.testing.expectEqual(before + 1, fixture.calls);
+    }
     var guarded: GuardedCatalog = undefined;
     guarded.native = backend;
     try std.testing.expect(guarded.backend().vtable.resolve_retained != null);

@@ -76,10 +76,32 @@ pub const ExpiryMaintenance = struct {
     after: u64 = 0,
     next_ns: u64 = 0,
     cycle_progress: bool = false,
+    backoff: Backoff = .{},
+    // Hash the exact descriptor bytes, including its revision and dataset
+    // identity. This also throttles malformed descriptors without parsing them
+    // outside failure admission. The durable cursor remains authoritative.
+    const RetryKey = struct { resource: u64, descriptor: [32]u8 };
+    const Backoff = @import("../../metadata/retained_dataset_owners.zig").RetryBackoff(RetryKey);
+
+    fn retryKey(resource: local.system_catalog_domain.Resource) RetryKey {
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(resource.source_json, &hash, .{});
+        return .{ .resource = resource.id, .descriptor = hash };
+    }
+    fn elapsedNow(now: u64, started: u64) u64 {
+        return now +| (@import("antfly_platform").time.monotonicNs() -| started);
+    }
+    fn deferred(err: anyerror) bool {
+        return switch (err) {
+            // These visits advanced a durable segment cursor. Continue to the
+            // next extent rather than delaying all work in this dataset.
+            error.DatasetDependencyPending, error.DatasetRetentionPending, error.DatasetReadersActive, error.DatasetCompactionOrder => true,
+            else => false,
+        };
+    }
 
     pub fn deinit(self: *ExpiryMaintenance, alloc: std.mem.Allocator) void {
-        _ = self;
-        _ = alloc;
+        self.backoff.deinit(alloc);
     }
 
     pub fn run(
@@ -123,7 +145,8 @@ pub const ExpiryMaintenance = struct {
 
     fn drain(self: *ExpiryMaintenance, alloc: std.mem.Allocator, now: u64, context: *const operation.RequestContext, worker: anytype) !void {
         self.next_ns = now +| 10 * std.time.ns_per_ms;
-        const until = @import("antfly_platform").time.monotonicNs() +| 100 * std.time.ns_per_ms;
+        const started = @import("antfly_platform").time.monotonicNs();
+        const until = started +| 100 * std.time.ns_per_ms;
         for (0..32) |_| {
             if (@import("antfly_platform").time.monotonicNs() >= until) break;
             try context.ensureActive();
@@ -144,11 +167,23 @@ pub const ExpiryMaintenance = struct {
                 self.cycle_progress = false;
             }
             self.after = resource.id;
+            const key = retryKey(resource);
+            if (!self.backoff.due(key, elapsedNow(now, started))) continue;
             const progress = worker.visit(a, resource) catch |err| {
+                if (deferred(err)) {
+                    self.backoff.succeeded(key);
+                    continue;
+                }
+                // Shutdown cancellation is not a resource failure. A resource
+                // which consumed its deadline still receives a retry delay,
+                // measured from completion instead of this turn's start.
+                try context.cancellation.check();
+                try self.backoff.failed(alloc, key, elapsedNow(now, started));
                 if (err == error.Canceled or err == error.Timeout) return err;
                 if (!retryable(err)) std.log.warn("retained archive work deferred resource={d} err={s}", .{ resource.id, @errorName(err) });
                 continue;
             };
+            self.backoff.succeeded(key);
             self.cycle_progress = self.cycle_progress or progress;
         }
     }
@@ -225,4 +260,95 @@ test "retained owner native controls archive scheduler drains fair batches and r
     const previous = worker.visits[1];
     try maintenance.drain(std.testing.allocator, maintenance.next_ns, &context, &worker);
     try std.testing.expect(worker.visits[1] > previous + 1);
+    try std.testing.expectEqual(@as(usize, 0), maintenance.backoff.entries.count());
+}
+
+test "retained owner native controls archive failure backoff isolates revisions and preserves healthy cleanup" {
+    const Resource = local.system_catalog_domain.Resource;
+    const Worker = struct {
+        visits: [2]usize = .{ 0, 0 },
+        revision: bool = false,
+        fail: bool = true,
+        fn next(self: *@This(), _: std.mem.Allocator, after: u64) !?Resource {
+            return .{ .id = if (after == 1) 2 else 1, .kind = .dataset, .name = "summary", .source_json = if (self.revision) "revision-2" else "revision-1" };
+        }
+        fn visit(self: *@This(), _: std.mem.Allocator, resource: Resource) !bool {
+            self.visits[@intCast(resource.id - 1)] += 1;
+            if (resource.id == 1 and self.fail) return error.DatasetLocationUnavailable;
+            return true;
+        }
+    };
+    const a = std.testing.allocator;
+    var maintenance: ExpiryMaintenance = .{};
+    defer maintenance.deinit(a);
+    var worker: Worker = .{};
+    var now: u64 = std.time.ns_per_s;
+    const first = (try worker.next(a, 0)).?;
+    const key = ExpiryMaintenance.retryKey(first);
+    try maintenance.drain(a, now, &.{}, &worker);
+    try std.testing.expectEqual(@as(usize, 1), worker.visits[0]);
+    try std.testing.expect(worker.visits[1] > 0);
+    const healthy = worker.visits[1];
+    try maintenance.drain(a, now + std.time.ns_per_ms, &.{}, &worker);
+    try std.testing.expectEqual(@as(usize, 1), worker.visits[0]);
+    try std.testing.expect(worker.visits[1] > healthy);
+    for (1..12) |attempt| {
+        const retry = maintenance.backoff.entries.get(key).?;
+        now = retry.until_ns;
+        try maintenance.drain(a, now, &.{}, &worker);
+        try std.testing.expectEqual(attempt + 1, worker.visits[0]);
+        const recorded = maintenance.backoff.entries.get(key).?;
+        const delay = recorded.until_ns - recorded.touched_ns;
+        try std.testing.expect(delay >= 7 * std.time.ns_per_s / 8);
+        try std.testing.expect(delay <= 30 * std.time.ns_per_s);
+    }
+    // A lifecycle revision (for example discard) bypasses the old retry delay.
+    worker.revision = true;
+    const before = worker.visits[0];
+    try maintenance.drain(a, now + std.time.ns_per_ms, &.{}, &worker);
+    try std.testing.expectEqual(before + 1, worker.visits[0]);
+    const replacement = ExpiryMaintenance.retryKey((try worker.next(a, 0)).?);
+    const retry_at = maintenance.backoff.entries.get(replacement).?.until_ns;
+    worker.fail = false;
+    try maintenance.drain(a, retry_at, &.{}, &worker);
+    try std.testing.expect(worker.visits[0] > before + 1);
+    try std.testing.expect(maintenance.backoff.entries.get(replacement) == null);
+}
+
+test "retained owner native controls archive resource timeouts back off while shutdown leaves no failure" {
+    const Resource = local.system_catalog_domain.Resource;
+    const Worker = struct {
+        visits: usize = 0,
+        stop: ?*std.atomic.Value(bool) = null,
+        fn next(_: *@This(), _: std.mem.Allocator, _: u64) !?Resource {
+            return .{ .id = 1, .kind = .dataset, .name = "summary" };
+        }
+        fn visit(self: *@This(), _: std.mem.Allocator, _: Resource) !bool {
+            self.visits += 1;
+            if (self.stop) |stopping| {
+                stopping.store(true, .release);
+                return error.Canceled;
+            }
+            return error.Timeout;
+        }
+    };
+    const a = std.testing.allocator;
+    var maintenance: ExpiryMaintenance = .{};
+    defer maintenance.deinit(a);
+    var worker: Worker = .{};
+    try std.testing.expectError(error.Timeout, maintenance.drain(a, 1, &.{}, &worker));
+    try maintenance.drain(a, 2, &.{}, &worker);
+    try std.testing.expectEqual(@as(usize, 1), worker.visits);
+    var shutdown = std.atomic.Value(bool).init(true);
+    const context: operation.RequestContext = .{ .cancellation = .fromAtomic(&shutdown) };
+    const entries = maintenance.backoff.entries.count();
+    try std.testing.expectError(error.Canceled, maintenance.drain(a, 100 * std.time.ns_per_s, &context, &worker));
+    try std.testing.expectEqual(entries, maintenance.backoff.entries.count());
+    // Cancellation can arrive while the archive operation is in flight.
+    shutdown.store(false, .release);
+    worker.stop = &shutdown;
+    var interrupted: ExpiryMaintenance = .{};
+    defer interrupted.deinit(a);
+    try std.testing.expectError(error.Canceled, interrupted.drain(a, 1, &context, &worker));
+    try std.testing.expectEqual(@as(usize, 0), interrupted.backoff.entries.count());
 }

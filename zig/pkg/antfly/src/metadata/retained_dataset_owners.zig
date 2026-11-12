@@ -57,41 +57,47 @@ pub const Registration = struct {
 };
 /// Disposable, revision-scoped retry admission. Only failed owners wait; a
 /// healthy owner can keep publishing pages while another store is unavailable.
-pub const ArchiveBackoff = struct {
-    pub const capacity = 4096;
-    const Retry = struct { attempts: u8, until_ns: u64, touched_ns: u64 };
-    entries: std.AutoHashMapUnmanaged(ArchiveScope, Retry) = .empty,
+pub const ArchiveBackoff = RetryBackoff(ArchiveScope);
 
-    pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
-        self.entries.deinit(a);
-    }
-    pub fn due(self: *const @This(), key: ArchiveScope, now: u64) bool {
-        return if (self.entries.get(key)) |entry| now >= entry.until_ns else true;
-    }
-    pub fn succeeded(self: *@This(), key: ArchiveScope) void {
-        _ = self.entries.remove(key);
-    }
-    pub fn failed(self: *@This(), a: std.mem.Allocator, key: ArchiveScope, now: u64) !void {
-        const attempts = if (self.entries.get(key)) |old| @min(old.attempts +| 1, 6) else @as(u8, 1);
-        if (!self.entries.contains(key) and self.entries.count() == capacity) {
-            // Bound scheduler metadata even across retired resources. Eviction
-            // can shorten a retry delay but never blocks unrelated owners.
-            var oldest: ?ArchiveScope = null;
-            var oldest_ns: u64 = std.math.maxInt(u64);
-            var it = self.entries.iterator();
-            while (it.next()) |entry| if (oldest == null or entry.value_ptr.touched_ns < oldest_ns) {
-                oldest = entry.key_ptr.*;
-                oldest_ns = entry.value_ptr.touched_ns;
-            };
-            _ = self.entries.remove(oldest.?);
+/// Bounded disposable retry state shared by owner exports and dataset cleanup.
+/// Keys bind the durable revision; replacement work is immediately eligible.
+pub fn RetryBackoff(comptime Key: type) type {
+    return struct {
+        pub const capacity = 4096;
+        const Retry = struct { attempts: u8, until_ns: u64, touched_ns: u64 };
+        entries: std.AutoHashMapUnmanaged(Key, Retry) = .empty,
+
+        pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
+            self.entries.deinit(a);
         }
-        const base = @min(@as(u64, std.time.ns_per_s) << @as(u6, @intCast(attempts - 1)), 30 * std.time.ns_per_s);
-        var hash = std.hash.Wyhash.init(now);
-        std.hash.autoHash(&hash, key);
-        const delay = @min(base - base / 8 + hash.final() % (base / 4 + 1), 30 * std.time.ns_per_s);
-        try self.entries.put(a, key, .{ .attempts = attempts, .until_ns = now +| delay, .touched_ns = now });
-    }
-};
+        pub fn due(self: *const @This(), key: Key, now: u64) bool {
+            return if (self.entries.get(key)) |entry| now >= entry.until_ns else true;
+        }
+        pub fn succeeded(self: *@This(), key: Key) void {
+            _ = self.entries.remove(key);
+        }
+        pub fn failed(self: *@This(), a: std.mem.Allocator, key: Key, now: u64) !void {
+            const attempts = if (self.entries.get(key)) |old| @min(old.attempts +| 1, 6) else @as(u8, 1);
+            if (!self.entries.contains(key) and self.entries.count() == capacity) {
+                // Bound scheduler metadata even across retired resources. Eviction
+                // can shorten a retry delay but never blocks unrelated owners.
+                var oldest: ?Key = null;
+                var oldest_ns: u64 = std.math.maxInt(u64);
+                var it = self.entries.iterator();
+                while (it.next()) |entry| if (oldest == null or entry.value_ptr.touched_ns < oldest_ns) {
+                    oldest = entry.key_ptr.*;
+                    oldest_ns = entry.value_ptr.touched_ns;
+                };
+                _ = self.entries.remove(oldest.?);
+            }
+            const base = @min(@as(u64, std.time.ns_per_s) << @as(u6, @intCast(attempts - 1)), 30 * std.time.ns_per_s);
+            var hash = std.hash.Wyhash.init(now);
+            std.hash.autoHash(&hash, key);
+            const delay = @min(base - base / 8 + hash.final() % (base / 4 + 1), 30 * std.time.ns_per_s);
+            try self.entries.put(a, key, .{ .attempts = attempts, .until_ns = now +| delay, .touched_ns = now });
+        }
+    };
+}
 
 /// Private reads use distinct tags so older peers reject unknown authority.
 pub const Cursor = struct { resource: u64 = 0, generation: u64 = 0, owner_group: u64 = 0 };
@@ -532,4 +538,14 @@ test "retained archive retry admission backs off failures without delaying healt
     try std.testing.expectEqual(@as(usize, 0), retries.entries.count());
     var sweep: WorkSweep = .{};
     try std.testing.expectEqual(@as(u64, std.time.ns_per_s), sweep.finish());
+}
+
+test "retained archive retry admission bounds stale revision history" {
+    const a = std.testing.allocator;
+    var retries: RetryBackoff(u64) = .{};
+    defer retries.deinit(a);
+    for (0..@TypeOf(retries).capacity + 1) |index| try retries.failed(a, index, @intCast(index));
+    try std.testing.expectEqual(@TypeOf(retries).capacity, retries.entries.count());
+    try std.testing.expect(retries.due(0, 0));
+    try std.testing.expect(!retries.due(@TypeOf(retries).capacity, @TypeOf(retries).capacity));
 }

@@ -571,6 +571,27 @@ def test_standalone_retained_summary_recovery_and_concurrent_archive(tmp_path, e
                 autocommit=True,
             ) as connection:
                 relation = f"retained_summary(public.overflow_sum, '{first_bucket}', '{first_bucket + interval}')"
+                # A namespace can disappear after a connection captures its
+                # search path. Unqualified retained lookup must keep searching;
+                # explicitly qualified lookup must retain the schema error.
+                expected = connection.execute(f"SELECT n FROM {relation}").fetchall()
+                scratch = "/databases/default/namespaces/retained_lookup_scratch"
+                api("POST", scratch)
+                connection.execute("SET search_path TO retained_lookup_scratch, public")
+                api("DELETE", scratch)
+                try:
+                    for prepared in (False, True):
+                        unqualified = connection.execute(
+                            f"SELECT n FROM retained_summary(overflow_sum, '{first_bucket}', '{first_bucket + interval}')",
+                            prepare=prepared,
+                        ).fetchall()
+                        assert unqualified == expected
+                    with pytest.raises(psycopg.errors.InvalidSchemaName):
+                        connection.execute(
+                            f"SELECT n FROM retained_summary(retained_lookup_scratch.overflow_sum, '{first_bucket}', '{first_bucket + interval}')"
+                        )
+                finally:
+                    connection.execute("SET search_path TO public")
                 for prepared in (False, True):
                     assert (
                         connection.execute(
