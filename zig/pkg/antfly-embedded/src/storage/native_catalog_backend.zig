@@ -123,6 +123,35 @@ pub const Sink = struct {
     submitDeferred: ?*const fn (ptr: *anyopaque, scope: []const u8, mutations: []const Mutation) anyerror!Pending = null,
 };
 
+/// Durably removes every entry currently committed under `scope`, so a
+/// later `Backend.init` for the same scope -- e.g. after the index that
+/// owned it is deleted and a differently-configured index of the same name
+/// is re-admitted -- starts from nothing instead of resurrecting the
+/// deleted generation's stale records (dims, root node, postings, ...).
+/// `durable = true`: the caller (index removal) must call this, and let it
+/// complete, before committing the catalog mutation that makes the index's
+/// removal visible, so a crash between the two can never leave the catalog
+/// saying the index is gone while its stale scope survives underneath a
+/// later re-admission. A no-op when nothing is committed under `scope`.
+pub fn deleteAllForScope(allocator: Allocator, sink: Sink, scope: []const u8) !void {
+    const loaded = try sink.loadAllAlloc(sink.ptr, allocator, scope);
+    defer {
+        for (loaded) |entry| {
+            if (entry.namespace) |n| allocator.free(n);
+            allocator.free(entry.key);
+            allocator.free(entry.value);
+        }
+        allocator.free(loaded);
+    }
+    if (loaded.len == 0) return;
+    const mutations = try allocator.alloc(Mutation, loaded.len);
+    defer allocator.free(mutations);
+    for (loaded, 0..) |entry, i| {
+        mutations[i] = .{ .namespace = entry.namespace, .key = entry.key, .is_delete = true };
+    }
+    try sink.submit(sink.ptr, scope, mutations, true);
+}
+
 const State = struct {
     tree: ordered.Tree = .empty,
 
