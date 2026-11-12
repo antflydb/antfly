@@ -24319,22 +24319,22 @@ export interface components {
             retryable?: boolean;
             /** @description Minimum retry delay in milliseconds */
             retry_after_ms?: number;
-            /** @description Blocking inference budget (host, backend, combined, scratch, or kv), when known */
-            budget?: string;
-            /**
-             * Format: int64
-             * @description Required working-set bytes, including resident resources, for the blocking budget
-             */
-            required_bytes?: number;
-            /**
-             * Format: int64
-             * @description Configured bytes allowed by the blocking budget
-             */
-            limit_bytes?: number;
             /** @description Input whose atomic extraction validation or decoding failed, when known */
             input_index?: number;
             /** @description Extraction failure stage, when known */
             stage?: string;
+            /** @description Blocking inference budget (host, backend, combined, scratch, or kv), when known */
+            budget?: string;
+            /**
+             * Format: uint64
+             * @description Required working-set bytes, including resident resources, for the blocking budget
+             */
+            required_bytes?: number;
+            /**
+             * Format: uint64
+             * @description Configured bytes allowed by the blocking budget
+             */
+            limit_bytes?: number;
         };
         /** @description Actionable retry contract for temporary inference-capacity failures. */
         InferenceTransientCapacityError: {

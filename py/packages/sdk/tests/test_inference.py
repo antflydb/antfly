@@ -925,3 +925,15 @@ def test_generate_stream_accepts_legacy_plain_text_failure() -> None:
     with pytest.raises(AntflyException, match="generation stream failed: legacy failure"):
         with client.generate_stream(generation_request()) as chunks:
             list(chunks)
+
+
+def test_inference_error_preserves_positional_constructor():
+    from antfly.client_generated.models.inference_error import InferenceError
+    from antfly.client_generated.types import UNSET
+
+    error = InferenceError("ERROR", "message", UNSET, False, UNSET, 3, "decode")
+    assert error.input_index == 3
+    assert error.stage == "decode"
+    assert error.budget is UNSET
+    assert error.required_bytes is UNSET
+    assert error.limit_bytes is UNSET

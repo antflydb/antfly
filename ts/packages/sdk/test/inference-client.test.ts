@@ -763,6 +763,23 @@ describe("InferenceClient with mock fetch", () => {
   });
 
   describe("generation stream budget failures", () => {
+    it("preserves classification without rounding unsigned diagnostic counts", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          'event: error\ndata: {"error":"MODEL_RESOURCE_LIMIT","retryable":false,"required_bytes":18446744073709551615,"limit_bytes":100}\n\n',
+          { headers: { "Content-Type": "text/event-stream" } }
+        )
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(
+        client.generateStream({ model: "gemma", messages: [] }).next()
+      ).rejects.toMatchObject({
+        code: "MODEL_RESOURCE_LIMIT",
+        retryable: false,
+        requiredBytes: undefined,
+        limitBytes: 100,
+      });
+    });
     it("preserves structured permanent budget details and cancels the stream", async () => {
       const payload = {
         error: "MODEL_RESOURCE_LIMIT",

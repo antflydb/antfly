@@ -60,8 +60,8 @@ type InferenceAPIError struct {
 	Stage      string
 	// Budget details are present when the server identifies a blocking limit.
 	Budget        string
-	RequiredBytes *int64
-	LimitBytes    *int64
+	RequiredBytes *uint64
+	LimitBytes    *uint64
 	prefix        string
 }
 
@@ -85,6 +85,32 @@ func newInferenceAPIError(statusCode int, prefix string, payload *oapi.Inference
 		LimitBytes:    payload.LimitBytes,
 		prefix:        prefix,
 	}
+}
+
+// decodeInferenceError keeps optional diagnostics from obscuring the error contract.
+func decodeInferenceError(body []byte) *oapi.InferenceError {
+	var wire struct {
+		oapi.InferenceError
+		Budget        json.RawMessage `json:"budget"`
+		RequiredBytes json.RawMessage `json:"required_bytes"`
+		LimitBytes    json.RawMessage `json:"limit_bytes"`
+	}
+	if json.Unmarshal(body, &wire) != nil || (wire.Error == "" && wire.Message == "") {
+		return nil
+	}
+	payload := wire.InferenceError
+	var budget string
+	if json.Unmarshal(wire.Budget, &budget) == nil {
+		payload.Budget = budget
+	}
+	var required, limit *uint64
+	if json.Unmarshal(wire.RequiredBytes, &required) == nil {
+		payload.RequiredBytes = required
+	}
+	if json.Unmarshal(wire.LimitBytes, &limit) == nil {
+		payload.LimitBytes = limit
+	}
+	return &payload
 }
 
 func inferenceErrorPrefix(statusCode int) string {
@@ -121,9 +147,8 @@ func inferenceResponseError(statusCode int, body []byte) error {
 	if truncated {
 		body = body[:maxErrorResponseBytes]
 	}
-	var payload oapi.InferenceError
-	if json.Unmarshal(body, &payload) == nil && (payload.Error != "" || payload.Message != "") {
-		return newInferenceAPIError(statusCode, inferenceErrorPrefix(statusCode), &payload)
+	if payload := decodeInferenceError(body); payload != nil {
+		return newInferenceAPIError(statusCode, inferenceErrorPrefix(statusCode), payload)
 	}
 
 	message := string(body)
@@ -182,9 +207,8 @@ func (c *InferenceClient) GenerateStream(
 	done := false
 	err = scanSSE(resp.Body, func(event, data string) (bool, error) {
 		if event == "error" {
-			var payload oapi.InferenceError
-			if json.Unmarshal([]byte(data), &payload) == nil && (payload.Error != "" || payload.Message != "") {
-				return false, newInferenceAPIError(resp.StatusCode, "generation stream failed", &payload)
+			if payload := decodeInferenceError([]byte(data)); payload != nil {
+				return false, newInferenceAPIError(resp.StatusCode, "generation stream failed", payload)
 			}
 			return false, fmt.Errorf("generation stream failed: %s", data)
 		}
@@ -225,9 +249,8 @@ func readInferenceAPIError(resp *http.Response) error {
 		return inferenceCapacityError(&capacity)
 	}
 
-	var payload oapi.InferenceError
-	if json.Unmarshal(body, &payload) == nil && (payload.Error != "" || payload.Message != "") {
-		return newInferenceAPIError(resp.StatusCode, "", &payload)
+	if payload := decodeInferenceError(body); payload != nil {
+		return newInferenceAPIError(resp.StatusCode, "", payload)
 	}
 
 	message := string(body)

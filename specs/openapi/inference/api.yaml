@@ -2027,21 +2027,6 @@ components:
           type: integer
           minimum: 0
           description: Minimum retry delay in milliseconds
-        budget:
-          type: string
-          description: Blocking inference budget (host, backend, combined, scratch, or kv), when known
-        required_bytes:
-          type: integer
-          format: int64
-          minimum: 0
-          x-go-type-skip-optional-pointer: false
-          description: Required working-set bytes, including resident resources, for the blocking budget
-        limit_bytes:
-          type: integer
-          format: int64
-          minimum: 0
-          x-go-type-skip-optional-pointer: false
-          description: Configured bytes allowed by the blocking budget
         input_index:
           type: integer
           minimum: 0
@@ -2050,6 +2035,22 @@ components:
         stage:
           type: string
           description: Extraction failure stage, when known
+        # Append optional properties to preserve generated positional constructors.
+        budget:
+          type: string
+          description: Blocking inference budget (host, backend, combined, scratch, or kv), when known
+        required_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Required working-set bytes, including resident resources, for the blocking budget
+        limit_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Configured bytes allowed by the blocking budget
     TransientCapacityError:
       type: object
       description: Actionable retry contract for temporary inference-capacity failures.

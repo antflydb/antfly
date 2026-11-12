@@ -43231,6 +43231,8 @@ fn writeInternalStreamError(
 }
 
 fn writeGenerationStreamError(ctx: *httpx.Context, writer: *httpx.Context.StreamWriter, err: anyerror) void {
+    if (err == error.MemoryBudgetExceeded and !builtin.is_test)
+        std.log.warn("generation memory admission denied during streaming", .{});
     if (err == error.ResourceLimitExceeded or err == error.MemoryBudgetExceeded) {
         // Headers may already be committed. Preserve the HTTP error contract
         // in the terminal event, without allocating during memory pressure.
@@ -43245,8 +43247,6 @@ fn writeGenerationStreamError(ctx: *httpx.Context, writer: *httpx.Context.Stream
         return;
     }
     if (generationRequestFailure(err)) |failure| {
-        if (err == error.MemoryBudgetExceeded and !builtin.is_test)
-            std.log.warn("generation memory admission denied during streaming", .{});
         writer.writeEvent("error", failure.message) catch {};
         return;
     }
