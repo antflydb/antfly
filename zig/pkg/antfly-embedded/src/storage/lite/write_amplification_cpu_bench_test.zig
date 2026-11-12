@@ -412,13 +412,15 @@ const Fixture = struct {
             .hosted = false,
             .no_sync = false,
             .use_redo_log = redo,
-            // redo-log is unsupported combined with indexed reclamation's
-            // page reuse (docstore.zig's own createWithOptions asserts
-            // this) -- `page_reuse` defaults to `true`, so the redo run
-            // must turn it off explicitly; the legacy run leaves it at
-            // its existing default, unchanged from every call site here
-            // before this harness mode existed.
-            .page_reuse = if (redo) false else null,
+            // §9 (redo + indexed reclamation): redo-log and indexed page
+            // reuse are no longer mutually exclusive, so `page_reuse` is
+            // left at its existing default (`null`, which resolves to
+            // `true`) for both the redo and legacy runs, unchanged from
+            // every call site here before this harness mode existed --
+            // the redo run is now measured with reclamation on, matching
+            // this design's own gate (checkpointRedoLog's batched
+            // transaction does the reclaiming, not each foreground commit).
+            .page_reuse = null,
         });
 
         if (mode != .full_text) {

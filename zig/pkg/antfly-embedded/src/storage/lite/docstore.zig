@@ -1459,10 +1459,12 @@ pub const CreateOptions = struct {
     ride_along_idle_ns: ?u64 = null,
     /// docs/design/lite-performance/lite-single-commit-write-path.md §9,
     /// point 3. `null` (the current default) is the legacy copy-on-write
-    /// commit path. `true` opts a new, non-page-reuse file into redo-log
-    /// (an error alongside `reclamation.page_reuse`, which combines with
-    /// it unvalidated -- `native.NativeFile.createWithRedoLog`'s own
-    /// assert); `false` is the same as the default, spelled out.
+    /// commit path. `true` opts a new file into redo-log; it combines with
+    /// `reclamation.page_reuse` (indexed reclamation) without restriction
+    /// -- per-commit page allocation, retirement, and reclamation defer to
+    /// `checkpointRedoLog`'s own batched transaction in that case, rather
+    /// than running on every foreground commit. `false` is the same as
+    /// the default, spelled out.
     ///
     /// Not yet flipped to default-on for every new file, despite that
     /// being point 3's original ask: doing so surfaced 13 failures across
@@ -1894,11 +1896,15 @@ pub const Store = struct {
             .indexed_reclamation = opts.reclamation.page_reuse,
         };
         // Point 3: redo-log is opt-in for now (see `CreateOptions.use_redo_log`'s
-        // doc comment for why the default stays legacy copy-on-write). An
-        // explicit `true` alongside page reuse is a caller error, not a
-        // silent fallback.
-        if (opts.use_redo_log == true and native_opts.indexed_reclamation) return error.InvalidArgument;
-        const use_redo_log = (opts.use_redo_log orelse false) and !native_opts.indexed_reclamation;
+        // doc comment for why the default stays legacy copy-on-write).
+        // Redo-log commit and indexed page reclamation are no longer
+        // mutually exclusive (§9, redo+indexed_reclamation work): a
+        // caller may set both `use_redo_log = true` and
+        // `reclamation.page_reuse = true` together -- per-commit page
+        // allocation, retirement, and indexed reclamation defer to
+        // `checkpointRedoLog`'s own batched transaction instead of
+        // running on every foreground commit (`NativeFile.transactionWrites`).
+        const use_redo_log = opts.use_redo_log orelse false;
         // §9.7a: `default_redo_log_capacity_bytes` (8 MiB) is reserved
         // eagerly, in full, the moment the file is created -- it is real
         // physical file size from byte zero, not amortized content. A

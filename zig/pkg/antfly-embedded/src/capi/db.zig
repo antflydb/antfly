@@ -3164,10 +3164,9 @@ pub const LiteResolvedOpenOptions = struct {
     /// Meaningless on `open` (only `create` reaches it).
     use_redo_log: ?bool = null,
     /// `null` keeps the existing default (`reclamation.Options.page_reuse
-    /// = true`). `use_redo_log = true` combined with an unset or `true`
-    /// `page_reuse` here is a caller error (see `use_redo_log`'s own doc
-    /// comment) -- set this to `false` explicitly to use redo-log.
-    /// Meaningless on `open` (only `create` reaches it).
+    /// = true`). Combines with `use_redo_log = true` without restriction
+    /// (see `use_redo_log`'s own doc comment). Meaningless on `open`
+    /// (only `create` reaches it).
     page_reuse: ?bool = null,
 };
 

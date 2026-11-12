@@ -1019,26 +1019,41 @@ const recovery_agenda = @import("recovery_agenda.zig");
 // `flushTransactionWrites`/`persistAllocator` cycle, in particular) still
 // gets the one-sync manifest path instead of always falling back to the
 // two-sync presynced one.
-// Antfly is unreleased, so no old layout is preserved: a v3/v7 (pre-v8) or
-// v4/v8 (single-run manifest) file is refused by `decodeHeader`'s version
-// check (surfaced as `error.UnsupportedNativeFormatVersion`), not migrated.
-pub const magic = "AFLITE\x05P";
-const unpacked_v4_magic = "AFLITE\x05N";
-const indexed_magic = "AFLITE\x09P";
-/// docs/design/lite-performance/lite-single-commit-write-path.md §9.5:
-/// the log-structured commit format bump. Distinct from
-/// `format_version`/`indexed_format_version` (a redo-log file never uses
-/// the v8/v9 manifest machinery those gate -- see
-/// `NativeFile.manifest_commits_enabled`), so this version counter is its
-/// own family, bumped independently as the redo-log wire format changes.
-/// Build step (c): orthogonal to `indexed_reclamation` for now (a redo-log
-/// file is always created with `indexed_reclamation = false`); combining
-/// the two is unvalidated and not yet supported.
-const redo_log_magic = "AFLITE\x0bP";
-pub const format_version: u32 = 5;
-pub const indexed_format_version: u32 = 9;
-pub const redo_log_format_version: u32 = 1;
+// Antfly is unreleased, so no old layout is preserved: any file written by
+// a build before this version bump -- v3/v7 (pre-v8), v4/v8 (single-run
+// manifest), or any of the v5/v9/redo-v1 three-way magic split that
+// preceded the unified feature-flags header below -- is refused by
+// `decodeHeader`'s magic/version checks (surfaced as
+// `error.InvalidNativeMagic`/`error.UnsupportedNativeFormatVersion`), not
+// migrated.
+//
+// docs/design/lite-performance/lite-single-commit-write-path.md §9.5/§9.7a:
+// a file's mode (indexed reclamation, redo-log commit, record packing) used
+// to be encoded as which of several magic byte strings `encodeHeader`
+// chose, with `decodeHeader` inferring the mode back from a magic
+// equality check -- so two modes could never be combined (redo log and
+// indexed reclamation specifically: `docstore.zig`'s `createWithOptions`
+// and `NativeFile.createWithRedoLog(OwnedIo)` both refused the
+// combination, since there was no single magic that meant both). This is
+// replaced by one magic that means only "an aflite native file, format
+// `format_version`", plus an explicit `feature_flags` word (see
+// `feature_flags_offset`) carrying each mode as its own bit -- extensible
+// to a fourth/fifth mode without ever needing another magic string or
+// another priority-ordered branch.
+pub const magic = "AFLITE\x0cP";
+pub const format_version: u32 = 10;
 pub const default_page_size: u32 = 4096;
+
+/// §9.5/§9.7a: explicit, independently-encoded mode bits, read from/written
+/// to `feature_flags_offset`. Replaces the old magic-implied mode
+/// inference (see `magic`'s own doc comment) -- a mode's bit is set (or
+/// not) based purely on the `Header` field it corresponds to, never on
+/// which other bits are also set, so any combination round-trips exactly
+/// as written. Add new bits here as new modes are introduced; never reuse
+/// a retired bit's position (none are retired yet).
+const feature_flag_redo_log: u32 = 1 << 0;
+const feature_flag_indexed_reclamation: u32 = 1 << 1;
+const feature_flag_packed_records: u32 = 1 << 2;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
     const alloc = std.testing.allocator;
@@ -1980,11 +1995,16 @@ const version_offset: usize = 8;
 const page_size_offset: usize = 12;
 const header_size_offset: usize = 16;
 const reader_epoch_namespace_offset: usize = 24;
-/// §9.1/§9.5: only meaningful (and only written) when the header's magic
-/// is `redo_log_magic`. Fixed for the file's lifetime once set at creation
-/// (`NativeFile.enableRedoLog`) -- the log region never grows or moves.
+/// §9.1/§9.5: only meaningful (and only written) when `feature_flags`'s
+/// `feature_flag_redo_log` bit is set. Fixed for the file's lifetime once
+/// set at creation (`NativeFile.enableRedoLog`) -- the log region never
+/// grows or moves.
 const redo_log_offset_offset: usize = 56;
 const redo_log_capacity_offset: usize = 64;
+/// §9.5/§9.7a: the explicit mode-bits word (`feature_flag_*`). Placed
+/// right after `redo_log_capacity` (which ends at byte 72); the next new
+/// field after this one belongs at byte 76.
+const feature_flags_offset: usize = 72;
 const header_checksum_offset: usize = header_size - 4;
 const page_crc_offset: usize = 12;
 
@@ -6298,10 +6318,13 @@ pub const NativeFile = struct {
     /// plumbing into `createWithRuntime` has no slot for this, so a field
     /// that only one of several constructors actually honored would be a
     /// silent trap for a caller using any of the others. `opts.indexed_reclamation`
-    /// must be `false`: combining indexed reclamation with a redo log is
-    /// unvalidated and not yet supported.
+    /// may be `true` or `false`: combining indexed reclamation with a redo
+    /// log is supported (§9, redo+indexed_reclamation work) -- `enableRedoLog`
+    /// reserves the log region's page-id span starting after whatever
+    /// pages `createWithIo`'s own bootstrap (indexed or not) already
+    /// allocated, rather than assuming a fixed `reserved_header_pages`
+    /// start.
     pub fn createWithRedoLog(allocator: Allocator, io: std.Io, path: []const u8, opts: CreateOptions, redo_log_capacity_bytes: u64) !NativeFile {
-        std.debug.assert(!opts.indexed_reclamation);
         var file = try createWithIo(allocator, io, path, opts);
         errdefer file.close();
         try file.enableRedoLog(redo_log_capacity_bytes);
@@ -6314,7 +6337,6 @@ pub const NativeFile = struct {
     /// default-for-new-files policy (docstore.zig's `Store.createWithOptions`)
     /// needs this: it is reached whenever a caller passes no `opts.io`.
     pub fn createWithRedoLogOwnedIo(allocator: Allocator, path: []const u8, opts: CreateOptions, redo_log_capacity_bytes: u64) !NativeFile {
-        std.debug.assert(!opts.indexed_reclamation);
         var file = try createWithOptions(allocator, path, opts);
         errdefer file.close();
         try file.enableRedoLog(redo_log_capacity_bytes);
@@ -6343,37 +6365,73 @@ pub const NativeFile = struct {
     /// this is a deliberately modest default, not a measured optimum.
     pub const default_redo_log_capacity_bytes: u64 = 512 * 1024;
 
-    /// Upgrades a freshly bootstrapped, ordinary (non-indexed) file to the
+    /// Upgrades a freshly bootstrapped file (indexed or not) to the
     /// redo-log format in place: reserves `redo_log_capacity_bytes`
     /// (rounded up to a whole number of pages) as a dedicated, zero-filled
-    /// byte region immediately after the header and both checkpoint slots
-    /// (§9.1 -- in-file, not a sibling file), reserves that same range's
-    /// page-id span so `PageAllocator` never hands any of it out as an
-    /// ordinary page, and rewrites the header and the active checkpoint
-    /// slot to record the region and switch magic/version (§9.5's format
+    /// byte region immediately after whatever pages the bootstrap commit
+    /// already covers (§9.1 -- in-file, not a sibling file; `reserved_header_pages`
+    /// for a plain bootstrap, more for an indexed one, whose own bootstrap
+    /// commit already allocated a free-map/ledger page -- using the
+    /// checkpoint's own `page_count` rather than a hardcoded
+    /// `reserved_header_pages` is what makes this correct for both),
+    /// reserves that same range's page-id span so `PageAllocator` never
+    /// hands any of it out as an ordinary page, and rewrites the header
+    /// and both checkpoint slots to record the region (§9.5's format
     /// bump). Must only be called once, on a file with no transaction in
-    /// flight and nothing durable yet beyond the bootstrap checkpoint.
+    /// flight and nothing durable yet beyond the bootstrap checkpoint --
+    /// both slots are still identical at that point (an indexed bootstrap
+    /// writes both explicitly; a plain one leaves slot 1 structurally
+    /// invalid until the first real commit), so writing both here keeps
+    /// them that way rather than leaving slot 1 stale with a `page_count`
+    /// that doesn't reserve the log region, which a tie in recovery's slot
+    /// selection could otherwise surface.
+    ///
+    /// For an indexed bootstrap specifically, bumping `page_count` alone
+    /// is not enough: `allocator_v4.State`'s own root page cross-checks
+    /// its `covered_pages` against the checkpoint's `page_count`
+    /// (`decodeRoot`), so the two must be re-persisted together. Reserve
+    /// the log region's page-id span through the real allocator instead
+    /// -- the same `allocateFresh`/`reserveTail` path every ordinary
+    /// commit's own fresh page allocation already uses -- so the
+    /// ledger's coverage and the checkpoint's `page_count` land in
+    /// lockstep, then let `persistAllocator` write the updated ledger the
+    /// same way a real commit would. A plain (non-indexed) bootstrap has
+    /// no such cross-check (`readFreePagesAlloc` tolerates a `page_count`
+    /// ahead of the free-map page's own last-written content), so it
+    /// keeps the simpler direct bump.
     fn enableRedoLog(self: *NativeFile, capacity_bytes: u64) !void {
         std.debug.assert(self.redo == null);
         const page_size: u64 = self.header.page_size;
         const log_pages = std.math.divCeil(u64, @max(capacity_bytes, 1), page_size) catch unreachable;
         const capacity = log_pages * page_size;
-        const offset = reserved_header_pages * page_size;
         const io = self.runtimeIo();
+
+        var checkpoint = self.header.checkpoints[self.header.active_checkpoint];
+        const offset = checkpoint.page_count * page_size;
 
         // Zero-filled, preallocated extent: `redo_log.replay`'s
         // end-of-region detection relies on untouched space reading back
         // as zero, exactly like every other page range this file grows.
         try self.file.setLength(io, offset + capacity);
 
-        var checkpoint = self.header.checkpoints[self.header.active_checkpoint];
-        checkpoint.page_count = reserved_header_pages + log_pages;
+        if (self.header.indexed_reclamation) {
+            var pages = try self.pageAllocatorFromFreeMap(checkpoint);
+            defer pages.deinit();
+            for (0..log_pages) |_| _ = try pages.allocateFresh();
+            checkpoint.free_map_root_page = try pages.allocate();
+            checkpoint.page_count = pages.next_page_id;
+            try pages.flush();
+            try self.persistAllocator(&pages, &checkpoint);
+        } else {
+            checkpoint.page_count += log_pages;
+        }
         var slot_buf: [max_page_size]u8 = undefined;
         const slot_page = slot_buf[0..page_size];
         encodeCheckpointSlotPage(slot_page, checkpoint);
-        try self.file.writePositionalAll(io, slot_page, slotPhysicalPage(self.header.active_checkpoint) * page_size);
+        try self.file.writePositionalAll(io, slot_page, slotPhysicalPage(0) * page_size);
+        try self.file.writePositionalAll(io, slot_page, slotPhysicalPage(1) * page_size);
         if (!self.no_sync) try self.file.sync(io);
-        self.header.checkpoints[self.header.active_checkpoint] = checkpoint;
+        self.header.checkpoints = .{ checkpoint, checkpoint };
 
         self.header.redo_log_offset = offset;
         self.header.redo_log_capacity = capacity;
@@ -8356,6 +8414,24 @@ pub const NativeFile = struct {
         const previous_cancel = self.allocator_cancel_token;
         self.allocator_cancel_token = cancel;
         defer self.allocator_cancel_token = previous_cancel;
+        // §9 (redo + indexed reclamation): this commit builds a real page
+        // (persistAllocator's ledger/free-map write below) exactly like
+        // `checkpointRedoLog`'s own transaction, so it needs the same
+        // `checkpointing = true` guard for the same reason (see that
+        // function's own doc comment): `commitTransactionWithDurability`'s
+        // `syncIfRequired` skip and `publishCheckpoint`'s redo-log-record
+        // append both key off `self.redo.?.checkpointing` to tell "a real,
+        // physically-synced commit" apart from "a diverting one whose only
+        // durability barrier is the log append." Without this, a reclaim
+        // commit on a redo-log file is misclassified as diverting -- its
+        // real page work's own sync gets skipped and an empty, spurious
+        // log record is appended for a sequence the log has no logical
+        // mutation to replay for, corrupting the log's sequence
+        // continuity on the next reopen.
+        if (self.redo) |*redo| redo.checkpointing = true;
+        defer if (self.redo) |*redo| {
+            redo.checkpointing = false;
+        };
         try self.beginTransaction();
         errdefer self.abortTransaction();
         const before = self.activeCheckpoint();
@@ -13250,6 +13326,41 @@ pub const NativeFile = struct {
         return self.pageAllocatorFromFreeMapWithProof(checkpoint, !self.artifact_lease_transaction);
     }
 
+    /// §9 (redo + indexed reclamation): a diverting commit (this file has
+    /// a redo log and this is not `checkpointRedoLog`'s own transaction)
+    /// never builds a real copy-on-write page for its logical roots (see
+    /// `flushTransactionWrites`'s own `diverting` check), so loading the
+    /// `allocator_v4.State` ledger, verifying free pages, or draining a
+    /// retirement backlog for it would be pure, repeated wasted work on
+    /// every foreground commit -- exactly the per-commit cost
+    /// `checkpointRedoLog`'s own batched, undiverted transaction exists to
+    /// amortize instead (same `pageAllocatorFromFreeMap` call, reached
+    /// through `transactionWrites` there too, but with `checkpointing =
+    /// true` so the real indexed branch runs). Only `transactionWrites`
+    /// takes this shortcut: a direct caller like `reclaimPagesImpl` (owner
+    /// background retirement) or `initializeIndexedAllocator` (bootstrap)
+    /// calls `pageAllocatorFromFreeMap(WithProof)` itself and always gets
+    /// the real ledger -- this only ever defers page work for the
+    /// ordinary per-write commit path, never for an explicit
+    /// reclaim/maintenance pass, which must keep draining whatever
+    /// `checkpointRedoLog` already retired regardless of this file's
+    /// redo-log state.
+    ///
+    /// The one page-shaped exception a diverting commit still makes --
+    /// `stageMutation`'s own external value chains, written through this
+    /// same allocator at stage time -- only ever needs a fresh page id,
+    /// never a reused one and never ledger bookkeeping, so an empty free
+    /// list with no ledger attached serves it exactly as well as the real
+    /// thing would, at a fraction of the cost.
+    fn pageAllocatorForDivertingCommit(self: *NativeFile, checkpoint: CheckpointSlot) !PageAllocator {
+        return .{
+            .file = self,
+            .free_pages = try self.allocator.alloc(u64, 0),
+            .append_only = true,
+            .next_page_id = self.manifestSafeNextPageId(checkpoint.page_count),
+        };
+    }
+
     fn pageAllocatorFromFreeMapWithProof(self: *NativeFile, checkpoint: CheckpointSlot, require_reuse_proof: bool) !PageAllocator {
         // Read leases and their retirement must not force a whole-file proof.
         // Unverified housekeeping only extends the file; no existing page is
@@ -13965,7 +14076,19 @@ pub const NativeFile = struct {
         if (self.transaction_writes) |writes| return writes;
         const writes = try self.allocator.create(TransactionWrites);
         errdefer self.allocator.destroy(writes);
-        writes.* = .{ .pages = try self.pageAllocatorFromFreeMap(self.activeCheckpoint()), .value_arena = std.heap.ArenaAllocator.init(self.allocator) };
+        const checkpoint = self.activeCheckpoint();
+        // §9 (redo + indexed reclamation): the same `diverting` condition
+        // `flushTransactionWrites` computes later for this same
+        // transaction -- known here too, since `self.redo` and
+        // `checkpointing` are both file-level state, not something this
+        // specific call discovers. See `pageAllocatorForDivertingCommit`'s
+        // own doc comment for why only this call site (not
+        // `reclaimPagesImpl`, not bootstrap) takes the shortcut.
+        const diverting = self.redo != null and !self.redo.?.checkpointing;
+        writes.* = .{
+            .pages = if (diverting) try self.pageAllocatorForDivertingCommit(checkpoint) else try self.pageAllocatorFromFreeMap(checkpoint),
+            .value_arena = std.heap.ArenaAllocator.init(self.allocator),
+        };
         self.transaction_writes = writes;
         self.transaction_writes_generation +%= 1;
         return writes;
@@ -16225,7 +16348,7 @@ pub fn inspect(_: Allocator, io: std.Io, path: []const u8) !InspectReport {
     const active = header.checkpoints[recovered.index];
     return .{
         .valid = true,
-        .format_version = if (header.indexed_reclamation) indexed_format_version else format_version,
+        .format_version = format_version,
         .page_size = header.page_size,
         .active_checkpoint = recovered.index,
         .commit_sequence = active.commit_sequence,
@@ -16284,8 +16407,8 @@ pub fn copyStableSnapshot(allocator: Allocator, source_path: []const u8, dest_pa
 pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     @memset(out, 0);
     const is_redo_log = header.redo_log_capacity != 0;
-    @memcpy(out[magic_offset..][0..magic.len], if (is_redo_log) redo_log_magic else if (header.indexed_reclamation) indexed_magic else if (header.packed_records) magic else unpacked_v4_magic);
-    std.mem.writeInt(u32, out[version_offset..][0..4], if (is_redo_log) redo_log_format_version else if (header.indexed_reclamation) indexed_format_version else format_version, .little);
+    @memcpy(out[magic_offset..][0..magic.len], magic);
+    std.mem.writeInt(u32, out[version_offset..][0..4], format_version, .little);
     std.mem.writeInt(u32, out[page_size_offset..][0..4], header.page_size, .little);
     std.mem.writeInt(u32, out[header_size_offset..][0..4], header_size, .little);
     if (header.indexed_reclamation) @memcpy(out[reader_epoch_namespace_offset..][0..32], &header.reader_epoch_namespace);
@@ -16298,6 +16421,16 @@ pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     // omitted from the encoded bytes whenever `redo_log_capacity == 0`.
     std.mem.writeInt(u64, out[redo_log_offset_offset..][0..8], header.redo_log_offset, .little);
     std.mem.writeInt(u64, out[redo_log_capacity_offset..][0..8], header.redo_log_capacity, .little);
+    // §9.5/§9.7a: each mode is its own bit, set purely from this header's
+    // own field -- never implied by, or overriding, another bit -- so any
+    // combination (redo log plus indexed reclamation included) round-trips
+    // exactly as written, unlike the old magic-selection priority chain
+    // this replaces.
+    var flags: u32 = 0;
+    if (is_redo_log) flags |= feature_flag_redo_log;
+    if (header.indexed_reclamation) flags |= feature_flag_indexed_reclamation;
+    if (header.packed_records) flags |= feature_flag_packed_records;
+    std.mem.writeInt(u32, out[feature_flags_offset..][0..4], flags, .little);
     std.mem.writeInt(u32, out[header_checksum_offset..][0..4], headerChecksum(out), .little);
 }
 
@@ -16311,14 +16444,10 @@ pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
 pub fn decodeHeader(raw: []const u8) !Header {
     if (raw.len < header_size) return error.TruncatedNativeHeader;
     const header_raw = raw[0..header_size];
-    const is_redo_log = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], redo_log_magic);
-    const indexed_reclamation = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
-    const has_packed_records = is_redo_log or indexed_reclamation or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic);
-    if (!has_packed_records and !std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], unpacked_v4_magic)) return error.InvalidNativeMagic;
+    if (!std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic)) return error.InvalidNativeMagic;
 
     const version = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
-    const expected_version = if (is_redo_log) redo_log_format_version else if (indexed_reclamation) indexed_format_version else format_version;
-    if (version != expected_version) return error.UnsupportedNativeFormatVersion;
+    if (version != format_version) return error.UnsupportedNativeFormatVersion;
 
     const encoded_header_size = std.mem.readInt(u32, header_raw[header_size_offset..][0..4], .little);
     if (encoded_header_size != header_size) return error.InvalidNativeHeaderSize;
@@ -16329,9 +16458,15 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const page_size = std.mem.readInt(u32, header_raw[page_size_offset..][0..4], .little);
     if (!validPageSize(page_size)) return error.InvalidNativePageSize;
 
+    // §9.5/§9.7a: each mode bit is read back independently -- no priority
+    // chain, no bit implying or overriding another -- the direct inverse
+    // of `encodeHeader`'s write above.
+    const flags = std.mem.readInt(u32, header_raw[feature_flags_offset..][0..4], .little);
+    const indexed_reclamation = flags & feature_flag_indexed_reclamation != 0;
+
     return .{
         .reader_epoch_namespace = if (indexed_reclamation) header_raw[reader_epoch_namespace_offset..][0..32].* else @splat(0),
-        .packed_records = has_packed_records,
+        .packed_records = flags & feature_flag_packed_records != 0,
         .indexed_reclamation = indexed_reclamation,
         .page_size = page_size,
         .active_checkpoint = 0,
@@ -18036,7 +18171,7 @@ test "lite native indexed open refuses a pre-v8 format version" {
     }
     {
         var raw_version: [4]u8 = undefined;
-        std.mem.writeInt(u32, &raw_version, indexed_format_version - 1, .little);
+        std.mem.writeInt(u32, &raw_version, format_version - 1, .little);
         var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
         defer raw.close(std.testing.io);
         try raw.writePositionalAll(std.testing.io, &raw_version, version_offset);
@@ -21652,7 +21787,8 @@ test "lite unpacked v3 remains readable and vacuum explicitly adopts packed sign
     try std.testing.expect(file.header.packed_records);
     var header: [header_size]u8 = undefined;
     try readHeaderExactAt(file.file, std.testing.io, &header);
-    try std.testing.expect(!std.mem.eql(u8, header[0..magic.len], unpacked_v4_magic));
+    const flags = std.mem.readInt(u32, header[feature_flags_offset..][0..4], .little);
+    try std.testing.expect(flags & feature_flag_packed_records != 0);
     try std.testing.expect((try decodeHeader(&header)).packed_records);
     const value = (try file.getDocumentAlloc(alloc, "b")).?;
     defer alloc.free(value);
