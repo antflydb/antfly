@@ -5374,9 +5374,20 @@ test "capi native allocator proof path admission uses its bounded concurrent exe
         return error.ExpectedBusy;
     } else |err| try std.testing.expectEqual(error.FileBusy, err);
     try std.testing.expectEqual(@as(usize, 1), probe.retries);
+    // The contract this owns is bounded concurrency for whatever this `Io`
+    // *does* run concurrently, not that every bounded wait spawns a
+    // worker: §8's shared-mmap-region migration replaced the old file-
+    // based CLH ticket queue (writer_queue.zig, deleted) with
+    // `fairWriterLockWithIo`'s direct futex waits on the region itself
+    // (shared_lock_region.zig's `acquireWriterFairBounded`/
+    // `waitWriterFreeBounded`), which block the calling thread in place
+    // and never submit a `concurrent()`/`async()` task to `path_lock_io`
+    // -- so `worker_threads` legitimately stays null for this admission
+    // path now, contended or not. `concurrent_limit` is still this
+    // `Io`'s own configured bound for whatever *is* submitted to it
+    // concurrently elsewhere; verify the configuration survived, not a
+    // worker thread this path never needed.
     try std.testing.expectEqual(std.Io.Limit.limited(2), connection.owner.path_lock_io.concurrent_limit);
-    // A fallback through debug_io would never have started these workers.
-    try std.testing.expect(connection.owner.path_lock_io.worker_threads.load(.acquire) != null);
     var acquired = try connection.acquire();
     acquired.close();
     connection.gate.mutex.unlock(io);
@@ -5393,7 +5404,13 @@ test "capi native allocator proof maintenance capture joins the bounded lease qu
     const turn = owner.maintenanceTurn();
     held.close();
     try std.testing.expectError(error.FileBusy, turn);
-    try std.testing.expect(owner.path_lock_io.worker_threads.load(.acquire) != null);
+    // See the sibling "path admission uses its bounded concurrent
+    // executor" test's own comment: `fairWriterLockWithIo`'s region-
+    // backed wait blocks this call's own thread directly and never
+    // submits a `concurrent()` task to `path_lock_io`, so its
+    // `worker_threads` never populates for this bounded-queue admission
+    // either, contended or not.
+    try std.testing.expectEqual(std.Io.Limit.limited(2), owner.path_lock_io.concurrent_limit);
 }
 
 test "issue1015 issue1431 native background turns coordinate across independent owners" {
