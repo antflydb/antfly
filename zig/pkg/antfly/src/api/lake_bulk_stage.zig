@@ -206,6 +206,14 @@ pub const Stage = struct {
         var bytes: u64 = self.allowance *| 3;
         const budget: files.OutputBudget = .{ .generation = &bytes };
         var generation: files.Root = .{ .version = 2, .domain = self.store.upload_scope.?.domain };
+        // Identity reduction has joined its workers before this quiescent
+        // handoff. Unlike an index job, the fused stage otherwise has no I/O
+        // capability, forcing every source chunk through required-inline PUTs.
+        // Reuse the ordinary bounded publication scheduler and preserve any
+        // caller-owned capability. All upload children drain synchronously.
+        var publication_io: stores.PublicationIo = .{};
+        publication_io.install(&self.store.io_phase, self.io, if (provider.source.scanner.shared_reader) |reader| reader.scheduler else local.sql_parallel_scheduler.global(), .{ .ptr = self, .check = checkCensus });
+        defer publication_io.deinit();
         if (provider.bulk_checkpoints) {
             generation = try files.publishCheckpointPaged(self.a, &checkpoint, generation, "vectors/", self.store, self.token, budget, null);
             generation = try work.publishPartition(self.a, self.store, checkpoint.storage, generation, self.spool_path, partition, self.token, budget, true);

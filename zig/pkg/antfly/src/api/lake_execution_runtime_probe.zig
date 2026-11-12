@@ -179,6 +179,7 @@ pub fn run(io: std.Io) !void {
                 try std.testing.expectEqual(@as(u64, if (phase_index == 2) 2 else 1), ready.value.published.?.generation);
                 var scratch = std.heap.ArenaAllocator.init(a);
                 defer scratch.deinit();
+                try store.bindPublication(ready.value.published.?, .none);
                 const ref = ready.value.published.?.directory.?;
                 const document = try @import("lake_index_directory.zig").loadDocument(scratch.allocator(), store.artifactStore(), .{ .kind = .external_base_source, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, .none, null);
                 try std.testing.expectEqual(@as(usize, 5), document.declarations.len);
@@ -218,10 +219,17 @@ fn runParquet(io: std.Io, uri: []const u8) !void {
     const mode_json = try std.json.Stringify.valueAlloc(a, .{ .caller = @tagName(@import("builtin").mode), .caller_value = @as(u8, 1), .provider = provider_mode, .provider_is_test = provider_test }, .{});
     defer a.free(mode_json);
     std.debug.print("PARQUET_BULK_BUILD_MODE {s}\n", .{mode_json});
+    var remote_config = if (std.c.getenv("ANTFLY_LAKE_BULK_CONFIG")) |raw|
+        try local.common_config.loadFromPathWithSecretsWithIo(a, io, std.mem.span(raw), null)
+    else
+        null;
+    defer if (remote_config) |*config| config.deinit();
+    const node_config: ?*const local.common_config.Config = if (remote_config) |*config| config else null;
+    const source_options: @import("lake_execution_native_contract.zig").SourceOptions = .{ .node_config = node_config, .io = io };
     const dims = try count("ANTFLY_LAKE_BULK_DIMS", 768, 65536);
     const allowance = try count("ANTFLY_LAKE_BULK_INPUT_BYTES", 4 * 1024 * 1024 * 1024, std.math.maxInt(usize) / 2);
     const algorithm = if (std.c.getenv("ANTFLY_LAKE_BULK_ALGORITHM")) |raw| std.mem.span(raw) else "lloyd";
-    if (!std.mem.eql(u8, algorithm, "lloyd") and !std.mem.eql(u8, algorithm, "emeans")) return error.InvalidProbeWorkload;
+    if (!std.mem.eql(u8, algorithm, "lloyd") and !std.mem.eql(u8, algorithm, "emeans") and !std.mem.eql(u8, algorithm, "incremental")) return error.InvalidProbeWorkload;
     var nonce: [16]u8 = undefined;
     io.random(&nonce);
     const relative = try std.fmt.allocPrint(a, ".zig-cache/tmp/parquet-bulk-{s}", .{std.fmt.bytesToHex(nonce, .lower)});
@@ -248,38 +256,88 @@ fn runParquet(io: std.Io, uri: []const u8) !void {
     } else try a.dupe(u8, uri);
     defer a.free(source_uri);
     const schema = try std.fmt.allocPrint(a,
-        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"parquet-bulk","format":"parquet","uri":"{s}","schema_fingerprint":"schema","row_identity":{{"key_columns":["id"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"id":{{"type":"integer"}},"emb":{{"type":"array","items":{{"type":"number"}}}}}},"additionalProperties":false}}}}}}}}
-    , .{source_uri});
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"parquet-bulk","format":"parquet","uri":"{s}"{s},"schema_fingerprint":"schema","row_identity":{{"key_columns":["id"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"id":{{"type":"integer"}},"emb":{{"type":"array","items":{{"type":"number"}}}}}},"additionalProperties":false}}}}}}}}
+    , .{ source_uri, if (node_config != null) ",\"credentials\":{\"ref\":\"bulk-source\"}" else "" });
     defer a.free(schema);
-    const indexes = try std.fmt.allocPrint(a,
+    const indexes = if (std.mem.eql(u8, algorithm, "incremental")) try std.fmt.allocPrint(a,
+        \\{{"emb":{{"type":"embeddings","external":true,"dimension":{d},"distance_metric":"l2_squared"}}}}
+    , .{dims}) else try std.fmt.allocPrint(a,
         \\{{"emb":{{"type":"embeddings","external":true,"dimension":{d},"distance_metric":"l2_squared","lake_bulk_build":"{s}","lake_bulk_build_max_input_bytes":{d}}}}}
     , .{ dims, algorithm, allowance });
     defer a.free(indexes);
-    var state: support.State = .{ .allocator = a, .io = io, .table = .{ .table_id = 17, .name = "parquet-bulk", .schema_json = schema, .indexes_json = indexes } };
+    var state: support.State = .{
+        .allocator = a,
+        .io = io,
+        .table = .{ .table_id = 17, .name = "parquet-bulk", .schema_json = schema, .indexes_json = indexes },
+        .checkpoint_path = if (std.c.getenv("ANTFLY_LAKE_BULK_CATALOG")) |raw| std.mem.span(raw) else null,
+        .interrupt_at_bulk_receipt = if (std.c.getenv("ANTFLY_LAKE_BULK_INTERRUPT")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else null,
+    };
     defer state.deinit();
-    var store = try Store.openNative(a, null, null, false, .standalone, path);
+    var store = try Store.openNativeWithTransport(a, node_config, null, false, .standalone, path, .{ .io = io });
     defer store.deinit();
     const context: local.serverless_query_lake_read_context.Context = .{ .io = io };
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
     defer binding.deinit(a);
-    var source = try local.serverless_query_lake_serving.ServingSource.openWithContext(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{}, context);
+    var source = try local.serverless_query_lake_serving.ServingSource.openWithContext(a, .{ .storage_mode = .relational, .external_base_source = binding }, source_options.lakeOptions(), context);
     defer source.deinit();
+    const InputFile = struct { uri: []const u8, bytes: u64, version: []const u8, etag: []const u8 };
+    const input_files = try a.alloc(InputFile, source.inventory.files.len);
+    defer a.free(input_files);
+    for (input_files, source.inventory.files) |*file, entry| file.* = .{ .uri = entry.object_uri, .bytes = entry.byte_len, .version = entry.version_id, .etag = entry.etag };
+    const input_json = try std.json.Stringify.valueAlloc(a, .{ .files = input_files }, .{});
+    defer a.free(input_json);
+    // Pending publication and provider admission bind this inventory's source
+    // signature. Qualification must check the full set, including vectorless files.
+    std.debug.print("PARQUET_BULK_INVENTORY {s}\n", .{input_json});
+    if (std.c.getenv("ANTFLY_LAKE_BULK_EXPECTED_INVENTORY")) |raw| {
+        const expected_bytes = try cwd.readFileAlloc(io, std.mem.span(raw), a, .limited(16 * 1024 * 1024));
+        defer a.free(expected_bytes);
+        var expected = try std.json.parseFromSlice([]const InputFile, a, expected_bytes, .{});
+        defer expected.deinit();
+        if (expected.value.len != input_files.len) return error.ProbeSourceInventoryMismatch;
+        const matched = try a.alloc(bool, expected.value.len);
+        defer a.free(matched);
+        @memset(matched, false);
+        for (input_files) |actual| {
+            const position = for (expected.value, 0..) |admitted, i| {
+                if (!matched[i] and std.mem.eql(u8, actual.uri, admitted.uri)) break i;
+            } else return error.ProbeSourceInventoryMismatch;
+            const admitted = expected.value[position];
+            if (actual.bytes != admitted.bytes) return error.ProbeSourceInventoryMismatch;
+            if (actual.version.len != 0) {
+                if (!std.mem.eql(u8, actual.version, admitted.version) or (actual.etag.len != 0 and !std.mem.eql(u8, actual.etag, admitted.etag))) return error.ProbeSourceInventoryMismatch;
+            } else if (admitted.etag.len == 0 or !std.mem.eql(u8, actual.etag, admitted.etag)) return error.ProbeSourceInventoryMismatch;
+            matched[position] = true;
+        }
+    }
     const pending = try publication.beginWithLocator(a, io, state.table, &source, store.identity, context, 100, 1000, store.locator);
     defer a.free(pending);
-    try state.set(pending);
+    const reopen_only = support.enabled("ANTFLY_LAKE_BULK_REOPEN_ONLY");
+    if (support.enabled("ANTFLY_LAKE_BULK_RESUME") or reopen_only) {
+        const saved = try cwd.readFileAlloc(io, state.checkpoint_path orelse return error.InvalidProbeWorkload, a, .limited(16 * 1024 * 1024));
+        defer a.free(saved);
+        try state.set(saved);
+    } else try state.set(pending);
     var cause: ?anyerror = null;
     const started = @import("antfly_platform").time.monotonicNs();
-    const result = try @import("lake_execution_native_client.zig").build(a, io, state.table, .{}, try store.executionDescriptor(), context, .none, state.clock(), state.lease(), null, .{
+    const result = if (reopen_only) try a.dupe(u8, state.table.lake_index_catalog_json) else @import("lake_execution_native_client.zig").build(a, io, state.table, source_options, try store.executionDescriptor(), context, .none, state.clock(), state.lease(), null, .{
         .identity_spill_bytes = if (std.c.getenv("ANTFLY_LAKE_BULK_IDENTITY_SPILL_BYTES")) |value| try std.fmt.parseUnsigned(u64, std.mem.span(value), 10) else 1024 * 1024 * 1024,
         .bulk_prebind_parents = if (std.c.getenv("ANTFLY_LAKE_BULK_PREBIND")) |flag| !std.mem.eql(u8, std.mem.span(flag), "0") else true,
         .bulk_compact_partitions = if (std.c.getenv("ANTFLY_LAKE_BULK_COMPACT")) |flag| !std.mem.eql(u8, std.mem.span(flag), "0") else false,
         .fuse_bulk_identity = if (std.c.getenv("ANTFLY_LAKE_BULK_FUSED")) |flag| !std.mem.eql(u8, std.mem.span(flag), "0") else true,
         .bulk_source_checkpoints = if (std.c.getenv("ANTFLY_LAKE_BULK_CHECKPOINT")) |flag| !std.mem.eql(u8, std.mem.span(flag), "0") else true,
-    }, .{}, &cause);
+    }, .{}, &cause) catch |err| {
+        const failure = try std.json.Stringify.valueAlloc(a, .{ .error_name = @errorName(err), .cause = if (cause) |value| @errorName(value) else null, .elapsed_ns = @import("antfly_platform").time.monotonicNs() - started, .names = metrics.names ++ metrics.bulk_names, .ns = bulkPhaseTimes(false), .calls = bulkPhaseTimes(true) }, .{});
+        defer a.free(failure);
+        std.debug.print("PARQUET_BULK_FAILURE_PHASES {s}\n", .{failure});
+        return err;
+    };
     defer a.free(result);
-    const elapsed = @import("antfly_platform").time.monotonicNs() - started;
+    try state.set(result);
+    const elapsed = if (reopen_only) 0 else @import("antfly_platform").time.monotonicNs() - started;
     var ready = try catalog.parse(a, result);
     defer ready.deinit();
+    try store.bindPublication(ready.value.published.?, .none);
     const ref = ready.value.published.?.directory.?;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -288,9 +346,20 @@ fn runParquet(io: std.Io, uri: []const u8) !void {
         if (declaration.artifact.kind == .vector_segment) break declaration;
     } else return error.InvalidProbeWorkload;
     const dense = @import("lake_index_native_dense.zig");
-    const root = try dense.loadRoot(arena.allocator(), store.artifactStore(), declaration.artifact, .none, null);
+    // Match pooled serving readers: immutable authenticated chunks have a
+    // bounded memory cache plus an owned persistent disk tier. This is outside
+    // construction timing and never changes the built publication.
+    var serving_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer serving_cache.deinit();
+    if (node_config != null) {
+        const cache_path = try std.fmt.allocPrint(a, "{s}/serving-cache", .{path});
+        defer a.free(cache_path);
+        try serving_cache.ensurePersistent(io, cache_path, .{ .max_total_bytes = allowance *| 2, .max_entries = @max(16384, allowance / (128 * 1024)) }, .{});
+    }
+    const cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead = if (node_config != null) .{ .cache = &serving_cache, .scope = store.cache_identity, .context = context } else null;
+    const root = try dense.loadRoot(arena.allocator(), store.artifactStore(), declaration.artifact, .none, cached);
     const files = @import("lake_index_native_files.zig");
-    var reader: files.Reader = .{ .root = root.generation, .prefix = "/parquet-bulk", .store = store.artifactStore(), .context = context, .scratch = a };
+    var reader: files.Reader = .{ .root = root.generation, .prefix = "/parquet-bulk", .store = store.artifactStore(), .context = context, .scratch = a, .cache = cached, .max_block_bytes = if (cached != null) 8 * 1024 * 1024 else 0 };
     defer reader.deinit();
     var vectors = try local.storage_lsm_backend.Backend.open(a, "/parquet-bulk/vectors", .{ .storage = reader.storage(), .backend = .{ .read_only = true, .create_if_missing = false } });
     defer vectors.close();
@@ -315,10 +384,13 @@ fn runParquet(io: std.Io, uri: []const u8) !void {
     const phase_json = try std.json.Stringify.valueAlloc(a, .{ .names = metrics.names ++ metrics.bulk_names, .ns = bulkPhaseTimes(false), .calls = bulkPhaseTimes(true) }, .{});
     defer a.free(phase_json);
     std.debug.print("PARQUET_BULK_PHASES {s}\n", .{phase_json});
-    if (std.c.getenv("ANTFLY_LAKE_BULK_RECALL_DIR")) |raw| try parquetRecall(a, io, &index, &source, store.artifactStore(), root, std.mem.span(raw), dims);
+    if (std.c.getenv("ANTFLY_LAKE_BULK_RECALL_DIR")) |raw| try parquetRecall(a, io, &index, &source, store.artifactStore(), root, ready.value.published.?.row_identity, declaration.name, cached, std.mem.span(raw), dims);
+    const read_stats = try std.json.Stringify.valueAlloc(a, serving_cache.snapshot(), .{});
+    defer a.free(read_stats);
+    std.debug.print("PARQUET_BULK_SERVING_CACHE {s}\n", .{read_stats});
 }
 
-fn parquetRecall(a: A, io: std.Io, index: *local.storage_hbc_adapter.HBCIndex, source: *local.serverless_query_lake_serving.ServingSource, store: @import("../serverless/artifacts/store.zig").ArtifactStore, root: @import("lake_index_native_dense.zig").Root, path: []const u8, dims: usize) !void {
+fn parquetRecall(a: A, io: std.Io, index: *local.storage_hbc_adapter.HBCIndex, source: *local.serverless_query_lake_serving.ServingSource, store: @import("../serverless/artifacts/store.zig").ArtifactStore, root: @import("lake_index_native_dense.zig").Root, identity_ref: ?local.serverless_manifest_artifact_ref.ArtifactRef, index_name: []const u8, cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead, path: []const u8, dims: usize) !void {
     // Truth uses one-based physical ordinals in lexically sorted object order.
     // Authenticated private file identities map hits back to those coordinates.
     const inventory = source.inventory;
@@ -326,6 +398,41 @@ fn parquetRecall(a: A, io: std.Io, index: *local.storage_hbc_adapter.HBCIndex, s
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const entries = if (root.file_directory) |directory| try native_state.directoryFiles(arena.allocator(), store, directory, root.generation.domain, .none) else root.file_states;
+    const identity = @import("lake_row_identity.zig");
+    const tree = @import("../serverless/graph_segment/page_tree.zig");
+    // Default fresh builds can index logical fragments. Never compare their
+    // fragment ordinals directly with the physical Parquet oracle.
+    const relocated = for (entries) |entry| {
+        const physical = for (inventory.files) |file| {
+            if (std.mem.eql(u8, file.file_id, entry.id)) break true;
+        } else false;
+        if (!physical) break true;
+    } else false;
+    var identity_root: ?identity.Root = if (relocated) try identity.load(arena.allocator(), store, identity_ref orelse return error.InvalidProbeWorkload, .none, cached) else null;
+    if (identity_root) |*value| {
+        value.indexes = value.spaceForIndex(index_name);
+        value.reused = &.{};
+    }
+    var identity_store = store;
+    var reads: u64 = 128 * 1024 * 1024;
+    var writes: u64 = 0;
+    var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{
+        .domain = if (identity_root) |value| value.domain else @splat(0),
+        .artifacts = &identity_store,
+        .remaining_read_bytes = &reads,
+        .remaining_write_bytes = &writes,
+    };
+    var page_cache = struct {
+        cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead,
+        fn read(raw: *anyopaque, alloc: A, artifacts: *@import("../serverless/artifacts/store.zig").ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, digest_: [32]u8, token: @import("antfly_cancellation").CancellationToken, remaining: *u64) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try @import("../serverless/artifacts/store.zig").chargeReadBudget(remaining, length);
+            return @import("lake_index_aggregate_artifact.zig").readPageRange(alloc, artifacts.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest_, token, self.cached);
+        }
+    }{ .cached = cached };
+    if (cached != null) pages.read_cache = .{ .ptr = &page_cache, .read = @TypeOf(page_cache).read };
+    var identity_cache: tree.Cache = .{ .alloc = a, .underlying = pages.store(), .max_bytes = 2 * 1024 * 1024 };
+    defer identity_cache.deinit();
     const group_rows = try arena.allocator().alloc([]u64, inventory.files.len);
     for (inventory.files, group_rows) |file, *rows| {
         var footer = try local.serverless_query_lake_schema.readFooter(a, source.scanner.reader(), file);
@@ -364,7 +471,11 @@ fn parquetRecall(a: A, io: std.Io, index: *local.storage_hbc_adapter.HBCIndex, s
         for (0..nq) |qi| {
             var result = try index.searchProfiledRequest(.{ .query = queries[qi * dims ..][0..dims], .k = 100, .search_width = @intCast(probes), .epsilon = 7, .rerank_factor = 4, .load_metadata = true });
             defer result.results.deinit();
-            for (result.results.getHits()) |hit| {
+            var query_arena = std.heap.ArenaAllocator.init(a);
+            defer query_arena.deinit();
+            const qa = query_arena.allocator();
+            const refs = try qa.alloc(local.storage_rowsource_types.RowRef, result.results.getHits().len);
+            for (result.results.getHits(), refs) |hit, *ref_| {
                 const key = hit.metadata orelse return error.InvalidProbeWorkload;
                 const coordinates = try local.storage_rowsource_identity.parse(key);
                 const file_state = for (entries) |entry| {
@@ -374,16 +485,39 @@ fn parquetRecall(a: A, io: std.Io, index: *local.storage_hbc_adapter.HBCIndex, s
                     std.log.err("recall private key has no authenticated file: {s}", .{key});
                     return error.InvalidProbeWorkload;
                 };
-                var ordinal: u64 = coordinates.row + 1;
+                ref_.* = .{ .external = .{
+                    .source_id = if (identity_root) |value| value.indexSpace().source else inventory.source_id,
+                    .snapshot_id = if (identity_root) |value| value.indexSpace().snapshot else inventory.snapshot_id,
+                    .file_id = file_state.id,
+                    .row_group_ordinal = coordinates.group,
+                    .row_ordinal = coordinates.row,
+                } };
+            }
+            if (identity_root) |value| {
+                reads = 128 * 1024 * 1024;
+                var logical_reader: identity.Reader = .{ .root = value, .pages = &pages, .cache = &identity_cache };
+                const resolved = try logical_reader.translateMany(qa, refs, true);
+                const slots = try qa.alloc(u32, resolved.len);
+                for (resolved, slots) |row, *slot| slot.* = row.coordinate.file;
+                const names = try logical_reader.filesMany(qa, value.current, slots);
+                for (refs, resolved, names) |*ref_, row, name| {
+                    ref_.external.file_id = name;
+                    ref_.external.row_group_ordinal = row.coordinate.group;
+                    ref_.external.row_ordinal = row.coordinate.row;
+                }
+            }
+            for (refs) |ref_| {
+                const coordinates = ref_.external;
+                var ordinal: u64 = coordinates.row_ordinal + 1;
                 var matched = false;
                 for (order) |fi| {
                     const file = inventory.files[fi];
-                    if (std.mem.eql(u8, file.file_id, file_state.id)) {
-                        if (coordinates.group >= group_rows[fi].len or coordinates.row >= group_rows[fi][coordinates.group]) {
-                            std.log.err("recall coordinate outside pinned footer file={s} group={} row={}", .{ file.file_id, coordinates.group, coordinates.row });
+                    if (std.mem.eql(u8, file.file_id, coordinates.file_id)) {
+                        if (coordinates.row_group_ordinal >= group_rows[fi].len or coordinates.row_ordinal >= group_rows[fi][coordinates.row_group_ordinal]) {
+                            std.log.err("recall coordinate outside pinned footer file={s} group={} row={}", .{ file.file_id, coordinates.row_group_ordinal, coordinates.row_ordinal });
                             return error.InvalidProbeWorkload;
                         }
-                        for (group_rows[fi][0..coordinates.group]) |count_| ordinal += count_;
+                        for (group_rows[fi][0..coordinates.row_group_ordinal]) |count_| ordinal += count_;
                         matched = true;
                         break;
                     }
