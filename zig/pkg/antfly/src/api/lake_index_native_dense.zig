@@ -287,7 +287,15 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             };
             if (root.dims == dims and root.input_allowance == bulk_input_limit and std.mem.eql(u8, root.algorithm, @tagName(build_options.?.algorithm)) and
                 std.mem.eql(u8, &root.recipe, &recipe) and rebuild.bindingsEqual(root.binding, binding) and
-                std.mem.eql(u8, &root.generation.domain, &store.upload_scope.?.domain)) source_work = root;
+                std.mem.eql(u8, &root.generation.domain, &store.upload_scope.?.domain))
+            {
+                source_work = root;
+                if (comptime @hasDecl(@import("root"), "lakeExecutionProbeFamily")) {
+                    const report = try std.json.Stringify.valueAlloc(a, .{ .name = wanted.name, .manifest = work.manifest.artifact_id, .phase = if (root.index_complete) "tree" else "source", .rows = root.partition.count }, .{});
+                    defer a.free(report);
+                    std.debug.print("PARQUET_BULK_RESUME {s}\n", .{report});
+                }
+            }
         };
         const resuming_source = source_work != null;
         const overlay = if (local_stage != null) null else if (seed) |root| try files.Overlay.create(a, root.generation, store.*, path, provider.context, cancellation) else if (source_work) |root| try files.Overlay.create(a, root.generation, store.*, path, provider.context, cancellation) else null;
@@ -427,10 +435,12 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var input_remaining: u64 = bulk_input_limit;
         const input = if (provider.resume_work) |work| &work.native_input_left else &input_remaining;
         const ingest_started = probe.start();
+        var input_rows: u64 = 0;
         while (if (rows) |source_rows| try source_rows.next(a) else null) |batch| {
             var page_arena = std.heap.ArenaAllocator.init(a);
             defer page_arena.deinit();
             const pa = page_arena.allocator();
+            input_rows += batch.rowCount();
             var writes: std.ArrayList(hbc.BatchInsertItem) = .empty;
             var unit_records: std.StringHashMapUnmanaged([]const u8) = .empty;
             const vector_input = producer.bind(batch);
@@ -493,6 +503,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             }
         }
         probe.finish("dense_ingest", ingest_started);
+        if (comptime @hasDecl(@import("root"), "lakeExecutionProbeFamily")) {
+            const report = try std.json.Stringify.valueAlloc(a, .{ .rows = input_rows, .resumed = resuming_source }, .{});
+            defer a.free(report);
+            std.debug.print("PARQUET_BULK_INPUT {s}\n", .{report});
+        }
         if (build_options != null and !(source_work != null and source_work.?.index_complete)) {
             const root = if (spool_output) |*output| output.finish(io) catch |err| return if (err == error.DuplicateVectorId) error.NativeLakeVectorIdentityCollision else err else source_work.?.partition;
             spool_output = null;
@@ -503,6 +518,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 try vectors.checkpointRecoveryManifest();
                 try tracker.finish();
                 if (provider.bulk_checkpoints and provider.progress != null and provider.progress.?.save_work != null) {
+                    var publication_io: stores.PublicationIo = .{};
+                    publication_io.install(&store.io_phase, io, if (provider.source.scanner.shared_reader) |reader| reader.scheduler else local.sql_parallel_scheduler.global(), .{ .ptr = &build_cancellation, .check = BuildCancellation.check });
+                    defer publication_io.deinit();
                     var cut = try vectors.pinNativeCheckpoint();
                     defer cut.deinit();
                     var phase_bytes: u64 = bulk_input_limit *| 3;
@@ -532,6 +550,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             try tracker.finish();
         }
         if (build_options != null and provider.bulk_checkpoints and provider.progress != null and source_work != null and !source_work.?.index_complete) {
+            var publication_io: stores.PublicationIo = .{};
+            publication_io.install(&store.io_phase, io, if (provider.source.scanner.shared_reader) |reader| reader.scheduler else local.sql_parallel_scheduler.global(), .{ .ptr = &build_cancellation, .check = BuildCancellation.check });
+            defer publication_io.deinit();
             var cut = try index.pinNativeCheckpoint();
             defer cut.deinit();
             var phase_bytes: u64 = bulk_input_limit *| 3;
@@ -583,6 +604,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var vector_checkpoint = try vectors.pinNativeCheckpoint();
         defer vector_checkpoint.deinit();
         const upload_started = probe.start();
+        var publication_io: stores.PublicationIo = .{};
+        publication_io.install(&store.io_phase, io, if (provider.source.scanner.shared_reader) |reader| reader.scheduler else local.sql_parallel_scheduler.global(), .{ .ptr = &build_cancellation, .check = BuildCancellation.check });
+        defer publication_io.deinit();
         if (comptime @hasDecl(@import("root"), "lakeExecutionProbeFamily")) if (source_work) |source_phase| {
             const retained: files.Reuse = .{ .root = source_phase.generation, .navigation = &navigation };
             var reused_bytes: u64 = 0;

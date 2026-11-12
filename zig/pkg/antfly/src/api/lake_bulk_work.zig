@@ -61,6 +61,11 @@ pub fn save(a: A, provider: *Provider, store: *stores.ArtifactStore, name: []con
     if (bytes.len > 1024 * 1024) return error.NativeLakeFilesTooLarge;
     var uploaded = try store.putWithCancellation(bytes, token);
     defer uploaded.deinit(store.allocator);
+    if (comptime @hasDecl(@import("root"), "lakeExecutionProbeFamily")) {
+        const report = try std.json.Stringify.valueAlloc(a, .{ .name = name, .manifest = uploaded.artifact_id, .phase = if (root.index_complete) "tree" else "source", .rows = root.partition.count }, .{});
+        defer a.free(report);
+        std.debug.print("PARQUET_BULK_RECEIPT {s}\n", .{report});
+    }
     try provider.checkpointWork(.{ .name = name, .manifest = .{ .kind = .doc_values, .metadata_version = 1, .artifact_id = uploaded.artifact_id, .checksum = uploaded.checksum, .byte_len = uploaded.byte_len } });
 }
 pub fn publishPartition(a: A, store: *stores.ArtifactStore, source: local.storage_lsm_backend.Storage, root: files.Root, path: []const u8, partition: local.storage_hbc_adapter.HBCIndex.BulkSpool.Partition, token: Token, budget: files.OutputBudget, sample_only: bool) !files.Root {

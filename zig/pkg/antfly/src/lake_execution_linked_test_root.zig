@@ -16,6 +16,9 @@
 //! Link the complete lake build client against an independent provider image.
 pub const antfly_sources = @import("source_owner_physical.zig");
 test {
+    _ = @import("serverless/artifacts/store.zig");
+    _ = @import("api/lake_row_coordinate_join.zig");
+    _ = @import("api/lake_row_fragments.zig");
     _ = @import("api/lake_execution_native_test.zig");
     _ = @import("api/lake_execution_memory_test.zig");
     _ = @import("api/lake_execution_s3_test.zig");

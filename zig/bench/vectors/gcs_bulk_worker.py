@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Run one local qualification case against GCS with ADC or a stdin credential."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+import threading
+import shutil
+
+
+def atomic(path, value):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def network():
+    if not Path("/proc/net/dev").exists():
+        return None
+    lines = Path("/proc/net/dev").read_text().splitlines()[2:]
+    values = [line.split(":", 1) for line in lines if ":" in line]
+    return sum(
+        int(v.split()[0]) + int(v.split()[8])
+        for name, v in values
+        if name.strip() != "lo"
+    )
+
+
+def parse_records(text):
+    records = {}
+    for line in text.splitlines():
+        if line.startswith("PARQUET_BULK_") and " {" in line:
+            key, value = line.split(" ", 1)
+            records.setdefault(key, []).append(json.loads(value))
+    return records
+
+
+def validate_inventory(cfg, records):
+    inventories = records.get("PARQUET_BULK_INVENTORY", [])
+    if len(inventories) != 1 or not isinstance(inventories[0].get("files"), list):
+        raise RuntimeError("missing or duplicate native source inventory")
+    files = inventories[0]["files"]
+    if any(
+        not isinstance(file, dict)
+        or not isinstance(file.get("uri"), str)
+        or not isinstance(file.get("version"), str)
+        or not isinstance(file.get("etag", ""), str)
+        or type(file.get("bytes")) is not int
+        or file["bytes"] < 0
+        for file in files
+    ):
+        raise RuntimeError("invalid native source inventory")
+    expected = cfg["source_objects"]
+    if len(files) != len(expected):
+        raise RuntimeError(
+            "native source inventory differs from admitted immutable objects"
+        )
+    for observed, admitted in zip(
+        sorted(files, key=lambda file: file["uri"]),
+        sorted(expected, key=lambda file: file["uri"]),
+    ):
+        if observed["uri"] != admitted["uri"] or observed["bytes"] != admitted["bytes"]:
+            raise RuntimeError(
+                "native source inventory differs from admitted immutable objects"
+            )
+        # Prefix readers can bind a strong JSON metadata ETag instead of an
+        # explicit generation. GCS resolves that conditional revision to its
+        # generation before fetching bytes; compare the admitted alias too.
+        if observed["version"]:
+            if observed["version"] != admitted["version"] or (
+                observed.get("etag") and observed["etag"] != admitted.get("etag")
+            ):
+                raise RuntimeError(
+                    "native source generation differs from admitted object"
+                )
+        elif not admitted.get("etag") or observed.get("etag") != admitted["etag"]:
+            raise RuntimeError("native source has no admitted immutable revision")
+
+
+def validate_interruption(cfg, row, text, catalog):
+    phase = "source" if cfg["interrupt"] == 1 else "tree"
+    records = parse_records(text)
+    validate_inventory(cfg, records)
+    receipts = records.get("PARQUET_BULK_RECEIPT", [])
+    expected_phases = ["source"] if phase == "source" else ["source", "tree"]
+    construction = (catalog.get("checkpoint") or {}).get("construction", [])
+    if (
+        row["exit_code"] == 0
+        or "Cancelled" not in text
+        or [receipt["phase"] for receipt in receipts] != expected_phases
+        or len(construction) != 1
+        or receipts[-1]["name"] != "emb"
+        or receipts[-1]["rows"] != cfg["rows"]
+        or construction[0]["name"] != receipts[-1]["name"]
+        or construction[0]["manifest"]["artifact_id"] != receipts[-1]["manifest"]
+    ):
+        raise RuntimeError("interruption did not retain the requested receipt phase")
+    return receipts[-1]
+
+
+def validate_resume(records, receipt):
+    if records.get("PARQUET_BULK_RESUME") != [receipt]:
+        raise RuntimeError("resume did not accept the exact retained receipt")
+    if records.get("PARQUET_BULK_INPUT") != [dict(rows=0, resumed=True)]:
+        raise RuntimeError("resume replayed source input")
+    phases = records["PARQUET_BULK_PHASES"][0]
+    calls = dict(zip(phases["names"], phases["calls"]))
+    expected_clusters = 0 if receipt["phase"] == "tree" else 1
+    if (
+        calls.get("dense_cluster") != expected_clusters
+        or calls.get("bulk_tee") != 0
+        or calls.get("bulk_receipt") != 0
+        or (receipt["phase"] == "tree" and records.get("PARQUET_BULK_WORK"))
+    ):
+        raise RuntimeError("resume repeated completed construction work")
+
+
+def nonnegative_counts(record, fields):
+    return all(type(record.get(key)) is int and record[key] >= 0 for key in fields)
+
+
+def validate_evidence(cfg, row, receipt=None):
+    from bench_bulk_pipeline import BULK_PHASE_NAMES, validate_phases
+
+    records = row["records"]
+    validate_inventory(cfg, records)
+    modes = records.get("PARQUET_BULK_BUILD_MODE", [])
+    if (
+        len(modes) != 1
+        or modes[0].get("caller") != "fast"
+        or modes[0].get("provider_is_test") is not False
+        or any(
+            type(modes[0].get(key)) is not int or modes[0][key] != 1
+            for key in ("caller_value", "provider")
+        )
+    ):
+        raise RuntimeError("mixed or non-release compilation")
+    calls = validate_phases(records.get("PARQUET_BULK_PHASES", []), BULK_PHASE_NAMES)
+    if cfg.get("reopen_catalog"):
+        if (
+            row["native_ns"] != 0
+            or row["checkpoints"] != 0
+            or any(calls.values())
+            or any(
+                records.get(name)
+                for name in (
+                    "PARQUET_BULK_INPUT",
+                    "PARQUET_BULK_RESUME",
+                    "PARQUET_BULK_RECEIPT",
+                    "PARQUET_BULK_WORK",
+                    "PARQUET_BULK_PROJECTION",
+                    "PARQUET_BULK_SOURCE",
+                )
+            )
+        ):
+            raise RuntimeError("verification-only reopen performed construction")
+        return
+    if any(
+        calls[name] != 1
+        for name in (
+            "identity",
+            "dense",
+            "dense_ingest",
+            "dense_checkpoint",
+            "dense_upload",
+        )
+    ):
+        raise RuntimeError("missing or repeated construction phase")
+    inputs = records.get("PARQUET_BULK_INPUT", [])
+    if (
+        len(inputs) != 1
+        or not nonnegative_counts(inputs[0], ("rows",))
+        or type(inputs[0].get("resumed")) is not bool
+    ):
+        raise RuntimeError("invalid dense input evidence")
+    if stage_resume := receipt is not None:
+        validate_resume(records, receipt)
+    else:
+        fused = cfg["variant"] == "optimized"
+        bulk = cfg["variant"] != "incremental"
+        if (
+            calls["dense_cluster"] != int(bulk)
+            or bool(calls["bulk_tee"]) != fused
+            or calls["bulk_receipt"] != int(fused)
+        ):
+            raise RuntimeError("construction phases do not match the requested variant")
+        if records.get("PARQUET_BULK_INPUT") != [
+            dict(rows=0 if fused else cfg["rows"], resumed=fused)
+        ]:
+            raise RuntimeError(
+                "dense input evidence does not match the requested variant"
+            )
+    if cfg["variant"] != "incremental":
+        expected = (
+            []
+            if stage_resume and receipt["phase"] == "tree"
+            else ["tree"]
+            if stage_resume
+            else ["source", "tree"]
+        )
+        saved = records.get("PARQUET_BULK_RECEIPT", [])
+        if (
+            [value.get("phase") for value in saved] != expected
+            or row["checkpoints"] != len(expected)
+            or any(
+                value.get("name") != "emb" or value.get("rows") != cfg["rows"]
+                for value in saved
+            )
+        ):
+            raise RuntimeError("incomplete construction receipt evidence")
+    elif row["checkpoints"] != 0 or records.get("PARQUET_BULK_RECEIPT"):
+        raise RuntimeError("incremental case unexpectedly used bulk receipts")
+    memory = records.get("PARQUET_BULK_MEMORY", [])
+    fields = (
+        "dense_allocator_peak_bytes",
+        "source_allocator_peak_bytes",
+        "max_vector_allocator_peak_bytes",
+    )
+    if (
+        len(memory) != 1
+        or not nonnegative_counts(memory[0], fields)
+        or memory[0][fields[0]] == 0
+        or any(memory[0][key] > 256 * 1024**2 for key in fields)
+        or memory[0][fields[2]] != max(memory[0][fields[0]], memory[0][fields[1]])
+    ):
+        raise RuntimeError("missing memory evidence or private quota exceeded")
+    if cfg["variant"] == "incremental":
+        if any(
+            records.get(name)
+            for name in (
+                "PARQUET_BULK_WORK",
+                "PARQUET_BULK_PROJECTION",
+                "PARQUET_BULK_SOURCE",
+            )
+        ):
+            raise RuntimeError("incremental case unexpectedly emitted bulk work")
+        return
+    source = records.get("PARQUET_BULK_SOURCE", [])
+    if (
+        len(source) != 1
+        or not nonnegative_counts(
+            source[0], ("runs", "reused_runs", "reused_bytes", "new_bytes")
+        )
+        or source[0]["runs"] <= 0
+        or source[0]["new_bytes"] != 0
+        or source[0]["reused_runs"] != source[0]["runs"]
+        or source[0]["reused_bytes"] <= 0
+    ):
+        raise RuntimeError("exact source was not fully reused")
+    if not (stage_resume and receipt["phase"] == "tree"):
+        work = records.get("PARQUET_BULK_WORK", [])
+        fields = (
+            "identity_read_bytes",
+            "identity_written_bytes",
+            "identity_merge_inputs",
+            "projection_cache_peak_bytes",
+            "owned_index_count",
+            "partition_bytes",
+            "partition_read_bytes",
+            "compact_rows",
+            "projection_commit_ns",
+            "save_node_ns",
+            "update_parent_ns",
+            "update_parent_calls",
+            "training_ns",
+            "routing_ns",
+            "allocator_peak_bytes",
+        )
+        if (
+            len(work) != 1
+            or not nonnegative_counts(work[0], fields)
+            or work[0].get("identity_census_verified") is not True
+            or work[0]["owned_index_count"] != 0
+            or work[0]["identity_merge_inputs"] > 32
+        ):
+            raise RuntimeError("unverified or unbounded identity construction")
+        if cfg["variant"] == "optimized" and work[0]["update_parent_calls"] != 0:
+            raise RuntimeError("preassigned parents were rewritten")
+
+
+def main():
+    cfg = json.loads(Path(sys.argv[1]).read_text())
+    token = "" if cfg.get("auth") == "adc" else sys.stdin.readline(65537).strip()
+    if cfg.get("auth") != "adc" and (not token or len(token) > 65536):
+        raise ValueError("expected bounded credential on stdin")
+    root = Path(cfg["work"])
+    root.mkdir(exist_ok=False)
+    os.chdir(root)
+
+    def connection(capability, prefix):
+        return dict(
+            kind="external_io",
+            capabilities=[capability],
+            external_io=dict(
+                protocol="gcs",
+                buckets=[cfg["bucket"]],
+                prefix=prefix,
+                bucket_provisioning="require_existing",
+                credentials=dict(
+                    **(
+                        {"source": "default"}
+                        if cfg.get("auth") == "adc"
+                        else {
+                            "source": "bearer_token",
+                            "bearer_token": "${secret:BULK_GCS_BEARER}",
+                        }
+                    )
+                ),
+            ),
+        )
+
+    config = dict(
+        deployment_mode="standalone",
+        storage=dict(
+            engine="local",
+            local={"base_dir": str(root / "data")},
+            artifacts=dict(
+                connection="bulk-artifacts",
+                bucket=cfg["bucket"],
+                prefix=cfg["prefix"] + "/artifacts",
+            ),
+        ),
+        connections={
+            "bulk-source": connection("lake.read", cfg["source_prefix"]),
+            "bulk-artifacts": connection(
+                "storage.primary", cfg["prefix"] + "/artifacts"
+            ),
+        },
+    )
+    Path("config.json").write_text(json.dumps(config))
+    Path("config.json").chmod(0o400)
+    config_hash = hashlib.sha256(Path("config.json").read_bytes()).hexdigest()
+    Path("expected-inventory.json").write_text(json.dumps(cfg["source_objects"]))
+    Path("expected-inventory.json").chmod(0o400)
+    inventory_hash = hashlib.sha256(
+        Path("expected-inventory.json").read_bytes()
+    ).hexdigest()
+    from bench_bulk_pipeline import probe_environment
+
+    env = dict(
+        probe_environment(),
+        BULK_GCS_BEARER=token,
+        ANTFLY_LAKE_BULK_CONFIG=str(root / "config.json"),
+        ANTFLY_LAKE_BULK_EXPECTED_INVENTORY=str(root / "expected-inventory.json"),
+        ANTFLY_LAKE_BULK_PARQUET="gs://" + cfg["bucket"] + "/" + cfg["source_prefix"],
+        ANTFLY_LAKE_BULK_CATALOG=str(root / "catalog.json"),
+        ANTFLY_LAKE_BULK_RECALL_DIR=cfg["recall"],
+        ANTFLY_LAKE_BULK_DIMS="768",
+        ANTFLY_LAKE_BULK_INPUT_BYTES=str(cfg["allowance"]),
+        ANTFLY_LAKE_BULK_IDENTITY_SPILL_BYTES=str(
+            cfg.get("identity_allowance", 1024**3)
+        ),
+        ANTFLY_LAKE_BULK_ALGORITHM="incremental"
+        if cfg["variant"] == "incremental"
+        else "lloyd",
+        ANTFLY_LAKE_BULK_FUSED="1" if cfg["variant"] == "optimized" else "0",
+        ANTFLY_LAKE_BULK_PREBIND="1" if cfg["variant"] == "optimized" else "0",
+        ANTFLY_LAKE_BULK_CHECKPOINT="1",
+        ANTFLY_LAKE_BULK_COMPACT="0",
+    )
+    if cfg.get("reopen_catalog"):
+        shutil.copyfile(cfg["reopen_catalog"], root / "catalog.json")
+        env["ANTFLY_LAKE_BULK_REOPEN_ONLY"] = "1"
+    report = dict(
+        config=cfg,
+        native_config_sha256=config_hash,
+        expected_inventory_sha256=inventory_hash,
+        qualified=False,
+        attempts=[],
+        network_scope="Linux process network namespace interfaces, including control traffic; unavailable on macOS; not object-store payload bytes",
+    )
+    atomic(root / "result.json", report)
+    stop = threading.Event()
+    peaks = {
+        "case_nominal_bytes": 0,
+        "host_filesystem_min_free_bytes": shutil.disk_usage(root).free,
+    }
+
+    def sample_disk():
+        while not stop.is_set():
+            total = 0
+            for base in (root,):
+                for directory, _, names in os.walk(base):
+                    for name in names:
+                        try:
+                            total += (Path(directory) / name).stat().st_size
+                        except FileNotFoundError:
+                            pass
+            peaks["case_nominal_bytes"] = max(peaks["case_nominal_bytes"], total)
+            peaks["host_filesystem_min_free_bytes"] = min(
+                peaks["host_filesystem_min_free_bytes"], shutil.disk_usage(root).free
+            )
+            stop.wait(2)
+
+    sampler = threading.Thread(target=sample_disk, daemon=True)
+    sampler.start()
+    retained_receipt = None
+    for stage in (
+        ["reopen"]
+        if cfg.get("reopen_catalog")
+        else ["interrupt", "resume"]
+        if cfg.get("interrupt")
+        else ["build"]
+    ):
+        if stage == "interrupt":
+            env["ANTFLY_LAKE_BULK_INTERRUPT"] = str(cfg["interrupt"])
+            env.pop("ANTFLY_LAKE_BULK_RECALL_DIR", None)
+        if stage == "resume":
+            env.pop("ANTFLY_LAKE_BULK_INTERRUPT", None)
+            env["ANTFLY_LAKE_BULK_RESUME"] = "1"
+            env["ANTFLY_LAKE_BULK_RECALL_DIR"] = cfg["recall"]
+        before, start = network(), time.monotonic_ns()
+        with (root / (stage + ".log")).open("w") as log:
+            child = subprocess.Popen(
+                [cfg["binary"]], env=env, stdout=log, stderr=subprocess.STDOUT
+            )
+            try:
+                _, status, usage = os.wait4(child.pid, 0)
+                child.returncode = os.waitstatus_to_exitcode(status)
+            finally:
+                if child.returncode is None:
+                    child.kill()
+                    child.wait()
+        row = dict(
+            stage=stage,
+            exit_code=child.returncode,
+            wall_ns=time.monotonic_ns() - start,
+            user_seconds=usage.ru_utime,
+            system_seconds=usage.ru_stime,
+            peak_rss_bytes=usage.ru_maxrss * (1 if sys.platform == "darwin" else 1024),
+            pod_network_bytes=network() - before if before is not None else None,
+            probe_environment={
+                key: value
+                for key, value in env.items()
+                if key.startswith(("ANTFLY_LAKE_BULK_", "ANTFLY_LAKE_PROBE_"))
+            },
+        )
+        report["attempts"].append(row)
+        atomic(root / "result.json", report)
+        if hashlib.sha256(Path("config.json").read_bytes()).hexdigest() != config_hash:
+            raise RuntimeError("native configuration changed during execution")
+        if (
+            hashlib.sha256(Path("expected-inventory.json").read_bytes()).hexdigest()
+            != inventory_hash
+        ):
+            raise RuntimeError("expected inventory changed during execution")
+        text = (root / (stage + ".log")).read_text()
+        if token and token in text:
+            raise RuntimeError("credential appeared in child log")
+        row["records"] = parse_records(text)
+        atomic(root / "result.json", report)
+        validate_inventory(cfg, row["records"])
+        if stage == "interrupt":
+            catalog = json.loads((root / "catalog.json").read_text())
+            retained_receipt = validate_interruption(cfg, row, text, catalog)
+            row["retained_receipt"] = retained_receipt
+            row["retained_catalog_sha256"] = hashlib.sha256(
+                (root / "catalog.json").read_bytes()
+            ).hexdigest()
+            continue
+        match = re.search(
+            r"^PARQUET_BULK algorithm=\w+ vectors=(\d+) dims=768 total_ns=(\d+) reopened_hits=10 checkpoints=(\d+) logical_identity=true$",
+            text,
+            re.M,
+        )
+        if child.returncode or not match or int(match[1]) != cfg["rows"]:
+            raise RuntimeError("build/reopen verification failed")
+        row["native_ns"] = int(match[2])
+        row["checkpoints"] = int(match[3])
+        from bench_bulk_pipeline import validate_recall
+
+        truth = json.loads((Path(cfg["recall"]) / "prepare.json").read_text())
+        validate_recall(row["records"].get("PARQUET_BULK_RECALL", []), truth)
+
+        validate_evidence(cfg, row, retained_receipt if stage == "resume" else None)
+        if cfg.get("reopen_catalog"):
+            row["build_timing_available"] = False
+
+    stop.set()
+    sampler.join()
+    report["scratch_sample"] = dict(
+        peaks,
+        interval_seconds=2,
+        scope="case directory nominal lengths only; host free-space includes unrelated work, native /tmp scratch not attributed",
+    )
+    report["qualified"] = True
+    atomic(root / "result.json", report)
+    print(json.dumps(dict(qualified=True, case=cfg["case"])), flush=True)
+
+
+if __name__ == "__main__":
+    main()
