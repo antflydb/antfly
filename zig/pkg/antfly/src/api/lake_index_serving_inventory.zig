@@ -51,6 +51,7 @@ fn encode(a: A, group: corpus.FileGroup, compact: bool) ![]u8 {
     if (!compact) return std.json.Stringify.valueAlloc(a, group, .{});
     var file = group.file;
     file.docs = &.{};
+    file.docs_root = null;
     file.count = 0;
     return std.json.Stringify.valueAlloc(a, FileRouting{ .file = file, .segments = try compactRoutes(a, group), .physical = group.physical_manifest }, .{});
 }

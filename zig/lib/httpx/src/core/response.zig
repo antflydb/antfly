@@ -46,6 +46,23 @@ pub const Response = struct {
         self.releaseBody();
     }
 
+    /// Consume the buffered body in the destination allocation domain. Matching
+    /// ownership transfers without copying; otherwise copy first so failure
+    /// leaves this response intact. Headers always remain with the response.
+    pub fn takeBodyAlloc(self: *Self, destination: Allocator) ![]u8 {
+        const bytes = self.body orelse return try destination.alloc(u8, 0);
+        const owner = self.body_allocator orelse self.allocator;
+        if (self.body_owned and owner.ptr == destination.ptr and owner.vtable == destination.vtable) {
+            self.body = null;
+            self.body_owned = false;
+            self.body_allocator = null;
+            return @constCast(bytes);
+        }
+        const copy = try destination.dupe(u8, bytes);
+        self.releaseBody();
+        return copy;
+    }
+
     /// Release a transferred body through its original allocation domain.
     pub fn releaseBody(self: *Self) void {
         if (self.body_owned) if (self.body) |bytes| (self.body_allocator orelse self.allocator).free(bytes);
@@ -503,4 +520,56 @@ test "owned response buffer replacement and failed build release the original ow
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "body transfer preserves allocation identity and independent headers" {
+    const Quota = @import("../util/quota_allocator.zig").QuotaAllocator;
+    var quota = Quota{ .backing = std.testing.allocator, .limit = 4 };
+    var response = Response.init(std.testing.allocator, 200);
+    defer response.deinit();
+    try response.headers.set("Content-Type", "text/plain");
+    const original = try quota.allocator().dupe(u8, "body");
+    response.body = original;
+    response.body_owned = true;
+    response.body_allocator = quota.allocator();
+    const detached = try response.takeBodyAlloc(quota.allocator());
+    try std.testing.expect(original.ptr == detached.ptr);
+    try std.testing.expect(response.body == null and !response.body_owned);
+    try std.testing.expectEqualStrings("text/plain", response.headers.get("Content-Type").?);
+    try std.testing.expectEqual(@as(usize, 4), quota.live);
+    quota.allocator().free(detached);
+    try std.testing.expectEqual(@as(usize, 0), quota.live);
+}
+
+test "body transfer across allocators rolls back failure and releases the original on success" {
+    const a = std.testing.allocator;
+    const Quota = @import("../util/quota_allocator.zig").QuotaAllocator;
+    var quota = Quota{ .backing = a, .limit = 4 };
+    var response = Response.init(a, 200);
+    defer response.deinit();
+    const original = try quota.allocator().dupe(u8, "body");
+    response.body = original;
+    response.body_owned = true;
+    response.body_allocator = quota.allocator();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, response.takeBodyAlloc(failing.allocator()));
+    try std.testing.expect(response.body.?.ptr == original.ptr and response.body_owned);
+    try std.testing.expectEqual(@as(usize, 4), quota.live);
+    const copy = try response.takeBodyAlloc(a);
+    defer a.free(copy);
+    try std.testing.expect(copy.ptr != original.ptr);
+    try std.testing.expectEqualStrings("body", copy);
+    try std.testing.expectEqual(@as(usize, 0), quota.live);
+    try std.testing.expect(response.body == null);
+}
+
+test "body transfer copies borrowed buffers" {
+    const a = std.testing.allocator;
+    var response = Response.init(a, 200);
+    defer response.deinit();
+    response.body = "borrowed";
+    const copy = try response.takeBodyAlloc(a);
+    defer a.free(copy);
+    try std.testing.expectEqualStrings("borrowed", copy);
+    try std.testing.expect(response.body == null);
 }

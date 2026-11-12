@@ -88,10 +88,17 @@ const Column = struct {
             .vector_f32 => |v| {
                 bytes(&hash, "vector_f32");
                 word(&hash, v[row].len);
-                for (v[row]) |item| {
-                    var bits: [4]u8 = undefined;
-                    std.mem.writeInt(u32, &bits, @bitCast(item), .big);
-                    hash.update(&bits);
+                // Keep the canonical big-endian bit stream while feeding the
+                // hash in blocks instead of one update per coordinate.
+                var encoded: [1024]u8 = undefined;
+                var position: usize = 0;
+                while (position < v[row].len) {
+                    const count: usize = @min(encoded.len / 4, v[row].len - position);
+                    for (v[row][position..][0..count], 0..) |item, i| {
+                        std.mem.writeInt(u32, encoded[i * 4 ..][0..4], @bitCast(item), .big);
+                    }
+                    hash.update(encoded[0 .. count * 4]);
+                    position += count;
                 }
             },
             .json => |v| json(&hash, try std.json.parseFromSliceLeaky(std.json.Value, a, v[row], .{ .parse_numbers = false })),
@@ -262,5 +269,27 @@ test "external lake shared fingerprint kernels hash overlapping dictionary nulla
         var expected: [2]Digest = undefined;
         try plan.fill(a, 0, &expected);
         try std.testing.expectEqualDeep(expected, values[0..2].*);
+    }
+}
+
+test "external lake execution vector fingerprint blocks preserve canonical coordinate bits" {
+    var values: [1025]f32 = undefined;
+    for (&values, 0..) |*value, i| value.* = @floatFromInt(i);
+    values[0] = -0.0;
+    values[1] = @bitCast(@as(u32, 0x7fc00001));
+    for ([_]usize{ 0, 1, 2, 255, 256, 257, 768, 1024, 1025 }) |len| {
+        var column: Column = .{ .vector = .{ .name = "v", .values = .{ .vector_f32 = &.{values[0..len]} } }, .domain = @splat(0) };
+        const actual = try column.value(std.testing.allocator, 0);
+        var reference = Hash.init(.{});
+        bytes(&reference, "vector_f32");
+        word(&reference, len);
+        for (values[0..len]) |value| {
+            var bits: [4]u8 = undefined;
+            std.mem.writeInt(u32, &bits, @bitCast(value), .big);
+            reference.update(&bits);
+        }
+        var expected: Digest = undefined;
+        reference.final(&expected);
+        try std.testing.expectEqual(expected, actual);
     }
 }

@@ -264,10 +264,16 @@ pub const RepairQueue = struct {
     }
 };
 
-fn stageContent(txn: anytype, physical: []const u8, content: Content) !bool {
+/// Install a source digest verified by the caller under its pinned snapshot.
+/// Writer publication must retain the captured revision through this check.
+pub fn stageContent(txn: anytype, physical: []const u8, content: Content) !bool {
     const key = keyForPhysical(physical) orelse return error.InvalidArgument;
     if (try load(txn, key) != content.revision or !try txn.contains(physical)) return false;
-    if (try loadContent(txn, physical) != null) return false;
+    const existing = loadContent(txn, physical) catch |err| switch (err) {
+        error.InvalidDocumentContentAuthority => null,
+        else => return err,
+    };
+    if (existing != null) return false;
     var buf: [encoded_len_with_content]u8 = undefined;
     try txn.put(&key, encodeCombined(&buf, .{ .revision = content.revision, .content = content }));
     return true;
@@ -416,6 +422,7 @@ pub const Capture = struct {
     staged: bool = false,
     identity_reuse: value_identity.ReuseStats = .{},
     poisoned: bool = false,
+    catalog_changed: bool = false,
 
     pub fn deinit(self: *Capture, alloc: std.mem.Allocator) void {
         var values = self.documents.valueIterator();
@@ -427,6 +434,11 @@ pub const Capture = struct {
     }
 
     pub fn touch(self: *Capture, alloc: std.mem.Allocator, physical_key: []const u8) !void {
+        if (@import("db/artifact_inventory.zig").isCatalogKey(physical_key)) {
+            if (self.staged or self.poisoned) return error.RetainedEffectsTransactionFailed;
+            self.catalog_changed = true;
+            return;
+        }
         const key = keyForPhysical(physical_key) orelse return;
         try self.touchKeyed(alloc, key);
     }
@@ -519,6 +531,7 @@ pub const Capture = struct {
         if (self.poisoned) return error.RetainedEffectsTransactionFailed;
         if (self.staged) return;
         errdefer self.poisoned = true;
+        if (self.catalog_changed) try @import("db/artifact_inventory.zig").refresh(txn);
         var iter = self.documents.iterator();
         while (iter.next()) |entry| {
             const key = entry.key_ptr.*;

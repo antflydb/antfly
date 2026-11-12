@@ -1,0 +1,151 @@
+{
+  "captured_utc": "2026-11-11T07:31:33.258432+00:00",
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "dataset": "VectorDBBench Cohere Medium 1M authored Parquet",
+  "source_parquet_bytes": 3131995162,
+  "source_parquet_sha256": "de6b84eb08fc5203a56eef619970a14f5cae08d0a0ae0bcd23b8058d7045f381",
+  "configuration": {
+    "vectors": 1000000,
+    "dimensions": 768,
+    "metric": "l2_squared",
+    "normalization": "No normalization applied by the builder or operation probe",
+    "leaf_capacity": 100,
+    "branching_factor": 16,
+    "quantization_bits": 1,
+    "bulk_input_allowance_bytes": 4294967296,
+    "shared_index_exact_vector_allocator_limit_bytes": 268435456,
+    "artifact_backend": "local filesystem framed object store",
+    "optimize": "ReleaseFast"
+  },
+  "scope": "Native build call, including optional logical identity verification, typed Parquet decode, immutable exact-vector runs, clustering, and published artifact catalog candidate. Excludes fixture preparation, initial source opening, final external metadata catalog transaction, and reopen/search time.",
+  "notes": [
+    "Whole-source builders bypass optional fragment payload capture/assembly.",
+    "Reopen/search checks member count and serving; the raw-Parquet probe does not measure recall.",
+    "Shared-workstation observations with concurrent compilation, not a controlled statistical speedup estimate.",
+    "The baseline executable predates prefix-table integration. Binary SHA-256 pins the tested implementation; subsequent legacy-codec compatibility changes do not change its fresh-v5 bulk path.",
+    "Recorded full-operation executions use the pinned prefix-table executable before the later DOUBLE-only SQL precision correction; these input corpora use FLOAT lists."
+  ],
+  "operation_results": [
+    {
+      "decoder": "standard-library linear Huffman symbol search",
+      "algorithm": "lloyd",
+      "vectors": 1000000,
+      "dimensions": 768,
+      "total_ns": 788859634000,
+      "reopened_hits": 10,
+      "checkpoints": 0,
+      "logical_identity_published": null,
+      "executable_sha256": "28363bbfa0fe19dec1a87a881c4022878b9444c071cfd5c70995b0759a76632e"
+    },
+    {
+      "decoder": "native bounded Huffman prefix table",
+      "algorithm": "lloyd",
+      "vectors": 1000000,
+      "dimensions": 768,
+      "total_ns": 220370713000,
+      "reopened_hits": 10,
+      "checkpoints": 0,
+      "logical_identity_published": true,
+      "executable_sha256": "3bf13ced7b877431183b7478a76f33dc2a1db675133ed08994950de6c7c5cfa4",
+      "implementation_commit": "938a680afc2e4b57146ab903a53ec68ba4eec42f"
+    },
+    {
+      "decoder": "native bounded Huffman prefix table",
+      "algorithm": "emeans",
+      "vectors": 1000000,
+      "dimensions": 768,
+      "total_ns": 218119497000,
+      "reopened_hits": 10,
+      "checkpoints": 0,
+      "logical_identity_published": true,
+      "executable_sha256": "3bf13ced7b877431183b7478a76f33dc2a1db675133ed08994950de6c7c5cfa4",
+      "implementation_commit": "938a680afc2e4b57146ab903a53ec68ba4eec42f"
+    }
+  ],
+  "zstd_kernel": {
+    "implementation_commit": "938a680afc2e4b57146ab903a53ec68ba4eec42f",
+    "command": "zig build bench-zstd -Doptimize=ReleaseFast; zig-out/bin/bench_zstd lib/compress/src/testdata/cohere_literals.zst 2000 24576 5",
+    "table_entries_max": 2048,
+    "table_bytes": 4096,
+    "equal_window_bytes": 8519680,
+    "output_validation": "Every output compared byte-for-byte with the reference result; trial order alternates",
+    "benchmark_executable_sha256": "3e1227a535098206b769d07b7a394a3b12781b23465e044efe7cd95b42b29be9",
+    "trials": [
+      {
+        "trial": 0,
+        "iterations": 2000,
+        "decoded_bytes": 49152000,
+        "encoded_frame_bytes": 22723,
+        "native_first": true,
+        "native_ns": 639689333,
+        "reference_ns": 5372046500,
+        "sha256": "c4d4f0bb547163a34653b2b74769aadd76c7ec89c5cf004b440c8a4da0ca0f03"
+      },
+      {
+        "trial": 1,
+        "iterations": 2000,
+        "decoded_bytes": 49152000,
+        "encoded_frame_bytes": 22723,
+        "native_first": false,
+        "native_ns": 751214125,
+        "reference_ns": 5368185333,
+        "sha256": "c4d4f0bb547163a34653b2b74769aadd76c7ec89c5cf004b440c8a4da0ca0f03"
+      },
+      {
+        "trial": 2,
+        "iterations": 2000,
+        "decoded_bytes": 49152000,
+        "encoded_frame_bytes": 22723,
+        "native_first": true,
+        "native_ns": 667078083,
+        "reference_ns": 5835675125,
+        "sha256": "c4d4f0bb547163a34653b2b74769aadd76c7ec89c5cf004b440c8a4da0ca0f03"
+      },
+      {
+        "trial": 3,
+        "iterations": 2000,
+        "decoded_bytes": 49152000,
+        "encoded_frame_bytes": 22723,
+        "native_first": false,
+        "native_ns": 697060250,
+        "reference_ns": 5445889167,
+        "sha256": "c4d4f0bb547163a34653b2b74769aadd76c7ec89c5cf004b440c8a4da0ca0f03"
+      },
+      {
+        "trial": 4,
+        "iterations": 2000,
+        "decoded_bytes": 49152000,
+        "encoded_frame_bytes": 22723,
+        "native_first": true,
+        "native_ns": 715571792,
+        "reference_ns": 5460684375,
+        "sha256": "c4d4f0bb547163a34653b2b74769aadd76c7ec89c5cf004b440c8a4da0ca0f03"
+      }
+    ],
+    "median_native_ns": 697060250,
+    "median_reference_ns": 5445889167
+  },
+  "scale_regressions": [
+    {
+      "dataset": "synthetic identity admission, not a recall benchmark",
+      "generator": "zig/bench/vectors/prepare_identity_stress.py",
+      "pyarrow": "25.0.1",
+      "row_group_rows": 100000,
+      "vectors": 3000000,
+      "dimensions": 4,
+      "algorithm": "lloyd",
+      "decoder": "native bounded Huffman prefix table",
+      "source_parquet_bytes": 46904587,
+      "source_parquet_sha256": "04015cc566d625cfe3730acf2286033857366267ae72f65d1619282d15c1c456",
+      "raw_file_input": true,
+      "bulk_input_allowance_bytes": 536870912,
+      "fixed_width_private_key_bytes": 288000000,
+      "former_identity_cap_bytes": 268435456,
+      "total_ns": 102261365000,
+      "reopened_hits": 10,
+      "logical_identity_published": true,
+      "executable_sha256": "3bf13ced7b877431183b7478a76f33dc2a1db675133ed08994950de6c7c5cfa4",
+      "implementation_commit": "938a680afc2e4b57146ab903a53ec68ba4eec42f"
+    }
+  ]
+}

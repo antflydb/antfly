@@ -30,6 +30,10 @@ class InferenceAPIError(AntflyException):
         retryable: bool | None = None,
         input_index: int | None = None,
         stage: str | None = None,
+        *,
+        budget: str | None = None,
+        required_bytes: int | None = None,
+        limit_bytes: int | None = None,
     ) -> None:
         self.status_code = status_code
         self.code = code
@@ -37,6 +41,9 @@ class InferenceAPIError(AntflyException):
         self.retryable = retryable
         self.input_index = input_index
         self.stage = stage
+        self.budget = budget
+        self.required_bytes = required_bytes
+        self.limit_bytes = limit_bytes
         super().__init__(f"inference request failed ({status_code}): {message}")
 
 

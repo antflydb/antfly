@@ -419,51 +419,73 @@ def _validate_extraction_v2_response(payload: dict[str, Any], request: dict[str,
             raise ValueError(f"version 2 response item {index} id does not match the request")
 
 
-def _raise_inference_error(response: Response) -> None:
-    body, truncated = _read_limited_response(response, MAX_INFERENCE_ERROR_BYTES)
+def _inference_error_from_payload(status_code: int, payload: object, message: str) -> InferenceAPIError:
     code: str | None = None
     retryable: bool | None = None
     input_index: int | None = None
     stage: str | None = None
-    capacity: tuple[str, str, int] | None = None
+    budget: str | None = None
+    required_bytes: int | None = None
+    limit_bytes: int | None = None
+    if isinstance(payload, dict):
+        code = payload.get("error") if isinstance(payload.get("error"), str) else None
+        detail = payload.get("message")
+        if isinstance(detail, str) and detail:
+            message = f"{detail} ({code})" if code and detail != code else detail
+        elif code:
+            message = code
+        if isinstance(payload.get("retryable"), bool):
+            retryable = payload["retryable"]
+        if type(payload.get("input_index")) is int and payload["input_index"] >= 0:
+            input_index = payload["input_index"]
+        if isinstance(payload.get("stage"), str):
+            stage = payload["stage"]
+        budget = payload.get("budget") if isinstance(payload.get("budget"), str) else None
+        required_bytes = payload.get("required_bytes")
+        if type(required_bytes) is not int or required_bytes < 0:
+            required_bytes = None
+        limit_bytes = payload.get("limit_bytes")
+        if type(limit_bytes) is not int or limit_bytes < 0:
+            limit_bytes = None
+        reason = payload.get("reason")
+        retry_after_ms = payload.get("retry_after_ms")
+        if (
+            status_code == 503
+            and code is not None
+            and retryable is True
+            and isinstance(reason, str)
+            and reason in {"inference_capacity", "inference_admission", "request_queue"}
+            and type(retry_after_ms) is int
+            and retry_after_ms > 0
+        ):
+            return InferenceCapacityError(code, message, reason, retry_after_ms)
+    return InferenceAPIError(
+        status_code,
+        code,
+        message,
+        retryable,
+        input_index,
+        stage,
+        budget=budget,
+        required_bytes=required_bytes,
+        limit_bytes=limit_bytes,
+    )
+
+
+def _raise_inference_error(response: Response) -> None:
+    body, truncated = _read_limited_response(response, MAX_INFERENCE_ERROR_BYTES)
     message = body.decode("utf-8", errors="replace").strip()
+    payload: object = None
     if not truncated:
         try:
             payload = json.loads(body)
-            if isinstance(payload, dict):
-                code = payload.get("error") if isinstance(payload.get("error"), str) else None
-                detail = payload.get("message")
-                if isinstance(detail, str) and detail:
-                    message = f"{detail} ({code})" if code and detail != code else detail
-                elif code:
-                    message = code
-                if isinstance(payload.get("retryable"), bool):
-                    retryable = payload["retryable"]
-                if type(payload.get("input_index")) is int and payload["input_index"] >= 0:
-                    input_index = payload["input_index"]
-                if isinstance(payload.get("stage"), str):
-                    stage = payload["stage"]
-                reason = payload.get("reason")
-                retry_after_ms = payload.get("retry_after_ms")
-                if (
-                    response.status_code == 503
-                    and code is not None
-                    and retryable is True
-                    and reason in {"inference_capacity", "inference_admission", "request_queue"}
-                    and type(retry_after_ms) is int
-                    and retry_after_ms > 0
-                ):
-                    capacity = (code, reason, retry_after_ms)
         except (TypeError, ValueError):
             pass
     else:
         message = f"{response.reason_phrase or f'HTTP {response.status_code}'} (response body exceeded {MAX_INFERENCE_ERROR_BYTES} bytes)"
     if not message:
         message = response.reason_phrase or f"HTTP {response.status_code}"
-    if capacity is not None:
-        capacity_code, reason, retry_after_ms = capacity
-        raise InferenceCapacityError(capacity_code, message, reason, retry_after_ms)
-    raise InferenceAPIError(response.status_code, code, message, retryable, input_index, stage)
+    raise _inference_error_from_payload(response.status_code, payload, message)
 
 
 def _iter_bounded_response_lines(response: Response, max_line_bytes: int) -> Iterator[bytes]:
@@ -535,6 +557,14 @@ def _iter_generation_chunks(
     saw_context_attestation = False
     for event, data in _iter_sse_frames(response):
         if event == "error":
+            try:
+                payload = json.loads(data)
+            except (TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict) and (
+                isinstance(payload.get("error"), str) or isinstance(payload.get("message"), str)
+            ):
+                raise _inference_error_from_payload(response.status_code, payload, f"generation stream failed: {data}")
             raise AntflyException(f"generation stream failed: {data}")
         if data.strip() == "[DONE]":
             if request is not None and not saw_context_attestation:

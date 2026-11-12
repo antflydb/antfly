@@ -4440,11 +4440,16 @@ test "public api integration supports hybrid query pruner and reranker" {
     var rounds: usize = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
 
+    var graph_index = try client.createTableIndex(base_uri, "docs", "knowledge",
+        \\{"type":"graph","edge_types":[{"name":"link","field":"links"}]}
+    );
+    defer graph_index.deinit(std.testing.allocator);
+
     const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
         \\{"inserts":{
-        \\  "doc:a":{"title":"alpha","body":"alpha body"},
-        \\  "doc:b":{"title":"beta","body":"beta body"},
-        \\  "doc:c":{"title":"plain","body":"body body"}
+        \\  "doc:a":{"title":"alpha","body":"alpha body","links":["evidence:a"]},
+        \\  "doc:b":{"title":"beta","body":"beta body","links":["evidence:b"]},
+        \\  "doc:c":{"title":"plain","body":"body body","links":["evidence:c"]}
         \\}}
     );
     defer std.testing.allocator.free(batch_body);
@@ -4472,6 +4477,67 @@ test "public api integration supports hybrid query pruner and reranker" {
     const hybrid_reranker = hybrid_profile.get("reranker").?.object;
     try std.testing.expectEqualStrings("cross-encoder/ms-marco-MiniLM-L-6-v2", hybrid_reranker.get("model").?.string);
     for (hits) |hit| try std.testing.expect(!std.mem.eql(u8, hit._id, "doc:c"));
+    // The public single-range coordinator must resolve the limited start set
+    // after reranking, with the same identity as an explicit winning root.
+    const cases = [_]struct { rerank: bool, explicit: bool }{
+        .{ .rerank = false, .explicit = false },
+        .{ .rerank = true, .explicit = false },
+        .{ .rerank = true, .explicit = true },
+        .{ .rerank = true, .explicit = false },
+    };
+    for (cases) |case| {
+        const reranker = if (case.rerank) try std.fmt.allocPrint(std.testing.allocator,
+            \\,"reranker":{{"provider":"antfly","model":"cross-encoder/ms-marco-MiniLM-L-6-v2","url":{f},"field":"body","candidate_count":3,"top_n":2}}
+        , .{std.json.fmt(antfly_base_uri, .{})}) else try std.testing.allocator.dupe(u8, "");
+        defer std.testing.allocator.free(reranker);
+        const query = try std.fmt.allocPrint(std.testing.allocator,
+            \\{{"full_text_search":{{"match":{{"field":"body","text":"body"}}}},"graph_queries":{{"neighbors":{{"index":"knowledge","traverse":{{"start":{s},"edge_types":["link"],"direction":"out","max_depth":1}}}}}},"limit":3{s}}}
+        , .{ if (case.explicit) "{\"keys\":[\"doc:b\"]}" else "{\"result_ref\":\"$query_results\",\"limit\":1}", reranker });
+        defer std.testing.allocator.free(query);
+        var response = try client.fetchQuery(base_uri, "docs", query);
+        defer response.deinit(std.testing.allocator);
+        var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, response.body, .{});
+        defer parsed.deinit();
+        const cell = parsed.value.responses.?[0];
+        const winner = cell.hits.?.hits.?[0]._id;
+        if (case.rerank) try std.testing.expectEqualStrings("doc:b", winner);
+        if (!case.rerank) try std.testing.expect(!std.mem.eql(u8, "doc:b", winner));
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "evidence:{s}", .{winner[4..]});
+        defer std.testing.allocator.free(expected);
+        const neighbors = cell.graph_results.?.map.get("neighbors").?.graph_nodes_result.nodes;
+        try std.testing.expectEqual(@as(usize, 1), neighbors.len);
+        try std.testing.expectEqualStrings(expected, neighbors[0].key);
+    }
+    // A base-hit evaluation must still finalize $query_results before graph
+    // traversal. Deferring every evaluation would reintroduce the wrong root.
+    var hit_evaluated = try client.fetchQuery(base_uri, "docs",
+        \\{"full_text_search":{"match":{"field":"body","text":"body"}},"limit":3,"graph_queries":{"neighbors":{"index":"knowledge","traverse":{"start":{"result_ref":"$query_results","limit":1},"edge_types":["link"],"direction":"out","max_depth":1}}},"evaluate":{"scope":"candidates","candidate_count":3,"compute":{"label":{"field":"title"}},"where":{"eq":[{"ref":"label"},{"literal":"beta"}]}}}
+    );
+    defer hit_evaluated.deinit(std.testing.allocator);
+    var hit_evaluated_json = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, hit_evaluated.body, .{});
+    defer hit_evaluated_json.deinit();
+    const hit_evaluated_cell = hit_evaluated_json.value.responses.?[0];
+    try std.testing.expectEqual(@as(usize, 1), hit_evaluated_cell.hits.?.hits.?.len);
+    try std.testing.expectEqualStrings("doc:b", hit_evaluated_cell.hits.?.hits.?[0]._id);
+    const evaluated_neighbors = hit_evaluated_cell.graph_results.?.map.get("neighbors").?.graph_nodes_result.nodes;
+    try std.testing.expectEqual(@as(usize, 1), evaluated_neighbors.len);
+    try std.testing.expectEqualStrings("evidence:b", evaluated_neighbors[0].key);
+
+    // Graph evaluation must follow MATCH, while base hits retain their page.
+    var evaluated = try client.fetchQueryRaw(base_uri, "docs",
+        \\{"full_text_search":{"match":{"field":"body","text":"body"}},"limit":2,"graph_queries":{"customers":{"index":"knowledge","match":{"anchor":"customer","nodes":{"customer":{"filter":{"ids":["doc:a","doc:b"]}}},"edges":[]},"return":{"bindings":["customer"],"include_documents":true,"fields":["title"],"limit":2}}},"evaluate":{"graph_query":"customers","scope":"candidates","candidate_count":10,"compute":{"label":{"field":"customer.document.title"}},"where":{"eq":[{"ref":"label"},{"literal":"beta"}]}}}
+    );
+    defer evaluated.deinit(std.testing.allocator);
+    if (evaluated.status != 200) std.debug.print("graph evaluation HTTP {d}: {s}\n", .{ evaluated.status, evaluated.body });
+    try std.testing.expect(evaluated.status == 200);
+    var evaluated_json = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, evaluated.body, .{});
+    defer evaluated_json.deinit();
+    const evaluated_cell = evaluated_json.value.responses.?[0];
+    try std.testing.expectEqual(@as(usize, 2), evaluated_cell.hits.?.hits.?.len);
+    const bindings = evaluated_cell.graph_results.?.map.get("customers").?.graph_bindings_result;
+    try std.testing.expectEqual(@as(usize, 1), bindings.rows.len);
+    try std.testing.expectEqualStrings("doc:b", bindings.rows[0].map.get("customer").?.?.key);
+    try std.testing.expectEqualStrings("beta", bindings.computed.?[0].map.get("label").?.string);
 }
 
 test "public api integration supports retrieval agent pipeline queries" {

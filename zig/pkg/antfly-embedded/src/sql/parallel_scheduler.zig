@@ -181,6 +181,19 @@ pub const Scheduler = struct {
         const memory = @min(budget, self.max_bytes -| self.bytes) / minimum;
         return @max(1, @min(work, @min(slots, memory)));
     }
+    /// Optional synchronous I/O can widen its transient working set without
+    /// escaping the same node-wide admission used by asynchronous workers.
+    pub const IoLease = struct {
+        scheduler: *Scheduler,
+        bytes: usize,
+        pub fn release(self: IoLease) void {
+            self.scheduler.releaseClass(.io, self.bytes);
+        }
+    };
+    pub fn reserveIo(self: *Scheduler, bytes: usize) ?IoLease {
+        if (!self.acquireClass(.io, bytes)) return null;
+        return .{ .scheduler = self, .bytes = bytes };
+    }
     fn acquire(self: *Scheduler, bytes: usize) bool {
         return self.acquireClass(.cpu, bytes);
     }

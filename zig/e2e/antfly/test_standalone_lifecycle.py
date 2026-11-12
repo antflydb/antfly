@@ -338,3 +338,37 @@ def test_standalone_drop_drains_pending_enrichment_work(
             except (AssertionError, requests.RequestException, ValueError):
                 pass
         session.close()
+
+
+@pytest.mark.parametrize("use_symlink", [False, True], ids=["absolute-path", "symlink"])
+def test_standalone_discovers_inference_worker_off_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, use_symlink: bool
+):
+    binary = Path(
+        _resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    ).resolve()
+    assert binary.is_file(), f"Antfly binary not found: {binary}"
+    if use_symlink:
+        link = tmp_path / "server-off-path"
+        link.symlink_to(binary)
+        binary = link
+
+    class OffPathServer(EmbeddedInferenceStandaloneServer):
+        def _start(self):
+            # Reserve ports with the harness's normal PATH first (macOS uses
+            # sysctl), then give only the server and its worker an empty PATH.
+            with monkeypatch.context() as child_env:
+                child_env.setenv("PATH", str(tmp_path / "empty-path"))
+                child_env.delenv("ANTFLY_INFERENCE_WORKER", raising=False)
+                super()._start()
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    server = OffPathServer(str(binary), models_dir, "")
+    try:
+        assert server.proc is not None and server.proc.poll() is None
+        assert (
+            requests.get(f"{server.public_url}/readyz", timeout=10).status_code == 200
+        )
+    finally:
+        server.stop()

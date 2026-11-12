@@ -45,6 +45,7 @@ const State = struct {
     stage: u8 = 0,
     next_ms: u64 = 0,
     lease_until_ms: u64 = 0,
+    claim_token: [16]u8 = @splat(0),
     request: ?[]const u8 = null,
     last_result: ?[]const u8 = null,
     failures: u32 = 0,
@@ -56,17 +57,37 @@ fn backlog(result: std.json.Value) bool {
     const remaining = result.object.get("remaining_snapshots") orelse return false;
     return remaining == .integer and remaining.integer > 0;
 }
-pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local.common_topology_records.TableRecord, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, parent: catalog.types.Context) !bool {
+fn beginClaim(state: *State, io: std.Io, now: u64) void {
+    // ETag stores can reproduce a revision when two claims have identical
+    // bodies (including the same millisecond). A nonce prevents that ABA.
+    io.random(&state.claim_token);
+    state.lease_until_ms = now +| 120000;
+}
+
+/// Completion cleanup changes only our claimed scheduler revision. A parent
+/// cancellation must not strand its two-minute lease across orderly restart.
+/// A new owner/revision wins; failures retain the ordinary expiry fallback.
+fn releaseClaim(a: A, client: *@import("objectstore").Client, bucket: []const u8, key: []const u8, revision: @import("objectstore").ObjectRevision, state: State, io: ?std.Io) void {
+    var released = state;
+    released.lease_until_ms = 0;
+    const bytes = std.json.Stringify.valueAlloc(a, released, .{}) catch return;
+    defer a.free(bytes);
+    const cleanup: catalog.types.Context = .{ .io = io, .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_s };
+    var result = client.compareAndPut(bucket, key, bytes, revision, .{ .cancellation = catalog.types.contextCancellation(&cleanup) }) catch return;
+    result.deinit(client.allocator);
+}
+
+pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local.common_topology_records.TableRecord, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, parent: catalog.types.Context) !?u64 {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
     var loaded = try configured.executeLakeCatalogAlloc(a, binding, options, parent, .load);
     defer loaded.deinit(a);
     const root = try catalog.metadata.parse(scratch, loaded.table.metadata_json);
-    const property = (try catalog.metadata.get(root, "properties")).object.get("antfly.maintenance.policy") orelse return false;
+    const property = (try catalog.metadata.get(root, "properties")).object.get("antfly.maintenance.policy") orelse return null;
     const policy = try std.json.parseFromSliceLeaky(Policy, scratch, try catalog.metadata.str(property), .{});
     try policy.validate(binding.catalog.?.type == .rest);
-    if (!policy.enabled) return false;
+    if (!policy.enabled) return null;
     var opened = try ingestion.openQueue(a, binding, options);
     defer opened.deinit();
     var client = opened.client;
@@ -86,10 +107,15 @@ pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local
             2 => policy.vacuum,
             else => false,
         };
-        if (!enabled) return false;
+        if (!enabled) return null;
     }
     const now: u64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
-    if (state.lease_until_ms > now or state.next_ms > now) return false;
+    if (state.lease_until_ms > now) return null;
+    if (state.next_ms > now) {
+        // An unrelated write may wake publication before the scheduled retry.
+        // Restore the delayed wakeup while the unfinished request remains.
+        return if (state.request != null and state.failures == 0) state.next_ms - now else null;
+    }
     if (state.request == null) {
         while (state.stage < 3) : (state.stage += 1) {
             const enabled = switch (state.stage) {
@@ -116,14 +142,17 @@ pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local
     }
     // Work has a shorter monotonic deadline than the ownership lease. Allow
     // clock skew using the same grace contract as reader leases.
-    state.lease_until_ms = now +| 120000;
+    beginClaim(&state, parent.io orelse return error.UnsupportedOperation, now);
     var claimed = client.compareAndPut(opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, state, .{}), if (saved) |value| value.metadata.writeRevision() orelse return error.MissingObjectRevision else null, .{ .cancellation = catalog.types.contextCancellation(&parent) }) catch |err| switch (err) {
-        error.PreconditionFailed, error.ConditionalCheckFailed => return false,
+        error.PreconditionFailed, error.ConditionalCheckFailed => return null,
         else => return err,
     };
     defer claimed.deinit(client.allocator);
+    const claimed_revision = claimed.writeRevision() orelse return error.MissingObjectRevision;
+    var finished = false;
+    defer if (!finished) releaseClaim(a, &client, opened.bucket, key, claimed_revision, state, parent.io);
     var mutated = false;
-    var pending = false;
+    var continuation_delay_ms: ?u64 = null;
     if (state.request) |request| {
         var context = parent;
         const deadline = @import("antfly_platform").time.monotonicNs() +| 60 * std.time.ns_per_s;
@@ -136,7 +165,13 @@ pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local
             mutated = result.mutated;
             const completed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, result.body, .{});
             const complete = if (completed.object.get("complete")) |value| value == .bool and value.bool else true;
-            pending = !complete;
+            if (!complete) {
+                // Keep the same durable operation ID and give a bounded step
+                // time to make progress before starting another provider pass.
+                const delay_ms = @max(result.retry_delay_ms, 250);
+                state.next_ms = now +| delay_ms;
+                continuation_delay_ms = delay_ms;
+            }
             if (complete) {
                 state.request = null;
                 // A bounded vacuum that left expirable snapshots plans the next
@@ -153,9 +188,46 @@ pub fn run(a: A, server: *@import("http_server.zig").ApiHttpServer, table: local
         }
     }
     state.lease_until_ms = 0;
-    var completed = try client.compareAndPut(opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, state, .{}), claimed.writeRevision() orelse return error.MissingObjectRevision, .{ .cancellation = catalog.types.contextCancellation(&parent) });
+    var completed = try client.compareAndPut(opened.bucket, key, try std.json.Stringify.valueAlloc(scratch, state, .{}), claimed_revision, .{ .cancellation = catalog.types.contextCancellation(&parent) });
     completed.deinit(client.allocator);
-    return mutated or pending;
+    finished = true;
+    return if (mutated) 0 else continuation_delay_ms;
+}
+
+test "external lake scheduled maintenance releases interrupted claims without overwriting a replacement owner" {
+    const a = std.testing.allocator;
+    const os = @import("objectstore");
+    var memory = os.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var state: State = .{ .sequence = 7, .stage = 1, .request = "retained request" };
+    beginClaim(&state, std.testing.io, 3000);
+    const encoded = try std.json.Stringify.valueAlloc(a, state, .{});
+    defer a.free(encoded);
+    var claimed = try client.compareAndPut("db", "scheduler", encoded, null, .{});
+    defer claimed.deinit(client.allocator);
+    const revision = claimed.writeRevision().?;
+    releaseClaim(a, &client, "db", "scheduler", revision, state, std.testing.io);
+    var saved = try client.getObject("db", "scheduler", .{});
+    defer saved.deinit(client.allocator);
+    var parsed = try std.json.parseFromSlice(State, a, saved.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 0), parsed.value.lease_until_ms);
+    try std.testing.expectEqualStrings(state.request.?, parsed.value.request.?);
+    // Reusing the old revision cannot release or rewrite the successor's claim.
+    var next = state;
+    beginClaim(&next, std.testing.io, 3000);
+    try std.testing.expectEqual(state.lease_until_ms, next.lease_until_ms);
+    try std.testing.expect(!std.mem.eql(u8, &state.claim_token, &next.claim_token));
+    const next_bytes = try std.json.Stringify.valueAlloc(a, next, .{});
+    defer a.free(next_bytes);
+    var successor = try client.compareAndPut("db", "scheduler", next_bytes, saved.metadata.writeRevision().?, .{});
+    defer successor.deinit(client.allocator);
+    releaseClaim(a, &client, "db", "scheduler", revision, state, std.testing.io);
+    var unchanged = try client.getObject("db", "scheduler", .{});
+    defer unchanged.deinit(client.allocator);
+    try std.testing.expectEqualStrings(next_bytes, unchanged.body);
 }
 
 test "external lake scheduler requires bounded policy and prohibits automatic REST vacuum" {

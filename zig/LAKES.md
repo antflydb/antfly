@@ -1703,3 +1703,19 @@ The HN native comparison runner uses identical source checksums and separate
 empty-cache/readiness cases rather than attributing aggregate improvements to
 BM25. See `examples/hackernews/native_search_comparison.py` and the qualification
 instructions in the ingestion/publication plan.
+
+## Offline dense Parquet construction
+
+Authored floating-point Parquet lists feed borrowed float32 batches through the
+lake reader and binary producer replay. Fresh offline dense builds publish
+bounded immutable exact-vector runs and train hierarchical routers from
+reservoirs collected while writing partitions. Native posting publication and
+later full consolidation stream centroid blocks under the builder's allocator.
+Input, identity, and output admission scale with the configured corpus allowance.
+Paged artifact directories support generations beyond the former 16 GiB limit.
+
+Configuration, operation benchmarks, and the current construction lifecycle are
+specified in [the bulk builder design](../docs/design/vector-store/bulk-builder.md).
+Source-backed reranking, compact ordinal partitions, direct posting assembly,
+and durable phase manifests have their contracts in
+[bulk source storage](../docs/design/vector-store/bulk-source-storage.md).

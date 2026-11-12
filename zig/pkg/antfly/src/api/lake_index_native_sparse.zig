@@ -25,9 +25,9 @@ const rebuild = @import("../serverless/build/lake_rebuild.zig");
 const A = std.mem.Allocator;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
-pub const metadata_version: u16 = 4;
+pub const metadata_version: u16 = 5;
 pub fn supportsMetadata(version: u16) bool {
-    return version == metadata_version;
+    return version == 4 or version == metadata_version;
 }
 pub const Root = struct {
     version: u16 = metadata_version,

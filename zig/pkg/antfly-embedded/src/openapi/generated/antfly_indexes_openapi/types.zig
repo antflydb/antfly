@@ -750,6 +750,10 @@ pub const CreateEmbeddingsIndexRequest = struct {
     external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
+    /// Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates.
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    /// Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
@@ -795,6 +799,8 @@ pub const CreateEmbeddingsIndexRequest = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -856,6 +862,14 @@ pub const CreateEmbeddingsIndexRequest = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -1426,6 +1440,8 @@ pub const CreatedEmbeddingsIndex = struct {
     external: ?bool = null,
     external_vector_space: ?[]const u8 = null,
     sparse: ?bool = null,
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
@@ -1458,6 +1474,8 @@ pub const CreatedEmbeddingsIndex = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -1519,6 +1537,14 @@ pub const CreatedEmbeddingsIndex = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -1601,6 +1627,8 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     external: ?bool = null,
     external_vector_space: ?[]const u8 = null,
     sparse: ?bool = null,
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
@@ -1628,6 +1656,8 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -1674,6 +1704,14 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -3961,6 +3999,10 @@ pub const EmbeddingsIndexConfig = struct {
     external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
+    /// Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates.
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    /// Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
@@ -4002,6 +4044,8 @@ pub const EmbeddingsIndexConfig = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -4050,6 +4094,14 @@ pub const EmbeddingsIndexConfig = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -10169,6 +10221,10 @@ pub const IndexConfig = struct {
     external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
+    /// Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates.
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    /// Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
@@ -10242,6 +10298,8 @@ pub const IndexConfig = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "embedding_name", "embedding_name", true },
         .{ "source_artifact_name", "source_artifact_name", true },
@@ -10342,6 +10400,14 @@ pub const IndexConfig = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -10965,6 +11031,32 @@ pub const IndexType = enum {
             .{ "graph", .graph },
             .{ "algebraic", .algebraic },
             .{ "relational", .relational },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Offline clustering algorithm for fresh native Parquet lake HBC indexes.
+pub const LakeBulkBuildAlgorithm = enum {
+    lloyd,
+    emeans,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .lloyd => "lloyd",
+            .emeans => "emeans",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "lloyd", .lloyd },
+            .{ "emeans", .emeans },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

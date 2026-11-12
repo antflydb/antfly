@@ -203,7 +203,7 @@ fn executeSearch(
         execution_req.native_query_cut = null;
         execution_req.identity_read_generation = null;
     };
-    const captured: db_mod.SearchWithDenseProfileResult = if (lease) |held|
+    const captured: db_mod.SearchWithDenseProfileResult = if (lease) |*held|
         held.search(alloc, execution_req) catch |err| return fail(err, executeOperation(request.dialect), out_failure)
     else if (owned.req.profile)
         db.searchWithDenseProfile(alloc, execution_req) catch |err|

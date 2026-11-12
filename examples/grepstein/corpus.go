@@ -50,6 +50,7 @@ type corpusProgress struct {
 	Files        int     `json:"files"`
 	Pages        int     `json:"pages"`
 	Audio        int     `json:"audio"`
+	Images       int     `json:"images"`
 	Records      int     `json:"records"`
 	Reused       int     `json:"reused,omitempty"`
 	SourceBytes  int64   `json:"source_bytes"`
@@ -127,12 +128,20 @@ func corpusPrepareCmd(args []string) error {
 	base := flags.String("base-url", "http://localhost:3001", "Public source server URL reachable by Antfly and your browser")
 	pages := flags.Int("pages-per-record", 25, "Maximum PDF pages per source record")
 	limitPages := flags.Int("limit-pages", 0, "Pilot PDF page budget (0 means unlimited; applied before extraction)")
-	limitFiles := flags.Int("limit-files", 0, "Pilot source file budget (0 means unlimited, includes audio)")
+	limitFiles := flags.Int("limit-files", 0, "Pilot source file budget (0 means unlimited, selected profile only)")
+	profileName := flags.String("profile", "pdf", "Native processing profile: pdf, transcription or images")
 	resume := flags.Bool("resume", false, "Continue an existing preparation with its saved configuration")
 	var sources StringSliceFlag
 	flags.Var(&sources, "source", "Repeatable dataset=directory or dataset=archive.zip")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	requestedProfile, profileErr := processingProfile(*profileName)
+	if profileErr != nil {
+		return profileErr
+	}
+	if !*resume && requestedProfile.Name != "pdf" && *limitPages > 0 {
+		return fmt.Errorf("limit-pages applies only to the pdf profile; use limit-files for non-PDF profiles")
 	}
 	if *pages < 1 || *limitPages < 0 || *limitFiles < 0 {
 		return fmt.Errorf("page size must be positive; limits cannot be negative")
@@ -148,7 +157,7 @@ func corpusPrepareCmd(args []string) error {
 	cfgPath := filepath.Join(*state, "sources.json")
 	var cfg corpusConfig
 	if *resume {
-		if len(sources) > 0 || flagChanged(flags, "base-url") || flagChanged(flags, "pages-per-record") || flagChanged(flags, "limit-pages") || flagChanged(flags, "limit-files") {
+		if len(sources) > 0 || flagChanged(flags, "profile") || flagChanged(flags, "base-url") || flagChanged(flags, "pages-per-record") || flagChanged(flags, "limit-pages") || flagChanged(flags, "limit-files") {
 			return fmt.Errorf("resume uses saved source configuration; start a new state to change it")
 		}
 		if err = readCorpusJSON(cfgPath, &cfg); err != nil {
@@ -162,7 +171,10 @@ func corpusPrepareCmd(args []string) error {
 		if e != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.RawQuery != "" || u.Fragment != "" || u.User != nil || strings.Trim(u.Path, "/") != "" {
 			return fmt.Errorf("base-url must be an HTTP(S) origin without credentials, path, or query")
 		}
-		cfg = corpusConfig{IndexedAt: time.Now().Unix(), BaseURL: *base, PagesPerRecord: *pages, LimitPages: *limitPages, LimitFiles: *limitFiles}
+		if _, err := processingProfile(*profileName); err != nil {
+			return err
+		}
+		cfg = corpusConfig{Profile: *profileName, IndexedAt: time.Now().Unix(), BaseURL: *base, PagesPerRecord: *pages, LimitPages: *limitPages, LimitFiles: *limitFiles}
 		cfg.Key, err = newCorpusKey()
 		if err != nil {
 			return err
@@ -193,6 +205,13 @@ func corpusPrepareCmd(args []string) error {
 			return err
 		}
 	}
+	profile, err := processingProfile(cfg.Profile)
+	if err != nil {
+		return err
+	}
+	if profile.Name != "pdf" && cfg.LimitPages > 0 {
+		return fmt.Errorf("limit-pages applies only to the pdf profile; use limit-files for non-PDF profiles")
+	}
 	if cfg.IndexedAt <= 0 {
 		return fmt.Errorf("saved preparation is missing indexed_at; start a new --state")
 	}
@@ -208,7 +227,7 @@ func corpusPrepareCmd(args []string) error {
 	}
 	inventory := filepath.Join(*state, "inventory.ndjson")
 	if _, err = os.Stat(inventory); errors.Is(err, os.ErrNotExist) {
-		fmt.Println("Discovering and deduplicating PDF/audio sources (no OCR or transcription yet)...")
+		fmt.Println("Discovering and deduplicating profile sources (no inference yet)...")
 		temp := inventory + ".tmp"
 		if err = discoverCorpus(cfg, temp); err != nil {
 			os.Remove(temp)
@@ -308,7 +327,7 @@ func corpusPrepareCmd(args []string) error {
 				continue
 			}
 		} else if entry.Locator.Size > corpusMaxBytes {
-			return fmt.Errorf("audio %s exceeds 128 MiB; split it before preparation", entry.ID)
+			return fmt.Errorf("media %s exceeds 64 MiB; prepare a smaller source", entry.ID)
 		}
 		selectedPages := totalPages
 		if cfg.LimitPages > 0 {
@@ -396,7 +415,11 @@ func corpusPrepareCmd(args []string) error {
 			if e = emit(entry.Locator); e != nil {
 				return e
 			}
-			progress.Audio++
+			if profile.Name == "images" {
+				progress.Images++
+			} else {
+				progress.Audio++
+			}
 		}
 		progress.InputOffset += n
 		progress.Files++
@@ -407,8 +430,11 @@ func corpusPrepareCmd(args []string) error {
 			}
 		}
 		if progress.Files%100 == 0 {
-			fmt.Printf("Prepared %d sources, %d pages, %d audio, %d records\n", progress.Files, progress.Pages, progress.Audio, progress.Records)
+			fmt.Printf("Prepared %d sources, %d pages, %d audio, %d images, %d records\n", progress.Files, progress.Pages, progress.Audio, progress.Images, progress.Records)
 		}
+	}
+	if progress.Records == 0 {
+		return fmt.Errorf("profile %s selected no processable source records", profile.Name)
 	}
 	if err = save(); err != nil {
 		return err
@@ -431,9 +457,11 @@ func printCorpusJSON(value any) error {
 }
 
 type corpusIndexOptions struct {
-	Embedder         map[string]any
-	InferenceSecret  string
-	SourceConnection string
+	Embedder          map[string]any
+	InferenceSecret   string
+	SourceConnection  string
+	Profile           string
+	TranscriberConfig string
 }
 
 func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string, graph, semantic bool, overrides ...corpusIndexOptions) (map[string]any, error) {
@@ -452,6 +480,19 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 			}
 		}
 		secretRef = "${secret:" + options.InferenceSecret + "}"
+	}
+	profile, err := processingProfile(options.Profile)
+	if err != nil {
+		return nil, err
+	}
+	if profile.Name == "transcription" && language != "" {
+		return nil, fmt.Errorf("reader-config belongs to the pdf or images profile")
+	}
+	if profile.Name != "transcription" && options.TranscriberConfig != "" {
+		return nil, fmt.Errorf("transcriber-config requires the transcription profile")
+	}
+	if profile.Name == "images" && language == "" {
+		return nil, fmt.Errorf("images requires --reader-config lightonocr-reader.example.json")
 	}
 	// Without a reader config, extraction keeps native text only.
 	var ocr map[string]any
@@ -486,12 +527,36 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 			reader["api_key"] = secretRef
 		}
 		ocr = map[string]any{"mode": "auto", "render": map[string]any{"dpi": 150}, "reader": reader}
+		if profile.Name == "images" {
+			if reader["provider"] != "antfly" {
+				return nil, fmt.Errorf("images requires an Antfly LightOnOCR-3 reader")
+			}
+			model, _ := reader["model"].(string)
+			if !strings.HasPrefix(model, "lightonai/LightOnOCR-3-") {
+				return nil, fmt.Errorf("images requires a LightOnOCR-3 model")
+			}
+			if prompt, exists := reader["prompt"]; exists && prompt != "grounding" {
+				return nil, fmt.Errorf("images requires the grounding prompt")
+			}
+			ocr["prompt"] = "grounding"
+		}
 	}
 	extraction := map[string]any{
 		"source": map[string]any{"filename_field": "filename", "content_type_field": "mime_type", "version_field": "version"},
 	}
+	if profile.Name == "transcription" {
+		extraction, err = nativeTranscriptionConfig(options.TranscriberConfig, inferenceURL, secretRef)
+		if err != nil {
+			return nil, err
+		}
+		extraction["source"] = map[string]any{"filename_field": "filename", "content_type_field": "mime_type", "version_field": "version"}
+	}
 	if ocr != nil {
 		extraction["ocr"] = ocr
+	}
+	if profile.Name == "images" {
+		extraction["route_preset"] = "explicit_only"
+		extraction["routes"] = []any{map[string]any{"extractor": map[string]any{"type": "image", "unit": "image"}}}
 	}
 	if options.SourceConnection != "" {
 		extraction["credentials"] = options.SourceConnection
@@ -655,6 +720,7 @@ func corpusLoadCmd(args []string) error {
 	model := flags.String("embedding-model", DefaultEmbeddingModel, fmt.Sprintf("Embedding model (%d dimensions; use embedder-config for another dimension)", DefaultEmbeddingDims))
 	embedderPath := flags.String("embedder-config", "", "Native embedder JSON including provider, model, project/location and dimension")
 	extractorModel := flags.String("artifact-extractor-model", DefaultAutographModel, "Registered inference model for relation extraction")
+	transcriberConfig := flags.String("transcriber-config", "", "Native STT JSON for the transcription profile (default: hosted Whisper-small)")
 	language := flags.String("reader-config", "", "Native OCR reader JSON file (lightonocr-reader.example.json for hosted inference); empty disables OCR")
 	numShards := flags.Int("num-shards", 1, "Number of shards when creating the table")
 	if err := flags.Parse(args); err != nil {
@@ -697,7 +763,7 @@ func corpusLoadCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	indexes, err := corpusIndexes(*model, *extractorModel, *inference, *language, *graph, *semantic, corpusIndexOptions{Embedder: embedder, InferenceSecret: *inferenceSecret, SourceConnection: *sourceConnection})
+	indexes, err := corpusIndexes(*model, *extractorModel, *inference, *language, *graph, *semantic, corpusIndexOptions{Embedder: embedder, InferenceSecret: *inferenceSecret, SourceConnection: *sourceConnection, Profile: sourceConfig.Profile, TranscriberConfig: *transcriberConfig})
 	if err != nil {
 		return err
 	}
@@ -863,7 +929,7 @@ func corpusServeCmd(args []string) error {
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/sources/", store)
-	fmt.Printf("Serving signed PDF/audio sources on %s; keep running during enrichment and browsing\n", *listen)
+	fmt.Printf("Serving signed profile sources on %s; keep running during enrichment and browsing\n", *listen)
 	return (&http.Server{Addr: *listen, Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: time.Minute}).ListenAndServe()
 }
 

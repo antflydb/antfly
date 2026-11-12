@@ -893,3 +893,698 @@ timings. The deployment qualifications described above still apply.
 Full-lake E2E now collects a native HN managed-overlay bridge, exercising the
 hierarchy/restart regression through the assembled artifacts. This additional
 local, credential-free bridge passed with the locked lake/Iceberg extras.
+
+
+## Cold working-set follow-up
+
+The follow-up to PR #1550 keeps the existing 16-segment / 16 MiB optional
+warming allowance and reader/cancellation fences. Within each admitted segment,
+opening metadata takes priority over arbitrary posting prefixes. A process-local
+history records up to 16 recently demanded blocks for each of 64 immutable
+segment directories. History keys include the credential cache scope and exact
+directory identity; entries contain no credentials, provider clients, leases or
+request pointers. Recording uses a nonblocking mutex attempt, so optional
+history cannot stall demand I/O. Warming resolves hints through the current
+validated directory and authenticates every block normally.
+
+This history improves rewarming after eviction within a process. It is not a
+durable hot-set manifest: after restart, the verified disk cache and publication
+opening metadata provide the cold-start path. The bounded publication traversal
+still limits coverage of large archives; no full-archive residency claim follows
+from this change.
+
+Owned text/ordered-row readiness now selects the retained native cut through the
+same preparation path as queries. It retains credential/store/definition checks,
+reader protection, cut expiry and accepted-WAL visibility while avoiding fresh
+live-source catalog discovery. This additional readiness preparation does not contribute query-phase metrics.
+Tables containing vector or materialization definitions retain strict live-source
+qualification. Manifest loading transfers its verified allocation into the decoded
+owner, and source planning transfers its manifest into the serving source instead
+of duplicating it. Parallel views continue borrowing from their parent source.
+
+The composed HTTP fixture accepts `ANTFLY_E2E_COMPOSED_CACHE_MIB` (1–256,
+default 64) and `ANTFLY_E2E_COMPOSED_PENDING_ROWS` (0–10,000, default 0). Extra
+pending rows do not match the correctness query, but must survive retained-cut
+construction, resumed pagination and suppression checks. These options extend the
+existing real-corpus, selectivity, concurrent-write, restart and cache-cleared
+checks without changing their expected results or retry contracts.
+
+The larger pending-WAL case exposed a preparation-budget defect: physical-mask
+construction retained each partition's temporary predicate plans in the shared
+prepared-reader arena. Resolve each partition in reclaimable scratch while
+preserving the enclosing memory budgets, then copy only its completed physical
+row set into the retained owner. No query limit was increased. A native
+regression resolves 256 partitions with 128 KiB of temporary planning each under
+a 256 KiB budget, checks all retained row identities and verifies complete
+budget release. The original HTTP reproduction also passes with 10,000 real
+comments, 1,000 additional pending changes and an 8 MiB memory cache.
+
+Qualification used engine source `ee54d8350811e697b6638a0f578e26f57a1e3c19`
+with the same corpus hashes recorded above. The ReleaseSafe server SHA-256 is
+`9f7d5f101ac4b2eff91a44cab01ef0df01a11b43026fd6314b71da2ad2ad9b56`;
+the matching Lite library is
+`678d9aa63ed76836505f6c4472858260f401024fa6807f92bfed17b8768e0295`.
+The integrated build passed 96/96 steps and the 141-function public export
+boundary. All 70 focused native tests passed without failures, skips or leaks.
+The four local composed modes passed. The HN hierarchy/restart bridge initially
+returned HTTP 503 `InvalidSocketOption` during dry-run vacuum; an unchanged
+repeat passed. That intermittent transport observation remains visible here.
+
+Both fully remote GCS modes passed with highlights, 1,000 additional pending
+changes and an 8 MiB memory cache. They verified two preparations across three
+leaf calls for both profiling and resumed pending cursors, zero query-time
+cursor publication, and three acknowledged ingestion batches during concurrent
+reads. Stored-source and Parquet-hydration modes completed 424 and 449 successful
+publication-overlapping reads respectively, with no binding conflicts or
+retryable rebuild responses. Single-request samples were:
+
+| Mode | First after restart | Warm median (3) | Cache-cleared query | Sampled peak RSS | Sampled peak footprint |
+|---|---:|---:|---:|---:|---:|
+| Stored source | 2,643 ms | 81 ms | 6,399 ms | 194 MiB | 181 MiB |
+| Parquet hydration | 1,169 ms | 83 ms | 7,581 ms | 196 MiB | 233 MiB |
+
+These are client HTTP times excluding startup; memory peaks cover the restart,
+warm and cache-cleared samples. The two modes ran concurrently on a busy host
+(load averages approximately 14/18/17, four concurrent Zig compilers). The
+12-query burst at concurrency four had medians of 121/116 ms. Reads during
+ingestion/publication had medians of 319/327 ms and maxima of 5.49/5.24 seconds.
+Separate selectivity probes ranged from 74 ms to 1.86 seconds, including zero
+hits for the English stopword `the` and the absent term. Profiling uses
+`database`; the initial profiling attempts incorrectly required seven hits for
+`the`, after their correctness checks had passed. No analyzer or correctness
+expectation was relaxed.
+All object versions under the task-owned GCS UUID prefixes were deleted and
+their absence verified after the runs; private qualification token files were
+removed. No infrastructure, IAM, deployment or release was changed.
+
+This pressure workload differs from the earlier baseline. The results do not
+establish a cold-latency speedup, a matched A/B comparison, DuckDB parity or
+full-archive performance. Restart and cache-cleared reads still incur remote
+I/O; the bounded demand history alone does not remove those costs. Only this
+compact new evidence is retained in the repository.
+
+Remaining deployment qualification uses a released candidate on the existing
+managed route and intended CPU/memory shape, sustained credential refresh and
+owner replacement with loss of local cache. Full-archive query diversity and
+cache pressure must be measured before making archive-wide latency claims. Real
+S3 qualification remains waived for this task. Keep compact new results here;
+the November 8 baseline above does not need duplicated artifacts or reruns.
+
+### Reset-socket recovery and original-settings check
+
+Local syscall tracing identified the intermittent HN transport failure:
+Darwin returns `EINVAL` when setting a valid timeout on a TCP socket made
+defunct by a peer reset. The observed value was 25 ms on a live socket
+descriptor. An independent loopback reproduction confirmed both timeout
+options fail this way even after `recv` consumes `SO_ERROR`; `getpeername`
+still identifies the disconnected socket. Timeout setup now reports
+`ConnectionResetByPeer` for this state. Invalid descriptors and option errors
+on connected sockets retain their existing diagnostics. Healthy timeout setup
+performs no additional syscall.
+
+Buffered and streaming HTTP/1 pool admission replace at most one such reset
+connection before publishing the request socket or transmitting headers/body.
+The replacement shares the request's cancellation and deadline. Existing
+method-aware replay rules continue to govern failures during transmission or
+response delivery. A deterministic loopback regression seeds a reset pooled
+connection, consumes its socket error, then sends a POST with retries disabled
+through each response API and verifies exactly one server-side request and one
+response body. Disabling the fix reproduces `InvalidSocketOption`; restoring it
+passes. The HTTP library gate passed 619 tests with eight platform skips.
+
+The original-settings check used the same previously recorded engine binary
+and corpus, `database` with highlights, a 64 MiB cache, zero additional pending
+rows and five warm samples. It isolates the preparation/warming changes from
+the subsequent transport correction. Results against the earlier recorded
+baseline were:
+
+| Mode / measurement | Earlier baseline | Original-settings candidate |
+|---|---:|---:|
+| Stored-source warm median | 8.90 ms | 7.47 ms |
+| Parquet-hydration warm median | 7.51 ms | 9.04 ms |
+| Stored-source first after restart | 2,345 ms | 2,764 ms |
+| Parquet-hydration first after restart | 832 ms | 720 ms |
+| Stored-source cache-cleared query | 6,207 ms | 7,360 ms |
+| Parquet-hydration cache-cleared query | 8,207 ms | 7,823 ms |
+
+Both cases passed and again recorded two preparations across three leaf calls.
+Stored-source/hydration sampled peak RSS was 202/291 MiB and footprint was
+174/267 MiB. One-minute host loads were 15.0/9.7 with three/four concurrent Zig
+compilers. These reuse the original workload settings; they are not a matched
+host experiment. Warm latency remains approximately 7–9 ms, and cold queries
+remain dominated by seconds-scale setup. This establishes no material cold
+speedup. The demonstrated improvement is bounded memory and successful retained
+pagination/publication with the larger pending overlay described above.
+
+The transport correction in `32697344d1` passed a fresh ReleaseSafe server/Lite
+build: 96/96 steps and 141 public exports, with no internal exports. The server
+SHA-256 is `706c0b1d75b8d4c182fefc3de25f31541be49d368183e85847a7a8cc6f1628f7`;
+the matching Lite library is
+`d1c40c7dba354d648732b1974ff5f06b3f7ee15ea5525a2c1f731d1b4060e251`.
+The native HN maintenance/hierarchy/restart fixture passed in 164 seconds,
+including an explicit assertion rejecting `InvalidSocketOption` anywhere in
+the server log, including background work. One preceding run timed out at the
+unchanged 180-second scheduled-WAL-GC deadline with a saved reader-grace
+`waiting` result, zero recorded job failures and no invalid socket options.
+This separate timing observation remains recorded; no timeout, grace period or
+correctness assertion was relaxed. The fixture now retains at most 32 scheduler
+state transitions in timeout diagnostics.
+
+Main at `7db8b07aee` subsequently merged cleanly, without changing the transport
+sources or this HN fixture. The HTTP library gate passed again using its verified
+cache. The optimized binaries above precede that merge; full CI must validate
+the final merged revision after maintainer approval.
+
+### Publication opening bundles and restart inventory
+
+Candidate `a16071381e` implements the [cold-opening design](../../design/table-object-storage.md#cold-opening-and-restart-recovery):
+publication-wide verified metadata/range bundles, bounded parallel admission,
+clean disk-inventory recovery, early optional restoration and request-owned I/O
+profiles. Reader protocol 98 retains protocol-97 compatibility; metadata
+capability 85 fences new catalog writes. Existing publications gain bundles on
+publication/rebuild. Source authority, reader protection and memory limits remain
+mandatory.
+
+The fresh ReleaseSafe server/Lite build passed 98/98 steps and the export boundary
+check: 141 public functions, no internal exports. Server SHA-256:
+`0ef8ca80e16596f70a003c4a3d6a22dd0b34a5940e4211aa0c5051bfd70fc845`.
+Matching Lite SHA-256:
+`74c0e520529977814720d06367aebd4fb7ebf051b3039f786b8c5832a925fc04`.
+All 104 final focused query, recovery, cancellation, preparation-budget and
+metric-exposition regressions passed without failures, skips or leaks.
+
+Both real-GCS composed cases passed with the same 10,000-comment corpus,
+`database`, highlights, a 64 MiB cache, zero additional pending rows and five warm
+samples. Parentheses contain the preceding original-settings candidate above;
+these are developer-machine samples with different host loads, not a matched A/B.
+
+| Mode | Warm median | First after restart | Cache-cleared query |
+|---|---:|---:|---:|
+| Stored source | 7.86 ms (7.47) | 2.36 s (2.76) | 5.26 s (7.36) |
+| Parquet hydration | 9.09 ms (9.04) | 1.28 s (0.72) | 5.78 s (7.82) |
+
+Restart-plus-query totals were 2.75/1.73 s; empty-cache startup-plus-query totals
+were 5.58/6.10 s (stored/hydration). Sampled peak RSS was 220/261 MiB and footprint
+193/230 MiB. One-minute host loads were 11.3/33.6 with two/one other Zig compilers.
+Both cases verified two preparations across three leaf calls, retained pending
+pagination, concurrent ingestion/publication and exact highlighted hits. All
+1,710 task-owned GCS object versions were deleted, absence verified, and private
+credential files removed.
+
+The retained request profiles show bundle opening at 0.63/0.51 s with an empty
+cache and below 7 ms after restart. The stored-source cold request recorded 36
+covered artifact loads (2.88 MB), 5.86 s summed provider time and peak concurrency
+four; overlapping I/O sums are not wall time. Hydration recorded 11 covered
+artifact loads (0.35 MB); its Parquet data reads are outside this artifact trace.
+These profiles cover immutable Antfly artifact/cache loads, not every provider
+metadata/authentication operation, Parquet read, HTTP request or billing event.
+
+The empty-cache samples are 26–29% lower than the preceding samples, while restart
+results are mixed and warm latency remains about 8–9 ms. This does not establish a
+10× improvement, DuckDB parity or archive-wide latency. Further cold work should
+use the remaining on-demand artifact and Parquet reads identified by these
+profiles. The fixture retains only bounded diagnostic snapshots; its inventory
+counter prefix filter was corrected without rerunning these timing cases.
+
+The assembled Hacker News managed-lake HTTP regression passed in 174 seconds on
+these matching artifacts, including hierarchy, pending enrichment, maintenance,
+pagination and restart. The existing 180-second maintenance deadline and reader
+grace remain unchanged, and the strict background-log assertion found no
+`InvalidSocketOption`.
+
+### Demand-read candidate qualification (2026-11-09)
+
+Native revision `d2cd8141f9` passed the 98-step ReleaseSafe server/Lite build and
+141-function export check. Server SHA-256:
+`c83e22558ffa46bd9e7dbdfc0f6408e034359a20d5a318a5abf32da300bd9799`;
+Lite SHA-256:
+`aa83c3dcad3751ea846d787fb50965f850c292f16e9682bee4978ff38bd56ac3`.
+The final selected regression gates passed 14 focused and 85 broader cases
+(overlapping selections), with zero failures, skips or leaks.
+
+Both real-GCS cases passed using the same original settings above. Parentheses
+contain the preceding candidate; these are individual developer-host samples,
+not a controlled A/B or full-archive qualification.
+
+| Mode | Warm median | First after restart | Cache-cleared query |
+|---|---:|---:|---:|
+| Stored source | 12.14 ms (7.86) | 1.80 s (2.36) | 4.38 s (5.26) |
+| Parquet hydration | 7.66 ms (9.09) | 1.73 s (1.28) | 4.75 s (5.78) |
+
+Cold sampled RSS was 161/268 MiB and footprint was 188/238 MiB
+(stored/hydration). Both cases verified two preparations across three leaf calls,
+including resumed pending cursors, and concurrent ingestion/publication.
+
+Cold query CPU was 368/355 ms (stored/hydration); most elapsed time remains
+outside CPU execution. The stored-source leaf recorded opening at 262 ms,
+ranking at 2.02 s and 21 covered artifact loads (5.01 MB), compared with
+630 ms and 36 loads (2.88 MB) previously. Read-ahead trades fewer requests for
+more bytes. Its fresh-process native-hydration aggregate was 1.90 s.
+The Parquet leaf recorded opening at 289 ms and ranking at 2.15 s, with eight
+covered artifact loads (0.62 MB) and 33 source loads (3.89 MB). Its fresh-process
+source-hydration aggregate was 2.01 s. Process aggregates can include startup or
+background work; overlapping provider durations are not wall time, and these
+counters do not cover every authentication, catalog or billing operation.
+
+The cold samples are 17–18% lower; warm and restart changes are mixed. The
+sub-second and 10x goals remain unmet. Next work should reduce the remaining
+dependent ranking reads and batch/prefetch identity and winning-row hydration
+blocks, guided by these request profiles rather than larger speculative reads.
+
+The assembled Hacker News HTTP regression passed in 175 seconds, including
+hierarchy, pending enrichment, maintenance, pagination and restart, with the
+existing deadlines and strict background-log assertion unchanged. All 1,690
+task-owned GCS versions were deleted, absence verified, and credential files
+removed. Raw qualification artifacts remain outside the PR.
+
+### Batched-read candidate qualification (2026-11-09)
+
+Native revision `8299117c73` includes the five-part read batching/locator change
+and main through `42d1a0b9e2`. All 98 ReleaseSafe server/Lite build steps and the
+141-function export check passed. The post-merge gate passed 119 cases
+(76 API / 43 local), with zero failures, skips or leaks. Server SHA-256:
+`aed141e3d0a7cefed4191b2195c0224fc8a137f3bd24bd6f3b95c1f74c478093`;
+Lite SHA-256:
+`e35df9fdd37c19ddab8aebeafd37f4a0b197d9eed640dbb6e5a32c4184031e9d`.
+
+Both original-settings GCS cases passed. Parentheses contain the preceding
+`d2cd8141f9` samples; these are individual developer-host observations.
+
+| Mode | Warm median | First after restart | Cache-cleared query |
+|---|---:|---:|---:|
+| Stored source | 9.27 ms (12.14) | 1.74 s (1.80) | 4.97 s (4.38) |
+| Parquet hydration | 15.41 ms (7.66) | 1.92 s (1.73) | 4.95 s (4.75) |
+
+Cold CPU was 396/562 ms, sampled RSS 252/208 MiB and footprint 222/270 MiB
+(stored/hydration). Both cases again verified two preparations across three leaf
+calls, nonempty retained pending pagination, and concurrent ingestion/publication.
+
+Stored-source native hydration fell from the preceding process aggregate of
+1.90 s to 0.82 s. Its retained slowest lake call was 2.74 s, including opening
+0.50 s and ranking 1.36 s; the composed request took 4.97 s across three calls.
+That leaves about 2.23 s in other leaf calls, which the single retained lake-call
+profile does not individually attribute. The composed profile recorded 29
+artifact loads (3.59 MB), four traced map loads (0.48 s) and 23 direct-locator hits.
+
+Parquet source hydration remained 2.14 s, with 33 source loads (3.89 MB), peak
+source concurrency six and no recorded file-lane submissions. The fixture
+combines the input corpus into one Parquet file with 1,000-row groups; the added
+selected-file split therefore does not exercise multiple hydration lanes here.
+Its composed profile recorded 14 artifact loads (1.93 MB versus the preceding
+0.62 MB), four traced map loads (0.52 s) and five direct-locator hits. Additional
+metadata/read amplification needs attention. Process aggregates may include
+background work, and nested/overlapping provider durations are not additive.
+
+These samples do not establish an end-to-end speedup; the sub-second and 10x
+goals remain unmet. The next targets are selected-row-group splitting inside one
+file, remaining map/opening dependencies, and per-leaf attribution of refill and
+current-source costs. The assembled HN HTTP regression passed in 177 seconds.
+All 1,673 test object versions were deleted with absence verified, and private
+credential files removed. Raw logs and fixture results remain outside the PR.
+
+
+### Selected row-group candidate (b9fb4d7260, November 9)
+
+The optimized server/Lite gate completed all 98 steps and the 141-function export
+check. The focused gate passed 34 cases and the broader gate passed 124 cases
+(77 API / 47 local), with no failures, skips or leaks. Both original-settings
+real-GCS cases and the assembled HN mutation/restart regression passed; HN took
+174.54 seconds. No quiet-host rerun was required.
+
+| Delivery | Warm median | First query after restart | Empty-cache query |
+|---|---:|---:|---:|
+| Stored source | 13.21 ms | 1.91 s | 3.71 s |
+| Parquet hydration | 7.94 ms | 1.29 s | 3.79 s |
+
+These are individual developer-host samples. The preceding cold results were
+4.97 / 4.95 seconds; sub-second cold latency remains unmet. The Parquet case
+recorded eight admitted row-group lane submissions, none declined, peak source
+concurrency seven, and 27 source reads (previously 33). Both cases confirmed two
+preparations across three leaf calls. Both still performed six generation-map
+reads. Stored-source leaf times were 3.35 s for archive, 356 ms for current, and
+1.57 ms for the current refill, motivating independent source waves and physical
+locator capture for range-backed navigation.
+
+Cold stored-source CPU/RSS/footprint were 436 ms / 173.7 MiB / 219.5 MiB;
+Parquet values were 385 ms / 284.9 MiB / 254.2 MiB. The server SHA-256 is
+`03426db292ca9cdb64e1b8451718681387f99c5a4ad0b8dcfc3a2b288df66607`;
+Lite remains `e35df9fdd37c19ddab8aebeafd37f4a0b197d9eed640dbb6e5a32c4184031e9d`.
+All 1,734 versioned objects from the two scoped prefixes were deleted with zero
+remaining, and private credential files were removed. Subsequent source-wave,
+locator-capture and posting-lookahead changes are not measured by these results.
+
+### Source-wave candidate (390239b3f9, November 9)
+
+The optimized build passed 98/98 steps and the 141-function export boundary;
+148 broader tests passed without failures, skips or leaks. Stored-source GCS
+qualification passed with a 3.27 s empty-cache query and 1.70 s restart query.
+The composed trace recorded 22 artifact GETs and five map GETs; archive ranking
+still took 1.67 s and preparation 0.79 s. Source calls now overlap: their summed
+4.16 s exceeds the 3.27 s composed wall time.
+
+The first Parquet run reached a published-visibility timeout. An unchanged-binary
+reproduction passed, including concurrent publication and retained pagination:
+3.88 s empty-cache, 1.07 s restart, 6.93 ms warm median. This does not establish
+that the intermittent publication problem is resolved. The HN regression then
+exposed a restart maintenance failure: an interrupted scheduler claim retained
+its 120 s lease before the collector's separate 60 s reader grace could begin.
+The three scoped GCS attempts deleted 2,600 object versions with zero remaining.
+
+The next fixes target these observed gaps, before another optimized build:
+
+1. Keep retention scans and scheduled maintenance outside publication's worker;
+   run maintenance with independent bounded admission, fresh incarnation checks
+   and existing provider-side CAS ownership. Release interrupted claims with a
+   short conditional cleanup so orderly restart does not strand their leases.
+   Fresh claim nonces also prevent ETag ABA on identical same-millisecond claims.
+2. Capture physical selectors on leased artifact reads as well as allocated
+   reads; retain authoritative map fallback for dependencies without selectors.
+3. Reuse bounded prefetch flights on overlapping demand reads instead of issuing
+   a second whole-pack read. Verify transferred bytes, cancellation and cache-hit
+   behavior, rather than assuming fewer calls means less work.
+4. Qualify the finished candidate against the original GCS paths and HN restart,
+   publication, maintenance and cursor checks. Keep existing timeouts and reader
+   protection. Sub-second cold latency remains unproven; broader archive/payload
+   layout work depends on the resulting trace.
+
+
+### Reproducible network simulation
+
+`zig/tools/benchmark_lake_network.py` runs the real server against a loopback
+versioned GCS JSON API fixture. It does not contact a cloud provider. Example:
+
+```sh
+uv run --project zig/e2e/antfly --locked --extra lake --extra iceberg \
+  python zig/tools/benchmark_lake_network.py \
+  --binary zig/zig-out/bin/antfly \
+  --output-dir .benchmark-results/lake/network-candidate \
+  --rows 10000 --files 4 --row-group 100 --samples 3 \
+  --latency-ms 0 --latency-ms 30 --latency-ms 100 \
+  --bandwidth-mib 32 --io-concurrency 16 --qualify-sql
+```
+
+The matrix covers common, rare and absent terms, phrases, conjunctions, highlights, wide projection and
+selective filters. Vary `--files`, `--row-group`, `--payload-bytes`, `--cache-mib`,
+`--clients` and `--no-store-source` to expose topology, amplification, eviction,
+cold stampedes and Parquet hydration costs. `--client-workload mixed` rotates
+clients through distinct query cases to distinguish contention from coalescing. `--fault` accepts `throttle`, `reset`
+or `truncate`; `--fault-every` injects faults on media requests. An unrecovered
+query produces an incomplete report and retained local failure evidence, never
+a successful timing. Protocol tests independently check recovery and immutable
+generation authority after removing each fault.
+
+Each sample restarts the process after clearing only the configured Antfly cache.
+Navigation warming is disabled; startup I/O and startup latency are reported
+separately. The OS filesystem cache is uncontrolled. Authoritative serving cuts
+are enabled for the sealed manifest; use `--no-authoritative-cuts` for strict
+external coordination, which has a different freshness and cursor-publication
+cost. Cursor pages are replayed after restart before timing (`--cursor-pages`,
+default three); this immutable fixture does not qualify pending WAL mutations.
+The assembled HN regression remains the mutation/publication/maintenance oracle.
+
+The report records binary/tool/config/source hashes, answer equivalence, logical
+ID oracles, per-query and batch timings, peak RSS, requests/bytes, object kinds,
+queue time and observed overlap. Observed request waves are **not** a causal DAG.
+The trace is bounded and overflow or simulator errors invalidate a measurement.
+Bandwidth is shared across responses, and changing phases preserves outstanding
+bandwidth reservations. Headers, credentials and raw object names are omitted.
+Fewer than 20 samples are explicitly marked as inadequate tail qualification.
+
+The preliminary optimized parent fixture (`cb69d8b7b3`, 1,000 synthetic rows,
+17 scoring segments, stored source, strict external mode) took 28 ms at zero
+injected RTT, 1.18 s at 30 ms and 3.78 s at 100 ms. Those are single synthetic
+samples, not HN or GCS latency claims. Seventeen descriptor GETs per common-term
+query motivated the bounded descriptor packing and admission-only decoding.
+Candidate timings must measure the resulting binary separately. The latest
+completed real-GCS parent sample remains 3.13 s cold / 1.62 s restart; sub-second
+cold latency has not yet been established on GCS.
+
+
+### Canonical-root and numeric-filter findings (baab016320)
+
+The merged candidate passed 10 focused and 88 broader targeted native tests, all
+98 optimized server/Lite build steps and the export check. Real-GCS stored-source
+qualification passed: 2.85 s cold, 3.17 s including startup, 232 ms server CPU and
+253.7 MiB peak RSS. All 862 task-owned object versions were deleted with zero
+remaining. This remains above the sub-second target.
+
+The simulator falsified the expected descriptor improvement: the 1,000-row
+common-term query still fetched 16 physical row maps and took 1.20 s at 30 ms injected
+RTT. Publication warming followed the compacted serving root (one segment), while
+exact ordering selected the canonical root (16 segments). The regression now
+constructs distinct roots and checks both against the warmed byte cache. The
+bounded producer now covers both planner choices.
+
+A separate 10,000-row filter took 5.21 s with 400 Parquet range reads: the legacy
+f64 `numeric_range` operator could not prove integer index bounds and scanned all
+row groups. Exact integer lowering now preserves the original f64 comparisons,
+including rounding plateaus and NULL handling. Non-finite bounds and floating
+columns retain fallback. The simulator checks both legacy numeric and typed
+ranges, independent logical IDs, exact/lower-bound total validity and retained
+pages. These corrections require fresh candidate validation; the measurements
+above do not include them.
+
+The broader regression also exercised a resumed append whose original canonical
+postings had been reclaimed. Canonical warming must remain optional when a
+compacted representation exists. The candidate now carries that policy through
+navigation, descriptors and tiny payloads, using a scoped hint view that cannot
+mark a mandatory recovery failure. Required serving reads retain recovery. The
+existing real-Parquet/checkpoint/cloud-certificate regression and a direct
+recovery-marker test qualify this distinction before candidate timings.
+
+Separating file manifests, scoring admissions and physical row manifests in the
+simulator identified those 16 GETs as physical row maps. The producer now uses a
+synchronous observer of validated routing records to capture all three dependency
+roles, plus bounded source metadata, rather than using a pruning callback only
+for scoring descriptors. Captured identities deduplicate before another provider
+read. This observation was made before the corrected candidate's optimized build.
+
+The corrected pre-build gate passes 15 focused tests, 93 broader targeted native
+tests, six simulator tests and 19 archive-helper tests, without failures or leaks.
+Ordered filter proofs now use the same typed lowering, with a regression that
+rejects a bound widened by f64 rounding. Fresh optimized timings remain pending.
+
+### Completed row-map candidate (b728670528)
+
+All 98 optimized server/Lite build steps, comparison/matrix/scale/mixed-hydration
+fixtures, both original-settings GCS cases and the assembled HN regression pass.
+On 10,000 synthetic rows at 30 ms injected RTT, cold common-term search takes
+482 ms, highlights 470 ms and the legacy numeric filter 559 ms (previously
+5.21 s). Physical row-manifest GETs fall to zero. Four mixed cold queries with
+Parquet hydration and two I/O slots take 477–607 ms. These are single samples,
+not tail qualification or real-provider forecasts.
+
+Real GCS remains above target: stored-source cold search takes 2.70 s (3.03 s
+including startup), 241 ms server CPU and 267.1 MiB peak RSS. Parquet hydration
+takes 3.81 s (4.13 s including startup), 283 ms CPU and 274.4 MiB peak RSS.
+All 878 and 817 task-owned object versions respectively were removed, with zero
+remaining. Cache GC completed successfully.
+
+The stored-source profile still shows three generation-map reads totaling
+396 ms of provider time, two payload reads totaling 1.04 s, and 831 ms of native
+hydration phase time. These counters overlap and must not be summed into a
+critical path. The next candidate prioritizes payload locators within the fixed
+catalog envelope, captures bounded complete ranking/identity/compact-column
+working sets, and batches adjacent selected hydration chunks. Its correctness
+and latency require separate validation; sub-second GCS remains unproven.
+
+### Working-set candidate and GCS repeat (81dc6f51b8)
+
+The optimized build and every simulator fixture pass. At 30 ms simulated RTT,
+10,000-row common search improves from 482 to 429 ms, highlights from 470 to
+432 ms and selective filtering from 559 to 457 ms. Four mixed queries take
+443–555 ms. Strict-external common search at 100 ms RTT improves from 1.094 s
+to 901 ms. These remain individual samples.
+
+The first GCS stored-source cold query spikes to 37.43 s, with 33 provider reads
+and 51.96 s aggregate overlapping provider time. The Parquet case measures
+15.85 s cold, then fails its existing concurrent-publication readiness deadline.
+The unchanged-candidate repeat passes both full GCS cases and HN: stored source
+1.98 s cold / 1.25 s restart; Parquet hydration 2.52 s cold / 1.14 s restart.
+Cold server CPU is 240/264 ms and peak RSS 280/294 MiB. Both repeats still have
+three generation-map reads (301/274 ms). All four task-owned prefixes were
+cleaned with zero remaining versions. The spike is consistent with transient
+provider delay; it does not prove the publication timeout harmless.
+
+The next candidate removes synchronous recovery/warming from publication CAS and
+catalog-ACK paths, bounds ingestion passes, preserves coalesced recovery wakeups,
+borrows existing provider I/O runtimes, and discovers later canonical payload
+selectors independently of the warming cap. Bootstrap locators retain priority;
+tiny seeds avoid a duplicate producer pass. Sub-second GCS and the disappearance
+of remaining generation-map reads still require candidate validation. No public
+readiness timeout, fixture concurrency or correctness assertion is relaxed.
+
+Candidate 97ffc2e013 builds all 98 optimized server/Lite steps, but qualification
+stops during local fixture publication with `ConcurrencyUnavailable`, before any
+search sample or GCS run. An unchanged local reproduction fails the same way.
+Parallel Parquet callers and nested provider HTTP tasks exhaust the shared
+16-worker API lane. The replacement separates transport execution and adds
+shared whole-request admission, deadline/cancellation/shutdown regressions, and
+retryable readiness classification. Fresh candidate qualification is required;
+the failed setup supplies no new latency evidence.
+
+
+### Pipeline admission regression (9d927b5c5e)
+
+The optimized server/Lite build passes all 98 steps; broad native and linked ABI
+checks pass 251 tests. Both simulator suites pass. Real-GCS stored-source cold
+search takes 5.033 s (407 ms server CPU, 249 MiB peak RSS), versus the earlier
+31ab22461f sample of 2.410 s. Combined provider reads rise from 17 to 42; archive
+preparation falls to 430 ms but its ranking phase rises to 3.545 s. The Parquet
+case measures 5.652 s cold and later fails the unchanged concurrent-write
+publication-readiness deadline. Restart-plus-query totals are 1.837/1.851 s,
+including process startup. These are single samples, not percentiles. Both
+prefixes are fully cleaned: 923/826 deleted versions, zero remaining.
+
+The follow-up makes the first seed a demand read and lets already admitted later
+seed workers wait cancellably with demand priority, instead of discarding them
+on transient transport contention. HEAD probes no longer reserve response-body
+bytes. GCS metadata/upload responses reserve 1 MiB and listings 8 MiB rather than
+the unknown-media default of 100 MiB, which otherwise serializes control traffic
+through the 32/64 MiB gates. Pipeline opening time is now attributed explicitly.
+Transport priority/deadline/cancellation and control-response bounds have focused
+regressions; new optimized latency and publication-readiness qualification are
+required before claiming improvement. No correctness or readiness limit is relaxed.
+
+
+### Matched loopback qualification
+
+`zig/tools/benchmark_hn_network.py` runs the same composed fixture as real GCS:
+the provided HN corpus, history/current overlay, highlights, retained restart
+cursors, concurrent changes and unchanged publication barrier. It uses explicit
+loopback GCS endpoints with bearer credentials, queries immediately after cold
+startup, and never waits for provider idleness before timing. Reports separate
+startup/query provider traffic, duplicate reads, request waves and connection
+reuse. Request latency, jitter, bandwidth, provider concurrency and a synthetic
+per-connection setup cost are explicit inputs. The latter models setup cost;
+the fixture still uses HTTP and does not implement real TLS or Google auth.
+
+```sh
+uv run --project zig/e2e/antfly --locked --extra lake --extra iceberg python -B \
+  zig/tools/benchmark_hn_network.py --binary zig/zig-out/bin/antfly \
+  --corpus-dir qualification-assets/composed-real-10k/archive --rows 10000 \
+  --latency-ms 100 --jitter-ms 30 --connection-ms 50 --bandwidth-mib 16 \
+  --concurrency 8 --output-dir .benchmark-results/lake/hn-matched-stored
+```
+
+Repeat with `--no-store-source` and a new output directory for Parquet hydration.
+This is a matched local performance/correctness gate; real-GCS qualification
+remains required. Current engine changes include bounded inline map navigation,
+artifact-client reuse, charged chunk hydration and exact-flight joining. The
+previous 738ff2c6d5 GCS samples were 1.819 s stored-source / 4.068 s Parquet; both
+full GCS cases passed and cleaned their prefixes (879/811 versions, zero
+remaining). That candidate's HN fixture failed its first pending dense query
+with `index_rebuilding` after immediate restart. New timings and HN validation
+are required; sub-second GCS cold latency is not established.
+
+
+### Candidate 340d977e8a qualification
+
+The optimized server/Lite build and focused native, SQL and linked ABI gates
+passed. The same 10,000-row GCS fixture passed both concurrent-write publication
+barriers. Empty-cache search measured 1.652 s with stored source and 2.005 s with
+Parquet hydration (previous samples: 1.819 / 4.068 s). Peak RSS was 254 / 284 MB.
+Parquet source reads fell from 27 to 19, and transferred bytes from 3.88 to
+3.33 MB; these are individual fixture samples, not latency distributions. Cleanup
+removed 900 / 836 versions and verified zero remaining in both task prefixes.
+
+The initial matched local runs applied the 100 ms model to index construction
+and timed out before cold measurement. The zero-latency control passed the full
+fixture. Enabling shaping before cold startup instead produced a 1.454 s cold
+stored-source sample, but the later all-shaped publication barrier timed out;
+that probe is incomplete and is not a passing qualification. The runner now
+reports construction and query policies separately: the default shapes measured
+reads, while initial construction and the final publication phase use loopback
+without synthetic delay. `--shape-setup` retains the all-phase stress case.
+Neither readiness deadlines nor correctness assertions are extended or skipped.
+The default cannot qualify publication performance under the shaped network;
+the real GCS barrier remains an independent requirement.
+
+The assembled HN case still fails the first manual dense-vector query after
+restart with `index_rebuilding`. Its accepted-write preparation exhausts the
+five-second window, and all vector recipes share each partition job, including
+the two managed chunk/enrichment recipes. Interrupted jobs release their claims,
+but manual-vector reads still wait for the whole recipe set. Recovery scheduling
+alone does not establish immediate manual-vector visibility. Recipe-scoped
+preparation and readiness need further implementation and validation; this is
+still a merge blocker.
+
+
+With the corrected phase transitions, the local Parquet case passed the entire
+fixture at 1.953 s cold versus 2.005 s on GCS using the same engine binary. The
+transition waits only for canceled responses while Antfly is stopped; it never
+waits for provider idleness after cold startup. An initial stored-source retry
+was refused by the production-equivalent disk-headroom gate; repository cache
+GC restored headroom and the fresh retry passed the whole fixture at 1.510 s
+cold (1.652 s on GCS). Both corrected local cases completed their mutation,
+restart, retained-cursor and publication-barrier assertions. These results do
+not establish publication performance under the all-shaped stress policy.
+
+
+### Comprehensive review of the cold-serving change
+
+Review covered publication/certificate binding and compatibility, map and seed
+integrity, credential-scoped caches, prepared/retained reader lifetimes, source
+and Parquet hydration, composed-source concurrency, transport admission and
+cancellation, publication/maintenance ownership, predicate lowering, metrics and
+benchmark validity. The baseline remains qualified at engine 340d977e8a; the
+following fixes require a fresh candidate build and HN HTTP regression.
+
+Merge blockers addressed in source:
+
+- Recent-vector jobs grouped all recipes in a partition, so manual-vector reads
+  waited for managed enrichment after restart. Protocol 102 / capability 89 adds
+  independently durable recipe partitions, prioritizes supplied vectors and
+  requires only query-selected recipes. Mixed queries still require all their
+  recipes at one WAL cut. Selected reads cannot claim table-wide readiness.
+- Independent recipe runs can share a partition prefix. Vector search lanes and
+  deferred chunk payload lookup must select the index as well as that prefix;
+  treating them as the old all-recipe runs can select the wrong runtime.
+- Optional Parquet chunk staging allocated its owner before quota admission.
+  Declined admission is a successful null return, so the errdefer leaked that
+  owner. Allocation now follows successful reservation.
+- Replacement recent-vector attempts carried forward the expired job's cloud
+  map. A declined new map capture could then bind a complete map for the wrong
+  output generation. Claims and interrupted cleanup now clear old declarations
+  and selectors before producing replacement artifacts.
+- Vector publications using the old reader protocol require controlled
+  republication before independent recipe runs are issued. Text-only compatible
+  generations do not require rebuilding.
+
+The biggest remaining cold-search opportunities are:
+
+- Publish a small first opening tier separately from the bulk seed packs. The
+  first pack is joined before navigation can continue and currently shares the
+  4 MiB decoded pack limit. A bounded micro-bootstrap containing only roots and
+  essential routing could start required reads sooner; remaining seeds must
+  stay optional, cancellable and subordinate to demand. Measure the extra
+  demand misses as well as fewer startup bytes before choosing its size.
+
+1. Reuse provider connection pools across short-lived store views. Preparation,
+   navigation, retained manifests and each seed worker still reopen separate
+   clients; the matched cold-query windows observed 19/22 connections for stored
+   source/Parquet. These are process-wide windows including background traffic,
+   not an attribution of every connection to the foreground query. Pool reuse
+   must preserve credential/endpoint isolation and per-request cancellation and
+   admission; sharing a mutable client configuration would be unsafe.
+2. Batch native stored-column metadata discovery with winner payload reads.
+   Winner hydration already batches identities and selected blocks, but opens
+   column cursors before scheduling their payloads. The stored-source GCS sample
+   recorded about 562 ms in native hydration; opening recorded about 623 ms.
+   These phase times overlap other work and must not be summed as independent
+   savings. Fewer sequential metadata/payload waves are the largest plausible
+   path to sub-second cold queries; further concurrency alone cannot remove
+   these dependencies.
+3. Complete direct locators for remaining required map lookups, and adapt
+   source chunk sizing to the selected range/transfer budget. The measured
+   stored-source query still used two map reads (~158 ms); Parquet used one
+   (~96 ms) and 19 source reads (~3.33 MB). Removing only map reads does not
+   explain enough of the 1.65/2.00 s total to establish a sub-second result.
+
+Follow-up performance work includes explicit non-diagnostic Parquet probe
+policy (large-chunk probe sizing still checks trace availability), fair
+admission under mixed demand/seed load, and fail-fast propagation across selected
+hydration lanes. None is a demonstrated additional wrong-result bug in this
+review. All-shaped archive construction/publication still exceeds the fixture
+readiness budget; the passing query-shaped local model does not qualify that
+stress case. Full-archive scale and tail distributions remain unqualified.

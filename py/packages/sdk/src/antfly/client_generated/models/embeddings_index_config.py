@@ -10,6 +10,7 @@ from ..models.dense_index_algorithm import DenseIndexAlgorithm
 from ..models.derived_coverage_policy import DerivedCoveragePolicy
 from ..models.distance_metric import DistanceMetric
 from ..models.index_publication_policy import IndexPublicationPolicy
+from ..models.lake_bulk_build_algorithm import LakeBulkBuildAlgorithm
 from ..models.quantization_refine import QuantizationRefine
 from ..types import UNSET, Unset
 
@@ -52,6 +53,11 @@ class EmbeddingsIndexConfig:
                 writer, not proof of the generating model.
             sparse (bool | Unset): When true, creates a sparse (SPLADE) inverted index. When false (default), creates a
                 dense HBC vector index. Default: False.
+            lake_bulk_build (LakeBulkBuildAlgorithm | Unset): Offline clustering algorithm for fresh native Parquet lake HBC
+                indexes.
+            lake_bulk_build_max_input_bytes (int | Unset): Total vector and identity bytes admitted for a fresh offline lake
+                build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live
+                builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
             dimension (int | Unset): Vector dimension for dense indexes. Required for external dense indexes. Can be omitted
                 for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
             field (str | Unset): Field to extract embeddings from (managed indexes only; not allowed when external=true)
@@ -113,6 +119,8 @@ class EmbeddingsIndexConfig:
     external: bool | Unset = False
     external_vector_space: str | Unset = UNSET
     sparse: bool | Unset = False
+    lake_bulk_build: LakeBulkBuildAlgorithm | Unset = UNSET
+    lake_bulk_build_max_input_bytes: int | Unset = UNSET
     dimension: int | Unset = UNSET
     field: str | Unset = UNSET
     sources: list[ArtifactIndexSource] | Unset = UNSET
@@ -167,6 +175,12 @@ class EmbeddingsIndexConfig:
         external_vector_space = self.external_vector_space
 
         sparse = self.sparse
+
+        lake_bulk_build: str | Unset = UNSET
+        if not isinstance(self.lake_bulk_build, Unset):
+            lake_bulk_build = self.lake_bulk_build.value
+
+        lake_bulk_build_max_input_bytes = self.lake_bulk_build_max_input_bytes
 
         dimension = self.dimension
 
@@ -254,6 +268,10 @@ class EmbeddingsIndexConfig:
             field_dict["external_vector_space"] = external_vector_space
         if sparse is not UNSET:
             field_dict["sparse"] = sparse
+        if lake_bulk_build is not UNSET:
+            field_dict["lake_bulk_build"] = lake_bulk_build
+        if lake_bulk_build_max_input_bytes is not UNSET:
+            field_dict["lake_bulk_build_max_input_bytes"] = lake_bulk_build_max_input_bytes
         if dimension is not UNSET:
             field_dict["dimension"] = dimension
         if field is not UNSET:
@@ -329,6 +347,15 @@ class EmbeddingsIndexConfig:
         external_vector_space = d.pop("external_vector_space", UNSET)
 
         sparse = d.pop("sparse", UNSET)
+
+        _lake_bulk_build = d.pop("lake_bulk_build", UNSET)
+        lake_bulk_build: LakeBulkBuildAlgorithm | Unset
+        if isinstance(_lake_bulk_build, Unset):
+            lake_bulk_build = UNSET
+        else:
+            lake_bulk_build = LakeBulkBuildAlgorithm(_lake_bulk_build)
+
+        lake_bulk_build_max_input_bytes = d.pop("lake_bulk_build_max_input_bytes", UNSET)
 
         dimension = d.pop("dimension", UNSET)
 
@@ -495,6 +522,8 @@ class EmbeddingsIndexConfig:
             external=external,
             external_vector_space=external_vector_space,
             sparse=sparse,
+            lake_bulk_build=lake_bulk_build,
+            lake_bulk_build_max_input_bytes=lake_bulk_build_max_input_bytes,
             dimension=dimension,
             field=field,
             sources=sources,

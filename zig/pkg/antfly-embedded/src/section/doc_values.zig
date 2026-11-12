@@ -499,8 +499,9 @@ pub const Cursor = struct {
         if (!self.reader.indexed) return result;
         const view = self.reader.range orelse return result;
         if (view.source != .ranges or view.source.ranges.prefetch == null) return result;
+        var ranges: [4]struct { offset: u64, length: u64 } = undefined;
         var position: usize = 0;
-        while (position < docs.len and result.ranges < 4 and result.examined < 64) {
+        while (position < docs.len and result.examined < 64) {
             result.examined += 1;
             const doc = docs[position];
             if (doc < base or doc >= end) break;
@@ -524,10 +525,20 @@ pub const Cursor = struct {
             // Oversized required values remain demand reads. Speculation has
             // a byte cap as well as the existing four-task source queue.
             if (length > 1024 * 1024 - result.bytes) break;
-            view.source.prefetch(view.offset + self.reader.data_start + start, length);
-            result.ranges += 1;
+            const offset = view.offset + self.reader.data_start + start;
+            // Plan the complete winner tile before dispatch. Adjacent selected
+            // chunks share one hint and one bounded physical read; sparse gaps
+            // are never pulled in merely to reduce the request count.
+            if (result.ranges != 0 and ranges[result.ranges - 1].offset + ranges[result.ranges - 1].length == offset) {
+                ranges[result.ranges - 1].length += length;
+            } else {
+                if (result.ranges == ranges.len) break;
+                ranges[result.ranges] = .{ .offset = offset, .length = length };
+                result.ranges += 1;
+            }
             result.bytes += length;
         }
+        for (ranges[0..result.ranges]) |range| view.source.prefetch(range.offset, range.length);
         return result;
     }
     pub fn get(self: *Cursor, doc: u32) !?[]const u8 {
@@ -897,14 +908,14 @@ test "external lake bounded window profiles source chunk prefetch selects exact 
             const reads = state.reads;
             const hint = cursor.prefetchSelected(&.{ 100, 100, 102, 102, 106, 108, 110, 114, 116 }, 100, 116);
             try std.testing.expectEqual(reads, state.reads);
-            try std.testing.expectEqual(@as(usize, if (large) 1 else 4), hint.ranges);
+            try std.testing.expectEqual(@as(usize, if (large) 1 else 3), hint.ranges);
             try std.testing.expectEqual(hint.ranges, state.count);
             try std.testing.expect(hint.bytes <= 1024 * 1024);
-            const selected = [_]u32{ 1, 3, 4, 5 };
-            for (state.hints[0..state.count], selected[0..state.count]) |range, chunk| {
-                const start = cursor.reader.endOffset(chunk - 1);
+            const selected = [_]struct { first: u32, last: u32 }{ .{ .first = 1, .last = 1 }, .{ .first = 3, .last = 5 }, .{ .first = 7, .last = 7 } };
+            for (state.hints[0..state.count], selected[0..state.count]) |range, chunks| {
+                const start = cursor.reader.endOffset(chunks.first - 1);
                 try std.testing.expectEqual(view.offset + cursor.reader.data_start + start, range.offset);
-                try std.testing.expectEqual(cursor.reader.endOffset(chunk) - start, range.length);
+                try std.testing.expectEqual(cursor.reader.endOffset(chunks.last) - start, range.length);
             }
             // Prefetch neither changes the live decoded chunk nor transfers
             // value ownership; missing and out-of-segment IDs stay harmless.

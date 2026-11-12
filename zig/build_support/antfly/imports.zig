@@ -120,6 +120,7 @@ pub const AntflyRootImports = struct {
     vector: *std.Build.Module,
     vectorindex: *std.Build.Module,
     hash: *std.Build.Module,
+    compress: *std.Build.Module,
     matcher: *std.Build.Module,
     resolver: *std.Build.Module,
     casbin: *std.Build.Module,
@@ -201,6 +202,7 @@ pub const AntflyRootImports = struct {
         .{ .name = "antfly_vector", .field = "vector" },
         .{ .name = "antfly_vectorindex", .field = "vectorindex" },
         .{ .name = "antfly_hash", .field = "hash" },
+        .{ .name = "antfly_compress", .field = "compress" },
         .{ .name = "antfly_matcher", .field = "matcher" },
         .{ .name = "antfly_resolver", .field = "resolver" },
         .{ .name = "antfly_casbin", .field = "casbin" },
@@ -338,7 +340,7 @@ pub const AntflyRootImports = struct {
             "query_openapi",    "reader_config",      "readers",           "regex",
             "reranking",        "scraping",           "source_reference",  "synthesizing",
             "transcribing",     "vector",             "fst",               "schema_openapi",
-            "sql_regex",        "resolver",
+            "sql_regex",        "resolver",           "compress",
         }) |field| self.addImport(mod, field);
     }
 
