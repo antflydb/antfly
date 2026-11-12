@@ -23,6 +23,8 @@ pub const AdmittedAllocator = struct {
     backing: std.mem.Allocator,
     session: ?sessions.Session = null,
     admission_context: ?*anyopaque = null,
+    /// Session-based callbacks must read this allocator's current session,
+    /// which carries the attempt-local diagnostic sink during growth retries.
     admit: ?*const fn (*anyopaque, usize) anyerror!memory.AdmissionLease = null,
     /// Refund auxiliary ledgers when a successful custom admission cannot be
     /// adopted because reservation metadata allocation fails.
