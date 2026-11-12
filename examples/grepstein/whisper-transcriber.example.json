@@ -1,0 +1,4 @@
+{
+  "provider": "antfly",
+  "model": "openai/whisper-small:safetensors@973afd24965f72e36ca33b3055d56a652f456b4d"
+}

@@ -795,6 +795,10 @@ pub const SparseEmbedder = struct {
         return resolve(self.ptr, a, name);
     }
 
+    pub fn requireRevision(self: SparseEmbedder, a: Allocator, name: []const u8, revision: ?[32]u8) !void {
+        if (!std.meta.eql(revision, try self.captureRevision(a, name))) return error.EnrichmentSourceChanged;
+    }
+
     pub fn embedSparse(self: SparseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8) !SparseEmbedding {
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "sparse embedder");
         defer sanitized.deinit(alloc);

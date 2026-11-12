@@ -1997,6 +1997,28 @@ pub const SegmentReader = struct {
         };
     }
 
+    /// Plan identity-table and ID-byte reads for one bounded sorted winner tile.
+    /// The source owns asynchronous work; no caller scratch escapes this call.
+    pub fn prefetchStoredIdentities(self: *const SegmentReader, docs: []const u32, base: u32, end: u32) !void {
+        const native = self.native orelse return;
+        const source_ = self.source();
+        if (source_ != .ranges or source_.ranges.prefetch == null or native.range.num_blocks == 0) return;
+        for (docs[0..@min(docs.len, 64)]) |global| {
+            if (global < base or global >= end) break;
+            source_.prefetch(native.range.stored_offset + 21 + @as(u64, global - base) * stored_fields_v4_doc_entry_size, stored_fields_v4_doc_entry_size);
+        }
+        const ids = native.range.stored_offset + 21 + @as(u64, native.range.doc_count) * stored_fields_v4_doc_entry_size + @as(u64, native.range.num_blocks) * 12;
+        for (docs[0..@min(docs.len, 64)]) |global| {
+            if (global < base or global >= end) break;
+            var entry: [stored_fields_v4_doc_entry_size]u8 = undefined;
+            try native.metadata_cache.?.readInto(native.range.stored_offset + 21 + @as(u64, global - base) * entry.len, &entry);
+            const offset = std.mem.readInt(u64, entry[0..8], .little);
+            const length = std.mem.readInt(u32, entry[8..12], .little);
+            if (std.mem.readInt(u32, entry[12..16], .little) >= native.range.num_blocks or offset > native.range.id_bytes_length or length > native.range.id_bytes_length - offset) return error.InvalidSegment;
+            source_.prefetch(ids + offset, length);
+        }
+    }
+
     pub fn prefetchStoredDoc(self: *const SegmentReader, doc: u32) !void {
         if (self.native == null) return;
         const backing_source = self.source();

@@ -714,6 +714,11 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     hbc_isolate_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
     hbc_isolate_root_mod.addImport("antfly_platform", platform_mod);
     hbc_isolate_root_mod.addImport("antfly_hash", hash_mod);
+    antfly_imports.configureRuntimeContracts(hbc_isolate_root_mod);
+    antfly_imports.storage_boundary.configureSources(hbc_isolate_root_mod, false, false);
+    @import("../../../build_support/embedded/source_owner.zig").registerStorageIndependent(hbc_isolate_root_mod);
+    hbc_isolate_root_mod.addImport("antfly-json", antfly_imports.json);
+    hbc_isolate_root_mod.addImport("structlog", structlog_mod);
     hbc_isolate_mod.addImport("antfly_hbc_isolate_root", hbc_isolate_root_mod);
 
     const hbc_isolate = b.addExecutable(.{
@@ -724,6 +729,16 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const hbc_isolate_step = b.step("hbc-isolate", "Build and install hbc_isolate");
     hbc_isolate_step.dependOn(&b.addInstallArtifact(hbc_isolate, .{}).step);
 
+    // HBC-only comparisons do not need the server's inference library.
+    const hbc_read_mod = b.createModule(.{
+        .root_source_file = b.path("bench/vectors/hbc_read_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    hbc_read_mod.addImport("antfly-zig", hbc_isolate_root_mod);
+    const hbc_read = b.addExecutable(.{ .name = "hbc_read_bench", .root_module = hbc_read_mod });
+    b.step("hbc-read-bench", "Build standalone HBC build/recall benchmark").dependOn(&b.addInstallArtifact(hbc_read, .{}).step);
+
     const build_quality_mod = b.createModule(.{
         .root_source_file = b.path("tools/bench_build_quality.zig"),
         .target = target,
@@ -733,6 +748,24 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     const build_quality = b.addExecutable(.{ .name = "bench_build_quality", .root_module = build_quality_mod });
     const build_quality_step = b.step("bench-build-quality", "Build bounded-bootstrap held-out recall benchmark");
     build_quality_step.dependOn(&b.addInstallArtifact(build_quality, .{}).step);
+
+    const publication_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_hbc_publication.zig"), .target = target, .optimize = optimize });
+    publication_mod.addImport("antfly_hbc_isolate_root", hbc_isolate_root_mod);
+    const publication = b.addExecutable(.{ .name = "bench_hbc_publication", .root_module = publication_mod });
+    b.step("bench-hbc-publication", "Qualify native publication from a sealed HBC projection").dependOn(&b.addInstallArtifact(publication, .{}).step);
+
+    const zstd_bench_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_zstd.zig"), .target = target, .optimize = optimize });
+    zstd_bench_mod.addImport("antfly_compress", options.antfly_imports.compress);
+    const zstd_bench = b.addExecutable(.{ .name = "bench_zstd", .root_module = zstd_bench_mod });
+    b.step("bench-zstd", "Compare bounded native Huffman lookup with standard Zstandard decoding").dependOn(&b.addInstallArtifact(zstd_bench, .{}).step);
+
+    const spool_tests = b.addTest(.{
+        .root_module = options.antfly_test_mod,
+        .filters = &.{ "spooled bulk", "offline lake build configuration", "stable generation finalization", "authoritative external-vector HBC", "experimental posting checkpoint reopens", "native posting initial acceleration", "prepared posting activation" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("bulk-spool-test", "Verify bounded offline HBC construction, publication and failure cleanup")
+        .dependOn(&b.addRunArtifact(spool_tests).step);
 
     const dense_stack_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/dense_stack_bench.zig"),

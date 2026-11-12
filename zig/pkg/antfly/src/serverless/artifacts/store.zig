@@ -252,6 +252,36 @@ pub const ExecutionIo = struct {
         self.pending = null;
     }
 };
+/// Stack-owned publication scheduling. Borrow an inherited capability unchanged;
+/// otherwise acquire CPU admission without waiting before installing one. The
+/// scheduler's CPU budget already excludes its I/O reserve. Busy, disabled and
+/// undersized schedulers retain required-inline progress, including nested owners.
+pub const PublicationIo = struct {
+    const Execution = @import("antfly_local_sources").sql_parallel_scheduler.Execution;
+    slot: ?*?*const IoPhase = null,
+    execution: Execution = undefined,
+    phase: ExecutionIo = undefined,
+    pub fn install(self: *PublicationIo, slot: *?*const IoPhase, io: std.Io, scheduler: *@import("antfly_local_sources").sql_parallel_scheduler.Scheduler, checkpoint: @FieldType(Execution, "checkpoint")) void {
+        self.* = .{};
+        const bytes = 8 * 1024 * 1024;
+        if (slot.* != null or scheduler.max_workers == 0 or scheduler.max_io_workers == 0 or scheduler.cpuWorkspaceBudget(bytes) < bytes) return;
+        self.execution = .{ .scheduler = scheduler, .bytes = bytes, .checkpoint = checkpoint };
+        if (!self.execution.tryEnter()) return;
+        self.phase = .{ .execution = &self.execution, .io = io };
+        self.slot = slot;
+        slot.* = self.phase.capability();
+    }
+    pub fn deinit(self: *PublicationIo) void {
+        if (self.slot) |slot| {
+            // Upload helpers join every child before returning, including errors.
+            std.debug.assert(self.phase.pending == null);
+            slot.* = null;
+            self.execution.pause();
+            self.slot = null;
+        }
+    }
+};
+
 pub const IoGuard = struct {
     phase: ?*const IoPhase = null,
     pub fn abort(self: *IoGuard) void {
@@ -296,6 +326,10 @@ pub const ArtifactStore = struct {
     }
 
     pub const VTable = struct {
+        /// Optional hints must not turn an unused representation's missing
+        /// bytes into mandatory derived-state recovery. Adapters opt in; all
+        /// unrecognized authorization/provider wrappers remain intact.
+        optional_read_view: ?*const fn (*anyopaque) ArtifactStore = null,
         object_store: ?*const fn (*anyopaque) *@import("object_store.zig").ObjectStore = null,
         retention_witness: ?*const fn (*anyopaque, UploadScope, CancellationToken) anyerror!?RetentionWitness = null,
         retained_closure: ?*const fn (*anyopaque, []const u8, CancellationToken) anyerror!bool = null,
@@ -327,6 +361,17 @@ pub const ArtifactStore = struct {
         cleanup_retired_scoped_temporaries: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken) anyerror!void = null,
     };
 
+    /// Borrowed hint-only view. The backend owner must outlive it. Preserve
+    /// caller scope, allocator and I/O admission; only opted-in recovery
+    /// decorators change. Required reads keep their original recovery policy.
+    pub fn optionalReadView(self: ArtifactStore) ArtifactStore {
+        const callback = self.vtable.optional_read_view orelse return self;
+        const target = callback(self.ptr);
+        var result = self;
+        result.ptr = target.ptr;
+        result.vtable = target.vtable;
+        return result;
+    }
     pub fn providerStore(self: ArtifactStore) ?*@import("object_store.zig").ObjectStore {
         return if (self.vtable.object_store) |call| call(self.ptr) else null;
     }
@@ -1038,4 +1083,66 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "external lake execution publication IO preserves inline progress and releases admission" {
+    const Scheduler = @import("antfly_local_sources").sql_parallel_scheduler.Scheduler;
+    for ([_]usize{ 0, 4, 8, 12, 16, 64 }) |mib| {
+        var scheduler: Scheduler = .{ .max_workers = 1, .max_io_workers = 2, .max_bytes = mib * 1024 * 1024 };
+        var slot: ?*const IoPhase = null;
+        var owner: PublicationIo = .{};
+        owner.install(&slot, std.testing.io, &scheduler, null);
+        try std.testing.expectEqual(mib >= 16, slot != null);
+        if (slot) |phase| {
+            // An upload wave yields CPU admission, then restores it on failure.
+            try phase.begin(phase.ptr, 2);
+            try std.testing.expectEqual(@as(usize, 2), scheduler.io_workers);
+            var guard: IoGuard = .{ .phase = phase };
+            try std.testing.expectEqual(error.AccessDenied, guard.failed(error.AccessDenied));
+            try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+            try std.testing.expectEqual(@as(usize, 1), scheduler.workers);
+            var nested: PublicationIo = .{};
+            nested.install(&slot, std.testing.io, &scheduler, null);
+            nested.deinit();
+            try std.testing.expect(slot == phase);
+        }
+        owner.deinit();
+        try std.testing.expect(slot == null);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    }
+    var scheduler: Scheduler = .{ .max_workers = 1, .max_io_workers = 1 };
+    var occupying: @import("antfly_local_sources").sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 1 };
+    try std.testing.expect(occupying.tryEnter());
+    var slot: ?*const IoPhase = null;
+    var busy: PublicationIo = .{};
+    busy.install(&slot, std.testing.io, &scheduler, null);
+    busy.deinit();
+    try std.testing.expect(slot == null);
+    occupying.pause();
+    const Check = struct {
+        canceled: bool = false,
+        fn call(raw: *anyopaque) !void {
+            if (@as(*@This(), @ptrCast(@alignCast(raw))).canceled) return error.Cancelled;
+        }
+    };
+    var check: Check = .{};
+    var owner: PublicationIo = .{};
+    owner.install(&slot, std.testing.io, &scheduler, .{ .ptr = &check, .check = Check.call });
+    try slot.?.begin(slot.?.ptr, 1);
+    check.canceled = true;
+    try std.testing.expectError(error.Cancelled, slot.?.finish(slot.?.ptr));
+    owner.deinit();
+    try std.testing.expect(slot == null);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    scheduler.max_io_workers = 0;
+    owner.install(&slot, std.testing.io, &scheduler, null);
+    owner.deinit();
+    try std.testing.expect(slot == null);
+    scheduler.max_io_workers = 1;
+    scheduler.max_workers = 0;
+    owner.install(&slot, std.testing.io, &scheduler, null);
+    owner.deinit();
+    try std.testing.expect(slot == null);
 }

@@ -19,6 +19,7 @@ pub const bzip2 = @import("bzip2.zig");
 pub const lzw = @import("lzw.zig");
 pub const lz4 = @import("lz4.zig");
 test {
+    _ = zstd;
     _ = bzip2;
     _ = lz4;
 }

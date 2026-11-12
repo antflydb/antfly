@@ -50,6 +50,9 @@ func qualificationConcurrencyFixture(t *testing.T, count int, document func(http
 	if err := atomicCorpusJSON(filepath.Join(state, "publication.json"), map[string]any{"sha256": fmt.Sprintf("%x", sha256.Sum256(manifest.Bytes())), "records": count}); err != nil {
 		t.Fatal(err)
 	}
+	if err := atomicCorpusJSON(filepath.Join(state, "sources.json"), corpusConfig{Profile: "pdf"}); err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.Contains(r.URL.Path, "/indexes/"):

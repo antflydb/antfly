@@ -762,6 +762,74 @@ describe("InferenceClient with mock fetch", () => {
     });
   });
 
+  describe("generation stream budget failures", () => {
+    it("preserves classification without rounding unsigned diagnostic counts", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          'event: error\ndata: {"error":"MODEL_RESOURCE_LIMIT","retryable":false,"required_bytes":18446744073709551615,"limit_bytes":100}\n\n',
+          { headers: { "Content-Type": "text/event-stream" } }
+        )
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(
+        client.generateStream({ model: "gemma", messages: [] }).next()
+      ).rejects.toMatchObject({
+        code: "MODEL_RESOURCE_LIMIT",
+        retryable: false,
+        requiredBytes: undefined,
+        limitBytes: 100,
+      });
+    });
+    it("preserves structured permanent budget details and cancels the stream", async () => {
+      const payload = {
+        error: "MODEL_RESOURCE_LIMIT",
+        message: "working set exceeds host budget",
+        retryable: false,
+        budget: "host",
+        required_bytes: 110,
+        limit_bytes: 100,
+      };
+      const cancel = vi.fn();
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(
+                new TextEncoder().encode(`event: error\ndata: ${JSON.stringify(payload)}\n\n`)
+              );
+            },
+            cancel,
+          }),
+          { headers: { "Content-Type": "text/event-stream" } }
+        )
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(
+        client.generateStream({ model: "gemma", messages: [] }).next()
+      ).rejects.toMatchObject({
+        status: 200,
+        code: "MODEL_RESOURCE_LIMIT",
+        retryable: false,
+        budget: "host",
+        requiredBytes: 110,
+        limitBytes: 100,
+      });
+      expect(cancel).toHaveBeenCalled();
+    });
+
+    it("accepts legacy text errors without assigning retryability", async () => {
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response("event: error\ndata: legacy failure\n\n", {
+          headers: { "Content-Type": "text/event-stream" },
+        })
+      );
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      await expect(client.generateStream({ model: "gemma", messages: [] }).next()).rejects.toThrow(
+        "Generation stream failed: legacy failure"
+      );
+    });
+  });
+
   describe("rerank", () => {
     it("sends text and content-part documents to /rerank", async () => {
       const mockResponse = {

@@ -15,12 +15,15 @@
 
 //! Immutable remote-source identity checks with no transport or OS dependencies.
 const std = @import("std");
-pub const VersionKind = enum { strong_etag, s3_version_id };
+pub const VersionKind = enum { strong_etag, s3_version_id, file_sha256 };
 pub fn validateReference(uri: []const u8, version: []const u8, kind: VersionKind, length: u64) !std.Uri {
     if (length == 0 or version.len == 0 or version.len > 4096 or uri.len > 16 * 1024) return error.InvalidSourceReference;
     if (kind == .strong_etag) {
         if (version.len < 2 or version[0] != '"' or version[version.len - 1] != '"') return error.ImmutableVersionRequired;
         for (version[1 .. version.len - 1]) |byte| if (byte < 0x21 or byte == 0x22 or byte == 0x7f) return error.ImmutableVersionRequired;
+    } else if (kind == .file_sha256) {
+        if (version.len != 64) return error.ImmutableVersionRequired;
+        for (version) |byte| if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) return error.ImmutableVersionRequired;
     } else if (std.mem.eql(u8, version, "null")) return error.ImmutableVersionRequired;
     const parsed = try std.Uri.parse(uri);
     if (parsed.user != null or parsed.password != null or parsed.fragment != null) return error.InvalidSourceReference;
@@ -28,7 +31,11 @@ pub fn validateReference(uri: []const u8, version: []const u8, kind: VersionKind
         if (kind != .strong_etag) return error.InvalidSourceReference;
         try validateHttpUri(parsed);
     } else if (std.ascii.eqlIgnoreCase(parsed.scheme, "s3")) {
+        if (kind == .file_sha256) return error.InvalidSourceReference;
         try validateS3Uri(parsed, .{});
+    } else if (std.ascii.eqlIgnoreCase(parsed.scheme, "file")) {
+        if (kind != .file_sha256 or parsed.port != null or parsed.query != null or !std.mem.startsWith(u8, parsed.path.percent_encoded, "/")) return error.InvalidSourceReference;
+        if (parsed.host) |host| if (host.percent_encoded.len != 0 and !std.ascii.eqlIgnoreCase(host.percent_encoded, "localhost")) return error.InvalidHost;
     } else return error.UnsupportedUrlScheme;
     return parsed;
 }
@@ -53,4 +60,17 @@ test "immutable source identities validate without transport or allocation" {
     try std.testing.expectError(error.InvalidSourceReference, validateReference("https://example.org/a", "v1", .s3_version_id, 1));
     try std.testing.expectError(error.InvalidS3Url, validateReference("s3://bucket/", "v1", .s3_version_id, 1));
     try std.testing.expectError(error.InvalidSourceReference, validateReference("https://example.org/a", "\"v1\"", .strong_etag, 0));
+}
+
+test "local source identity requires SHA256 and a local absolute URI" {
+    const digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    _ = try validateReference("file:///video%20file.mp4", digest, .file_sha256, 10);
+    _ = try validateReference("file://localhost/video.mp4", digest, .file_sha256, 10);
+    try std.testing.expectError(error.InvalidHost, validateReference("file://remote/video.mp4", digest, .file_sha256, 10));
+    for ([_][]const u8{ "file:relative.mp4", "file:///video.mp4?x=1", "file:///video.mp4#fragment", "https://example.org/video", "s3://bucket/video" }) |uri| {
+        try std.testing.expectError(error.InvalidSourceReference, validateReference(uri, digest, .file_sha256, 10));
+    }
+    try std.testing.expectError(error.ImmutableVersionRequired, validateReference("file:///video", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .file_sha256, 10));
+    try std.testing.expectError(error.ImmutableVersionRequired, validateReference("file:///video", "GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG", .file_sha256, 10));
+    try std.testing.expectError(error.InvalidSourceReference, validateReference("file:///video", "\"v1\"", .strong_etag, 10));
 }

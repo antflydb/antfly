@@ -140,7 +140,7 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
     } else true;
     var estimated_rows: u64 = 0;
     for (inventory.files) |file| estimated_rows +|= file.row_count;
-    const capture_eligible = @import("lake_row_input_recipes.zig").nativeFragmentsEligible(try std.json.parseFromSliceLeaky(std.json.Value, metadata.allocator(), table.indexes_json, .{}));
+    const capture_eligible = @import("lake_row_input_recipes.zig").fragmentsEligibleForBuild(try std.json.parseFromSliceLeaky(std.json.Value, metadata.allocator(), table.indexes_json, .{}), previous == null);
     if (full_scan and capture_eligible and input_recipes.len != 0 and estimated_rows >= 128) capture_out.* = try @import("lake_row_payloads.zig").Capture.start(capture_allocator, provider, store, columns);
     if (capture_out.*) |capture| capture.configureOrdering(runtime) catch |err| {
         if (!capture.optionalFailure(err)) return err;
@@ -178,6 +178,12 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
         const proof = try @import("lake_row_verification.zig").compute(a, tuple, namespace, batch, builder.cohorts, token, provider.context, store.io_phase);
         defer proof.deinit();
         const ids = proof.ids;
+        if (provider.bulk_stage) |stage| {
+            var tee_phase = try store.beginIo(1);
+            defer tee_phase.abort();
+            stage.add(batch) catch |err| return tee_phase.failed(err);
+            try tee_phase.finish();
+        }
         if (capture_out.*) |capture| capture.add(batch, ids, store) catch |err| {
             if (!capture.optionalFailure(err)) return err;
             capture.deinit();

@@ -9706,6 +9706,24 @@ pub const ScopedInvertedIndexReader = struct {
         return context.native.docLength(doc);
     }
 
+    /// Resolve a bounded query term batch, then issue independent posting
+    /// headers before the first scorer waits for one term. Inline hits need no I/O.
+    pub fn prefetchTerms(self: *const ScopedInvertedIndexReader, terms: []const []const u8) !void {
+        const context = self.context orelse return;
+        const view = context.native.view;
+        if (view.source != .ranges or view.source.ranges.prefetch == null) return;
+        if (context.over_budget) return error.SegmentReadBudgetExceeded;
+        // Norms are independently addressable once the section header is open.
+        if (context.native.norms_length != 0) view.source.prefetch(view.offset + context.native.norms_offset, @min(64 * 1024, context.native.norms_length));
+        for (terms[0..@min(terms.len, 64)]) |term| {
+            const value = (try context.native.lookupValue(term, &context.dictionary)) orelse continue;
+            if (fstValIs1Hit(value)) continue;
+            const start = std.math.add(u64, v7_header_size, value) catch return error.InvalidData;
+            if (start >= context.native.norms_offset) return error.InvalidData;
+            view.source.prefetch(view.offset + start, @min(64 * 1024, context.native.norms_offset - start));
+        }
+    }
+
     pub fn lookup(self: *const ScopedInvertedIndexReader, term: []const u8) !?LookupResult {
         if (self.contiguous) |reader| return reader.lookupChecked(term);
         const context = self.context.?;
@@ -10668,7 +10686,7 @@ test "streamed positions preserve decoded prefix across packed crossover" {
     }
 }
 
-test "native scoped postings preserve prefetch through caches and translate section offsets" {
+test "external lake bounded window profiles native scoped postings preserve prefetch through caches and translate section offsets" {
     const a = std.testing.allocator;
     var builder = InvertedIndexBuilder.init(a, .{});
     defer builder.deinit();
@@ -10701,6 +10719,9 @@ test "native scoped postings preserve prefetch through caches and translate sect
     defer concurrent.deinit();
     var scoped = try ScopedInvertedIndexReader.initRanges(a, try sources.View.init(concurrent.borrowedSource(), prefix, bytes.len), .{});
     defer scoped.deinit();
+    state.hints = 0;
+    try scoped.prefetchTerms(&.{ "common", "missing" });
+    try std.testing.expect(state.hints >= 2); // independent norms and posting header
     const lookup = (try scoped.lookup("common")).?;
     var iterator = try lookup.iterator(a);
     defer iterator.deinit();

@@ -29,6 +29,7 @@ pub const Provider = struct {
     until_ms: u64 = 1_000_000,
     stats: usize = 0,
     gets: usize = 0,
+    clock_reads: std.atomic.Value(usize) = .init(0),
     get_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     put_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
     retention_hook: ?struct { ptr: *anyopaque, call: *const fn (*anyopaque) anyerror!void } = null,
@@ -195,6 +196,7 @@ pub const Provider = struct {
         return if (self.now_ms < self.until_ms) .{ .observed_ms = self.now_ms, .until_ms = self.until_ms } else null;
     }
     fn time(raw: *anyopaque, _: A, _: []const u8, _: ?os.CancellationToken) !?u64 {
+        _ = owner(raw).clock_reads.fetchAdd(1, .monotonic);
         return owner(raw).now_ms;
     }
     const vtable: os.Client.VTable = .{ .deinit = noop, .bucket_exists = exists, .make_bucket = make, .put_object = put, .get_object = get, .stat_object = stat, .stat_object_with_options = statOptions, .get_object_attributes = attributes, .delete_object = delete, .list_objects = list, .list_object_versions = listVersions, .version_retention = retention, .provider_time = time };

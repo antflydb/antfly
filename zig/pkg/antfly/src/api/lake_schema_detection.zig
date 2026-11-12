@@ -108,6 +108,11 @@ pub fn prepare(a: A, input: []const u8, options: @import("../serverless/configur
         for (detected.columns) |column| {
             var definition: std.json.ObjectMap = .empty;
             try definition.put(owned, "type", .{ .string = try owned.dupe(u8, column.kind) });
+            if (std.mem.eql(u8, column.kind, "array")) {
+                var items: std.json.ObjectMap = .empty;
+                try items.put(owned, "type", .{ .string = "number" });
+                try definition.put(owned, "items", .{ .object = items });
+            }
             const name = try owned.dupe(u8, column.name);
             try properties.put(owned, name, .{ .object = definition });
             if (column.required) try required.append(.{ .string = name });

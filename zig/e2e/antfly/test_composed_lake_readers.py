@@ -39,6 +39,12 @@ from conftest import (
 )
 
 
+# The matched loopback runner installs this observer. Default qualification is
+# unchanged; phase changes never drain startup/background provider activity.
+def network_phase(name):
+    pass
+
+
 pytestmark = [
     pytest.mark.iceberg_integration,
     pytest.mark.fresh_antfly_process,
@@ -71,6 +77,12 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
     assert 6 <= body_bytes <= 4096
     record_property("archive_rows", archive_rows)
     record_property("body_bytes", body_bytes)
+    cache_mib = int(os.environ.get("ANTFLY_E2E_COMPOSED_CACHE_MIB", "64"))
+    pending_rows = int(os.environ.get("ANTFLY_E2E_COMPOSED_PENDING_ROWS", "0"))
+    assert 1 <= cache_mib <= 256
+    assert 0 <= pending_rows <= 10_000
+    record_property("cache_mib", cache_mib)
+    record_property("additional_pending_rows", pending_rows)
     switches = {
         name: os.environ.get("ANTFLY_E2E_COMPOSED_" + name, default)
         for name, default in (("HIGHLIGHTS", "0"), ("STORE_SOURCE", "1"))
@@ -85,6 +97,23 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
     gcs_prefix = os.environ.get("ANTFLY_E2E_GCS_PREFIX")
     token_file = os.environ.get("ANTFLY_E2E_GCS_TOKEN_FILE")
     token = None
+    api_base = os.environ.get("ANTFLY_E2E_GCS_LOOPBACK_BASE")
+    if api_base:
+        from urllib.parse import urlsplit
+
+        endpoint = urlsplit(api_base)
+        assert (
+            endpoint.scheme == "http"
+            and endpoint.hostname == "127.0.0.1"
+            and endpoint.port
+        )
+        assert (
+            not endpoint.path
+            and not endpoint.query
+            and not endpoint.fragment
+            and not endpoint.username
+            and not endpoint.password
+        )
     is_gcs = provider.startswith("gcs")
     remote_source = provider == "gcs_remote"
     if is_gcs:
@@ -114,7 +143,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             config.setdefault("lake_indexes", {})["serving_cuts"] = {"enabled": True}
         config["lake_cache"] = {
             "root": str(root / "serving-cache"),
-            "max_memory_bytes": 64 * 1024**2,
+            "max_memory_bytes": cache_mib * 1024**2,
             "max_disk_bytes": 1024**3,
         }
         config["storage"] = {"engine": "local", "local": {"base_dir": str(root)}}
@@ -130,6 +159,14 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 "capabilities": ["storage.primary"],
                 "external_io": {
                     "protocol": "gcs",
+                    **(
+                        {
+                            "endpoint": api_base + "/storage/v1",
+                            "upload_endpoint": api_base + "/upload/storage/v1",
+                        }
+                        if api_base
+                        else {}
+                    ),
                     "buckets": [gcs_bucket],
                     "prefix": gcs_prefix,
                     "credentials": {
@@ -150,6 +187,14 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                 + ([] if publication_blocked else ["lake.write"]),
                 "external_io": {
                     "protocol": "gcs",
+                    **(
+                        {
+                            "endpoint": api_base + "/storage/v1",
+                            "upload_endpoint": api_base + "/upload/storage/v1",
+                        }
+                        if api_base
+                        else {}
+                    ),
                     "buckets": [gcs_bucket],
                     "prefix": gcs_prefix,
                     "credentials": {
@@ -248,7 +293,7 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
 
             def put_remote(name, body):
                 r = requests.post(
-                    f"https://storage.googleapis.com/upload/storage/v1/b/{gcs_bucket}/o",
+                    f"{api_base or 'https://storage.googleapis.com'}/upload/storage/v1/b/{gcs_bucket}/o",
                     params={
                         "uploadType": "media",
                         "name": f"{gcs_prefix}/source/archive/{name}",
@@ -399,7 +444,10 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                             value.get("code") == "index_rebuilding"
                             and value.get("retryable") is True
                         ), value
-                assert time.monotonic() < deadline, value
+                assert time.monotonic() < deadline, (
+                    f"Query readiness deadline exceeded: {value}\n"
+                    + server.debug_logs()
+                )
                 time.sleep(0.1)
 
         for name, source in (
@@ -596,10 +644,18 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             return {
                 k: float(v)
                 for line in r.text.splitlines()
-                if line.startswith("antfly_lake_query_")
+                if line.startswith(
+                    ("antfly_lake_query_", "antfly_lake_disk_cache_inventory_")
+                )
                 for k, v in [line.split()]
             }
 
+        def assert_ready():
+            for name in ("history", "current"):
+                _, resource = call("GET", f"/tables/{name}/indexes/body_text")
+                assert resource["status"]["readiness"]["queryable"], resource
+
+        assert_ready()
         # The health endpoint exposes an asynchronous five-second cache.
         time.sleep(6)
         before = metrics()
@@ -725,12 +781,26 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
                         {"id": 50, "body": "different", "deleted": False},
                         {"id": later_id, "body": "quasar", "deleted": False},
                     )
+                ]
+                + [
+                    {
+                        "op": "upsert",
+                        "row": {
+                            "id": archive_rows + 10_000 + offset,
+                            "body": "overlaypressuretoken",
+                            "deleted": True,
+                        },
+                    }
+                    for offset in range(pending_rows)
                 ],
             },
         )
         _, committed = call("GET", "/tables/current/lake/catalog")
         assert committed["metadata"]["properties"]["antfly.wal.coverage"] == "1"
         _, accepted_first = call("POST", "/query", query)
+        # Owned readiness must use the accepted cut even while publishing is
+        # blocked and the retained WAL overlay is nonempty.
+        assert_ready()
         assert accepted_first["next_source_cursor"].startswith(
             "source3:" if owned else "source2:"
         )
@@ -884,6 +954,28 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             record_property("query_samples", json.dumps(samples))
             time.sleep(6)
             profile_after = metrics()
+            record_property(
+                "slowest_immutable_io_after_restart",
+                json.dumps(
+                    {
+                        name: value
+                        for name, value in profile_after.items()
+                        if name.startswith(
+                            (
+                                "antfly_lake_query_slowest_lake_",
+                                "antfly_lake_query_slowest_composed_",
+                            )
+                        )
+                        or name
+                        in {
+                            "antfly_lake_query_slowest_lake_total_nanoseconds",
+                            "antfly_lake_query_slowest_composed_total_nanoseconds",
+                            "antfly_lake_disk_cache_inventory_checkpoint_hits_total",
+                            "antfly_lake_disk_cache_inventory_scan_entries_total",
+                        }
+                    }
+                ),
+            )
             profile_preparations = (
                 profile_after["antfly_lake_query_source_calls_total"]
                 - profile_before["antfly_lake_query_source_calls_total"]
@@ -929,8 +1021,10 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             cache_root = (server.root / "serving-cache").resolve()
             assert cache_root.parent == server.root.resolve()
             shutil.rmtree(cache_root, ignore_errors=True)
+            network_phase("cold_startup")
             cold_started = time.monotonic()
             server.resume()
+            network_phase("cold_query")
             response, usage = measure(
                 logical_process_reader(server.proc.pid),
                 lambda: requests.post(
@@ -946,9 +1040,62 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             )
             assert_highlights(response.json()["responses"][0], profile_term)
             record_property("cold_cache_query", json.dumps(usage))
+            network_phase("after_cold_query")
             record_property(
                 "cold_cache_startup_and_query_ms",
                 (time.monotonic() - cold_started) * 1000,
+            )
+            # These are the slowest retained leaf/composed profiles since process start;
+            # its total identifies whether it corresponds to the measured cold
+            # request. Preserve that bounded diagnostic profile, not
+            # a full process metrics dump or another timing series.
+            time.sleep(6)
+            cold_metrics = metrics()
+            record_property(
+                "slowest_immutable_io_after_cold",
+                json.dumps(
+                    {
+                        name: value
+                        for name, value in cold_metrics.items()
+                        if name.startswith(
+                            (
+                                "antfly_lake_query_slowest_lake_",
+                                "antfly_lake_query_slowest_composed_",
+                            )
+                        )
+                        or name
+                        in {
+                            "antfly_lake_query_slowest_lake_total_nanoseconds",
+                            "antfly_lake_query_slowest_composed_total_nanoseconds",
+                        }
+                    }
+                ),
+            )
+            # Fresh-process aggregates fill gaps in the retained request
+            # profile, particularly hydration. Startup/background work can
+            # contribute, so these are not request-attributed durations.
+            record_property(
+                "cold_process_phase_totals",
+                json.dumps(
+                    {
+                        name: cold_metrics[name]
+                        for phase in (
+                            "index",
+                            "hydration",
+                            "hydration_source",
+                            "hydration_native",
+                            "highlight",
+                            "text_directory",
+                            "text_inventory",
+                            "text_opening",
+                            "text_term_plan",
+                            "text_navigation",
+                            "text_postings",
+                        )
+                        if (name := f"antfly_lake_query_{phase}_nanoseconds_total")
+                        in cold_metrics
+                    }
+                ),
             )
             # Separate warm selectivity probes from the restart/cold samples.
             # Common, fixture-rare and absent terms exercise different posting
@@ -988,7 +1135,11 @@ def test_composed_lake_preparation_reuses_pins_and_keeps_restart_cursors(
             import threading
 
             publication_blocked = False
-            server.restart()
+            server.pause()
+            # The matched simulator can select a construction policy while the
+            # engine is stopped. Never drain provider work after cold startup.
+            network_phase("publication_setup")
+            server.resume()
             _, pinned = call("POST", "/query", query)
             stop = threading.Event()
             first_read = threading.Event()

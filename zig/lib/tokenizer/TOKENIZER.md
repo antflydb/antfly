@@ -40,6 +40,43 @@ malformed input, ambiguous string merge keys, and aliased vocabulary IDs.
 Optimization must not change token IDs. Performance results are accepted only
 after checking the complete output sequence, not merely its length.
 
+WordPiece normalizers compile to an immutable ordered profile rather than
+flattened flags. Nested `Sequence` programs preserve BERT cleaning, Unicode
+lowercase, Han spacing, NFC/NFD, accent stripping, trimming, and supported
+literal/whitespace replacements in their declared order. Unsupported steps
+reject the entire WordPiece profile; a supported prefix never silently runs
+alone. The common single-BERT profile borrows input until normalization and
+retains the ASCII fast path.
+
+Ordinary encoding, reused buffers, and padded/unpadded model inputs use the same
+profile. WordPiece `normalized: false` markers are protected before normalizing
+surrounding text; normalized added-token spellings compile through the same
+profile at load and match afterward, including absent and empty normalizers.
+Identity profiles borrow input without a normalization copy. They stay separate
+from the subword model's vocabulary. Equal normalized spellings choose the lowest
+token ID, and empty markers are ignored. Both immutable matchers retain the single-token fast path.
+Offset encoding keeps a checked ASCII fast path. Unicode and non-local
+steps carry byte-to-source intervals through decomposition, composition,
+replacement, and protected tokens, preserving the source spans needed by NER.
+Spans cover the complete consumed source units: composed characters include
+their combining marks, and replacement pieces cover the original match. These
+coverage spans can differ from Hugging Face offset metadata while IDs match.
+Independent `tokenizers==0.22.1` sequence fixtures cover reversed step order,
+Unicode, Han spacing, special tokens, and model wrapping, with allocation-failure
+checks for owned profiles and scratch.
+
+BERT classifications and lowercase mappings are generated from
+`tokenizers==0.22.1`, whose Unicode dependencies differ from CPython's Unicode
+version. WordPiece canonical normalization applies checked reference exceptions;
+generic NFC retains its existing Unicode 15 contract. Regenerate with
+`uv run --python 3.12 --with tokenizers==0.22.1 python tools/generate_unicode_nfc.py`
+and run the analogous `generate_unicode_punctuation.py` command with
+`src/unicode_punctuation_data.zig` as its output. Generation checks every scalar,
+including canonical decomposition/composition compatibility. Runtime encoding
+uses immutable tables and has no Python dependency. Whole-word WordPiece failure
+replaces any partially emitted prefix with one unknown token in every path.
+
+
 The primary benchmark fixture is:
 
 - tokenizer: `openai-community/gpt2` `tokenizer.json`
