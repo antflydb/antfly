@@ -4403,6 +4403,17 @@ const RedoCommitState = struct {
     checkpoint_sequence: u64 = 0,
     /// See this struct's own doc comment.
     checkpointing: bool = false,
+    /// Set by `NativeFile.maybeAutoCheckpointRedoLog` when its own
+    /// opportunistic checkpoint attempt fails (budget, disk, an
+    /// allocator invariant, OOM -- any error); cleared the moment a
+    /// checkpoint attempt (opportunistic or not) next succeeds. While
+    /// set, `maybeAutoCheckpointRedoLog` keeps retrying on every
+    /// subsequent commit regardless of how close to full the log
+    /// currently is -- the point of this flag is that a persistent
+    /// failure must not quietly wait for the log to refill back past the
+    /// 25%-remaining bound before trying again, which could otherwise
+    /// let it grow uncheckpointed all the way to `error.LogFull`.
+    checkpoint_pending_error: bool = false,
 
     fn deinit(self: *RedoCommitState, allocator: Allocator) void {
         self.logical_pending.deinit(allocator);
@@ -15414,15 +15425,42 @@ pub const NativeFile = struct {
     /// page/allocator work defer to `checkpointRedoLog`, same as a
     /// transient disk-space or I/O error -- must never retroactively turn
     /// an already-durable write into a failure the caller then (wrongly)
-    /// aborts. Swallowed exactly like the idle-timer trigger
-    /// (`Store.maybeCheckpointRedoLogOnIdleTurn`) swallows the same call:
-    /// the log is simply left a little fuller than ideal, for that timer
-    /// or a future commit crossing this same bound to retry.
+    /// aborts, so it is never returned to the caller. Not silently
+    /// dropped, though: `redo.checkpoint_pending_error` latches so the
+    /// *next* commit retries unconditionally (see its own doc comment,
+    /// and `redoCheckpointPendingError` for an outside observer), and
+    /// `self.allocator_work.redo_checkpoint_failures` -- surfaced through
+    /// `Store.reclamationStatus().allocator_work`, the same status both
+    /// the budget and maintenance paths already read -- counts every
+    /// failure so a persistent one (unlike a one-off transient I/O
+    /// error) is visible to whatever is watching that status. Logged via
+    /// `std.log.warn`, rate-limited to the first failure and every
+    /// power-of-two one after that, so a budget stuck at capacity does
+    /// not spam a line per commit.
     fn maybeAutoCheckpointRedoLog(self: *NativeFile) anyerror!void {
         const redo: *RedoCommitState = if (self.redo) |*r| r else return;
         if (redo.checkpointing) return;
-        if (redo.writer.remaining() >= redo.writer.capacity / 4) return;
-        self.checkpointRedoLog() catch {};
+        if (!redo.checkpoint_pending_error and redo.writer.remaining() >= redo.writer.capacity / 4) return;
+        self.checkpointRedoLog() catch |err| {
+            redo.checkpoint_pending_error = true;
+            self.allocator_work.redo_checkpoint_failures +|= 1;
+            const failures = self.allocator_work.redo_checkpoint_failures;
+            if (failures == 1 or std.math.isPowerOfTwo(failures)) {
+                std.log.warn("lite: opportunistic redo-log checkpoint failed, retrying on a later commit (path={s} err={s} failures={d})", .{ self.path, @errorName(err), failures });
+            }
+            return;
+        };
+        redo.checkpoint_pending_error = false;
+    }
+
+    /// Whether `maybeAutoCheckpointRedoLog`'s own opportunistic checkpoint
+    /// attempt is currently stuck failing (see `RedoCommitState
+    /// .checkpoint_pending_error`'s own doc comment) -- `false` for a
+    /// non-redo file. For an outside observer (a test, or a maintenance
+    /// path deciding whether a stalled checkpoint needs attention beyond
+    /// what the next commit's own retry will do on its own).
+    pub fn redoCheckpointPendingError(self: *const NativeFile) bool {
+        return if (self.redo) |redo| redo.checkpoint_pending_error else false;
     }
 
     /// WS1(b) single-fsync commits. A first attempt measured a

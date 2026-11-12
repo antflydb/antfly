@@ -81,6 +81,15 @@ pub const AllocatorWork = struct {
     /// as long as the readers directory's membership is unchanged between
     /// commits; see `NativeFile.scanReaderEpochsCached`.
     reader_namespace_full_scans: u64 = 0,
+    /// `NativeFile.maybeAutoCheckpointRedoLog`'s own opportunistic
+    /// redo-log checkpoint attempts that failed (budget, disk, an
+    /// allocator invariant, OOM -- any error). That commit still durably
+    /// published; only the *opportunistic* follow-up checkpoint did not.
+    /// Monotonic, never reset: a maintenance or budget path watching this
+    /// climb, with no corresponding drop in `redo_checkpoint_pending`
+    /// (`NativeFile.redoCheckpointPendingError`), has a persistently
+    /// failing checkpoint on its hands, not a one-off.
+    redo_checkpoint_failures: u64 = 0,
 
     pub fn absorb(self: *AllocatorWork, source: *AllocatorWork) void {
         if (self == source) return;
