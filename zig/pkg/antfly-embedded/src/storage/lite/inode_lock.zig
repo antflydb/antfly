@@ -93,6 +93,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const shared_lock_region = @import("shared_lock_region.zig");
+const redo_overlay = @import("redo_overlay.zig");
 
 pub const Mode = enum { shared, exclusive };
 
@@ -285,16 +286,45 @@ pub const Entry = struct {
     /// path, exactly like `ensureFd`'s existing lazy-reopen pattern after
     /// `entry.fd` goes back to `null`.
     region: ?shared_lock_region.Region = null,
-    /// The highest commit sequence any `NativeFile` in this process has
-    /// durably published for this inode, so any other `NativeFile` instance
-    /// on the same inode (a maintenance turn's own detached snapshot, a
-    /// writer-lease handoff's receiving instance, ...) can tell whether its
-    /// own in-memory header/allocator state is still current before staging
-    /// or committing writes of its own -- the writer-side twin of the
-    /// on-disk stale-base check. Populated under the publishing commit's own
-    /// exclusion (`NativeFile.publishCheckpoint`); read lock-free via a
-    /// monotonic compare, never regressed by an older commit's publish
-    /// racing a newer one. See `publishCommittedSequence`/`committedSequence`.
+    /// §9.6a: the redo-log's in-process versioned overlay, shared the
+    /// same way `region` is -- one instance per inode, referenced by
+    /// every `NativeFile` (writer or `ReadGeneration` reader) open on
+    /// this path in this process, instead of each independently
+    /// replaying the log into its own copy (which is what made a
+    /// `ReadGeneration` blind to anything written after it opened: its
+    /// own, unshared copy never saw a later commit at all). Populated
+    /// once, by whichever caller reaches `ensureRedoOverlay` first (see
+    /// that function); `rebind` does not clear this, unlike `region` --
+    /// a generation swap keeps the same logical content, just a new
+    /// path/fd, and the overlay is addressed by inode via this `Entry`,
+    /// never by path directly.
+    redo_overlay: ?redo_overlay.SharedRedoOverlay = null,
+    /// The in-process half of the reuse-safety frontier: every live,
+    /// same-process reader that can dereference tree pages at a fixed
+    /// checkpoint registers its own pinned sequence here, guarded by
+    /// `mutex` like every other field above. This exists alongside (not
+    /// instead of) `region`'s cross-process reader table and docstore.zig's
+    /// own `Store.reader_frontier` atomic: those two already cover their
+    /// own reader categories (a coordinated reader via `region`, a
+    /// `ReadGeneration` pin via `reader_frontier`), but neither one is
+    /// reachable by a reader that opens its own plain, uncoordinated
+    /// `NativeFile` directly (e.g. `captureFullReadSnapshot`'s reader, used
+    /// by vacuum's own verification snapshot) -- that reader never claims a
+    /// region slot and is a different `NativeFile` instance than whatever
+    /// `Store.reader_frontier` is wired into. `minimumReaderSequence`/
+    /// `minimumMetadataReaderSequence` combine this registry with
+    /// `region`'s own answer so every caller has one place to ask,
+    /// regardless of which mechanism a given reader happens to use.
+    reader_pins: std.ArrayListUnmanaged(ReaderPin) = .empty,
+    /// Published by the writer side on every commit (inode-wide, so every
+    /// instance on this inode -- not just the one that committed -- can
+    /// read it): the most recently committed `commit_sequence`, used to
+    /// detect a writer instance operating against a stale base (an old
+    /// generation/header it never refreshed). Populated under the
+    /// publishing commit's own exclusion (`NativeFile.publishCheckpoint`);
+    /// read lock-free via a monotonic compare, never regressed by an older
+    /// commit's publish racing a newer one. See
+    /// `publishCommittedSequence`/`committedSequence` below.
     last_committed_sequence: std.atomic.Value(u64) = .init(0),
 };
 
@@ -314,6 +344,100 @@ pub fn publishCommittedSequence(entry: *Entry, sequence: u64) void {
 /// nothing has published yet). See `publishCommittedSequence`.
 pub fn committedSequence(entry: *Entry) u64 {
     return entry.last_committed_sequence.load(.monotonic);
+}
+
+/// One live reader's pinned sequence(s), registered in `Entry.reader_pins`.
+/// Mirrors `shared_lock_region.Region`'s own data/metadata split so a
+/// reader that only dereferences one domain can pin just that one; most
+/// callers (a full snapshot reader) pin both to the same value.
+pub const ReaderPin = struct {
+    data: ?u64 = null,
+    metadata: ?u64 = null,
+};
+
+/// Registers a live pin, under `entry.mutex`. Callers must do this
+/// *before* reading whatever checkpoint/root they are about to dereference
+/// pages through (or re-validate afterward that it didn't change) -- see
+/// this function's callers in native.zig for the exact ordering each one
+/// uses. `allocator` is always `std.heap.page_allocator`: like `region`/
+/// `redo_overlay`, this registry's own bookkeeping outlives, and is shared
+/// across, whichever individual caller populated or last referenced it.
+pub fn pinReader(entry: *Entry, io: Io, pin: ReaderPin) !void {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    try entry.reader_pins.append(std.heap.page_allocator, pin);
+}
+
+/// Removes exactly one pin matching `pin` (the same values `pinReader` was
+/// given), not every pin that happens to share those values.
+pub fn unpinReader(entry: *Entry, io: Io, pin: ReaderPin) void {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    for (entry.reader_pins.items, 0..) |p, i| {
+        if (std.meta.eql(p, pin)) {
+            _ = entry.reader_pins.swapRemove(i);
+            return;
+        }
+    }
+}
+
+/// The minimum `.data` pin currently registered in this registry alone
+/// (never combined with `region`'s own answer -- callers that want the
+/// full picture call both this and `region.minimumPinnedSequence()` and
+/// take the smaller, exactly like every other term in `NativeFile.
+/// reuseFrontier` already does). `null` if no pin carries a `.data` value.
+pub fn minimumReaderSequence(entry: *Entry, io: Io) ?u64 {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    var min: ?u64 = null;
+    for (entry.reader_pins.items) |p| if (p.data) |s| {
+        if (min == null or s < min.?) min = s;
+    };
+    return min;
+}
+
+/// The metadata analogue of `minimumReaderSequence`.
+pub fn minimumMetadataReaderSequence(entry: *Entry, io: Io) ?u64 {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    var min: ?u64 = null;
+    for (entry.reader_pins.items) |p| if (p.metadata) |s| {
+        if (min == null or s < min.?) min = s;
+    };
+    return min;
+}
+
+/// Lazily populates (once per `Entry`, shared by every reference to it)
+/// and returns this inode's shared redo-log overlay. If it is already
+/// populated, `populate` is never called -- the existing overlay already
+/// reflects every commit made so far, kept current by every writer's own
+/// `appendVersion` calls against the same shared instance, so a second (or
+/// later) opener on this inode must not replay the log again, which would
+/// either duplicate versions or race the live writer's own in-flight
+/// appends. `entry.mutex` serializes concurrent first-use the same way it
+/// already serializes every other field above, including `region`.
+pub fn ensureRedoOverlay(
+    entry: *Entry,
+    io: Io,
+    ctx: anytype,
+    populate: *const fn (@TypeOf(ctx), *redo_overlay.SharedRedoOverlay, std.mem.Allocator) anyerror!void,
+) !*redo_overlay.SharedRedoOverlay {
+    entry.mutex.lockUncancelable(io);
+    defer entry.mutex.unlock(io);
+    if (entry.redo_overlay == null) {
+        entry.redo_overlay = redo_overlay.SharedRedoOverlay{};
+        errdefer {
+            entry.redo_overlay.?.deinit(std.heap.page_allocator);
+            entry.redo_overlay = null;
+        }
+        // Like `region` above: this registry's own bookkeeping always
+        // uses `std.heap.page_allocator`, never a caller-supplied one --
+        // the overlay outlives, and is shared across, whichever
+        // individual NativeFile happened to populate or last reference
+        // it, so it cannot safely be tied to any one of their allocators.
+        try populate(ctx, &entry.redo_overlay.?, std.heap.page_allocator);
+    }
+    return &entry.redo_overlay.?;
 }
 
 /// Lazily opens (once per `Entry`, shared by every reference to it) and
@@ -618,6 +742,7 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
     var destroy = false;
     var fd: ?Io.File = null;
     var region: ?shared_lock_region.Region = null;
+    var overlay: ?redo_overlay.SharedRedoOverlay = null;
     {
         entry.mutex.lockUncancelable(io);
         defer entry.mutex.unlock(io);
@@ -631,6 +756,8 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
             entry.state = .none;
             region = entry.region;
             entry.region = null;
+            overlay = entry.redo_overlay;
+            entry.redo_overlay = null;
         }
     }
     if (destroy) _ = registry.remove(entry.inode);
@@ -638,7 +765,9 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
     if (destroy) {
         if (fd) |held| held.close(io);
         if (region) |*r| r.close();
+        if (overlay) |*o| o.deinit(page);
         page.free(entry.path);
+        entry.reader_pins.deinit(page);
         entry.debug_outstanding.deinit(page);
         page.destroy(entry);
     }

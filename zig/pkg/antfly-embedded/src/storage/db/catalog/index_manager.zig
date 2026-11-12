@@ -1403,6 +1403,9 @@ pub const IndexManager = struct {
     resolver_catalog_projection_dictionary: std.atomic.Value(bool) = .init(false),
     alloc: Allocator,
     base_path: []u8,
+    /// Owned copy of `IndexBackendOptions.native_catalog_scratch_dir`. See
+    /// `persistent.PersistentIndexOptions.scratch_dir`.
+    native_catalog_scratch_dir: ?[]u8 = null,
     byte_range: docstore_mod.ByteRange,
     relaxed_split_durability: bool,
     leann_replication: bool = false,
@@ -3359,6 +3362,9 @@ pub const IndexManager = struct {
         const native_read_scratch = try native_read_scratch_pool.Pool.create(alloc, resource_manager);
         errdefer native_read_scratch.destroy();
 
+        const native_catalog_scratch_dir: ?[]u8 = if (opts.native_catalog_scratch_dir) |dir| try alloc.dupe(u8, dir) else null;
+        errdefer if (native_catalog_scratch_dir) |dir| alloc.free(dir);
+
         var owned_vector_block_storage: ?*lsm_backend_mod.NativeStorage = null;
         errdefer if (owned_vector_block_storage) |storage| {
             storage.deinit();
@@ -3419,6 +3425,7 @@ pub const IndexManager = struct {
         return .{
             .alloc = alloc,
             .base_path = try alloc.dupe(u8, base_path),
+            .native_catalog_scratch_dir = native_catalog_scratch_dir,
             .byte_range = .{ .start = "", .end = "" },
             .relaxed_split_durability = false,
             .leann_replication = opts.leann_replication,
@@ -7460,6 +7467,7 @@ pub const IndexManager = struct {
             self.alloc.destroy(storage);
         }
         self.alloc.free(self.base_path);
+        if (self.native_catalog_scratch_dir) |dir| self.alloc.free(dir);
         self.native_read_scratch.destroy();
         // PR #957 review on the #938 escalation commit: the process-wide
         // ResourceManager's replay-document-not-visible tracker is keyed in
@@ -15175,6 +15183,15 @@ pub const IndexManager = struct {
                     owned_embedding_names.items,
                 );
                 defer artifact_cleanup.deinit();
+                // #1216: a native-catalog HBC index's own metadata (dims,
+                // root node, postings) lives under a fixed, name-derived
+                // scope, independent of the generated-artifact cleanup
+                // above. Clear it durably before the catalog mutation below
+                // makes this index's removal visible, so a crash between
+                // the two can never leave the catalog saying "img" is gone
+                // while its stale dims survive underneath a later
+                // re-admission -- see `HBCIndex.deleteNativeCatalogScopeForRemoval`.
+                try entry.index.deleteNativeCatalogScopeForRemoval();
                 const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
                 try self.persistCatalogExcludingWithAtomicMutation(store, name, commit_mutation);
                 const replicated_leann = if (entry.index.leann) |leann_store| leann_store.isReplicated() else false;
@@ -23944,6 +23961,7 @@ pub const IndexManager = struct {
                     .main_no_sync = self.relaxed_split_durability,
                     .main_no_meta_sync = self.relaxed_split_durability,
                     .wal_no_sync = self.relaxed_split_durability,
+                    .scratch_dir = if (self.text_main_backend == .native_catalog) self.native_catalog_scratch_dir else null,
                 };
                 var persistent = openTextPersistentIndexWithRetry(self.alloc, persistent_opts) catch |err| {
                     std.log.warn("full_text open failed step=persistent_open name={s} err={s}", .{

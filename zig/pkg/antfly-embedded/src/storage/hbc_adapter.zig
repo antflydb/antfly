@@ -5259,6 +5259,26 @@ pub const HBCIndex = struct {
         };
     }
 
+    /// Durably removes this index's own native-catalog KV records (dims,
+    /// root node, postings, ...) so a later re-admission of a differently
+    /// configured index under the same name starts fresh instead of
+    /// resurrecting this generation's stale metadata (#1216: a dimension
+    /// change survived delete+re-admission because nothing ever cleared
+    /// this scope). A no-op for every other backend, which either owns no
+    /// persistent root of its own to leak (`.lsm`, deleted by the caller's
+    /// own directory removal) or is the raw-storage-authority `.native`
+    /// mode this adapter never promotes a `.native_catalog` index into.
+    /// Callers must call this -- and let it complete -- before committing
+    /// the catalog mutation that makes the index's removal visible; see
+    /// `native_catalog_backend.deleteAllForScope`.
+    pub fn deleteNativeCatalogScopeForRemoval(self: *HBCIndex) !void {
+        const backend = switch (self.env_owner) {
+            .native_catalog => |backend| backend,
+            .lsm, .native => return,
+        };
+        try native_catalog_backend.deleteAllForScope(self.alloc, backend.sink, backend.scope);
+    }
+
     alloc: Allocator,
     env_owner: EnvOwner,
     store: vectorindex_store.NamespaceStore,

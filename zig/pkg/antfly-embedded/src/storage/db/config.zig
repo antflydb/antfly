@@ -324,6 +324,13 @@ pub const IndexBackendOptions = struct {
     /// Required when `sparse_backend == .native_catalog` (Lite only). See
     /// `storage/native_catalog_backend.zig:Sink`.
     sparse_main_native_catalog_sink: ?sparse_mod.NativeCatalogSink = null,
+    /// A real host directory for bounded staging spill on indexes that have
+    /// no file-backed `SegmentFileStore` -- always true for `.native_catalog`
+    /// (Lite only), which publishes segments inline through the catalog sink
+    /// rather than through file-backed artifacts. Lite's `Handle` sets this
+    /// to the directory containing its own on-disk file. See
+    /// `persistent.PersistentIndexOptions.scratch_dir`.
+    native_catalog_scratch_dir: ?[]const u8 = null,
     graph_reverse_backend: graph_mod.ReverseBackend = .lsm,
     /// Required when `graph_reverse_backend == .native_catalog` (Lite only).
     /// See `graph/graph.zig:NativeCatalogSink` and `storage/
@@ -546,6 +553,7 @@ pub fn indexBackendOptionsForPrimary(
         .sparse_main_native_catalog_sink = overrides.sparse_main_native_catalog_sink,
         .graph_reverse_backend = if (graph_storage_override) overrides.graph_reverse_backend else graphReverseBackendForPrimary(kind),
         .graph_native_catalog_sink = overrides.graph_native_catalog_sink,
+        .native_catalog_scratch_dir = overrides.native_catalog_scratch_dir,
         .text_lsm_storage = overrides.text_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .dense_lsm_storage = overrides.dense_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .vector_block_storage = overrides.vector_block_storage orelse if (kind == .lsm) primary_lsm_storage else null,
