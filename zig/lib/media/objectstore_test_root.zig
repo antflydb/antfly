@@ -63,7 +63,7 @@ test "S3 authenticated media ranges sign version and range with no metadata prob
 }
 test "GCS authenticated media ranges pin generation and propagate cancellation" {
     const Fake = struct {
-        fn request(_: ?*anyopaque, a: std.mem.Allocator, method: store.gcs.HttpMethod, url: []const u8, headers: []const store.gcs.HeaderPair, _: ?[]const u8, _: ?[]const u8, cap: ?usize, cancellation: ?store.CancellationToken) !store.gcs.TransportResponse {
+        fn request(_: ?*anyopaque, a: std.mem.Allocator, method: store.gcs.HttpMethod, url: []const u8, headers: []const store.gcs.HeaderPair, _: ?[]const u8, _: ?[]const u8, cap: ?usize, cancellation: ?store.CancellationToken, _: store.gcs.TransportOptions) !store.gcs.TransportResponse {
             try cancellation.?.check();
             try std.testing.expectEqual(store.gcs.HttpMethod.GET, method);
             try std.testing.expect(std.mem.endsWith(u8, url, "/b/bucket/o/folder%2Fkey?generation=42&alt=media"));

@@ -255,6 +255,10 @@ pub const RequestOptions = struct {
     /// Per-request retry ceiling. Zero forbids replay even when the borrowed
     /// client is configured to retry non-idempotent methods.
     max_retries: ?u32 = null,
+    /// Opt in only when server-side preconditions make replay safe, even after
+    /// an ambiguous successful commit. Does not raise retry limits or permit
+    /// replay of streaming bodies or partially delivered writer responses.
+    replay_safe: bool = false,
     /// Override ambient cookie persistence for this request. Credentialed API
     /// clients should set this false even when borrowing a general client.
     cookies_enabled: ?bool = null,
@@ -1322,6 +1326,7 @@ pub const Client = struct {
         defer req.deinit();
         req.max_response_size = reqOpts.max_response_size;
         req.max_retries = reqOpts.max_retries;
+        req.replay_safe = reqOpts.replay_safe;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
         req.remaining_timeout_header = reqOpts.remaining_timeout_header;
         req.delivery_observer = reqOpts.delivery_observer;
@@ -1418,7 +1423,11 @@ pub const Client = struct {
             // not run cleanup again on the already released response.
             response.deinit();
             response_owned = false;
-            return self.requestInternal(next_method, next_url, reqOpts, depth + 1, deadline_ms);
+            // A precondition/idempotency key on this target need not protect
+            // the redirect destination. Its caller must admit replay there.
+            var next_options = reqOpts;
+            next_options.replay_safe = false;
+            return self.requestInternal(next_method, next_url, next_options, depth + 1, deadline_ms);
         }
 
         return response;
@@ -1447,6 +1456,7 @@ pub const Client = struct {
         defer req.deinit();
         req.max_response_size = reqOpts.max_response_size;
         req.max_retries = reqOpts.max_retries;
+        req.replay_safe = reqOpts.replay_safe;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
         req.remaining_timeout_header = reqOpts.remaining_timeout_header;
         req.delivery_observer = reqOpts.delivery_observer;
@@ -1545,7 +1555,9 @@ pub const Client = struct {
             // not run cleanup again on the already released response.
             response.deinit();
             response_owned = false;
-            return self.requestToWriterInternal(next_method, next_url, reqOpts, writer, progress_cb, progress_ctx, depth + 1, deadline_ms);
+            var next_options = reqOpts;
+            next_options.replay_safe = false;
+            return self.requestToWriterInternal(next_method, next_url, next_options, writer, progress_cb, progress_ctx, depth + 1, deadline_ms);
         }
 
         return response;
@@ -1707,7 +1719,7 @@ pub const Client = struct {
     fn executeRequestWithRetries(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64, interrupt: *RequestInterrupt) !Response {
         const policy = self.config.retry_policy;
         const max_retries = @min(req.max_retries orelse policy.max_retries, policy.max_retries);
-        const can_retry_method = (!policy.retry_only_idempotent) or req.method.isIdempotent();
+        const can_retry_method = req.replay_safe or (!policy.retry_only_idempotent) or req.method.isIdempotent();
 
         var attempt: u32 = 0;
         while (true) {
@@ -6846,7 +6858,14 @@ test "client body replay preserves method safety after truncation" {
     const TestServer = @import("../testing.zig").TestServer;
     const alloc = std.testing.allocator;
     const io = std.testing.io;
-    for ([_]types.Method{ .GET, .POST }) |method| {
+    const Case = struct { method: types.Method, replay_safe: bool = false, max_retries: ?u32 = null, succeeds: bool };
+    for ([_]Case{
+        .{ .method = .GET, .succeeds = true },
+        .{ .method = .POST, .succeeds = false },
+        .{ .method = .POST, .replay_safe = true, .succeeds = true },
+        .{ .method = .POST, .replay_safe = true, .max_retries = 0, .succeeds = false },
+    }) |case| {
+        const method = case.method;
         var server = try TestServer.start(alloc, io, &.{
             .{ .method = method, .path = "/", .max_uses = 1, .respond = .{ .body = "ready", .truncate_body_at = 2 } },
             .{ .method = method, .path = "/", .respond = .{ .body = "ready" } },
@@ -6862,13 +6881,13 @@ test "client body replay preserves method safety after truncation" {
         defer group.cancel(io);
         var client = Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .initial_delay_ms = 1 } });
         defer client.deinit();
-        if (method == .GET) {
-            var response = try client.request(method, server.baseUrl(), .{});
+        if (case.succeeds) {
+            var response = try client.request(method, server.baseUrl(), .{ .replay_safe = case.replay_safe, .max_retries = case.max_retries });
             defer response.deinit();
             try std.testing.expectEqualStrings("ready", response.body.?);
             try std.testing.expectEqualSlices(usize, &.{ 1, 1 }, server.route_hits);
         } else {
-            try std.testing.expectError(error.UnexpectedEof, client.request(method, server.baseUrl(), .{}));
+            try std.testing.expectError(error.UnexpectedEof, client.request(method, server.baseUrl(), .{ .replay_safe = case.replay_safe, .max_retries = case.max_retries }));
             try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, server.route_hits);
         }
     }
@@ -7700,4 +7719,46 @@ test "request task admission accounts every body representation error ceilings a
         try std.testing.expectEqual(@as(u32, 0), query.active);
         try std.testing.expectEqual(@as(u64, 0), query.active_bytes);
     };
+}
+
+test "request replay admission does not follow a redirect" {
+    const TestServer = @import("../testing.zig").TestServer;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |to_writer| {
+        var server = try TestServer.start(a, io, &.{
+            .{ .method = .POST, .path = "/start", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/final" }} } },
+            .{ .method = .POST, .path = "/final", .max_uses = 1, .respond = .{ .status = 503 } },
+            .{ .method = .POST, .path = "/final", .respond = .{ .body = "replayed" } },
+        });
+        defer server.deinit();
+        const Task = struct {
+            fn serve(ts: *TestServer) Io.Cancelable!void {
+                for (0..3) |_| ts.handleOne() catch return;
+            }
+        };
+        var group: Io.Group = .init;
+        try group.concurrent(io, Task.serve, .{&server});
+        defer group.cancel(io);
+        var client = Client.initWithConfig(a, io, .{ .keep_alive = false, .retry_policy = .{ .initial_delay_ms = 1 } });
+        defer client.deinit();
+        const Check = struct {
+            fn intercept(req: *Request, _: ?*anyopaque) !void {
+                if (std.mem.eql(u8, req.uri.path, "/final")) try std.testing.expect(!req.replay_safe);
+            }
+        };
+        try client.addInterceptor(.{ .request_fn = Check.intercept });
+        const url = try server.url("/start");
+        defer a.free(url);
+        var output: std.ArrayListUnmanaged(u8) = .empty;
+        defer output.deinit(a);
+        const options: RequestOptions = .{ .borrowed_body = "immutable", .replay_safe = true, .timeout_ms = 3000 };
+        var response = if (to_writer)
+            try client.requestToWriter(.POST, url, options, arrayListWriter(&output, a), null, null)
+        else
+            try client.request(.POST, url, options);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expectEqualSlices(usize, &.{ 1, 1, 0 }, server.route_hits);
+    }
 }

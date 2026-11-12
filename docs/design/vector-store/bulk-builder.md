@@ -719,3 +719,48 @@ before construction; vectorless files cannot silently alter identity work while
 preserving embedding count and recall. Receipt checks bind the exact interrupted
 manifest and require skipped input replay/clustering after restart. These testing
 contracts are separate from production catalog CAS, Raft and power-loss recovery.
+
+### Conditional upload recovery and request memory
+
+Identity ingestion can publish row-key chunks before it saves a source receipt.
+Those writes need the same bounded recovery behavior as final artifact uploads.
+GCS implements create-only media uploads with POST and `ifGenerationMatch=0`.
+The object-store caller explicitly admits replay only for that conditional media
+request. HTTPx retains its ordinary method safety defaults, retry ceiling,
+backoff, cancellation and request-wide deadline; it does not propagate this
+admission through a redirect. Authentication and transport consume the captured
+request deadline. Unconditional POST and resumable-session initiation do not
+inherit the new replay admission.
+
+A lost successful response may turn the retry into a precondition conflict.
+The GCS client returns that conflict. The artifact layer then reads the existing
+object under its immutable provider revision and verifies its length and digest
+before accepting it. A different object at the expected content address fails
+closed. Retrying a request never grants publication authority to private work.
+
+GCS transport borrows the immutable request body through synchronous completion
+of every attempt, removing a second payload-sized allocation and copy. The
+owner must keep the bytes alive and immutable until the call returns. A focused
+8 MiB request-setup comparison measured 8,388,855 allocated bytes with an owned
+body versus 247 with the borrowed body; this excludes network execution and is
+an allocation result, not an ingest throughput or RSS claim. Clustering, native
+SST formats and normal database insertion are unaffected by this change.
+
+Qualification emits fixed operation/error tags at source-read, identity spill
+and chunk publication, exact-vector flush, and spool append/finish failures.
+Spool failures retain the file writer's underlying error when available. The
+diagnostic does not log object URLs, credentials, source values or scratch paths,
+and compiles away in production. The controller treats SIGHUP and SIGTERM as
+cancellation, drains its owned worker group and persists a terminal status.
+SIGKILL cannot run cleanup; long suites still require a durable supervisor and
+retained exit records.
+
+The final 1M WAN attempt failed during identity ingestion and remains
+unqualified. Its generic `WriteFailed` log cannot establish which operation
+failed. The [failure investigation](../../../zig/bench/vectors/GCS_BULK_FAILURE_INVESTIGATION.md)
+separates that historical uncertainty from reproduced recovery and lifecycle
+defects. Planned range reads already skip metadata probes, so removing an
+assumed extra HEAD is not a performance opportunity on that path. Further
+upload batching, range coalescing or concurrency changes need attributed phase
+and request measurements plus a successful publication/reopen/recall check
+before another paired performance comparison.

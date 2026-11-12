@@ -172,7 +172,10 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
     while (true) {
         var phase = try store.beginIo(1);
         defer phase.abort();
-        const next = source.next(a) catch |err| return phase.failed(err);
+        const next = source.next(a) catch |err| {
+            @import("lake_execution_probe_hooks.zig").failure("identity_source_read", err, null);
+            return phase.failed(err);
+        };
         try phase.finish();
         const batch = next orelse break;
         const proof = try @import("lake_row_verification.zig").compute(a, tuple, namespace, batch, builder.cohorts, token, provider.context, store.io_phase);
@@ -198,11 +201,17 @@ fn buildInner(a: A, out: A, table: local.common_topology_records.TableRecord, st
             const ref = batch.rowRef(row);
             if (ref != .external) return error.InvalidLogicalRowIdentity;
             const slot = by_file.get(ref.external.file_id) orelse return error.InvalidLogicalRowIdentity;
-            try builder.addWithInputs(.{ .id = ids[row], .values = ids[row] }, .{ .file = slot, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }, proof.row(row));
+            builder.addWithInputs(.{ .id = ids[row], .values = ids[row] }, .{ .file = slot, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }, proof.row(row)) catch |err| {
+                @import("lake_execution_probe_hooks.zig").failure("identity_spill_append", err, null);
+                return err;
+            };
         }
     }
     try extendInputs(a, builder, provider, store, &tuple, namespace, contract, by_file, token);
-    var root = try builder.finish(namespace.digest(), recipe, cut);
+    var root = builder.finish(namespace.digest(), recipe, cut) catch |err| {
+        @import("lake_execution_probe_hooks.zig").failure("identity_reduce_finish", err, null);
+        return err;
+    };
     root.definition = definition;
     root.current.navigation = navigation;
     const encoded = try std.json.Stringify.valueAlloc(a, root, .{});

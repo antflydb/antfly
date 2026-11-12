@@ -207,13 +207,15 @@ def upload(bucket, prefix, name, path, expected, framed, log_path, *, timeout=18
 
 
 def termination_signal(signum, _frame):
-    # Raising preserves the upload/worker finally blocks; the default SIGTERM
-    # action would abandon children deliberately placed in a separate session.
+    # Raising preserves the upload/worker finally blocks; default termination
+    # actions abandon children deliberately placed in a separate session.
     raise SystemExit(128 + signum)
 
 
 def main():
     signal.signal(signal.SIGTERM, termination_signal)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, termination_signal)
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--binary", type=Path, required=True)
     p.add_argument("--source", type=Path, required=True)
@@ -398,6 +400,7 @@ def main():
         ).hexdigest(),
         case=case,
     )
+    report["status"] = "running"
     write_report(args.output / "local.json", report)
     start = time.monotonic()
     with (args.output / "worker.log").open("w") as log:
@@ -415,10 +418,22 @@ def main():
         )
         try:
             process.wait(timeout=args.timeout)
-        except BaseException:
+        except BaseException as exc:
+            report["status"] = (
+                "cancelled"
+                if isinstance(exc, (SystemExit, KeyboardInterrupt))
+                else "failed"
+            )
+            report["controller_error_type"] = type(exc).__name__
+            if isinstance(exc, SystemExit) and isinstance(exc.code, int):
+                report["controller_exit_code"] = exc.code
             terminate_group(process)
             raise
         finally:
+            if report["status"] == "running":
+                report["status"] = (
+                    "worker_finished" if process.returncode == 0 else "failed"
+                )
             report["wall_seconds"] = time.monotonic() - start
             report["load_after"] = os.getloadavg()
             report["worker_exit_code"] = process.returncode
@@ -433,6 +448,7 @@ def main():
         raise ValueError("case descriptor changed during execution")
     result = json.loads((args.output / "case/result.json").read_text())
     report["qualified"] = process.returncode == 0 and result["qualified"]
+    report["status"] = "qualified" if report["qualified"] else "failed"
     write_report(args.output / "local.json", report)
     if not report["qualified"]:
         raise RuntimeError(

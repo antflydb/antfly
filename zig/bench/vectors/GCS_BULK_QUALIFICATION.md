@@ -187,15 +187,16 @@ recorded separately from sampled child scratch.
 Both runners clear inherited bulk/probe flags before applying a case's settings.
 Local-file overrides, compact mode, resume flags and headroom experiments cannot
 silently change a GCS variant. The GCS worker records its explicit probe settings.
-SIGTERM follows the same cleanup path as timeout/interrupt, signals the owned
+SIGTERM and SIGHUP follow the same cleanup path as timeout/interrupt, signal the owned
 worker group and reaps its leader. Cleanup also signals surviving descendants
 when the group leader has already exited and is safe to call repeatedly.
 
 The native probe emits the actual complete Parquet inventory. Qualification
 matches file URIs, lengths and immutable revisions against the admitted objects,
 including files that emit no vectors. An explicit generation is checked directly;
-a prefix reader's metadata ETag must match the admitted alias that GCS resolves
-conditionally to that generation. The probe checks the owned expected inventory
+a prefix reader's metadata ETag must match the admitted alias and is enforced
+on the planned media GET. Planned range reads already skip metadata probes.
+The probe checks the owned expected inventory
 before beginning construction, and the worker checks the emitted inventory too.
 Unexpected vectorless files therefore fail admission even when vector count and
 recall would otherwise pass. This is probe-only admission; no publication format
@@ -219,3 +220,25 @@ contracts when both files were admitted; this isolates the inventory regression.
 The recorded report retains both observations. Final validation passed all 87
 build steps, 27 native tests (one guarded S3 skip, no failures/leaks), and all 26
 Python regressions. These synthetic checks are correctness evidence only.
+
+## Failed 1M scale attempt and follow-up
+
+The final optimized 1M attempt failed with `WriteFailed` after 3,017.935988
+seconds during identity ingestion. It produced no construction receipt or
+published index. Its controller disappeared without a final report; the worker
+retained the native failure. The original stale suite report was preserved
+before reconciling it as failed, with the queued incremental/control cases
+unstarted. This is not a qualified 1M performance result.
+
+The [investigation](GCS_BULK_FAILURE_INVESTIGATION.md) records the ambiguous
+historical error separately from a reproduced SIGHUP cleanup defect and an
+unretried conditional GCS POST path. Follow-up coverage exercises interrupted
+uploads, ambiguous commits, digest verification after conflicts, cancellation,
+deadlines and controller cleanup. Native failure records now identify the
+operation boundary, including underlying spool file errors when available.
+
+The follow-up also removes a payload-sized GCS request-body copy. An 8 MiB
+pre-transport comparison allocated 8,388,855 bytes for the owned body and 247
+for the borrowed body. This is an allocation measurement, not a new full-build
+timing. The successful 100K construction remains 299.9 seconds; another 1M
+publication/reopen/recall is required before making scale or throughput claims.

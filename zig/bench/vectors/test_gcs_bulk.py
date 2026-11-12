@@ -183,6 +183,13 @@ with open(sys.argv[1],'ab',buffering=0) as out:
                     pass
 
     def test_sigterm_cancels_the_real_snapshotted_controller_and_worker_group(self):
+        self.check_controller_cancellation(signal.SIGTERM)
+
+    @unittest.skipUnless(hasattr(signal, "SIGHUP"), "POSIX hangup signal required")
+    def test_sighup_cancels_the_real_snapshotted_controller_and_worker_group(self):
+        self.check_controller_cancellation(signal.SIGHUP)
+
+    def check_controller_cancellation(self, signum):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pulse = root / "pulse"
@@ -285,14 +292,17 @@ with open(sys.argv[1],'ab',buffering=0) as out:
                         "ANTFLY_LAKE_PROBE_HEADROOM",
                     ):
                         self.assertNotIn(key, actual_env)
-                    process.send_signal(signal.SIGTERM)
-                    self.assertEqual(process.wait(timeout=15), 143)
+                    process.send_signal(signum)
+                    self.assertEqual(process.wait(timeout=15), 128 + signum)
                     time.sleep(0.1)
                     before = pulse.stat().st_size
                     time.sleep(0.1)
                     self.assertEqual(before, pulse.stat().st_size)
                     report = json.loads((output / "local.json").read_text())
                     self.assertFalse(report["qualified"])
+                    self.assertEqual(report["status"], "cancelled")
+                    self.assertEqual(report["controller_exit_code"], 128 + signum)
+                    self.assertGreater(report["wall_seconds"], 0)
                     self.assertNotEqual(report["worker_exit_code"], 0)
                     self.assertTrue((output / "inputs/manifest.json").exists())
                 finally:

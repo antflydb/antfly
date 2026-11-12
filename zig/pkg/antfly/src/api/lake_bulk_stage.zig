@@ -183,23 +183,41 @@ pub const Stage = struct {
                 try stores.chargeReadBudget(&self.left, @as(u64, self.dims) * 4 + 128);
                 const ref = batch.rowRef(row);
                 const key = try self.plan.privateKey(a, ref);
-                try self.tracker.append(ref, key);
+                self.tracker.append(ref, key) catch |err| {
+                    probe.failure("identity_chunk_upload", err, null);
+                    return err;
+                };
                 try self.fresh.append("exact_vectors", key, try @import("antfly_vector").codec.encodePackedF32BytesAlloc(a, vector));
-                if (self.fresh.bytes >= 16 * 1024 * 1024) try self.fresh.flush(&self.vectors);
-                try self.output.?.append(dense.vectorId(key), key, self.index.transformVector(vector, transformed));
+                if (self.fresh.bytes >= 16 * 1024 * 1024) self.fresh.flush(&self.vectors) catch |err| {
+                    probe.failure("exact_vector_flush", err, null);
+                    return err;
+                };
+                self.output.?.append(dense.vectorId(key), key, self.index.transformVector(vector, transformed)) catch |err| {
+                    probe.failure("spool_append", err, self.output.?.writer.err);
+                    return err;
+                };
             }
         }
     }
     pub fn finish(self: *Stage, provider: *Provider) !void {
         const started = probe.start();
         defer probe.finish("bulk_receipt", started);
-        const partition = self.output.?.finish(self.io) catch |err| return if (err == error.DuplicateVectorId) error.NativeLakeVectorIdentityCollision else err;
+        const partition = self.output.?.finish(self.io) catch |err| {
+            probe.failure("spool_finish", err, self.output.?.writer.err);
+            return if (err == error.DuplicateVectorId) error.NativeLakeVectorIdentityCollision else err;
+        };
         self.output = null;
-        try self.fresh.flush(&self.vectors);
+        self.fresh.flush(&self.vectors) catch |err| {
+            probe.failure("exact_vector_flush", err, null);
+            return err;
+        };
         try self.vectors.finishBulkIngestSessionWithOptions(.{ .compact = false });
         self.source_session = false;
         try self.vectors.checkpointRecoveryManifest();
-        try self.tracker.finish();
+        self.tracker.finish() catch |err| {
+            probe.failure("identity_chunk_finish", err, null);
+            return err;
+        };
         var checkpoint = try self.vectors.pinNativeCheckpoint();
         var checkpoint_open = true;
         defer if (checkpoint_open) checkpoint.deinit();

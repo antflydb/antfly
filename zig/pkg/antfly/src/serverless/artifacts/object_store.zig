@@ -1691,3 +1691,74 @@ test "external lake global frontier unversioned S3-compatible GC uses names thro
     try std.testing.expectEqual(@as(usize, 1), state.lists);
     try std.testing.expectEqual(@as(usize, 1), state.deletes);
 }
+
+test "external lake execution GCS ambiguous creates authenticate existing content after retry" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const httpx = @import("httpx");
+    const payload = "payload";
+    const checksum = try sha256StringWithCancellationAlloc(a, payload, .none);
+    defer a.free(checksum);
+    const id = try makeArtifactIdAlloc(a, checksum);
+    defer a.free(id);
+    const key = try keyForArtifactIdAlloc(a, "", id);
+    defer a.free(key);
+    // This fixture uses an unscoped digest key, whose slash is URL encoded.
+    const encoded = try httpx.uri.encode(a, key);
+    defer a.free(encoded);
+    const metadata_path = try std.fmt.allocPrint(a, "/storage/v1/b/bucket/o/{s}", .{encoded});
+    defer a.free(metadata_path);
+    const metadata = try std.fmt.allocPrint(a, "{{\"name\":\"{s}\",\"generation\":\"42\",\"size\":\"7\"}}", .{key});
+    defer a.free(metadata);
+    for ([_]bool{ false, true }) |corrupt| {
+        const Check = struct {
+            fn create(info: httpx.testing_mod.RequestInfo) !void {
+                try std.testing.expectEqualStrings("payload", info.body);
+                try std.testing.expect(std.mem.indexOf(u8, info.query, "ifGenerationMatch=0") != null);
+            }
+            fn read(info: httpx.testing_mod.RequestInfo) !void {
+                try std.testing.expect(std.mem.indexOf(u8, info.query, "generation=42") != null);
+                try std.testing.expectEqualStrings("bytes=0-6", info.header("Range").?);
+            }
+        };
+        var server = try httpx.testing_mod.TestServer.start(a, io, &.{
+            // The server accepted the bytes but the success reply was lost.
+            .{ .method = .POST, .path = "/upload/storage/v1/b/bucket/o", .max_uses = 1, .assert_request = Check.create, .respond = .{ .disconnect_before_response = true } },
+            .{ .method = .POST, .path = "/upload/storage/v1/b/bucket/o", .max_uses = 1, .assert_request = Check.create, .respond = .{ .status = 412 } },
+            .{ .path = metadata_path, .max_uses = 1, .respond = .{ .body = metadata } },
+            .{ .path = metadata_path, .assert_request = Check.read, .respond = .{ .status = 206, .headers = &.{ .{ .name = "Content-Range", .value = "bytes 0-6/7" }, .{ .name = "x-goog-generation", .value = "42" } }, .body = if (corrupt) "corrupt" else payload } },
+        });
+        defer server.deinit();
+        const Task = struct {
+            fn serve(ts: *httpx.testing_mod.TestServer) std.Io.Cancelable!void {
+                for (0..4) |_| ts.handleOne() catch return;
+            }
+        };
+        var group: std.Io.Group = .init;
+        try group.concurrent(io, Task.serve, .{&server});
+        defer group.cancel(io);
+        var json = try objectstore.Gcs.JsonApiClient.init(a, .{
+            .endpoint = try std.fmt.allocPrint(a, "{s}/storage/v1", .{server.baseUrl()}),
+            .upload_endpoint = try std.fmt.allocPrint(a, "{s}/upload/storage/v1", .{server.baseUrl()}),
+            .io = io,
+            .request_timeout_ms = 3000,
+            .http_client_config = .{ .keep_alive = false, .retry_policy = .{ .initial_delay_ms = 1 } },
+        });
+        var client = json.client();
+        defer client.deinit();
+        var backend = try ObjectStore.initWithClientOptions(a, client, "bucket", "", .{ .skip_bucket_probe = true });
+        defer backend.deinit();
+        var store = backend.artifactStore();
+        if (corrupt) {
+            try std.testing.expectError(error.ArtifactIntegrityMismatch, store.put(payload));
+        } else {
+            var value = try store.put(payload);
+            defer value.deinit(a);
+            try std.testing.expectEqualStrings(id, value.artifact_id);
+            try std.testing.expectEqualStrings(checksum, value.checksum);
+            try std.testing.expectEqualStrings("42", value.provider_version.?);
+        }
+        try group.await(io);
+        try std.testing.expectEqualSlices(usize, &.{ 1, 1, 1, 1 }, server.route_hits);
+    }
+}
