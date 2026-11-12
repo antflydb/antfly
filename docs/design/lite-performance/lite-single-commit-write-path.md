@@ -1465,7 +1465,27 @@ checkpoint first; or it is explicitly out of scope today. Audited:
 This resolves point 2 in full except for the two explicitly open items
 above (backup/restore quiesce-ordering verification, and `check()`'s
 `record_count`/`liveStats` inconsistency), both documented decisions to
-revisit, not blockers left unexamined.
+revisit, not blockers left unexamined. `check()`'s inconsistency is
+fixed as part of point 3 below (`NativeFile.redoOverlayEntryCount`,
+added into `record_count` in both the indexed and non-indexed branches
+of `checkAtFileSizeWithCancel`).
+
+### 9.3e A second occurrence of the same key-ownership bug, in replay
+
+`appendLogicalMutation`'s `fetchPut`-vs-`getOrPut` fix (§9.3c) has a
+sibling: `decodeLogicalMutationsPayload`, the function `recoverRedoLog`
+uses to rebuild `logical_overlay` from the log on open, had the
+identical bug (`fetchPut`, then freeing its returned "old" key as if
+it were a separate allocation from the map's own live key). It did not
+surface until point 3's work below actually exercised recovery against
+a log whose replayed range covers more than one record for the same
+key -- an ordinary put-then-overwrite or put-then-delete before the
+next checkpoint, same trigger as the original bug, just on the replay
+path instead of the live-commit path. Found via `docstore.zig`'s own
+`performVacuum`, which opens a fresh read-only `NativeFile` on the same
+path (triggering `recoverRedoLog` independently of the live handle);
+closing it then double-freed. Fixed the same way: `getOrPut`, storing
+the new key only when there wasn't already one to keep.
 
 ### 9.4 Background checkpointer: batched, owner-only, ride-along
 
@@ -1541,6 +1561,52 @@ background checkpointer (§9.4) calls instead of something a commit
 calls inline. No change to `State`'s in-memory shape or its public
 `retain`/`release`/`allocate` API (§ survey Part A.4) is needed; only
 where `persist()`'s bytes land changes.
+
+#### 9.4b Step 4, as implemented: riding the existing idle-flush timer
+
+The synchronous 25%-remaining check inside `commitTransactionWithDurability`
+(`maybeAutoCheckpointRedoLog`) is kept exactly as designed above --
+backpressure for a writer that outruns everything else, never the
+primary trigger. The primary trigger is now `docstore.zig`'s
+`rideAlongFlushLoop`: the same background thread/timer §3.2a's
+ride-along idle-flush barrier already runs (wakes every
+`ride_along_idle_ns`, default 50ms), extended with a second,
+independent check (`maybeCheckpointRedoLogOnIdleTurn`) on every wake,
+regardless of whether the ride-along branch found anything to flush.
+Reusing this loop rather than adding a new thread/timer was deliberate:
+it already exists, already wakes on a sensible cadence, and already
+has the right shape (a periodic tick that's free to be a no-op).
+
+Two triggers, both checked on every wake:
+
+- **Idle**: any non-empty `logical_overlay` (any root) reaching this
+  point has gone at least one full `ride_along_idle_ns` tick with
+  nothing else pressing enough to wake the loop sooner, so checkpointing
+  it now is cheap and bounds the staleness a reopen would have to replay
+  to at most one tick.
+- **Threshold**: the log's own byte capacity past the halfway point
+  (`redo.writer.remaining() < redo.writer.capacity / 2`), checked
+  independently of the overlay's *entry* count -- a commit's external-
+  value pages consume log bytes without necessarily adding many logical
+  entries, so the two signals can disagree, and either one alone
+  triggers the same checkpoint.
+
+Starting the loop: `ensureRideAlongFlushStarted` used to run lazily,
+only on a file's first `stageRideAlong` call -- a workload that never
+rides along (every commit durable and synchronous) would never start
+it, leaving only the 25%-remaining backpressure path ever checkpointing.
+The fix is **not** to start it eagerly inside `createWithOptions`/
+`openWithOptions`: both return `Store` by value, so a thread spawned
+there against `&result` captures a pointer to a stack temporary that
+goes stale the instant the caller's own copy of the returned value
+settles at a different address (found by reproducing it: a real crash,
+`@cmpxchgStrong` reading a corrupted `Io.Event` from freed/reused
+memory, the first time a test exercised this against a stable
+non-redo-log baseline). Instead, `applyMutationGroup` -- always called
+through the caller's own long-lived `*Store`, never a temporary --
+starts the loop lazily on a file's first real commit, for a redo-log
+file specifically. A file with zero commits ever has nothing to
+checkpoint regardless, so this loses nothing a workload would need.
 
 ### 9.5 Recovery: last durable checkpoint plus a validated log prefix
 
@@ -1659,6 +1725,59 @@ crash_consistency_test.zig:3235-3263), which must keep not firing:
    retirement," with checkpoint ride-along commits substituted for
    merge/retirement, to catch the same class of idle-flush-timer
    starvation bug §7.1 found, in the new code path.
+
+### 9.7a Point 3: threading the option, and holding back the default
+
+The option is threaded the whole way: `capi/db.zig`'s
+`HostLiteOpenOptions`/`LiteResolvedOpenOptions` (`use_redo_log: ?bool`,
+plus `page_reuse: ?bool` since redo-log and indexed reclamation remain
+mutually exclusive) -> `backend.zig`'s `CreateOptions` ->
+`docstore.zig`'s `CreateOptions.use_redo_log` -> `NativeFile.createWithRedoLog`/
+the new owned-io counterpart `createWithRedoLogOwnedIo` (needed because
+`docstore.Store.createWithOptions` has an `opts.io == null` path
+`createWithRedoLog` itself can't serve -- it requires a caller-supplied
+`std.Io`). `null` (unset) and explicit `false` both mean legacy;
+explicit `true` alongside `page_reuse` (which defaults to `true`) is a
+caller error, not a silent downgrade. Default capacity:
+`NativeFile.default_redo_log_capacity_bytes` (8 MiB) -- no prior
+sizing precedent existed in this codebase to inherit; this is a fresh,
+deliberately generous choice, not a measured optimum.
+
+**The default itself is not flipped to redo-log for every new file**,
+despite that being point 3's original ask. Flipping it and running the
+existing suite surfaced 13 failures in `storage.lite.docstore.test`'s
+reclamation/replay/maintenance tests alone (page-growth-based
+assessment heuristics, vacuum/replay-cleanup code that assumes a
+commit's pages are already physically on disk by the time retirement
+or replay logic looks at them, allocation-failure-injection tests whose
+expected failure point shifts with the allocation pattern) -- none of
+which §9.3d's audit covered, because they are not "does this subsystem
+read/write through the overlay-aware paths" questions at all, but
+"does this subsystem's own timing/sizing assumptions survive a commit
+that defers its physical page build" questions, a different audit this
+pass did not have time to run to completion. Opt-in (`use_redo_log =
+true`) is fully supported, covered by the same native.zig/crash-sim
+tests as the legacy path, and already demonstrated end-to-end through
+the real capi seam by the harness mode below. Only the production
+*default* stays legacy until that second audit happens; flipping it
+blind was exactly the risk this whole revision's review process (the
+logical-mutation rewrite, the overlay/scan merge-join, two
+`fetchPut`-vs-`getOrPut` memory-corruption bugs) was already right to
+be cautious about once.
+
+The CPU harness (`write_amplification_cpu_bench_test.zig`) gained a
+`redo: bool` parameter threaded through `Fixture.open`/
+`measureSingleWriter`/`measureConcurrent`, with every pre-existing call
+site passing `false` explicitly (so the long-calibrated "ceilings" test
+keeps measuring exactly what it always measured, unaffected by the
+option existing at all) and a new `"lite write amplification cpu redo
+vs legacy"` test measuring both side by side through the real capi
+seam. Measured end-to-end (updates=128, text_bytes=1024): legacy
+pwrite/write=12.41, pread/write=9.69, syscalls/write=23.09; redo
+pwrite/write=2.07, pread/write=0.43, syscalls/write=3.52 -- the same
+order-of-magnitude win native.zig's own direct measurement showed,
+confirmed surviving the full capi -> backend.zig -> docstore.zig ->
+native.zig path, not just the native.zig layer.
 
 ### 9.8 Gates (from step (c) on)
 

@@ -386,7 +386,15 @@ const Fixture = struct {
     runtime: db_mod.background_runtime.BackendRuntimeHandle,
     handle: *anyopaque,
 
-    fn open(alloc: std.mem.Allocator, comptime name: []const u8, mode: Mode) !Fixture {
+    /// `redo`: docs/design/lite-performance/lite-single-commit-write-path.md
+    /// §9, point 3's side-by-side harness mode. `false` reproduces every
+    /// existing call site's original (legacy copy-on-write) measurement
+    /// unchanged, since `createWithOptions`'s own default is now redo-log
+    /// for a newly created file -- every caller here must pass this
+    /// explicitly rather than inherit that default silently, so the
+    /// long-calibrated "ceilings" test keeps measuring what it was
+    /// calibrated against.
+    fn open(alloc: std.mem.Allocator, comptime name: []const u8, mode: Mode, redo: bool) !Fixture {
         var directory = try TestDirectory.init(name);
         errdefer directory.cleanup();
         try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
@@ -403,6 +411,14 @@ const Fixture = struct {
             .create = true,
             .hosted = false,
             .no_sync = false,
+            .use_redo_log = redo,
+            // redo-log is unsupported combined with indexed reclamation's
+            // page reuse (docstore.zig's own createWithOptions asserts
+            // this) -- `page_reuse` defaults to `true`, so the redo run
+            // must turn it off explicitly; the legacy run leaves it at
+            // its existing default, unchanged from every call site here
+            // before this harness mode existed.
+            .page_reuse = if (redo) false else null,
         });
 
         if (mode != .full_text) {
@@ -527,8 +543,8 @@ fn resetCounters() void {
     syscalls.reset();
 }
 
-fn measureSingleWriter(alloc: std.mem.Allocator, comptime name: []const u8, mode: Mode, updates: usize) !CpuReport {
-    var fixture = try Fixture.open(alloc, name, mode);
+fn measureSingleWriter(alloc: std.mem.Allocator, comptime name: []const u8, mode: Mode, updates: usize, redo: bool) !CpuReport {
+    var fixture = try Fixture.open(alloc, name, mode, redo);
     defer fixture.close();
 
     const sync_level: []const u8 = if (mode == .full_text) "full_index" else "write";
@@ -591,8 +607,8 @@ const ConcurrentWorker = struct {
     }
 };
 
-fn measureConcurrent(alloc: std.mem.Allocator, comptime name: []const u8, mode: Mode, writers: usize, updates_per_writer: usize) !CpuReport {
-    var fixture = try Fixture.open(alloc, name, mode);
+fn measureConcurrent(alloc: std.mem.Allocator, comptime name: []const u8, mode: Mode, writers: usize, updates_per_writer: usize, redo: bool) !CpuReport {
+    var fixture = try Fixture.open(alloc, name, mode, redo);
     defer fixture.close();
 
     resetCounters();
@@ -763,10 +779,10 @@ test "lite write amplification cpu report" {
     const alloc = cpuAllocator();
     const updates = default_updates;
 
-    const primary = try measureSingleWriter(alloc, "lite-write-amp-cpu-primary", .primary_only, updates);
-    const primary_concurrent = try measureConcurrent(alloc, "lite-write-amp-cpu-primary-concurrent", .primary_only, default_writers, updates / default_writers);
-    const full_text = try measureSingleWriter(alloc, "lite-write-amp-cpu-full-text", .full_text, updates);
-    const full_text_concurrent = try measureConcurrent(alloc, "lite-write-amp-cpu-full-text-concurrent", .full_text, default_writers, updates / default_writers);
+    const primary = try measureSingleWriter(alloc, "lite-write-amp-cpu-primary", .primary_only, updates, false);
+    const primary_concurrent = try measureConcurrent(alloc, "lite-write-amp-cpu-primary-concurrent", .primary_only, default_writers, updates / default_writers, false);
+    const full_text = try measureSingleWriter(alloc, "lite-write-amp-cpu-full-text", .full_text, updates, false);
+    const full_text_concurrent = try measureConcurrent(alloc, "lite-write-amp-cpu-full-text-concurrent", .full_text, default_writers, updates / default_writers, false);
 
     std.debug.print("lite write amplification CPU report (updates={d}, text_bytes={d}):\n", .{ updates, text_bytes });
     printReport("primary-only", primary);
@@ -796,7 +812,7 @@ test "lite write amplification cpu report" {
 test "lite write amplification cpu profile loop" {
     const alloc = cpuAllocator();
     const profile_updates: usize = 6000;
-    const report = try measureSingleWriter(alloc, "lite-write-amp-cpu-profile", .primary_only, profile_updates);
+    const report = try measureSingleWriter(alloc, "lite-write-amp-cpu-profile", .primary_only, profile_updates, false);
     printReport("profile loop: primary-only", report);
 }
 
@@ -819,7 +835,7 @@ test "lite write amplification cpu attribution" {
     native.PageWriteMetrics.reset();
     native.PageDecodeMetrics.resetCrc();
     histogram_armed.store(true, .monotonic);
-    const report = try measureSingleWriter(alloc, "lite-write-amp-cpu-attrib", .primary_only, updates);
+    const report = try measureSingleWriter(alloc, "lite-write-amp-cpu-attrib", .primary_only, updates, false);
     histogram_armed.store(false, .monotonic);
     const crc = native.PageDecodeMetrics.crcSnapshot();
     std.debug.print("  CRC: calls/write={d:.3} bytes/write={d:.1}\n", .{
@@ -960,7 +976,7 @@ test "lite write amplification cpu attribution" {
 // `--test-filter "lite write amplification cpu document index keys"`.
 test "lite write amplification cpu document index keys" {
     const alloc = cpuAllocator();
-    var fixture = try Fixture.open(alloc, "lite-write-amp-cpu-docidx", .primary_only);
+    var fixture = try Fixture.open(alloc, "lite-write-amp-cpu-docidx", .primary_only, false);
     defer fixture.close();
 
     var buffer: [text_bytes]u8 = undefined;
@@ -1001,11 +1017,40 @@ test "lite write amplification cpu ceilings" {
     // syscalls/write; full-text ~1355-1426 allocs/write, ~39-39.5
     // syscalls/write. Ceilings below are the higher observed value plus 25%
     // slack.
-    const primary = try measureSingleWriter(alloc, "lite-write-amp-cpu-ceil-primary", .primary_only, updates);
+    const primary = try measureSingleWriter(alloc, "lite-write-amp-cpu-ceil-primary", .primary_only, updates, false);
     try std.testing.expect(primary.allocsPerWrite() < 1125.0);
     try std.testing.expect(primary.syscallsPerWrite() < 39.0);
 
-    const full_text = try measureSingleWriter(alloc, "lite-write-amp-cpu-ceil-fulltext", .full_text, updates);
+    const full_text = try measureSingleWriter(alloc, "lite-write-amp-cpu-ceil-fulltext", .full_text, updates, false);
     try std.testing.expect(full_text.allocsPerWrite() < 1785.0);
     try std.testing.expect(full_text.syscallsPerWrite() < 50.0);
+}
+
+// Point 3's side-by-side harness mode: redo-log vs legacy copy-on-write,
+// through the same capi seam as every other measurement in this file (not
+// native.zig directly). Diagnostic only, like "cpu report" above -- no
+// ceiling assertions here, since redo-log's numbers (§9's target: pwrite
+// ~2/write, durable bytes/write ~record size, pread ~0, confirmed by
+// native.zig's own direct-measurement unit test) are already proven at the
+// native.zig layer; this exists to confirm the same shape survives the
+// full capi -> backend.zig -> docstore.zig -> native.zig path once redo-log
+// is the default, and to make the comparison visible to anyone reading the
+// harness output rather than needing two separate runs.
+test "lite write amplification cpu redo vs legacy" {
+    // See "lite write amplification cpu report" above: shared global GPA.
+    const alloc = cpuAllocator();
+    const updates = default_updates;
+
+    const legacy = try measureSingleWriter(alloc, "lite-write-amp-cpu-legacy", .primary_only, updates, false);
+    const redo = try measureSingleWriter(alloc, "lite-write-amp-cpu-redo", .primary_only, updates, true);
+
+    std.debug.print("lite write amplification CPU report, redo vs legacy (updates={d}, text_bytes={d}):\n", .{ updates, text_bytes });
+    printReport("primary-only (legacy)", legacy);
+    printReport("primary-only (redo)", redo);
+
+    const ReportPair = struct { legacy: ModeReportJson, redo: ModeReportJson };
+    const report: ReportPair = .{ .legacy = modeJson(legacy), .redo = modeJson(redo) };
+    const json_text = try std.json.Stringify.valueAlloc(alloc, report, .{ .whitespace = .indent_2 });
+    defer alloc.free(json_text);
+    std.debug.print("lite_write_amplification_cpu_redo_vs_legacy_json_begin\n{s}\nlite_write_amplification_cpu_redo_vs_legacy_json_end\n", .{json_text});
 }
