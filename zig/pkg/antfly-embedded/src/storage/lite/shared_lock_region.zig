@@ -778,7 +778,19 @@ pub const Region = struct {
             };
             fresh.header_checksum = headerChecksum(&fresh);
             try setup_file.writePositionalAll(io, std.mem.asBytes(&fresh), 0);
-            try setup_file.sync(io);
+            // Deliberately no `sync(io)` here: the region is a disposable
+            // coordination aid, not a durable record -- a torn or missing
+            // header is caught by `isValidHeader`'s checksum check and
+            // simply rebuilt (under `ensureNoLivePeer`'s liveness proof)
+            // the next time anything opens it, exactly like any other
+            // corruption this same function already tolerates. Durability
+            // of this header buys nothing but an fsync's latency, and
+            // landing that fsync inside whichever caller's first
+            // page-reusing commit happens to need the region first
+            // (`NativeFile.openWithRuntime`/`createWithRuntime` now call
+            // `ensureRegion` eagerly at open/create time specifically to
+            // avoid that) would reintroduce the exact cost this comment
+            // is here to rule back out.
         }
 
         // Re-read the header fresh: `need_init` above may have just set

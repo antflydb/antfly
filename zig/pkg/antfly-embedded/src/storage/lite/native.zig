@@ -6014,6 +6014,18 @@ pub const NativeFile = struct {
 
         const inode_entry = try inode_lock.open(io, path);
         errdefer inode_lock.unref(inode_entry, io);
+        // Eagerly establish (or attach to an already-cached) this inode's
+        // shared lock region here, at open time, instead of leaving its
+        // one-time create/validate cost (`Region.openSized`) to land
+        // lazily inside whichever call happens to be first to need it --
+        // which, for a writer, can be the first page-reusing commit
+        // (`acquireEpochReuseLock` -> `regionForInode`), landing region
+        // setup work inside a commit's own fault window. Every error is
+        // swallowed exactly like `regionForInode` already does: a region
+        // that can't be set up here just means every later caller's own
+        // region-mode fallback engages instead, never a reason to fail
+        // this open.
+        _ = inode_lock.ensureRegion(inode_entry, io) catch {};
 
         // Every read-only open used to ask `openDataFile` to take its
         // `.shared` kernel lock atomically at open, on its own fd, for
@@ -6526,6 +6538,10 @@ pub const NativeFile = struct {
         // create.
         const inode_entry = try inode_lock.open(io, path);
         errdefer inode_lock.unref(inode_entry, io);
+        // See the matching comment in `openWithRuntime`: set the region up
+        // eagerly here too, so a freshly created file never defers that
+        // one-time cost into its first page-reusing commit either.
+        _ = inode_lock.ensureRegion(inode_entry, io) catch {};
 
         var result = NativeFile{
             .allocator = allocator,
