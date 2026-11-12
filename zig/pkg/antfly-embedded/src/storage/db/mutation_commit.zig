@@ -1367,6 +1367,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     policy_schema_view,
                     effective_req,
                     if (use_preprepared_rows) preparation.rows else null,
+                    if (use_preprepared_rows) preparation.effects else null,
                     principal,
                 );
             }
@@ -4623,6 +4624,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             schema_view: schema_registry_mod.SchemaView,
             req: types.BatchRequest,
             prepared_rows: ?[]?mapper.PreparedRelationalWrite,
+            prepared_effects: ?[]const PreparedRowEffects,
             principal: *const row_policy_authority_mod.Payload,
         ) !void {
             if (principal.access != .write or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
@@ -4644,8 +4646,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer probe.abort();
             for (req.writes, 0..) |write, i| {
                 if (isMetadataKey(write.key)) return error.RowPolicyMutationUnsupported;
-                const store_key = try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, write.key);
-                defer S.ownerField(self, "alloc").*.free(store_key);
+                // When the caller already encoded this write's store key into
+                // preparation.effects (the relational preprepared-rows path),
+                // borrow it instead of re-encoding and re-acquiring a schema
+                // view for the exact same key. The cache is owned by the
+                // caller's PreparedBatchResources and freed/transferred there;
+                // only a freshly-encoded key (document mode, or no cache) is
+                // freed here.
+                const cached_store_key: ?[]const u8 = if (prepared_effects) |effects| effects[i].store_key else null;
+                const store_key = cached_store_key orelse try encodeStoreLookupKeyAlloc(self, S.ownerField(self, "alloc").*, write.key);
+                defer if (cached_store_key == null) S.ownerField(self, "alloc").*.free(store_key);
                 const old_bytes: ?[]const u8 = probe.getLeased(store_key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
