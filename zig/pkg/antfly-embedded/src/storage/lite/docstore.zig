@@ -1241,6 +1241,74 @@ test "lite reclamation budget rejects a mutation before exhausting capacity" {
     try std.testing.expectEqual(@as(u8, @intCast(accepted - 1)), stored[0]);
 }
 
+// `NativeFile.maybeAutoCheckpointRedoLog` fires after every durable
+// commit on a redo-log file once the log's own remaining capacity
+// crosses its 25%-remaining bound (same file/budget shape as "lite
+// reclamation budget rejects a mutation before exhausting capacity",
+// which is what first exposed this). Its own checkpoint attempt hits
+// the same `max_storage_bytes` budget well before the budget rejects
+// any write outright -- the triggering commit still durably publishes
+// (`write.commit()` below never fails inside the loop), but the
+// opportunistic checkpoint it tried to run failed. That must latch
+// `NativeFile.redoCheckpointPendingError` and count on
+// `Store.reclamationStatus().allocator_work.redo_checkpoint_failures`,
+// not vanish silently -- and once the budget is no longer the blocker,
+// the very next commit's retry must actually succeed and clear the
+// flag, not leave the log to grow toward `error.LogFull` unattended.
+test "lite reclamation opportunistic redo checkpoint failure is visible and recovers" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "reclamation-budget-recover.aflite");
+    defer alloc.free(path);
+    const limit = 64 * 4096;
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .use_redo_log = true, .reclamation = .{ .page_reuse = false, .enabled = false, .max_storage_bytes = limit } });
+    defer store.close();
+    var value: [8192]u8 = @splat('a');
+    var last_committed: usize = undefined;
+    var version: usize = 0;
+    while (true) : (version += 1) {
+        try std.testing.expect(version < 128); // must latch well before the budget rejects a write outright
+        value[0] = @intCast(version);
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("doc", &value);
+        // The triggering commit's own write always durably publishes,
+        // even on the iteration whose opportunistic follow-up checkpoint
+        // fails -- that is exactly the bug this test guards against.
+        try write.commit();
+        last_committed = version;
+        if (store.file.redoCheckpointPendingError()) break;
+    }
+    const failures_at_latch = (try store.reclamationStatus()).allocator_work.redo_checkpoint_failures;
+    try std.testing.expect(failures_at_latch >= 1);
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        const stored = try read.get("doc");
+        try std.testing.expectEqual(@as(u8, @intCast(last_committed)), stored[0]);
+    }
+
+    // Recovery: once the budget is no longer the blocker, the next
+    // commit's own retry (still via `maybeAutoCheckpointRedoLog`, same
+    // code path, no special-cased "retry now" call) must succeed and
+    // clear the latch. `refreshAdmissionAssumeLocked` recomputes
+    // `self.file.max_file_bytes` from this option on every write, so the
+    // option itself -- not the derived field -- is what must change.
+    store.maintenance_policy.options.max_storage_bytes = limit * 8;
+    value[0] = @intCast(last_committed + 1);
+    var write = try store.beginWrite();
+    errdefer write.abort();
+    try write.put("doc", &value);
+    try write.commit();
+    try std.testing.expect(!store.file.redoCheckpointPendingError());
+    // The counter itself never resets (it is a lifetime total, not a
+    // "currently failing" gauge -- that is what the latch is for), so
+    // only its continued presence is checked, not a drop back to zero.
+    try std.testing.expect((try store.reclamationStatus()).allocator_work.redo_checkpoint_failures >= failures_at_latch);
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
 test "lite reclamation low disk defers rewriting and resumes when capacity returns" {
     const Probe = struct {
         bytes: u64 = 0,
