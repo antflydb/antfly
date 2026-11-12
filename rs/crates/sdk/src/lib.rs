@@ -731,6 +731,8 @@ impl Default for types::CreateEmbeddingsIndexRequest {
             external: false,
             external_vector_space: None,
             field: None,
+            lake_bulk_build: None,
+            lake_bulk_build_max_input_bytes: None,
             leann: None,
             mem_only: None,
             min_weight: None,

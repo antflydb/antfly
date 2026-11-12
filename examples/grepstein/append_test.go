@@ -51,12 +51,20 @@ func writeAppendState(t *testing.T, state string, records []corpusRecord, config
 	}
 }
 
-func nativeAppendReaderFixture(t *testing.T, calls *atomic.Int64) *httptest.Server {
+const imageFixtureModel = "lightonai/LightOnOCR-3-4B:safetensors@b71010f095dc3735de7ee6b9969bff8f8f50b39a"
+const imageFixtureGrounding = "![text](0,0,1000,300)\nNative GCS extraction evidence. This sign contains ordinary readable evidence text.\n\n![image](0,300,1000,1000)\nA red vehicle parked outside a large building with windows and trees."
+
+func nativeAppendReaderFixture(t *testing.T, calls *atomic.Int64, images ...bool) *httptest.Server {
 	t.Helper()
+	grounded := len(images) > 0 && images[0]
+	model := "e2e-reader"
+	if grounded {
+		model = imageFixtureModel
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/ai/v1/models") {
-			json.NewEncoder(w).Encode(map[string]any{"readers": map[string]any{"e2e-reader": map[string]any{
+			json.NewEncoder(w).Encode(map[string]any{"readers": map[string]any{model: map[string]any{
 				"inputs": []string{"text", "image"}, "inference_capabilities": map[string]any{
 					"version": 4, "task": "read", "input_modalities": []string{"text", "image"}, "accepted_mime_types": []string{"image/png", "image/jpeg"}, "input_granularity": "page", "output": "read_result", "result_cardinality": "one_per_item", "prompt_policy": "explicit", "borrowed_attachments": false,
 					"task_limits": map[string]any{"max_text_bytes_per_item": 65536, "max_input_tokens_per_item": 8192, "max_output_tokens_per_item": 8192, "max_candidates_per_request": nil, "max_schema_bytes": nil},
@@ -71,22 +79,33 @@ func nativeAppendReaderFixture(t *testing.T, calls *atomic.Int64) *httptest.Serv
 		}
 		var body struct {
 			Images []map[string]any `json:"images"`
+			Prompt string           `json:"prompt"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad request", 400)
 			return
 		}
+		if grounded && body.Prompt != "grounding" {
+			t.Errorf("expected grounding prompt, got %q", body.Prompt)
+			http.Error(w, "expected grounding prompt", 400)
+			return
+		}
 		data := []any{}
 		for i, image := range body.Images {
 			source, _ := image["url"].(string)
-			if !strings.HasPrefix(source, "data:image/png;base64,") {
+			if !strings.HasPrefix(source, "data:image/png;base64,") && !(grounded && strings.HasPrefix(source, "data:image/jpeg;base64,")) {
+				t.Errorf("expected PNG media, got prefix %.64s", source)
 				http.Error(w, "expected native PDF raster", 400)
 				return
 			}
 			calls.Add(1)
-			data = append(data, map[string]any{"object": "read_result", "index": i, "status": "complete", "text": "Native GCS extraction evidence. This scanned document contains ordinary readable evidence text. Its native units and chunks retain the original source identity after appending more documents."})
+			text := "Native GCS extraction evidence. This scanned document contains ordinary readable evidence text. Its native units and chunks retain the original source identity after appending more documents."
+			if grounded {
+				text = imageFixtureGrounding
+			}
+			data = append(data, map[string]any{"object": "read_result", "index": i, "status": "complete", "text": text})
 		}
-		json.NewEncoder(w).Encode(map[string]any{"object": "list", "model": "e2e-reader", "data": data, "usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 40, "total_tokens": 41}})
+		json.NewEncoder(w).Encode(map[string]any{"object": "list", "model": model, "data": data, "usage": map[string]any{"prompt_tokens": 1, "completion_tokens": 40, "total_tokens": 41}})
 	}))
 	t.Cleanup(server.Close)
 	return server

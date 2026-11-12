@@ -616,7 +616,7 @@ pub const ColumnPage = struct {
             .dictionary_bytes => |values| .{ .string = values.at(index) },
             .json => |values| try std.json.parseFromSliceLeaky(std.json.Value, alloc, values[index], .{ .allocate = .alloc_always, .parse_numbers = false }),
             .decimal128 => |values| .{ .string = try values.text(alloc, index) },
-            .vector_f32 => return error.UnsupportedSqlExecution,
+            .vector_f32 => try column.values.jsonAt(alloc, index),
         };
         return .{ .value = value, .sql_null = false };
     }

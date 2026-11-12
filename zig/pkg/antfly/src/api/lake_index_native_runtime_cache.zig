@@ -178,7 +178,7 @@ pub const Entry = struct {
     }
     fn open(self: *Entry, server: *server_api.ApiHttpServer, declaration: local.serverless_segment_sidecar_manifest.DeclaredArtifact, domain: [32]u8, scope: [32]u8, context: Context, cloud: ?local.metadata_lake_index_catalog.CloudGenerations) !void {
         const a = self.arena.allocator();
-        self.store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+        self.store = try Store.openNativeWithTransport(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir, try server.lakeProviderTransport());
         self.store_open = true;
         self.store.implementation.cloud_io = context.io;
         try self.store.bindGenerationMap(cloud, if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none);
@@ -202,6 +202,7 @@ pub const Entry = struct {
             const index = try a.create(local.storage_hbc_adapter.HBCIndex);
             var config: local.storage_hbc_adapter.HBCConfig = .{ .dims = root.dims };
             config.metric = std.meta.stringToEnum(@TypeOf(config.metric), root.metric) orelse return error.InvalidNativeLakeDenseRoot;
+            try dense.applyStoredQuantization(a, &config, root);
             index.* = try local.storage_hbc_adapter.HBCIndex.openWithLsmOptions(self.budget.allocator(), path, config, .{ .storage = reader.storage(), .backend_options = .{ .backend = .{ .read_only = true, .create_if_missing = false } } });
             errdefer index.close();
             index.setIo(server.embedding_provider_runtime.io);

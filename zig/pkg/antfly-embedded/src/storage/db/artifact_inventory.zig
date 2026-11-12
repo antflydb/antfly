@@ -24,6 +24,33 @@ pub const resolver_key = "\x00\x00__metadata__:resolvers";
 pub const ordered_key = "\x00\x00__metadata__:ordered_artifact_catalog";
 pub const local_key = "\x00\x00__metadata__:artifact_inventory";
 
+pub fn isCatalogKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, index_key) or std.mem.eql(u8, key, enrichment_key) or std.mem.eql(u8, key, resolver_key);
+}
+
+/// The common DocStore writer refreshes this identity atomically with every
+/// catalog put/delete. Readiness and restore audits still use `local`, which
+/// independently checks all bytes. Publication reads only this bounded record.
+pub fn publicationIdentity(txn: anytype) !?LocalBinding {
+    const raw = try get(txn, local_key);
+    if (raw.len == 0) return null;
+    if (raw.len != 40) return error.ArtifactCatalogCorrupt;
+    const epoch = std.mem.readInt(u64, raw[0..8], .little);
+    if (epoch == 0) return error.ArtifactCatalogCorrupt;
+    return .{ .epoch = epoch, .digest = raw[8..40].* };
+}
+
+pub fn requirePublicationDigest(txn: anytype, expected: [32]u8) !void {
+    if (try publicationIdentity(txn)) |identity| {
+        if (!std.mem.eql(u8, &identity.digest, &expected)) return error.EnrichmentSourceChanged;
+    } else {
+        // Older stores install the witness only after checking current bytes
+        // under the writer. No format migration or repeated catalog scan.
+        if (!std.mem.eql(u8, &(try catalogs(txn)).digest(), &expected)) return error.EnrichmentSourceChanged;
+        try refresh(txn);
+    }
+}
+
 pub const dense_artifact_flags_protocol: u16 = 19;
 pub const max_effect_protocol: u16 = dense_artifact_flags_protocol;
 
@@ -236,9 +263,9 @@ pub fn validateRequest(req: anytype) !void {
 }
 
 fn get(txn: anytype, key: []const u8) ![]const u8 {
-    return txn.get(key) catch |err| switch (err) {
-        error.NotFound => "",
-        else => return err,
+    return txn.get(key) catch |err| {
+        if (err == error.NotFound) return "";
+        return err;
     };
 }
 /// Content identity fences this scalar cache across publication, rollback and

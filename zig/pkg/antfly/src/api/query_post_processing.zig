@@ -65,6 +65,20 @@ pub fn applyQueryPostProcessing(
     meta: *query_api.QueryResponseMeta,
     runtime_cfg: ManagedReadRuntimeConfig,
 ) !void {
+    try applyHitPostProcessing(alloc, req, result, meta, runtime_cfg);
+    try applyGraphPostProcessing(alloc, req, result, meta, runtime_cfg);
+}
+
+/// Finalize the retrieval page before graph result references consume it.
+/// Graph-scoped evaluation depends on traversal output and runs separately.
+pub fn applyHitPostProcessing(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    result: *db_mod.types.SearchResult,
+    meta: *query_api.QueryResponseMeta,
+    runtime_cfg: ManagedReadRuntimeConfig,
+) !void {
+    if (req.evaluation_graph) return;
     if (req.evaluation_limit > 0) {
         try @import("antfly_local_sources").functions_query_eval.apply(alloc, req, result, meta, runtime_cfg);
         return;
@@ -77,6 +91,18 @@ pub fn applyQueryPostProcessing(
     const pruned_count = pruneSearchHitPrefix(req, result.hits[0..candidate_count]).len;
     const output_limit = if (req.reranker) |reranker| rerankerOutputLimit(req.limit, reranker.top_n) else req.limit;
     try pageSearchHitsAfterScoreTransforms(alloc, result, pruned_count, req.offset, output_limit);
+}
+
+/// Evaluate graph bindings only after their named graph results exist.
+pub fn applyGraphPostProcessing(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    result: *db_mod.types.SearchResult,
+    meta: *query_api.QueryResponseMeta,
+    runtime_cfg: ManagedReadRuntimeConfig,
+) !void {
+    if (req.evaluation_limit > 0 and req.evaluation_graph)
+        try @import("antfly_local_sources").functions_query_eval.apply(alloc, req, result, meta, runtime_cfg);
 }
 
 pub fn applyReranker(

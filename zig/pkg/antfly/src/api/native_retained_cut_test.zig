@@ -945,7 +945,9 @@ test "external lake Cypher execution hides pending privacy records in native poi
         defer a.free(visible);
         defer if (visible[0]) |*row| row.deinit(a);
         try std.testing.expect(visible[0] != null);
-        try std.testing.expectEqualStrings("private source", visible[0].?.json.object.get("body").?.string);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, visible[0].?.json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("private source", parsed.value.object.get("body").?.string);
     }
     // Install only the catalog guard. There is deliberately no published
     // privacy artifact, so every point projection must hide this primary row.

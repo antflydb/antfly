@@ -23,6 +23,8 @@ pub const AdmittedAllocator = struct {
     backing: std.mem.Allocator,
     session: ?sessions.Session = null,
     admission_context: ?*anyopaque = null,
+    /// Session-based callbacks must read this allocator's current session,
+    /// which carries the attempt-local diagnostic sink during growth retries.
     admit: ?*const fn (*anyopaque, usize) anyerror!memory.AdmissionLease = null,
     /// Refund auxiliary ledgers when a successful custom admission cannot be
     /// adopted because reservation metadata allocation fails.
@@ -54,14 +56,8 @@ pub const AdmittedAllocator = struct {
     fn reserve(self: *@This(), amount: usize) !?memory.AdmissionLease {
         if (self.admit) |callback| return try callback(self.admission_context.?, amount);
         const session = self.session orelse return error.ResourceLimitExceeded;
-        // Separate chunk leases still belong to one request. Its own retained
-        // bytes cannot turn an intrinsically oversized request into contention.
-        if (session.run_admission) |admission| {
-            const owned = std.math.add(usize, self.reserved_bytes, self.prepaid_host_bytes) catch return error.ResourceLimitExceeded;
-            const total = std.math.add(usize, owned, amount) catch return error.ResourceLimitExceeded;
-            try admission.validateOwnedHostScratch(total);
-        }
-        return (try session.admitHostPreprocess(amount)).lease;
+        const owned = std.math.add(usize, self.reserved_bytes, self.prepaid_host_bytes) catch return error.ResourceLimitExceeded;
+        return (try session.admitHostPreprocessOwned(amount, owned)).lease;
     }
 
     /// Execution borrows this permit's workspace. On exit, adopt its lease
@@ -113,6 +109,17 @@ pub const AdmittedAllocator = struct {
         const capacity = try std.math.add(usize, self.reserved_bytes, self.prepaid_host_bytes);
         if (needed <= capacity) return;
         const minimum = try std.math.add(usize, needed - capacity, @sizeOf(Reservation));
+        const original_session = self.session;
+        var failure = memory.AdmissionFailure.Capture.init(if (original_session) |session| if (session.run_admission) |admission| admission.failure else null else null);
+        if (original_session) |session| self.session = session.withAdmissionFailure(failure.sink());
+        defer self.session = original_session;
+        return self.reserveGrowth(minimum) catch |err| {
+            failure.publish(err);
+            return err;
+        };
+    }
+
+    fn reserveGrowth(self: *@This(), minimum: usize) !void {
         var amount = @max(minimum, quantum);
         var lease = self.reserve(amount) catch |err| blk: {
             if (amount == minimum or (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable and err != error.MemoryBudgetExceeded)) return err;
@@ -417,4 +424,66 @@ test "admission prepaid workspace grows only its deficit and rolls back failed s
     a.free(payload);
     scope.deinit();
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "admitted allocator admission includes cumulative growth and resident weights" {
+    var controller = memory.AdmissionController{};
+    const limits = memory.Limits{ .host_limit_bytes = 100 * 1024 };
+    var weights = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 90 * 1024 }, false);
+    defer weights.release();
+    const session = sessions.Session{ .ptr = &controller, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = limits, .static_workspace_bytes = 0, .required_residency = weights.amounts, .check_live_memory = false } };
+    var owner = AdmittedAllocator{ .backing = std.testing.allocator, .session = session };
+    defer owner.deinit();
+    const alloc = owner.allocator();
+    const first = try alloc.alloc(u8, 6 * 1024);
+    @memset(first, 17);
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 6 * 1024));
+    try std.testing.expectEqual(error.ResourceLimitExceeded, owner.admission_error.?);
+    try std.testing.expectEqual(@as(u8, 17), first[0]);
+    alloc.free(first);
+    try owner.trim();
+    try std.testing.expectEqualDeep(weights.amounts, controller.snapshot());
+}
+
+test "admission growth discards recovered slack diagnostics and replaces unknown terminal failures" {
+    const Provider = struct {
+        deny: bool = false,
+        next: usize = 1,
+        fn acquire(raw: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.deny) return error.ResourceLimitExceeded;
+            defer self.next += 1;
+            return self.next;
+        }
+        fn retain(_: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {}
+        fn release(_: *anyopaque, _: usize) void {}
+    };
+    var provider = Provider{};
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    try controller.configureResourceBudget(.{ .context = &provider, .try_reserve = Provider.acquire, .retain = Provider.retain, .release = Provider.release });
+    const limits = memory.Limits{ .host_limit_bytes = 100 * 1024 };
+    var weights = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 90 * 1024 }, false);
+    defer weights.release();
+    var failure = memory.AdmissionFailure{};
+    const session = sessions.Session{ .ptr = &controller, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = limits, .static_workspace_bytes = 0, .required_residency = weights.amounts, .failure = &failure, .check_live_memory = false } };
+    var owner = AdmittedAllocator{ .backing = std.testing.allocator, .session = session };
+    defer owner.deinit();
+    const a = owner.allocator();
+    const first = try a.alloc(u8, 512);
+    try std.testing.expect(failure.snapshot() == null);
+    a.free(first);
+    try owner.trim();
+    // A successful retry must not clear another operation's terminal result.
+    const peer = memory.AdmissionAmounts.LimitExceeded{ .limit = .backend, .requested_bytes = 12, .limit_bytes = 10 };
+    failure.record(peer);
+    const second = try a.alloc(u8, 512);
+    defer a.free(second);
+    try std.testing.expectEqualDeep(peer, failure.snapshot().?);
+    provider.deny = true;
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitHostPreprocess(1));
+    try std.testing.expect(failure.snapshot() == null);
+    // The current attempt's real policy constraint replaces unknown details.
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitHostPreprocess(20 * 1024));
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts.LimitExceeded{ .limit = .host, .requested_bytes = 110 * 1024, .limit_bytes = 100 * 1024 }, failure.snapshot().?);
 }

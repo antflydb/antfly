@@ -29,7 +29,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     provider_options.addOption(bool, "shared_storage_core", false);
     provider_options.addOption(bool, "storage_engine_owner", true);
     provider.addOptions("storage_engine_options", provider_options);
-    const archive = @import("../../../build_support/embedded/shared_library.zig").addProviderArchive(b, provider, "lake-execution-abi-provider-probe", 5 * 1024 * 1024 * 1024);
+    const archive = @import("../../../build_support/embedded/shared_library.zig").addProviderArchive(b, provider, "lake-execution-abi-provider-probe", 12 * 1024 * 1024 * 1024);
     const consumer = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/lake_execution_linked_test_root.zig"), .target = target, .optimize = optimize });
     test_imports.configure(b, consumer, true, true);
     const consumer_options = b.addOptions();
@@ -45,7 +45,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     runtime_module.addOptions("lake_execution_options", consumer_options);
     // Match the provider's explicit storage owner options in the source oracle.
     runtime_module.addOptions("storage_engine_options", provider_options);
-    const probe = b.addExecutable(.{ .name = "lake-execution-runtime-probe", .root_module = runtime_module, .max_rss = 5 * 1024 * 1024 * 1024, .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result) });
+    const probe = b.addExecutable(.{ .name = "lake-execution-runtime-probe", .root_module = runtime_module, .max_rss = 12 * 1024 * 1024 * 1024, .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result) });
     probe.root_module.linkLibrary(archive);
     imports.build_info.link(probe.root_module);
     b.step("lake-execution-runtime-probe-build", "Build and install the non-test lake runtime probe").dependOn(&b.addInstallArtifact(probe, .{}).step);

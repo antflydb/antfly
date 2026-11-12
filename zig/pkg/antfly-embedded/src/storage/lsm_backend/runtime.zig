@@ -10757,7 +10757,14 @@ test "lsm remaining wins run handle lookup scales and unwinds allocation failure
     defer warm.release();
     const Fixture = struct {
         fn run(alloc: Allocator, b: *B, r: *Run) !void {
-            var indexes = RunBatchIndexHandles{ .allocator = alloc };
+            // OS-dependent in-place growth changes the allocation count across
+            // fault-injection trials. Exercise every growth allocation through
+            // allocate/copy, as other exhaustive storage fixtures do.
+            var vtable = alloc.vtable.*;
+            vtable.resize = Allocator.noResize;
+            vtable.remap = Allocator.noRemap;
+            const deterministic: Allocator = .{ .ptr = alloc.ptr, .vtable = &vtable };
+            var indexes = RunBatchIndexHandles{ .allocator = deterministic };
             defer indexes.deinit();
             for (0..8) |i| _ = try indexes.state(b, r, i);
             for (0..8) |i| try std.testing.expectEqual(i, (try indexes.state(b, r, i)).run_index);

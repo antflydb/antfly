@@ -154,7 +154,7 @@ fn executePhysical(a: A, io: std.Io, table: local.common_topology_records.TableR
 /// obligation; do not mistake a matching definition signature for available
 /// derived storage. Transient provider errors retain the existing obligation.
 fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, cancellation: Cancellation) !bool {
-    if (ready.namespace == null or ready.reader_protocol != catalog.native_reader_protocol) return false;
+    if (ready.namespace == null or (ready.reader_protocol < catalog.minimum_reader_protocol or ready.reader_protocol > catalog.native_reader_protocol)) return false;
     const directory = ready.directory orelse return false;
     var cloud_binding = try @import("lake_cloud_publication.zig").Binding.init(std.heap.page_allocator, &store.implementation, ready, cancellation);
     defer if (cloud_binding) |*held| held.deinit();
@@ -188,6 +188,10 @@ fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, ca
     // Unsupported declarations remain an explicit repair obligation.
     for (document.declarations) |declaration| {
         if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version != @import("lake_index_native_text.zig").metadata_version) return false;
+        // Old readers interpret recent runs as one all-recipe cohort. Upgrade
+        // vector publications before issuing independently prepared recipe cuts;
+        // compatible text-only generations keep their existing fast recovery.
+        if (ready.reader_protocol < 102 and (declaration.artifact.kind == .vector_segment or declaration.artifact.kind == .sparse_segment)) return false;
     }
     return true;
 }

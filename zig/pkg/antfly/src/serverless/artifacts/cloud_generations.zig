@@ -206,13 +206,29 @@ pub fn sharedNavigation(scope: [32]u8) ?*NavigationOwner {
     if (std.mem.allEqual(u8, &scope, 0)) return null;
     return process_navigation.acquire(scope) catch null;
 }
+pub const ByteCache = struct {
+    cache: *local.serverless_query_lake_serving_cache.Cache,
+    scope: [32]u8,
+    context: local.serverless_query_lake_read_context.Context,
+};
+
 pub const Reader = struct {
+    opening_pages: []const local.metadata_lake_index_catalog.CloudNavigationPage = &.{},
+    opening_root: ?Ref = null,
+    byte_cache: ?ByteCache = null,
     io: ?std.Io = null,
     client: objectstore.Client,
     bucket: []const u8,
     prefix: []const u8,
     root: ?Ref = null,
     complete: bool = false,
+    /// Borrowed from the admitted publication, for an optional opening seed
+    /// only. Both the record and this exact map binding must outlive the reader.
+    opening_hint: ?struct { root: Ref, record: Record } = null,
+    bootstrap: []const local.metadata_lake_index_catalog.ProviderLocator = &.{},
+    publication_locators: []const local.metadata_lake_index_catalog.OpeningBundle = &.{},
+    locator_root: ?Ref = null,
+    trace: ?*local.serverless_query_lake_read_context.IoTrace = null,
     alternatives: []const *Reader = &.{},
     cache_limit: usize = 8 * 1024 * 1024,
     cache_allocator: A = std.heap.page_allocator,
@@ -292,6 +308,74 @@ pub const Reader = struct {
             if (!std.mem.eql(u8, &root_scope.domain, &nested.domain)) return error.InvalidCloudGenerationMap;
         }
     }
+    pub fn bindOpeningPages(self: *Reader, pages: []const local.metadata_lake_index_catalog.CloudNavigationPage, token: Token) !void {
+        const root = self.root orelse return error.InvalidCloudGenerationMap;
+        const domain = (try api.uploadScopeFromArtifactId(root.artifact_id)) orelse return error.InvalidCloudGenerationMap;
+        if (pages.len > 17) return error.InvalidCloudGenerationMap;
+        var remaining: usize = 32 * 1024;
+        for (pages, 0..) |page, i| {
+            try page.ref.validate();
+            const scope_ = (try api.uploadScopeFromArtifactId(page.ref.artifact_id)) orelse return error.InvalidCloudGenerationMap;
+            if (!std.mem.eql(u8, &scope_.domain, &domain.domain) or page.body.len != page.ref.byte_len or page.body.len > remaining) return error.InvalidCloudGenerationMap;
+            for (pages[0..i]) |prior| if (std.mem.eql(u8, prior.ref.artifact_id, page.ref.artifact_id)) return error.InvalidCloudGenerationMap;
+            try api.validatePayloadSha256WithCancellation(page.body, page.ref.checksum, token);
+            remaining -= page.body.len;
+        }
+        self.opening_pages = pages;
+        self.opening_root = root;
+    }
+
+    fn readBytes(self: *Reader, a: A, ref: Ref, token: Token) ![]u8 {
+        if (self.opening_root) |bound| if (self.root) |root| if (sameRef(bound, root)) {
+            for (self.opening_pages) |page| if (sameRef(page.ref, ref)) {
+                try token.check();
+                try api.validatePayloadSha256WithCancellation(page.body, ref.checksum, token);
+                return a.dupe(u8, page.body);
+            };
+        };
+        const Load = struct {
+            reader: *Reader,
+            ref: Ref,
+            token: Token,
+            fn load(raw: *anyopaque, alloc: A) ![]u8 {
+                const args: *@This() = @ptrCast(@alignCast(raw));
+                const path = try key(alloc, args.reader.prefix, args.ref.artifact_id);
+                defer alloc.free(path);
+                var client = args.reader.client;
+                client.allocator = alloc;
+                const started = @import("antfly_platform").time.monotonicNs();
+                defer if (args.reader.trace) |trace| {
+                    trace.add("map_provider_reads", 1);
+                    trace.add("map_provider_nanoseconds", @import("antfly_platform").time.monotonicNs() -| started);
+                };
+                var result = client.getObject(args.reader.bucket, path, .{
+                    .version_id = args.ref.generation,
+                    .skip_metadata_probe = true,
+                    .max_response_bytes = @intCast(args.ref.byte_len),
+                    .cancellation = remote(args.token),
+                }) catch |err| switch (err) {
+                    error.FileNotFound, error.NotFound => return error.CloudGenerationMapUnavailable,
+                    else => return err,
+                };
+                defer result.deinit(alloc);
+                if (result.body.len != args.ref.byte_len) return error.ArtifactIntegrityMismatch;
+                try api.validatePayloadSha256WithCancellation(result.body, args.ref.checksum, args.token);
+                return alloc.dupe(u8, result.body);
+            }
+        };
+        var loader: Load = .{ .reader = self, .ref = ref, .token = token };
+        if (self.byte_cache) |cached| {
+            // Version and credential scope are part of the key. Persisted
+            // bytes still undergo checksum, namespace and node-depth checks.
+            const identity = try std.fmt.allocPrint(a, "cloud-map:{s}:{s}", .{ ref.artifact_id, ref.generation });
+            defer a.free(identity);
+            var lease = try cached.cache.readImmutableBlockLease(a, cached.scope, identity, @intCast(ref.byte_len), try api.sha256DigestFromChecksum(ref.checksum), cached.context, .{ .ptr = &loader, .load = Load.load });
+            defer lease.deinit();
+            try token.check();
+            return a.dupe(u8, lease.bytes());
+        }
+        return Load.load(&loader, a);
+    }
     pub fn read(self: *Reader, a: A, ref: Ref, depth: u8, token: Token) !Node {
         try ref.validate();
         try token.check();
@@ -345,21 +429,12 @@ pub const Reader = struct {
             try api.chargeReadBudget(&self.remaining_bytes, ref.byte_len);
             break;
         }
-        const path = try key(a, self.prefix, ref.artifact_id);
-        defer a.free(path);
-        var client = self.client;
-        client.allocator = a;
-        var result = client.getObject(self.bucket, path, .{ .version_id = ref.generation, .skip_metadata_probe = true, .max_response_bytes = @intCast(ref.byte_len), .cancellation = remote(token) }) catch |err| switch (err) {
-            error.FileNotFound, error.NotFound => return error.CloudGenerationMapUnavailable,
-            else => return err,
-        };
-        defer result.deinit(a);
-        if (result.body.len != ref.byte_len) return error.ArtifactIntegrityMismatch;
-        try api.validatePayloadSha256WithCancellation(result.body, ref.checksum, token);
-        const node = try std.json.parseFromSliceLeaky(Node, a, result.body, .{ .allocate = .alloc_always });
+        const bytes = try self.readBytes(a, ref, token);
+        defer a.free(bytes);
+        const node = try std.json.parseFromSliceLeaky(Node, a, bytes, .{ .allocate = .alloc_always });
         try node.validate(depth);
         try self.validateDomain(node, ref);
-        if (result.body.len > self.cacheLimit()) return node;
+        if (bytes.len > self.cacheLimit()) return node;
         // Distinct cold leaves can use the shared I/O scheduler concurrently.
         // Cache bookkeeping stays serialized; no network request holds its lock.
         lock(&self.navigation().mu);
@@ -371,7 +446,7 @@ pub const Reader = struct {
         const ca = self.cacheAllocator();
         // Make room before optional decoding, including shared-parent pressure.
         // Otherwise a full byte budget would prevent reaching LRU eviction.
-        const staging = @min(self.cacheLimit(), result.body.len * 4 + 16 * 1024);
+        const staging = @min(self.cacheLimit(), bytes.len * 4 + 16 * 1024);
         while ((local.sql_memory_budget.headroom(ca) orelse std.math.maxInt(usize)) < staging) {
             if (!self.evictOne()) {
                 const owner = self.shared orelse break;
@@ -379,7 +454,7 @@ pub const Reader = struct {
                 if (!pool.reclaimIdle(owner)) break;
             }
         }
-        const owned = ca.dupe(u8, result.body) catch return node;
+        const owned = ca.dupe(u8, bytes) catch return node;
         const owned_ref = cloneRef(ca, ref) catch {
             ca.free(owned);
             return node;
@@ -452,7 +527,59 @@ pub const Reader = struct {
         };
         return null;
     }
+    pub fn bindOpeningHint(self: *Reader, record: Record) !void {
+        try record.validate();
+        const root = self.root orelse return error.InvalidCloudGenerationMap;
+        try root.validate();
+        const map_scope = (try api.uploadScopeFromArtifactId(root.artifact_id)) orelse return error.InvalidCloudGenerationMap;
+        const payload_scope = (try api.uploadScopeFromArtifactId(record.id)) orelse return error.InvalidCloudGenerationMap;
+        if (!std.mem.eql(u8, &map_scope.domain, &payload_scope.domain)) return error.InvalidCloudGenerationMap;
+        self.opening_hint = .{ .root = root, .record = record };
+    }
+    /// The admitted publication authenticates these optional direct locators.
+    /// Keep the exact root binding and namespace; hints grant no authority to
+    /// unrelated IDs or a later incarnation/generation.
+    pub fn bindPublicationLocators(self: *Reader, bundles: []const local.metadata_lake_index_catalog.OpeningBundle) !void {
+        const root = self.root orelse return;
+        const domain = (try api.uploadScopeFromArtifactId(root.artifact_id)) orelse return error.InvalidCloudGenerationMap;
+        var total: usize = 0;
+        var seen: [128][]const u8 = undefined;
+        for (bundles) |bundle| for (bundle.provider_locators) |value| {
+            total += 1;
+            if (total > 128) return error.InvalidCloudGenerationMap;
+            for (seen[0 .. total - 1]) |prior| if (std.mem.eql(u8, prior, value.id)) return error.InvalidCloudGenerationMap;
+            seen[total - 1] = value.id;
+            try (Record{ .id = value.id, .bytes = value.bytes, .generation = value.generation, .retention_until_ms = value.retention_until_ms }).validate();
+            for (self.bootstrap) |bootstrap| if (std.mem.eql(u8, bootstrap.id, value.id)) {
+                if (bootstrap.bytes != value.bytes or !std.mem.eql(u8, bootstrap.generation, value.generation) or bootstrap.retention_until_ms != value.retention_until_ms) return error.InvalidCloudGenerationMap;
+            };
+            const scoped = (try api.uploadScopeFromArtifactId(value.id)) orelse return error.InvalidCloudGenerationMap;
+            if (!std.mem.eql(u8, &domain.domain, &scoped.domain)) return error.InvalidCloudGenerationMap;
+        };
+        self.publication_locators = bundles;
+        self.locator_root = root;
+    }
     pub fn lookup(self: *Reader, a: A, id: []const u8, token: Token) !?Record {
+        try token.check();
+        const started = @import("antfly_platform").time.monotonicNs();
+        defer if (self.trace) |trace| trace.add("map_lookup_nanoseconds", @import("antfly_platform").time.monotonicNs() -| started);
+        if (self.locator_root) |bound| if (self.root) |root| {
+            if (bound.byte_len == root.byte_len and bound.retention_until_ms == root.retention_until_ms and std.mem.eql(u8, bound.artifact_id, root.artifact_id) and std.mem.eql(u8, bound.checksum, root.checksum) and std.mem.eql(u8, bound.generation, root.generation)) {
+                for (self.bootstrap) |value| if (std.mem.eql(u8, value.id, id)) {
+                    if (self.trace) |trace| trace.add("map_locator_hits", 1);
+                    return try (Record{ .id = value.id, .bytes = value.bytes, .generation = value.generation, .retention_until_ms = value.retention_until_ms }).clone(a);
+                };
+                for (self.publication_locators) |bundle| for (bundle.provider_locators) |value| if (std.mem.eql(u8, value.id, id)) {
+                    if (self.trace) |trace| trace.add("map_locator_hits", 1);
+                    return try (Record{ .id = value.id, .bytes = value.bytes, .generation = value.generation, .retention_until_ms = value.retention_until_ms }).clone(a);
+                };
+            }
+        };
+        if (self.opening_hint) |hint| if (self.root) |root| {
+            if (root.byte_len == hint.root.byte_len and root.retention_until_ms == hint.root.retention_until_ms and
+                std.mem.eql(u8, root.artifact_id, hint.root.artifact_id) and std.mem.eql(u8, root.checksum, hint.root.checksum) and
+                std.mem.eql(u8, root.generation, hint.root.generation) and std.mem.eql(u8, id, hint.record.id)) return try hint.record.clone(a);
+        };
         return self.lookupAt(a, id, self.root, token);
     }
     fn lookupAt(self: *Reader, a: A, id: []const u8, root: ?Ref, token: Token) anyerror!?Record {
@@ -1424,4 +1551,198 @@ test "external lake metadata navigation pool reclaims idle scopes before owner a
     try std.testing.expectEqual(@as(usize, 2), next.refs.load(.acquire));
     next.release();
     (try pool.acquire(@splat(3))).release();
+}
+
+test "external lake read ahead opening hints skip map I/O and fence map identity cancellation and unrelated records" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    const Probe = struct {
+        calls: usize = 0,
+        fn get(raw: *anyopaque, _: A, _: []const u8, _: []const u8, _: objectstore.GetOptions) !objectstore.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.TestMapRead;
+        }
+    };
+    var probe: Probe = .{};
+    var vtable = memory.client().vtable.*;
+    vtable.get_object = Probe.get;
+    const client: objectstore.Client = .{ .allocator = a, .ptr = &probe, .vtable = &vtable };
+    const checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const scope = try api.UploadScope.forPublication(@splat(46), 1, std.testing.io);
+    const root_id = try scope.artifactId(checksum);
+    const object_id = try scope.artifactId("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    const id = &object_id;
+    const root: Ref = .{ .artifact_id = &root_id, .checksum = checksum, .byte_len = 1, .generation = "map-v1" };
+    var reader: Reader = .{ .client = client, .bucket = "bucket", .prefix = "maps", .root = root };
+    defer reader.deinit();
+    try reader.bindOpeningHint(.{ .id = id, .bytes = 42, .generation = "object-v7" });
+    var selected = (try reader.lookup(a, id, .none)).?;
+    defer selected.deinit(a);
+    try std.testing.expectEqualStrings("object-v7", selected.generation);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    const unrelated = try scope.artifactId("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    try std.testing.expectError(error.TestMapRead, reader.lookup(a, &unrelated, .none));
+    reader.root.?.generation = "map-v2";
+    try std.testing.expectError(error.TestMapRead, reader.lookup(a, id, .none));
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    reader.root = null;
+    try std.testing.expect((try reader.lookup(a, id, .none)) == null);
+    reader.root = root;
+    const Stop = struct {
+        fn canceled(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    var stop: u8 = 0;
+    try std.testing.expectError(error.Canceled, reader.lookup(a, id, .{ .ptr = &stop, .is_cancelled_fn = Stop.canceled }));
+    try std.testing.expectError(error.InvalidCloudGenerationMap, reader.bindOpeningHint(.{ .id = id, .bytes = 42, .generation = "" }));
+    const foreign_scope = try api.UploadScope.forPublication(@splat(47), 1, std.testing.io);
+    const foreign_id = try foreign_scope.artifactId(checksum);
+    try std.testing.expectError(error.InvalidCloudGenerationMap, reader.bindOpeningHint(.{ .id = &foreign_id, .bytes = 42, .generation = "foreign-v1" }));
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    reader.opening_hint = null;
+    const bundle: local.metadata_lake_index_catalog.OpeningBundle = .{
+        .artifact = .{ .kind = .doc_values, .metadata_version = 1, .artifact_id = &root_id, .checksum = checksum, .byte_len = 1 },
+        .decoded_bytes = 5,
+        .provider_locators = &.{.{ .id = id, .bytes = 42, .generation = "published-v8" }},
+    };
+    try reader.bindPublicationLocators(&.{bundle});
+    var trace: local.serverless_query_lake_read_context.IoTrace = .{};
+    reader.trace = &trace;
+    var direct = (try reader.lookup(a, id, .none)).?;
+    defer direct.deinit(a);
+    try std.testing.expectEqualStrings("published-v8", direct.generation);
+    try std.testing.expectEqual(@as(u64, 1), trace.snapshot().map_locator_hits);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expectError(error.Canceled, reader.lookup(a, id, .{ .ptr = &stop, .is_cancelled_fn = Stop.canceled }));
+    try std.testing.expectError(error.TestMapRead, reader.lookup(a, &unrelated, .none));
+    reader.root.?.generation = "changed-root";
+    try std.testing.expectError(error.TestMapRead, reader.lookup(a, id, .none));
+    reader.root = root;
+    var foreign = bundle;
+    foreign.provider_locators = &.{.{ .id = &foreign_id, .bytes = 42, .generation = "foreign" }};
+    try std.testing.expectError(error.InvalidCloudGenerationMap, reader.bindPublicationLocators(&.{foreign}));
+    try std.testing.expectError(error.InvalidCloudGenerationMap, reader.bindPublicationLocators(&.{ bundle, bundle }));
+}
+
+test "external lake metadata navigation verified bytes survive reader recreation and isolate credential scopes" {
+    const a = std.testing.allocator;
+    const Provider = @import("cloud_generations_test_provider.zig").Provider;
+    var provider = Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    const scope: api.UploadScope = .{ .domain = @splat(54), .attempt = @splat(2) };
+    var writer: Writer = .{ .a = a, .reader = .{ .client = client, .bucket = "bucket", .prefix = "native" }, .scope = scope };
+    defer writer.deinit();
+    const id = try scope.artifactId("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    try writer.capture(&id, 42, "v1", .none);
+    const root = (try writer.finish(.none)).?;
+    defer freeRef(a, root);
+    var cache = local.serverless_query_lake_serving_cache.Cache.initWithMemoryLimit(a, 1024 * 1024);
+    defer cache.deinit();
+    var reads: usize = 0;
+    for (0..3) |pass| {
+        var reader: Reader = .{ .client = client, .bucket = "bucket", .prefix = "native", .root = root, .byte_cache = .{ .cache = &cache, .scope = @splat(if (pass == 2) 2 else 1), .context = .{ .io = std.testing.io } } };
+        defer reader.deinit();
+        var found = (try reader.lookup(a, &id, .none)).?;
+        defer found.deinit(a);
+        try std.testing.expectEqualStrings("v1", found.generation);
+        if (pass == 0) reads = provider.gets;
+        if (pass == 1) try std.testing.expectEqual(reads, provider.gets);
+        if (pass == 2) try std.testing.expect(provider.gets > reads);
+    }
+}
+
+fn sameRef(left: Ref, right: Ref) bool {
+    return left.byte_len == right.byte_len and left.retention_until_ms == right.retention_until_ms and
+        std.mem.eql(u8, left.artifact_id, right.artifact_id) and std.mem.eql(u8, left.checksum, right.checksum) and std.mem.eql(u8, left.generation, right.generation);
+}
+pub fn freeOpeningPages(a: A, pages: []const local.metadata_lake_index_catalog.CloudNavigationPage) void {
+    for (pages) |page| {
+        freeRef(a, page.ref);
+        a.free(page.body);
+    }
+    if (pages.len != 0) a.free(pages);
+}
+/// A bounded copy of the authenticated map spine, carried in the publication.
+/// No extra object is created, so the map never depends on its own seed pack.
+pub fn collectOpeningPages(reader: *Reader, a: A, token: Token) ![]const local.metadata_lake_index_catalog.CloudNavigationPage {
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    var output: std.ArrayList(local.metadata_lake_index_catalog.CloudNavigationPage) = .empty;
+    defer output.deinit(a);
+    errdefer for (output.items) |page| {
+        freeRef(a, page.ref);
+        a.free(page.body);
+    };
+    var queue: [17]struct { ref: Ref, depth: u8 } = undefined;
+    queue[0] = .{ .ref = reader.root orelse return &.{}, .depth = 0 };
+    var count: usize = 1;
+    var position: usize = 0;
+    var remaining: usize = 32 * 1024;
+    while (position < count) : (position += 1) {
+        const entry = queue[position];
+        if (entry.ref.byte_len > remaining) continue;
+        const bytes = try reader.readBytes(sa, entry.ref, token);
+        const node = try std.json.parseFromSliceLeaky(Node, sa, bytes, .{ .allocate = .alloc_always });
+        try node.validate(entry.depth);
+        try reader.validateDomain(node, entry.ref);
+        const owned_ref = try cloneRef(a, entry.ref);
+        errdefer freeRef(a, owned_ref);
+        const body = try a.dupe(u8, bytes);
+        errdefer a.free(body);
+        try output.append(a, .{ .ref = owned_ref, .body = body });
+        remaining -= bytes.len;
+        if (entry.depth == 0) for (node.children) |child| {
+            if (count == queue.len) break;
+            queue[count] = .{ .ref = child.ref, .depth = 1 };
+            count += 1;
+        };
+    }
+    return output.toOwnedSlice(a);
+}
+
+test "external lake inline map navigation removes cold dependency reads and fences the exact root" {
+    const a = std.testing.allocator;
+    const Provider = @import("cloud_generations_test_provider.zig").Provider;
+    var provider = Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    const scope: api.UploadScope = .{ .domain = @splat(61), .attempt = @splat(2) };
+    var writer: Writer = .{ .a = a, .reader = .{ .client = client, .bucket = "bucket", .prefix = "native" }, .scope = scope };
+    defer writer.deinit();
+    const id = try scope.artifactId("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    try writer.capture(&id, 42, "payload-v1", .none);
+    const root = (try writer.finish(.none)).?;
+    defer freeRef(a, root);
+    var seed_reader: Reader = .{ .client = client, .bucket = "bucket", .prefix = "native", .root = root };
+    defer seed_reader.deinit();
+    const pages = try collectOpeningPages(&seed_reader, a, .none);
+    defer freeOpeningPages(a, pages);
+    try std.testing.expectEqual(@as(usize, 1), pages.len);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var reader: Reader = .{ .client = client, .bucket = "bucket", .prefix = "native", .root = root };
+    defer reader.deinit();
+    try reader.bindOpeningPages(pages, .none);
+    const reads = provider.gets;
+    var selected = (try reader.lookup(arena.allocator(), &id, .none)).?;
+    defer selected.deinit(arena.allocator());
+    try std.testing.expectEqualStrings("payload-v1", selected.generation);
+    try std.testing.expectEqual(reads, provider.gets);
+    var damaged = [_]local.metadata_lake_index_catalog.CloudNavigationPage{pages[0]};
+    var bytes = try a.dupe(u8, damaged[0].body);
+    defer a.free(bytes);
+    bytes[0] ^= 1;
+    damaged[0].body = bytes;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, reader.bindOpeningPages(&damaged, .none));
+    const original = reader.root;
+    reader.root.?.generation = "different-root";
+    defer reader.root = original;
+    try std.testing.expectError(error.CloudGenerationMapUnavailable, reader.lookup(arena.allocator(), &id, .none));
 }

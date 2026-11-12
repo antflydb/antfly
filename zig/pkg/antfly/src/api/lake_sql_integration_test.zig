@@ -207,6 +207,14 @@ fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_ses
         fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
         fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (call == .lake_source_owner_read) {
+                try context.ensureActive();
+                const view = @import("../metadata/lake_source_owner_view.zig");
+                var scratch = std.heap.ArenaAllocator.init(alloc);
+                defer scratch.deinit();
+                const owner = try view.fromLifecycle(scratch.allocator(), self.lifecycle_rows.get(call.lake_source_owner_read) orelse "{}");
+                return view.encode(alloc, owner);
+            }
             return Fixture.catalog(&self.fixture, alloc, context, call);
         }
         fn replace(raw: *anyopaque, expected: table_manager.TableRecord, replacement: table_manager.TableRecord) !void {

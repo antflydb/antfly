@@ -28,6 +28,8 @@ const values = [_]anyerror{
     error.ArtifactStoreReadOnly,
     error.ArtifactVersionDeletionPaused,
     error.BestFirstBudgetExceeded,
+    error.BulkSpoolKeyTooLong,
+    error.BulkSpoolTrainingBudget,
     error.CacheEntryCorrupt,
     error.CacheEntryTooLarge,
     error.CannotDeleteHead,
@@ -36,9 +38,11 @@ const values = [_]anyerror{
     error.CloudGenerationStoreUnavailable,
     error.CommittedGraphMetricMaterializationRejected,
     error.CommittedRepairRequired,
+    error.ConcurrencyUnavailable,
     error.ConditionalCheckFailed,
     error.ConditionalIdempotentAppendUnsupported,
     error.ConditionalManifestDeletionUnsupported,
+    error.CorruptBulkSpool,
     error.DocumentBodyNotFound,
     error.DocumentFactsNotFound,
     error.DocumentFactsPolicyChanged,
@@ -104,6 +108,9 @@ const values = [_]anyerror{
     error.InvalidArtifactStoreOptions,
     error.InvalidArtifactUploadInventory,
     error.InvalidArtifactUploadScope,
+    error.InvalidBulkBuildConfig,
+    error.InvalidBulkSpoolCount,
+    error.InvalidBulkSpoolVector,
     error.InvalidCacheBatch,
     error.InvalidCacheReservation,
     error.InvalidCloudRetentionCertificate,
@@ -264,6 +271,7 @@ const values = [_]anyerror{
     error.PatternWitnessFound,
     error.PredicateRangeFound,
     error.PredicateRangeUnknown,
+    error.ProcessFdQuotaExceeded,
     error.ProviderGenerationUnavailable,
     error.PublicationFenceRequired,
     error.PublishedHeadManifestMissing,
@@ -272,6 +280,7 @@ const values = [_]anyerror{
     error.QueryCacheBudgetCannotBeEnforced,
     error.RelationalStorageUnavailable,
     error.RemoteMediaFetchFailed,
+    error.ResourceTemporarilyUnavailable,
     error.RetainedCutCollectionBound,
     error.SchemaVersionExhausted,
     error.ServingPackAdmissionDeclined,
@@ -281,6 +290,8 @@ const values = [_]anyerror{
     error.SparseSegmentNotFound,
     error.SparseSegmentTooLarge,
     error.StaleEnrichmentWithoutPublishedHead,
+    error.SystemFdQuotaExceeded,
+    error.SystemResources,
     error.TextSegmentNotFound,
     error.TextSegmentTooLarge,
     error.TransformSourceBudgetExceeded,
@@ -315,7 +326,12 @@ const values = [_]anyerror{
 };
 const names = blk: {
     var result: [values.len][]const u8 = undefined;
-    for (values, 0..) |value, i| result[i] = @errorName(value);
+    @setEvalBranchQuota(100_000);
+    for (values, 0..) |value, i| {
+        result[i] = @errorName(value);
+        if (i != 0 and std.mem.order(u8, result[i - 1], result[i]) != .lt)
+            @compileError("lake execution errors must be unique and sorted");
+    }
     break :blk result;
 };
 pub fn fromName(name: []const u8) anyerror {

@@ -43,6 +43,7 @@ func TestExtractionQualificationDoesNotEquateServingWithOCRCoverage(t *testing.T
 			os.WriteFile(filepath.Join(state, "published.ndjson"), raw, 0600)
 			digest := fmt.Sprintf("%x", sha256.Sum256(raw))
 			atomicCorpusJSON(filepath.Join(state, "publication.json"), map[string]any{"sha256": digest, "records": 1})
+			atomicCorpusJSON(filepath.Join(state, "sources.json"), corpusConfig{Profile: "pdf"})
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
 				case strings.Contains(r.URL.Path, "/indexes/"):

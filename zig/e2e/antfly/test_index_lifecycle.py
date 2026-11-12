@@ -3255,20 +3255,27 @@ def test_leann_index_returns_exact_nearest_first(stateful_api):
         return base + [i * 0.05]
 
     docs = {
-        f"doc:{i:04d}": {"body": f"leann {i}", "_embeddings": {index_name: _pack_f32_le(vector(i))}}
+        f"doc:{i:04d}": {
+            "body": f"leann {i}",
+            "_embeddings": {index_name: _pack_f32_le(vector(i))},
+        }
         for i in range(count)
     }
     stateful_api.batch_write(table, inserts=docs, sync_level="full_index")
 
     def ready():
-        status = ready_index_status(stateful_api.get_index(table, index_name), until="complete")
+        status = ready_index_status(
+            stateful_api.get_index(table, index_name), until="complete"
+        )
         if status is None:
             return None
         if status.get("total_indexed", status.get("doc_count")) != count:
             return None
         return status
 
-    assert wait_until(ready, timeout_s=60, interval_s=0.1), stateful_api.get_index(table, index_name)
+    assert wait_until(ready, timeout_s=60, interval_s=0.1), stateful_api.get_index(
+        table, index_name
+    )
 
     for i in (7, 123, 299):
         result = stateful_api.query_table(

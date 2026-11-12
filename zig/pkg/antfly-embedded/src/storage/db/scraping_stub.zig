@@ -62,3 +62,7 @@ pub fn downloadContentOutcomeAllocWithHeaders(
     _ = content_type_hint;
     return error.UnsupportedPlatform;
 }
+
+pub fn authorizeLocalSource(_: std.mem.Allocator, _: std.Io, _: []const u8, _: ?*const RemoteContentConfig) !void {
+    return error.UnsupportedPlatform;
+}

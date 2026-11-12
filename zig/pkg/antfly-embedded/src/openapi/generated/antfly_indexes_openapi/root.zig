@@ -191,6 +191,7 @@ pub const IndexSourceReadinessReason = types.IndexSourceReadinessReason;
 pub const IndexSourceReadinessStatus = types.IndexSourceReadinessStatus;
 pub const IndexStats = types.IndexStats;
 pub const IndexType = types.IndexType;
+pub const LakeBulkBuildAlgorithm = types.LakeBulkBuildAlgorithm;
 pub const LeannIndexConfig = types.LeannIndexConfig;
 pub const LegacyGraphDocumentQuery = types.LegacyGraphDocumentQuery;
 pub const LegacyGraphNodeSelector = types.LegacyGraphNodeSelector;

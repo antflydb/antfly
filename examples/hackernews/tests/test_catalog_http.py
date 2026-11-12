@@ -68,6 +68,10 @@ class RestAuthority(BaseHTTPRequestHandler):
     # when native queries, enrichment, and publication run concurrently.
     _state_lock = threading.RLock()
 
+    # Match provider keep-alive to avoid a new TCP connection for every read.
+    protocol_version = "HTTP/1.1"
+    disable_nagle_algorithm = True
+
     def log_message(self, *args):
         pass
 
@@ -77,7 +81,8 @@ class RestAuthority(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)
+        if self.command != "HEAD":
+            self.wfile.write(payload)
 
     def result(self):
         return {
@@ -127,6 +132,8 @@ class RestAuthority(BaseHTTPRequestHandler):
 
     @atomic_authority_operation
     def do_PUT(self):
+        # Drain the body even when the precondition fails and the socket is reused.
+        data = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         if urlsplit(self.path).path.rstrip("/") == "/archive":
             self.send_response(200)
             self.send_header("Content-Length", "0")
@@ -138,7 +145,6 @@ class RestAuthority(BaseHTTPRequestHandler):
             and path.name.startswith("antfly-")
             and path.suffix == ".parquet"
         ):
-            self.rfile.read(int(self.headers["Content-Length"]))
             return self.respond(503, {})
         if self.headers.get("If-None-Match") == "*" and path.exists():
             return self.respond(412, {})
@@ -151,7 +157,6 @@ class RestAuthority(BaseHTTPRequestHandler):
             if actual != expected:
                 return self.respond(412, {})
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = self.rfile.read(int(self.headers["Content-Length"]))
         path.write_bytes(data)
         self.send_response(200)
         self.send_header("Content-Length", "0")
@@ -444,7 +449,7 @@ def test_external_maintenance_controller_protocol_and_restart(tmp_path, provider
 @pytest.mark.parametrize("mode", ["managed", "rest"])
 @pytest.mark.parametrize("native_rows", [False, True, "delete_first", "overlay"])
 def test_native_catalog_file_commit_read_and_restart(
-    tmp_path, mode, native_rows, maintenance_provider=None
+    tmp_path, mode, native_rows, maintenance_provider=None, restart_mode="graceful"
 ):
     binary = os.environ.get("ANTFLY_NATIVE_BINARY")
     if not binary:
@@ -608,7 +613,10 @@ def test_native_catalog_file_commit_read_and_restart(
         pytest.fail("daemon did not start")
 
     def stop():
-        process.terminate()
+        if restart_mode == "crash":
+            process.kill()
+        else:
+            process.terminate()
         try:
             process.wait(20)
         except subprocess.TimeoutExpired:
@@ -1122,8 +1130,40 @@ def test_native_catalog_file_commit_read_and_restart(
                     "fields": ["amount"],
                     "limit": 10,
                 }
+                vector_qualification = []
                 for vector_request in (dense_request, sparse_request):
+                    first_started = time.monotonic()
                     vector_result = call("POST", "/tables/hn/query", vector_request)
+                    first_seconds = time.monotonic() - first_started
+                    warm_started = time.monotonic()
+                    warm_result = call("POST", "/tables/hn/query", vector_request)
+                    warm_seconds = time.monotonic() - warm_started
+                    warm_hits = warm_result.get("responses", [warm_result])[0]["hits"][
+                        "hits"
+                    ]
+                    assert sorted(hit["_source"]["amount"] for hit in warm_hits) == [
+                        1,
+                        3,
+                        4,
+                    ], warm_result
+                    vector_qualification.append(
+                        {
+                            "index": vector_request["indexes"][0],
+                            "first_vector_query_after_restart_seconds": first_seconds,
+                            "repeat_query_seconds": warm_seconds,
+                        }
+                    )
+                    (tmp_path / "vector-recovery-qualification.json").write_text(
+                        json.dumps(
+                            {
+                                "restart_mode": restart_mode,
+                                "fixture": "local managed HN accepted overlay; functional qualification",
+                                "requests": vector_qualification,
+                            },
+                            indent=2,
+                        )
+                        + "\n"
+                    )
                     vector_hits = vector_result.get("responses", [vector_result])[0][
                         "hits"
                     ]["hits"]
@@ -1684,16 +1724,28 @@ def test_native_catalog_file_commit_read_and_restart(
                 stop()
                 start()
                 deadline = time.monotonic() + 180
+                scheduler_samples = []
                 while True:
                     scheduled = call("POST", maintenance, {"action": "status"})
                     progress = scheduled.get("state")
+                    sample = json.dumps(progress, sort_keys=True)
+                    if not scheduler_samples or scheduler_samples[-1][1] != sample:
+                        scheduler_samples.append(
+                            (round(deadline - time.monotonic(), 2), sample)
+                        )
+                        scheduler_samples = scheduler_samples[-32:]
                     if progress and progress.get("last_result"):
                         assert not progress.get("last_error"), scheduled
-                        if json.loads(progress["last_result"])["complete"]:
+                        result = json.loads(progress["last_result"])
+                        if (result.get("collection") or {}).get("phase") == "waiting":
+                            assert progress["next_ms"] > 0, scheduled
+                        if result["complete"]:
                             break
-                    assert time.monotonic() < deadline, (
-                        tmp_path / "server.log"
-                    ).read_text()[-5000:]
+                    assert time.monotonic() < deadline, {
+                        "scheduled": scheduled,
+                        "samples": scheduler_samples,
+                        "server_log": (tmp_path / "server.log").read_text()[-5000:],
+                    }
                     time.sleep(0.2)
                 stop()
                 start()

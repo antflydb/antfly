@@ -488,6 +488,24 @@ pub fn detectFormatFromFilename(file_name: []const u8) ?EncodedFormat {
     return null;
 }
 
+/// Canonical transport MIME selected from the same header contract as decoding.
+/// This does not decode samples or allocate recording-sized buffers.
+pub fn mimeForBytes(bytes: []const u8) ![]const u8 {
+    return switch (detectFormat(bytes) orelse return error.UnsupportedAudioFormat) {
+        .wav => "audio/wav",
+        .mp3 => "audio/mpeg",
+        .aac => "audio/aac",
+        .mp4 => "audio/mp4",
+        .ogg => "audio/ogg",
+        .opus => "audio/opus",
+        .flac => "audio/flac",
+        .aiff => "audio/aiff",
+        .caf => "audio/x-caf",
+        .au => "audio/basic",
+        .webm => "audio/webm",
+    };
+}
+
 pub fn canDecodeMime(mime: []const u8) bool {
     const format = detectFormatFromMime(mime) orelse return false;
     return canDecodeFormat(format);
