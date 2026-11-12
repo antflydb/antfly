@@ -206,6 +206,9 @@ fn readLimited(a: A, snapshot: Snapshot, input: Request, context: operation.Requ
     return result;
 }
 fn readBudgeted(a: A, snapshot: Snapshot, input: Request, context: operation.RequestContext, reader: anytype) !Result {
+    return readBudgetedWithKey(a, snapshot, input, context, reader, codec.key);
+}
+fn readBudgetedWithKey(a: A, snapshot: Snapshot, input: Request, context: operation.RequestContext, reader: anytype, comptime rowKey: fn (series.Bucket) dataset.RowKey) !Result {
     const range: dataset.Range = .{ .start_ns = input.start_ns, .end_ns = input.end_ns };
     try range.validate();
     if (input.max_rows == 0 or input.max_rows > max_input_rows) return error.DatasetPageBudgetExceeded;
@@ -268,7 +271,7 @@ fn readBudgeted(a: A, snapshot: Snapshot, input: Request, context: operation.Req
         for (part.rows) |row| {
             if (row.start_ns < start or row.start_ns >= end or @mod(row.start_ns, width) != offset or
                 row.rows <= 0 or row.dimensions.len > 4096 or row.metrics.len != summary.measures.len) return error.RetainedSeriesCorrupt;
-            const key = codec.key(row);
+            const key = rowKey(row);
             if (input.after) |after| if (std.mem.order(u8, &key, &after) != .gt) continue;
             if (input.dimensions_json) |dimensions| if (!std.mem.eql(u8, dimensions, row.dimensions)) continue;
             if (previous) |last| if (std.mem.order(u8, &last, &key) != .lt) return error.RetainedSeriesCorrupt;
@@ -299,21 +302,32 @@ fn readBudgeted(a: A, snapshot: Snapshot, input: Request, context: operation.Req
         if (cost > max_result_bytes - row_bytes) return error.DatasetPageBudgetExceeded;
         row_bytes += cost;
     }
-    std.mem.sort(series.Bucket, rows.items, {}, struct {
-        fn before(_: void, left: series.Bucket, right: series.Bucket) bool {
-            return std.mem.order(u8, &codec.key(left), &codec.key(right)) == .lt;
+    // Reuse the keys already computed during reduction. Comparing buckets here
+    // would hash up to 4 KiB of dimensions on every sort comparison.
+    const Ordered = struct { key: dataset.RowKey, index: usize };
+    var ordered = try scratch.alloc(Ordered, positions.count());
+    var entries = positions.iterator();
+    for (ordered) |*item| {
+        const entry = entries.next().?;
+        item.* = .{ .key = entry.key_ptr.*, .index = entry.value_ptr.* };
+    }
+    std.mem.sort(Ordered, ordered, {}, struct {
+        fn before(_: void, left: Ordered, right: Ordered) bool {
+            return std.mem.order(u8, &left.key, &right.key) == .lt;
         }
     }.before);
     if (input.page) if (safe_through) |fence| {
-        while (rows.items.len > 0 and std.mem.order(u8, &codec.key(rows.items[rows.items.len - 1]), &fence) == .gt) rows.items.len -= 1;
+        while (ordered.len > 0 and std.mem.order(u8, &ordered[ordered.len - 1].key, &fence) == .gt) ordered.len -= 1;
     };
-    var next_key: ?dataset.RowKey = if (input.page and rows.items.len == 0) safe_through else null;
-    if (input.page and rows.items.len != 0 and (rows.items.len > input.max_rows or more)) {
-        rows.items.len = @min(rows.items.len, input.max_rows);
-        next_key = codec.key(rows.items[rows.items.len - 1]);
+    var next_key: ?dataset.RowKey = if (input.page and ordered.len == 0) safe_through else null;
+    if (input.page and ordered.len != 0 and (ordered.len > input.max_rows or more)) {
+        ordered.len = @min(ordered.len, input.max_rows);
+        next_key = ordered[ordered.len - 1].key;
     }
+    const output = try scratch.alloc(series.Bucket, ordered.len);
+    for (output, ordered) |*row, item| row.* = rows.items[item.index];
     try context.ensureActive();
-    return .{ .arena = arena, .rows = rows.items, .history = summary.initial_history, .input_rows = visited_rows, .next = next_key };
+    return .{ .arena = arena, .rows = output, .history = summary.initial_history, .input_rows = visited_rows, .next = next_key };
 }
 
 /// Capture authority after the caller has authorized the qualified dataset.
@@ -922,4 +936,59 @@ test "retained owner native controls public JSON projection and reply copies sha
     try std.testing.expect(memory.denied);
     var canceled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Canceled, formatJsonResult(a, &memory, summary, result, .{ .cancellation = .fromAtomic(&canceled) }));
+}
+
+test "retained owner native controls wide dimension fanin hashes each input once including ordering and pagination" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const lineage = try local.system_catalog_retained_datasets.Source.fromTable(temp, .{ .table_id = 7, .name = "raw", .schema_json = "" }, "11111111111111111111111111111111".*);
+    var schema: dataset.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash("{}", &schema, .{});
+    const definition: dataset.Definition = .{ .id = @splat(1), .generation = 1, .kind = .summary, .schema = schema, .schema_json = "{}", .authorization = @splat(2), .retention_ns = 1000, .local_residence_ns = 100, .summary = .{ .source = lineage.identity(), .timestamp = "ts", .interval_ns = 10, .mutable_for_ns = 100, .measures = &.{.{ .name = "sum_v", .law = .sum, .field = "v" }} } };
+    const descriptor: local.system_catalog_retained_datasets.Descriptor = .{ .definition = definition, .source = lineage, .phase = .active, .catalog_location = @splat(3), .catalog_storage_identity = @splat(4) };
+    const json = try std.json.Stringify.valueAlloc(temp, descriptor, .{});
+    var membership: topology.RangeMembershipAccumulator = .{};
+    for (1..97) |group| try membership.add(group);
+    var plan: owner_model.Plan = .{ .id = @splat(0), .resource = 8, .dataset = definition.id, .generation = 1, .definition = try definition.fingerprint(temp), .source = lineage.identity(), .source_table = 7, .topology_generation = 1, .membership = membership.finish(7).digest, .phase = .active, .registration_after = 96, .registration_complete = true, .registered = 96, .registration_membership = membership, .ready = 96 };
+    plan.id = plan.identity();
+    const owners = try temp.alloc(owner_model.Owner, 96);
+    for (owners, 1..) |*owner, group| owner.* = .{ .plan = plan.id, .group = group, .partition = @splat(5), .incarnation = 1, .mode = .ready, .native_receipt = @splat(6) };
+    const snapshot: Snapshot = .{ .resource = .{ .id = 8, .kind = .dataset, .name = "stats", .source_json = json, .retained = descriptor.identity() }, .plan = plan, .owners = owners };
+    const Reader = struct {
+        rows: [48]series.Bucket,
+        pub fn readPartition(self: *@This(), alloc: A, owner: owner_model.Owner, _: Authority, _: dataset.Range, _: operation.RequestContext) !@import("../serverless/datasets/summary_read.zig").Result {
+            const index = (owner.group - 1) % self.rows.len;
+            return .{ .arena = std.heap.ArenaAllocator.init(alloc), .rows = self.rows[index..][0..1] };
+        }
+    };
+    var metrics = [_]series.Metric{.{ .count = 1, .sum = 1 }};
+    var reader: Reader = .{ .rows = undefined };
+    for (&reader.rows, 0..) |*row, index| {
+        const dimensions = try temp.alloc(u8, 4096);
+        @memset(dimensions, 'a');
+        dimensions[0] = '[';
+        dimensions[1] = '"';
+        dimensions[2] = "0123456789abcdef"[index % 16];
+        dimensions[3] = "0123456789abcdef"[index / 16];
+        dimensions[4094] = '"';
+        dimensions[4095] = ']';
+        row.* = .{ .start_ns = 0, .dimensions = dimensions, .rows = 1, .metrics = &metrics };
+    }
+    const Counted = struct {
+        var calls: usize = 0;
+        fn key(row: series.Bucket) dataset.RowKey {
+            calls += 1;
+            return codec.key(row);
+        }
+    };
+    Counted.calls = 0;
+    var result = try readBudgetedWithKey(a, snapshot, .{ .start_ns = "0", .end_ns = "10", .page = true, .max_rows = 2 }, .{}, &reader, Counted.key);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 96), Counted.calls);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqual(codec.key(result.rows[1]), result.next.?);
+    try std.testing.expect(std.mem.order(u8, &codec.key(result.rows[0]), &codec.key(result.rows[1])) == .lt);
+    for (result.rows) |row| try std.testing.expectEqual(@as(i64, 2), row.rows);
 }

@@ -33,7 +33,6 @@ const A = std.mem.Allocator;
 const MemoryBudget = @import("antfly_platform").allocator.BoundedAllocator;
 const Target = local.system_catalog_domain.Target;
 const max_owners = 128;
-const max_floors = 32;
 const max_rows = 4096;
 
 pub const Create = struct { start_ns: ?[]const u8 = null, end_ns: ?[]const u8 = null, window_ns: ?[]const u8 = null };
@@ -44,6 +43,7 @@ const Part = struct {
     group: u64,
     owner_revision: u64,
     root: []const u8 = "",
+    admitted_ns: i128 = 0,
     cursor: ?series.Cursor = null,
     rows: []const series.Bucket = &.{},
     floors: []const Floor = &.{},
@@ -132,7 +132,7 @@ fn capture(server: anytype, a: A, working: A, snapshot: read.Snapshot, definitio
     try spend(budget, raw.len);
     const reply = try std.json.parseFromSliceLeaky(read.NativeReply, a, raw, .{ .allocate = .alloc_always });
     if (reply.rows.len > max_rows or !std.mem.eql(u8, &reply.cursor.partition, &owner.partition) or !std.mem.eql(u8, &reply.cursor.definition, &snapshot.plan.definition) or reply.cursor.incarnation != owner.incarnation) return error.RetainedSeriesResetRequired;
-    return .{ .group = owner.group, .owner_revision = owner.revision, .root = reply.root_incarnation, .cursor = reply.cursor, .rows = reply.rows };
+    return .{ .group = owner.group, .owner_revision = owner.revision, .root = reply.root_incarnation, .admitted_ns = reply.admitted_ns, .cursor = reply.cursor, .rows = reply.rows };
 }
 fn spend(remaining: *usize, cost: usize) !void {
     if (cost > remaining.*) return error.DatasetPageBudgetExceeded;
@@ -339,8 +339,9 @@ fn pollBudgeted(server: anytype, alloc: A, working: A, sessions: *registry.Regis
             } else part.* = .{ .group = old.group, .owner_revision = old.owner_revision, .root = observed.root_incarnation, .cursor = observed.cursor };
             continue;
         }
-        part.* = try advancePart(server, a, working, snapshot, definition, owner, old, original.bounds, bounds, now, if (archive) |*opened| opened else null, ctx, &budget, replay);
+        part.* = try advancePart(server, a, working, snapshot, definition, owner, old, original.bounds, bounds, now, if (archive) |*opened| opened else null, ctx, &budget, replay, &resynchronized);
     }
+    for (next.parts) |part| next.clock_ns = @max(next.clock_ns, part.admitted_ns);
     var before = try aggregate(a, snapshot, original, ctx);
     defer before.deinit();
     var after = try aggregate(a, snapshot, next, ctx);
@@ -354,16 +355,15 @@ fn pollBudgeted(server: anytype, alloc: A, working: A, sessions: *registry.Regis
     return sessions.commit(server.alloc, alloc, position, principal, platform.monotonicNs(), payload, response);
 }
 
-fn applyFrames(a: A, rows: *std.AutoHashMapUnmanaged(dataset.RowKey, series.Bucket), floors: []const Floor, visible: Bounds, initial: u64, replay: wire.Replay) !u64 {
+fn applyFrames(a: A, rows: *std.AutoHashMapUnmanaged(dataset.RowKey, series.Bucket), visible: Bounds, initial: u64, replay: wire.Replay) !u64 {
     var sequence = initial;
     for (replay.frames) |frame| {
         sequence = std.math.add(u64, sequence, 1) catch return error.RetainedSeriesResetRequired;
         if (frame.sequence != sequence) return error.RetainedSeriesResetRequired;
-        edit_loop: for (frame.edits) |edit| {
+        for (frame.edits) |edit| {
             const key = try replayKey(edit.key);
             const timestamp = try dataset.rowKeyTimestamp(key);
             if (!inRange(visible, timestamp)) continue;
-            for (floors) |fence| if (sequence <= fence.through and inRange(fence.bounds, timestamp)) continue :edit_loop;
             if (edit.row) |row| {
                 if (!std.mem.eql(u8, &codec.key(row), &key)) return error.RetainedSeriesCorrupt;
                 try rows.put(a, key, row);
@@ -384,7 +384,16 @@ fn validateReplay(old: Part, replay: wire.Replay) !void {
     if (!std.mem.eql(u8, replay.root_incarnation, old.root) or !std.mem.eql(u8, &replay.cursor.definition, &cursor.definition) or !std.mem.eql(u8, &replay.cursor.partition, &cursor.partition) or replay.cursor.incarnation != cursor.incarnation or replay.frames.len > 8) return error.RetainedSeriesResetRequired;
 }
 
-fn advancePart(server: anytype, a: A, working: A, snapshot: read.Snapshot, definition: dataset.Definition, owner: owners.Owner, old: Part, prior: Bounds, current: Bounds, now: i128, archive: ?*const archive_api.Opened, ctx: operation.RequestContext, budget: *usize, prefetched: ?wire.Replay) !Part {
+fn refreshPart(server: anytype, a: A, working: A, snapshot: read.Snapshot, definition: dataset.Definition, owner: owners.Owner, old: Part, minimum: series.Cursor, visible: Bounds, now: i128, archive: ?*const archive_api.Opened, ctx: operation.RequestContext, budget: *usize, resynchronized: *bool) !Part {
+    const fresh = try capture(server, a, working, snapshot, definition, owner, visible, now, archive, ctx, budget);
+    var expected = old;
+    expected.cursor = minimum;
+    try requireSameProducer(expected, .{ .root_incarnation = fresh.root, .cursor = fresh.cursor orelse return error.RetainedSeriesResetRequired, .rows = fresh.rows });
+    resynchronized.* = true;
+    return fresh;
+}
+
+fn advancePart(server: anytype, a: A, working: A, snapshot: read.Snapshot, definition: dataset.Definition, owner: owners.Owner, old: Part, prior: Bounds, current: Bounds, now: i128, archive: ?*const archive_api.Opened, ctx: operation.RequestContext, budget: *usize, prefetched: ?wire.Replay, resynchronized: *bool) !Part {
     try ctx.ensureActive();
     const replay = if (old.cursor) |cursor| prefetched orelse replay: {
         const source = snapshot.source_table orelse return error.RetainedSeriesResetRequired;
@@ -407,34 +416,45 @@ fn advancePart(server: anytype, a: A, working: A, snapshot: read.Snapshot, defin
         if (manifest.expired_before_ns) |expired| floor = @max(floor, expired);
     };
     const visible: Bounds = .{ .start = floor, .end = current.end };
+    // Older sessions may contain entering ranges captured ahead of their replay
+    // cursor. Replace that mixed cut before publishing another response.
+    if (old.cursor != null and old.floors.len != 0 and visible.start < visible.end) {
+        var minimum = replay.?.cursor;
+        for (old.floors) |fence| minimum.sequence = @max(minimum.sequence, fence.through);
+        return refreshPart(server, a, working, snapshot, definition, owner, old, minimum, visible, @max(now, replay.?.admitted_ns), archive, ctx, budget, resynchronized);
+    }
     var rows: std.AutoHashMapUnmanaged(dataset.RowKey, series.Bucket) = .empty;
     defer rows.deinit(a);
     for (old.rows) |row| if (inRange(visible, row.start_ns)) try rows.put(a, codec.key(row), row);
-    var floors: std.ArrayList(Floor) = .empty;
-    for (old.floors) |fence| if (fence.bounds.end > floor) try floors.append(a, fence);
     if (current.end > prior.end and visible.start < visible.end) {
         const entering: Bounds = .{ .start = @max(prior.end, visible.start), .end = current.end };
         const fresh = try capture(server, a, working, snapshot, definition, owner, entering, @max(now, if (replay) |value| value.admitted_ns else now), archive, ctx, budget);
         if (fresh.cursor) |cursor| {
-            if (!std.mem.eql(u8, fresh.root, old.root) or cursor.sequence < old.cursor.?.sequence) return error.RetainedSeriesResetRequired;
-            try floors.append(a, .{ .bounds = entering, .through = cursor.sequence });
+            const through = replay.?.cursor;
+            try requireSameProducer(old, .{ .root_incarnation = fresh.root, .cursor = cursor, .rows = fresh.rows });
+            if (cursor.sequence < through.sequence) return error.RetainedSeriesResetRequired;
+            const fresh_floor = try spec.bucket(try std.math.sub(i128, fresh.admitted_ns, spec.retention_ns));
+            if (cursor.sequence > through.sequence or fresh_floor > floor) {
+                // The retention clock can advance independently of sequence.
+                // Refresh once at an immutable owner cut; replay catchup loops
+                // could starve indefinitely under sustained writes.
+                if (entering.start == visible.start) {
+                    resynchronized.* = true;
+                    return fresh;
+                }
+                return refreshPart(server, a, working, snapshot, definition, owner, old, cursor, visible, @max(fresh.admitted_ns, @max(now, replay.?.admitted_ns)), archive, ctx, budget, resynchronized);
+            }
         }
         for (fresh.rows) |row| try rows.put(a, codec.key(row), row);
     }
     var next = old;
     if (old.cursor) |cursor| {
         const frames = replay orelse return error.RetainedSeriesResetRequired;
-        const sequence = try applyFrames(a, &rows, floors.items, visible, cursor.sequence, frames);
+        _ = try applyFrames(a, &rows, visible, cursor.sequence, frames);
         next.cursor = frames.cursor;
-        var write: usize = 0;
-        for (floors.items) |fence| if (fence.through > sequence) {
-            floors.items[write] = fence;
-            write += 1;
-        };
-        floors.items.len = write;
     }
-    if (floors.items.len > max_floors or rows.count() > max_rows) return error.RetainedSeriesResetRequired;
-    next.floors = floors.items;
+    if (rows.count() > max_rows) return error.RetainedSeriesResetRequired;
+    next.floors = &.{};
     const ordered = try a.alloc(series.Bucket, rows.count());
     const keys = try a.alloc(dataset.RowKey, rows.count());
     var iterator = rows.keyIterator();
@@ -449,7 +469,7 @@ fn advancePart(server: anytype, a: A, working: A, snapshot: read.Snapshot, defin
     return next;
 }
 
-test "retained subscription replay preserves entering buckets until their read position is passed" {
+test "retained subscription replay applies contiguous owner cuts and rejects gaps" {
     const a = std.testing.allocator;
     var latest_metrics = [_]series.Metric{.{ .count = 3 }};
     var stale_metrics = [_]series.Metric{.{ .count = 1 }};
@@ -464,15 +484,14 @@ test "retained subscription replay preserves entering buckets until their read p
     defer rows.deinit(a);
     try rows.put(a, key, fresh);
     const bounds: Bounds = .{ .start = 0, .end = 20 };
-    const fence: Floor = .{ .bounds = .{ .start = 10, .end = 20 }, .through = 1 };
     var replay: wire.Replay = .{ .root_incarnation = "7", .cursor = .{ .definition = @splat(1), .partition = @splat(2), .incarnation = 1, .sequence = 1 }, .frames = &.{.{ .sequence = 1, .source_sequence = 5, .edits = &.{.{ .key = raw, .row = stale }} }} };
-    try std.testing.expectEqual(@as(u64, 1), try applyFrames(a, &rows, &.{fence}, bounds, 0, replay));
-    try std.testing.expectEqual(@as(i64, 3), rows.get(key).?.rows);
+    try std.testing.expectEqual(@as(u64, 1), try applyFrames(a, &rows, bounds, 0, replay));
+    try std.testing.expectEqual(@as(i64, 1), rows.get(key).?.rows);
     replay.cursor.sequence = 2;
     replay.frames = &.{.{ .sequence = 2, .source_sequence = 6, .edits = &.{.{ .key = raw, .row = newer }} }};
-    try std.testing.expectEqual(@as(u64, 2), try applyFrames(a, &rows, &.{fence}, bounds, 1, replay));
+    try std.testing.expectEqual(@as(u64, 2), try applyFrames(a, &rows, bounds, 1, replay));
     try std.testing.expectEqual(@as(i64, 4), rows.get(key).?.rows);
-    try std.testing.expectError(error.RetainedSeriesResetRequired, applyFrames(a, &rows, &.{}, bounds, 0, replay));
+    try std.testing.expectError(error.RetainedSeriesResetRequired, applyFrames(a, &rows, bounds, 0, replay));
 }
 
 test "retained subscription archived polling observes durable retention after clock rollback" {
@@ -544,7 +563,8 @@ test "retained subscription archived polling observes durable retention after cl
     const owner: owners.Owner = .{ .plan = @splat(7), .group = 11, .partition = @splat(5), .incarnation = 1, .mode = .closed, .native_receipt = @splat(4), .cut = .{ .closure = cut.closure, .sequence = 20, .complete_from_ns = "0", .admitted_ns = "1000" }, .independent_receipt = receipt };
     var budget: usize = registry.max_state_bytes;
     const bounds: Bounds = .{ .start = 0, .end = 180 };
-    const next = try advancePart(&server, a, a, undefined, def, owner, .{ .group = 11, .owner_revision = 1, .rows = &rows }, bounds, bounds, 1050, &opened, .{}, &budget, null);
+    var resynchronized = false;
+    const next = try advancePart(&server, a, a, undefined, def, owner, .{ .group = 11, .owner_revision = 1, .rows = &rows }, bounds, bounds, 1050, &opened, .{}, &budget, null, &resynchronized);
 
     try std.testing.expectEqual(@as(usize, 1), next.rows.len);
 
@@ -597,9 +617,98 @@ test "retained subscription native polling applies the durable retention clock w
     const prior: Part = .{ .group = 11, .owner_revision = 1, .root = "7", .cursor = cursor, .rows = &rows };
     const bounds: Bounds = .{ .start = 0, .end = 180 };
     var budget: usize = registry.max_state_bytes;
-    const next = try advancePart(&server, a, a, snapshot, def, owner, prior, bounds, bounds, 1050, null, .{}, &budget, null);
+    var resynchronized = false;
+    const next = try advancePart(&server, a, a, snapshot, def, owner, prior, bounds, bounds, 1050, null, .{}, &budget, null, &resynchronized);
     try std.testing.expect(try spec.expired(0, server.admitted_ns));
     try std.testing.expectEqual(@as(usize, 0), next.rows.len);
+}
+
+test "retained subscription moving window replaces the full owner cut when entering capture overtakes replay" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var schema: dataset.Id = undefined;
+    std.crypto.hash.sha2.Sha256.hash("{}", &schema, .{});
+    const def: dataset.Definition = .{ .id = @splat(1), .generation = 1, .kind = .summary, .schema = schema, .schema_json = "{}", .authorization = @splat(3), .retention_ns = 1000, .local_residence_ns = 0, .summary = .{ .source = @splat(9), .timestamp = "ts", .interval_ns = 60, .mutable_for_ns = 100, .measures = &.{.{ .name = "n", .law = .count }} } };
+    const owner: owners.Owner = .{ .plan = @splat(7), .group = 11, .partition = @splat(5), .incarnation = 1, .mode = .ready, .native_receipt = @splat(4) };
+    const spec = try specFor(a, def, owner);
+    const cursor: series.Cursor = .{ .definition = spec.definition, .partition = owner.partition, .incarnation = 1, .sequence = 0 };
+    const Server = struct {
+        cursor: series.Cursor,
+        admitted_ns: i128 = 180,
+        reads: usize = 0,
+        capture_sequence: u64 = 1,
+        capture_clock: i128 = 180,
+        metrics: [1]series.Metric = .{.{ .count = 3 }},
+        pub fn sharedApiIo(_: *@This()) ?std.Io {
+            return std.testing.io;
+        }
+        pub fn readRetainedOwnerRows(self: *@This(), alloc: A, _: []const u8, _: u64, query: read.NativeQuery, _: operation.RequestContext) ![]u8 {
+            self.reads += 1;
+            const start = try parseBound(query.start_ns);
+            const rows = [_]series.Bucket{
+                .{ .start_ns = 60, .dimensions = "[]", .rows = 3, .metrics = &self.metrics },
+                .{ .start_ns = 120, .dimensions = "[]", .rows = 3, .metrics = &self.metrics },
+            };
+            var observed = self.cursor;
+            observed.sequence = self.capture_sequence;
+            return std.json.Stringify.valueAlloc(alloc, read.NativeReply{ .root_incarnation = "7", .cursor = observed, .admitted_ns = self.capture_clock, .rows = if (start == 120 or self.capture_clock >= 1120) rows[1..] else &rows }, .{});
+        }
+        pub fn pollRetainedOwnerReplay(self: *@This(), alloc: A, _: []const u8, _: u64, _: read.NativeReplay, _: operation.RequestContext) ![]u8 {
+            return std.json.Stringify.valueAlloc(alloc, wire.Replay{ .root_incarnation = "7", .cursor = self.cursor, .frames = &.{}, .admitted_ns = self.admitted_ns }, .{});
+        }
+    };
+    var server: Server = .{ .cursor = cursor };
+    const snapshot: read.Snapshot = .{ .resource = .{ .id = 41, .kind = .dataset, .name = "summary" }, .plan = .{ .id = @splat(7), .resource = 41, .dataset = def.id, .generation = 1, .definition = spec.definition, .source = @splat(9), .source_table = 7, .topology_generation = 1, .membership = @splat(6) }, .owners = &.{owner}, .source_table = .{ .table_id = 7, .name = "raw" } };
+    var metrics = [_]series.Metric{.{ .count = 2 }};
+    const rows = [_]series.Bucket{.{ .start_ns = 60, .dimensions = "[]", .rows = 2, .metrics = &metrics }};
+    const prior: Part = .{ .group = 11, .owner_revision = 1, .root = "7", .cursor = cursor, .rows = &rows };
+    const bounds: Bounds = .{ .start = 0, .end = 120 };
+    const moving: Bounds = .{ .start = 60, .end = 180 };
+    var budget: usize = registry.max_state_bytes;
+    var resynchronized = false;
+    const next = try advancePart(&server, a, a, snapshot, def, owner, prior, bounds, moving, 180, null, .{}, &budget, null, &resynchronized);
+    try std.testing.expect(resynchronized);
+    try std.testing.expectEqual(@as(usize, 2), server.reads);
+    try std.testing.expectEqual(@as(u64, 1), next.cursor.?.sequence);
+    try std.testing.expectEqual(@as(usize, 2), next.rows.len);
+    for (next.rows) |row| try std.testing.expectEqual(@as(i64, 3), row.metrics[0].count);
+    try std.testing.expectEqual(@as(usize, 0), next.floors.len);
+
+    // Persisted mixed-cut sessions from the previous implementation are repaired
+    // even when the window does not move on the next poll.
+    var legacy = prior;
+    legacy.floors = &.{.{ .bounds = moving, .through = 1 }};
+    resynchronized = false;
+    const repaired = try advancePart(&server, a, a, snapshot, def, owner, legacy, moving, moving, 180, null, .{}, &budget, null, &resynchronized);
+    try std.testing.expect(resynchronized);
+    try std.testing.expectEqual(@as(u64, 1), repaired.cursor.?.sequence);
+    for (repaired.rows) |row| try std.testing.expectEqual(@as(i64, 3), row.metrics[0].count);
+    // Expiry admission has no replay frame and need not advance the cursor.
+    server.capture_sequence = 0;
+    server.capture_clock = 1120;
+    resynchronized = false;
+    const expired = try advancePart(&server, a, a, snapshot, def, owner, prior, bounds, moving, 180, null, .{}, &budget, null, &resynchronized);
+    try std.testing.expect(resynchronized);
+    try std.testing.expectEqual(@as(u64, 0), expired.cursor.?.sequence);
+    try std.testing.expectEqual(@as(usize, 1), expired.rows.len);
+    try std.testing.expectEqual(@as(i128, 120), expired.rows[0].start_ns);
+
+    // Without an intervening write or expiry, preserve the incremental path.
+    server.capture_clock = 180;
+    server.reads = 0;
+    resynchronized = false;
+    _ = try advancePart(&server, a, a, snapshot, def, owner, prior, bounds, moving, 180, null, .{}, &budget, null, &resynchronized);
+    try std.testing.expect(!resynchronized);
+    try std.testing.expectEqual(@as(usize, 1), server.reads);
+
+    // A window with no overlap already has a complete owner snapshot.
+    server.capture_sequence = 1;
+    server.reads = 0;
+    resynchronized = false;
+    _ = try advancePart(&server, a, a, snapshot, def, owner, prior, .{ .start = 0, .end = 60 }, moving, 180, null, .{}, &budget, null, &resynchronized);
+    try std.testing.expect(resynchronized);
+    try std.testing.expectEqual(@as(usize, 1), server.reads);
 }
 
 test "retained subscription snapshot catchup preserves physical producer identity" {

@@ -104,7 +104,7 @@ The host API is exported as `serverless.datasets`. It provides typed catalog ope
 
 GET a dataset with `max_owners` (1–64, default 16) and optional decimal `after_group` to page through `progress.owners`; use `progress.next_group` for the next page. Status includes registration counters, native readiness, replay bounds, retention clock, last maintenance error/attempt, and archive export frontier. RPC failures appear separately as `status_error`. Diagnostics share a two-second best-effort budget; an unavailable owner or archive does not hide lifecycle metadata. These diagnostics do not grant read or deletion authority.
 
-Subscription frames may include `resynchronized: true` when replay is unavailable or behind the current head. The server reads a fresh bounded owner snapshot and emits the resulting changes. Intermediate source changes can be coalesced. Changed producer identity still requires a reset.
+Subscription frames may include `resynchronized: true` when replay is unavailable or behind the current head. The server reads a fresh bounded owner snapshot and emits the resulting changes. Intermediate source changes can be coalesced. A moving window also resynchronizes the full visible owner partition if its entering-range snapshot is newer than replay or admits a later expiry boundary; overlapping and entering buckets always use one owner cut. This does not provide an atomic cut across different owners. Changed producer identity still requires a reset.
 
 SUM and AVG now preserve exact binary64 contribution sums across corrections and archive merges, rounding only the served value. Existing nonempty generations written with legacy floating state must be rebuilt into a fresh generation before corrections; their archives remain readable.
 
