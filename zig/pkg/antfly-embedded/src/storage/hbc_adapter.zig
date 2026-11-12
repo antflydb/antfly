@@ -12293,7 +12293,7 @@ pub const HBCIndex = struct {
                     @import("root").hbcBootstrapProjectionConsolidated(before, handle.backend.runs.count());
                 break :blk changed;
             },
-            .native => false,
+            .native, .native_catalog => false,
         };
     }
 
@@ -12313,7 +12313,7 @@ pub const HBCIndex = struct {
         const forced: ?bool = if (comptime @hasDecl(@import("root"), "hbcBootstrapConsolidateProjection")) @import("root").hbcBootstrapConsolidateProjection() else null;
         const too_many_runs = switch (self.env_owner) {
             .lsm => |handle| handle.backend.runs.count() == handle.backend.runs.l0Files() and handle.backend.runs.count() > max_initial_posting_runs,
-            .native => false,
+            .native, .native_catalog => false,
         };
         const consolidated = if (forced orelse too_many_runs) try self.consolidateInitialPostingProjection() else false;
         const result = self.stageInitialPostingCheckpoint(posting_store, generation, sequence, check, context) catch |err| retry: {
