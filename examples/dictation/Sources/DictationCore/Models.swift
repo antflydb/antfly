@@ -203,15 +203,17 @@ public struct Configuration: Codable, Equatable, Sendable {
   ) -> Bool {
     guard usesManagedRuntime else { return false }
     let apple = catalog.transcriber("transcribers/apple-speech")
-    let available =
-      supportsApple && apple?.dictation != nil
-      && apple?.dictation?.readiness_error == nil
-    let selected = available ? "transcribers/apple-speech" : "transcribers/whisper"
     var changed = false
     for index in presets.indices {
       guard presets[index].automaticallySelectLocalTranscriber != false,
         ["transcribers/whisper", "transcribers/apple-speech"].contains(presets[index].model)
       else { continue }
+      let ready =
+        apple?.speechReadiness(language: presets[index].language, defaultLanguage: "en-US").isReady
+        == true
+      let selected =
+        supportsApple && ready && presets[index].hasCompatibleSharedProcessor(in: catalog)
+        ? "transcribers/apple-speech" : "transcribers/whisper"
       if presets[index].model != selected || presets[index].transcriberRoute != .gateway {
         presets[index].model = selected
         presets[index].transcriberRoute = .gateway
@@ -287,18 +289,24 @@ public struct DictationResult: Sendable {
 }
 
 public struct DiscoveredModel: Decodable, Identifiable, Sendable {
+  public struct NativeSpeechStatus: Decodable, Sendable {
+    public var speech_available: Bool?
+    public var speech_installed_locales: [String]?
+  }
   public struct DictationCapabilities: Decodable, Sendable {
     public var stable_segments: Bool?
     public var text_cleanup: Bool?
     public var live_preview: Bool
     public var recognition_hints: Bool
     public var readiness_error: String?
+    public var native_status: NativeSpeechStatus?
     public var executor: String?
   }
   public var id: String
   public var task: String?
   public var executor: String?
   public var dictation: DictationCapabilities?
+  public var availability: String?
   public var executorName: String { executor ?? dictation?.executor ?? "runtime" }
 }
 public struct ModelCatalog: Decodable, Sendable {

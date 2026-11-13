@@ -100,3 +100,28 @@ private func setupDirectory(_ config: Configuration) throws -> URL {
   #expect(!store.shortcutSetupPending)
   store.captureShortcut(false)
 }
+
+@Test @MainActor func shortcutOnlySaveUpdatesDirtyBaselineAndKeepsOtherEditsPending() async throws {
+  var saved = Configuration()
+  saved.effectiveShortcut = .controlOptionSpace
+  let directory = try setupDirectory(saved)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let store = Store(
+    directory: directory, registerHotkey: false, keyboardAccess: { true },
+    keyboardAccessRequest: {}, settingsOpener: { _ in })
+  #expect(!store.hasUnsavedSettings)
+  store.config.effectiveShortcut = .fn
+  #expect(store.hasUnsavedSettings)
+  store.setUpShortcut()
+  #expect(!store.hasUnsavedSettings)
+  store.config.dictionary.append("PendingWord")
+  store.config.effectiveShortcut = .controlOption
+  store.setUpShortcut()
+  #expect(store.hasUnsavedSettings)
+  let disk = try Configuration.decode(
+    Data(contentsOf: directory.appendingPathComponent("settings.json")))
+  #expect(disk.effectiveShortcut == .controlOption && disk.dictionary == saved.dictionary)
+  store.config.dictionary = saved.dictionary
+  #expect(!store.hasUnsavedSettings)
+  await store.prepareToQuit()
+}

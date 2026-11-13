@@ -1,10 +1,10 @@
-// Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
-@testable import DictationCore
 import Foundation
 import Testing
 
 @testable import DictationApp
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+@testable import DictationCore
 
 @Test func newInstallUsesBundledRuntimeButLegacyServerSettingsStayExternal() throws {
   let fresh = Configuration()
@@ -101,13 +101,17 @@ import Testing
 }
 
 private func localCatalog(error: String? = nil) throws -> ModelCatalog {
-  var capabilities: [String: Any] = ["live_preview": false, "recognition_hints": false]
+  var capabilities: [String: Any] = [
+    "live_preview": false, "recognition_hints": false,
+    "native_status": ["speech_available": true, "speech_installed_locales": ["en_US"]],
+  ]
   if let error { capabilities["readiness_error"] = error }
   return try JSONDecoder().decode(
     ModelCatalog.self,
     from: JSONSerialization.data(withJSONObject: [
       "data": [
-        ["id": "transcribers/apple-speech", "task": "transcribe", "dictation": capabilities]
+        ["id": "transcribers/apple-speech", "task": "transcribe", "dictation": capabilities],
+        ["id": "generators/custom-cleanup", "task": "generate"],
       ]
     ]))
 }
@@ -164,4 +168,18 @@ private func localCatalog(error: String? = nil) throws -> ModelCatalog {
   #expect(await client.origin.absoluteString == Configuration.managedServerOrigin)
   let explicit = try AntflyClient(server: "https://external.example")
   #expect(await explicit.origin.absoluteString == "https://external.example")
+}
+
+@MainActor @Test func setupWaitReportsStartupFailureInsteadOfWaitingTheFullDeadline() async throws {
+  let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let runtime = ManagedRuntime(
+    directory: root, runtime: URL(fileURLWithPath: "/does-not-exist"), credentialRead: { "" },
+    credentialWrite: { _ in })
+  runtime.start()
+  do {
+    try await runtime.waitUntilReady(timeout: .seconds(3))
+    Issue.record("Missing engine became ready")
+  } catch { #expect(error.localizedDescription.contains("Bundled Antfly is missing")) }
+  await runtime.stop()
 }

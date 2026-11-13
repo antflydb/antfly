@@ -537,7 +537,7 @@ See [updates and release setup](UPDATES.md) for organization signing credentials
 notarization, protected GitHub setup, independent release tags, recovery, and the
 optional managed-local-server design.
 
-### Getting ready and everyday use
+## Getting ready and everyday use
 
 The Getting ready checklist separates microphone permission, Accessibility permission,
 shortcut registration, and speech model discovery. Recording from the window is a
@@ -547,20 +547,50 @@ return from System Settings.
 
 Settings are grouped into General (updates and retention), Speech & text (engine and
 voice formatting), Shortcuts & permissions, and Advanced (server/storage details).
-Edits remain local drafts until **Save settings**; the footer shows unsaved changes.
-History shows **Off** in its tab when disabled. Enabling history explicitly saves
+Edits are held in memory for the current session. **Save settings** persists them
+and applies shortcut/retention changes; the footer shows unsaved changes. History shows **Off** in its tab when disabled. Enabling history explicitly saves
 settings; text history and local audio retention are independent.
 
 New installations start with Verbatim output. **Clean up** removes fillers and fixes
 punctuation; **Rewrite** also applies tone and instructions. Both require a text
-processor selected in the preset. Recording stops with an actionable configuration
-message rather than silently ignoring the selected output mode. Preferred spellings
-are vocabulary hints, not guaranteed recognition replacements.
+processor selected in the preset. Recording is blocked with an actionable
+configuration message rather than silently ignoring the selected output mode.
+The same validation also applies to retries; a configuration error preserves
+original-text recovery. Preferred spellings are vocabulary hints, not guaranteed
+recognition replacements.
 
-For the bundled engine, **Install / check English speech** explicitly permits Apple
+For the bundled engine, **Install / check … speech** explicitly permits Apple
 asset downloads, restarts the engine, and sends one second of generated silence to
-install and verify the English speech model. This does not record microphone audio,
-paste text, or create history. Setup displays its current stage and can be canceled;
+install and verify the active preset’s language (English when the language is
+empty). This does not record microphone audio, paste text, or create history. Setup displays its current stage and can be canceled;
 Apple controls the download and does not expose percentage progress through this
-released runtime. Other languages may require separate assets at first use. External
-servers must enable `download_assets` on the server host themselves.
+released runtime. Installation uses a separate cancellable HTTP session and an
+explicit `X-Antfly-Inference-Timeout-Ms: 1800000` budget supported by the pinned
+rc.13 engine. The setup request allows 30 minutes, with a short client grace period
+for the server's final response. Normal dictation keeps its existing shorter
+request budgets; this does not change inference defaults globally. Select another
+preset before setup to install/check its language separately. Regional equivalence
+that the inventory cannot prove stays unverified until a successful dictation.
+External servers must enable `download_assets` on the server host themselves.
+
+Engine checks expose checking, current, and failed states. Failed checks discard
+cached model readiness. Apple speech readiness uses the native speech-availability
+flag and installed languages, not catalog presence alone. Missing or ambiguous
+regional language information stays unverified until dictation confirms it;
+external models with an unknown default language do not get a guessed green check.
+Automatic selection only chooses Apple when speech assets for the preset language
+are known ready and its text processor is compatible with shared cleanup.
+
+Switching bundled speech engines checks all configured text processors before
+starting setup. An incompatible raw model or missing generator blocks the switch
+and offers explicit choices: use Verbatim for affected presets, or use the bundled
+Apple processor if it exists. Compatible processors and rewrite instructions are
+preserved. The app commits the candidate preset selection only after setup succeeds.
+Apple text processing still requires Apple Intelligence and its generation assets,
+independently of Apple speech. Setup success, failure, and cancellation messages
+identify the engine being configured; failed/canceled setup does not trigger an
+automatic transcriber switch.
+
+The unsaved indicator is cached on configuration/credential edits. Shortcut-only
+setup updates only the saved shortcut baseline, so unrelated changes remain pending
+without serializing the full configuration during recording UI updates.

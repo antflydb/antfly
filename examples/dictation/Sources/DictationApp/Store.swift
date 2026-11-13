@@ -7,12 +7,12 @@ import DictationCore
 import SwiftUI
 
 @MainActor final class Store: ObservableObject {
-  @Published var config = Configuration()
+  @Published var config = Configuration() { didSet { updateSettingsDirtyState() } }
   let runtime: ManagedRuntime
   private var runtimeModeTask: Task<Void, Never>?
-  private var modelSetupTask: Task<Void, Never>?
-  @Published private(set) var settingUpModel = false
-  @Published private(set) var appleSetupStatus = ""
+  private(set) var modelSetupTask: Task<Void, Never>?
+  @Published private(set) var modelSetup = ModelSetupState.idle
+  var settingUpModel: Bool { modelSetup.isRunning }
   @Published var history: [HistoryEntry] = []
   @Published var state = RecordingState.idle
   @Published var phase = DictationPhase.idle { didSet { updateOverlay() } }
@@ -26,19 +26,52 @@ import SwiftUI
   @Published var message = "Ready. Hold Fn to dictate." { didSet { updateOverlay() } }
   @Published var discovery = ""
   @Published var models: [DiscoveredModel] = []
+  @Published private(set) var discoveryState = ModelDiscoveryState.unchecked
+  private struct SpeechSelection: Equatable {
+    let server: String
+    let model: String
+    let language: String
+    init(_ config: Configuration, _ preset: Preset) {
+      server = config.effectiveServer
+      model = preset.model
+      language = DiscoveredModel.localeKey(
+        preset.language.isEmpty && server == ManagedRuntime.origin ? "en-US" : preset.language)
+    }
+  }
+  private var verifiedSpeech: SpeechSelection?
+  var engineReadiness: SpeechReadiness {
+    if config.usesManagedRuntime && !runtime.ready { return .unavailable(runtime.status) }
+    switch discoveryState {
+    case .checking: return .checking
+    case .unchecked: return .unverified
+    case .failed(let reason): return .unavailable("Engine check failed: " + reason)
+    case .current: break
+    }
+    let preset = config.preset(for: nil)
+    guard let model = ModelCatalog(data: models).transcriber(preset.model) else {
+      return .unavailable(
+        "The selected speech model was not found. Choose a discovered transcriber in Presets.")
+    }
+    let readiness = model.speechReadiness(
+      language: preset.language, defaultLanguage: config.usesManagedRuntime ? "en-US" : nil)
+    switch readiness {
+    case .unverified, .assetsNeeded:
+      return verifiedSpeech == SpeechSelection(config, preset) ? .ready : readiness
+    default: return readiness
+    }
+  }
   @Published var searchText = ""
   @Published var searchResult = ""
   @Published var token = "" { didSet { if !loadingCredential { credentialEdited = true } } }
-  private var savedSettings = Data()
-  var hasUnsavedSettings: Bool { encodedSettings() != savedSettings || credentialEdited }
-  private func encodedSettings() -> Data {
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys]
-    return (try? encoder.encode(config)) ?? Data()
+  private var savedConfiguration = Configuration()
+  @Published private(set) var hasUnsavedSettings = false
+  private func updateSettingsDirtyState() {
+    let dirty = config != savedConfiguration || credentialEdited
+    if hasUnsavedSettings != dirty { hasUnsavedSettings = dirty }
   }
   private var loadingCredential = false
   private var credentialOrigin: String?
-  private var credentialEdited = false
+  private var credentialEdited = false { didSet { updateSettingsDirtyState() } }
   private func loadCredential(for origin: String) {
     loadingCredential = true
     token = credentialReader(origin)
@@ -260,7 +293,8 @@ import SwiftUI
         await self.restoreHistoryDestinations(legacyDestination: legacyDestination, epoch: epoch)
       }
     }
-    savedSettings = encodedSettings()
+    savedConfiguration = config
+    updateSettingsDirtyState()
     if registerHotkey, !config.usesManagedRuntime { loadCredential(for: config.server) }
     hotkey?.changed = { [weak self] down in self?.shortcut(down: down) }
     hotkey?.interrupted = { [weak self] in if self?.state != .idle { self?.cancel() } }
@@ -372,7 +406,9 @@ import SwiftUI
         }
         throw error
       }
+      savedConfiguration = saved
       config.effectiveShortcut = shortcut
+      updateSettingsDirtyState()
       registered = shortcut
       shortcutStatus = "Shortcut active: " + shortcut.label
       shortcutSetupPending = false
@@ -410,6 +446,8 @@ import SwiftUI
       credentialEdited = false
     }
     try write(JSONEncoder().encode(config), to: settingsFile)
+    savedConfiguration = config
+    updateSettingsDirtyState()
     var shortcutIssue: String?
     do { try registerShortcut() } catch {
       shortcutIssue = error.localizedDescription
@@ -451,7 +489,6 @@ import SwiftUI
       }
     }
     if !config.retainAudio { try removeAudio() }
-    savedSettings = encodedSettings()
     return shortcutIssue
   }
   func save() {
@@ -717,9 +754,14 @@ import SwiftUI
   }
   private func runSubmission(
     preset: Preset, snapshot: Configuration, destination: InsertionTarget?,
-    releasedAt: TimeInterval? = nil,
+    releasedAt: TimeInterval? = nil, verifiesRecognition: Bool = true,
     operation: @escaping @MainActor () async throws -> DictationResult
   ) {
+    do { try preset.outputMode.validateProcessor(preset.cleanupModel) } catch {
+      message = error.localizedDescription
+      phase = .failed
+      return
+    }
     state = .processing
     result = ""
     canRecoverRaw = false
@@ -735,6 +777,7 @@ import SwiftUI
         output.timing?.afterRelease = ProcessInfo.processInfo.systemUptime - released
         try Task.checkCancellation()
         guard generation == run else { return }
+        if verifiesRecognition { verifiedSpeech = SpeechSelection(snapshot, preset) }
         // Only recognition can request a key action; generated text cannot.
         let formatted: VoiceFormatting.Output
         if let processed = output.formatting {
@@ -893,7 +936,9 @@ import SwiftUI
       snapshot.autoPaste = false
       generation = UUID()
       let run = generation
-      runSubmission(preset: preset, snapshot: snapshot, destination: nil) { [self] in
+      runSubmission(
+        preset: preset, snapshot: snapshot, destination: nil, verifiesRecognition: false
+      ) { [self] in
         try await self.client(snapshot).cleanupText(
           original, preset: preset, dictionary: snapshot.dictionary,
           formatting: VoiceFormatting.Options(snapshot),
@@ -903,13 +948,33 @@ import SwiftUI
       message = phase.label
     } catch { message = error.localizedDescription }
   }
-  func refreshModels() { scheduleDiscovery(debounce: false, loadCredentials: false) }
-  private func scheduleDiscovery(debounce: Bool, loadCredentials: Bool) {
+  func refreshModels() {
+    guard !settingUpModel, !terminating else { return }
+    scheduleDiscovery(debounce: false, loadCredentials: false)
+  }
+  func checkEngine() {
+    guard !settingUpModel, !terminating else { return }
+    scheduleDiscovery(debounce: false, loadCredentials: true, report: true)
+  }
+  private func invalidateDiscovery() {
+    discoveryTask?.cancel()
+    discoveryGeneration = UUID()
+    models = []
+    discovery = ""
+    verifiedSpeech = nil
+    discoveryState = .unchecked
+  }
+  private func scheduleDiscovery(debounce: Bool, loadCredentials: Bool, report: Bool = false) {
     discoveryTask?.cancel()
     discoveryGeneration = UUID()
     let revision = discoveryGeneration
     var snapshot = config
     snapshot.server = snapshot.server.trimmingCharacters(in: .whitespacesAndNewlines)
+    discoveryState = .checking
+    if report {
+      verifiedSpeech = nil
+      message = "Checking the speech engine…"
+    }
     discoveryTask = Task { [weak self] in
       do {
         if debounce { try await Task.sleep(for: .milliseconds(350)) }
@@ -925,18 +990,31 @@ import SwiftUI
         try Task.checkCancellation()
         let catalog = try JSONDecoder().decode(ModelCatalog.self, from: Data(data.utf8))
         guard discoveryGeneration == revision else { return }
+        // A fresh inventory supersedes verification against the previous engine snapshot.
+        verifiedSpeech = nil
         models = catalog.data
-        if state == .idle, !working {
+        if report { discovery = data }
+        discoveryState = .current
+        if state == .idle, !working, modelSetup == .idle {
           config.selectAvailableManagedTranscriber(
             from: catalog, supportsApple: runtime.supportsAppleSpeech)
         }
-      } catch { /* Explicit Discover models surfaces connection/readiness errors. */  }
+        if report { message = engineReadiness.message }
+      } catch {
+        guard let self, discoveryGeneration == revision, !Task.isCancelled else { return }
+        models = []
+        discovery = ""
+        verifiedSpeech = nil
+        discoveryState = .failed(error.localizedDescription)
+        if report { message = "Engine check failed: " + error.localizedDescription }
+      }
     }
   }
   func runtimeModeChanged() {
     let previous = runtimeModeTask
     previous?.cancel()
-    models = []
+    invalidateDiscovery()
+    modelSetup = .idle
     runtimeModeTask = Task {
       await previous?.value
       guard !Task.isCancelled else { return }
@@ -945,88 +1023,113 @@ import SwiftUI
       refreshModels()
     }
   }
-  private func runModelSetup(_ action: @escaping @MainActor () async throws -> Void) {
+  // The operation owns all status, cancellation and commit transitions.
+  func runModelSetup(
+    _ operation: ModelSetupOperation, action: @escaping @MainActor () async throws -> Void
+  ) {
     guard !working, !terminating, state == .idle, config.usesManagedRuntime else { return }
+    let previousDiscovery = discoveryTask
+    previousDiscovery?.cancel()
+    discoveryGeneration = UUID()
+    discoveryState = .unchecked
+    verifiedSpeech = nil
     working = true
-    settingUpModel = true
-    message = "Setting up local recognition…"
+    modelSetup = .running(operation, "Setting up " + operation.label + "…")
+    message = modelSetup.message
     modelSetupTask = Task {
       defer {
         if !terminating { working = false }
-        settingUpModel = false
         modelSetupTask = nil
+        if !terminating { refreshModels() }
       }
       do {
+        await previousDiscovery?.value
         try Task.checkCancellation()
         try await action()
         try Task.checkCancellation()
         guard !terminating else { throw CancellationError() }
         _ = try persistSettings()
+        modelSetup = .ready(operation)
+      } catch let conflict as ManagedCleanupConflict {
+        modelSetup = .blocked(operation, conflict)
       } catch is CancellationError {
-        appleSetupStatus = "Setup canceled. Retry when ready."
-        message = "Model setup canceled."
+        modelSetup = .canceled(operation)
         if !terminating, config.usesManagedRuntime { runtime.start() }
       } catch {
-        appleSetupStatus = "Setup needs attention. Retry Apple speech setup."
-        message = error.localizedDescription
+        modelSetup = .failed(operation, error.localizedDescription)
       }
+      message = modelSetup.message
     }
+  }
+  private func setupStage(_ operation: ModelSetupOperation, _ stage: String) {
+    modelSetup = .running(operation, stage)
+    message = stage
   }
   func cancelModelSetup() {
     modelSetupTask?.cancel()
     runtime.cancelDownload()
   }
-  func installLocalWhisper() {
-    runModelSetup {
-      try await self.runtime.installWhisper()
-      try Task.checkCancellation()
-      for index in self.config.presets.indices {
-        self.config.presets[index].automaticallySelectLocalTranscriber = false
-        self.config.presets[index].model = "transcribers/whisper"
-        self.config.presets[index].transcriberRoute = .gateway
-        if self.config.presets[index].cleanupModel.isEmpty {
-          self.config.presets[index].outputMode = .verbatim
-        }
-      }
-      self.message = "Whisper selected. The local engine is restarting."
+  func retryModelSetup(resolution: CleanupResolution = .requireCompatible) {
+    guard let operation = modelSetup.operation else { return }
+    if operation == .appleSpeech {
+      useLocalApple(resolution: resolution)
+    } else {
+      installLocalWhisper(resolution: resolution)
     }
   }
-  func useLocalApple() {
+  var appleSpeechLanguage: String {
+    let selected = config.preset(for: nil).language.trimmingCharacters(in: .whitespacesAndNewlines)
+    return selected.isEmpty ? "en-US" : selected
+  }
+  var appleSpeechSetupTitle: String {
+    let language =
+      Locale.current.localizedString(forIdentifier: appleSpeechLanguage) ?? appleSpeechLanguage
+    return "Install / check " + language + " speech…"
+  }
+  func installLocalWhisper(resolution: CleanupResolution = .requireCompatible) {
+    setUpManagedSpeech(.whisper, resolution: resolution)
+  }
+  func useLocalApple(resolution: CleanupResolution = .requireCompatible) {
     guard runtime.supportsAppleSpeech else {
-      message =
-        "Native Apple providers are unavailable in the pinned Antfly release. Use Whisper or an external Apple-enabled server."
+      modelSetup = .failed(
+        .appleSpeech,
+        "Apple speech is unavailable in this app or macOS version. Use Whisper or an Apple-enabled external server."
+      )
+      message = modelSetup.message
       return
     }
-    runModelSetup {
-      self.appleSetupStatus = "Starting Apple speech…"
-      try await self.runtime.enableAppleAssets()
-      let deadline = ContinuousClock.now.advanced(by: .seconds(90))
-      while !self.runtime.ready {
-        try Task.checkCancellation()
-        guard ContinuousClock.now < deadline else {
-          throw DictationError.invalid(
-            "The local engine did not start. Retry setup or open the engine log.")
-        }
-        try await Task.sleep(for: .milliseconds(250))
+    setUpManagedSpeech(.appleSpeech, resolution: resolution)
+  }
+  private func setUpManagedSpeech(_ operation: ModelSetupOperation, resolution: CleanupResolution) {
+    runModelSetup(operation) {
+      try await self.runtime.waitUntilReady()
+      let data = try await self.client().models()
+      let catalog = try JSONDecoder().decode(ModelCatalog.self, from: Data(data.utf8))
+      // Check every processor before starting downloads; user choices remain intact on failure.
+      let language = self.appleSpeechLanguage
+      let candidate = try self.config.selectingManagedTranscriber(
+        operation, catalog: catalog, resolution: resolution)
+      if operation == .whisper {
+        self.setupStage(operation, "Downloading Whisper Tiny…")
+        try await self.runtime.installWhisper()
+        try await self.runtime.waitUntilReady()
+      } else {
+        self.setupStage(operation, "Starting Apple speech…")
+        try await self.runtime.enableAppleAssets()
+        try await self.runtime.waitUntilReady()
+        self.setupStage(
+          operation,
+          "Installing/checking " + language
+            + " speech assets. Apple manages the download; you can cancel. Setup allows up to 30 minutes."
+        )
+        try await self.client().checkAppleSpeechAssets(language: language)
       }
-      self.appleSetupStatus = "Installing and checking English speech assets…"
-      self.message = "Apple manages this download. Keep the app open; this may take a few minutes."
-      try await self.client(self.config).checkAppleSpeechAssets()
       try Task.checkCancellation()
-      self.appleSetupStatus = "English speech is ready"
-      for index in self.config.presets.indices {
-        self.config.presets[index].automaticallySelectLocalTranscriber = false
-        self.config.presets[index].model = "transcribers/apple-speech"
-        self.config.presets[index].transcriberRoute = .gateway
-        if self.config.presets[index].cleanupModel.isEmpty {
-          self.config.presets[index].outputMode = .verbatim
-        }
-      }
-      self.message = "English speech is installed and ready. Try a test dictation."
+      self.config = candidate
     }
   }
   func connectionChanged() {
-    models = []
+    invalidateDiscovery()
     loadingCredential = true
     token = ""
     loadingCredential = false
@@ -1107,6 +1210,9 @@ import SwiftUI
   func prepareToQuit() async {
     terminating = true
     working = true
+    discoveryTask?.cancel()
+    discoveryGeneration = UUID()
+    await discoveryTask?.value
     hotkey?.unregister()
     cancel()
     await clipboardRestoration()
@@ -1171,19 +1277,7 @@ import SwiftUI
       do { try await action() } catch { message = error.localizedDescription }
     }
   }
-  func discover() {
-    discoveryTask?.cancel()
-    discoveryGeneration = UUID()
-    run {
-      self.discovery = try await self.client(token: self.token).models()
-      let catalog = try JSONDecoder().decode(ModelCatalog.self, from: Data(self.discovery.utf8))
-      self.models = catalog.data
-      self.config.selectAvailableManagedTranscriber(
-        from: catalog, supportsApple: self.runtime.supportsAppleSpeech)
-      self.message =
-        "Models discovered. Apple native status and installed locales are included below; transcription checks the requested locale."
-    }
-  }
+  func discover() { checkEngine() }
   func setup() {
     run {
       try await self.client().setup(table: self.config.table)

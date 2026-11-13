@@ -34,10 +34,11 @@ struct SetupChecklist: View {
           if !store.shortcutReady { Button("Activate shortcut") { store.setUpShortcut() } }
         }
         HStack {
-          readiness("Speech engine", ready: speechReady)
-          Text(engineStatus).font(.caption).lineLimit(2)
+          readiness("Speech engine", ready: store.engineReadiness.isReady)
+          Text(store.engineReadiness.message).font(.caption).lineLimit(2)
           Spacer()
-          Button("Check engine") { store.refreshModels() }.disabled(store.working)
+          Button("Check engine") { store.checkEngine() }.disabled(
+            store.working || store.discoveryState == .checking)
         }
         Text(
           "You can test recording without Accessibility access. To dictate into another app, enable access and focus its text field first."
@@ -53,25 +54,6 @@ struct SetupChecklist: View {
     { _ in
       store.refreshPermissions()
     }
-  }
-  private var model: DiscoveredModel? {
-    ModelCatalog(data: store.models).transcriber(
-      store.config.presets.first(where: { $0.id == store.config.selectedPreset })?.model ?? "")
-  }
-  private var speechReady: Bool {
-    (!store.config.usesManagedRuntime || runtime.ready) && model != nil
-      && model?.dictation?.readiness_error == nil
-  }
-  private var engineStatus: String {
-    if store.config.usesManagedRuntime && !runtime.ready { return runtime.status }
-    if let error = model?.dictation?.readiness_error {
-      return error.contains("AppleSpeechAssetsMissing")
-        ? "Language assets needed. Enable Apple speech downloads in Speech & text, then test dictation."
-        : "Speech needs attention: " + error
-    }
-    return model == nil
-      ? "Check the engine to discover your speech model."
-      : "Speech model available. Test dictation to confirm language readiness."
   }
   private func readiness(_ title: String, ready: Bool) -> some View {
     Label(title, systemImage: ready ? "checkmark.circle.fill" : "circle")

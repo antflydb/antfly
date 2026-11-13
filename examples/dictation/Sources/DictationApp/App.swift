@@ -510,18 +510,33 @@ private struct RuntimeControls: View {
   var body: some View {
     Text(runtime.status).font(.callout)
     if store.settingUpModel { ProgressView().controlSize(.small) }
-    if !store.appleSetupStatus.isEmpty { Text(store.appleSetupStatus).font(.callout) }
+    if !store.modelSetup.message.isEmpty { Text(store.modelSetup.message).font(.callout) }
+    if case .blocked(_, let conflict) = store.modelSetup {
+      HStack {
+        Button("Use Verbatim for incompatible presets") {
+          store.retryModelSetup(resolution: .verbatim)
+        }
+        if conflict.canUseBundledProcessor {
+          Button("Use bundled Apple text processor") { store.retryModelSetup(resolution: .bundled) }
+        }
+      }
+      Text(
+        "The bundled Apple text processor requires Apple Intelligence and its model assets. Verbatim skips text processing."
+      ).font(.caption)
+    }
+    if case .failed = store.modelSetup { Button("Retry setup") { store.retryModelSetup() } }
+    if case .canceled = store.modelSetup { Button("Retry setup") { store.retryModelSetup() } }
     HStack {
       Button("Start / retry local engine") { runtime.start() }.disabled(
         runtime.busy || runtime.ready)
       Button("Download Whisper Tiny…") { store.installLocalWhisper() }.disabled(
         !runtime.ready || runtime.busy)
-      Button("Install / check English speech…") { store.useLocalApple() }.disabled(
+      Button(store.appleSpeechSetupTitle) { store.useLocalApple() }.disabled(
         !runtime.ready || runtime.busy || !runtime.supportsAppleSpeech)
       Button("Open engine log") { NSWorkspace.shared.open(runtime.logURL) }
     }
     Text(
-      "Apple speech needs macOS 26+ and language assets. Install / check downloads missing English assets from Apple and verifies speech before selecting it. Whisper is an alternative. Text cleanup is configured separately in Presets."
+      "Apple speech needs macOS 26+ and language assets. Install / check downloads assets for the active preset’s language (English by default) and verifies speech before selecting it. Whisper is an alternative. Text cleanup is configured separately in Presets."
     ).font(.caption)
   }
 }
