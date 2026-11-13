@@ -8966,6 +8966,25 @@ pub const NativeFile = struct {
         // No cancellation checks after checkpoint publication begins: preserve
         // the usual uncertain-outcome fencing across the durability boundary.
         try self.commitTransactionWithDurability(durable, null);
+        // §9 (redo + reclamation): `redo.checkpointing = true` above sent
+        // this commit through the same real, physical-slot-write branch
+        // of `publishCheckpoint` that `checkpointRedoLog`'s own build
+        // commit uses (neither one appends to the log), so this commit's
+        // sequence was consumed without ever being logged. Unlike
+        // `checkpointRedoLog`, this commit folds no logical overlay --
+        // it is purely a free-map/ledger write -- so the log's own bytes
+        // are untouched and must stay exactly as they are (still correct,
+        // still needed for a future fold): no zeroing, no `old_tail`
+        // bookkeeping, just resyncing the sequence-continuity counters
+        // the next ordinary commit's own `redo.appendRecord` call checks.
+        // Left undone, that next commit fails with the far less specific
+        // `error.OutcomeUnknown` (via `error.SequenceOutOfOrder`), on a
+        // commit that is otherwise perfectly fine.
+        if (self.redo) |*redo| {
+            const new_sequence = self.activeCheckpoint().commit_sequence;
+            redo.durable_sequence = new_sequence;
+            redo.writer.last_sequence = new_sequence;
+        }
         return count;
     }
 
@@ -15894,12 +15913,14 @@ pub const NativeFile = struct {
             self.header = durable;
             self.durable_header = null;
         }
+        var redo_fell_back_to_slot = false;
         if (self.redo != null and !self.redo.?.checkpointing) {
             const redo = &self.redo.?;
             // A log-full condition must be decided before anything is
             // appended, never discovered as a failed, partial append
             // (`error.LogFull`, surfacing as the far less specific
             // `error.OutcomeUnknown` below).
+            var try_redo_log = true;
             if (redo.pendingRecordLen() > redo.writer.remaining()) {
                 if (redo.logical_pending.items.len != 0) {
                     // This commit diverted logical mutations, already
@@ -15922,7 +15943,14 @@ pub const NativeFile = struct {
                     // `redo.writer` are untouched by a failed checkpoint
                     // attempt, so the log stays intact and the caller
                     // sees a clean, pre-decision error, never a torn
-                    // append.
+                    // append. This commit's own durability comes from
+                    // `checkpointRedoLog`'s own real, physical publish
+                    // (a genuine slot write + sync), regardless of
+                    // whether that call could also reclaim log *bytes*
+                    // (`pinned_below`, that function's own doc comment)
+                    // -- unlike the page-shaped branch below, nothing
+                    // here still needs the log to fit anything
+                    // afterward.
                     try self.checkpointRedoLog();
                     redo.logical_pending.clearRetainingCapacity();
                     redo.pending.clearRetainingCapacity();
@@ -15949,65 +15977,104 @@ pub const NativeFile = struct {
                     try self.file.writePositionalAll(self.runtimeIo(), p.bytes, p.page_id * @as(u64, self.header.page_size));
                 }
                 redo.pending.clearRetainingCapacity();
+                // §9 (redo log full under a reader pin): this commit's
+                // own page-shaped content is already flushed above and
+                // `pending` is now empty, so `pendingRecordLen()` is
+                // down to the bare minimum -- the record's own framing
+                // plus one fixed-size `CompactCheckpoint`, the tracking
+                // entry every commit through this branch still appends
+                // unconditionally below. That minimum can still exceed
+                // `remaining()` if a live reader pin has kept every
+                // `checkpointRedoLog` call (this commit's own
+                // proactive one, or any earlier one) from ever
+                // physically reclaiming log bytes
+                // (`checkpointRedoLog`'s own `pinned_below` branch) --
+                // no amount of further page-shaped flushing shrinks
+                // this minimum, since there is nothing left to flush.
+                // Checked again here, after clearing, rather than
+                // trusting the first check above (which measured this
+                // commit's full, pre-flush record): falling through to
+                // `redo.appendRecord` regardless would surface the
+                // log's own `error.LogFull` as the far less specific,
+                // and wrong, `error.OutcomeUnknown` -- wrong because
+                // nothing about this commit is actually uncertain, it
+                // simply has nowhere to log its own tracking entry.
+                try_redo_log = redo.pendingRecordLen() <= redo.writer.remaining();
             }
-            // §9.1/§9.3: the on-disk checkpoint slot is untouched here --
-            // it still names the last real checkpoint (build step (d) is
-            // the only thing that ever advances it for a redo-log file).
-            // This commit's durability comes entirely from appending
-            // `pending` (everything `flushTransactionWrites` diverted
-            // above) to the log and syncing it -- the commit's one fsync,
-            // same durability boundary as the v8/v9 path's slot write +
-            // `syncIfRequired`, just covering the log instead.
-            //
-            // Not replicated here: `checkpoint_publication_uncertain`/
-            // `uncertain_checkpoint`/`uncertain_slot` and
-            // `reconcilePublicationUncertainty`. Those exist to let a
-            // *live* handle recover from a failed slot write without a
-            // full reopen, specific to the two-physical-slot model; a
-            // redo-log file's recovery path (`recoverRedoLog`) already
-            // tolerates a torn or absent tail on the *next* open, which is
-            // this design's answer to the same failure instead. A failed
-            // sync (not append -- that can no longer fail with `LogFull`
-            // here, per the preemptive check above) still reports
-            // `OutcomeUnknown`, so callers (`Store`'s reconciliation)
-            // treat this commit exactly as uncertain as the v8/v9 path
-            // would.
-            self.publication_in_flight = true;
-            defer self.publication_in_flight = false;
-            (blk: {
-                if (comptime builtin.is_test) if (self.test_fail_checkpoint_publication) |err| {
-                    self.test_fail_checkpoint_publication = null;
-                    break :blk err;
+            if (try_redo_log) {
+                // §9.1/§9.3: the on-disk checkpoint slot is untouched here --
+                // it still names the last real checkpoint (build step (d) is
+                // the only thing that ever advances it for a redo-log file).
+                // This commit's durability comes entirely from appending
+                // `pending` (everything `flushTransactionWrites` diverted
+                // above) to the log and syncing it -- the commit's one fsync,
+                // same durability boundary as the v8/v9 path's slot write +
+                // `syncIfRequired`, just covering the log instead.
+                //
+                // Not replicated here: `checkpoint_publication_uncertain`/
+                // `uncertain_checkpoint`/`uncertain_slot` and
+                // `reconcilePublicationUncertainty`. Those exist to let a
+                // *live* handle recover from a failed slot write without a
+                // full reopen, specific to the two-physical-slot model; a
+                // redo-log file's recovery path (`recoverRedoLog`) already
+                // tolerates a torn or absent tail on the *next* open, which is
+                // this design's answer to the same failure instead. A failed
+                // sync (not append -- that can no longer fail with `LogFull`
+                // here, per the preemptive checks above) still reports
+                // `OutcomeUnknown`, so callers (`Store`'s reconciliation)
+                // treat this commit exactly as uncertain as the v8/v9 path
+                // would.
+                self.publication_in_flight = true;
+                defer self.publication_in_flight = false;
+                (blk: {
+                    if (comptime builtin.is_test) if (self.test_fail_checkpoint_publication) |err| {
+                        self.test_fail_checkpoint_publication = null;
+                        break :blk err;
+                    };
+                    redo.appendRecord(self.allocator, checkpoint.commit_sequence, CompactCheckpoint.fromCheckpointSlot(checkpoint)) catch |err| break :blk err;
+                    redo.writer.sync() catch |err| break :blk err;
+                    break :blk {};
+                }) catch {
+                    return error.OutcomeUnknown;
                 };
-                redo.appendRecord(self.allocator, checkpoint.commit_sequence, CompactCheckpoint.fromCheckpointSlot(checkpoint)) catch |err| break :blk err;
-                redo.writer.sync() catch |err| break :blk err;
-                break :blk {};
-            }) catch {
-                return error.OutcomeUnknown;
-            };
-            redo.durable_sequence = checkpoint.commit_sequence;
-            // §9.3b: publish right after the append this process just
-            // made durable, never before -- ride-along/deferred appends
-            // elsewhere are unsynced and must never be visible to a
-            // cross-process reader until a `durable=true` commit's own
-            // sync (the one that just returned, above) covers them.
-            // `redo.checkpoint_sequence` is untouched by an ordinary
-            // commit (only `checkpointRedoLog` advances it), so this
-            // publishes the same baseline a cross-process reader already
-            // has whenever nothing has been checkpointed since it last
-            // refreshed.
-            self.publishRedoLogState();
-            self.header.checkpoints[self.header.active_checkpoint] = checkpoint;
-            wal_trace.recordCommit();
-            self.last_synced_header = self.header;
-            if (self.ledger) |state| {
-                self.retirement_activity_bytes +|= state.released_data_pages *| self.header.page_size;
-                self.retirement_activity_bytes +|= state.retired_inline_bytes;
-                state.released_data_pages = 0;
-                state.retired_inline_bytes = 0;
+                redo.durable_sequence = checkpoint.commit_sequence;
+                // §9.3b: publish right after the append this process just
+                // made durable, never before -- ride-along/deferred appends
+                // elsewhere are unsynced and must never be visible to a
+                // cross-process reader until a `durable=true` commit's own
+                // sync (the one that just returned, above) covers them.
+                // `redo.checkpoint_sequence` is untouched by an ordinary
+                // commit (only `checkpointRedoLog` advances it), so this
+                // publishes the same baseline a cross-process reader already
+                // has whenever nothing has been checkpointed since it last
+                // refreshed.
+                self.publishRedoLogState();
+                self.header.checkpoints[self.header.active_checkpoint] = checkpoint;
+                wal_trace.recordCommit();
+                self.last_synced_header = self.header;
+                if (self.ledger) |state| {
+                    self.retirement_activity_bytes +|= state.released_data_pages *| self.header.page_size;
+                    self.retirement_activity_bytes +|= state.retired_inline_bytes;
+                    state.released_data_pages = 0;
+                    state.retired_inline_bytes = 0;
+                }
+                self.publishCommittedSequenceToInode();
+                return;
             }
-            self.publishCommittedSequenceToInode();
-            return;
+            // §9 (redo log full under a reader pin): even the minimal
+            // tracking entry does not fit, and nothing here can make it
+            // fit -- the log stays exactly this full until the pin
+            // releases. This commit's own content is already real,
+            // physical pages (flushed just above); fall through to the
+            // ordinary, non-redo checkpoint-slot write below instead of
+            // trying to log anyway. That slot write is itself a
+            // complete, self-sufficient durability record for this
+            // commit -- it needs nothing further from the log -- so
+            // writes keep working for exactly as long as a pinned
+            // reader keeps the log from reclaiming space, rather than
+            // surfacing a commit that never took effect as
+            // `error.OutcomeUnknown`.
+            redo_fell_back_to_slot = true;
         }
         const next_slot: u8 = if (self.header.active_checkpoint == 0) 1 else 0;
 
@@ -16077,6 +16144,42 @@ pub const NativeFile = struct {
             self.retirement_activity_bytes +|= state.retired_inline_bytes;
             state.released_data_pages = 0;
             state.retired_inline_bytes = 0;
+        }
+        // §9 (redo log full under a reader pin): this slot write is the
+        // one taken above in place of the ordinary redo-log append,
+        // when even that append's own minimal tracking entry could not
+        // fit. `committedSequence`'s own contract reads
+        // `redo.durable_sequence` exclusively for a redo-log file (its
+        // own doc comment) -- this write just made `checkpoint` durable
+        // exactly as thoroughly as a log append would have, so that
+        // contract must reflect it too. Deliberately not also
+        // `publishRedoLogState`: that call's own `durable_offset` is
+        // the log's physical tail, unmoved here (nothing was appended),
+        // so publishing an advanced `durable_sequence` paired with that
+        // unmoved offset would tell a cross-process reader there is a
+        // log record at a position where none exists -- an invariant
+        // that function's own callers rely on, not merely a staleness
+        // question its own doc comment excuses. Such a reader catches
+        // up the ordinary way instead, through this now-durable
+        // checkpoint slot on its own next reopen or refresh.
+        if (redo_fell_back_to_slot) {
+            self.redo.?.durable_sequence = checkpoint.commit_sequence;
+            // This commit's sequence was consumed without ever being
+            // appended to the log (the slot write above is its only
+            // durability record). `redo.writer.last_sequence` still
+            // reflects the last sequence actually logged, so the *next*
+            // commit that does take the ordinary redo-log-append branch
+            // would otherwise fail `Writer.append`'s own continuity
+            // check (`error.SequenceOutOfOrder`): it would try to append
+            // `last_logged + 1`, which is now stale by however many
+            // commits fell back to this slot-write path in between.
+            // Advance just the sequence counter, not `tail` -- no bytes
+            // were written to the log region by this commit, so the
+            // writer's physical append position must not move. This is
+            // the same gap `checkpointRedoLog`'s own `pinned_below`
+            // branch closes via `Writer.initAt` when it, too, consumes a
+            // sequence without logging it.
+            self.redo.?.writer.last_sequence = checkpoint.commit_sequence;
         }
         self.publishCommittedSequenceToInode();
     }
