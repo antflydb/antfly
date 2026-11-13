@@ -28617,6 +28617,116 @@ test "lite redo log ride-along commit is lost on a crash before its sync; the du
     // right sequence).
 }
 
+// Writer-race investigation (docs/design/lite-performance/
+// lite-single-commit-write-path.md §8/§9): reproduces the "two commits
+// overlapping on one NativeFile" symptom the add-index crash sweeps hit
+// (SequenceOutOfOrder, surfacing as the far less specific OutcomeUnknown)
+// without any concurrency at all -- it is purely sequential, single-fiber,
+// single-thread. The real mechanism: `NativeFile.sync()`'s
+// `durable_header`-flush fallback (`if (self.durable_header != null) try
+// self.publishCheckpoint(self.activeCheckpoint(), ...)`), reached by
+// `commitTransactionWithDurability`'s own `else try self.sync();` branch
+// whenever a commit's own `apply` stages nothing new (`changed == false`),
+// re-publishes whatever `commit_sequence` is currently in `self.header` --
+// which, right after a ride-along commit, is a sequence that commit
+// already appended to the log (but never synced). Before the fix,
+// `publishCheckpoint`'s redo branch always called `redo.appendRecord`
+// unconditionally, re-logging that same sequence a second time and
+// tripping `redo_log.Writer.append`'s own `commit_sequence == last_sequence
+// + 1` continuity check.
+test "lite redo log a commit that stages nothing still durably flushes a pending ride-along without re-appending its sequence" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-republish.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+
+    // A durable baseline commit.
+    try file.beginTransaction();
+    try file.putDocument("base-doc", "base");
+    try file.commitTransaction();
+
+    // A ride-along (non-durable) commit: appends its own record to the
+    // log (never synced) and captures `durable_header` -- the checkpoint
+    // from just before this commit, which the *next* durable publish
+    // restores `self.header` to before republishing on top of it (§3.2a).
+    try file.beginTransaction();
+    try file.putDocument("ride-along-doc", "pending");
+    try file.commitTransactionWithDurability(false, null);
+    try std.testing.expect(file.durable_header != null);
+    const pending_sequence = file.activeCheckpoint().commit_sequence;
+    try std.testing.expectEqual(pending_sequence, file.redo.?.writer.last_sequence.?);
+
+    // A durability barrier outside any transaction -- `Store.sync()`/
+    // `syncIndexContents()`'s own path, and exactly what
+    // `commitTransactionWithDurability`'s `else try self.sync();` branch
+    // calls whenever a commit's own apply stages nothing new
+    // (`changed == false`). Must still flush the ride-along above, since
+    // this is the first durability barrier since it landed. Before the
+    // fix, this failed: `error.OutcomeUnknown` (wrapping
+    // `redo_log.Writer.append`'s `error.SequenceOutOfOrder`, since
+    // `publishCheckpoint` tried to re-append `pending_sequence` while the
+    // writer's own `last_sequence` was already `pending_sequence`).
+    try file.sync();
+
+    // The ride-along's sequence is now durable -- appended exactly once,
+    // not twice -- and the pending durable_header baseline is consumed.
+    try std.testing.expectEqual(@as(?u64, pending_sequence), file.redo.?.writer.last_sequence);
+    try std.testing.expectEqual(pending_sequence, file.redo.?.durable_sequence);
+    try std.testing.expect(file.durable_header == null);
+
+    // A fresh reopen proves the ride-along data actually reached disk
+    // durably, not just the in-memory header.
+    file.close();
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    try std.testing.expectEqual(pending_sequence, reopened.redo.?.durable_sequence);
+    const kept = (try reopened.getDocumentAlloc(a, "ride-along-doc")).?;
+    defer a.free(kept);
+    try std.testing.expectEqualStrings("pending", kept);
+}
+
+// Writer-race investigation, continued: the legacy (`use_redo_log = false`)
+// path never fails this way, because its own `publishCheckpoint` branch
+// just rewrites the same checkpoint slot and resyncs -- idempotent, no
+// continuity counter to violate. This is a positive control showing the
+// legacy path hides the defect rather than being immune to the underlying
+// "republish an already-published checkpoint" pattern.
+test "lite legacy (non-redo-log) commit tolerates republishing an unchanged checkpoint" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "legacy-republish.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{});
+
+    try file.beginTransaction();
+    try file.putDocument("base-doc", "base");
+    try file.commitTransaction();
+
+    try file.beginTransaction();
+    try file.putDocument("ride-along-doc", "pending");
+    try file.commitTransactionWithDurability(false, null);
+    try std.testing.expect(file.durable_header != null);
+
+    // A durability barrier outside any transaction; must still flush the
+    // pending durable_header above -- and, unlike the redo-log case, this
+    // has always worked, since the legacy publish path is a plain
+    // idempotent slot rewrite.
+    try file.sync();
+    try std.testing.expect(file.durable_header == null);
+
+    file.close();
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    const kept = (try reopened.getDocumentAlloc(a, "ride-along-doc")).?;
+    defer a.free(kept);
+    try std.testing.expectEqualStrings("pending", kept);
+}
+
 test "lite redo log recovery rejects a corrupted (not merely torn) log record" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
