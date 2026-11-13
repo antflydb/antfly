@@ -11856,91 +11856,16 @@ pub const NativeFile = struct {
         return self.getDocumentsAtCheckpointWithState(allocator, temporary, checkpoint, keys, buffers, values, &state);
     }
 
-    /// Reuse bounded native working storage independently of the result arena.
-    ///
-    /// Regression: the real tree walk this delegates to
-    /// (`readBatchAtCheckpoint` -> `resolveBatchReferences` ->
-    /// `readDocumentBatchWithPath`) has no overlay knowledge at all -- it
-    /// resolves every key to a real B-tree page reference or 0 ("not
-    /// found"), never consulting `SharedRedoOverlay`. A key whose only
-    /// version lives in the redo-log overlay (committed, not yet folded
-    /// into a real page by `checkpointRedoLog`) therefore always resolves
-    /// as absent here, even though the single-key `getDocumentAtCheckpointAlloc`
-    /// (which checks `redoOverlayEntry` first) finds it immediately on
-    /// the very same handle. Found as derived catch-up's own document
-    /// read (`document_collectors.zig`'s `txn.getManySorted`, which
-    /// bottoms out here) reporting `error.ReplayDocumentNotVisible` for a
-    /// document the replay-journal scan -- already overlay-aware, via
-    /// `docstore.Cursor` -- had just found moments earlier in the same
-    /// catch-up pass.
-    ///
-    /// Fixed by resolving every key's overlay entry directly first (the
-    /// same primitive the single-key path already trusts); only keys
-    /// that come back genuinely absent from the overlay go through the
-    /// real batch/tree path below, same as before this fix. A live
-    /// tombstone in the overlay stays correctly absent (`values[i]`
-    /// stays null) without ever consulting the tree, which may still
-    /// hold a stale, now-superseded page for that key.
+    /// Reuse bounded native working storage independently of the result
+    /// arena. §9.7c (ReadView): `readBatchAtCheckpoint` now runs its own
+    /// overlay pre-pass internally (shared with every score-batch read
+    /// too), so this is a thin wrapper again -- the per-site pre-pass
+    /// that used to live here (resolving each key's overlay entry
+    /// directly, only sending genuinely-absent keys through the real
+    /// batch/tree path) has moved down into the one place every batch
+    /// read goes through.
     pub fn getDocumentsAtCheckpointWithState(self: *NativeFile, allocator: Allocator, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, state: *DocumentBatchReadState) !void {
-        if (self.redo == null or keys.len == 0) {
-            return self.readBatchAtCheckpoint(allocator, temporary, checkpoint, keys, buffers, values, @as(?ScoreSink, null), state, null, false);
-        }
-        if (buffers) |out| if (out.len != keys.len) return error.InvalidBatch;
-        if (keys.len != values.len) return error.InvalidBatch;
-        @memset(values, null);
-        errdefer {
-            if (buffers == null) for (values) |value| if (value) |bytes| allocator.free(bytes);
-            @memset(values, null);
-        }
-
-        const remaining_keys = try temporary.alloc([]const u8, keys.len);
-        defer temporary.free(remaining_keys);
-        const remaining_positions = try temporary.alloc(usize, keys.len);
-        defer temporary.free(remaining_positions);
-        var remaining_count: usize = 0;
-        for (keys, 0..) |key, i| {
-            if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
-            const entry = (try self.redoOverlayEntry(.documents, checkpoint, key)) orelse {
-                remaining_keys[remaining_count] = key;
-                remaining_positions[remaining_count] = i;
-                remaining_count += 1;
-                continue;
-            };
-            defer self.allocator.free(entry.value);
-            if (entry.is_delete) continue;
-            if (entry.external_value_root_page != 0) {
-                const resolved_value = try self.readValuePagesAtCheckpointAlloc(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint);
-                if (buffers) |bufs| {
-                    defer allocator.free(resolved_value);
-                    if (resolved_value.len > bufs[i].len) return error.BufferTooSmall;
-                    @memcpy(bufs[i][0..resolved_value.len], resolved_value);
-                    values[i] = bufs[i][0..resolved_value.len];
-                } else {
-                    values[i] = resolved_value;
-                }
-            } else if (buffers) |bufs| {
-                if (entry.value.len > bufs[i].len) return error.BufferTooSmall;
-                @memcpy(bufs[i][0..entry.value.len], entry.value);
-                values[i] = bufs[i][0..entry.value.len];
-            } else {
-                values[i] = try allocator.dupe(u8, entry.value);
-            }
-        }
-        if (remaining_count == 0) return;
-
-        const sub_keys = remaining_keys[0..remaining_count];
-        const sub_positions = remaining_positions[0..remaining_count];
-        const sub_values = try temporary.alloc(?[]const u8, remaining_count);
-        defer temporary.free(sub_values);
-        @memset(sub_values, null);
-        const sub_buffers: ?[]const []u8 = if (buffers) |bufs| blk: {
-            const filtered = try temporary.alloc([]u8, remaining_count);
-            for (sub_positions, 0..) |orig_i, j| filtered[j] = bufs[orig_i];
-            break :blk filtered;
-        } else null;
-        defer if (sub_buffers) |filtered| temporary.free(filtered);
-        try self.readBatchAtCheckpoint(allocator, temporary, checkpoint, sub_keys, sub_buffers, sub_values, @as(?ScoreSink, null), state, null, false);
-        for (sub_positions, sub_values) |orig_i, v| values[orig_i] = v;
+        return self.readBatchAtCheckpoint(allocator, temporary, checkpoint, keys, buffers, values, @as(?ScoreSink, null), state, null, false);
     }
 
     /// Fixed-width scores are decoded while the authenticated record is borrowed.
@@ -12005,10 +11930,15 @@ pub const NativeFile = struct {
         }
         defer state.resolved = retained;
         const identity = ReadIdentity{ .canonical = canonical_identity, .namespace = namespace };
-        if (checkpoint.document_index_root_page == 0) {
-            for (0..read_keys.len) |i| sink.write(sink.context, i, null);
-            return;
-        }
+        // §9.7c (ReadView): this used to short-circuit straight to "not
+        // found" for every key whenever the physical tree was empty,
+        // without ever consulting the overlay -- wrong whenever a
+        // graph-metric score document was logged but not yet folded by
+        // checkpointRedoLog (the tree can be legitimately empty while
+        // the overlay already holds every score this call is for).
+        // `readBatchAtCheckpoint` below now has its own overlay-aware
+        // version of this same empty-tree case, so there is no need for
+        // a second one here; always delegate to it.
         // Owned physical keys and decoded values survive scope detach. A hit
         // needs no namespace reconstruction, record reader, or temporary arena.
         if (state.binding) |binding| if (state.resolved) |resolved| {
@@ -12023,6 +11953,25 @@ pub const NativeFile = struct {
             }
         };
         return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, read_keys, null, &.{}, @as(?CompleteScoreSink, sink), state, identity, true);
+    }
+
+    /// §9.7c (ReadView): decode an overlay entry's score the same way
+    /// `readBatchRecord`'s own `wants_score` branch decodes a real page's
+    /// -- a fixed 8-byte `f64`, inline or through one external-value-chain
+    /// read. `null` for a tombstone (consistent with `readBatchRecord`'s
+    /// own `entry.is_delete` handling); any other mismatched length is
+    /// the same `error.InvalidGraphMetricScore` a real page's own
+    /// corruption would raise.
+    fn scoreFromCatalogEntry(self: *NativeFile, checkpoint: CheckpointSlot, entry: CatalogEntry) !?f64 {
+        if (entry.is_delete) return null;
+        const length = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+        if (length != 8) return error.InvalidGraphMetricScore;
+        var raw: [8]u8 = undefined;
+        const score_bytes = if (entry.external_value_root_page != 0) blk: {
+            try self.readValuePagesRangeInto(entry.external_value_root_page, 8, 0, &raw, checkpoint);
+            break :blk &raw;
+        } else entry.value;
+        return try decodeScore(score_bytes);
     }
 
     // Keep record and external-score reads inside the same recovery boundary.
@@ -12070,8 +12019,88 @@ pub const NativeFile = struct {
             if (buffers == null) for (values) |value| if (value) |bytes| allocator.free(bytes);
             @memset(values, null);
         }
+        // §9.7c (ReadView): the one overlay-resolution step every batch
+        // read this function serves shares -- plain value gets
+        // (`getDocumentsAtCheckpointWithState`) and every score-batch
+        // variant (`visitScoresAtCheckpointWithState` and siblings)
+        // alike. Previously only the value path had its own, separate
+        // pre-pass (`getDocumentsAtCheckpointWithState`'s own wrapper,
+        // now folded in here and removed there); every score-reading
+        // caller went straight to the raw tree walk below with no
+        // overlay knowledge at all, so a graph-metric score document
+        // logged but not yet folded by `checkpointRedoLog` was
+        // invisible to a score-batch read even though a plain `get()`
+        // on the same key found it immediately.
+        //
+        // A key found here is fully resolved and delivered now, then
+        // `skip[i]` keeps the tree walk/caching logic below from ever
+        // touching it again -- including `resolveBatchReferences`'
+        // own (now simply wasted, not wrong) tree lookup for it. This
+        // does mean a batch that touches overlay content can never
+        // reach `decoded_ready = true` for the score cache (`captured`
+        // can never reach `keys.len` while any key is skipped) -- a
+        // bounded performance cost, not a correctness one: the cache's
+        // own checkpoint-keyed `matches`/`matchesPrepared` check already
+        // means a cached, fully-decoded batch can never silently reflect
+        // a stale overlay state, since `checkpoint.commit_sequence`
+        // advances on every commit, including one that only diverts
+        // into the overlay (`NativeFile.committedSequence`'s own doc
+        // comment).
+        var skip: []bool = &.{};
+        defer temporary.free(skip);
+        // Cheap, allocation-free out: an empty documents-root overlay
+        // (the common case away from a live redo-log write window --
+        // nothing uncheckpointed at all) means nothing below could ever
+        // match, so skip the per-key lookups and the `skip` array
+        // itself entirely. Matters beyond a pure optimization: several
+        // memory-budget/OOM-injection tests assert an exact allocation
+        // count for this function on a file that happens to have
+        // `use_redo_log` on but nothing ever diverted into the overlay
+        // during the assertion in question -- this keeps this function
+        // allocation-for-allocation identical to before this fix
+        // whenever there is genuinely nothing for it to find.
+        if (self.redo != null and keys.len != 0 and
+            self.redo.?.shared.count(self.runtimeIo(), @backingInt(TransactionWrites.Root.documents)) != 0)
+        {
+            skip = try temporary.alloc(bool, keys.len);
+            @memset(skip, false);
+            for (keys, 0..) |key, i| {
+                const full_key = if (namespace.len == 0) key else blk: {
+                    const buf = try temporary.alloc(u8, namespace.len + key.len);
+                    @memcpy(buf[0..namespace.len], namespace);
+                    @memcpy(buf[namespace.len..], key);
+                    break :blk buf;
+                };
+                defer if (namespace.len != 0) temporary.free(full_key);
+                const entry = (try self.redoOverlayEntry(.documents, checkpoint, full_key)) orelse continue;
+                defer self.allocator.free(entry.value);
+                skip[i] = true;
+                if (comptime score_reads) {
+                    const score = try self.scoreFromCatalogEntry(checkpoint, entry);
+                    if (score) |s| {
+                        deliverBatchScore(scores, i, s);
+                    } else if (complete and scores != null) deliverBatchScore(scores, i, null);
+                } else if (entry.is_delete) {
+                    // values[i] already null from the @memset above.
+                } else if (buffers) |out| {
+                    const length = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+                    if (length > out[i].len) return error.BufferTooSmall;
+                    if (entry.external_value_root_page != 0) {
+                        try self.readValuePagesRangeInto(entry.external_value_root_page, length, 0, out[i][0..length], checkpoint);
+                    } else @memcpy(out[i][0..length], entry.value);
+                    values[i] = out[i][0..length];
+                } else {
+                    values[i] = if (entry.external_value_root_page != 0)
+                        try self.readValuePagesAtCheckpointAlloc(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint)
+                    else
+                        try allocator.dupe(u8, entry.value);
+                }
+            }
+        }
         if (keys.len == 0 or checkpoint.document_index_root_page == 0) {
-            if (complete and scores != null) for (0..keys.len) |i| deliverBatchScore(scores, i, null);
+            if (complete and scores != null) for (0..keys.len) |i| {
+                if (skip.len == 0 or !skip[i]) deliverBatchScore(scores, i, null);
+            };
             return;
         }
         const use_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
@@ -12149,6 +12178,13 @@ pub const NativeFile = struct {
         var position: usize = 0;
         while (position < keys.len) {
             const i = if (order) |positions| positions[position] else position;
+            if (skip.len != 0 and skip[i]) {
+                // Already fully resolved and delivered from the overlay
+                // above; deliberately never touches `capture`/`captured`
+                // (see this function's own overlay-pre-pass comment).
+                position += 1;
+                continue;
+            }
             const reference = references[i];
             if (reference == 0) {
                 if (capture) {
@@ -29724,6 +29760,89 @@ test "lite ReadView: get, batch get, and a catalog range scan across put, overwr
 
         try checkScan(&view, a, &.{ "k/alpha", "k/beta", "k/delta" }, &.{ "one", "two-updated", "four" });
     }
+}
+
+test "lite redo log score-batch read sees a graph-metric score document logged before any checkpoint" {
+    // §9.7c (ReadView): visitScoresAtCheckpointWithState (and its
+    // siblings -- readDecodedScoresAtCheckpointWithState,
+    // visitCompleteScoresAtCheckpointWithState, the prepared/canonical
+    // variants) used to call readBatchAtCheckpoint with no overlay
+    // knowledge at all: a graph-metric score document logged but not
+    // yet folded by checkpointRedoLog was invisible to a score-batch
+    // read even though a plain get() on the same key found it
+    // immediately. Confirms the fix directly, through the real public
+    // entry point a graph query uses.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-score-batch.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer file.close();
+
+    const scoreBytes = struct {
+        fn run(value: f64) [8]u8 {
+            var out: [8]u8 = undefined;
+            std.mem.writeInt(u64, &out, @bitCast(value), .little);
+            return out;
+        }
+    }.run;
+    const alpha_v1 = scoreBytes(3);
+    const beta_v1 = scoreBytes(5);
+    const gamma_v1 = scoreBytes(7);
+
+    // alpha/beta/gamma land through the redo overlay -- no checkpoint yet.
+    try file.beginTransaction();
+    try file.putDocument("alpha", &alpha_v1);
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("beta", &beta_v1);
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("gamma", &gamma_v1);
+    try file.commitTransaction();
+
+    var state: DocumentBatchReadState = .{};
+    defer state.deinit();
+    var scores: [3]?f64 = undefined;
+    try file.getScoresAtCheckpointWithState(a, file.activeCheckpoint(), &.{ "alpha", "beta", "gamma" }, &scores, &state);
+    try std.testing.expectEqualSlices(?f64, &.{ 3, 5, 7 }, &scores);
+
+    // Checkpoint: the scores move into the real tree. A score-batch
+    // read must see exactly the same results, now page-sourced instead
+    // of overlay-sourced.
+    try file.checkpointRedoLog();
+    try file.getScoresAtCheckpointWithState(a, file.activeCheckpoint(), &.{ "alpha", "beta", "gamma" }, &scores, &state);
+    try std.testing.expectEqualSlices(?f64, &.{ 3, 5, 7 }, &scores);
+
+    // Overwrite beta and delete gamma (both now overlay-only mutations
+    // shadowing tree-resident keys); insert delta (overlay-only, brand
+    // new, sorts between beta and gamma).
+    const beta_v2 = scoreBytes(11);
+    try file.beginTransaction();
+    try file.putDocument("beta", &beta_v2);
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.deleteDocument("gamma");
+    try file.commitTransaction();
+    const delta_v1 = scoreBytes(13);
+    try file.beginTransaction();
+    try file.putDocument("delta", &delta_v1);
+    try file.commitTransaction();
+
+    var scores4: [4]?f64 = undefined;
+    try file.getScoresAtCheckpointWithState(a, file.activeCheckpoint(), &.{ "alpha", "beta", "delta", "gamma" }, &scores4, &state);
+    try std.testing.expectEqualSlices(?f64, &.{ 3, 11, 13, null }, &scores4);
+
+    // The complete-sink variant (used by prepared/canonical score
+    // reads) must agree.
+    var decoded: [4]f64 = undefined;
+    try file.readDecodedScoresAtCheckpointWithState(a, file.activeCheckpoint(), &.{ "alpha", "beta", "delta", "gamma" }, &decoded, &state);
+    try std.testing.expectEqual(@as(f64, 3), decoded[0]);
+    try std.testing.expectEqual(@as(f64, 11), decoded[1]);
+    try std.testing.expectEqual(@as(f64, 13), decoded[2]);
+    try std.testing.expect(std.math.isNan(decoded[3]));
 }
 
 test "lite redo log vacuum captures uncheckpointed overlay and demotes the file rather than corrupting it" {
