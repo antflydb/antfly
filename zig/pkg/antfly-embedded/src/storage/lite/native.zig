@@ -16411,7 +16411,41 @@ pub const NativeFile = struct {
                     // Only a page that is neither already counted nor one
                     // of the ledger's own structural pages is a real,
                     // previously-unretained continuation page.
-                    if (state.count(page_id) == 0 and !state.isSelfDescribingPage(page_id)) try state.retain(page_id);
+                    //
+                    // A page-shaped exception is not always a single
+                    // external-value continuation page: a diverting
+                    // commit's own `pack_records` path (`PageAllocator
+                    // .writeRecord`) can also flush a shared
+                    // `record_bundle` page here (`flushRecords`, called
+                    // from `takeAllPagesAlloc`'s own drain), bundling
+                    // several packed document/catalog records that each
+                    // need their own retain -- never touched by
+                    // `retainRecord` while diverting, same as a plain
+                    // continuation page. A single blind `retain()` left
+                    // every bundled record but the first invisible to the
+                    // ledger (count stuck at 1 regardless of how many
+                    // packed records the page actually holds), so a later
+                    // `release()` on just one of them freed the whole
+                    // page while the others were still live --
+                    // reproduced by "lite replay cleanup commits bounded
+                    // chunks isolates namespaces and retries" as
+                    // `validateIndexedOwnership`'s own reachability walk
+                    // expecting many more references than the ledger had.
+                    if (state.count(page_id) == 0 and !state.isSelfDescribingPage(page_id)) {
+                        const raw = try self.readPhysicalPageAlloc(self.allocator, page_id, self.activeCheckpoint());
+                        defer self.allocator.free(raw);
+                        if (raw.len > page_header_size and raw[4] == @backingInt(PageKind.record_bundle)) {
+                            const bundle_payload = try decodePagePayload(raw, .record_bundle);
+                            var offset: usize = 0;
+                            while (offset < bundle_payload.len) {
+                                const record = try packedRecordAtOffset(bundle_payload, offset);
+                                try state.retain(page_id);
+                                offset += 4 + record.bytes.len;
+                            }
+                        } else {
+                            try state.retain(page_id);
+                        }
+                    }
                 }
             }
         }
