@@ -10182,6 +10182,42 @@ pub const NativeFile = struct {
         try self.finishCatalogAppend(root, key);
         const checkpoint = self.activeCheckpoint();
         if (self.stagedEntry(if (root == .metadata) .metadata else .index, key)) |entry| return if (entry.is_delete) null else entry;
+        // §9.7c (ReadView): the overlay-blind-read bug class, found three
+        // times already at other call sites (docstore.Cursor,
+        // getDocumentsAtCheckpointWithState, readBackingPages's read-ahead
+        // window) -- this is a fourth. A key whose current value lives
+        // only in the redo-log overlay (logged by an earlier commit via
+        // appendLogicalMutation, not yet folded into the real tree by
+        // checkpointRedoLog) falls straight through to `lookupCatalogPage`
+        // below, which only ever sees the real tree -- returning null (or
+        // a stale, pre-overlay value) for a key that is very much live.
+        // `stageCatalogAppend`'s own caller then treats that as "nothing to
+        // append to" and builds its new suffix on the wrong base, silently
+        // discarding (or duplicating, if the stale on-disk value is itself
+        // a shorter prefix of the live one) whatever the overlay held.
+        // Checked here, before the real-tree fallback, so every caller of
+        // this function (append and rename) sees exactly what a plain
+        // `get()` on the same key already would. The overlay returns an
+        // owned value; copied into `scratch` (bounded the same way the
+        // real-tree path already is, by `maxPagePayloadBytes` <=
+        // scratch.len) so this function's own ownership contract -- every
+        // returned `CatalogEntry.value` borrows from either `scratch` or
+        // `stagedEntry`'s map, never something the caller must free --
+        // stays the same for both existing callers.
+        if (try self.redoOverlayEntry(if (root == .metadata) .metadata else .index, checkpoint, key)) |overlay_entry| {
+            defer self.allocator.free(overlay_entry.value);
+            if (overlay_entry.is_delete) return null;
+            if (overlay_entry.external_value_root_page != 0) return .{
+                .previous_page = 0,
+                .key = key,
+                .value = &.{},
+                .external_value_root_page = overlay_entry.external_value_root_page,
+                .external_value_len = overlay_entry.external_value_len,
+            };
+            if (overlay_entry.value.len > scratch.len) return error.RecordTooLarge;
+            @memcpy(scratch[0..overlay_entry.value.len], overlay_entry.value);
+            return .{ .previous_page = 0, .key = key, .value = scratch[0..overlay_entry.value.len] };
+        }
         const page = (try self.lookupCatalogPage(checkpoint, root, key)) orelse return null;
         const payload = try decodePagePayload(try self.readPageInto(page, checkpoint, scratch), .catalog);
         const entry = try decodeCatalogEntry(payload);
