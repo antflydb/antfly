@@ -44,7 +44,7 @@ struct SetupChecklist: View {
           "You can test recording without Accessibility access. To dictate into another app, enable access and focus its text field first."
         )
         .font(.caption).foregroundStyle(.secondary)
-      }.disabled(store.state != .idle || store.working)
+      }.disabled(store.state != .idle || store.settingsLocked)
     } label: {
       Label("Getting ready", systemImage: "checklist")
     }

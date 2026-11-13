@@ -6,13 +6,25 @@ import AVFoundation
 import DictationCore
 import SwiftUI
 
+struct PreparedModelSetup: Sendable {
+  let configuration: Configuration
+  let result: ModelSetupResult
+}
+
 @MainActor final class Store: ObservableObject {
   @Published var config = Configuration() { didSet { updateSettingsDirtyState() } }
   let runtime: ManagedRuntime
+  private let managedAppleSupport: @MainActor () -> Bool
+  var canUseManagedAppleSpeech: Bool { managedAppleSupport() }
   private var runtimeModeTask: Task<Void, Never>?
   private(set) var modelSetupTask: Task<Void, Never>?
   @Published private(set) var modelSetup = ModelSetupState.idle
   var settingUpModel: Bool { modelSetup.isRunning }
+  @Published private(set) var hasPendingSetupCommit = false
+  var settingsLocked: Bool { working || hasPendingSetupCommit }
+  private var pendingSetupCommit: (prepared: PreparedModelSetup, baseline: Configuration)?
+  private var setupCleanupResolution = CleanupResolution.requireCompatible
+  private var setupProcessingResolution = ProcessingResolution.requireCompatible
   @Published var history: [HistoryEntry] = []
   @Published var state = RecordingState.idle
   @Published var phase = DictationPhase.idle { didSet { updateOverlay() } }
@@ -165,6 +177,7 @@ import SwiftUI
       try await RecordingArchive.stage($0, in: $1)
     },
     clientFactory: (@Sendable (Configuration) throws -> AntflyClient)? = nil,
+    managedAppleSupport: (@MainActor () -> Bool)? = nil,
     shortcutManager: (any ShortcutManaging)? = nil,
     originalPaster: (
       @MainActor (String, @escaping @MainActor () throws -> Void) async throws -> Void
@@ -198,7 +211,9 @@ import SwiftUI
       ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
       .appendingPathComponent("AntflyDictation")
     self.directory = directory
-    runtime = ManagedRuntime(directory: directory)
+    let managedRuntime = ManagedRuntime(directory: directory)
+    runtime = managedRuntime
+    self.managedAppleSupport = managedAppleSupport ?? { managedRuntime.supportsAppleSpeech }
     archive = HistoryArchive(
       file: directory.appendingPathComponent("history.json"), beforeWrite: historyArchiveBeforeWrite
     )
@@ -339,7 +354,7 @@ import SwiftUI
     shortcutStatus = "Shortcut active: " + shortcut.label
   }
   func refreshShortcutAccess() {
-    guard state == .idle, !capturingShortcut else { return }
+    guard state == .idle, !hasPendingSetupCommit, !capturingShortcut else { return }
     if shortcutSetupPending {
       if keyboardAccess() { completeShortcutSetup() }
       return
@@ -358,7 +373,7 @@ import SwiftUI
   }
 
   func setUpShortcut() {
-    guard state == .idle, !working, !capturingShortcut else { return }
+    guard state == .idle, !settingsLocked, !capturingShortcut else { return }
     shortcutSetupPending = true
     if keyboardAccess() {
       completeShortcutSetup()
@@ -399,11 +414,7 @@ import SwiftUI
           hotkey?.unregister()
           registered = nil
         }
-        if let previousData {
-          try? previousData.write(to: settingsFile, options: .atomic)
-        } else {
-          try? FileManager.default.removeItem(at: settingsFile)
-        }
+        // AtomicSettingsFile leaves the destination unchanged on failure.
         throw error
       }
       savedConfiguration = saved
@@ -423,34 +434,38 @@ import SwiftUI
   }
 
   private func write(_ data: Data, to url: URL) throws {
-    try data.write(to: url, options: .atomic)
-    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    try AtomicSettingsFile.write(data, to: url)
   }
-  private func persistSettings() throws -> String? {
-    config = try config.validated()
+  private func persistSettings(_ proposed: Configuration? = nil) throws -> String? {
+    let candidate = try (proposed ?? config).validated()
     let recoveringSettings = settingsLoadError != nil
-    if recoveringSettings, config.retainHistory,
+    var recoveredHistory: [HistoryEntry]?
+    if recoveringSettings, candidate.retainHistory,
       FileManager.default.fileExists(atPath: historyFile.path)
     {
-      history = HistoryArchive.bounded(
+      recoveredHistory = HistoryArchive.bounded(
         try JSONDecoder().decode([HistoryEntry].self, from: Data(contentsOf: historyFile)))
-      historyRevision += 1
     }
-    // Unloaded credentials are different from a token explicitly cleared by the user.
-    if !config.usesManagedRuntime {
-      if credentialOrigin != config.server && !credentialEdited {
-        loadCredential(for: config.server)
+    if !candidate.usesManagedRuntime {
+      if credentialOrigin != candidate.server && !credentialEdited {
+        loadCredential(for: candidate.server)
       }
-      try credentialWriter(token, config.server)
-      credentialOrigin = config.server
+      try credentialWriter(token, candidate.server)
+      credentialOrigin = candidate.server
       credentialEdited = false
     }
-    try write(JSONEncoder().encode(config), to: settingsFile)
-    savedConfiguration = config
+    // Publish to disk before activating the candidate or applying retention changes.
+    try write(JSONEncoder().encode(candidate), to: settingsFile)
+    config = candidate
+    savedConfiguration = candidate
     updateSettingsDirtyState()
-    var shortcutIssue: String?
+    if let recoveredHistory {
+      history = recoveredHistory
+      historyRevision += 1
+    }
+    var applicationWarning: String?
     do { try registerShortcut() } catch {
-      shortcutIssue = error.localizedDescription
+      applicationWarning = error.localizedDescription
       shortcutStatus = error.localizedDescription
     }
     settingsLoadError = nil
@@ -488,15 +503,22 @@ import SwiftUI
         }
       }
     }
-    if !config.retainAudio { try removeAudio() }
-    return shortcutIssue
+    if !config.retainAudio {
+      do { try removeAudio() } catch {
+        let warning =
+          "Settings were saved, but retained audio could not be removed: "
+          + error.localizedDescription
+        applicationWarning = [applicationWarning, warning].compactMap { $0 }.joined(separator: " ")
+      }
+    }
+    return applicationWarning
   }
   func save() {
-    guard !terminating else { return }
+    guard !terminating, !hasPendingSetupCommit else { return }
     perform {
       let issue = try self.persistSettings()
       self.message =
-        "Settings saved locally." + (issue.map { " Shortcut needs attention: " + $0 } ?? "")
+        "Settings saved locally." + (issue.map { " Needs attention: " + $0 } ?? "")
     }
   }
   private func perform(_ body: () throws -> Void) {
@@ -995,9 +1017,9 @@ import SwiftUI
         models = catalog.data
         if report { discovery = data }
         discoveryState = .current
-        if state == .idle, !working, modelSetup == .idle {
+        if state == .idle, !settingsLocked, modelSetup == .idle {
           config.selectAvailableManagedTranscriber(
-            from: catalog, supportsApple: runtime.supportsAppleSpeech)
+            from: catalog, supportsApple: canUseManagedAppleSpeech)
         }
         if report { message = engineReadiness.message }
       } catch {
@@ -1023,11 +1045,24 @@ import SwiftUI
       refreshModels()
     }
   }
+  func selectAutomaticTranscriber(presetID: String) {
+    guard state == .idle, !settingsLocked, !terminating,
+      let index = config.presets.firstIndex(where: { $0.id == presetID })
+    else { return }
+    // Explicit user intent supersedes suppression following failed/canceled setup.
+    modelSetup = .idle
+    config.presets[index].automaticallySelectLocalTranscriber = true
+    config.presets[index].model = "transcribers/whisper"
+    config.presets[index].transcriberRoute = .gateway
+    refreshModels()
+  }
   // The operation owns all status, cancellation and commit transitions.
   func runModelSetup(
-    _ operation: ModelSetupOperation, action: @escaping @MainActor () async throws -> Void
+    _ operation: ModelSetupOperation,
+    action: @escaping @MainActor () async throws -> PreparedModelSetup
   ) {
-    guard !working, !terminating, state == .idle, config.usesManagedRuntime else { return }
+    guard !settingsLocked, !terminating, state == .idle, config.usesManagedRuntime else { return }
+    let baseline = config
     let previousDiscovery = discoveryTask
     previousDiscovery?.cancel()
     discoveryGeneration = UUID()
@@ -1045,13 +1080,20 @@ import SwiftUI
       do {
         await previousDiscovery?.value
         try Task.checkCancellation()
-        try await action()
+        let prepared = try await action()
         try Task.checkCancellation()
         guard !terminating else { throw CancellationError() }
-        _ = try persistSettings()
-        modelSetup = .ready(operation)
+        guard prepared.result.operation == operation, prepared.configuration.usesManagedRuntime
+        else {
+          throw DictationError.invalid("Invalid prepared setup result.")
+        }
+        pendingSetupCommit = (prepared, baseline)
+        hasPendingSetupCommit = true
+        commitPreparedSetup()
       } catch let conflict as ManagedCleanupConflict {
         modelSetup = .blocked(operation, conflict)
+      } catch let conflict as ManagedProcessingConflict {
+        modelSetup = .blockedProcessing(operation, conflict)
       } catch is CancellationError {
         modelSetup = .canceled(operation)
         if !terminating, config.usesManagedRuntime { runtime.start() }
@@ -1061,6 +1103,39 @@ import SwiftUI
       message = modelSetup.message
     }
   }
+  private func commitPreparedSetup() {
+    guard let pending = pendingSetupCommit else { return }
+    guard config == pending.baseline else {
+      modelSetup = .installedNotSaved(
+        pending.prepared.result,
+        "Settings changed during setup. Discard the pending selection to keep those edits, then choose the engine again."
+      )
+      return
+    }
+    do {
+      let warning = try persistSettings(pending.prepared.configuration)
+      var result = pending.prepared.result
+      result.warning = warning
+      pendingSetupCommit = nil
+      hasPendingSetupCommit = false
+      modelSetup = .ready(result)
+    } catch {
+      modelSetup = .installedNotSaved(pending.prepared.result, error.localizedDescription)
+    }
+  }
+  func savePendingSetup() {
+    guard !working, !terminating, state == .idle, !capturingShortcut else { return }
+    commitPreparedSetup()
+    message = modelSetup.message
+    if !hasPendingSetupCommit { refreshModels() }
+  }
+  func discardPendingSetup() {
+    guard !working, !terminating, state == .idle, let pending = pendingSetupCommit else { return }
+    pendingSetupCommit = nil
+    hasPendingSetupCommit = false
+    modelSetup = .installedNotSelected(pending.prepared.result)
+    message = modelSetup.message
+  }
   private func setupStage(_ operation: ModelSetupOperation, _ stage: String) {
     modelSetup = .running(operation, stage)
     message = stage
@@ -1069,13 +1144,17 @@ import SwiftUI
     modelSetupTask?.cancel()
     runtime.cancelDownload()
   }
-  func retryModelSetup(resolution: CleanupResolution = .requireCompatible) {
+  func retryModelSetup(
+    resolution: CleanupResolution? = nil, processing: ProcessingResolution? = nil
+  ) {
     guard let operation = modelSetup.operation else { return }
-    if operation == .appleSpeech {
-      useLocalApple(resolution: resolution)
-    } else {
-      installLocalWhisper(resolution: resolution)
+    if hasPendingSetupCommit {
+      savePendingSetup()
+      return
     }
+    setUpManagedSpeech(
+      operation, resolution: resolution ?? setupCleanupResolution,
+      processing: processing ?? setupProcessingResolution)
   }
   var appleSpeechLanguage: String {
     let selected = config.preset(for: nil).language.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1090,7 +1169,14 @@ import SwiftUI
     setUpManagedSpeech(.whisper, resolution: resolution)
   }
   func useLocalApple(resolution: CleanupResolution = .requireCompatible) {
-    guard runtime.supportsAppleSpeech else {
+    setUpManagedSpeech(.appleSpeech, resolution: resolution)
+  }
+  private func setUpManagedSpeech(
+    _ operation: ModelSetupOperation, resolution: CleanupResolution,
+    processing: ProcessingResolution = .requireCompatible
+  ) {
+    guard !settingsLocked, !terminating, state == .idle else { return }
+    if operation == .appleSpeech && !canUseManagedAppleSpeech {
       modelSetup = .failed(
         .appleSpeech,
         "Apple speech is unavailable in this app or macOS version. Use Whisper or an Apple-enabled external server."
@@ -1098,9 +1184,8 @@ import SwiftUI
       message = modelSetup.message
       return
     }
-    setUpManagedSpeech(.appleSpeech, resolution: resolution)
-  }
-  private func setUpManagedSpeech(_ operation: ModelSetupOperation, resolution: CleanupResolution) {
+    setupCleanupResolution = resolution
+    setupProcessingResolution = processing
     runModelSetup(operation) {
       try await self.runtime.waitUntilReady()
       let data = try await self.client().models()
@@ -1108,7 +1193,7 @@ import SwiftUI
       // Check every processor before starting downloads; user choices remain intact on failure.
       let language = self.appleSpeechLanguage
       let candidate = try self.config.selectingManagedTranscriber(
-        operation, catalog: catalog, resolution: resolution)
+        operation, catalog: catalog, resolution: resolution, processing: processing)
       if operation == .whisper {
         self.setupStage(operation, "Downloading Whisper Tiny…")
         try await self.runtime.installWhisper()
@@ -1125,7 +1210,10 @@ import SwiftUI
         try await self.client().checkAppleSpeechAssets(language: language)
       }
       try Task.checkCancellation()
-      self.config = candidate
+      return PreparedModelSetup(
+        configuration: candidate,
+        result: ModelSetupResult(
+          operation: operation, language: operation == .appleSpeech ? language : nil))
     }
   }
   func connectionChanged() {
@@ -1285,6 +1373,7 @@ import SwiftUI
     }
   }
   func publish() {
+    guard !hasPendingSetupCommit else { return }
     run {
       _ = try self.persistSettings()
       try await self.client().saveSettings(self.config)
@@ -1292,6 +1381,7 @@ import SwiftUI
     }
   }
   func download() {
+    guard !hasPendingSetupCommit else { return }
     run {
       let current = self.config
       var incoming = try await self.client().loadSettings(
@@ -1657,6 +1747,7 @@ import SwiftUI
     }
   }
   func importSettings() {
+    guard !hasPendingSetupCommit else { return }
     let panel = NSOpenPanel()
     panel.allowsMultipleSelection = false
     panel.canChooseDirectories = false

@@ -211,9 +211,19 @@ public struct Configuration: Codable, Equatable, Sendable {
       let ready =
         apple?.speechReadiness(language: presets[index].language, defaultLanguage: "en-US").isReady
         == true
+      var appleCandidate = presets[index]
+      appleCandidate.model = "transcribers/apple-speech"
+      appleCandidate.transcriberRoute = .gateway
       let selected =
-        supportsApple && ready && presets[index].hasCompatibleSharedProcessor(in: catalog)
+        supportsApple && ready && appleCandidate.hasCompatibleSharedProcessor(in: catalog)
+          && appleCandidate.supportsProcessing(with: apple)
         ? "transcribers/apple-speech" : "transcribers/whisper"
+      var selectedCandidate = presets[index]
+      selectedCandidate.model = selected
+      selectedCandidate.transcriberRoute = .gateway
+      guard selectedCandidate.supportsProcessing(with: catalog.transcriber(selected)) else {
+        continue
+      }
       if presets[index].model != selected || presets[index].transcriberRoute != .gateway {
         presets[index].model = selected
         presets[index].transcriberRoute = .gateway

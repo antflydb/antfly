@@ -594,3 +594,20 @@ automatic transcriber switch.
 The unsaved indicator is cached on configuration/credential edits. Shortcut-only
 setup updates only the saved shortcut baseline, so unrelated changes remain pending
 without serializing the full configuration during recording UI updates.
+
+Choosing **Automatic** in a preset is an explicit new selection and clears the
+suppression left by a completed, failed, or canceled setup. Automatic selection
+keeps an incremental Whisper preset on a compatible engine. An explicit switch
+to an engine without stable segments offers **Use Automatic processing for
+incompatible presets** before installation starts. Text-processor and processing
+resolutions compose, so resolving one conflict does not undo the other choice.
+
+Installation and preference saving are separate steps. New settings are written
+to a private staging file and atomically published before the app activates the
+candidate preset selection. If writing fails, the old selection stays active and
+the window offers **Retry saving settings** (without reinstalling) or **Keep
+previous selection**. Resolve that choice before editing configuration; installed
+speech assets remain available either way. Errors applying already-saved settings,
+such as shortcut permissions, are reported as warnings rather than pretending the
+settings write failed. Setup success messages retain the language actually checked,
+so changing the selected preset cannot relabel an earlier language verification.

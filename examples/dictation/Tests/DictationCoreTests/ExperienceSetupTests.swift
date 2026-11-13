@@ -51,6 +51,13 @@ private func speechCatalog(
       "data": [
         ["id": "transcribers/apple-speech", "task": "transcribe", "dictation": capabilities],
         ["id": "generators/cleanup", "task": "generate"],
+        [
+          "id": "transcribers/whisper", "task": "transcribe",
+          "dictation": [
+            "live_preview": true, "recognition_hints": true, "stable_segments": true,
+            "text_cleanup": true,
+          ],
+        ],
       ]
     ]))
 }
@@ -144,4 +151,57 @@ private func speechCatalog(
   #expect(config.presets[0].model == "transcribers/whisper")
   #expect(config.presets[0].cleanupModel == before.cleanupModel)
   #expect(config.presets[1].model == "transcribers/apple-speech")
+}
+
+@Test func changingSpeechEngineRequiresResolutionForUnsupportedIncrementalProcessing() throws {
+  var config = Configuration()
+  config.presets[0].processingStrategy = .incremental
+  config.presets[0].cleanupModel = "generators/cleanup"
+  config.presets[0].outputMode = .clean
+  config.presets[1].processingStrategy = .wholeUtterance
+  let original = config
+  let catalog = try speechCatalog()
+  #expect(throws: ManagedProcessingConflict.self) {
+    try config.selectingManagedTranscriber(.appleSpeech, catalog: catalog)
+  }
+  let candidate = try config.selectingManagedTranscriber(
+    .appleSpeech, catalog: catalog, processing: .automatic)
+  #expect(config == original)
+  #expect(candidate.presets[0].processingStrategy == .automatic)
+  #expect(
+    candidate.presets[0].outputMode == .clean
+      && candidate.presets[0].cleanupModel == "generators/cleanup")
+  #expect(candidate.presets[1].processingStrategy == .wholeUtterance)
+  for preset in candidate.presets {
+    _ = try ProcessingPlan(preset: preset, model: catalog.transcriber(preset.model))
+  }
+  let whisper = try config.selectingManagedTranscriber(.whisper, catalog: catalog)
+  #expect(whisper.presets[0].processingStrategy == .incremental)
+}
+
+@Test func automaticSelectionKeepsACompatibleIncrementalWhisperPreset() throws {
+  var config = Configuration()
+  config.presets[0].processingStrategy = .incremental
+  config.selectAvailableManagedTranscriber(from: try speechCatalog(), supportsApple: true)
+  #expect(config.presets[0].model == "transcribers/whisper")
+  #expect(config.presets[0].processingStrategy == .incremental)
+  #expect(config.presets[1].model == "transcribers/apple-speech")
+}
+
+@Test func cleanupAndProcessingResolutionsComposeWithoutDroppingUserInstructions() throws {
+  var config = Configuration()
+  config.presets[0].cleanupModel = "Qwen/raw"
+  config.presets[0].processingStrategy = .incremental
+  config.presets[0].outputMode = .clean
+  config.presets[0].instructions = "Preserve my vocabulary"
+  let catalog = try speechCatalog()
+  #expect(throws: ManagedProcessingConflict.self) {
+    try config.selectingManagedTranscriber(.appleSpeech, catalog: catalog, resolution: .bundled)
+  }
+  let candidate = try config.selectingManagedTranscriber(
+    .appleSpeech, catalog: catalog,
+    resolution: .bundled, processing: .automatic)
+  #expect(candidate.presets[0].cleanupModel == "generators/cleanup")
+  #expect(candidate.presets[0].processingStrategy == .automatic)
+  #expect(candidate.presets[0].instructions == config.presets[0].instructions)
 }

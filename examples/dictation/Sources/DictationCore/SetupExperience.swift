@@ -69,6 +69,32 @@ public enum ModelSetupOperation: String, Equatable, Sendable {
   }
 }
 
+public enum ProcessingResolution: Equatable, Sendable { case requireCompatible, automatic }
+public struct ManagedProcessingConflict: LocalizedError, Equatable, Sendable {
+  public let presets: [String]
+  public var errorDescription: String? {
+    "The selected speech engine cannot use these presets’ processing strategies: "
+      + presets.joined(separator: ", ")
+      + ". Choose Automatic processing for these presets to continue."
+  }
+}
+public struct ModelSetupResult: Equatable, Sendable {
+  public let operation: ModelSetupOperation
+  public let language: String?
+  public var warning: String?
+  public init(operation: ModelSetupOperation, language: String? = nil, warning: String? = nil) {
+    self.operation = operation
+    self.language = language
+    self.warning = warning
+  }
+  public var installationMessage: String {
+    if operation == .appleSpeech, let language {
+      return "Apple speech is installed and checked for " + language + "."
+    }
+    return operation.label + " is installed."
+  }
+}
+
 public enum CleanupResolution: Equatable, Sendable { case requireCompatible, verbatim, bundled }
 public struct ManagedCleanupConflict: LocalizedError, Equatable, Sendable {
   public let presets: [String]
@@ -83,16 +109,21 @@ public struct ManagedCleanupConflict: LocalizedError, Equatable, Sendable {
 public enum ModelSetupState: Equatable, Sendable {
   case idle
   case running(ModelSetupOperation, String)
-  case ready(ModelSetupOperation)
+  case ready(ModelSetupResult)
+  case installedNotSaved(ModelSetupResult, String)
+  case installedNotSelected(ModelSetupResult)
   case canceled(ModelSetupOperation)
   case failed(ModelSetupOperation, String)
   case blocked(ModelSetupOperation, ManagedCleanupConflict)
+  case blockedProcessing(ModelSetupOperation, ManagedProcessingConflict)
   public var operation: ModelSetupOperation? {
     switch self {
     case .idle: return nil
-    case .running(let op, _), .ready(let op), .canceled(let op), .failed(let op, _),
-      .blocked(let op, _):
+    case .running(let op, _), .canceled(let op), .failed(let op, _), .blocked(let op, _),
+      .blockedProcessing(let op, _):
       return op
+    case .ready(let result), .installedNotSaved(let result, _), .installedNotSelected(let result):
+      return result.operation
     }
   }
   public var isRunning: Bool {
@@ -103,18 +134,26 @@ public enum ModelSetupState: Equatable, Sendable {
     switch self {
     case .idle: return ""
     case .running(_, let stage): return stage
-    case .ready(let op):
-      return op == .appleSpeech
-        ? "Apple speech is installed and checked for the selected language. Try a test dictation."
-        : "Whisper is installed. Test dictation to verify recognition."
+    case .ready(let result):
+      return result.installationMessage + " Settings saved. Try a test dictation."
+        + (result.warning.map { " Needs attention: " + $0 } ?? "")
+    case .installedNotSaved(let result, let reason):
+      return result.installationMessage
+        + " Settings could not be saved; previous preset selections remain active. " + reason
+    case .installedNotSelected(let result):
+      return result.installationMessage + " Previous preset selections were kept."
     case .canceled(let op): return op.label + " setup canceled. Retry when ready."
     case .failed(let op, let error): return op.label + " setup failed: " + error
     case .blocked(_, let conflict): return conflict.localizedDescription
+    case .blockedProcessing(_, let conflict): return conflict.localizedDescription
     }
   }
 }
 
 extension Preset {
+  public func supportsProcessing(with model: DiscoveredModel?) -> Bool {
+    (try? ProcessingPlan(preset: self, model: model)) != nil
+  }
   public func hasCompatibleSharedProcessor(in catalog: ModelCatalog) -> Bool {
     let name = cleanupModel.trimmingCharacters(in: .whitespacesAndNewlines)
     if name.isEmpty { return true }
@@ -127,7 +166,8 @@ extension Configuration {
   /// Construct a candidate without modifying any presets until setup succeeds.
   public func selectingManagedTranscriber(
     _ operation: ModelSetupOperation, catalog: ModelCatalog,
-    resolution: CleanupResolution = .requireCompatible
+    resolution: CleanupResolution = .requireCompatible,
+    processing: ProcessingResolution = .requireCompatible
   ) throws -> Configuration {
     let generators = Set(
       catalog.data.filter { $0.task == "generate" && $0.id.hasPrefix("generators/") }.map(\.id))
@@ -158,6 +198,14 @@ extension Configuration {
         candidate.presets[index].outputMode = .verbatim
       }
     }
+    let model = catalog.transcriber(operation.transcriber)
+    let unsupported = candidate.presets.indices.filter {
+      !candidate.presets[$0].supportsProcessing(with: model)
+    }
+    if !unsupported.isEmpty && processing == .requireCompatible {
+      throw ManagedProcessingConflict(presets: unsupported.map { candidate.presets[$0].name })
+    }
+    for index in unsupported { candidate.presets[index].processingStrategy = .automatic }
     return try candidate.validated()
   }
 }

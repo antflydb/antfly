@@ -126,10 +126,23 @@ struct SettingsView: View {
         Text(store.phase.label)
       }
       SetupChecklist(store: store, runtime: store.runtime)
+      if store.hasPendingSetupCommit {
+        VStack(alignment: .leading, spacing: 8) {
+          Text(store.modelSetup.message).textSelection(.enabled)
+          HStack {
+            Button("Retry saving settings") { store.savePendingSetup() }
+            Button("Keep previous selection") { store.discardPendingSetup() }
+          }.disabled(store.state != .idle || store.working)
+          Text(
+            "Resolve the pending selection before editing settings. Installed speech assets are kept either way."
+          )
+          .font(.caption).foregroundStyle(.secondary)
+        }.padding(10).background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+      }
       HStack {
         Picker("Preset", selection: $store.config.selectedPreset) {
           ForEach(store.config.presets) { Text($0.name).tag($0.id) }
-        }.frame(maxWidth: 240).disabled(store.state != .idle || store.working)
+        }.frame(maxWidth: 240).disabled(store.state != .idle || store.settingsLocked)
         Text("Shortcut: " + store.config.effectiveShortcut.label).font(.headline)
         Spacer()
         Button(store.state == .recording ? "Finish dictation" : "Test dictation") {
@@ -150,15 +163,21 @@ struct SettingsView: View {
       if let error = store.settingsLoadError {
         Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
       }
-      Text(store.message).font(.callout).textSelection(.enabled).frame(
-        maxWidth: .infinity, alignment: .leading)
+      if !store.hasPendingSetupCommit {
+        Text(store.message).font(.callout).textSelection(.enabled).frame(
+          maxWidth: .infinity, alignment: .leading)
+      }
       HStack {
-        Text(store.hasUnsavedSettings ? "Unsaved changes" : "Settings saved").font(.caption)
+        Text(
+          store.hasPendingSetupCommit
+            ? "Selection not saved"
+            : store.hasUnsavedSettings ? "Unsaved changes" : "Settings saved"
+        ).font(.caption)
           .foregroundStyle(.secondary)
         Button("Save settings") { store.save() }.disabled(
-          store.state != .idle || store.working || store.capturingShortcut)
+          store.state != .idle || store.settingsLocked || store.capturingShortcut)
         Button("Import JSON…") { store.importSettings() }.disabled(
-          store.state != .idle || store.working || store.capturingShortcut)
+          store.state != .idle || store.settingsLocked || store.capturingShortcut)
         Button("Export JSON…") { store.exportSettings() }
         Spacer()
         Button(store.settingUpModel ? "Cancel model setup" : "Cancel recording / request") {
@@ -283,7 +302,7 @@ struct SettingsView: View {
           }
         }
       }.formStyle(.grouped)
-    }.disabled(store.state != .idle || store.working)
+    }.disabled(store.state != .idle || store.settingsLocked)
   }
   var presets: some View {
     ScrollView {
@@ -368,9 +387,7 @@ struct SettingsView: View {
               Menu("Choose discovered transcriber") {
                 if store.config.usesManagedRuntime {
                   Button("Automatic (Apple when ready, otherwise Whisper)") {
-                    preset.automaticallySelectLocalTranscriber = true
-                    preset.model = "transcribers/whisper"
-                    store.refreshModels()
+                    store.selectAutomaticTranscriber(presetID: preset.id)
                   }
                 }
                 ForEach(store.models.filter { $0.task == "transcribe" }) { model in
@@ -400,7 +417,7 @@ struct SettingsView: View {
           store.config.presets.append(Preset(id: UUID().uuidString, name: "New preset"))
         }
       }.formStyle(.grouped)
-    }.disabled(store.state != .idle || store.working)
+    }.disabled(store.state != .idle || store.settingsLocked)
   }
   var transcript: some View {
     VStack(alignment: .leading) {
@@ -452,7 +469,7 @@ struct SettingsView: View {
           store.config.retainHistory = true
           store.save()
         }
-        .disabled(store.state != .idle || store.working)
+        .disabled(store.state != .idle || store.settingsLocked)
       } else {
         Text(
           "Transcript history is on. Audio is stored separately only if enabled in General settings."
@@ -510,7 +527,9 @@ private struct RuntimeControls: View {
   var body: some View {
     Text(runtime.status).font(.callout)
     if store.settingUpModel { ProgressView().controlSize(.small) }
-    if !store.modelSetup.message.isEmpty { Text(store.modelSetup.message).font(.callout) }
+    if !store.hasPendingSetupCommit && !store.modelSetup.message.isEmpty {
+      Text(store.modelSetup.message).font(.callout)
+    }
     if case .blocked(_, let conflict) = store.modelSetup {
       HStack {
         Button("Use Verbatim for incompatible presets") {
@@ -524,6 +543,11 @@ private struct RuntimeControls: View {
         "The bundled Apple text processor requires Apple Intelligence and its model assets. Verbatim skips text processing."
       ).font(.caption)
     }
+    if case .blockedProcessing = store.modelSetup {
+      Button("Use Automatic processing for incompatible presets") {
+        store.retryModelSetup(processing: .automatic)
+      }
+    }
     if case .failed = store.modelSetup { Button("Retry setup") { store.retryModelSetup() } }
     if case .canceled = store.modelSetup { Button("Retry setup") { store.retryModelSetup() } }
     HStack {
@@ -532,7 +556,7 @@ private struct RuntimeControls: View {
       Button("Download Whisper Tiny…") { store.installLocalWhisper() }.disabled(
         !runtime.ready || runtime.busy)
       Button(store.appleSpeechSetupTitle) { store.useLocalApple() }.disabled(
-        !runtime.ready || runtime.busy || !runtime.supportsAppleSpeech)
+        !runtime.ready || runtime.busy || !store.canUseManagedAppleSpeech)
       Button("Open engine log") { NSWorkspace.shared.open(runtime.logURL) }
     }
     Text(
