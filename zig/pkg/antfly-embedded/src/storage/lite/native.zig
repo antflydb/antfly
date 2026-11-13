@@ -29316,6 +29316,136 @@ test "lite redo log catalog cursor merges the overlay across put, overwrite, del
     try assertScan(&file, a, &.{ "k/alpha", "k/beta", "k/delta" }, &.{ "one", "two-updated", "four" });
 }
 
+test "lite ReadView: get, batch get, and a catalog range scan across put, overwrite, delete, a checkpoint, and a reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "readview-basic.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+
+    // alpha/beta/gamma documents and k/alpha..k/gamma catalog records
+    // land only in the redo-log overlay -- no checkpoint yet.
+    try file.beginTransaction();
+    try file.putDocument("alpha", "one");
+    try file.putCatalogRecord("k/alpha", "one");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("beta", "two");
+    try file.putCatalogRecord("k/beta", "two");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("gamma", "three");
+    try file.putCatalogRecord("k/gamma", "three");
+    try file.commitTransaction();
+
+    const checkScan = struct {
+        fn run(view: *const ReadView, alloc: Allocator, expected_keys: []const []const u8, expected_values: []const []const u8) !void {
+            var cursor = try view.openMetadataCursor("k/");
+            defer cursor.deinit();
+            var i: usize = 0;
+            while (try cursor.nextRecordAlloc(alloc)) |record| {
+                defer {
+                    alloc.free(record.key);
+                    alloc.free(record.value);
+                }
+                try std.testing.expect(i < expected_keys.len);
+                try std.testing.expectEqualStrings(expected_keys[i], record.key);
+                try std.testing.expectEqualStrings(expected_values[i], record.value);
+                i += 1;
+            }
+            try std.testing.expectEqual(expected_keys.len, i);
+        }
+    }.run;
+
+    {
+        var view = try ReadView.open(&file, std.testing.io);
+        defer view.release(std.testing.io);
+
+        const alpha = (try view.getDocumentAlloc(a, "alpha")).?;
+        defer a.free(alpha);
+        try std.testing.expectEqualStrings("one", alpha);
+
+        var values: [3]?[]const u8 = .{ null, null, null };
+        try view.getDocumentsAlloc(a, &.{ "alpha", "beta", "gamma" }, &values);
+        defer for (values) |v| if (v) |owned| a.free(owned);
+        try std.testing.expectEqualStrings("one", values[0].?);
+        try std.testing.expectEqualStrings("two", values[1].?);
+        try std.testing.expectEqualStrings("three", values[2].?);
+
+        try checkScan(&view, a, &.{ "k/alpha", "k/beta", "k/gamma" }, &.{ "one", "two", "three" });
+    }
+
+    // Checkpoint: everything above moves into the real tree. A fresh
+    // ReadView must see exactly the same results, now page-sourced
+    // instead of overlay-sourced.
+    try file.checkpointRedoLog();
+    {
+        var view = try ReadView.open(&file, std.testing.io);
+        defer view.release(std.testing.io);
+        try checkScan(&view, a, &.{ "k/alpha", "k/beta", "k/gamma" }, &.{ "one", "two", "three" });
+    }
+
+    // Overwrite beta and delete gamma (both now overlay-only mutations
+    // shadowing tree-resident keys); insert delta (overlay-only, brand
+    // new). Exercises the same put/overwrite/delete/checkpoint-boundary
+    // shape as the plain scan tests above, but through ReadView's own
+    // get/batch-get/cursor methods instead of calling NativeFile
+    // directly.
+    try file.beginTransaction();
+    try file.putDocument("beta", "two-updated");
+    try file.putCatalogRecord("k/beta", "two-updated");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.deleteDocument("gamma");
+    try file.deleteCatalogRecord("k/gamma");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("delta", "four");
+    try file.putCatalogRecord("k/delta", "four");
+    try file.commitTransaction();
+
+    {
+        var view = try ReadView.open(&file, std.testing.io);
+        defer view.release(std.testing.io);
+
+        var values: [4]?[]const u8 = .{ null, null, null, null };
+        try view.getDocumentsAlloc(a, &.{ "alpha", "beta", "delta", "gamma" }, &values);
+        defer for (values) |v| if (v) |owned| a.free(owned);
+        try std.testing.expectEqualStrings("one", values[0].?);
+        try std.testing.expectEqualStrings("two-updated", values[1].?);
+        try std.testing.expectEqualStrings("four", values[2].?);
+        try std.testing.expectEqual(@as(?[]const u8, null), values[3]);
+
+        try checkScan(&view, a, &.{ "k/alpha", "k/beta", "k/delta" }, &.{ "one", "two-updated", "four" });
+    }
+
+    file.close();
+
+    // Reopen: recovery must replay the uncheckpointed log into the
+    // shared overlay before any ReadView can pin it (§9.5/§9.7c), so a
+    // fresh ReadView.open on the reopened handle sees exactly the same
+    // post-overwrite/delete/insert state a crash-free process would,
+    // with no explicit replay call from this test.
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    {
+        var view = try ReadView.open(&reopened, std.testing.io);
+        defer view.release(std.testing.io);
+
+        var values: [4]?[]const u8 = .{ null, null, null, null };
+        try view.getDocumentsAlloc(a, &.{ "alpha", "beta", "delta", "gamma" }, &values);
+        defer for (values) |v| if (v) |owned| a.free(owned);
+        try std.testing.expectEqualStrings("one", values[0].?);
+        try std.testing.expectEqualStrings("two-updated", values[1].?);
+        try std.testing.expectEqualStrings("four", values[2].?);
+        try std.testing.expectEqual(@as(?[]const u8, null), values[3]);
+
+        try checkScan(&view, a, &.{ "k/alpha", "k/beta", "k/delta" }, &.{ "one", "two-updated", "four" });
+    }
+}
+
 test "lite redo log vacuum captures uncheckpointed overlay and demotes the file rather than corrupting it" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

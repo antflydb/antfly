@@ -339,3 +339,92 @@ test "native catalog sink key encoding disambiguates scopes that share a prefix"
         return error.TestUnexpectedResult;
     }
 }
+
+test "native catalog sink: a mid-stream index admission is visible to loadAllAlloc before any checkpoint" {
+    // §9.7c: this is the exact seam every full-text/dense/sparse/graph
+    // native-catalog managed index seeds its in-process mirror through
+    // at open (`Backend.init`'s own `loadAllAlloc` call) and the exact
+    // seam every write afterward goes through (`submit`) -- simulating
+    // "an index admits a record mid-stream, with no checkpoint" at the
+    // layer the redo-log overlay fix in this branch actually covers.
+    //
+    // The real end-to-end path (`db.addIndex` actually creating a
+    // dense/sparse/graph index) currently fails for an unrelated reason
+    // on its very first call -- a write-path LogFull/OutcomeUnknown bug
+    // in index creation's own `deleteTree` (`installIndexForReconciliation`
+    // -> `addWithAtomicMutation` -> `addWithOptions` ->
+    // `prepareStorageForFreshCatalogEntry` -> `deleteTree`, via
+    // `submitIndexMutation`'s own `waitSequence`), tracked separately
+    // from this branch's own read-path work; see this branch's report.
+    // This test exercises the read half of that scenario directly,
+    // through `submitIndexMutation`/`loadAllAlloc` rather than through
+    // the currently-broken creation path.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ncat-sink-mid-stream.aflite", .{tmp.sub_path});
+    defer a.free(path);
+
+    var store = try docstore.Store.createWithOptions(a, path, .{ .use_redo_log = true, .io = std.testing.io });
+    defer store.close();
+
+    var sink: Sink = .{ .store = &store, .allocator = a };
+    const iface = sink.sink();
+    const scope = "/dense-index-1";
+
+    try iface.submit(iface.ptr, scope, &.{
+        .{ .namespace = "segments", .key = "range:0001", .value = "seg-one" },
+        .{ .namespace = "segments", .key = "range:0002", .value = "seg-two" },
+        .{ .namespace = "meta", .key = "dims", .value = "768" },
+    }, true);
+
+    const findEntry = struct {
+        fn run(entries: []const native_catalog_backend.Entry, namespace: []const u8, key: []const u8) ?[]const u8 {
+            for (entries) |e| {
+                if (e.namespace == null) continue;
+                if (std.mem.eql(u8, e.namespace.?, namespace) and std.mem.eql(u8, e.key, key)) return e.value;
+            }
+            return null;
+        }
+    }.run;
+    const freeEntries = struct {
+        fn run(alloc: Allocator, entries: []native_catalog_backend.Entry) void {
+            for (entries) |e| {
+                if (e.namespace) |n| alloc.free(n);
+                alloc.free(e.key);
+                alloc.free(e.value);
+            }
+            alloc.free(entries);
+        }
+    }.run;
+
+    // No checkpoint call anywhere above: every one of those three
+    // records lives only in the redo-log overlay right now. Before the
+    // `OverlayScanState` gate fix in this branch, a fresh `beginRead`'s
+    // separately-opened `generation.file` silently saw zero records
+    // here whenever the checkpoint it was handed (tracked, genuinely
+    // current) didn't match `generation.file`'s own frozen snapshot --
+    // exactly the same overlay-blind-scan bug `docstore.Cursor` hit.
+    const loaded = try iface.loadAllAlloc(iface.ptr, a, scope);
+    defer freeEntries(a, loaded);
+    try std.testing.expectEqual(@as(usize, 3), loaded.len);
+    try std.testing.expectEqualStrings("seg-one", findEntry(loaded, "segments", "range:0001").?);
+    try std.testing.expectEqualStrings("seg-two", findEntry(loaded, "segments", "range:0002").?);
+    try std.testing.expectEqualStrings("768", findEntry(loaded, "meta", "dims").?);
+
+    // A follow-up write -- delete one record, overwrite none, admit a
+    // new one -- still with no checkpoint. The overlay must merge
+    // put/delete here exactly like the plain document/catalog scans do.
+    try iface.submit(iface.ptr, scope, &.{
+        .{ .namespace = "segments", .key = "range:0001", .is_delete = true },
+        .{ .namespace = "segments", .key = "range:0003", .value = "seg-three" },
+    }, true);
+
+    const reloaded = try iface.loadAllAlloc(iface.ptr, a, scope);
+    defer freeEntries(a, reloaded);
+    try std.testing.expectEqual(@as(usize, 3), reloaded.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), findEntry(reloaded, "segments", "range:0001"));
+    try std.testing.expectEqualStrings("seg-two", findEntry(reloaded, "segments", "range:0002").?);
+    try std.testing.expectEqualStrings("seg-three", findEntry(reloaded, "segments", "range:0003").?);
+    try std.testing.expectEqualStrings("768", findEntry(reloaded, "meta", "dims").?);
+}
