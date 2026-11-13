@@ -603,6 +603,7 @@ pub const storage_prepared_score_plan = @import("storage/prepared_score_plan.zig
 pub const storage_prepared_score_request = @import("storage/prepared_score_request.zig");
 pub const storage_lite_reclamation = @import("storage/lite/reclamation.zig");
 pub const storage_lite_redo_log = @import("storage/lite/redo_log.zig");
+pub const storage_lite_redo_differential_test = @import("storage/lite/redo_differential_test.zig");
 pub const storage_lite_secret_store = @import("storage/lite/secret_store.zig");
 pub const storage_lite_snapshot_test = @import("storage/lite/snapshot_test.zig");
 pub const storage_local_query = @import("storage/query.zig");
