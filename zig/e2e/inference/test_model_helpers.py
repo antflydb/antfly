@@ -1040,7 +1040,138 @@ def test_model_provisioning_follows_selected_family_and_affinity(monkeypatch):
     assert [s.task for s in pulled] == ["transcribers"]
     pulled.clear()
     prefetch_test_models([("test_models.py", "eviction")])
-    assert [s.task for s in pulled] == ["embedders"]
+    assert pulled == []
     pulled.clear()
     prefetch_test_models([("test_model_helpers.py", None)])
     assert pulled == []
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_eviction_provisions_its_concrete_pair_without_dense_defaults(
+    monkeypatch, enabled
+):
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    monkeypatch.setattr(models, "run_large_model_tests", lambda: False)
+    monkeypatch.setattr(models, "run_clipclap_contract_tests", lambda: enabled)
+    monkeypatch.setattr(models, "model_available", lambda spec: False)
+    pulled = []
+    monkeypatch.setattr(models, "ensure_model", pulled.append)
+    prefetch_test_models(
+        [("test_models.py", "eviction")],
+        required_model_groups=(("antflydb/clipclap", "antflydb/florence-2-base"),),
+    )
+    assert [s.repo for s in pulled] == (
+        ["antflydb/clipclap", "antflydb/florence-2-base"] if enabled else []
+    )
+
+
+def test_sparse_only_selection_does_not_provision_dense_embeddings(monkeypatch):
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    pulled = []
+    monkeypatch.setattr(models, "ensure_model", pulled.append)
+    sparse = "sparse-encoder-testing/splade-bert-tiny-nq-onnx"
+    prefetch_test_models(
+        [("test_sparse_embed.py", None)], required_model_groups=((sparse, sparse),)
+    )
+    assert [s.repo for s in pulled] == [sparse]
+
+
+def test_structural_catalog_checks_do_not_provision_weights(monkeypatch):
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    pulled = []
+    monkeypatch.setattr(models, "ensure_model", pulled.append)
+    prefetch_test_models([("test_models.py", None)])
+    assert pulled == []
+
+
+def test_unknown_required_model_fails_before_provisioning(monkeypatch):
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    pulled = []
+    monkeypatch.setattr(models, "ensure_model", pulled.append)
+    with pytest.raises(ValueError, match="Unknown required E2E model"):
+        prefetch_test_models(
+            [("test_embed.py", None)], required_model_groups=(("typo/model",),)
+        )
+    assert pulled == []
+
+
+def test_provisioning_reports_model_setup_separately_from_requests(
+    monkeypatch, tmp_path
+):
+    import json
+
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    monkeypatch.setenv("ANTFLY_INFERENCE_REPORT_DIR", str(tmp_path))
+    monkeypatch.setattr(models, "ensure_model", lambda spec: None)
+    prefetch_test_models([], required_model_groups=((models.DEFAULT_EXTRACTOR_MODEL,),))
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "model-provisioning.jsonl").read_text().splitlines()
+    ]
+    assert len(records) == 1
+    assert records[0]["model"] == models.DEFAULT_EXTRACTOR_MODEL
+    assert records[0]["phase"] == "provision"
+    assert records[0]["seconds"] >= 0
+
+
+def test_cached_gated_prerequisite_allows_its_group_without_downloading_it(monkeypatch):
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    monkeypatch.setattr(models, "run_large_model_tests", lambda: False)
+    monkeypatch.setattr(models, "run_clipclap_contract_tests", lambda: False)
+    monkeypatch.setattr(
+        models, "model_available", lambda spec: spec.repo == "antflydb/clipclap"
+    )
+    pulled = []
+    monkeypatch.setattr(models, "ensure_model", pulled.append)
+    prefetch_test_models(
+        [], required_model_groups=(("antflydb/clipclap", "antflydb/florence-2-base"),)
+    )
+    assert [s.repo for s in pulled] == ["antflydb/florence-2-base"]
+
+
+def test_required_model_identifiers_use_the_curated_case_insensitive_identity(
+    monkeypatch,
+):
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    pulled = []
+    monkeypatch.setattr(models, "ensure_model", pulled.append)
+    prefetch_test_models(
+        [],
+        required_model_groups=((" BAAI/bge-small-en-v1.5 ", "baai/bge-small-en-v1.5"),),
+    )
+    assert pulled == [models.EMBEDDER_MODELS[0]]
+
+
+def test_concrete_dependencies_replace_family_defaults_and_keep_markers_together():
+    from types import SimpleNamespace as S
+    from .conftest import _model_provision_plan
+
+    def item(file, *groups):
+        return S(
+            path=file,
+            iter_markers=lambda name: [S(args=g) for g in groups],
+            get_closest_marker=lambda name: None,
+        )
+
+    selected, groups = _model_provision_plan(
+        [
+            item(
+                "test_embed.py", ("antflydb/clipclap",), ("antflydb/florence-2-base",)
+            ),
+            item("test_chat.py"),
+        ]
+    )
+    assert selected == [("test_chat.py", None)]
+    assert groups == (("antflydb/clipclap", "antflydb/florence-2-base"),)
+
+
+def test_concrete_large_dependency_honors_explicit_model_selection(monkeypatch):
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    monkeypatch.setenv(
+        "ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", DEFAULT_GENERATOR_MODEL
+    )
+    monkeypatch.setattr(models, "run_large_model_tests", lambda: False)
+    pulled = []
+    monkeypatch.setattr(models, "ensure_model", pulled.append)
+    prefetch_test_models([], required_model_groups=((DEFAULT_GENERATOR_MODEL,),))
+    assert [s.repo for s in pulled] == [DEFAULT_GENERATOR_MODEL]
