@@ -14189,7 +14189,7 @@ pub const NativeFile = struct {
         return try self.readValuePagesAtCheckpointAlloc(allocator, root_page_id, value_len, self.activeCheckpoint());
     }
 
-    fn readValuePagesAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, root_page_id: u64, value_len: usize, checkpoint: CheckpointSlot) ![]u8 {
+    pub fn readValuePagesAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, root_page_id: u64, value_len: usize, checkpoint: CheckpointSlot) ![]u8 {
         var cursor: ValueChunkCursor = undefined;
         try cursor.initInto(self, root_page_id, value_len, checkpoint, true);
         defer cursor.deinit();
@@ -14634,7 +14634,7 @@ pub const NativeFile = struct {
     /// doc comment), so every caller of this function must
     /// `self.allocator.free(entry.value)` once done with it, exactly like
     /// any other `...Alloc` function in this file.
-    fn redoOverlayEntry(self: *NativeFile, root: TransactionWrites.Root, checkpoint: CheckpointSlot, key: []const u8) !?CatalogEntry {
+    pub fn redoOverlayEntry(self: *NativeFile, root: TransactionWrites.Root, checkpoint: CheckpointSlot, key: []const u8) !?CatalogEntry {
         const redo = self.redo orelse return null;
         const resolved = (try redo.shared.resolveAlloc(self.allocator, self.runtimeIo(), @backingInt(root), key, checkpoint.commit_sequence)) orelse return null;
         return .{
@@ -14680,7 +14680,7 @@ pub const NativeFile = struct {
     /// caller's own tree-side loop decide, key by key, whether the tree's
     /// or the overlay's candidate comes first in a standard merge-join,
     /// without this type needing to know anything about the tree side.
-    const OverlayScanState = struct {
+    pub const OverlayScanState = struct {
         /// §9.6a: each key is an owned copy (`keysWithPrefixAlloc`'s own
         /// doc comment) -- unlike the pre-sharing design, these are never
         /// borrowed references into the live map, so `deinit` must free
@@ -14693,7 +14693,7 @@ pub const NativeFile = struct {
         /// other than the current one: a deliberately pinned, older
         /// snapshot must never see mutations the overlay only reflects
         /// for the *current* generation.
-        fn initForPrefix(allocator: Allocator, file: *NativeFile, root: TransactionWrites.Root, checkpoint: CheckpointSlot, prefix: []const u8) !OverlayScanState {
+        pub fn initForPrefix(allocator: Allocator, file: *NativeFile, root: TransactionWrites.Root, checkpoint: CheckpointSlot, prefix: []const u8) !OverlayScanState {
             const empty: OverlayScanState = .{ .allocator = allocator };
             const redo = file.redo orelse return empty;
             if (checkpoint.commit_sequence != file.activeCheckpoint().commit_sequence) return empty;
@@ -14701,7 +14701,29 @@ pub const NativeFile = struct {
             return .{ .keys = keys, .allocator = allocator };
         }
 
-        fn deinit(self: *OverlayScanState) void {
+        /// Like `initForPrefix`, but without that "must equal the
+        /// currently active (physical) checkpoint" precondition -- for a
+        /// caller (`docstore.zig`'s `Cursor`) whose own checkpoint value
+        /// (`Txn.checkpoint`, from `ReadGeneration.checkpoint`) is not
+        /// comparable to `file.activeCheckpoint()` in the first place: it
+        /// can be a different `NativeFile` instance's (`generation.file`,
+        /// a separately-opened, read-only handle) view, kept current via
+        /// `Store.observeReadCheckpoint` rather than by sharing
+        /// `activeCheckpoint()`'s own in-memory state directly. Per-key
+        /// value resolution (`redoOverlayEntry`/`resolveAlloc`) is already
+        /// correctly version-pinned regardless of which checkpoint number
+        /// is passed -- the same function an ordinary point `get()` uses,
+        /// with no such gate at all -- so omitting this precondition here
+        /// does not weaken correctness for a genuinely stale pin, only
+        /// widens *enumeration* to match what point-read resolution
+        /// already does. Still returns empty for a non-redo file.
+        pub fn initForPrefixUnchecked(allocator: Allocator, file: *NativeFile, root: TransactionWrites.Root, prefix: []const u8) !OverlayScanState {
+            const redo = file.redo orelse return .{ .allocator = allocator };
+            const keys = try redo.shared.keysWithPrefixAlloc(allocator, file.runtimeIo(), @backingInt(root), prefix);
+            return .{ .keys = keys, .allocator = allocator };
+        }
+
+        pub fn deinit(self: *OverlayScanState) void {
             for (self.keys) |k| self.allocator.free(k);
             self.allocator.free(self.keys);
             self.* = undefined;
@@ -14727,6 +14749,40 @@ pub const NativeFile = struct {
         /// also visited on a later step.
         fn consumeIfEqual(self: *OverlayScanState, key: []const u8) void {
             if (self.index < self.keys.len and std.mem.eql(u8, self.keys[self.index], key)) self.index += 1;
+        }
+
+        /// Index of the first key that is `>= key` (or `> key` if
+        /// `strict`), i.e. `keys.len` if none -- binary search, since
+        /// `keys` is sorted ascending (`keysWithPrefixAlloc`'s own
+        /// contract). For a bidirectional cursor's own forward-candidate
+        /// position, parallel to `peek`/`takeFront`'s forward-only
+        /// consume model above.
+        pub fn indexAtOrAfter(self: *const OverlayScanState, key: []const u8, strict: bool) usize {
+            var lo: usize = 0;
+            var hi: usize = self.keys.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const order = std.mem.order(u8, self.keys[mid], key);
+                const before = if (strict) order != .gt else order == .lt;
+                if (before) lo = mid + 1 else hi = mid;
+            }
+            return lo;
+        }
+
+        /// Count of keys that are `<= key` (or `< key` if `strict`) --
+        /// the backward-candidate position is `keys[result - 1]` when
+        /// `result > 0`, nonexistent otherwise. Binary search, same
+        /// ordering contract as `indexAtOrAfter`.
+        pub fn countAtOrBefore(self: *const OverlayScanState, key: []const u8, strict: bool) usize {
+            var lo: usize = 0;
+            var hi: usize = self.keys.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                const order = std.mem.order(u8, self.keys[mid], key);
+                const include = if (strict) order == .lt else order != .gt;
+                if (include) lo = mid + 1 else hi = mid;
+            }
+            return lo;
         }
     };
 

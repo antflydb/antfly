@@ -2316,6 +2316,105 @@ test "WS4 phase 2 round 2: a worker-backlogged index falls back correctly instea
     }
 }
 
+// Regression for the bug found alongside the crash sweep below: under
+// redo-as-default, `sync_level: .full_text`'s own derived-index catch-up
+// pass used to discover "what changed" via a cursor scan
+// (`docstore.zig`'s `forEachReplayLaneRaw` -> `Txn.openCursor()`) that
+// merged only a write transaction's own in-flight pending writes, never
+// `NativeFile`'s redo-log overlay -- so a commit logged but not yet
+// checkpointed was invisible to it, even on the very same, uncrashed
+// handle, with no fault injection or reopen involved at all. Root-caused
+// via exactly this reproduction: it failed roughly 35/40 iterations under
+// redo-as-default before the fix (`docstore.Cursor`'s three-way merge,
+// `pending_tree` over the redo overlay over the B-tree), and 0/40 under
+// `use_redo_log: false` throughout -- confirming this is not actually a
+// crash-recovery bug, just one that the crash sweep below also happened
+// to surface.
+test "lite full text synchronous visibility is searchable immediately after an uncrashed commit" {
+    const allocator = std.testing.allocator;
+    const iterations = 20;
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testAflitePath(allocator, tmp);
+        defer allocator.free(path);
+        var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+        defer handle.close();
+        try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+        try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+        try assertSearchable(&handle, allocator, "body_text", "body", "ft-doc", "needle");
+    }
+}
+
+// Same shape as the full-text test above, under `use_redo_log: false`
+// (legacy) -- the control. Must also pass: the bug this guards against
+// is specific to redo, not something this test's own write pattern
+// happens to trip regardless of storage mode.
+test "lite full text synchronous visibility is searchable immediately after an uncrashed commit LEGACY control" {
+    const allocator = std.testing.allocator;
+    const iterations = 20;
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testAflitePath(allocator, tmp);
+        defer allocator.free(path);
+        var lite_backend = try backend.Handle.createWithOptions(allocator, path, .{ .exclusive = true, .io = std.testing.io, .use_redo_log = false });
+        errdefer lite_backend.deinit();
+        const identity = connection.identityOpenOptions(true);
+        var db_opts = db_mod.OpenOptions{
+            .open_mode = .writer,
+            .identity_namespace = identity.identity_namespace,
+            .prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace,
+        };
+        try lite_backend.configureDbOpenOptions(&db_opts);
+        var db = try db_mod.DB.open(allocator, path, db_opts);
+        errdefer db.close();
+        try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+        try db.runUntilIdle();
+        var handle = DbHandle{ .backend = lite_backend, .db = db };
+        defer handle.close();
+        try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+        try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+        try assertSearchable(&handle, allocator, "body_text", "body", "ft-doc", "needle");
+    }
+}
+
+// Dense-vector variant of the two full-text tests above: the same
+// "write, then immediately require derived-index visibility, no crash"
+// shape, but through `sync_level: .full_index` and a dense-vector index
+// instead -- `waitForSyncLevelWithPublicationCut`'s `.full_index` branch
+// is a different code path from `.full_text`'s, so this is independent
+// coverage of the same bug class (any derived-index catch-up pass that
+// discovers "what changed" via a cursor scan over the primary store),
+// not a restatement of the full-text case. No dedicated vector-query
+// assertion exists in this harness (see `runDenseVectorAddIndexMidScenario`'s
+// own doc comment); like that scenario, this checks the primary
+// document's own marker field survives an immediate, uncrashed reopen.
+test "lite dense vector full index visibility is readable immediately after an uncrashed commit" {
+    const allocator = std.testing.allocator;
+    const iterations = 20;
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testAflitePath(allocator, tmp);
+        defer allocator.free(path);
+        var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+        defer handle.close();
+        try handle.db.addIndex(.{
+            .name = "dv_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        try handle.db.batch(.{ .writes = &.{.{ .key = "dv-doc", .value = "{\"marker\":\"dv-doc-marker\",\"_embeddings\":{\"dv_idx\":[1.0,0.0]}}" }}, .sync_level = .full_index });
+        const read = (try handle.db.get(allocator, "dv-doc")) orelse return error.TestExpectedDocumentFound;
+        defer allocator.free(read);
+        try std.testing.expect(std.mem.indexOf(u8, read, "dv-doc-marker") != null);
+    }
+}
+
 test "crash sweep: full text synchronous visibility" {
     var report = try runCrashSweep(std.testing.allocator, .{
         .name = "full-text-sync-visible",

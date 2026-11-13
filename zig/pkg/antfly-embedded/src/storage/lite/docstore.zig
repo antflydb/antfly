@@ -1547,30 +1547,26 @@ pub const CreateOptions = struct {
     /// See `OpenOptions.ride_along_idle_ns`.
     ride_along_idle_ns: ?u64 = null,
     /// docs/design/lite-performance/lite-single-commit-write-path.md §9,
-    /// point 3. `null` (the current default) is the legacy copy-on-write
-    /// commit path. `true` opts a new file into redo-log; it combines with
-    /// `reclamation.page_reuse` (indexed reclamation) without restriction
-    /// -- per-commit page allocation, retirement, and reclamation defer to
-    /// `checkpointRedoLog`'s own batched transaction in that case, rather
-    /// than running on every foreground commit. `false` is the same as
-    /// the default, spelled out.
+    /// point 3. `null` (the current default) opts a new file into
+    /// redo-log; `false` explicitly asks for the legacy copy-on-write
+    /// commit path instead. `true` is the same as the default, spelled
+    /// out. Combines with `reclamation.page_reuse` (indexed reclamation)
+    /// without restriction -- per-commit page allocation, retirement, and
+    /// reclamation defer to `checkpointRedoLog`'s own batched transaction
+    /// in that case, rather than running on every foreground commit.
     ///
-    /// Not yet flipped to default-on for every new file, despite that
-    /// being point 3's original ask: doing so surfaced 13 failures across
-    /// `storage.lite.docstore.test`'s reclamation/replay/maintenance
-    /// suites alone (reclamation's page-growth-based assessment heuristics,
-    /// vacuum/replay-cleanup's assumption that a commit's pages are already
-    /// physically written by the time retirement/replay code looks at
-    /// them, allocation-failure-injection tests whose expected failure
-    /// point shifts along with the allocation pattern) -- none audited or
-    /// adapted for a commit that defers its physical build to the next
-    /// checkpoint. Flipping the default before that audit risks shipping
-    /// exactly the kind of regression this design's own review process
-    /// already caught once (the logical-mutation rewrite, the overlay/scan
-    /// merge-join, and the two `fetchPut`-vs-`getOrPut` memory-corruption
-    /// fixes this same pass also found). Opt-in via `true` is fully
-    /// supported and gated by the same crash-sim/native coverage as the
-    /// legacy path; only the *default* is being held back.
+    /// Flipped to default-on (§9.6c): the original 13-failure audit
+    /// turned out to be two real bugs, both now fixed, not 13 unaudited
+    /// assumptions -- (1) the log-full/OutcomeUnknown cluster
+    /// (`RedoCommitState.pendingRecordLen`'s preemptive check, and the
+    /// page-shaped fallback for a bare commit's own diverted pages,
+    /// which the logical-only `checkpointRedoLog` fold never touched);
+    /// (2) `ReadGeneration`'s independent, never-refreshed overlay copy
+    /// (fixed by `redo_overlay.zig`'s per-inode sharing). One failure
+    /// (the budget test's `error.InvalidNativeFreeMap`) remains open,
+    /// owned by the free-map/allocator-under-redo work rather than this
+    /// option itself. Legacy (`false`) stays fully supported and tested,
+    /// same crash-sim/native coverage as before.
     use_redo_log: ?bool = null,
 };
 
@@ -2031,11 +2027,12 @@ pub const Store = struct {
             .writer_lock_marker = opts.writer_lock_marker,
             .indexed_reclamation = opts.reclamation.page_reuse,
         };
-        // Point 3: redo-log is opt-in for now (see `CreateOptions.use_redo_log`'s
-        // doc comment for why the default stays legacy copy-on-write).
-        // Redo-log commit and indexed page reclamation are no longer
-        // mutually exclusive (§9, redo+indexed_reclamation work): a
-        // caller may set both `use_redo_log = true` and
+        // Point 3: redo-log is the default for a new file now (see
+        // `CreateOptions.use_redo_log`'s own doc comment, §9.6c, for why
+        // the earlier 13-failure audit held this back and what actually
+        // needed fixing). Redo-log commit and indexed page reclamation
+        // are no longer mutually exclusive (§9, redo+indexed_reclamation
+        // work): a caller may have both this and
         // `reclamation.page_reuse = true` together -- per-commit page
         // allocation, retirement, and indexed reclamation defer to
         // `checkpointRedoLog`'s own batched transaction instead of
@@ -5996,6 +5993,22 @@ pub const Cursor = struct {
     owned_value: ?[]u8 = null,
     disk_candidate: ?native.DocumentIndexEntry = null,
     last_direction: ?Direction = null,
+    /// A sorted snapshot of the redo-log overlay's own uncheckpointed
+    /// mutations, scoped to `self.txn.prefix`, lazily materialized on
+    /// this cursor's first move and cached for its whole lifetime (the
+    /// txn's checkpoint -- and so the overlay content a *current*-
+    /// generation snapshot like this one sees -- never changes mid-
+    /// cursor). Layered as `pending_tree` over this over the real
+    /// B-tree (`resolveMerged`'s own doc comment): every `docstore.Cursor`
+    /// consumer (`Txn.openCursor`/`openKeyCursor`, and so every SQL range
+    /// read, posting-list walk, replay-journal/derived-index catch-up
+    /// scan, reclamation and pooling scan that goes through it) used to
+    /// see only the real, checkpointed pages here -- exactly the gap
+    /// behind "crash sweep: full text synchronous visibility"'s redo-
+    /// mode-only `CrashConsistencyFullTextNotRebuilt` failures, found to
+    /// be a whole bug *class* (every range/prefix iterator over
+    /// `NativeFile`, not one call site) rather than a single occurrence.
+    redo_overlay: ?native.NativeFile.OverlayScanState = null,
     // WS5: a third mode alongside full/keys-only. Set by `setLengthOnly`.
     // `readValue` then asks the native layer for the document's real
     // logical size (one bounded page read; never the external value's own
@@ -6028,28 +6041,49 @@ pub const Cursor = struct {
         if (self.disk_candidate) |*candidate| candidate.deinit(self.txn.allocator);
         if (self.current_key) |key| self.txn.allocator.free(key);
         if (self.owned_value) |value| self.txn.allocator.free(value);
+        if (self.redo_overlay) |*overlay| overlay.deinit();
         self.current_key = null;
         self.owned_value = null;
         self.disk_candidate = null;
+        self.redo_overlay = null;
+    }
+
+    /// Lazily materializes and caches `redo_overlay` -- see that field's
+    /// own doc comment for why this is safe to do once and reuse for
+    /// every move this cursor makes afterward.
+    fn ensureRedoOverlay(self: *Cursor) !*native.NativeFile.OverlayScanState {
+        if (self.redo_overlay == null) {
+            const file = try self.txn.readFile();
+            // `initForPrefixUnchecked`, not `initForPrefix`: `self.txn.checkpoint`
+            // (`ReadGeneration.checkpoint`) is not comparable to `file.activeCheckpoint()`
+            // the way `initForPrefix`'s own gate requires -- see that
+            // function's own doc comment.
+            self.redo_overlay = try native.NativeFile.OverlayScanState.initForPrefixUnchecked(self.txn.allocator, file, .documents, self.txn.prefix);
+        }
+        return &self.redo_overlay.?;
     }
 
     pub fn first(self: *Cursor) !backend_adapter.Entry {
         self.clearBufferedDisk();
+        const overlay = try self.ensureRedoOverlay();
         const disk = if (self.txn.prefix.len == 0)
             try self.index_cursor.first()
         else
             try self.index_cursor.seekAtOrAfter(self.txn.prefix, false);
-        return try self.resolveMerged(disk, self.overlayAtOrAfter(self.txn.prefix, false), .forward);
+        return try self.resolveMerged(disk, self.overlayAtOrAfter(self.txn.prefix, false), if (overlay.keys.len > 0) 0 else null, .forward);
     }
 
     pub fn last(self: *Cursor) !backend_adapter.Entry {
         self.clearBufferedDisk();
+        const overlay = try self.ensureRedoOverlay();
         if (self.upper_bound) |upper_bound| {
             const upper = try self.txn.prefixedKey(upper_bound);
             defer if (self.txn.prefix.len > 0) self.txn.allocator.free(upper);
+            const count = overlay.countAtOrBefore(upper, true);
             return try self.resolveMerged(
                 try self.index_cursor.seekAtOrBefore(upper, true),
                 self.overlayAtOrBefore(upper, true),
+                if (count > 0) count - 1 else null,
                 .backward,
             );
         }
@@ -6057,14 +6091,17 @@ pub const Cursor = struct {
             return try self.resolveMerged(
                 try self.index_cursor.last(),
                 self.txn.pending_tree.getMax(),
+                if (overlay.keys.len > 0) overlay.keys.len - 1 else null,
                 .backward,
             );
         } else {
             const upper = try self.namespaceUpperBound();
             defer self.txn.allocator.free(upper);
+            const count = overlay.countAtOrBefore(upper, true);
             return try self.resolveMerged(
                 try self.index_cursor.seekAtOrBefore(upper, true),
                 self.overlayAtOrBefore(upper, true),
+                if (count > 0) count - 1 else null,
                 .backward,
             );
         }
@@ -6072,33 +6109,40 @@ pub const Cursor = struct {
 
     pub fn next(self: *Cursor) !backend_adapter.Entry {
         const current = self.current_key orelse return error.NotFound;
+        const overlay = try self.ensureRedoOverlay();
         const disk = if (self.last_direction == .forward)
             self.takeBufferedDisk() orelse try self.index_cursor.next()
         else blk: {
             self.clearBufferedDisk();
             break :blk try self.index_cursor.seekAtOrAfter(current, true);
         };
-        return try self.resolveMerged(disk, self.overlayAtOrAfter(current, true), .forward);
+        const idx = overlay.indexAtOrAfter(current, true);
+        return try self.resolveMerged(disk, self.overlayAtOrAfter(current, true), if (idx < overlay.keys.len) idx else null, .forward);
     }
 
     pub fn prev(self: *Cursor) !backend_adapter.Entry {
         const current = self.current_key orelse return error.NotFound;
+        const overlay = try self.ensureRedoOverlay();
         const disk = if (self.last_direction == .backward)
             self.takeBufferedDisk() orelse try self.index_cursor.prev()
         else blk: {
             self.clearBufferedDisk();
             break :blk try self.index_cursor.seekAtOrBefore(current, true);
         };
-        return try self.resolveMerged(disk, self.overlayAtOrBefore(current, true), .backward);
+        const count = overlay.countAtOrBefore(current, true);
+        return try self.resolveMerged(disk, self.overlayAtOrBefore(current, true), if (count > 0) count - 1 else null, .backward);
     }
 
     pub fn seekAtOrAfter(self: *Cursor, key: []const u8) !backend_adapter.Entry {
         const lookup_key = try self.txn.prefixedKey(key);
         defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
         self.clearBufferedDisk();
+        const overlay = try self.ensureRedoOverlay();
+        const idx = overlay.indexAtOrAfter(lookup_key, false);
         return try self.resolveMerged(
             try self.index_cursor.seekAtOrAfter(lookup_key, false),
             self.overlayAtOrAfter(lookup_key, false),
+            if (idx < overlay.keys.len) idx else null,
             .forward,
         );
     }
@@ -6107,20 +6151,25 @@ pub const Cursor = struct {
         const lookup_key = try self.txn.prefixedKey(key);
         defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
         self.clearBufferedDisk();
+        const overlay = try self.ensureRedoOverlay();
         if (self.upper_bound) |upper_bound| {
             const upper = try self.txn.prefixedKey(upper_bound);
             defer if (self.txn.prefix.len > 0) self.txn.allocator.free(upper);
             if (std.mem.order(u8, lookup_key, upper) != .lt) {
+                const count = overlay.countAtOrBefore(upper, true);
                 return try self.resolveMerged(
                     try self.index_cursor.seekAtOrBefore(upper, true),
                     self.overlayAtOrBefore(upper, true),
+                    if (count > 0) count - 1 else null,
                     .backward,
                 );
             }
         }
+        const count = overlay.countAtOrBefore(lookup_key, false);
         return try self.resolveMerged(
             try self.index_cursor.seekAtOrBefore(lookup_key, false),
             self.overlayAtOrBefore(lookup_key, false),
+            if (count > 0) count - 1 else null,
             .backward,
         );
     }
@@ -6131,16 +6180,26 @@ pub const Cursor = struct {
         self.upper_bound = upper;
     }
 
+    /// Three-way merge: `pending_tree` (this transaction's own in-flight,
+    /// uncommitted writes) over the redo-log overlay (committed, not yet
+    /// checkpointed) over the real B-tree (`index_cursor`). A key tie
+    /// always favors the higher-priority source, and every lower-
+    /// priority source whose own candidate shares the winning key is
+    /// consumed (advanced past) in the same step -- a shadowed overlay
+    /// or disk entry, including a real page a redo-log tombstone
+    /// deletes, must never be visited again.
     fn resolveMerged(
         self: *Cursor,
         initial_disk: ?native.DocumentIndexEntry,
-        initial_overlay_index: ?*PendingTree.Node,
+        initial_pending_index: ?*PendingTree.Node,
+        initial_redo_index: ?usize,
         direction: Direction,
     ) !backend_adapter.Entry {
         const file = try self.txn.readFile();
         var disk = initial_disk;
         errdefer if (disk) |*candidate| candidate.deinit(self.txn.allocator);
-        var overlay_index = initial_overlay_index;
+        var pending_index = initial_pending_index;
+        var redo_index = initial_redo_index;
 
         while (true) {
             if (disk) |candidate| {
@@ -6150,55 +6209,110 @@ pub const Cursor = struct {
                     disk = null;
                 }
             }
-            const overlay_candidate = if (overlay_index) |index| blk: {
+            const pending_candidate = if (pending_index) |index| blk: {
                 const candidate = self.txn.pending.items[Txn.pendingNode(index).ordinal];
                 if (!self.keyInRange(candidate.key)) {
-                    overlay_index = null;
+                    pending_index = null;
                     break :blk null;
                 }
                 break :blk candidate;
             } else null;
+            const redo_key: ?[]const u8 = if (redo_index) |idx| blk: {
+                const k = self.redo_overlay.?.keys[idx];
+                if (!self.keyInRange(k)) {
+                    redo_index = null;
+                    break :blk null;
+                }
+                break :blk k;
+            } else null;
 
-            const choose_overlay = if (overlay_candidate) |pending| blk: {
-                const indexed = disk orelse break :blk true;
-                const order = std.mem.order(u8, pending.key, indexed.key);
-                break :blk switch (direction) {
-                    .forward => order != .gt,
-                    .backward => order != .lt,
-                };
-            } else false;
+            const Source = enum { pending, redo, disk };
+            var winner: ?Source = null;
+            var winner_key: []const u8 = undefined;
+            if (pending_candidate) |p| {
+                winner = .pending;
+                winner_key = p.key;
+            }
+            if (redo_key) |k| {
+                const better = if (winner != null) switch (direction) {
+                    .forward => std.mem.order(u8, k, winner_key) == .lt,
+                    .backward => std.mem.order(u8, k, winner_key) == .gt,
+                } else true;
+                if (better) {
+                    winner = .redo;
+                    winner_key = k;
+                }
+            }
+            if (disk) |d| {
+                const better = if (winner != null) switch (direction) {
+                    .forward => std.mem.order(u8, d.key, winner_key) == .lt,
+                    .backward => std.mem.order(u8, d.key, winner_key) == .gt,
+                } else true;
+                if (better) {
+                    winner = .disk;
+                    winner_key = d.key;
+                }
+            }
+            const chosen = winner orelse return error.NotFound;
 
-            if (choose_overlay) {
-                const pending = overlay_candidate.?;
-                if (disk) |indexed| {
-                    if (std.mem.eql(u8, pending.key, indexed.key)) {
+            if (pending_candidate != null and std.mem.eql(u8, pending_candidate.?.key, winner_key)) {
+                pending_index = self.advanceOverlayIndex(pending_index.?, direction);
+            }
+            if (redo_key != null and std.mem.eql(u8, redo_key.?, winner_key)) {
+                redo_index = self.advanceRedoIndex(redo_index.?, direction);
+            }
+            if (disk != null and std.mem.eql(u8, disk.?.key, winner_key) and chosen != .disk) {
+                var consumed = disk.?;
+                consumed.deinit(self.txn.allocator);
+                disk = null;
+                disk = try self.advanceDisk(direction);
+            }
+
+            switch (chosen) {
+                .pending => {
+                    const pending = pending_candidate.?;
+                    const value = pending.value orelse continue;
+                    const buffered_disk = disk;
+                    disk = null;
+                    return try self.installPending(pending.key, value, buffered_disk, direction);
+                },
+                .redo => {
+                    const entry = (try file.redoOverlayEntry(.documents, self.txn.checkpoint, winner_key)) orelse return error.InvalidNativeRedoRecord;
+                    defer self.txn.allocator.free(entry.value);
+                    if (entry.is_delete) continue;
+                    const resolved_value = if (entry.external_value_root_page != 0)
+                        try file.readValuePagesAtCheckpointAlloc(self.txn.allocator, entry.external_value_root_page, entry.external_value_len, self.txn.checkpoint)
+                    else
+                        entry.value;
+                    defer if (entry.external_value_root_page != 0) self.txn.allocator.free(resolved_value);
+                    const buffered_disk = disk;
+                    disk = null;
+                    return try self.installPending(winner_key, resolved_value, buffered_disk, direction);
+                },
+                .disk => {
+                    const indexed = disk.?;
+                    disk = null;
+                    const value = self.readValue(file, indexed) catch |err| {
                         var consumed = indexed;
                         consumed.deinit(self.txn.allocator);
-                        disk = null;
-                        disk = try self.advanceDisk(direction);
-                    }
-                }
-                overlay_index = self.advanceOverlayIndex(overlay_index.?, direction);
-                const value = pending.value orelse continue;
-                const buffered_disk = disk;
-                disk = null;
-                return try self.installPending(pending.key, value, buffered_disk, direction);
-            }
-
-            if (disk) |indexed| {
-                var consumed = indexed;
-                disk = null;
-                const value = self.readValue(file, consumed) catch |err| {
+                        return err;
+                    };
+                    if (value) |owned_value| return self.installDisk(indexed, owned_value, direction);
+                    var consumed = indexed;
                     consumed.deinit(self.txn.allocator);
-                    return err;
-                };
-                if (value) |owned_value| return self.installDisk(consumed, owned_value, direction);
-                consumed.deinit(self.txn.allocator);
-                disk = try self.advanceDisk(direction);
-                continue;
+                    disk = try self.advanceDisk(direction);
+                    continue;
+                },
             }
-            return error.NotFound;
         }
+    }
+
+    fn advanceRedoIndex(self: *Cursor, index: usize, direction: Direction) ?usize {
+        const overlay = &self.redo_overlay.?;
+        return switch (direction) {
+            .forward => if (index + 1 < overlay.keys.len) index + 1 else null,
+            .backward => if (index > 0) index - 1 else null,
+        };
     }
 
     fn readValue(self: *Cursor, file: *native.NativeFile, indexed: native.DocumentIndexEntry) !?[]u8 {
@@ -6500,6 +6614,31 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
 
 // Both runtime adapters share traversal and ownership rules. Only NotFound
 // means exhaustion; failed reads and malformed keys must reach replay workers.
+// Regression (now fixed at the source instead of here): this scans via
+// `read.openCursor()` -> `docstore.Cursor`, which used to merge only
+// `Txn.pending_tree` (a write transaction's own in-flight, uncommitted
+// mutations) -- never `NativeFile`'s redo-log overlay (`SharedRedoOverlay`/
+// `redoOverlayEntry`), a wholly separate, cross-commit mechanism `Cursor`
+// had no knowledge of at all. A read-only `Txn` (exactly what this
+// function opens) has an empty `pending_tree`, so that merge contributed
+// nothing either way: every replay-journal entry still sitting in the
+// redo overlay (committed, but not yet folded into a real page by
+// `checkpointRedoLog`) was invisible to this scan, even though the
+// identical key is visible to an ordinary point `get()` on the very same,
+// uncrashed handle. Found via `storage.lite.crash_consistency_test`'s
+// "crash sweep: full text synchronous visibility" failing even on
+// `[uncrashed run]`s with no fault injected at all: `sync_level: .full_text`'s
+// derived-index catch-up pass discovers "what changed" by calling this
+// function, so a commit logged but not yet checkpointed was never indexed,
+// even though `batch()` had already returned success for it.
+//
+// Fixed in the base layer instead of here: `Cursor` itself now merges the
+// redo overlay (`Cursor.redo_overlay`/`resolveMerged`'s three-way merge,
+// layered `pending_tree` over the overlay over the B-tree), so this
+// function needs no special-casing of its own -- it is the original,
+// simple cursor scan, now correct for the same reason every other
+// `Txn.openCursor()`/`openKeyCursor()` consumer (SQL range reads, posting-
+// list walks, reclamation/pooling scans, and so on) is.
 fn forEachReplayLaneRaw(
     store: *Store,
     prefix: []const u8,
@@ -9854,6 +9993,136 @@ test "lite packed document cursors read each physical bundle once per scan" {
     try std.testing.expectEqualStrings("key-00001000", (try cursor.seekAtOrAfter("key-00001000")).key);
     try std.testing.expectEqualStrings("key-00000999", (try cursor.prev()).key);
     try std.testing.expectEqualStrings("key-00001000", (try cursor.next()).key);
+}
+
+// Regression: `Txn.openCursor()`'s `Cursor` used to merge only
+// `pending_tree` (a write transaction's own in-flight, uncommitted
+// writes), never `NativeFile`'s redo-log overlay -- a commit logged but
+// not yet folded by `checkpointRedoLog` was invisible to every cursor
+// scan, even though it was visible to an ordinary point `get()`. Exercises
+// the fixed three-way merge (`pending_tree` over the overlay over the
+// B-tree) directly at the `docstore.Cursor` level: puts, an overwrite and
+// a delete all land in the overlay (no checkpoint in between for most of
+// them), straddling a checkpoint boundary partway through, scanned both
+// forward and backward.
+test "lite docstore cursor merges the redo overlay across put, overwrite, delete and a checkpoint boundary" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "cursor-redo-overlay.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .use_redo_log = true, .io = std.testing.io, .reclamation = .{ .page_reuse = false } });
+    defer store.close();
+
+    // alpha/beta/gamma land through the redo overlay -- no checkpoint yet.
+    {
+        var write = try store.beginWrite();
+        try write.put("alpha", "one");
+        try write.commit();
+    }
+    {
+        var write = try store.beginWrite();
+        try write.put("beta", "two");
+        try write.commit();
+    }
+    {
+        var write = try store.beginWrite();
+        try write.put("gamma", "three");
+        try write.commit();
+    }
+
+    const Expect = struct { key: []const u8, value: []const u8 };
+    const checkCursorSees = struct {
+        fn run(s: *Store, expected: []const Expect) !void {
+            std.debug.assert(expected.len > 0);
+            var read = try s.beginRead();
+            defer read.abort();
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            var i: usize = 0;
+            var entry = try cursor.first();
+            while (true) {
+                try std.testing.expect(i < expected.len);
+                try std.testing.expectEqualStrings(expected[i].key, entry.key);
+                try std.testing.expectEqualStrings(expected[i].value, entry.value);
+                i += 1;
+                entry = cursor.next() catch break;
+            }
+            try std.testing.expectEqual(expected.len, i);
+            // Same contract, walked backward from `last()`.
+            var j = expected.len;
+            var back = try cursor.last();
+            while (true) {
+                j -= 1;
+                try std.testing.expectEqualStrings(expected[j].key, back.key);
+                try std.testing.expectEqualStrings(expected[j].value, back.value);
+                if (j == 0) break;
+                back = try cursor.prev();
+            }
+            try std.testing.expectError(error.NotFound, cursor.prev());
+        }
+    }.run;
+
+    try checkCursorSees(&store, &.{
+        .{ .key = "alpha", .value = "one" },
+        .{ .key = "beta", .value = "two" },
+        .{ .key = "gamma", .value = "three" },
+    });
+
+    // Checkpoint: alpha/beta/gamma move into the real tree. The cursor
+    // must see exactly the same results, now page-sourced instead of
+    // overlay-sourced.
+    try store.file.checkpointRedoLog();
+    try checkCursorSees(&store, &.{
+        .{ .key = "alpha", .value = "one" },
+        .{ .key = "beta", .value = "two" },
+        .{ .key = "gamma", .value = "three" },
+    });
+
+    // Overwrite beta and delete gamma (both now overlay-only mutations
+    // shadowing tree-resident keys -- gamma's tombstone must hide its
+    // real page entirely); insert delta (overlay-only, brand new, sorts
+    // between beta and gamma).
+    {
+        var write = try store.beginWrite();
+        try write.put("beta", "two-updated");
+        try write.commit();
+    }
+    {
+        var write = try store.beginWrite();
+        try write.delete("gamma");
+        try write.commit();
+    }
+    {
+        var write = try store.beginWrite();
+        try write.put("delta", "four");
+        try write.commit();
+    }
+
+    try checkCursorSees(&store, &.{
+        .{ .key = "alpha", .value = "one" },
+        .{ .key = "beta", .value = "two-updated" },
+        .{ .key = "delta", .value = "four" },
+    });
+
+    // seekAtOrAfter/seekAtOrBefore must resolve correctly too, including
+    // landing exactly on an overlay-only key and stepping past a
+    // tombstoned one without ever surfacing it.
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        try std.testing.expectEqualStrings("delta", (try cursor.seekAtOrAfter("beta-zzz")).key);
+        // "At or before" is inclusive: "delta" itself is live, so it wins.
+        try std.testing.expectEqualStrings("delta", (try cursor.seekAtOrBefore("delta")).key);
+        // "gamma" itself is a tombstone (hidden, never surfaced) -- the
+        // largest live key at or before it is "delta", not "beta": the
+        // tombstone must not make the search fall back past a live key
+        // that sorts between the deleted one and the next real candidate.
+        try std.testing.expectEqualStrings("delta", (try cursor.seekAtOrBefore("gamma")).key);
+        try std.testing.expectEqualStrings("four", (try cursor.seekAtOrBefore("gamma")).value);
+    }
 }
 
 test "lite maintenance snapshots release shared cache accounting on cancellation and publication" {

@@ -211,7 +211,32 @@ pub const shared_fail_fast_retry_ns: i128 = 40 * std.time.ns_per_ms;
 pub const Entry = struct {
     inode: Io.File.INode,
     /// Reopened lazily to get this entry's own dedicated fd (see
-    /// `ensureFd`). Owned by `std.heap.page_allocator`.
+    /// `ensureFd`), and the string `ensureRegion` derives the shared lock
+    /// region's own sidecar name from -- the one canonical truth both
+    /// use. Canonicalized once (best-effort; see `canonicalPathAlloc`),
+    /// at `open`/`rebind` time, to an absolute, symlink-resolved
+    /// spelling: necessary for `ensureRegion`'s lazy reopen, which can
+    /// run arbitrarily later against whatever is cached here, with no
+    /// opportunity to re-derive "where this file originally was" from a
+    /// relative string at that later point (a cwd change in between), or
+    /// to converge two spellings of the same file (a symlink alias, or
+    /// two processes resolving their own relative spellings
+    /// independently) on the one sidecar name both must agree on.
+    /// `ensureFd` only strictly needs this entry's own inode (already
+    /// its whole identity), so a canonical spelling costs it nothing
+    /// either -- on a real filesystem. It is *not* safe to canonicalize
+    /// this field unless `crash_sim_io.zig`'s `SimIo` normalizes its own
+    /// `durable`/`handle_paths` tracking to the same canonical identity
+    /// (see that file's `canonicalKeyAllowingMissing`): that shim tracks
+    /// durability by path *string*, a test-only simplification, and
+    /// `ensureFd` reopening under a spelling different from whatever
+    /// `openDataFile`/`createDataFile` used would otherwise register as
+    /// a second, independently-tracked, never-synced path for the same
+    /// real file, which `applyPowerLoss` then deletes out from under the
+    /// first, correctly-synced record -- the exact cause of "crash
+    /// sweep: redo log checkpoint with indexed reclamation retires
+    /// pages" and "crash sweep: full text synchronous visibility"
+    /// failing with `FileNotFound`. Owned by `std.heap.page_allocator`.
     path: []const u8,
     /// Every live reference to this entry, from both `open`/`unref` (a
     /// NativeFile's own long-lived interest) and `acquire`/`release` (a
@@ -565,25 +590,26 @@ pub fn isRegionUnusable(err: anyerror) bool {
 var registry_mutex: Io.Mutex = .init;
 var registry: std.AutoHashMapUnmanaged(Io.File.INode, *Entry) = .empty;
 
-/// Resolves `path` to an absolute, symlink-resolved path, so everything
-/// keyed off the result -- `Entry.path`, and `shared_lock_region`'s own
-/// `<path>.aflite-lock` sidecar derived from it -- stays correct no matter
-/// what the process's current directory is later changed to, and so that
-/// two different relative or symlinked spellings of the same file resolve
-/// to the *same* string. `ensureRegion`'s lazy reopen (after `rebind`, or
-/// after the region closes and a later caller reopens it) uses whatever
-/// is cached in `Entry.path` at whatever later moment it happens to run,
-/// with no opportunity to re-derive "where this file originally was" from
-/// a relative string at that point -- so canonicalizing once, here, at
-/// `open`/`rebind` time, while the caller's own cwd is still the one that
-/// made the relative spelling meaningful, is the only point this can
-/// happen correctly. Mirrors #1650's `root_identity.zig` fix and
-/// `native.zig`'s own `writerLockPathAlloc`: an existing file (the only
-/// case `open`/`rebind` ever actually hit -- both call sites resolve a
-/// data file already renamed into its final place) resolves directly;
-/// the missing-file fallback (parent directory through an open handle,
-/// basename joined back on) is kept only for robustness.
-fn canonicalPathAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
+/// Resolves `path` to an absolute, symlink-resolved path for `Entry.path`
+/// (see that field's own doc comment for the full reasoning: this is
+/// the one canonical truth both `ensureFd` and `ensureRegion` use, safe
+/// for `ensureFd` specifically because `crash_sim_io.zig`'s `SimIo` now
+/// normalizes its own tracking to the same canonical identity -- see
+/// that file's `canonicalKeyAllowingMissing`). Best-effort, and never
+/// fails on account of `path` not currently resolving: `open` already
+/// confirms `path` exists (via its own, separate stat, before this is
+/// ever called), so this call's own fast tier should succeed in
+/// practice; the fallbacks below exist for the narrow remaining races
+/// (a concurrent deletion between that stat and this call) and for
+/// `rebind`, whose caller has already renamed the file into place but
+/// might, in principle, race a concurrent remover. Each tier falls
+/// through to the next on any error other than `OutOfMemory`: an
+/// existing file resolves directly; failing that, its parent directory
+/// resolved through an open handle plus the basename joined back on
+/// (mirroring `native.zig`'s own `writerLockPathAlloc`); failing that
+/// too, `path` itself, unresolved -- exactly what every caller tolerated
+/// before this file canonicalized anything.
+fn canonicalPathAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8) std.mem.Allocator.Error![]u8 {
     if (Io.Dir.cwd().realPathFileAlloc(io, path, allocator)) |resolved| {
         // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8`,
         // over-allocated by one byte for the terminator. `Entry.path`'s
@@ -596,10 +622,16 @@ fn canonicalPathAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8) ![
         // matching type, instead.
         defer allocator.free(resolved);
         return try allocator.dupe(u8, resolved);
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    }
+    } else |err| if (err == error.OutOfMemory) return error.OutOfMemory;
+
+    if (canonicalParentJoin(allocator, io, path)) |joined| {
+        return joined;
+    } else |err| if (err == error.OutOfMemory) return error.OutOfMemory;
+
+    return try allocator.dupe(u8, path);
+}
+
+fn canonicalParentJoin(allocator: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
     const dirname = std.fs.path.dirname(path) orelse ".";
     const basename = std.fs.path.basename(path);
     var parent = try Io.Dir.cwd().openDir(io, dirname, .{});
@@ -616,20 +648,29 @@ fn canonicalPathAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8) ![
 /// pointer directly (behind an atomic, if it can ever be reread concurrently
 /// with a rebind such as `replaceWithPreparedGeneration`'s) -- there is
 /// nothing else to wrap it in.
+///
+/// Stats `path` itself first, not a canonicalized form of it, so the one
+/// check that decides whether this call succeeds or fails at all keeps
+/// simple, direct timing. Canonicalization (`canonicalPathAlloc`) is
+/// deferred until *after* that stat succeeds, and only for a genuinely
+/// new `Entry` (a registry hit reuses the existing one's own
+/// `Entry.path`, already canonical from whenever it was first created):
+/// both avoid adding canonicalization's own extra real I/O to a path
+/// this call already confirms exists, or to the common warm case of
+/// reopening an inode this process already has open.
 pub fn open(io: Io, path: []const u8) !*Entry {
     const page = std.heap.page_allocator;
-    const canonical_path = try canonicalPathAlloc(page, io, path);
-    errdefer page.free(canonical_path);
-    const inode = (try Io.Dir.cwd().statFile(io, canonical_path, .{})).inode;
+    const inode = (try Io.Dir.cwd().statFile(io, path, .{})).inode;
     registry_mutex.lockUncancelable(io);
     defer registry_mutex.unlock(io);
     if (registry.get(inode)) |entry| {
-        page.free(canonical_path);
         entry.mutex.lockUncancelable(io);
         entry.refs += 1;
         entry.mutex.unlock(io);
         return entry;
     }
+    const canonical_path = try canonicalPathAlloc(page, io, path);
+    errdefer page.free(canonical_path);
     const entry = try page.create(Entry);
     errdefer page.destroy(entry);
     entry.* = .{ .inode = inode, .path = canonical_path, .refs = 1 };
@@ -921,11 +962,11 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
 pub fn rebind(entry: *Entry, io: Io, new_path: []const u8) !void {
     const page = std.heap.page_allocator;
     // Canonicalize here too, for the exact reason `open` does: the next
-    // `ensureRegion` reopens lazily, at some later and otherwise
-    // unconstrained point, against whatever is cached in `entry.path` --
-    // so it must already be an absolute, symlink-resolved path by the
-    // time this call returns, not a relative spelling that depended on
-    // this call's own cwd.
+    // `ensureRegion`/`ensureFd` reopens lazily, at some later and
+    // otherwise unconstrained point, against whatever is cached in
+    // `entry.path` -- so it must already be an absolute, symlink-resolved
+    // path by the time this call returns, not a relative spelling that
+    // depended on this call's own cwd.
     const owned = try canonicalPathAlloc(page, io, new_path);
     entry.mutex.lockUncancelable(io);
     defer entry.mutex.unlock(io);
@@ -1164,6 +1205,66 @@ test "ensureRegion's lazy reopen after rebind uses the original directory, not a
     // And nothing leaked into `elsewhere_dir`, the cwd the reopen
     // actually ran under.
     try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, "new.data.aflite-lock", .{}));
+
+    try std.process.setCurrentPath(io, original_cwd);
+    restored = true;
+}
+
+// #1650's own bug class, checked directly against `ensureFd`: `open`
+// canonicalizes `path` to an absolute spelling once, at open time, so a
+// *later* lazy reopen of this entry's dedicated flock fd (after `fd`
+// goes back to `null`, e.g. following a fairness release) must still
+// resolve to the exact same file no matter what the process's current
+// directory has since become -- a relative spelling cached instead
+// would silently reopen a *different* file (or none at all) after a
+// cwd change, and the in-process lock would stop excluding anything
+// without telling anyone.
+test "ensureFd's lazy reopen targets the original file despite a relative open path and a later cwd change" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    const original_cwd = try Io.Dir.cwd().realPathFileAlloc(io, ".", a);
+    defer a.free(original_cwd);
+    var restored = false;
+    defer if (!restored) std.process.setCurrentPath(io, original_cwd) catch {};
+
+    var data_tmp = std.testing.tmpDir(.{});
+    defer data_tmp.cleanup();
+    var data_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const data_dir_len = try data_tmp.dir.realPath(io, &data_buf);
+    const data_dir = try a.dupe(u8, data_buf[0..data_dir_len]);
+    defer a.free(data_dir);
+
+    var elsewhere_tmp = std.testing.tmpDir(.{});
+    defer elsewhere_tmp.cleanup();
+    var elsewhere_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const elsewhere_dir_len = try elsewhere_tmp.dir.realPath(io, &elsewhere_buf);
+    const elsewhere_dir = try a.dupe(u8, elsewhere_buf[0..elsewhere_dir_len]);
+    defer a.free(elsewhere_dir);
+
+    try std.process.setCurrentPath(io, data_dir);
+    const relative_path = "ensure-fd-relative.data";
+    {
+        const f = try Io.Dir.cwd().createFile(io, relative_path, .{});
+        f.close(io);
+    }
+    const expected_inode = (try Io.Dir.cwd().statFile(io, relative_path, .{})).inode;
+
+    // Opened with a relative spelling while cwd is still `data_dir` --
+    // the only moment that spelling is meaningful.
+    const entry = try open(io, relative_path);
+    defer unref(entry, io);
+
+    // Move cwd somewhere else entirely before the lazy reopen runs.
+    try std.process.setCurrentPath(io, elsewhere_dir);
+
+    const fd = try ensureFd(entry, io);
+    try std.testing.expectEqual(expected_inode, (try fd.stat(io)).inode);
+
+    // Nothing leaked into `elsewhere_dir`, the cwd the reopen actually
+    // ran under.
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, relative_path, .{}));
 
     try std.process.setCurrentPath(io, original_cwd);
     restored = true;

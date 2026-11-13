@@ -2222,6 +2222,76 @@ order-of-magnitude win native.zig's own direct measurement showed,
 confirmed surviving the full capi -> backend.zig -> docstore.zig ->
 native.zig path, not just the native.zig layer.
 
+**Update:** the default was flipped after all, once the page-shaped
+commit fallback (§9.6c) and `NativeFile.committedSequence()` landed and
+the reclamation/replay/maintenance failures above were run down and
+fixed. `use_redo_log` now defaults to `true` for newly-created files
+(`docstore.zig`'s `Store.createWithOptions`); every intermediate layer
+listed above still just threads the `?bool` through unchanged.
+
+### 9.7b A self-deadlock in the idle-turn checkpoint error path
+
+With redo as the default, a crash-sweep run appeared to hang at
+roughly 10% of one core for over an hour -- slow enough to suspect host
+contention (other sessions were loading the same build host) or one of
+three latency hypotheses (the ride-along bounded wait, a checkpointer
+firing on every commit, or the page-shaped fallback's small pwrites).
+`sample`-ing the stuck process twice, minutes apart, showed the
+identical stack both times: one thread in
+`Store.recordMaintenanceError` -> `PublicationMutex.lock`, reached from
+`Store.maybeCheckpointRedoLogOnIdleTurn` <- `Store.rideAlongFlushLoop`,
+while the main thread sat in the ordinary commit path
+(`Txn.commit` -> ... -> `Store.applyMutationGroup`) waiting on the same
+mutex. Not slowness -- a self-deadlock.
+
+`maybeCheckpointRedoLogOnIdleTurn` runs its whole body under
+`lockStoreExclusive` (`self.mutex`) and, on a `checkpointRedoLog`
+failure (the close-induced `error.OutcomeUnknown` from §9.6c's cluster
+reaches this path occasionally), called `recordMaintenanceError` --
+which locks that same `self.mutex` again, from the same thread.
+`PublicationMutex` is a cooperative, ticketed yield-spin
+(`platform_sync.lockYielding`), not a hard OS mutex, so this never
+crashed outright: the nested call's own freshly-drawn ticket could
+never become "next" while the ticket ahead of it -- this same call's
+own, still-unreleased hold -- never advanced either. It just spun
+forever, burning a steady trickle of CPU on retry/yield syscalls, which
+is exactly what looked like "waiting, not computing" rather than a
+hang.
+
+Fix: split `recordMaintenanceError` into a thin `lockStore` wrapper
+plus `recordMaintenanceErrorAssumeLocked` (the actual body, for a
+caller that already holds `self.mutex`), and have
+`maybeCheckpointRedoLogOnIdleTurn` call the `AssumeLocked` form
+directly. Audited every other `lockStore`/`lockStoreExclusive`/
+`tryLockStoreExclusive` call site in `docstore.zig` for the same
+"calls something that re-locks while already holding the lock"
+pattern; this was the only instance.
+
+General guard against the whole bug class, not just this one call site:
+in Debug/safe builds (`std.debug.runtime_safety`, covering both
+`.debug` and `.safe`), `PublicationMutex` now records its owning thread
+(`owner: std.atomic.Value(u64)`, a sentinel `maxInt(u64)` standing in
+for "unowned" since `std.atomic.Value` cannot wrap a non-pointer
+optional) and panics immediately via `assertNotOwnedByCurrentThread()`
+if `lock()` is re-entered by that same thread, instead of spinning
+forever. Zero cost in release builds (the field is `void` and every
+check compiles out).
+
+Regression test: a new `NativeFile.test_fail_checkpoint_redo_log`
+failpoint (same disarm-on-first-use pattern as
+`test_fail_checkpoint_publication`) fails the next `checkpointRedoLog`
+call outright; "lite idle-turn checkpoint failure records the error
+without deadlocking the store mutex" forces that failure on the
+idle-turn path and asserts, each under its own bounded deadline (never
+`.join()`-ing a thread that might still be hung, matching "lite closing
+a store with only ride-along work (no foreground write) does not
+hang"'s own pattern): the maintenance error is recorded
+(`status.last_error`/`.reason`/`.state`), a subsequent commit still
+succeeds, and `close()` still returns, all within a few seconds.
+
+Landed as its own commit, separate from the default flip, so the two
+can be merged independently.
+
 ### 9.8 Gates (from step (c) on)
 
 Unchanged from the task's own list, restated for traceability:

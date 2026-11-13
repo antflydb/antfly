@@ -511,6 +511,60 @@ pub const SimIo = struct {
             }
         }
     }
+
+    /// Resolves `path` to this shim's canonical tracking key -- an absolute,
+    /// symlink-resolved spelling via the *real*, unwrapped `Io` (never
+    /// through this shim's own overridden vtable, which would otherwise
+    /// re-enter its own tracking). A real filesystem tracks durability per
+    /// inode; this shim, a test-only simplification, tracks it by path
+    /// *string* in `durable`/`directories`/`handle_paths`. Without
+    /// normalizing every path to one shared key first, two different
+    /// spellings of the same file -- a relative path reopened after a cwd
+    /// change, or a symlink alias, both legitimate at the `inode_lock.zig`/
+    /// `shared_lock_region.zig` layer this shim exists to crash-test --
+    /// become two independent, inconsistent durability records for the one
+    /// real file. `applyPowerLoss` then deletes whichever of those records
+    /// it never saw synced, even though a different, correctly-synced
+    /// record for a different spelling of the exact same file says
+    /// otherwise -- observed as "crash sweep: redo log checkpoint with
+    /// indexed reclamation retires pages" and "crash sweep: full text
+    /// synchronous visibility" failing with `FileNotFound`, caused by
+    /// `inode_lock.Entry`'s own, unrelated canonicalization reopening a
+    /// dedicated fd under a spelling this shim had never seen before.
+    ///
+    /// Best-effort and infallible except `OutOfMemory`, exactly like
+    /// `inode_lock.zig`'s own `canonicalPathAlloc` (independently
+    /// duplicated, not shared -- this file has zero dependencies beyond
+    /// `std`, by design; see this file's own module doc comment): an
+    /// existing file resolves directly; failing that (the common case
+    /// here, since `new_sub_path` in a rename never exists yet), its
+    /// parent directory resolved through an open handle plus the
+    /// basename joined back on; failing that too, `path` itself,
+    /// unresolved -- at which point this shim's own string-keyed
+    /// limitation is back, but no worse than before this function
+    /// existed.
+    fn canonicalKeyAllowingMissing(self: *SimIo, path: []const u8) Allocator.Error![]u8 {
+        if (Dir.cwd().realPathFileAlloc(self.real, path, self.allocator)) |resolved| {
+            defer self.allocator.free(resolved);
+            return try self.allocator.dupe(u8, resolved);
+        } else |err| if (err == error.OutOfMemory) return error.OutOfMemory;
+
+        if (self.canonicalParentJoin(path)) |joined| {
+            return joined;
+        } else |err| if (err == error.OutOfMemory) return error.OutOfMemory;
+
+        return try self.allocator.dupe(u8, path);
+    }
+
+    fn canonicalParentJoin(self: *SimIo, path: []const u8) ![]u8 {
+        const dirname = std.fs.path.dirname(path) orelse ".";
+        const basename = std.fs.path.basename(path);
+        var parent = try Dir.cwd().openDir(self.real, dirname, .{});
+        defer parent.close(self.real);
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const parent_len = try parent.realPath(self.real, &buf);
+        return try std.fs.path.join(self.allocator, &.{ buf[0..parent_len], basename });
+    }
 };
 
 /// Side table from a real `Io`'s `userdata` to the `SimIo` wrapping it.
@@ -711,11 +765,23 @@ fn vtDirRename(userdata: ?*anyopaque, old_dir: Dir, old_sub_path: []const u8, ne
     self.mutex.lock();
     defer self.mutex.unlock();
 
-    const crash_before = self.recordBarrier(.rename, new_sub_path, old_sub_path) catch return error.AccessDenied;
+    // Canonicalize both sides before the real rename runs, while each
+    // spelling still resolves to a real location: `old_sub_path`'s file
+    // still exists there (pre-rename), and `new_sub_path`'s parent
+    // directory, though not yet the file itself, already does. See
+    // `canonicalKeyAllowingMissing`'s own doc comment for why this must
+    // happen *before* either spelling's meaning changes, not later
+    // against whatever has since moved or been deleted.
+    const old_key = self.canonicalKeyAllowingMissing(old_sub_path) catch return error.AccessDenied;
+    defer self.allocator.free(old_key);
+    const new_key = self.canonicalKeyAllowingMissing(new_sub_path) catch return error.AccessDenied;
+    defer self.allocator.free(new_key);
+
+    const crash_before = self.recordBarrier(.rename, new_key, old_key) catch return error.AccessDenied;
     if (crash_before) return error.AccessDenied;
 
     try self.real.vtable.dirRename(self.real.userdata, old_dir, old_sub_path, new_dir, new_sub_path);
-    self.renameDurable(old_sub_path, new_sub_path) catch return error.AccessDenied;
+    self.renameDurable(old_key, new_key) catch return error.AccessDenied;
 
     if (self.maybeArmAfter(self.next_sequence - 1)) return error.AccessDenied;
 }
@@ -725,23 +791,33 @@ fn vtDirRenamePreserve(userdata: ?*anyopaque, old_dir: Dir, old_sub_path: []cons
     self.mutex.lock();
     defer self.mutex.unlock();
 
-    const crash_before = self.recordBarrier(.rename, new_sub_path, old_sub_path) catch return error.AccessDenied;
+    const old_key = self.canonicalKeyAllowingMissing(old_sub_path) catch return error.AccessDenied;
+    defer self.allocator.free(old_key);
+    const new_key = self.canonicalKeyAllowingMissing(new_sub_path) catch return error.AccessDenied;
+    defer self.allocator.free(new_key);
+
+    const crash_before = self.recordBarrier(.rename, new_key, old_key) catch return error.AccessDenied;
     if (crash_before) return error.AccessDenied;
 
     try self.real.vtable.dirRenamePreserve(self.real.userdata, old_dir, old_sub_path, new_dir, new_sub_path);
-    self.renameDurable(old_sub_path, new_sub_path) catch return error.AccessDenied;
+    self.renameDurable(old_key, new_key) catch return error.AccessDenied;
 
     if (self.maybeArmAfter(self.next_sequence - 1)) return error.AccessDenied;
 }
 
 // Not part of the formal vtable surface; small helper shared by the two
-// open/create overrides above.
+// open/create overrides above. Canonicalizes `sub_path` to this shim's
+// shared tracking key (see `canonicalKeyAllowingMissing`) before it ever
+// reaches `handle_paths`/`durable`: the file this call just created or
+// opened already exists on the real filesystem (the real `dirCreateFile`/
+// `dirOpenFile` call above this one's own caller already succeeded), so
+// the fast, direct-resolve tier always applies here.
 fn trackOpenedFile(self: *SimIo, file: File, sub_path: []const u8) !void {
-    const owned = try self.allocator.dupe(u8, sub_path);
+    const owned = try self.canonicalKeyAllowingMissing(sub_path);
     errdefer self.allocator.free(owned);
     if (self.handle_paths.fetchRemove(file.handle)) |old| self.allocator.free(old.value.path);
     try self.handle_paths.put(self.allocator, file.handle, .{ .path = owned });
-    try self.ensureDurableEntry(sub_path);
+    try self.ensureDurableEntry(owned);
 }
 
 test "SimIo records a file_sync barrier and reopening after a before-crash loses the unsynced write" {
@@ -822,6 +898,69 @@ test "SimIo after-crash keeps the synced write durable" {
     try std.testing.expectEqualStrings("durable", &contents);
 
     try Dir.cwd().deleteFile(std.testing.io, path);
+}
+
+// The regression this guards against: a file created, written, and
+// durably synced under one spelling, then reopened (with no write or
+// sync of its own) under a *different* spelling of the exact same
+// file, must not confuse this shim into treating the file as never
+// synced. Before `canonicalKeyAllowingMissing` existed, the second
+// open's own `ensureDurableEntry` call registered a brand new, null
+// (never-synced) `durable` entry keyed by the second spelling's raw
+// string, and `applyPowerLoss` deleted the real file because of it --
+// even though the first spelling's own entry, for the identical file,
+// was correctly marked durable. See `canonicalKeyAllowingMissing`'s own
+// doc comment for the exact crash-sweep failures this caused.
+test "SimIo treats two spellings of one file as one durability record" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &buf);
+    const dir_path = try allocator.dupe(u8, buf[0..dir_len]);
+    defer allocator.free(dir_path);
+    const absolute_path = try std.fmt.allocPrint(allocator, "{s}/sim-two-spellings.bin", .{dir_path});
+    defer allocator.free(absolute_path);
+    const relative_path = "sim-two-spellings.bin";
+
+    const original_cwd = try Dir.cwd().realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(original_cwd);
+    var restored = false;
+    defer if (!restored) std.process.setCurrentPath(std.testing.io, original_cwd) catch {};
+    try std.process.setCurrentPath(std.testing.io, dir_path);
+
+    const sim = try SimIo.init(allocator, std.testing.io);
+    defer sim.deinit();
+    // Fires after the one sync below (the real sync, and this shim's own
+    // durable snapshot capture, both already happened by the time the
+    // caller is told it failed) -- same shape as "SimIo after-crash
+    // keeps the synced write durable" above.
+    sim.setCrashPlan(.{ .at_barrier = 0, .when = .after, .power_loss = .drop_unsynced });
+
+    // Created, written, and synced under the *relative* spelling.
+    var file = try Dir.cwd().createFile(sim.io(), relative_path, .{ .read = true });
+    try file.writePositionalAll(sim.io(), "durable", 0);
+    try std.testing.expectError(error.InputOutput, file.sync(sim.io()));
+    file.close(sim.io());
+    try std.testing.expect(sim.crashed);
+
+    // Reopened under the *absolute* spelling -- the identical file, a
+    // different string -- with no write or sync of its own.
+    var reopened_absolute = try Dir.cwd().openFile(sim.io(), absolute_path, .{ .mode = .read_only });
+    reopened_absolute.close(sim.io());
+
+    try sim.applyPowerLoss();
+
+    try std.process.setCurrentPath(std.testing.io, original_cwd);
+    restored = true;
+
+    var reopened = try Dir.cwd().openFile(std.testing.io, absolute_path, .{ .mode = .read_only });
+    defer reopened.close(std.testing.io);
+    var contents: [7]u8 = undefined;
+    _ = try reopened.readPositionalAll(std.testing.io, &contents, 0);
+    try std.testing.expectEqualStrings("durable", &contents);
+
+    try Dir.cwd().deleteFile(std.testing.io, absolute_path);
 }
 
 test "SimIo io fault plan injects one transient error without crashing" {
