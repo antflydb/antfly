@@ -16596,6 +16596,31 @@ pub const NativeFile = struct {
         const deferred_publication = !durable and !self.no_sync and !self.externally_locked;
         self.allow_manifest_reservation = !deferred_publication and self.manifest_commits_enabled;
         defer self.allow_manifest_reservation = false;
+        // `flushTransactionWrites` (and everything else below, before the
+        // success path's own `self.transaction_header = null` a few lines
+        // down runs) can fail partway through a write already staged via
+        // `stageMutation`'s `self.transactionWrites()` call. Without this,
+        // an error here leaves `self.transaction_header`/`self.
+        // transaction_writes` set forever: every later `stagingTransaction()`
+        // check (that name's own doc comment) then wrongly believes a
+        // transaction is still open, silently staging every future write
+        // into the stale `TransactionWrites` instead of ever really
+        // committing it again -- confirmed reachable live, via `check()`'s
+        // own `liveStats`/`LiveRecordCursor` path hitting a `std.HashMap`
+        // `pointer_stability` double-lock panic inside the eventually-
+        // triggered `flushTransactionWrites` call on that same stale,
+        // never-cleared instance. A caller with its own abort-on-error
+        // (`docstore.zig`'s `applyMutationGroup`, `errdefer self.file.
+        // abortTransaction()`) already recovers from this correctly; a
+        // bare `NativeFile.commitTransaction()` caller with no such
+        // wrapper (every direct native-level test, crash_consistency_
+        // test.zig's own scenarios) does not. Mirrors `abortTransaction`'s
+        // own cleanup of the same two fields.
+        errdefer {
+            if (self.transaction_writes) |writes| writes.deinit(self.allocator);
+            self.transaction_writes = null;
+            self.transaction_header = null;
+        }
         try self.flushTransactionWrites();
         var next = self.activeCheckpoint();
         const changed = next.commit_sequence != previous.checkpoints[previous.active_checkpoint].commit_sequence;
@@ -31003,6 +31028,63 @@ test "lite redo log a pin survives checkpoint and reclaim: a superseded multi-pa
     const pinned_value = (try file.getDocumentAtCheckpointAlloc(a, checkpoint_at_large, "doc")).?;
     defer a.free(pinned_value);
     try std.testing.expectEqualSlices(u8, large, pinned_value);
+}
+
+// Regression: `commitTransactionWithDurability`'s own `flushTransactionWrites`
+// call could fail (budget, allocator, I/O -- any of the ordinary ways a
+// real page build can fail) without the enclosing `errdefer` -- declared
+// *after* that call -- ever running, leaving `self.transaction_header`/
+// `self.transaction_writes` set forever. Every later `stagingTransaction()`
+// check (that name's own doc comment) then wrongly believes a transaction
+// is still open, silently staging every future write into the same stale,
+// never-flushed `TransactionWrites` instead of ever really committing
+// again -- confirmed reachable live while qualifying the redo/vacuum
+// oracle (a seeded run hit a `std.HashMap` `pointer_stability` double-
+// lock panic inside a much later, unrelated `check()` call's own
+// `flushTransactionWrites`, on exactly this stale instance). A caller with
+// its own abort-on-error (`docstore.zig`'s `applyMutationGroup`) already
+// recovers correctly; a bare `NativeFile.commitTransaction()` caller --
+// every direct native-level test, this one included -- did not.
+test "lite native file commitTransaction clears transaction_header/transaction_writes on a flush failure" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "commit-flush-failure-recovery.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{});
+    defer file.close();
+
+    try file.putDocument("seed", "seed-value");
+
+    // Clamp the budget so this transaction's own real build -- several
+    // document/index pages for 64 small keys, all built together inside
+    // `commitTransaction`'s own `flushTransactionWrites` call -- runs out
+    // of room partway through, after `stageMutation` has already staged
+    // every key (each small enough to stage without its own eager
+    // external-value write, so the failure lands inside the *top-level*
+    // flush this test targets, not a nested one).
+    const before_size = (try file.file.stat(file.runtimeIo())).size;
+    file.max_file_bytes = before_size + 3 * file.header.page_size;
+
+    try file.beginTransaction();
+    var failed = false;
+    for (0..64) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "k{d}", .{i});
+        file.putDocument(key, "v") catch {
+            failed = true;
+            break;
+        };
+    }
+    if (!failed) try std.testing.expectError(error.LiteStorageBudgetExceeded, file.commitTransaction());
+
+    // The regression this test exists to catch: before the fix, both of
+    // these stayed set, so `stagingTransaction()` kept reporting "a
+    // transaction is still open" forever, and every later write silently
+    // staged into this same, never-flushed instance instead of ever
+    // committing again.
+    try std.testing.expect(file.transaction_header == null);
+    try std.testing.expect(file.transaction_writes == null);
 }
 
 // Regression: `prepareVacuum`/`replaceWithPreparedGeneration` used to
