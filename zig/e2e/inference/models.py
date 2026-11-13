@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -1110,7 +1111,25 @@ def prefetch_test_models(
             and not (spec.repo == "antflydb/clipclap" and run_clipclap_contract_tests())
         ):
             continue
+        started = time.monotonic()
         ensure_model(spec)
+        seconds = time.monotonic() - started
+        print(f"E2E model provisioned: {spec.request_name} ({seconds:.3f}s)")
+        if report_dir := os.environ.get("ANTFLY_INFERENCE_REPORT_DIR"):
+            destination = Path(report_dir)
+            destination.mkdir(parents=True, exist_ok=True)
+            with (destination / "model-provisioning.jsonl").open("a") as output:
+                output.write(
+                    json.dumps(
+                        {
+                            "model": spec.request_name,
+                            "task": spec.task,
+                            "phase": "provision",
+                            "seconds": seconds,
+                        }
+                    )
+                    + "\n"
+                )
 
 
 def prefetch_curated_models() -> None:

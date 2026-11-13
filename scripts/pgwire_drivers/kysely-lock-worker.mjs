@@ -25,6 +25,56 @@ import {
 // Exercise parent-side failure reporting without creating a database claim.
 if (process.argv[2] === "exit-before-report") process.exit(17);
 
+// Keep bounded phase evidence in the subprocess outcome. In particular, a
+// contender timeout must distinguish a slow owner DDL/release from stale reads.
+// Parameters and connection URLs are never included in these diagnostics.
+const started = performance.now();
+const phases = new Map();
+const slowest = [];
+const record = (phase, before) => {
+	const elapsed = performance.now() - before;
+	const entry = phases.get(phase) ?? { calls: 0, milliseconds: 0 };
+	entry.calls++;
+	entry.milliseconds += elapsed;
+	phases.set(phase, entry);
+	slowest.push({ phase, start_ms: Math.round(before - started), duration_ms: Math.round(elapsed) });
+	slowest.sort((a, b) => b.duration_ms - a.duration_ms);
+	slowest.length = Math.min(slowest.length, 8);
+};
+const fetch = globalThis.fetch;
+globalThis.fetch = async (...args) => {
+	const before = performance.now();
+	try { return await fetch(...args); }
+	finally { record("HTTP", before); }
+};
+const wrapped = Symbol("migration query timings");
+class TimedPool extends pg.Pool {
+	async connect() {
+		const connection = await super.connect();
+		if (!connection[wrapped]) {
+			connection[wrapped] = true;
+			const original = connection.query.bind(connection);
+			connection.query = async (...args) => {
+				const sql = typeof args[0] === "string" ? args[0] : args[0]?.text ?? "";
+				const verb = sql.match(/^\s*(\w+)/)?.[1]?.toUpperCase() ?? "UNKNOWN";
+				const phase = sql.includes("_antfly_kysely_migration_claims") ? `CLAIM ${verb}` : verb;
+				const before = performance.now();
+				try {
+					return await original(...args);
+				} finally {
+					record(phase, before);
+				}
+			};
+		}
+		return connection;
+	}
+}
+const timings = () => ({
+	total_ms: Math.round(performance.now() - started),
+	queries: Object.fromEntries(phases),
+	slowest,
+});
+
 const url = new URL(process.env.ANTFLY_PGWIRE_URL);
 const client = new AntflyClient({
 	baseUrl: process.env.ANTFLY_HTTP_URL,
@@ -34,7 +84,7 @@ const client = new AntflyClient({
 	},
 });
 const runtime = createAntflyPostgres({
-	pg,
+	pg: { ...pg, Pool: TimedPool },
 	client,
 	pool: { connectionString: url.toString() },
 });
@@ -66,10 +116,11 @@ try {
 		process.send({
 			error: result.error ? inspect(result.error, { depth: 5 }) : null,
 			applied: result.results?.length ?? 0,
+			timings: timings(),
 		});
 	}
 } catch (error) {
-	process.send({ error: inspect(error, { depth: 5 }) });
+	process.send({ error: inspect(error, { depth: 5 }), timings: timings() });
 	process.exitCode = 1;
 } finally {
 	await runtime.close();

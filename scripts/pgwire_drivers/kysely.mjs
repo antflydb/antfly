@@ -333,6 +333,9 @@ try {
     const runners = [spawnWorker("migrate"), spawnWorker("migrate")];
     const outcomes = await Promise.all(runners.map((runner) => runner.message));
     await Promise.all(runners.map((runner) => runner.exited));
+    if (process.env.ANTFLY_PGWIRE_TRACE_MIGRATIONS === "1") {
+      console.log("Concurrent migration timings:", JSON.stringify(outcomes.map((outcome) => outcome.timings)));
+    }
     assert.deepEqual(outcomes.map((outcome) => outcome.error), [null, null],
       `Concurrent migration outcomes: ${JSON.stringify(outcomes)}`);
     assert.equal(

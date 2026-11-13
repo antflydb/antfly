@@ -1092,3 +1092,22 @@ def test_unknown_required_model_fails_before_provisioning(monkeypatch):
     with pytest.raises(ValueError, match="Unknown required E2E model"):
         prefetch_test_models([("test_embed.py", None)], required_models=("typo/model",))
     assert pulled == []
+
+
+def test_provisioning_reports_model_setup_separately_from_requests(
+    monkeypatch, tmp_path
+):
+    import json
+
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    monkeypatch.setenv("ANTFLY_INFERENCE_REPORT_DIR", str(tmp_path))
+    monkeypatch.setattr(models, "ensure_model", lambda spec: None)
+    prefetch_test_models([], required_models=(models.DEFAULT_EXTRACTOR_MODEL,))
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "model-provisioning.jsonl").read_text().splitlines()
+    ]
+    assert len(records) == 1
+    assert records[0]["model"] == models.DEFAULT_EXTRACTOR_MODEL
+    assert records[0]["phase"] == "provision"
+    assert records[0]["seconds"] >= 0
