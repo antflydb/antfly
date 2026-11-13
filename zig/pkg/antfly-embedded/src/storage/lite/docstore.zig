@@ -12892,8 +12892,26 @@ test "lite prepared cached scores retry after page cache eviction" {
     try std.testing.expect(!scope.discard_workspace);
     for (scores) |score| try std.testing.expectEqual(@as(?f64, 3), score);
     const before = counter.alloc_calls;
+    // Under the redo log (the default), the 512 document records this
+    // test wrote via `putDocumentBatch` were diverted into the log and
+    // never folded by a checkpoint (nothing here ever calls
+    // `checkpointRedoLog`/`maintainOnce`), so the handful of physical
+    // pages holding them are still served from the in-memory overlay on
+    // every read, not from a stable on-disk copy -- `readBackingPages`'
+    // own §9.3a doc comment. Unlike a page a checkpoint has already
+    // folded, an overlay-served page is never cached, so a repeat read
+    // of it allocates a fresh, transient `dupe` every time
+    // (`test_redo_page_overlay_hits`), even though every other part of
+    // this retry is a full cache hit. This is a legacy-only physical
+    // detail, not a redo-mode inefficiency: the overlay must be
+    // consulted on every read for correctness (it can change between
+    // calls in a live system), so the right invariant under redo is
+    // "zero allocations beyond the ones the still-staged pages this
+    // retry touches legitimately cost," not "zero allocations."
+    const overlay_hits_before = file.test_redo_page_overlay_hits.load(.monotonic);
     try scope.getManySortedScores(&keys, &scores);
-    try std.testing.expectEqual(before, counter.alloc_calls);
+    const overlay_hit_allocs = file.test_redo_page_overlay_hits.load(.monotonic) - overlay_hits_before;
+    try std.testing.expectEqual(before + overlay_hit_allocs, counter.alloc_calls);
 }
 
 test "lite prepared point versus batch scope measurement" {

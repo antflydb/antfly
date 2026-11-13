@@ -6540,6 +6540,17 @@ pub const NativeFile = struct {
     test_value_read_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_cancel_on_read: if (builtin.is_test) ?*maintenance.CancelToken else void = if (builtin.is_test) null else {},
     test_page_reads: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    /// §9.3a: `readBackingPages`'s overlay consult (below) returns a fresh,
+    /// transient `dupe` for each physical page that is still staged in the
+    /// redo log overlay (not yet folded by a checkpoint) -- correct, but
+    /// unlike a page already folded onto disk, it is never cached, so it
+    /// costs one allocation on *every* read of that page, not just the
+    /// first. Counted separately so a test asserting "a retry over an
+    /// unchanged read allocates nothing new" can account for this
+    /// legitimate, bounded cost instead of either ignoring it or wrongly
+    /// treating it as a regression (see the "retry after page cache
+    /// eviction" test in docstore.zig).
+    test_redo_page_overlay_hits: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_index_view_hits: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_index_comparisons: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_page_writes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
@@ -9753,6 +9764,7 @@ pub const NativeFile = struct {
                     const page_id = offset / page_size;
                     if (try redo.shared.readPageAlloc(self.allocator, self.runtimeIo(), page_id)) |bytes| {
                         defer self.allocator.free(bytes);
+                        if (builtin.is_test) _ = self.test_redo_page_overlay_hits.fetchAdd(1, .monotonic);
                         @memcpy(out, bytes);
                         return;
                     }
@@ -9795,6 +9807,7 @@ pub const NativeFile = struct {
                         const page_id = first_page + i;
                         if (try redo.shared.readPageAlloc(self.allocator, self.runtimeIo(), page_id)) |bytes| {
                             defer self.allocator.free(bytes);
+                            if (builtin.is_test) _ = self.test_redo_page_overlay_hits.fetchAdd(1, .monotonic);
                             @memcpy(out[i * page_size ..][0..page_size], bytes);
                             i += 1;
                             continue;
