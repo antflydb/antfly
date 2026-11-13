@@ -5872,7 +5872,7 @@ pub const ReadView = struct {
     /// never processes a commit itself and so never advances its own
     /// `activeCheckpoint()`/`committedSequence()`).
     pub fn openAt(file: *NativeFile, io: std.Io, checkpoint: CheckpointSlot) !ReadView {
-        var view: ReadView = .{ .file = file, .checkpoint = checkpoint, .mark = checkpoint.commit_sequence, .owns_pin = false };
+        var view: ReadView = .{ .file = file, .checkpoint = checkpoint, .mark = file.readMark(checkpoint), .owns_pin = false };
         if (file.redo) |*redo| try redo.shared.pin(std.heap.page_allocator, io, view.mark);
         errdefer if (file.redo) |*redo| redo.shared.unpin(io, view.mark);
         if (file.inode_lock_ref.load(.acquire)) |entry| {
@@ -5889,7 +5889,7 @@ pub const ReadView = struct {
     /// method below behaves identically regardless of which
     /// constructor produced this view.
     pub fn borrowed(file: *NativeFile, checkpoint: CheckpointSlot) ReadView {
-        return .{ .file = file, .checkpoint = checkpoint, .mark = checkpoint.commit_sequence, .owns_pin = false };
+        return .{ .file = file, .checkpoint = checkpoint, .mark = file.readMark(checkpoint), .owns_pin = false };
     }
 
     /// Unpins, in reverse of `open`/`openAt`'s own order. A no-op for a
@@ -5991,7 +5991,7 @@ pub const ReadView = struct {
     /// that needs the entry's own flags (`is_delete`, the external-value
     /// pointer) rather than an already-materialized value.
     pub fn documentOverlayEntry(self: *const ReadView, key: []const u8) !?CatalogEntry {
-        return self.file.redoOverlayEntry(.documents, self.checkpoint, key);
+        return self.file.redoOverlayEntryAt(.documents, self.mark, key);
     }
 };
 
