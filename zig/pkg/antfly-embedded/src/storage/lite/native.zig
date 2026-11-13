@@ -9280,10 +9280,53 @@ pub const NativeFile = struct {
     }
 
     pub fn retirementNeedsServiceWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !bool {
+        return self.retirementNeedsServiceCoreWithCancel(cancel, true);
+    }
+
+    /// §9 (redo retirement signal): the same check, but never considering
+    /// redo-overlay debt -- used only by `Store.startMaintenanceAssumeLocked`
+    /// (docstore.zig). That caller's job is deciding whether to spin up a
+    /// *background* maintenance thread, a code path that, under redo, has
+    /// never run for a retirement reason before now (redo debt alone used
+    /// to make this whole function always return false): doing so for the
+    /// first time surfaced a pre-existing concurrency bug in the
+    /// background maintenance loop's interaction with a live redo commit
+    /// (reproduced independently of every other change in this patch --
+    /// see the crash-sweep/close+reopen regressions this gated on), which
+    /// overlaps the write-serialization race already being fixed on
+    /// `perf/lwa-writer-race`. Every other caller of
+    /// `retirementNeedsServiceWithCancel` -- explicit test assertions,
+    /// `Store.maintainOnceWithCancel`'s own foreground-driven service
+    /// call, `reclaimRetirementPressure`'s admission check -- is a
+    /// direct, synchronous call the caller already controls the timing
+    /// of, not a decision to launch a new concurrent task, so none of
+    /// them need this exclusion. Revisit once the writer-race fix lands:
+    /// this split can likely be removed then.
+    pub fn retirementNeedsServiceLedgerOnlyWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !bool {
+        return self.retirementNeedsServiceCoreWithCancel(cancel, false);
+    }
+
+    fn retirementNeedsServiceCoreWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken, consider_redo_debt: bool) !bool {
         if (cancel) |token| try token.check();
         if (!self.header.indexed_reclamation or self.read_only) return false;
         const state = try self.loadLedgerWithCancel(self.activeCheckpoint(), cancel);
         if (state.checkpointDue() or self.budgetedCheckpointDue(state)) return true;
+        // §9 (redo retirement signal): under the redo log, a superseded
+        // overlay version's chain (an old external-value chain included)
+        // is retirement debt the on-disk ledger above cannot see -- only
+        // `checkpointRedoLog`'s next fold discovers and retires it. "The
+        // overlay has anything at all" was tried and rejected (it fires
+        // for a plain, never-overwritten bulk insert, which supersedes
+        // nothing); `pendingRetirementVersions` only counts versions a
+        // *later* write in this same uncheckpointed window has actually
+        // superseded, so a key touched exactly once since the last
+        // checkpoint contributes zero. Unconditional like the two checks
+        // above: there is no epoch/reader-fence question to ask yet (the
+        // real `Retirement` item this debt will become does not exist
+        // until the fold runs), so this can only ever be a useful next
+        // step, never a wrong one -- except for `consider_redo_debt ==
+        // false`'s own caller, see that parameter's doc comment above.
+        if (consider_redo_debt and self.redoCheckpointWouldRetire()) return true;
         const excess_promotions = state.metadata_heap.count() > 2;
         if (state.data_pending == 0 and state.chains_heap.count() == 0 and !excess_promotions) return false;
         if (excess_promotions) {
@@ -9311,6 +9354,17 @@ pub const NativeFile = struct {
         // and avoid a checkpoint-per-service loop.
         const snapshot_bytes = allocator_v4.snapshotPages(self.maxPagePayloadBytes(), state.counts.items.len, state.pending.count()) *| self.maxPagePayloadBytes();
         return state.root.delta_bytes >= 2 *| snapshot_bytes;
+    }
+
+    /// §9 (redo retirement signal): true when the overlay holds at least
+    /// one version a fold would discover is garbage (see
+    /// `SharedRedoOverlay.pending_retirement_versions`'s own doc comment).
+    /// Read-only and O(1): a lock, a load, nothing allocated -- safe to
+    /// call from `retirementNeedsServiceWithCancel` on every maintenance
+    /// check.
+    fn redoCheckpointWouldRetire(self: *NativeFile) bool {
+        const redo = self.redo orelse return false;
+        return redo.shared.pendingRetirementVersions(self.runtimeIo()) != 0;
     }
 
     fn advanceAllocatorCheckpoint(self: *NativeFile, pages: *PageAllocator, budget: usize) !void {
@@ -9378,6 +9432,52 @@ pub const NativeFile = struct {
     fn reclaimPagesImpl(self: *NativeFile, budget: usize, cancel: ?*const maintenance.CancelToken, require_reuse_proof: bool, durable: bool) !usize {
         if (!self.header.indexed_reclamation or self.read_only) return 0;
         if (cancel) |token| try token.check();
+        // §9 (redo retirement signal): a page-shaped write (an external
+        // value chain) a diverting commit staged is real, physical
+        // content the on-disk free map does not know about yet -- that
+        // commit never touched the ledger at all (`checkpointRedoLog`'s
+        // own "page-shaped exception" doc comment). Building a
+        // `PageAllocator` from that stale free map below, as this
+        // function's own ledger-only retirement is about to do, risks
+        // allocating a page id a still-live staged chain already
+        // occupies -- found by reproducing it: running this function's
+        // existing ledger body on a redo file with a staged chain
+        // corrupts that chain, surfacing later as `check()`'s
+        // `unexpected_page_kind`. Only `checkpointRedoLog`'s own fold
+        // (via `redo_fold_retain_pending`) reconciles the ledger with
+        // that physical growth, so this function must not touch the
+        // ledger while any page-shaped write is still staged, unless it
+        // folds first.
+        if (self.redo) |*redo| {
+            const io = self.runtimeIo();
+            if (!redo.shared.pagesEmpty(io)) {
+                // Folding is worth its own real, physical (and, outside
+                // `no_sync`, syncing) commit only when capacity pressure
+                // is the reason this function is running at all -- the
+                // same `budgetedCheckpointDue` gate (a real
+                // `max_file_bytes` reserve). An unbudgeted caller (e.g.
+                // a plain `Store.maintainOnce` ride-along with no
+                // storage limit configured) must stay exactly as cheap
+                // and sync-free as the ledger-only path already is --
+                // see the "ride-along passes force no sync" test, which
+                // has no budget and must not pay for a fold it does not
+                // need, and correctly does nothing here instead (the
+                // debt it asserted via `retirementNeedsService` is real
+                // but not yet safe nor urgent enough to act on without
+                // one): `checkpointRedoLog`'s own commit is always
+                // fully durable (never a ride-along -- see that
+                // function's own doc comment), so running it
+                // unconditionally here would force a sync on every
+                // ride-along pass regardless of `durable`.
+                if (self.reserve_retirement_capacity and self.max_file_bytes != null) {
+                    self.checkpointRedoLog() catch {};
+                }
+                // Whether or not folding ran (skipped above, or
+                // attempted and failed), the ledger body below remains
+                // unsafe while anything is still staged.
+                if (!redo.shared.pagesEmpty(io)) return 0;
+            }
+        }
         const previous_cancel = self.allocator_cancel_token;
         self.allocator_cancel_token = cancel;
         defer self.allocator_cancel_token = previous_cancel;
