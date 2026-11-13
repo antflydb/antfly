@@ -27477,6 +27477,24 @@ test "lite reader registration path lease close retains only escaped snapshot pr
     try std.testing.expectEqual(@as(?u64, null), (try probe.regionForInode()).?.minimumMetadataPinnedSequence());
 }
 
+/// Every fork-based test in this file waits on a real second OS process
+/// across these bounds (`crossProcessReadBounded`/`crossProcessReapBounded`).
+/// A short, fixed bound here is a bug, not just a flaky test: the forked
+/// child competes for scheduling with however many other processes this
+/// host is running, which on a heavily shared build host (many unrelated
+/// agents' own compiles and test runs) can legitimately delay it past a
+/// few seconds even though it is making real, correct progress -- a
+/// one-off `sample`/CPU-time check during exactly this failure confirmed
+/// the child was simply not yet scheduled, not stuck. Raised generously
+/// (30s read, 10s reap) rather than derived from some finer-grained
+/// progress signal: these tests only ever exchange one fixed-size byte
+/// report each, so there is no partial-progress milestone to measure
+/// against short of adding new synchronization purely for this, and a
+/// genuinely hung child (the actual bug this bound exists to catch) still
+/// fails deterministically, just after a longer wait.
+const cross_process_fork_read_timeout_ms: i32 = 30_000;
+const cross_process_fork_reap_timeout_ms: i64 = 10_000;
+
 /// Blocks (via `poll`, a portable sleep with no extra syscall declared just
 /// for this) until `buf` is full or `timeout_ms` elapses -- the same
 /// bounded-pipe-read idiom `shared_lock_region.zig`'s own cross-process
@@ -27573,7 +27591,7 @@ test "lite reader fence across a forked child: writer withholds pages the child 
         _ = std.c.waitpid(child_pid, null, 0);
     };
     var report: [1]u8 = undefined;
-    try crossProcessReadBounded(pipe_fds[0], &report, 2000);
+    try crossProcessReadBounded(pipe_fds[0], &report, cross_process_fork_read_timeout_ms);
     // The child got a real region slot, not an inode-only fallback --
     // required for the rest of this test to actually exercise the region's
     // cross-process pin, not just kernel-lock fencing.
@@ -27592,7 +27610,7 @@ test "lite reader fence across a forked child: writer withholds pages the child 
     try std.testing.expect(region.minimumPinnedSequence() != null);
 
     _ = std.c.kill(child_pid, std.c.SIG.KILL);
-    _ = try crossProcessReapBounded(child_pid, 2000);
+    _ = try crossProcessReapBounded(child_pid, cross_process_fork_reap_timeout_ms);
     child_reaped = true;
 
     // Reclaimed by the writer's own frontier scan -- no separate cleanup
@@ -28427,7 +28445,7 @@ test "lite redo log cross-process: a forked child sees commits the parent makes 
         const region = (reader.regionForInode() catch crossProcessParkForever()) orelse crossProcessParkForever();
         region.reclaimLivenessAfterFork() catch crossProcessParkForever();
         var go: [1]u8 = undefined;
-        crossProcessReadBounded(go_fds[0], &go, 5000) catch crossProcessParkForever();
+        crossProcessReadBounded(go_fds[0], &go, cross_process_fork_read_timeout_ms) catch crossProcessParkForever();
         reader.refreshCrossProcessRedoOverlay() catch crossProcessParkForever();
         const beta = (reader.getDocumentAlloc(a, "beta") catch crossProcessParkForever()) orelse crossProcessParkForever();
         const ok = std.mem.eql(u8, beta, "two");
@@ -28453,11 +28471,11 @@ test "lite redo log cross-process: a forked child sees commits the parent makes 
     _ = std.c.write(go_fds[1], &go, go.len);
 
     var report: [1]u8 = undefined;
-    try crossProcessReadBounded(result_fds[0], &report, 5000);
+    try crossProcessReadBounded(result_fds[0], &report, cross_process_fork_read_timeout_ms);
     try std.testing.expectEqual(@as(u8, 1), report[0]);
 
     _ = std.c.kill(child_pid, std.c.SIG.KILL);
-    _ = try crossProcessReapBounded(child_pid, 2000);
+    _ = try crossProcessReapBounded(child_pid, cross_process_fork_reap_timeout_ms);
     child_reaped = true;
 }
 
@@ -28501,7 +28519,7 @@ test "lite redo log cross-process: checkpointer defers reclaim while a forked ch
     defer _ = std.posix.system.close(result_fds[0]);
 
     var report: [1]u8 = undefined;
-    try crossProcessReadBounded(result_fds[0], &report, 5000);
+    try crossProcessReadBounded(result_fds[0], &report, cross_process_fork_read_timeout_ms);
     try std.testing.expectEqual(@as(u8, 1), report[0]);
 
     try writer.beginTransaction();
@@ -28517,7 +28535,7 @@ test "lite redo log cross-process: checkpointer defers reclaim while a forked ch
     try std.testing.expectEqual(tail_before, writer.redo.?.writer.tail);
 
     _ = std.c.kill(child_pid, std.c.SIG.KILL);
-    _ = try crossProcessReapBounded(child_pid, 2000);
+    _ = try crossProcessReapBounded(child_pid, cross_process_fork_reap_timeout_ms);
     child_reaped = true;
 
     // Dead now: the next checkpointer pass reclaims normally, exactly
