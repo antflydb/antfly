@@ -5090,7 +5090,8 @@ pub const Txn = struct {
             const value = self.pending.items[pendingNode(node).ordinal].value orelse return error.NotFound;
             return allocator.dupe(u8, value);
         }
-        return (try (try self.readFile()).getDocumentAtCheckpointAlloc(allocator, self.checkpoint, lookup_key)) orelse error.NotFound;
+        const view = try self.readView();
+        return (try view.getDocumentAlloc(allocator, lookup_key)) orelse error.NotFound;
     }
 
     pub fn getInto(self: *Txn, key: []const u8, out: []u8) ![]const u8 {
@@ -5599,14 +5600,16 @@ pub const Txn = struct {
         if (!self.read_only or self.pending_count != 0) return error.InvalidArgument;
         const lookup_key = try self.prefixedKey(key);
         defer if (self.prefix.len > 0) self.allocator.free(lookup_key);
-        return (try self.readFile()).documentReferenceAtCheckpoint(self.checkpoint, lookup_key);
+        const view = try self.readView();
+        return view.documentReference(lookup_key);
     }
 
     pub fn valueFingerprint(self: *Txn, key: []const u8) !?[32]u8 {
         if (!self.read_only or self.pending_count != 0) return error.InvalidArgument;
         const lookup_key = try self.prefixedKey(key);
         defer if (self.prefix.len > 0) self.allocator.free(lookup_key);
-        return (try self.readFile()).documentFingerprintAtCheckpoint(self.checkpoint, lookup_key);
+        const view = try self.readView();
+        return view.documentFingerprint(lookup_key);
     }
 
     pub fn get(self: *Txn, key: []const u8) ![]const u8 {
@@ -5623,7 +5626,8 @@ pub const Txn = struct {
             const owned_key = try self.allocator.dupe(u8, lookup_key);
             errdefer self.allocator.free(owned_key);
             try self.snapshot_reads.ensureUnusedCapacity(self.allocator, 1);
-            const loaded = try (try self.readFile()).getDocumentAtCheckpointAlloc(self.allocator, self.checkpoint, lookup_key);
+            const view = try self.readView();
+            const loaded = try view.getDocumentAlloc(self.allocator, lookup_key);
             self.snapshot_reads.putAssumeCapacity(owned_key, loaded);
             break :blk loaded;
         };
@@ -5672,7 +5676,8 @@ pub const Txn = struct {
         try self.snapshot_reads.ensureUnusedCapacity(alloc, std.math.cast(u32, misses.items.len) orelse return error.RecordTooLarge);
         const loaded = try alloc.alloc(?[]const u8, misses.items.len);
         defer alloc.free(loaded);
-        try (try self.readFile()).getDocumentsAtCheckpointAlloc(alloc, self.checkpoint, misses.items, loaded);
+        const view = try self.readView();
+        try view.getDocumentsAlloc(alloc, misses.items, loaded);
         for (misses.items, loaded, positions.items) |*key, value, position| {
             self.snapshot_reads.putAssumeCapacity(key.*, value);
             key.* = "";
@@ -5846,9 +5851,10 @@ pub const Txn = struct {
     }
 
     pub fn openCursor(self: *Txn) !Cursor {
+        const view = try self.readView();
         return .{
             .txn = self,
-            .index_cursor = native.CheckpointedTree.init(try self.readFile(), self.checkpoint),
+            .index_cursor = view.openDocumentTreeCursor(view.file.allocator),
         };
     }
 
@@ -5887,23 +5893,28 @@ pub const Txn = struct {
     }
 
     pub fn openIndexValue(self: *Txn, allocator: Allocator, key: []const u8) !native.NativeFile.IndexValue {
-        return (try self.readFile()).openIndexValue(allocator, key, self.checkpoint);
+        const view = try self.readView();
+        return view.openIndexValue(allocator, key);
     }
 
     pub fn readIndexValueInto(self: *Txn, value: native.NativeFile.IndexValue, offset: u64, out: []u8) !void {
-        return (try self.readFile()).readIndexValueInto(value, offset, out, self.checkpoint);
+        const view = try self.readView();
+        return view.readIndexValueInto(value, offset, out);
     }
 
     pub fn checksumIndexValue(self: *Txn, value: native.NativeFile.IndexValue, offset: u64, length: u64) !u32 {
-        return (try self.readFile()).checksumIndexValue(value, offset, length, self.checkpoint);
+        const view = try self.readView();
+        return view.checksumIndexValue(value, offset, length);
     }
 
     pub fn readAuthenticatedIndexValue(self: *Txn, value: native.NativeFile.IndexValue, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
-        return (try self.readFile()).readAuthenticatedIndexValue(value, offset, length, within, out, expected, self.checkpoint);
+        const view = try self.readView();
+        return view.readAuthenticatedIndexValue(value, offset, length, within, out, expected);
     }
 
     pub fn copyIndexValueTo(self: *Txn, value: native.NativeFile.IndexValue, destination: std.Io.File) !void {
-        return (try self.readFile()).copyIndexValueTo(value, destination, self.checkpoint);
+        const view = try self.readView();
+        return view.copyIndexValueTo(value, destination);
     }
 
     /// The pinned descriptor is authoritative even after inode adoption.
@@ -5911,6 +5922,19 @@ pub const Txn = struct {
         if (self.read_generation) |generation| return &generation.file;
         const store = self.store orelse return error.InvalidTransactionState;
         return &store.file;
+    }
+
+    /// §9.7c: this transaction's one read primitive, borrowed from its
+    /// own already-held pin (`self.read_pin`/`self.read_generation`,
+    /// held for the whole transaction) -- `release` on the result is
+    /// therefore a no-op; this `Txn`'s own pin lifecycle
+    /// (`pinInitializedReadGeneration`/`releaseReadGeneration`) remains
+    /// authoritative. Every point get, batch get, and index-value read
+    /// below goes through this instead of calling `NativeFile`
+    /// directly, so there is exactly one place that resolves `self.
+    /// checkpoint` against the redo-log overlay.
+    pub fn readView(self: *Txn) !native.ReadView {
+        return native.ReadView.borrowed(try self.readFile(), self.checkpoint);
     }
 
     fn releaseGenerationReadLock(self: *Txn) void {
@@ -6053,12 +6077,8 @@ pub const Cursor = struct {
     /// every move this cursor makes afterward.
     fn ensureRedoOverlay(self: *Cursor) !*native.NativeFile.OverlayScanState {
         if (self.redo_overlay == null) {
-            const file = try self.txn.readFile();
-            // `initForPrefixUnchecked`, not `initForPrefix`: `self.txn.checkpoint`
-            // (`ReadGeneration.checkpoint`) is not comparable to `file.activeCheckpoint()`
-            // the way `initForPrefix`'s own gate requires -- see that
-            // function's own doc comment.
-            self.redo_overlay = try native.NativeFile.OverlayScanState.initForPrefixUnchecked(self.txn.allocator, file, .documents, self.txn.prefix);
+            const view = try self.txn.readView();
+            self.redo_overlay = try view.openDocumentOverlayScan(self.txn.allocator, self.txn.prefix);
         }
         return &self.redo_overlay.?;
     }
@@ -6277,11 +6297,12 @@ pub const Cursor = struct {
                     return try self.installPending(pending.key, value, buffered_disk, direction);
                 },
                 .redo => {
-                    const entry = (try file.redoOverlayEntry(.documents, self.txn.checkpoint, winner_key)) orelse return error.InvalidNativeRedoRecord;
+                    const view = try self.txn.readView();
+                    const entry = (try view.documentOverlayEntry(winner_key)) orelse return error.InvalidNativeRedoRecord;
                     defer self.txn.allocator.free(entry.value);
                     if (entry.is_delete) continue;
                     const resolved_value = if (entry.external_value_root_page != 0)
-                        try file.readValuePagesAtCheckpointAlloc(self.txn.allocator, entry.external_value_root_page, entry.external_value_len, self.txn.checkpoint)
+                        try view.readValueChainAlloc(self.txn.allocator, entry.external_value_root_page, entry.external_value_len)
                     else
                         entry.value;
                     defer if (entry.external_value_root_page != 0) self.txn.allocator.free(resolved_value);

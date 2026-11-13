@@ -5993,6 +5993,15 @@ pub const ReadView = struct {
     pub fn documentOverlayEntry(self: *const ReadView, key: []const u8) !?CatalogEntry {
         return self.file.redoOverlayEntryAt(.documents, self.mark, key);
     }
+
+    /// Resolves an external value chain's bytes -- the materialization
+    /// step a `documentOverlayEntry`/catalog-cursor result with a
+    /// non-zero `external_value_root_page` still needs, for a caller
+    /// (`docstore.Cursor`) that holds the entry itself rather than
+    /// going through `getDocumentAlloc`'s own all-in-one resolution.
+    pub fn readValueChainAlloc(self: *const ReadView, allocator: Allocator, root_page: u64, len: usize) ![]u8 {
+        return self.file.readValuePagesAtCheckpointAlloc(allocator, root_page, len, self.checkpoint);
+    }
 };
 
 pub const NativeFile = struct {
