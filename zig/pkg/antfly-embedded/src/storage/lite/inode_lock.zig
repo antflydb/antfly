@@ -211,8 +211,35 @@ pub const shared_fail_fast_retry_ns: i128 = 40 * std.time.ns_per_ms;
 pub const Entry = struct {
     inode: Io.File.INode,
     /// Reopened lazily to get this entry's own dedicated fd (see
-    /// `ensureFd`). Owned by `std.heap.page_allocator`.
+    /// `ensureFd`). Owned by `std.heap.page_allocator`. Deliberately the
+    /// exact, uninterpreted string `open`/`rebind` were called with --
+    /// never canonicalized. Two reasons: `ensureFd`'s reopen only has to
+    /// resolve to this entry's own inode (already its whole identity),
+    /// so an absolute/symlink-resolved spelling buys it nothing; and,
+    /// under `crash_sim_io.zig`'s `SimIo` (which tracks durability by
+    /// path *string*, a test-only simplification real callers never see),
+    /// reopening the same inode under a *different* string than whatever
+    /// `openDataFile`/`createDataFile` already used would register as a
+    /// second, independently-tracked path for the same underlying file --
+    /// observed as `applyPowerLoss` deleting a file a different, correctly
+    /// synced entry for the *same* string would have restored. See
+    /// `region_path`'s own doc comment for where canonicalization
+    /// actually belongs.
     path: []const u8,
+    /// An absolute, symlink-resolved spelling of `path`, computed once
+    /// (best-effort; see `canonicalPathAlloc`) at `open`/`rebind` time and
+    /// used only to derive `ensureRegion`'s own `<region_path>.aflite-lock`
+    /// sidecar name -- never to reopen the data file itself. Needs its
+    /// own field, separate from `path`, for the exact reason `path`'s own
+    /// doc comment gives: the region's sidecar derivation needs
+    /// symlink/cwd independence (two spellings of the same file, or a
+    /// cwd change before a lazy `ensureRegion` reopen, must still name
+    /// the same sidecar), but reusing `path` itself for that would feed a
+    /// different string into whatever opens the *data* file, splitting
+    /// one inode's durability tracking in two under `SimIo`. `null` only
+    /// transiently, between an `Entry`'s allocation and its first field
+    /// assignment -- every `open`/`rebind` call sets it immediately after.
+    region_path: ?[]const u8 = null,
     /// Every live reference to this entry, from both `open`/`unref` (a
     /// NativeFile's own long-lived interest) and `acquire`/`release` (a
     /// `Handle`'s share, for as long as it is held) -- see the module doc
@@ -531,7 +558,11 @@ pub fn ensureRegion(entry: *Entry, io: Io) !*shared_lock_region.Region {
     entry.mutex.lockUncancelable(io);
     defer entry.mutex.unlock(io);
     if (entry.region == null) {
-        entry.region = try shared_lock_region.Region.open(std.heap.page_allocator, io, entry.path);
+        // `region_path` (canonical), not `path` (raw) -- see `Entry.path`'s
+        // own doc comment for why the data file's own open/create calls
+        // and this sidecar derivation must never be fed different
+        // spellings of the same inode.
+        entry.region = try shared_lock_region.Region.open(std.heap.page_allocator, io, entry.region_path orelse entry.path);
     }
     return &entry.region.?;
 }
@@ -565,28 +596,27 @@ pub fn isRegionUnusable(err: anyerror) bool {
 var registry_mutex: Io.Mutex = .init;
 var registry: std.AutoHashMapUnmanaged(Io.File.INode, *Entry) = .empty;
 
-/// Resolves `path` to an absolute, symlink-resolved path, so everything
-/// keyed off the result -- `Entry.path`, and `shared_lock_region`'s own
-/// `<path>.aflite-lock` sidecar derived from it -- stays correct no matter
-/// what the process's current directory is later changed to, and so that
-/// two different relative or symlinked spellings of the same file resolve
-/// to the *same* string. `ensureRegion`'s lazy reopen (after `rebind`, or
-/// after the region closes and a later caller reopens it) uses whatever
-/// is cached in `Entry.path` at whatever later moment it happens to run,
-/// with no opportunity to re-derive "where this file originally was" from
-/// a relative string at that point -- so canonicalizing once, here, at
-/// `open`/`rebind` time, while the caller's own cwd is still the one that
-/// made the relative spelling meaningful, is the only point this can
-/// happen correctly. Mirrors #1650's `root_identity.zig` fix and
-/// `native.zig`'s own `writerLockPathAlloc`: an existing file (the only
-/// case `open`/`rebind` ever actually hit -- both call sites resolve a
-/// data file already renamed into its final place) resolves directly;
-/// the missing-file fallback (parent directory through an open handle,
-/// basename joined back on) is kept only for robustness.
-fn canonicalPathAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
+/// Resolves `path` to an absolute, symlink-resolved path for
+/// `Entry.region_path` -- never for `Entry.path` itself; see that field's
+/// own doc comment for why the two must stay separate. Best-effort, and
+/// never fails on account of `path` not currently resolving: under
+/// `crash_sim_io.zig`'s `SimIo`, a crash's own deliberate rollback
+/// (`applyPowerLoss` deletes any path it tracked as never durably synced)
+/// can make a path that existed moments ago transiently -- or,
+/// permanently, after a genuine crash -- unresolvable, and that must
+/// never become a hard failure to open/rebind at all; canonicalization is
+/// strictly an enhancement (symlink/cwd independence for the region's own
+/// sidecar name) over whatever `path` the caller already had. Each tier
+/// falls through to the next on any error other than `OutOfMemory`: an
+/// existing file resolves directly; failing that, its parent directory
+/// resolved through an open handle plus the basename joined back on
+/// (mirroring `native.zig`'s own `writerLockPathAlloc`); failing that
+/// too, `path` itself, unresolved -- exactly what every caller tolerated
+/// before this file canonicalized anything.
+fn canonicalPathAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8) std.mem.Allocator.Error![]u8 {
     if (Io.Dir.cwd().realPathFileAlloc(io, path, allocator)) |resolved| {
         // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8`,
-        // over-allocated by one byte for the terminator. `Entry.path`'s
+        // over-allocated by one byte for the terminator. `region_path`'s
         // own field type is a plain `[]const u8`, with no sentinel, so
         // storing the sentinel slice directly and freeing it later under
         // that plain type would ask the allocator to free one byte fewer
@@ -596,10 +626,16 @@ fn canonicalPathAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8) ![
         // matching type, instead.
         defer allocator.free(resolved);
         return try allocator.dupe(u8, resolved);
-    } else |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    }
+    } else |err| if (err == error.OutOfMemory) return error.OutOfMemory;
+
+    if (canonicalParentJoin(allocator, io, path)) |joined| {
+        return joined;
+    } else |err| if (err == error.OutOfMemory) return error.OutOfMemory;
+
+    return try allocator.dupe(u8, path);
+}
+
+fn canonicalParentJoin(allocator: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
     const dirname = std.fs.path.dirname(path) orelse ".";
     const basename = std.fs.path.basename(path);
     var parent = try Io.Dir.cwd().openDir(io, dirname, .{});
@@ -616,23 +652,33 @@ fn canonicalPathAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8) ![
 /// pointer directly (behind an atomic, if it can ever be reread concurrently
 /// with a rebind such as `replaceWithPreparedGeneration`'s) -- there is
 /// nothing else to wrap it in.
+///
+/// Stats `path` itself, exactly as this call did before `region_path`
+/// existed -- not a canonicalized form of it -- so the one check that
+/// decides whether this call succeeds or fails at all keeps its original
+/// timing and failure modes (see `Entry.path`'s own doc comment for why
+/// a canonicalized spelling must never be the one opening/statting the
+/// data file). `region_path` is computed only for a genuinely new
+/// `Entry` (a registry hit reuses the existing one's own, already
+/// computed) and used only by `ensureRegion`.
 pub fn open(io: Io, path: []const u8) !*Entry {
     const page = std.heap.page_allocator;
-    const canonical_path = try canonicalPathAlloc(page, io, path);
-    errdefer page.free(canonical_path);
-    const inode = (try Io.Dir.cwd().statFile(io, canonical_path, .{})).inode;
+    const inode = (try Io.Dir.cwd().statFile(io, path, .{})).inode;
     registry_mutex.lockUncancelable(io);
     defer registry_mutex.unlock(io);
     if (registry.get(inode)) |entry| {
-        page.free(canonical_path);
         entry.mutex.lockUncancelable(io);
         entry.refs += 1;
         entry.mutex.unlock(io);
         return entry;
     }
+    const owned_path = try page.dupe(u8, path);
+    errdefer page.free(owned_path);
+    const region_path = try canonicalPathAlloc(page, io, path);
+    errdefer page.free(region_path);
     const entry = try page.create(Entry);
     errdefer page.destroy(entry);
-    entry.* = .{ .inode = inode, .path = canonical_path, .refs = 1 };
+    entry.* = .{ .inode = inode, .path = owned_path, .region_path = region_path, .refs = 1 };
     try registry.put(page, inode, entry);
     return entry;
 }
@@ -895,6 +941,7 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
         if (region) |*r| r.close();
         if (overlay) |*o| o.deinit(page);
         page.free(entry.path);
+        if (entry.region_path) |rp| page.free(rp);
         entry.reader_pins.deinit(page);
         entry.debug_outstanding.deinit(page);
         page.destroy(entry);
@@ -920,17 +967,22 @@ fn unrefAndMaybeDestroy(entry: *Entry, io: Io) void {
 /// against `new_path`, exactly mirroring `ensureFd`'s own lazy-reopen shape.
 pub fn rebind(entry: *Entry, io: Io, new_path: []const u8) !void {
     const page = std.heap.page_allocator;
-    // Canonicalize here too, for the exact reason `open` does: the next
-    // `ensureRegion` reopens lazily, at some later and otherwise
-    // unconstrained point, against whatever is cached in `entry.path` --
-    // so it must already be an absolute, symlink-resolved path by the
-    // time this call returns, not a relative spelling that depended on
-    // this call's own cwd.
-    const owned = try canonicalPathAlloc(page, io, new_path);
+    const owned = try page.dupe(u8, new_path);
+    errdefer page.free(owned);
+    // Canonicalize `region_path` too (never `path` itself -- see
+    // `Entry.path`'s own doc comment), for the exact reason `open` does:
+    // the next `ensureRegion` reopens lazily, at some later and otherwise
+    // unconstrained point, against whatever is cached here -- so it must
+    // already be an absolute, symlink-resolved path by the time this
+    // call returns, not a relative spelling that depended on this call's
+    // own cwd.
+    const owned_region_path = try canonicalPathAlloc(page, io, new_path);
     entry.mutex.lockUncancelable(io);
     defer entry.mutex.unlock(io);
     page.free(entry.path);
     entry.path = owned;
+    if (entry.region_path) |old_region_path| page.free(old_region_path);
+    entry.region_path = owned_region_path;
     if (entry.region) |*r| {
         r.close();
         entry.region = null;
