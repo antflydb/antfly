@@ -13,14 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Optional Linux x86 GNU acceleration. Keep the library resident for the
+//! Optional Linux x86-64 and Arm64 GNU acceleration. Keep the library resident for the
 //! process lifetime: published function pointers must never outlive it.
 const std = @import("std");
 const builtin = @import("builtin");
 const options = @import("build_options");
 const linalg = @import("inference_linalg");
 
-pub const enabled = builtin.os.tag == .linux and builtin.cpu.arch == .x86_64 and
+pub const enabled = builtin.os.tag == .linux and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64) and
     builtin.abi == .gnu and builtin.link_libc and !options.enable_system_blas and
     @hasDecl(options, "enable_runtime_openblas") and options.enable_runtime_openblas;
 

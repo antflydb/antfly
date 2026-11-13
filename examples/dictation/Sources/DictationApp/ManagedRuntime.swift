@@ -224,6 +224,30 @@ import Security
     busy = false
     status = "Local engine stopped."
   }
+  func ensureReady(timeout: Duration = .seconds(90)) async throws {
+    try Task.checkCancellation()
+    if !ready && !busy {
+      // A failed startup may still own a child awaiting termination. Drain it
+      // before starting a fresh attempt rather than waiting on a stopped engine.
+      await stop()
+      try Task.checkCancellation()
+      start()
+    }
+    try await waitUntilReady(timeout: timeout)
+  }
+  func waitUntilReady(timeout: Duration = .seconds(90)) async throws {
+    let deadline = ContinuousClock.now.advanced(by: timeout)
+    while !ready {
+      try Task.checkCancellation()
+      guard busy else { throw DictationError.invalid(status) }
+      guard ContinuousClock.now < deadline else {
+        throw DictationError.invalid(
+          "The local engine did not start in time. Retry setup or open the engine log.")
+      }
+      try await Task.sleep(for: .milliseconds(200))
+    }
+    try Task.checkCancellation()
+  }
   func cancelDownload() { try? downloadControl?.fileHandleForWriting.close() }
   func enableAppleAssets() async throws {
     try Data().write(to: directory.appendingPathComponent("apple-assets-enabled"), options: .atomic)

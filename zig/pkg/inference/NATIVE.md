@@ -23,7 +23,7 @@ That makes Linux and cross-platform builds more fragile than they need to be. Th
 
 - Native CPU backend availability is decoupled from system BLAS linkage.
 - `-Dblas=auto|linked|off` controls native CPU BLAS acceleration.
-- Linux x86 GNU builds prefer runtime-loaded OpenBLAS when installed, with native fallback.
+- Linux x86-64 and Arm64 GNU builds prefer runtime-loaded OpenBLAS when installed, with native fallback.
 - Native builds report the `native` backend explicitly.
 - Backend identity stays `native`.
 - Shared pure Zig kernels live in `lib/linalg` and are reused by native and WASM.
@@ -67,9 +67,9 @@ The public backend surface is consistent across:
 
 ### Optional system BLAS configuration
 
-Linux x86-64 GNU builds enable optional runtime OpenBLAS by default. Install
+Linux x86-64 and Arm64 GNU builds enable optional runtime OpenBLAS by default. Install
 `libopenblas0-pthread` on Debian/Ubuntu to accelerate native inference. The
-official amd64 `zig/Dockerfile.runtime` image includes it. The executable has
+official amd64 and arm64 `zig/Dockerfile.runtime` images includes it. The executable has
 no required OpenBLAS dependency and still starts and runs native kernels when
 the library is absent. Mac Accelerate and portable musl builds are unchanged.
 
@@ -77,7 +77,7 @@ Build policy (shared by the root and standalone inference builds):
 
 | Option | Behavior |
 | --- | --- |
-| `-Dblas=auto` (default) | Keep macOS Accelerate linkage; prefer optional runtime OpenBLAS on Linux x86 GNU; use native kernels elsewhere. An explicit `-Dblas-root` selects link-time BLAS, preserving existing behavior. |
+| `-Dblas=auto` (default) | Keep macOS Accelerate linkage; prefer optional runtime OpenBLAS on Linux x86-64 and Arm64 GNU; use native kernels elsewhere. An explicit `-Dblas-root` selects link-time BLAS, preserving existing behavior. |
 | `-Dblas=linked` | Require link-time system BLAS: Accelerate on macOS, OpenBLAS elsewhere. Requires a native build with libc. |
 | `-Dblas=off` | Disable both link-time BLAS and runtime loading; use native kernels. |
 
@@ -109,8 +109,10 @@ lifetime. OpenBLAS thread settings are process-wide; configure them before
 starting inference. These controls do not change explicitly linked BLAS builds.
 
 Run `python3 zig/tools/verify_runtime_openblas.py` from the repository root to
-check loading, fallback, thread limits, and numerical behavior. Add
-`--openblas-library /path/to/libopenblas.so.0` to test an installed library too.
+check loading, fallback, thread limits, and numerical behavior on either supported
+Linux architecture. Fixture builds stay under the checkout’s `.zig-cache` and
+are removed on exit. Add `--openblas-library /path/to/libopenblas.so.0` to test
+an installed library too.
 
 ### Explicit link-time BLAS
 
@@ -159,3 +161,29 @@ Quantized direct kernels use the persistent native worker pool by default. Use
 - macOS can keep using `Accelerate` by default when system BLAS acceleration is enabled.
 - On non-macOS, `-Dblas=linked` links OpenBLAS, and `-Dblas-root=/path` points the build at an explicit OpenBLAS-style install with `include/` and `lib/`.
 - Performance work belongs after the portability boundary is correct.
+
+## CPU reader and transcription execution
+
+`antfly inference read MODEL_DIR IMAGE --backend native` supports both
+encoder-decoder readers and generator-backed readers such as LightOnOCR-3.
+Generator-backed reads use the same resident executor, output-completion checks,
+and resource admission as HTTP `/read`, without starting an HTTP server. The
+`--prompt`, `--max-tokens`, `--warmup-iters`, `--measure-iters`, and `--json-timing`
+options also apply. Encoder-decoder-only `--cache-dtype` overrides are rejected
+for generator-backed readers. Benchmark output identifies the executor and
+whether encoder-decoder kernel telemetry is available; unavailable counters
+must not be treated as proof of a generation optimization being disabled.
+
+Whisper's transient model workspace is separately charged to the process
+resource manager. The document's 512 MiB allocation ceiling still bounds its
+source, metadata and transcript output; it does not cap encoder/decoder tensor
+workspace. An admitted model does not imply that every execution fits: process
+memory refusal remains an admission error and should be retried after capacity
+is available.
+
+For Arm CPU comparisons, use a GNU executable and a compatible LP64 pthread
+OpenBLAS. An Arm64 portable musl executable cannot dynamically load GNU
+OpenBLAS. Record the library's version/selected CPU kernel, CPU affinity,
+thread count, peak memory, model revision, and output correctness. Arm64
+OpenBLAS support alone does not establish that a package uses SVE: the library
+build and its runtime dispatch determine that, independently of Antfly.

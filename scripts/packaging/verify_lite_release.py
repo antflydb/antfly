@@ -30,7 +30,11 @@ sys.path.insert(0, str(ROOT / "scripts" / "release"))
 from release_channels import normalize_release_version, python_version_from_release  # noqa: E402
 
 from package_cli_release import PACKAGE_PLATFORMS, lite_library_name  # noqa: E402
-from package_lite_release import SOURCE_LICENSE_FILES, archive_name  # noqa: E402
+from package_lite_release import (  # noqa: E402
+    EMBEDDED_BUILD_CONTRACT_SCHEMAS,
+    SOURCE_LICENSE_FILES,
+    archive_name,
+)
 
 
 def require(condition: bool, message: str) -> None:
@@ -69,6 +73,11 @@ def verify(
 
             lib_name = lite_library_name(platform)
             library = source_bytes(f"./lib/{lib_name}")
+            apple_bridge = (
+                source_bytes("./lib/libantfly-apple.dylib")
+                if build_contract_schema >= 7 and platform.release_os == "Darwin"
+                else None
+            )
             worker = None
             if build_contract_schema < 6:
                 source_bytes("./antfly-lite")
@@ -111,6 +120,13 @@ def verify(
             / f"antfly_embedded-{python_version}-py3-none-{platform.wheel_platform}.whl"
         )
         with zipfile.ZipFile(wheel_path) as wheel:
+            if apple_bridge is not None:
+                require(
+                    "antfly_embedded/_lib/libantfly-apple.dylib" in wheel.namelist()
+                    and wheel.read("antfly_embedded/_lib/libantfly-apple.dylib")
+                    == apple_bridge,
+                    f"Apple bridge mismatch: {wheel_path}",
+                )
             require(
                 wheel.read(f"antfly_embedded/_lib/{lib_name}") == library,
                 f"library mismatch: {wheel_path}",
@@ -181,6 +197,12 @@ def verify(
                 return member.read()
 
             manifest = json.loads(npm_bytes("package.json"))
+            if apple_bridge is not None:
+                require(
+                    "package/lib/libantfly-apple.dylib" in npm.getnames()
+                    and npm_bytes("lib/libantfly-apple.dylib") == apple_bridge,
+                    f"Apple bridge mismatch: {npm_path}",
+                )
             require(
                 manifest["name"] == f"@antfly/{package_name}",
                 f"wrong npm package: {npm_path}",
@@ -254,7 +276,10 @@ def main() -> int:
     parser.add_argument("--wheel-dir", type=Path, required=True)
     parser.add_argument("--npm-dir", type=Path, required=True)
     parser.add_argument(
-        "--build-contract-schema", type=int, choices=(2, 3, 4, 5, 6), default=6
+        "--build-contract-schema",
+        type=int,
+        choices=EMBEDDED_BUILD_CONTRACT_SCHEMAS,
+        default=6,
     )
     args = parser.parse_args()
     verify(

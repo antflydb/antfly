@@ -286,6 +286,7 @@ final class StoreProtocol: URLProtocol, @unchecked Sendable {
     #expect(try JSONDecoder().decode([HistoryEntry].self, from: Data(contentsOf: file)).count == 1)
     store.config.retainHistory = false
     store.save()
+    await store.settingsTask?.value
     await store.historySettingsTask?.value
     #expect(!FileManager.default.fileExists(atPath: queueDirectory.path))
     let restarted = Store(directory: directory, registerHotkey: false)
@@ -438,6 +439,7 @@ private actor HistorySignal {
   while await probe.uploads.isEmpty { await Task.yield() }
   store.config.retainHistory = false
   store.save()
+  await store.settingsTask?.value
   await store.historySettingsTask?.value
   let completedAtDisable = await probe.uploads.count
   while store.historyWorking { await Task.yield() }
@@ -479,6 +481,7 @@ private actor HistorySignal {
   store.config.retainHistory = true
   store.config.retainAudio = true
   store.save()
+  await store.settingsTask?.value
   await store.historySettingsTask?.value
   await store.outbox?.waitUntilIdle()
   #expect(store.settingsLoadError == nil && store.history.map(\.id) == [entry.id])
@@ -513,6 +516,7 @@ private actor HistorySignal {
   #expect(store.result == "Clean." && store.state == .idle && store.phase == .ready)
   store.config.retainHistory = false
   store.save()
+  await store.settingsTask?.value
   await release.send()
   await store.historySettingsTask?.value
   #expect(await store.outbox?.status().pending == 0)
@@ -551,6 +555,7 @@ private actor HistorySignal {
     credentialReader: { _ in "" }, credentialWriter: { _, _ in }, keyboardAccess: { true })
   #expect(store.settingsLoadError != nil)
   store.setUpShortcut()
+  await store.settingsTask?.value
   #expect(store.shortcutSetupStatus.contains("Settings are missing"))
   #expect(
     !FileManager.default.fileExists(atPath: directory.appendingPathComponent("settings.json").path))
