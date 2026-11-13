@@ -1307,6 +1307,14 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
     failed = True
     try:
 
+        def publication_pending(response):
+            # Fresh receipt-constrained reads can race publication's binding
+            # replacement. Rebind only this exact conflict; keep all deadlines.
+            return response.status_code == 503 or (
+                response.status_code == 409
+                and response.json() == {"error": "catalog changed during query binding"}
+            )
+
         def call(method, path, body=None):
             response = requests.request(
                 method,
@@ -1490,15 +1498,9 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             )
             if response.ok:
                 break
-            # A publication can replace the binding between capture and read.
-            # Rebind this fresh, receipt-constrained request, but never retry
-            # arbitrary conflicts or relax the original visibility deadline.
-            binding_changed = response.status_code == 409 and response.json() == {
-                "error": "catalog changed during query binding"
-            }
-            assert (
-                response.status_code == 503 or binding_changed
-            ) and time.monotonic() < deadline, response.text + server.debug_logs()
+            assert publication_pending(response) and time.monotonic() < deadline, (
+                response.text + server.debug_logs()
+            )
             time.sleep(0.1)
         # Keep the archive publication fixed while exercising incremental
         # accepted cuts. Otherwise the background writer can drain a batch
@@ -1632,6 +1634,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
         assert len(next_page["hits"]["hits"]) == 5, next_page
         hybrid_request = None
         hybrid_first = None
+        stale_sparse_request = None
         if vector_kind:
             embeddings = {}
             if vector_kind in ("dense", "hybrid"):
@@ -1653,7 +1656,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                         value["responses"][0] if "responses" in value else value
                     )
                     break
-                assert response.status_code == 503 and time.monotonic() < deadline, (
+                assert publication_pending(response) and time.monotonic() < deadline, (
                     response.text + server.debug_logs()
                 )
                 time.sleep(0.1)
@@ -1680,6 +1683,24 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 enrichment
             )
             hybrid_request["remote_snapshot"] = hybrid_first["remote_snapshot"]
+
+            # A retained cut covers the recipes selected when it was issued.
+            # Capture the sparse recipe at this same accepted watermark rather
+            # than adding it later to a dense-only cut. Reuse it after updates
+            # and restart to check stale-vector suppression at the pinned cut.
+            stale_sparse_request = dict(
+                query,
+                embeddings={"sparse_native": {"indices": [1], "values": [1]}},
+                filter_query={"term": {"path": "/id", "value": 0}},
+                fields=["id"],
+            )
+            stale_sparse_request.pop("full_text_search")
+            stale_sparse_request.pop("highlight")
+            stale_sparse = call(
+                "POST", "/tables/wal_windows/query", stale_sparse_request
+            )
+            assert stale_sparse["hits"]["hits"] == [], stale_sparse
+            stale_sparse_request["remote_snapshot"] = stale_sparse["remote_snapshot"]
 
             def retained_artifact(artifact_id, *, raw=False):
                 checksum = artifact_id.split(":")[1]
@@ -1763,7 +1784,7 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                     latest = response.json()
                     latest = latest["responses"][0] if "responses" in latest else latest
                     break
-                assert response.status_code == 503 and time.monotonic() < deadline, (
+                assert publication_pending(response) and time.monotonic() < deadline, (
                     response.text + server.debug_logs()
                 )
                 time.sleep(0.1)
@@ -1837,12 +1858,9 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 }, selected
                 # Replacement vectors use a different coordinate, so querying
                 # the old sparse coordinate cannot return the archived image.
-                stale_vector = dict(
-                    vector_only,
-                    embeddings={"sparse_native": {"indices": [1], "values": [1]}},
-                    filter_query={"term": {"path": "/id", "value": 0}},
+                selected = call(
+                    "POST", "/tables/wal_windows/query", stale_sparse_request
                 )
-                selected = call("POST", "/tables/wal_windows/query", stale_vector)
                 assert selected["hits"]["hits"] == [], selected
             repeated = call("POST", "/tables/wal_windows/query", pinned)
             assert repeated["hits"] == first["hits"]

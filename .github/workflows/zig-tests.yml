@@ -3028,6 +3028,11 @@ jobs:
         if: matrix.suite == 'inference-generation'
         working-directory: zig
         env:
+          # Exercise the same shipped CPU backend as the inference shard.
+          ANTFLY_INFERENCE_BLAS: openblas
+          OPENBLAS_NUM_THREADS: "2"
+          ANTFLY_E2E_PHASE_TIMINGS: "1"
+          ANTFLY_INFERENCE_SERVER_LOG_DIR: ${{ runner.temp }}/inference-server-logs
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_INFERENCE_STANDALONE_TESTS: "1"
           ANTFLY_INFERENCE_STANDALONE_MODEL_NAME: ggml-org/gemma-4-e2b-it-gguf
@@ -3040,7 +3045,7 @@ jobs:
         run: |
           # Reuse the immutable models downloaded by the generation shard.
           export ANTFLY_INFERENCE_STANDALONE_MODELS_DIR="$ANTFLY_INFERENCE_MODELS_DIR"
-          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q \
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q -s --durations=10 \
             e2e/antfly/test_standalone.py::test_standalone_inference_process_envelope_composition
 
       - name: Download shared full E2E plan
