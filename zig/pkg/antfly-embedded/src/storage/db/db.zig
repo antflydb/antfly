@@ -52584,7 +52584,10 @@ test "generated memo reuses only source matched typed embedding artifacts" {
     defer directory.cleanup();
     const path = directory.path().ptr;
     defer cleanupTempDir(path);
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    // Stored sparse vectors must be checked against the active provider's
+    // revision, even when that provider uses the legacy unversioned contract.
+    var sparse_provider = embedder_mod.DeterministicSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .sparse_embedder = sparse_provider.interface() } });
     defer db.close();
     var memo = GeneratedEmbeddingMemo.init(alloc);
     defer memo.deinit();
@@ -86691,7 +86694,7 @@ test "db document extraction completes image OCR with reader producer" {
     const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
-    var fake = TestAssetProducer{};
+    var fake = TestAssetProducer{ .reader_output = "[{\"text\":\"recognized image text\"}]" };
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -86720,6 +86723,11 @@ test "db document extraction completes image OCR with reader producer" {
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), fake.reader_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.reader_media_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.reader_source_text_bytes);
+    var expected_image_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("\x89PNG\r\n\x1a\nimage bytes", &expected_image_digest, .{});
+    try std.testing.expectEqualSlices(u8, &expected_image_digest, &fake.reader_media_digest);
 
     const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:image-ocr", "document_units_v1", "image:000001");
     defer alloc.free(unit_key);
@@ -86728,7 +86736,7 @@ test "db document extraction completes image OCR with reader producer" {
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"ocr_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"extraction_status\":\"completed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"ocr_used\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"reader:data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"recognized image text\"") != null);
 }
 
 test "db document extraction attempts forced OCR for a scanned PDF" {
@@ -86813,7 +86821,7 @@ test "db async document extraction reuses generated OCR text across streaming pa
     const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
-    var fake = TestAssetProducer{};
+    var fake = TestAssetProducer{ .reader_output = "[{\"text\":\"recognized image text\"}]" };
     var db = try DB.open(alloc, std.mem.span(path), .{
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{
@@ -86842,6 +86850,11 @@ test "db async document extraction reuses generated OCR text across streaming pa
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), fake.reader_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.reader_media_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.reader_source_text_bytes);
+    var expected_image_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("\x89PNG\r\n\x1a\nimage bytes", &expected_image_digest, .{});
+    try std.testing.expectEqualSlices(u8, &expected_image_digest, &fake.reader_media_digest);
 
     const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:image-ocr-async", "document_units_v1", "image:000001");
     defer alloc.free(unit_key);
@@ -86849,7 +86862,7 @@ test "db async document extraction reuses generated OCR text across streaming pa
     defer alloc.free(unit_payload);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"ocr_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"extraction_status\":\"completed\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"reader:data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"recognized image text\"") != null);
 }
 
 test "db document extraction stores structured OCR confidence and coordinates" {

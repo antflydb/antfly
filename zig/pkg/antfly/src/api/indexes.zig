@@ -6244,7 +6244,7 @@ fn consumerTests() type {
             );
             try ant_json.testing.expectSubsetJsonText(
                 alloc,
-                "{\"incarnation\":\"g-000000000000002a\",\"searchable_vectors\":266,\"activity\":null,\"source_coverage\":{\"covered\":64,\"observation_complete\":false,\"observation_incomplete_reasons\":[\"target_observation\"]},\"milestones\":{\"queryable\":{\"reached\":true},\"complete\":{\"reached\":false,\"blockers\":[\"target_observation\",\"source_coverage\",\"publication\"]}},\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"pending_reasons\":[\"target_observation\",\"backfill\",\"coverage\",\"publication\"]}}",
+                "{\"incarnation\":\"g-000000000000002a\",\"searchable_vectors\":266,\"activity\":null,\"source_coverage\":{\"covered\":64,\"observation_complete\":false,\"observation_incomplete_reasons\":[\"target_observation\"]},\"milestones\":{\"queryable\":{\"reached\":true},\"complete\":{\"reached\":false,\"blockers\":[\"target_observation\",\"source_coverage\",\"publication\"]}},\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"pending_reasons\":[\"target_observation\",\"backfill\",\"coverage\"]}}",
                 encoded.items,
             );
         }
@@ -10238,6 +10238,7 @@ fn consumerTests() type {
                 .name = try std.testing.allocator.dupe(u8, "vec"),
                 .kind = .dense_vector,
                 .doc_count = 50_000,
+                .serving_snapshot_ready = true,
                 .publication_target_ready = true,
                 .publication_target_count = 50_000,
                 .node_count = 24,
