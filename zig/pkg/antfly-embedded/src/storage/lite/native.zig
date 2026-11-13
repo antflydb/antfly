@@ -7130,6 +7130,30 @@ pub const NativeFile = struct {
             if (required > self.header.checkpoints[self.header.active_checkpoint].page_count) {
                 self.header.checkpoints[self.header.active_checkpoint].page_count = required;
             }
+            // Force `commitTransactionWithDurability`'s own `changed` check
+            // (`next.commit_sequence != previous.checkpoints[...].commit_sequence`,
+            // `previous` being the snapshot `beginTransaction` took just
+            // above, before this bump) to see this fold as having changed
+            // something, even if every logical head below turns out to be
+            // a content no-op (`putCatalogBatchForRoot`'s own "small index
+            // files include WAL control records" shortcut, which returns
+            // without ever staging into `transaction_writes` when a
+            // mutation's value already matches what's on disk). Without
+            // this, `changed == false` takes the plain-`sync()` branch
+            // instead of `publishCheckpoint`, so the real on-disk
+            // checkpoint slot is never advanced to cover the pages just
+            // physically written above -- yet the epilogue below still
+            // unconditionally reclaims the overlay and resets/zeros the
+            // log on the assumption ("everything above is durable now")
+            // that a fresh durable checkpoint was just published. The
+            // result: the pages are physically correct on disk, but
+            // nothing durable (neither the checkpoint slot nor the
+            // now-wiped log) points to them any more -- invisible, not
+            // merely stale, on the next open. Bumping here is safe: every
+            // reader of `commit_sequence` through this fold's own
+            // transaction only ever sees the final, already-published
+            // value `self.header` settles on past this point.
+            self.header.checkpoints[self.header.active_checkpoint].commit_sequence += 1;
         }
         // §9 (redo + indexed reclamation): every page just flushed was
         // allocated and written by an earlier *diverting* commit
@@ -9597,7 +9621,35 @@ pub const NativeFile = struct {
         };
 
         if (checkpoint.page_count == 0) return invalidCheck(report, "invalid_page_count");
-        if (file_size < expected_size) return invalidCheck(report, "truncated_file");
+        // §9 (redo + indexed reclamation): a diverting commit advances
+        // `checkpoint.page_count` on its own, to hand out fresh page ids
+        // for external value chains (`pageAllocatorForDivertingCommit`),
+        // before the file's own physical extent grows to match -- that
+        // growth only happens at the next `checkpointRedoLog` fold (or
+        // the "page-shaped only" pre-flush `publishCheckpoint` runs when
+        // the log itself is close to full). `decodeFreeMapAlloc`'s own
+        // `allow_behind` already tolerates exactly this gap for the free
+        // map's `covered_page_count`; `expected_size` here, built from
+        // the same `page_count`, inherits the identical gap and must be
+        // tolerated the same way, or every `check()` call on a live,
+        // still-diverting redo-log file reports `truncated_file` for
+        // pages that are not missing -- they are staged in the shared
+        // redo overlay, recoverable from the log, exactly like any other
+        // page in that gap. The floor this check still enforces for a
+        // redo-log file is the one thing that is never deferred: the
+        // fixed prefix every opener reads before any divert can happen
+        // at all (header, both checkpoint slots, and the log's own
+        // reserved region) -- a file truncated short of *that* is
+        // genuinely corrupt, not merely mid-divert. Every individual
+        // page read below (reachable-chain walks, the indexed-allocator
+        // graph walk) already goes through the overlay-aware primitives,
+        // so a page that is *not* actually recoverable -- truly missing,
+        // not merely undiverted -- still fails there, not here.
+        const truncation_floor = if (self.header.redo_log_capacity != 0)
+            self.header.redo_log_offset +| self.header.redo_log_capacity
+        else
+            expected_size;
+        if (file_size < truncation_floor) return invalidCheck(report, "truncated_file");
 
         if (self.header.indexed_reclamation) {
             // A writer/rebased cache contains transient traversal inventories,
@@ -10157,7 +10209,28 @@ pub const NativeFile = struct {
         // reset to the same contents. Avoid growing catalog history for those
         // writes. Bound comparison work to one inline record; bulk mutations
         // and spilled values retain the normal publication path.
-        if (!self.flushing_transaction and root == .index and mutations.len == 1 and !self.checkpoint_publication_uncertain) {
+        //
+        // Never while `checkpointRedoLog`'s own fold is replaying a head
+        // (`self.redo.?.checkpointing`): `getCatalogRecordSizeFromRoot`
+        // consults the redo overlay (`redoOverlayEntry`) before ever
+        // falling back to the real tree, and the head being replayed *is*
+        // the overlay's own current entry for this key -- so this "does it
+        // already match?" check is comparing the mutation against itself
+        // and always "matches," silently treating the fold's own replay as
+        // a no-op. For a delete this is actively wrong:
+        // `getCatalogRecordSizeFromRoot` reports `null` for a key the
+        // overlay already marks deleted (the exact mutation being folded),
+        // so `mutation.is_delete and size == null` looks like "already
+        // absent, nothing to do" and returns without ever staging the
+        // delete into `transaction_writes` -- the real tree (which still
+        // has the key, unmodified) never gets edited, and
+        // `checkpointRedoLog`'s epilogue then reclaims the overlay entry
+        // and may reset the log, discarding the only durable record of the
+        // delete. The real tree is the only thing this fold's own replay
+        // should ever compare against.
+        if (!self.flushing_transaction and root == .index and mutations.len == 1 and !self.checkpoint_publication_uncertain and
+            !(self.redo != null and self.redo.?.checkpointing))
+        {
             const mutation = mutations[0];
             const size = try self.getCatalogRecordSizeFromRoot(root, mutation.key);
             if (mutation.is_delete and size == null) return self.syncIfRequired(null);
@@ -10250,6 +10323,42 @@ pub const NativeFile = struct {
         try self.finishCatalogAppend(root, key);
         const checkpoint = self.activeCheckpoint();
         if (self.stagedEntry(if (root == .metadata) .metadata else .index, key)) |entry| return if (entry.is_delete) null else entry;
+        // §9.7c (ReadView): the overlay-blind-read bug class, found three
+        // times already at other call sites (docstore.Cursor,
+        // getDocumentsAtCheckpointWithState, readBackingPages's read-ahead
+        // window) -- this is a fourth. A key whose current value lives
+        // only in the redo-log overlay (logged by an earlier commit via
+        // appendLogicalMutation, not yet folded into the real tree by
+        // checkpointRedoLog) falls straight through to `lookupCatalogPage`
+        // below, which only ever sees the real tree -- returning null (or
+        // a stale, pre-overlay value) for a key that is very much live.
+        // `stageCatalogAppend`'s own caller then treats that as "nothing to
+        // append to" and builds its new suffix on the wrong base, silently
+        // discarding (or duplicating, if the stale on-disk value is itself
+        // a shorter prefix of the live one) whatever the overlay held.
+        // Checked here, before the real-tree fallback, so every caller of
+        // this function (append and rename) sees exactly what a plain
+        // `get()` on the same key already would. The overlay returns an
+        // owned value; copied into `scratch` (bounded the same way the
+        // real-tree path already is, by `maxPagePayloadBytes` <=
+        // scratch.len) so this function's own ownership contract -- every
+        // returned `CatalogEntry.value` borrows from either `scratch` or
+        // `stagedEntry`'s map, never something the caller must free --
+        // stays the same for both existing callers.
+        if (try self.redoOverlayEntry(if (root == .metadata) .metadata else .index, checkpoint, key)) |overlay_entry| {
+            defer self.allocator.free(overlay_entry.value);
+            if (overlay_entry.is_delete) return null;
+            if (overlay_entry.external_value_root_page != 0) return .{
+                .previous_page = 0,
+                .key = key,
+                .value = &.{},
+                .external_value_root_page = overlay_entry.external_value_root_page,
+                .external_value_len = overlay_entry.external_value_len,
+            };
+            if (overlay_entry.value.len > scratch.len) return error.RecordTooLarge;
+            @memcpy(scratch[0..overlay_entry.value.len], overlay_entry.value);
+            return .{ .previous_page = 0, .key = key, .value = scratch[0..overlay_entry.value.len] };
+        }
         const page = (try self.lookupCatalogPage(checkpoint, root, key)) orelse return null;
         const payload = try decodePagePayload(try self.readPageInto(page, checkpoint, scratch), .catalog);
         const entry = try decodeCatalogEntry(payload);
@@ -29105,6 +29214,62 @@ test "lite redo log commit stages pages without a physical pwrite and recovers a
     const beta = (try reopened.getDocumentAlloc(a, "beta")).?;
     defer a.free(beta);
     try std.testing.expectEqualStrings("two", beta);
+}
+
+// Regression: a diverting commit's own `flushTransactionWrites` advances
+// `next.page_count` unconditionally to cover whatever fresh page ids an
+// external value's extent tree needed (`pageAllocatorForDivertingCommit`),
+// but never grows the file's own physical extent to match -- those pages
+// are logged (`appendRecord`), not pwritten at their own offsets, until
+// the next `checkpointRedoLog` fold. `decodeFreeMapAlloc` already
+// tolerates exactly this gap for the free map's own `covered_page_count`
+// (its own `allow_behind` parameter); `checkAtFileSizeWithCancel`'s
+// `file_size < expected_size` truncation check, built from the same
+// `page_count`, did not, so `check()` on a live, still-diverting redo-log
+// file reported `truncated_file` for pages that were never missing --
+// merely not yet folded. Eight ordinary durable commits, each with its
+// own large (externally-chained) value and no checkpoint in between, is
+// enough to grow `page_count` well past the file's real physical size.
+test "lite check tolerates page_count run ahead of physical size on a still-diverting redo-log file" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-check-page-count-ahead.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 2 * 1024 * 1024);
+    defer file.close();
+    try std.testing.expect(file.redo != null);
+
+    const value = try a.alloc(u8, 64 * 1024);
+    defer a.free(value);
+    @memset(value, 'v');
+
+    var key_buf: [16]u8 = undefined;
+    for (0..8) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "doc{d}", .{i});
+        try file.beginTransaction();
+        try file.putDocument(key, value);
+        try file.commitTransaction();
+    }
+
+    // The bug: `page_count` ran ahead of the file's own real size (no
+    // fold has run), and the old, un-redo-aware truncation check in
+    // `checkAtFileSizeWithCancel` treated that gap as corruption.
+    const checkpoint = file.activeCheckpoint();
+    const real_size = (try file.file.stat(file.runtimeIo())).size;
+    try std.testing.expect(checkpoint.page_count * @as(u64, file.header.page_size) > real_size);
+
+    const report = try file.check();
+    try std.testing.expect(report.valid);
+
+    // A genuinely short file -- truncated below even the fixed prefix
+    // every opener needs (header, both checkpoint slots, the log's own
+    // reserved region) -- must still fail. The relaxed check only widens
+    // the floor for a redo-log file, never removes it.
+    const short_report = try file.checkAtFileSizeWithCancel(file.header.redo_log_offset, null);
+    try std.testing.expect(!short_report.valid);
+    try std.testing.expectEqualStrings("truncated_file", short_report.issue.?);
 }
 
 // The regression this guards against: `readBackingPages`'s redo-overlay

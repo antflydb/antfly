@@ -6129,20 +6129,43 @@ pub const Cursor = struct {
     pub fn next(self: *Cursor) !backend_adapter.Entry {
         const current = self.current_key orelse return error.NotFound;
         const merged = try self.ensureMerged();
+        // A direction change takes the `else` branch below, which seeks
+        // fresh from `current` instead of resuming from whatever this
+        // cursor's last (opposite-direction) move already fetched and
+        // buffered in `merged_candidate` (`takeBufferedMerged`'s own
+        // contract: "held here whenever pending_tree won a comparison
+        // without a tie", on the *continuing* direction only). That
+        // buffered candidate is still a live, owned `MergedCursor.Entry`
+        // (its own resolved value freshly allocated via
+        // `redoOverlayEntryAt`/`SharedRedoOverlay.resolveAlloc` under
+        // redo, or owning `DocumentIndexEntry.key` under the legacy
+        // tree path -- either way, `MergedCursor.Entry.deinit`'s job) --
+        // `installPending`/`installDisk` unconditionally overwrite
+        // `self.merged_candidate` with whatever this move's own
+        // `resolveMerged` call buffers next, with no record of the old
+        // one past this point. Discard it explicitly here, on the one
+        // path that would otherwise orphan it.
         const result = if (self.last_direction == .forward)
             self.takeBufferedMerged() orelse try merged.next(current, true)
-        else
-            try merged.next(current, false);
+        else blk: {
+            self.clearBufferedMerged();
+            break :blk try merged.next(current, false);
+        };
         return try self.resolveMerged(result, self.overlayAtOrAfter(current, true), .forward);
     }
 
     pub fn prev(self: *Cursor) !backend_adapter.Entry {
         const current = self.current_key orelse return error.NotFound;
         const merged = try self.ensureMerged();
+        // See `next`'s own comment: a direction change must discard
+        // `merged_candidate` before seeking fresh, or the buffered entry
+        // from the last (opposite-direction) move leaks.
         const result = if (self.last_direction == .backward)
             self.takeBufferedMerged() orelse try merged.prev(current, true)
-        else
-            try merged.prev(current, false);
+        else blk: {
+            self.clearBufferedMerged();
+            break :blk try merged.prev(current, false);
+        };
         return try self.resolveMerged(result, self.overlayAtOrBefore(current, true), .backward);
     }
 
