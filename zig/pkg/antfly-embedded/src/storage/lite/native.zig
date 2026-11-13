@@ -9262,11 +9262,42 @@ pub const NativeFile = struct {
         // path's own callers run outside any live transaction a redo-log
         // commit could have staged into this overlay.
         if (self.redo) |*redo| {
-            if (out.len == self.header.page_size and offset % self.header.page_size == 0) {
-                const page_id = offset / self.header.page_size;
-                if (try redo.shared.readPageAlloc(self.allocator, self.runtimeIo(), page_id)) |bytes| {
-                    defer self.allocator.free(bytes);
-                    @memcpy(out, bytes);
+            const page_size = self.header.page_size;
+            if (offset % page_size == 0 and out.len % page_size == 0 and out.len != 0) {
+                if (out.len == page_size) {
+                    const page_id = offset / page_size;
+                    if (try redo.shared.readPageAlloc(self.allocator, self.runtimeIo(), page_id)) |bytes| {
+                        defer self.allocator.free(bytes);
+                        @memcpy(out, bytes);
+                        return;
+                    }
+                } else {
+                    // `RecordReadWindow`'s own multi-page read-ahead
+                    // window, never a single page-id-keyed lookup: any
+                    // page in this span -- not just the first -- may be
+                    // redo-log-only with no correct physical copy yet,
+                    // same as the single-page case above. A single bulk
+                    // `readBackingPagesUncached` call below would skip
+                    // the overlay check entirely for every page past the
+                    // first (this branch only runs when `out.len` is
+                    // more than one page), reading right past the
+                    // physical end of file for one the file was never
+                    // extended to cover -- observed as `EndOfStream` in
+                    // `getDocumentsAtCheckpointWithState`'s own batch-read
+                    // path, immediately after a `putDocumentBatch` whose
+                    // writes this same commit diverted into the redo log.
+                    // Serve this span one page at a time instead: each
+                    // recursive call re-enters this same function, so
+                    // every page still gets its own overlay check. The
+                    // window's whole point is fewer syscalls on the
+                    // common, nothing-diverted path; this trades that
+                    // for correctness only while `self.redo` is active,
+                    // never on the legacy path these tests already cover.
+                    const page_count = out.len / page_size;
+                    var i: usize = 0;
+                    while (i < page_count) : (i += 1) {
+                        try self.readBackingPages(out[i * page_size ..][0..page_size], offset + i * page_size);
+                    }
                     return;
                 }
             }
@@ -28087,6 +28118,73 @@ test "lite redo log commit stages pages without a physical pwrite and recovers a
     try std.testing.expectEqualStrings("two", beta);
 }
 
+// The regression this guards against: `readBackingPages`'s redo-overlay
+// lookup only ever checked a single, exact `page_size`-wide read, so a
+// multi-page read-ahead window (`RecordReadWindow`, which `readBatchRecord`
+// requests via `recordRunAhead` for a sorted batch of keys whose document
+// index pages happen to be physically adjacent -- here, one batch, one
+// commit) skipped the overlay check entirely for every page past the
+// first and fell straight through to a raw physical read. Under a redo
+// log, those pages were diverted into the log instead of pwritten at
+// all, so that raw read ran past the physical end of file --
+// `error.EndOfStream` -- exactly the failure
+// `getDocumentsAtCheckpointWithState`'s own batch-read path hit in
+// "lite scoped native batch state reuses all working allocations",
+// "lite pooled graph reads reuse scratch across fresh queries and
+// isolate scopes", and "lite prepared review multiple columns retain
+// combined decoded reuse" under the redo-log default, immediately after
+// their own first `putDocumentBatch`/batch-read pair -- reproduced here
+// directly against the lower-level reader/window pair those tests only
+// exercise indirectly through `Store`.
+test "lite redo log multi-page read-ahead window checks the overlay for every page, not just the first" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-window-overlay.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer file.close();
+
+    var payload: [2000]u8 = undefined;
+    @memset(&payload, 'v');
+    var keys: [64][8]u8 = undefined;
+    var docs: [64]DocumentMutation = undefined;
+    for (&docs, &keys, 0..) |*doc, *key, i| {
+        const text = try std.fmt.bufPrint(key, "{d:0>8}", .{i});
+        doc.* = .{ .key = text, .value = &payload };
+    }
+    // One commit, diverted entirely into the redo log -- the whole point
+    // of `createWithRedoLog`; none of these document pages was ever
+    // pwritten to their physical location in the file. Same key count
+    // and payload size as "lite cold record windows coalesce only
+    // proven runs and authenticate every page" (the non-redo sibling
+    // this test mirrors), which already proves this shape lays out a
+    // physically adjacent run of document pages.
+    try file.putDocumentBatch(&docs);
+    const checkpoint = file.activeCheckpoint();
+
+    var refs: [64]u64 = undefined;
+    for (&refs, docs) |*ref, doc| ref.* = (try file.lookupDocumentIndexPage(checkpoint, doc.key)).?;
+
+    // One batch, inserted in key order: the whole run of document index
+    // pages is physically adjacent, so the very first lookup below asks
+    // for more than one page in a single window, not sixteen separate
+    // one-page lookups.
+    const ahead = recordRunAhead(&refs, null, 0);
+    try std.testing.expect(ahead > 1);
+
+    var reader = RecordPageReader{};
+    defer reader.deinit(a);
+    var window = RecordReadWindow{};
+    defer window.deinit(a);
+    for (refs, 0..) |ref, i| {
+        const entry = try decodeDocumentEntry(try reader.readWithWindow(true, &window, &file, a, checkpoint, ref, .document, if (i == 0) ahead else 1));
+        try std.testing.expectEqualStrings(docs[i].key, entry.key);
+        try std.testing.expectEqualSlices(u8, &payload, entry.value);
+    }
+}
+
 test "lite redo log ride-along commit is lost on a crash before its sync; the durable commit survives" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -29146,6 +29244,93 @@ test "lite redo log versioned overlay lets a pinned older checkpoint see its own
     const v2_after_checkpoint = (try file.getDocumentAlloc(a, "k")).?;
     defer a.free(v2_after_checkpoint);
     try std.testing.expectEqualStrings("v2", v2_after_checkpoint);
+}
+
+// The retention half of the ReadView model this design is working
+// toward (docs/design/lite-performance/lite-single-commit-write-path.md
+// §9.3a/§9.6a): a reader pinned at a checkpoint must still read exactly
+// what existed as of its own pin, even after a *later* commit supersedes
+// it, a checkpoint folds the overlay, and a maintenance reclaim pass
+// runs -- the same guarantee `SharedRedoOverlay.maybeClearPages`'s own
+// doc comment already states ("the conservative, always-safe choice is
+// to keep every staged page as long as *any* pin is live") and
+// `Store.pinInitializedReadGeneration` already wires up (the overlay pin
+// plus the general reader-pin registry, both registered here directly
+// against `NativeFile`/`inode_lock.Entry` without the full `Store`
+// wrapper). Exercises both halves of that existing machinery together
+// with the multi-page read-ahead fix above, against a value large
+// enough to span several pages of external value chain -- precisely the
+// "page reference, not an inline value, that a later checkpoint
+// reclaimed or moved" shape the three originally-reported EndOfStream
+// failures' own root-cause investigation considered and ruled out as
+// the cause *for those three tests specifically* (no fold or reclaim
+// ever ran in them), but that this design's longer-term correctness
+// still depends on holding regardless.
+test "lite redo log a pin survives checkpoint and reclaim: a superseded multi-page external value stays readable" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-pin-survives-reclaim.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 256 * 1024);
+    defer file.close();
+
+    // Several pages of external value chain, written raw by the
+    // diverting commit -- never through the ordinary copy-on-write
+    // ledger (`RedoCommitState`'s own doc comment) -- and, crucially,
+    // never checkpointed before the pin below is taken.
+    const large = try a.alloc(u8, 20 * 1024);
+    defer a.free(large);
+    @memset(large, 'A');
+
+    try file.beginTransaction();
+    try file.putDocument("doc", large);
+    try file.commitTransaction();
+    const checkpoint_at_large = file.activeCheckpoint();
+
+    // Pin a reader at this checkpoint: the same two registrations
+    // `Store.pinInitializedReadGeneration` makes for a real
+    // `ReadGeneration` -- the overlay pin (protects the diverted
+    // chain's own raw pages, `SharedRedoOverlay.pages`) and the general
+    // reader-pin registry (protects the allocator's own page-reuse
+    // frontier, `reuseFrontier`) -- made directly here since this test
+    // has no `Store` to make them through.
+    const entry = file.inode_lock_ref.load(.acquire).?;
+    if (file.redo) |*redo| try redo.shared.pin(std.heap.page_allocator, std.testing.io, checkpoint_at_large.commit_sequence);
+    try inode_lock.pinReader(entry, std.testing.io, .{ .data = checkpoint_at_large.commit_sequence, .metadata = checkpoint_at_large.commit_sequence });
+    defer {
+        inode_lock.unpinReader(entry, std.testing.io, .{ .data = checkpoint_at_large.commit_sequence, .metadata = checkpoint_at_large.commit_sequence });
+        if (file.redo) |*redo| redo.shared.unpin(std.testing.io, checkpoint_at_large.commit_sequence);
+    }
+
+    // Supersede the same key with a small value, then fold: the pinned
+    // checkpoint's own large value is now logically dead from the
+    // *current* generation's point of view -- exactly the shape a later
+    // checkpoint's reclaim must not free out from under the pin.
+    try file.beginTransaction();
+    try file.putDocument("doc", "small");
+    try file.commitTransaction();
+    try file.checkpointRedoLog();
+
+    // The fold's own overlay cleanup must have respected the live pin
+    // (a no-op whenever any pin exists), and a maintenance reclaim pass
+    // must not have freed or reused the superseded chain's pages either.
+    if (file.redo) |*redo| redo.shared.maybeClearPages(std.heap.page_allocator, std.testing.io);
+    _ = try file.reclaimPagesForMaintenanceWithCancel(1024, null, true);
+
+    // The live, current checkpoint sees the overwrite.
+    const current = (try file.getDocumentAlloc(a, "doc")).?;
+    defer a.free(current);
+    try std.testing.expectEqualStrings("small", current);
+
+    // The pinned, older checkpoint still reads back the full original
+    // value, byte for byte -- not `EndOfStream` (pages reclaimed or
+    // never folded), not a wrong/truncated value (pages reused for
+    // something else).
+    const pinned_value = (try file.getDocumentAtCheckpointAlloc(a, checkpoint_at_large, "doc")).?;
+    defer a.free(pinned_value);
+    try std.testing.expectEqualSlices(u8, large, pinned_value);
 }
 
 // §9 (redo + indexed reclamation): `checkpointRedoLog`'s real build folds
