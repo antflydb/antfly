@@ -1846,10 +1846,75 @@ pub fn remoteContentSnapshotJsonAlloc(
     alloc: std.mem.Allocator,
     remote_content: *const scraping.RemoteContentConfig,
 ) ![]u8 {
-    const Data = scraping.RemoteContentSnapshotData;
     var snapshot = try remote_content.acquire();
     defer snapshot.deinit();
-    const config = snapshot.config;
+    return remoteContentConfigJsonAlloc(alloc, snapshot.config);
+}
+
+pub const RemoteContentSnapshotUpdate = struct {
+    revision: [32]u8,
+    /// Null means the caller's revision still names the acquired publication.
+    json: ?[]u8 = null,
+};
+
+test "remote content snapshot updates hash mutable configurations and roll back allocation failures" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var data = try std.json.parseFromSlice(scraping.RemoteContentSnapshotData, alloc,
+                \\{"default_s3":"r2","s3":[{"name":"r2","credential":{"buckets":["media"],"secret_access_key":"${secret:key}"}}],"http":[{"name":"github","base_url":"https://api.github.com/","headers":[{"name":"Authorization","value":"${secret:token}"}]}]}
+            , .{ .allocate = .alloc_always });
+            defer data.deinit();
+            var config = try data.value.configAlloc(alloc);
+            defer scraping.RemoteContentSnapshotData.deinitConfig(&config, alloc);
+            const facade = &config;
+            const initial = try remoteContentSnapshotUpdateAlloc(alloc, facade, null);
+            defer alloc.free(initial.json.?);
+            const same = try remoteContentSnapshotUpdateAlloc(alloc, facade, &initial.revision);
+            try std.testing.expect(same.json == null);
+            facade.http.getPtr("github").?.headers.clearRetainingCapacity();
+            // Removed strings still belong to the parsed snapshot arena.
+            const changed = try remoteContentSnapshotUpdateAlloc(alloc, facade, &initial.revision);
+            defer alloc.free(changed.json.?);
+            try std.testing.expect(!std.mem.eql(u8, &initial.revision, &changed.revision));
+            var parsed = try std.json.parseFromSlice(scraping.RemoteContentSnapshotData, alloc, changed.json.?, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            var restored = try parsed.value.configAlloc(alloc);
+            defer scraping.RemoteContentSnapshotData.deinitConfig(&restored, alloc);
+            try std.testing.expectEqualStrings("${secret:key}", restored.getS3("r2").?.secret_access_key.?);
+            try std.testing.expectEqual(@as(usize, 0), restored.getHttp("github").?.headers.count());
+        }
+    };
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+/// Check the identity held by the same lease as the configuration. A separate
+/// health read could race a reload and associate bytes with the wrong revision.
+/// Publishers without immutable identities retain the safe serialize/hash path.
+pub fn remoteContentSnapshotUpdateAlloc(
+    alloc: std.mem.Allocator,
+    remote_content: *const scraping.RemoteContentConfig,
+    previous: ?*const [32]u8,
+) !RemoteContentSnapshotUpdate {
+    var snapshot = try remote_content.acquire();
+    defer snapshot.deinit();
+    if (snapshot.revision) |revision| {
+        if (previous) |old| if (std.mem.eql(u8, old, &revision)) return .{ .revision = revision };
+    }
+    const json = try remoteContentConfigJsonAlloc(alloc, snapshot.config);
+    const revision = snapshot.revision orelse blk: {
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(json, &hash, .{});
+        break :blk hash;
+    };
+    if (previous) |old| if (std.mem.eql(u8, old, &revision)) {
+        alloc.free(json);
+        return .{ .revision = revision };
+    };
+    return .{ .revision = revision, .json = json };
+}
+
+fn remoteContentConfigJsonAlloc(alloc: std.mem.Allocator, config: *const scraping.RemoteContentConfig) ![]u8 {
+    const Data = scraping.RemoteContentSnapshotData;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const scratch = arena.allocator();

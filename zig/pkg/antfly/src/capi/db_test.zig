@@ -32,6 +32,7 @@ const ApiTypes = public.ApiTypes;
 const search_wire = public.search_wire;
 const kernel_owner_abi = shared.kernel_owner_abi;
 const kernel_error_identity = server_api.kernel_error_identity;
+const remote_content_services = server_api.kernel_runtime_services;
 const local_query_client = shared.local_query_client;
 const capi_build_options = shared.capi_build_options;
 const kernel_wal_owner = server_api.kernel_wal_owner;
@@ -8167,4 +8168,116 @@ test "storage owner remote content source preserves S3 and HTTP credentials" {
     try std.testing.expectEqualStrings("https://api.github.com/repos/acme/", http.base_url.?);
     try std.testing.expectEqualStrings("${secret:missing-github-token}", http.headers.get("Authorization").?);
     try std.testing.expectEqualStrings("api.github.com", http.security.?.allowed_hosts.?[0]);
+}
+
+test "storage owner remote content source caches revisions without hiding errors or invalidating readers" {
+    const Source = struct {
+        revision: std.atomic.Value(u8) = .init(1),
+        payloads: std.atomic.Value(usize) = .init(0),
+        releases: std.atomic.Value(usize) = .init(0),
+        failure: kernel_owner_abi.Status = .ok,
+        malformed: bool = false,
+
+        fn acquire(_: *anyopaque, _: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+            // v3 must use the conditional callback.
+            return .invalid_argument;
+        }
+        fn acquireIfChanged(raw: *anyopaque, previous: ?*const [32]u8, out: *remote_content_services.CachedRemoteContentSource.Update) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.failure != .ok) return self.failure;
+            const revision: [32]u8 = @splat(self.revision.load(.acquire));
+            out.* = .{ .revision = revision };
+            if (previous) |old| if (std.mem.eql(u8, old, &revision)) return .ok;
+            const json = if (self.malformed) "{invalid" else if (revision[0] == 1)
+                \\{"default_s3":"r2","s3":[{"name":"r2","credential":{"buckets":["old"],"secret_access_key":"${secret:old}"}}],"http":[{"name":"github","headers":[{"name":"Authorization","value":"${secret:old}"}]}]}
+            else
+                \\{"default_s3":"r2","s3":[{"name":"r2","credential":{"buckets":["new"],"secret_access_key":"${secret:new}"}}],"http":[{"name":"github","headers":[{"name":"Authorization","value":"${secret:new}"}]}]}
+            ;
+            const bytes = std.testing.allocator.dupe(u8, json) catch return .out_of_memory;
+            out.bytes = .{ .ptr = bytes.ptr, .len = bytes.len };
+            _ = self.payloads.fetchAdd(1, .monotonic);
+            return .ok;
+        }
+        fn release(raw: *anyopaque, bytes: kernel_owner_abi.OwnedBytes) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.testing.allocator.free(bytes.slice());
+            _ = self.releases.fetchAdd(1, .monotonic);
+        }
+    };
+    var source: Source = .{};
+    var context: ?*anyopaque = null;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextCreate(&.{}, &context));
+    defer std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextDestroy(context)) catch unreachable;
+    const callbacks = remote_content_services.CachedRemoteContentSource{
+        .source = .{ .version = 3, .context = &source, .acquire = Source.acquire, .release = Source.release },
+        .acquire_if_changed = Source.acquireIfChanged,
+    };
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerContextConfigureRemoteContentSource(context, &callbacks.source));
+    const facade = asStorageOwnerContext(context).?.remoteContent().?;
+    var before = try facade.acquire();
+    defer before.deinit();
+    for (0..1000) |_| {
+        var held = try facade.acquire();
+        defer held.deinit();
+        try std.testing.expectEqual(before.config, held.config);
+    }
+    try std.testing.expectEqual(@as(usize, 1), source.payloads.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), source.releases.load(.acquire));
+
+    source.failure = .timeout;
+    try std.testing.expectError(error.Timeout, facade.acquire());
+    source.failure = .out_of_memory;
+    try std.testing.expectError(error.OutOfMemory, facade.acquire());
+    source.failure = .cancelled;
+    try std.testing.expectError(error.Canceled, facade.acquire());
+    source.failure = .resource_temporarily_unavailable;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, facade.acquire());
+    source.failure = .ok;
+    source.revision.store(2, .release);
+    source.malformed = true;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, facade.acquire());
+    source.malformed = false;
+    var after = try facade.acquire();
+    defer after.deinit();
+    try std.testing.expect(before.config != after.config);
+    try std.testing.expectEqualStrings("new", after.config.getS3("r2").?.buckets.?[0]);
+    try std.testing.expectEqualStrings("${secret:new}", after.config.getHttp("github").?.headers.get("Authorization").?);
+    try std.testing.expectEqualStrings("old", before.config.getS3("r2").?.buckets.?[0]);
+    try std.testing.expectEqualStrings("${secret:old}", before.config.getHttp("github").?.headers.get("Authorization").?);
+
+    const Reader = struct {
+        facade: *const server_api.scraping.RemoteContentConfig,
+        invalid: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            for (0..1000) |_| {
+                var held = self.facade.acquire() catch {
+                    self.invalid.store(true, .release);
+                    return;
+                };
+                defer held.deinit();
+                const s3 = held.config.getS3("r2").?.secret_access_key.?;
+                const http = held.config.getHttp("github").?.headers.get("Authorization").?;
+                if (!std.mem.eql(u8, s3, http)) self.invalid.store(true, .release);
+            }
+        }
+    };
+    var reader = Reader{ .facade = facade };
+    var first = try std.testing.io.concurrent(Reader.run, .{&reader});
+    defer first.await(std.testing.io);
+    var second = try std.testing.io.concurrent(Reader.run, .{&reader});
+    defer second.await(std.testing.io);
+    for (0..20) |i| {
+        source.revision.store(@intCast(1 + i % 2), .release);
+        var held = try facade.acquire();
+        held.deinit();
+    }
+    first.await(std.testing.io);
+    second.await(std.testing.io);
+    try std.testing.expect(!reader.invalid.load(.acquire));
+    try std.testing.expectEqual(source.payloads.load(.acquire), source.releases.load(.acquire));
+
+    // Reconfiguration drops only the cache's reference, not outstanding leases.
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerContextConfigureRemoteContentSecurity(context, .fromSlice("{}")));
+    try std.testing.expectEqualStrings("${secret:old}", before.config.getHttp("github").?.headers.get("Authorization").?);
+    try std.testing.expectEqualStrings("${secret:new}", after.config.getHttp("github").?.headers.get("Authorization").?);
 }

@@ -295,6 +295,9 @@ pub const RemoteContentConfig = struct {
 
     pub const Snapshot = struct {
         config: *const RemoteContentConfig,
+        /// Identity of this immutable publication, acquired atomically with
+        /// config. Null requires consumers to compare serialized contents.
+        revision: ?[32]u8 = null,
         context: ?*anyopaque = null,
         release_fn: ?*const fn (*anyopaque) void = null,
 
