@@ -30,7 +30,11 @@ sys.path.insert(0, str(ROOT / "scripts" / "release"))
 from release_channels import normalize_release_version, python_version_from_release  # noqa: E402
 
 from package_cli_release import PACKAGE_PLATFORMS, lite_library_name  # noqa: E402
-from package_lite_release import SOURCE_LICENSE_FILES, archive_name  # noqa: E402
+from package_lite_release import (  # noqa: E402
+    EMBEDDED_BUILD_CONTRACT_SCHEMAS,
+    SOURCE_LICENSE_FILES,
+    archive_name,
+)
 
 
 def require(condition: bool, message: str) -> None:
@@ -69,6 +73,22 @@ def verify(
 
             lib_name = lite_library_name(platform)
             library = source_bytes(f"./lib/{lib_name}")
+            # Contract 7 adds the Apple provider bridge beside libantfly. A
+            # matching main library alone cannot certify its packaged runtime.
+            libraries = (
+                {
+                    name.removeprefix("lib/"): source_bytes(name)
+                    for name, actual in names.items()
+                    if name.startswith("lib/") and source.getmember(actual).isfile()
+                }
+                if build_contract_schema >= 7
+                else {}
+            )
+            if build_contract_schema >= 7 and platform.release_os == "Darwin":
+                require(
+                    "libantfly-apple.dylib" in libraries,
+                    f"missing Apple provider bridge: {archive_path}",
+                )
             worker = None
             if build_contract_schema < 6:
                 source_bytes("./antfly-lite")
@@ -111,6 +131,13 @@ def verify(
             / f"antfly_embedded-{python_version}-py3-none-{platform.wheel_platform}.whl"
         )
         with zipfile.ZipFile(wheel_path) as wheel:
+            for name, content in libraries.items():
+                if Path(name).suffix == ".pc":
+                    continue  # pkg-config is shipped in the native npm package.
+                require(
+                    wheel.read(f"antfly_embedded/_lib/{name}") == content,
+                    f"library mismatch: {wheel_path}: {name}",
+                )
             require(
                 wheel.read(f"antfly_embedded/_lib/{lib_name}") == library,
                 f"library mismatch: {wheel_path}",
@@ -179,6 +206,12 @@ def verify(
                 member = npm.extractfile("package/" + name)
                 require(member is not None, f"missing {name} in {npm_path}")
                 return member.read()
+
+            for name, content in libraries.items():
+                require(
+                    npm_bytes(f"lib/{name}") == content,
+                    f"library mismatch: {npm_path}: {name}",
+                )
 
             manifest = json.loads(npm_bytes("package.json"))
             require(
@@ -254,7 +287,10 @@ def main() -> int:
     parser.add_argument("--wheel-dir", type=Path, required=True)
     parser.add_argument("--npm-dir", type=Path, required=True)
     parser.add_argument(
-        "--build-contract-schema", type=int, choices=(2, 3, 4, 5, 6), default=6
+        "--build-contract-schema",
+        type=int,
+        choices=EMBEDDED_BUILD_CONTRACT_SCHEMAS,
+        default=6,
     )
     args = parser.parse_args()
     verify(
