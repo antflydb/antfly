@@ -1662,17 +1662,24 @@ test "lite native directory cursor skips large subtrees and preserves boundary f
 // this fix, both the on-disk checkpoint slot and the redo log that could
 // have recovered them were left pointing at nothing.
 //
-// Deliberately omits a final `check()` call: this exact fold (any real
-// `checkpointRedoLog` fold following a large bare/diverted batch, delete
-// or not) also surfaces a second, separate `error.InvalidNativeAllocator`
-// from `validateIndexedOwnership` -- a page `redo_fold_retain_pending`
-// retroactively retains as a plain continuation page is later also
-// selected by `allocator_v4.State.persist`'s own metadata/delta-chain
-// rotation as a retirement candidate, double-booking it. That is an
-// allocator/ledger retirement-accounting bug, not a fold/read-path one;
-// confirmed not fixed by the two changes here, and left to the ledger
-// work on perf/lwa-redo-retire rather than risked under this task's
-// narrower scope.
+// This exact fold (any real `checkpointRedoLog` fold following a large
+// bare/diverted batch, delete or not) used to also surface a second,
+// separate `error.InvalidNativeAllocator` from `validateIndexedOwnership`:
+// a page `redo_fold_retain_pending` retroactively retained as a plain
+// continuation page was also, in the same persist cycle, selected by
+// `allocator_v4.State.persist`'s own metadata/delta-chain rotation as a
+// retirement candidate, double-booking it (both live-counted and pending
+// retirement at once). Root cause: pages the ledger never counts the
+// normal way -- the current free-map root, and anything still on the
+// active snapshot/pending/delta chains -- are flushed raw by a bare
+// commit's `PageWriteBatch.flushCount` under redo exactly like any other
+// page-shaped write, so they can land in `redo_fold_retain_pending`
+// alongside genuine, never-retained continuation pages. The retain loop
+// could not tell them apart from `count() == 0` alone. Fixed by
+// `allocator_v4.State.isSelfDescribingPage`, which the retain loop now
+// consults before retaining: a page that is the ledger's own root or on
+// its own metadata chains is skipped, never retained, leaving
+// `preparePersist`'s rotation as its only owner. See `check()` below.
 test "lite redo log checkpoint fold survives a close and reopen after a large diverted batch" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1710,6 +1717,7 @@ test "lite redo log checkpoint fold survives a close and reopen after a large di
     const marker = try indexes.storage().readFileAlloc(alloc, "/a/marker", 16);
     defer alloc.free(marker);
     try std.testing.expectEqualStrings("value", marker);
+    try std.testing.expect((try reopened.file.check()).valid);
 }
 
 test "lite native atomic imports batch writes and preserve publication on failed flush" {

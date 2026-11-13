@@ -16007,7 +16007,22 @@ pub const NativeFile = struct {
             }
             if (writes.pages.ledger) |state| {
                 for (pending) |page_id| {
-                    if (state.count(page_id) == 0) try state.retain(page_id);
+                    // §9 (redo + indexed reclamation): a page can reach
+                    // count() == 0 for two different reasons -- a genuine
+                    // continuation page nothing has ever retained (needs
+                    // retaining here), or the ledger's own self-describing
+                    // root/metadata page (never counted the normal way,
+                    // per `isSelfDescribingPage`'s own doc comment), which
+                    // `preparePersist`'s rotation below is about to retire
+                    // in this same persist cycle. Retaining the latter
+                    // double-books it: `validateIndexedOwnership` later
+                    // finds the same page simultaneously counted as live
+                    // (this retain) and pending retirement (the rotation),
+                    // and fails closed with `error.InvalidNativeAllocator`.
+                    // Only a page that is neither already counted nor one
+                    // of the ledger's own structural pages is a real,
+                    // previously-unretained continuation page.
+                    if (state.count(page_id) == 0 and !state.isSelfDescribingPage(page_id)) try state.retain(page_id);
                 }
             }
         }
