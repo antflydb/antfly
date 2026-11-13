@@ -1890,6 +1890,8 @@ test "remote content snapshot updates hash mutable configurations and roll back 
 /// Check the identity held by the same lease as the configuration. A separate
 /// health read could race a reload and associate bytes with the wrong revision.
 /// Publishers without immutable identities retain the safe serialize/hash path.
+/// That fallback costs O(serialized configuration bytes) even when unchanged;
+/// a cheap warm path requires a revision bound to an immutable publication.
 pub fn remoteContentSnapshotUpdateAlloc(
     alloc: std.mem.Allocator,
     remote_content: *const scraping.RemoteContentConfig,
