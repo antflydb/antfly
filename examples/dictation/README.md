@@ -287,11 +287,12 @@ Final clips use the binary AFATT001 attachment envelope, keeping audio out of
 JSON and avoiding base64 expansion and metadata allocation limits. A server can
 impose a smaller audio limit; shorten the recording if that limit is reached.
 
-**Clean** is the default. It fixes punctuation, filler words, and dictionary
-spellings when a generator is configured. **Rewrite** applies tone and custom
-instructions using the complete utterance. **Verbatim** skips generation. Without
-a cleanup generator, settings explain that only recognition runs. Existing JSON
-presets infer their mode from their style/instructions; explicit choices persist.
+**Verbatim** is the default when no text processor is configured. **Clean up**
+fixes punctuation, filler words, and dictionary spellings using a text processor.
+**Rewrite** applies tone and custom instructions using the complete utterance.
+Selecting Clean up or Rewrite requires a processor before recording. Existing JSON
+presets without an explicit mode infer Verbatim when no processor is configured;
+otherwise they infer their mode from style/instructions. Explicit choices persist.
 
 Automatic uses named Whisper transcribers advertising `stable_segments` and
 `text_cleanup`: final ASR segments are cleaned during recording, release commits
@@ -535,3 +536,31 @@ persistence to finish. Server and model updates remain independent.
 See [updates and release setup](UPDATES.md) for organization signing credentials,
 notarization, protected GitHub setup, independent release tags, recovery, and the
 optional managed-local-server design.
+
+### Getting ready and everyday use
+
+The Getting ready checklist separates microphone permission, Accessibility permission,
+shortcut registration, and speech model discovery. Recording from the window is a
+useful test without Accessibility; dictating into another app requires its text field
+to be focused before using the global shortcut. Permission status refreshes when you
+return from System Settings.
+
+Settings are grouped into General (updates and retention), Speech & text (engine and
+voice formatting), Shortcuts & permissions, and Advanced (server/storage details).
+Edits remain local drafts until **Save settings**; the footer shows unsaved changes.
+History shows **Off** in its tab when disabled. Enabling history explicitly saves
+settings; text history and local audio retention are independent.
+
+New installations start with Verbatim output. **Clean up** removes fillers and fixes
+punctuation; **Rewrite** also applies tone and instructions. Both require a text
+processor selected in the preset. Recording stops with an actionable configuration
+message rather than silently ignoring the selected output mode. Preferred spellings
+are vocabulary hints, not guaranteed recognition replacements.
+
+For the bundled engine, **Install / check English speech** explicitly permits Apple
+asset downloads, restarts the engine, and sends one second of generated silence to
+install and verify the English speech model. This does not record microphone audio,
+paste text, or create history. Setup displays its current stage and can be canceled;
+Apple controls the download and does not expose percentage progress through this
+released runtime. Other languages may require separate assets at first use. External
+servers must enable `download_assets` on the server host themselves.

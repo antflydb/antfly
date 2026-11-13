@@ -64,6 +64,17 @@ public actor AntflyClient {
   public func models() async throws -> String {
     String(decoding: try await json("ai/v1/models", method: "GET"), as: UTF8.self)
   }
+  /// Exercise the released engine's asset installation path without microphone audio.
+  /// Call only after the user opts into downloads in the managed engine configuration.
+  public func checkAppleSpeechAssets(language: String = "en-US") async throws {
+    try Task.checkCancellation()
+    var probe = Preset(id: "asset-check", name: "Language setup", style: "verbatim")
+    probe.model = "transcribers/apple-speech"
+    probe.language = language
+    let silence = try PCMRecording(samples: Data(count: 16000 * 4), sampleRate: 16000).wav()
+    _ = try await dictate(audio: silence, preset: probe, dictionary: [], progress: { _ in })
+    try Task.checkCancellation()
+  }
   private func dictationBody(preset: Preset, dictionary: [String]) -> [String: Any] {
     var body: [String: Any] = [
       "model": preset.model, "style": preset.requestStyle,

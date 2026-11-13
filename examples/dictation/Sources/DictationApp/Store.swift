@@ -12,6 +12,7 @@ import SwiftUI
   private var runtimeModeTask: Task<Void, Never>?
   private var modelSetupTask: Task<Void, Never>?
   @Published private(set) var settingUpModel = false
+  @Published private(set) var appleSetupStatus = ""
   @Published var history: [HistoryEntry] = []
   @Published var state = RecordingState.idle
   @Published var phase = DictationPhase.idle { didSet { updateOverlay() } }
@@ -28,6 +29,13 @@ import SwiftUI
   @Published var searchText = ""
   @Published var searchResult = ""
   @Published var token = "" { didSet { if !loadingCredential { credentialEdited = true } } }
+  private var savedSettings = Data()
+  var hasUnsavedSettings: Bool { encodedSettings() != savedSettings || credentialEdited }
+  private func encodedSettings() -> Data {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    return (try? encoder.encode(config)) ?? Data()
+  }
   private var loadingCredential = false
   private var credentialOrigin: String?
   private var credentialEdited = false
@@ -252,6 +260,7 @@ import SwiftUI
         await self.restoreHistoryDestinations(legacyDestination: legacyDestination, epoch: epoch)
       }
     }
+    savedSettings = encodedSettings()
     if registerHotkey, !config.usesManagedRuntime { loadCredential(for: config.server) }
     hotkey?.changed = { [weak self] down in self?.shortcut(down: down) }
     hotkey?.interrupted = { [weak self] in if self?.state != .idle { self?.cancel() } }
@@ -442,6 +451,7 @@ import SwiftUI
       }
     }
     if !config.retainAudio { try removeAudio() }
+    savedSettings = encodedSettings()
     return shortcutIssue
   }
   func save() {
@@ -455,9 +465,22 @@ import SwiftUI
   private func perform(_ body: () throws -> Void) {
     do { try body() } catch { message = error.localizedDescription }
   }
+  @Published private(set) var microphoneAllowed =
+    AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+  @Published private(set) var accessibilityAllowed = false
+  var shortcutReady: Bool { registered == config.effectiveShortcut && hotkey?.isAvailable == true }
+  func refreshPermissions() {
+    microphoneAllowed = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    accessibilityAllowed = keyboardAccess()
+    refreshShortcutAccess()
+  }
+  func openMicrophoneSettings() {
+    settingsOpener("com.apple.preference.security?Privacy_Microphone")
+  }
   func requestMicrophone() {
     Task {
       let allowed = await AVCaptureDevice.requestAccess(for: .audio)
+      microphoneAllowed = allowed
       message =
         allowed ? "Microphone ready." : "Microphone access denied. Enable it in System Settings."
     }
@@ -488,6 +511,7 @@ import SwiftUI
       let run = generation
       target = InsertionTarget.capture()
       let preset = snapshot.preset(for: target?.bundleID)
+      try preset.outputMode.validateProcessor(preset.cleanupModel)
       var effective = try ProcessingPlan(
         preset: preset, model: ModelCatalog(data: models).transcriber(preset.model))
       if snapshot.usesPressEnterCommand && effective.incrementalCleanup {
@@ -939,9 +963,11 @@ import SwiftUI
         guard !terminating else { throw CancellationError() }
         _ = try persistSettings()
       } catch is CancellationError {
+        appleSetupStatus = "Setup canceled. Retry when ready."
         message = "Model setup canceled."
         if !terminating, config.usesManagedRuntime { runtime.start() }
       } catch {
+        appleSetupStatus = "Setup needs attention. Retry Apple speech setup."
         message = error.localizedDescription
       }
     }
@@ -958,7 +984,9 @@ import SwiftUI
         self.config.presets[index].automaticallySelectLocalTranscriber = false
         self.config.presets[index].model = "transcribers/whisper"
         self.config.presets[index].transcriberRoute = .gateway
-        self.config.presets[index].cleanupModel = ""
+        if self.config.presets[index].cleanupModel.isEmpty {
+          self.config.presets[index].outputMode = .verbatim
+        }
       }
       self.message = "Whisper selected. The local engine is restarting."
     }
@@ -970,15 +998,31 @@ import SwiftUI
       return
     }
     runModelSetup {
+      self.appleSetupStatus = "Starting Apple speech…"
       try await self.runtime.enableAppleAssets()
+      let deadline = ContinuousClock.now.advanced(by: .seconds(90))
+      while !self.runtime.ready {
+        try Task.checkCancellation()
+        guard ContinuousClock.now < deadline else {
+          throw DictationError.invalid(
+            "The local engine did not start. Retry setup or open the engine log.")
+        }
+        try await Task.sleep(for: .milliseconds(250))
+      }
+      self.appleSetupStatus = "Installing and checking English speech assets…"
+      self.message = "Apple manages this download. Keep the app open; this may take a few minutes."
+      try await self.client(self.config).checkAppleSpeechAssets()
       try Task.checkCancellation()
+      self.appleSetupStatus = "English speech is ready"
       for index in self.config.presets.indices {
         self.config.presets[index].automaticallySelectLocalTranscriber = false
         self.config.presets[index].model = "transcribers/apple-speech"
         self.config.presets[index].transcriberRoute = .gateway
-        self.config.presets[index].cleanupModel = ""
+        if self.config.presets[index].cleanupModel.isEmpty {
+          self.config.presets[index].outputMode = .verbatim
+        }
       }
-      self.message = "Apple speech selected. The engine will report asset and locale readiness."
+      self.message = "English speech is installed and ready. Try a test dictation."
     }
   }
   func connectionChanged() {
@@ -989,6 +1033,19 @@ import SwiftUI
     credentialOrigin = nil
     credentialEdited = false
     scheduleDiscovery(debounce: true, loadCredentials: true)
+  }
+  var activePresetSummary: String {
+    let preset = config.preset(for: nil)
+    let speech =
+      preset.model.contains("apple-speech")
+      ? "Apple speech"
+      : preset.model.contains("whisper") ? "Whisper" : "Selected speech model"
+    let output =
+      preset.outputMode == .verbatim
+      ? "Verbatim"
+      : preset.runsCleanup ? preset.outputMode.label : "Text processor needed"
+    return speech + " · " + output + " · "
+      + (config.autoPaste ? "Paste automatically" : "Copy from Transcript")
   }
   func processingDescription(_ preset: Preset) -> String {
     do {

@@ -26,6 +26,34 @@ final class FixtureProtocol: URLProtocol, @unchecked Sendable {
 }
 
 @Suite(.serialized) struct ClientTests {
+  @Test func appleAssetCheckUsesGeneratedSilenceWithoutCleanup() async throws {
+    FixtureProtocol.reply = { request in
+      let body = try fixtureBody(request)
+      let length = body.subdata(in: 8..<16).withUnsafeBytes {
+        $0.loadUnaligned(as: UInt64.self).littleEndian
+      }
+      let metadata =
+        try JSONSerialization.jsonObject(with: body.subdata(in: 40..<(40 + Int(length))))
+        as! [String: Any]
+      #expect(metadata["model"] as? String == "transcribers/apple-speech")
+      #expect(metadata["style"] as? String == "verbatim")
+      #expect(metadata["language"] as? String == "en-US")
+      #expect(metadata["cleanup_model"] == nil)
+      #expect(body.suffix(32000).allSatisfy { $0 == 0 })
+      return (
+        200, "text/event-stream",
+        "data: {\"type\":\"dictation.transcript\",\"transcript\":{\"text\":\"\"}}\n\ndata: {\"type\":\"dictation.completed\",\"text\":\"\"}\n\ndata: [DONE]\n\n"
+      )
+    }
+    try await client().checkAppleSpeechAssets()
+  }
+  @Test func appleAssetCheckDoesNotHideInstallationFailure() async throws {
+    FixtureProtocol.reply = { _ in
+      (503, "application/json", "{\"error\":\"AppleSpeechAssetsMissing\"}")
+    }
+    await #expect(throws: (any Error).self) { try await client().checkAppleSpeechAssets() }
+  }
+
   @Test func managedPasswordUsesBasicAuthWithoutForwardingExternalBearer() async throws {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [FixtureProtocol.self]

@@ -111,6 +111,7 @@ struct MenuContent: View {
 struct SettingsView: View {
   @ObservedObject var store: Store
   @ObservedObject var updates: AppUpdates
+  @StateObject private var navigation = SettingsNavigation()
   var body: some View {
     VStack(alignment: .leading) {
       HStack {
@@ -124,11 +125,27 @@ struct SettingsView: View {
         Spacer()
         Text(store.phase.label)
       }
+      SetupChecklist(store: store, runtime: store.runtime)
+      HStack {
+        Picker("Preset", selection: $store.config.selectedPreset) {
+          ForEach(store.config.presets) { Text($0.name).tag($0.id) }
+        }.frame(maxWidth: 240).disabled(store.state != .idle || store.working)
+        Text("Shortcut: " + store.config.effectiveShortcut.label).font(.headline)
+        Spacer()
+        Button(store.state == .recording ? "Finish dictation" : "Test dictation") {
+          if store.state == .recording { store.finish() } else { store.start() }
+        }.disabled(store.state == .processing || store.working)
+      }
+      Text(store.activePresetSummary).font(.caption).foregroundStyle(.secondary)
+      Text(
+        "Testing here keeps the result available in Transcript. To paste elsewhere, focus a text field and use your shortcut."
+      )
+      .font(.caption).foregroundStyle(.secondary)
       TabView {
         settings.tabItem { Text("Settings") }.tag(0)
         presets.tabItem { Text("Presets & dictionary") }.tag(1)
         transcript.tabItem { Text("Transcript") }.tag(2)
-        history.tabItem { Text("History") }.tag(3)
+        history.tabItem { Text(store.config.retainHistory ? "History" : "History · Off") }.tag(3)
       }
       if let error = store.settingsLoadError {
         Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
@@ -136,6 +153,8 @@ struct SettingsView: View {
       Text(store.message).font(.callout).textSelection(.enabled).frame(
         maxWidth: .infinity, alignment: .leading)
       HStack {
+        Text(store.hasUnsavedSettings ? "Unsaved changes" : "Settings saved").font(.caption)
+          .foregroundStyle(.secondary)
         Button("Save settings") { store.save() }.disabled(
           store.state != .idle || store.working || store.capturingShortcut)
         Button("Import JSON…") { store.importSettings() }.disabled(
@@ -151,93 +170,113 @@ struct SettingsView: View {
   var settings: some View {
     ScrollView {
       Form {
-        Section("Connection — audio is processed on this server") {
-          Picker(
-            "Processing location",
-            selection: Binding(
-              get: { store.config.connectionMode ?? .external },
-              set: { store.config.connectionMode = $0 })
-          ) {
-            Text("On this Mac (bundled Antfly)").tag(ConnectionMode.managed)
-            Text("External Antfly server").tag(ConnectionMode.external)
-          }.disabled(store.state != .idle || store.working || store.historyWorking)
-            .onChange(of: store.config.connectionMode) { _, _ in store.runtimeModeChanged() }
-          if store.config.usesManagedRuntime {
-            RuntimeControls(store: store, runtime: store.runtime)
-          } else {
-            TextField("Server origin", text: $store.config.server).onChange(of: store.config.server)
-            {
-              _, _ in store.connectionChanged()
+        Picker("Settings", selection: $navigation.page) {
+          ForEach(["General", "Speech & text", "Shortcuts & permissions", "Advanced"], id: \.self) {
+            Text($0).tag($0)
+          }
+        }.pickerStyle(.segmented)
+        if navigation.page == "Speech & text" || navigation.page == "Advanced" {
+          Section("Speech engine — where your audio is processed") {
+            Picker(
+              "Processing location",
+              selection: Binding(
+                get: { store.config.connectionMode ?? .external },
+                set: { store.config.connectionMode = $0 })
+            ) {
+              Text("On this Mac (bundled Antfly)").tag(ConnectionMode.managed)
+              Text("External Antfly server").tag(ConnectionMode.external)
+            }.disabled(store.state != .idle || store.working || store.historyWorking)
+              .onChange(of: store.config.connectionMode) { _, _ in store.runtimeModeChanged() }
+            if store.config.usesManagedRuntime {
+              RuntimeControls(store: store, runtime: store.runtime)
+            } else {
+              TextField("Server origin", text: $store.config.server).onChange(
+                of: store.config.server
+              ) {
+                _, _ in store.connectionChanged()
+              }
+              SecureField("Bearer token (Keychain only)", text: $store.token)
             }
-            SecureField("Bearer token (Keychain only)", text: $store.token)
+            if navigation.page == "Advanced" {
+              HStack {
+                Button("Discover models") { store.discover() }
+                Button("Create storage table") { store.setup() }
+              }
+              Toggle(
+                "Allow parallel recognition and cleanup",
+                isOn: Binding(
+                  get: { store.config.concurrentRequests == 2 },
+                  set: { store.config.concurrentRequests = $0 ? 2 : 1 }))
+              Text(
+                "Requires at least two inference slots on the server. Leave off for a single-slot local server."
+              ).font(.caption).foregroundStyle(.secondary)
+              TextField("Antfly table", text: $store.config.table)
+              TextField("Settings profile", text: $store.config.profile)
+              HStack {
+                Button("Publish settings snapshot") { store.publish() }
+                Button("Replace settings from Antfly") { store.download() }
+              }
+              Text(
+                "Snapshots use explicit publish/replace. Local changes win until you replace them; publishing overwrites the selected remote profile. Credentials are never exported."
+              ).font(.caption).foregroundStyle(.secondary)
+            }
           }
-          HStack {
-            Button("Discover models") { store.discover() }
-            Button("Create storage table") { store.setup() }
-          }
-          Toggle(
-            "Allow parallel recognition and cleanup",
-            isOn: Binding(
-              get: { store.config.concurrentRequests == 2 },
-              set: { store.config.concurrentRequests = $0 ? 2 : 1 }))
-          Text(
-            "Requires at least two inference slots on the server. Leave off for a single-slot local server."
-          ).font(.caption).foregroundStyle(.secondary)
-          TextField("Antfly table", text: $store.config.table)
-          TextField("Settings profile", text: $store.config.profile)
-          HStack {
-            Button("Publish settings snapshot") { store.publish() }
-            Button("Replace settings from Antfly") { store.download() }
-          }
-          Text(
-            "Snapshots use explicit publish/replace. Local changes win until you replace them; publishing overwrites the selected remote profile. Credentials are never exported."
-          ).font(.caption).foregroundStyle(.secondary)
         }
-        Section("Microphone & shortcut") {
-          Picker("Microphone", selection: $store.config.microphoneID) {
-            Text("System default").tag("")
-            ForEach(Microphone.devices, id: \.uniqueID) { Text($0.localizedName).tag($0.uniqueID) }
+        if navigation.page == "Shortcuts & permissions" {
+          Section("Microphone & shortcut") {
+            Picker("Microphone", selection: $store.config.microphoneID) {
+              Text("System default").tag("")
+              ForEach(Microphone.devices, id: \.uniqueID) {
+                Text($0.localizedName).tag($0.uniqueID)
+              }
+            }
+            HStack {
+              Button("Allow microphone") { store.requestMicrophone() }
+            }
+            ShortcutSettings(store: store)
+            Toggle("Press to toggle recording instead of hold to talk", isOn: $store.config.toggle)
+            Toggle("Paste into the original focused text field", isOn: $store.config.autoPaste)
           }
-          HStack {
-            Button("Allow microphone") { store.requestMicrophone() }
+        }
+        if navigation.page == "Speech & text" {
+          Section("Voice formatting") {
+            Toggle(
+              "Spoken line and paragraph breaks",
+              isOn: Binding(
+                get: { store.config.usesVoiceFormatting },
+                set: { store.config.voiceFormatting = $0 })
+            )
+            Text(
+              "Say new line, next line, line break, skip a line, or new paragraph. Works without a cleanup model. Quote a phrase to keep it literal. For fully literal dictation, choose Verbatim and turn this off."
+            )
+            .font(.caption).foregroundStyle(.secondary)
+            Toggle(
+              "Add spaces around inserted dictation",
+              isOn: Binding(
+                get: { store.config.usesSmartSpacing }, set: { store.config.smartSpacing = $0 }))
+            Toggle(
+              "Allow a trailing ‘press enter’ voice command",
+              isOn: Binding(
+                get: { store.config.usesPressEnterCommand },
+                set: { store.config.pressEnterCommand = $0 }))
+            Text(
+              "Off by default. Ending dictation with press enter can send a message or submit a prompt. Enter is sent only after insertion is confirmed in the original text field."
+            )
+            .font(.caption).foregroundStyle(.secondary)
           }
-          ShortcutSettings(store: store)
-          Toggle("Press to toggle recording instead of hold to talk", isOn: $store.config.toggle)
-          Toggle("Paste into the original focused text field", isOn: $store.config.autoPaste)
         }
-        Section("Voice formatting") {
-          Toggle(
-            "Spoken line and paragraph breaks",
-            isOn: Binding(
-              get: { store.config.usesVoiceFormatting }, set: { store.config.voiceFormatting = $0 })
-          )
-          Text(
-            "Say new line, next line, line break, skip a line, or new paragraph. Works without a cleanup model. Quote a phrase to keep it literal. For fully literal dictation, choose Verbatim and turn this off."
-          )
-          .font(.caption).foregroundStyle(.secondary)
-          Toggle(
-            "Add spaces around inserted dictation",
-            isOn: Binding(
-              get: { store.config.usesSmartSpacing }, set: { store.config.smartSpacing = $0 }))
-          Toggle(
-            "Allow a trailing ‘press enter’ voice command",
-            isOn: Binding(
-              get: { store.config.usesPressEnterCommand },
-              set: { store.config.pressEnterCommand = $0 }))
-          Text(
-            "Off by default. Ending dictation with press enter can send a message or submit a prompt. Enter is sent only after insertion is confirmed in the original text field."
-          )
-          .font(.caption).foregroundStyle(.secondary)
+        if navigation.page == "General" {
+          UpdateSettings(updates: updates)
+          Section("Retention") {
+            Toggle(
+              "Save transcript history locally and in Antfly", isOn: $store.config.retainHistory)
+            Toggle("Keep last audio recording locally", isOn: $store.config.retainAudio)
+            Text(
+              "History is off by default. Audio is never stored in Antfly. Turning retention off removes local retained data when settings are saved; remote history requires explicit deletion."
+            ).font(.caption)
+          }
         }
-        UpdateSettings(updates: updates)
-        Section("Retention") {
-          Toggle("Save transcript history locally and in Antfly", isOn: $store.config.retainHistory)
-          Toggle("Keep last audio recording locally", isOn: $store.config.retainAudio)
-          Text(
-            "History is off by default. Audio is never stored in Antfly. Turning retention off removes local retained data when settings are saved; remote history requires explicit deletion."
-          ).font(.caption)
-        }
-        if !store.discovery.isEmpty {
+        if navigation.page == "Advanced", !store.discovery.isEmpty {
           Section("Server model discovery") {
             Text(store.discovery).font(.system(.caption, design: .monospaced)).textSelection(
               .enabled)
@@ -252,11 +291,11 @@ struct SettingsView: View {
         Picker("Default preset", selection: $store.config.selectedPreset) {
           ForEach(store.config.presets) { Text($0.name).tag($0.id) }
         }
-        TextField(
-          "Global dictionary (comma-separated)",
-          text: Binding(
-            get: { store.config.dictionary.joined(separator: ", ") },
-            set: { store.config.dictionary = terms($0) }))
+        DictionaryEditor(title: "Preferred spellings", words: $store.config.dictionary)
+        Text(
+          "Preferred spellings guide text cleanup. Recognition support depends on your speech engine; these are hints, not guaranteed replacements."
+        )
+        .font(.caption).foregroundStyle(.secondary)
         ForEach($store.config.presets) { $preset in
           Section(preset.name) {
             TextField("Name", text: $preset.name)
@@ -266,6 +305,24 @@ struct SettingsView: View {
             ) {
               ForEach(DictationMode.allCases, id: \.self) { Text($0.label).tag($0) }
             }.pickerStyle(.segmented)
+            Text(preset.outputMode.description).font(.caption)
+            if preset.outputMode != .verbatim {
+              TextField("Text processing model", text: $preset.cleanupModel)
+              Menu("Choose text processor") {
+                ForEach(preset.cleanupChoices(from: store.models)) { model in
+                  Button(model.id) { preset.cleanupModel = model.id }
+                }
+              }
+              if !preset.runsCleanup {
+                Label(
+                  "Choose a text processor to use " + preset.outputMode.label + ".",
+                  systemImage: "exclamationmark.triangle"
+                )
+                .foregroundStyle(.orange)
+                Button("Find available text processors") { store.discover() }
+                Button("Use Verbatim instead") { preset.outputMode = .verbatim }
+              }
+            }
             Text(store.processingDescription(preset)).font(.caption).foregroundStyle(.secondary)
             if preset.outputMode == .rewrite {
               Picker(
@@ -282,11 +339,8 @@ struct SettingsView: View {
             }
             TextField("Destination context", text: $preset.context)
             TextField("Language (empty = model default)", text: $preset.language)
-            TextField(
-              "Dictionary",
-              text: Binding(
-                get: { preset.dictionary.joined(separator: ", ") },
-                set: { preset.dictionary = terms($0) }))
+            DictionaryEditor(
+              title: "Preferred spellings for this preset", words: $preset.dictionary)
             TextField(
               "App bundle IDs (automatic selection)",
               text: Binding(
@@ -325,13 +379,6 @@ struct SettingsView: View {
                   }
                 }
               }.disabled(store.models.isEmpty)
-              TextField("Cleanup generator (empty = recognition only)", text: $preset.cleanupModel)
-              Menu("Choose discovered cleanup generator") {
-                Button("No cleanup") { preset.cleanupModel = "" }
-                ForEach(preset.cleanupChoices(from: store.models)) { model in
-                  Button(model.id) { preset.cleanupModel = model.id }
-                }
-              }.disabled(preset.outputMode == .verbatim)
               if !preset.usesNamedTranscriber {
                 Text(
                   "Raw runtime transcribers use raw cleanup models and recorded-clip processing. Choose a named transcriber for shared incremental cleanup."
@@ -396,6 +443,21 @@ struct SettingsView: View {
   }
   var history: some View {
     VStack(alignment: .leading) {
+      if !store.config.retainHistory {
+        Label("History is off", systemImage: "clock.badge.xmark").font(.headline)
+        Text(
+          "New dictations aren’t saved in this app or uploaded to Antfly. Any existing entries below are from earlier sessions."
+        )
+        Button("Enable history & save settings") {
+          store.config.retainHistory = true
+          store.save()
+        }
+        .disabled(store.state != .idle || store.working)
+      } else {
+        Text(
+          "Transcript history is on. Audio is stored separately only if enabled in General settings."
+        ).font(.caption)
+      }
       if store.pendingHistoryDeletions > 0 {
         Text(
           "\(store.pendingHistoryDeletions) transcript deletion(s) pending. Retry deletion to finish all original destinations."
@@ -447,17 +509,19 @@ private struct RuntimeControls: View {
   @ObservedObject var runtime: ManagedRuntime
   var body: some View {
     Text(runtime.status).font(.callout)
+    if store.settingUpModel { ProgressView().controlSize(.small) }
+    if !store.appleSetupStatus.isEmpty { Text(store.appleSetupStatus).font(.callout) }
     HStack {
       Button("Start / retry local engine") { runtime.start() }.disabled(
         runtime.busy || runtime.ready)
       Button("Download Whisper Tiny…") { store.installLocalWhisper() }.disabled(
         !runtime.ready || runtime.busy)
-      Button("Use Apple speech") { store.useLocalApple() }.disabled(
+      Button("Install / check English speech…") { store.useLocalApple() }.disabled(
         !runtime.ready || runtime.busy || !runtime.supportsAppleSpeech)
       Button("Open engine log") { NSWorkspace.shared.open(runtime.logURL) }
     }
     Text(
-      "Apple speech is selected automatically when available. Otherwise, download Whisper Tiny. Apple speech requires macOS 26+ and installed language assets. No cleanup model is selected automatically."
+      "Apple speech needs macOS 26+ and language assets. Install / check downloads missing English assets from Apple and verifies speech before selecting it. Whisper is an alternative. Text cleanup is configured separately in Presets."
     ).font(.caption)
   }
 }
@@ -465,4 +529,8 @@ private struct RuntimeControls: View {
 private struct RuntimeSummary: View {
   @ObservedObject var runtime: ManagedRuntime
   var body: some View { Text(runtime.status).font(.caption).foregroundStyle(.secondary) }
+}
+
+@MainActor private final class SettingsNavigation: ObservableObject {
+  @Published var page = "General"
 }

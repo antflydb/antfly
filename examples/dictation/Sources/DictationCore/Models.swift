@@ -108,8 +108,8 @@ public struct Configuration: Codable, Equatable, Sendable {
   public var selectedPreset = "slack"
   public var dictionary = ["Antfly", "Colony"]
   public var presets: [Preset] = [
-    Preset(id: "slack", name: "Slack", context: "a Slack message"),
-    Preset(id: "email", name: "Email", style: "formal", context: "an email"),
+    Preset(id: "slack", name: "Messages", context: "a message"),
+    Preset(id: "email", name: "Writing", style: "formal", context: "an email"),
     Preset(id: "verbatim", name: "Verbatim", style: "verbatim"),
   ]
   public init() {}
