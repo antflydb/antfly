@@ -657,6 +657,13 @@ pub const ModelManifest = struct {
             self.hasCapability("lightonocr3");
     }
 
+    /// Readers whose vision and text decoder execute through generation,
+    /// shared by HTTP, embedded reads and the standalone reader command.
+    pub fn isGenerativeReader(self: *const ModelManifest) bool {
+        return (self.isLightOnOcr3() and self.hasTask("read")) or
+            (self.model_type == .generator and self.isQwen3VlGgufBundle() and !self.isQwen3VlReranker());
+    }
+
     pub fn hasTask(self: *const ModelManifest, task: []const u8) bool {
         if (!self.hasSupportedGlinerRuntime()) return false;
         for (self.tasks) |candidate| {
