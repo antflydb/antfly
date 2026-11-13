@@ -621,7 +621,10 @@ visible saving state. The final commit is drained rather than canceled halfway
 through; the app applies its known disk outcome before admitting another change.
 Quitting waits for these writes and their resulting retention work. Exports use a
 separate owned worker, so slow export storage does not hold up preference writes or
-recording admission. Import selects credentials for the imported origin, and changing
+recording admission. Import stages credentials for the imported origin and adopts them only after the
+settings write succeeds; failures preserve the active credential editor and unsaved
+edits. Replacing an external origin invalidates and refreshes model discovery even
+when the connection settings are not visible. Changing
 processing location reconciles the engine independently of the visible settings tab.
 
 Startup recovery only removes regular, UUID-named `.dictation-settings-*.tmp` files

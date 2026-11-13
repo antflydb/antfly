@@ -227,6 +227,41 @@ private func persistenceDirectory() throws -> URL {
     await store.prepareToQuit()
   }
 
+  @Test(arguments: [false, true]) @MainActor
+  func failedImportPreservesActiveCredentialAndUnsavedEdit(failCredentialWrite: Bool) async throws {
+    let root = try persistenceDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    var original = Configuration()
+    original.connectionMode = .external
+    original.server = "https://old.example"
+    let settings = root.appendingPathComponent("settings.json")
+    try JSONEncoder().encode(original).write(to: settings)
+    let writer = AtomicFileWriter(
+      ownedDirectory: root,
+      beforeWrite: {
+        if !failCredentialWrite { throw DictationError.invalid("Disk write failed") }
+      })
+    let store = Store(
+      directory: root, registerHotkey: false, settingsWriter: writer,
+      credentialReader: { _ in "imported-saved-token" },
+      credentialWriter: { _, _ in
+        if failCredentialWrite { throw DictationError.invalid("Keychain write failed") }
+      })
+    store.token = "original-unsaved-token"
+    var imported = original
+    imported.server = "https://new.example"
+    let file = root.appendingPathComponent("import.json")
+    try JSONEncoder().encode(imported).write(to: file)
+    store.importConfiguration(from: file)
+    await store.settingsTask?.value
+    #expect(store.config == original)
+    #expect(store.token == "original-unsaved-token" && store.hasUnsavedSettings)
+    #expect(try Configuration.decode(Data(contentsOf: settings)) == original)
+    #expect(
+      store.message.contains(failCredentialWrite ? "Keychain write failed" : "Disk write failed"))
+    await store.prepareToQuit()
+  }
+
   @Test(.timeLimit(.minutes(1))) @MainActor
   func completedInstallationFinishesItsOwnedSaveBeforeReleasingSetup() async throws {
     let root = try persistenceDirectory()

@@ -503,7 +503,9 @@ struct PreparedModelSetup: Sendable {
       }
     } catch { message = error.localizedDescription }
   }
-  private func persistSettings(_ proposed: Configuration? = nil, reservation: UUID? = nil)
+  private func persistSettings(
+    _ proposed: Configuration? = nil, reservation: UUID? = nil, useSavedCredential: Bool = false
+  )
     async throws -> String?
   {
     guard !terminating || reservation != nil else { throw CancellationError() }
@@ -513,7 +515,9 @@ struct PreparedModelSetup: Sendable {
       throw DictationError.invalid("The settings write reservation expired.")
     }
     let candidate = proposed ?? config
-    let task = Task { [self] in try await applySettingsCommit(candidate) }
+    let task = Task { [self] in
+      try await applySettingsCommit(candidate, useSavedCredential: useSavedCredential)
+    }
     settingsCommitTask = task
     defer {
       settingsCommitTask = nil
@@ -522,7 +526,9 @@ struct PreparedModelSetup: Sendable {
     // This owned task is not canceled mid-write: its disk outcome must be applied.
     return try await task.value
   }
-  private func applySettingsCommit(_ proposed: Configuration) async throws -> String? {
+  private func applySettingsCommit(_ proposed: Configuration, useSavedCredential: Bool) async throws
+    -> String?
+  {
     await settingsCleanupTask?.value
     let candidate = try proposed.validated()
     let recoveringSettings = settingsLoadError != nil
@@ -533,19 +539,35 @@ struct PreparedModelSetup: Sendable {
       recoveredHistory = HistoryArchive.bounded(
         try JSONDecoder().decode([HistoryEntry].self, from: Data(contentsOf: historyFile)))
     }
-    if !candidate.usesManagedRuntime {
-      if credentialOrigin != candidate.server && !credentialEdited {
-        loadCredential(for: candidate.server)
-      }
-      try credentialWriter(token, candidate.server)
+    // Stage destination credentials without replacing the active editor state.
+    // Imports always use the destination's saved credential, never an unsaved edit.
+    let candidateToken: String? =
+      candidate.usesManagedRuntime
+      ? nil
+      : (useSavedCredential || (credentialOrigin != candidate.server && !credentialEdited)
+        ? credentialReader(candidate.server) : token)
+    if let candidateToken { try credentialWriter(candidateToken, candidate.server) }
+    // Publish to disk before activating either configuration or credential state.
+    try await settingsWriter.write(JSONEncoder().encode(candidate), to: settingsFile)
+    let previousManagedMode = config.usesManagedRuntime
+    let previousServer = config.effectiveServer
+    config = candidate
+    if let candidateToken {
+      loadingCredential = true
+      token = candidateToken
+      loadingCredential = false
       credentialOrigin = candidate.server
       credentialEdited = false
     }
-    // Publish to disk before activating the candidate or applying retention changes.
-    try await settingsWriter.write(JSONEncoder().encode(candidate), to: settingsFile)
-    let previousManagedMode = config.usesManagedRuntime
-    config = candidate
-    if previousManagedMode != candidate.usesManagedRuntime && !terminating { runtimeModeChanged() }
+    if !terminating {
+      if previousManagedMode != candidate.usesManagedRuntime {
+        runtimeModeChanged()
+      } else if previousServer != candidate.effectiveServer {
+        // Imports can replace an external origin without a mounted connection view.
+        invalidateDiscovery()
+        refreshModels()
+      }
+    }
     savedConfiguration = candidate
     updateSettingsDirtyState()
     if let recoveredHistory {
@@ -1873,10 +1895,7 @@ struct PreparedModelSetup: Sendable {
   func importConfiguration(from file: URL) {
     startSettingsTask { [self] owner in
       let imported = try await settingsWriter.readConfiguration(at: file)
-      // Imported settings never carry credentials. Select the destination's
-      // saved credential even if the previous origin had an unsaved token edit.
-      if !imported.usesManagedRuntime { loadCredential(for: imported.server) }
-      _ = try await persistSettings(imported, reservation: owner)
+      _ = try await persistSettings(imported, reservation: owner, useSavedCredential: true)
       message = "Settings imported."
     }
   }

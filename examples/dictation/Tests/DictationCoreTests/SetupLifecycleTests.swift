@@ -36,12 +36,60 @@ private final class SetupDiscoveryProtocol: URLProtocol, @unchecked Sendable {
   override func stopLoading() {}
 }
 
+private final class SetupOriginRecorder: @unchecked Sendable {
+  private let lock = NSLock()
+  private var origins: [String] = []
+  func append(_ origin: String) { lock.withLock { origins.append(origin) } }
+  var values: [String] { lock.withLock { origins } }
+}
+
 @Suite(.serialized) struct SetupLifecycleTests {
   private func directory() throws -> URL {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     return root
   }
+  @Test @MainActor func importedExternalOriginRefreshesCapabilitiesWithoutMountedConnectionView()
+    async throws
+  {
+    let root = try directory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let settings = URLSessionConfiguration.ephemeral
+    settings.protocolClasses = [SetupDiscoveryProtocol.self]
+    let requestedOrigins = SetupOriginRecorder()
+    let store = Store(
+      directory: root, registerHotkey: false,
+      clientFactory: { configuration in
+        requestedOrigins.append(configuration.effectiveServer)
+        return try AntflyClient(
+          configuration: configuration, session: URLSession(configuration: settings))
+      }, credentialReader: { _ in "" }, credentialWriter: { _, _ in })
+    store.config.connectionMode = .external
+    store.config.server = "https://old.example"
+    SetupDiscoveryProtocol.response = (
+      200,
+      #"{"data":[{"id":"transcribers/old","task":"transcribe","availability":"ready"}]}"#
+    )
+    store.checkEngine()
+    await store.discoveryTask?.value
+    #expect(store.models.first?.id == "transcribers/old")
+    var imported = store.config
+    imported.server = "https://new.example"
+    let file = root.appendingPathComponent("import.json")
+    try JSONEncoder().encode(imported).write(to: file)
+    SetupDiscoveryProtocol.response = (
+      200,
+      #"{"data":[{"id":"transcribers/new","task":"transcribe","availability":"ready"}]}"#
+    )
+    store.importConfiguration(from: file)
+    await store.settingsTask?.value
+    await store.discoveryTask?.value
+    #expect(requestedOrigins.values == ["https://old.example", "https://new.example"])
+    #expect(store.models.map(\.id) == ["transcribers/new"])
+    #expect(store.discoveryState == .current)
+    await store.prepareToQuit()
+  }
+
   @Test @MainActor func explicitCheckShowsFailureClearsStaleModelsAndRecovers() async throws {
     let root = try directory()
     defer { try? FileManager.default.removeItem(at: root) }
