@@ -179,6 +179,24 @@ pub const Handle = struct {
     namespace_runtimes: std.StringHashMapUnmanaged(NamespaceRuntime) = .empty,
     root_namespace_alias: ?[]u8 = null,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    /// Guards `deinit` against running twice on the same `Handle`. A caller
+    /// that explicitly closes a handle mid-scope and also leaves an
+    /// `errdefer`/`defer` registered earlier in the same scope (a common,
+    /// easy-to-hit pattern: see `crash_consistency_test.zig`'s `DbHandle`)
+    /// will invoke `deinit` a second time whenever anything *later* in that
+    /// scope returns an error. Before this flag, the second call read
+    /// `self.engine` and every other field out of memory `deinit` had
+    /// already set to `undefined` (poisoned to a repeating bit pattern in
+    /// safety-checked builds), so the switch below could take the wrong
+    /// branch entirely and dereference garbage -- observed as a
+    /// segmentation fault inside `bridge.zig`'s hashmap iterator, reached
+    /// through the `.bridge_lsm_container` arm despite every real handle in
+    /// that failure actually being `.native_single_file`. `deinit` only
+    /// needs to check this field, not reset it on exit: it is set `true`
+    /// *after* `self.* = undefined`, so it is the one field a stale second
+    /// call can still read correctly, and `undefined` already guarantees
+    /// nothing else in `self` is safe to touch once it is set.
+    closed: bool = false,
 
     /// Scope is a trusted authorization boundary chosen by the embedding host.
     /// The returned adapter borrows this handle and the key provider.
@@ -231,6 +249,11 @@ pub const Handle = struct {
     }
 
     pub fn deinit(self: *Handle) void {
+        // Idempotent: see `closed`'s doc comment. Must be the very first
+        // thing this function does, before anything below reads another
+        // field -- a second call after a prior `deinit` has nothing else
+        // in `self` it can safely read.
+        if (self.closed) return;
         switch (self.engine) {
             .bridge_lsm_container => {
                 if (comptime builtin.os.tag == .freestanding) {
@@ -278,6 +301,7 @@ pub const Handle = struct {
             },
         }
         self.* = undefined;
+        self.closed = true;
     }
 
     pub fn configureDbOpenOptions(self: *Handle, opts: *db_mod.OpenOptions) !void {
