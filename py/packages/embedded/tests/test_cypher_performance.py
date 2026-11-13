@@ -8638,23 +8638,8 @@ def test_sql_graph_null_filters_preserve_three_valued_windows(graph_db):
         assert actual["rows"] == control["rows"]
 
 
-def test_indexed_domains_compose_through_observers_and_distinct_stages(graph_db):
-    # The full source exceeds the public state/memory ceilings for the old
-    # fallback, while its authorized key domains have only 24 distinct tuples.
-    with graph_db.open_table("docs") as table:
-        table.batch(
-            [
-                af.WriteIntent(
-                    key=f"k{i:06}",
-                    value=json.dumps({"id": f"g{i % 8}", "score": (i // 8) % 3}).encode(),
-                )
-                for i in range(32000)
-            ],
-            timestamp=1,
-        )
-    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
-    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
-    graph_db.run_until_idle()
+def test_indexed_domains_compose_through_observers_and_distinct_stages(observer_graph_db):
+    graph_db = observer_graph_db
     aggregate = [["3", "0", "2"]]
     groups = [[f"g{i}", "3"] for i in range(8)]
     for query, expected in (
@@ -8759,8 +8744,27 @@ def scope_domains(db, count):
     db.run_until_idle()
 
 
-def test_group_observers_survive_output_filters_wrappers_and_later_order(graph_db):
-    scope_domains(graph_db, OBSERVER_DOMAIN_ROWS)
+@pytest.fixture(scope="module", params=[af.Storage.LITE, af.Storage.DIRECTORY])
+def observer_graph_db(require_native, tmp_path_factory, request):
+    """Query-only consumers reuse a complete corpus on each physical engine."""
+    storage = request.param
+    root = tmp_path_factory.mktemp("observer-graph")
+    path = root / ("graph.aflite" if storage == af.Storage.LITE else "graph")
+    opener = af.create_with_options if storage == af.Storage.LITE else af.open_with_options
+    with closing(opener(path, af.OpenOptions(storage=storage, no_sync=True))) as owner:
+        _seed_graph(owner)
+        # Preserve the largest source in these consumers, including the 32k
+        # case whose 24 distinct tuples must beat the 256-anchor work ceiling.
+        # Only construction is shared; each query has independent limits/state.
+        scope_domains(owner, 32000)
+        # Indexed graph queries require serving-owner leases; READONLY opens
+        # reject these operations. Only query-only tests use this fixture.
+        # All mutation, null-postimage and rebuild tests keep private graph_db.
+        yield owner
+
+
+def test_group_observers_survive_output_filters_wrappers_and_later_order(observer_graph_db):
+    graph_db = observer_graph_db
     groups = [[f"g{i}", "3"] for i in range(8)]
     for query, expected in (
         ("MATCH(n:D) RETURN n.id,count(DISTINCT n.score)+0 AS c ORDER BY n.id", groups),
@@ -8897,8 +8901,8 @@ def test_bounded_group_obligations_stop_after_accepted_groups(graph_db):
         assert result["stats"]["scanned_anchors"] <= 256
 
 
-def test_sql_group_and_filter_observers_scale_with_index_domains(graph_db):
-    scope_domains(graph_db, OBSERVER_DOMAIN_ROWS)
+def test_sql_group_and_filter_observers_scale_with_index_domains(observer_graph_db):
+    graph_db = observer_graph_db
     membership = graph_db.cypher_json(
         "g",
         {
@@ -8978,8 +8982,8 @@ def test_group_observer_proofs_preserve_nulls_ordinals_and_late_errors(graph_db)
         graph_db.cypher_json("g", {"query": weighted + "count(*)*10000000 ORDER BY g LIMIT 1"})
 
 
-def test_sql_filtered_observers_and_constant_admission_have_bounded_work(graph_db):
-    scope_domains(graph_db, OBSERVER_DOMAIN_ROWS)
+def test_sql_filtered_observers_and_constant_admission_have_bounded_work(observer_graph_db):
+    graph_db = observer_graph_db
     source = "GRAPH_TABLE(g MATCH(n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
     reducers = "count(DISTINCT score),min(score),max(score)"
     filtered = "count(DISTINCT score) FILTER(WHERE score>=1),min(score) FILTER(WHERE score>=1),max(score) FILTER(WHERE score>=1)"
@@ -9128,8 +9132,8 @@ def test_sql_filtered_observer_group_presence_and_windows_match_exhaustive_contr
         assert graph_db.sql(query)["rows"] == graph_db.sql(query.replace(source, control))["rows"], query
 
 
-def test_duplicate_membership_inputs_preserve_indexed_domains(graph_db):
-    scope_domains(graph_db, OBSERVER_DOMAIN_ROWS)
+def test_duplicate_membership_inputs_preserve_indexed_domains(observer_graph_db):
+    graph_db = observer_graph_db
     # The two scalar domains are identical across the old 256-input threshold.
     for length in (2, 256, 258, 1000):
         values = [1, 2] * (length // 2)

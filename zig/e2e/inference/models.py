@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -1046,7 +1047,11 @@ def _env_model_specs() -> list[ModelSpec]:
     return specs
 
 
-def prefetch_test_models(items: list[tuple[str, str | None]]) -> None:
+def prefetch_test_models(
+    items: list[tuple[str, str | None]],
+    *,
+    required_model_groups: tuple[tuple[str, ...], ...] = (),
+) -> None:
     """Provision only the selected tests' default families, before server start.
 
     Catalog discovery must never pull weights. Explicit requests retain their
@@ -1061,13 +1066,11 @@ def prefetch_test_models(items: list[tuple[str, str | None]]) -> None:
         "test_classify.py": {"classifiers"},
         "test_extract.py": {"extractors"},
         "test_embed.py": {"embedders"},
-        "test_sparse_embed.py": {"embedders"},
         "test_rerank.py": {"rerankers"},
         "test_read.py": {"readers"},
         "test_dictate.py": {"transcribers"},
         "test_transcribe.py": {"transcribers"},
         "test_transcription_sessions.py": {"transcribers"},
-        "test_models.py": {"embedders", "classifiers", "extractors", "readers"},
     }
     tasks: set[str] = set()
     for file, affinity in items:
@@ -1076,30 +1079,76 @@ def prefetch_test_models(items: list[tuple[str, str | None]]) -> None:
         elif affinity == "reader":
             tasks.add("readers")
         elif affinity == "eviction":
-            tasks.add("embedders")
+            # Scheduling affinity is independent of model dependencies.
+            # The compound test declares its concrete pair with inference_models.
+            continue
         else:
             tasks.update(families.get(file, ()))
-    explicit = [spec for spec in _env_model_specs() if spec.task in tasks]
-    explicit_keys = {(spec.task, spec.request_name.lower()) for spec in explicit}
+    env_specs = _env_model_specs()
+    explicit = [spec for spec in env_specs if spec.task in tasks]
+    explicit_keys = {(spec.task, spec.request_name.lower()) for spec in env_specs}
     planned = [
         spec
         for task, spec in DEFAULT_E2E_MODELS.items()
         if task in tasks
         and not (
             task == "generators"
-            and os.environ.get("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL")
+            and os.environ.get("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", "").strip()
         )
     ]
     planned.extend(explicit)
+
+    def download_allowed(spec: ModelSpec) -> bool:
+        key = (spec.task, spec.request_name.lower())
+        return (
+            not spec.large
+            or key in explicit_keys
+            or run_large_model_tests()
+            or (spec.repo == "antflydb/clipclap" and run_clipclap_contract_tests())
+        )
+
+    # Resolve every declaration before doing I/O. Dependencies belong to a test,
+    # not to its scheduling affinity: an unavailable gated prerequisite must
+    # defer the entire optional group instead of downloading unused siblings.
+    groups: list[list[ModelSpec]] = []
+    for names in required_model_groups:
+        group = []
+        for name in names:
+            spec = CURATED_BY_NAME.get(name.strip().lower())
+            if spec is None:
+                raise ValueError(f"Unknown required E2E model: {name}")
+            group.append(spec)
+        groups.append(group)
+    for group in groups:
+        if all(download_allowed(spec) or model_available(spec) for spec in group):
+            planned.extend(group)
     seen: set[tuple[str, str]] = set()
     for spec in planned:
         key = (spec.task, spec.request_name.lower())
         if key in seen:
             continue
         seen.add(key)
-        if spec.large and key not in explicit_keys and not run_large_model_tests():
+        if not download_allowed(spec):
             continue
+        started = time.monotonic()
         ensure_model(spec)
+        seconds = time.monotonic() - started
+        print(f"E2E model provisioned: {spec.request_name} ({seconds:.3f}s)")
+        if report_dir := os.environ.get("ANTFLY_INFERENCE_REPORT_DIR"):
+            destination = Path(report_dir)
+            destination.mkdir(parents=True, exist_ok=True)
+            with (destination / "model-provisioning.jsonl").open("a") as output:
+                output.write(
+                    json.dumps(
+                        {
+                            "model": spec.request_name,
+                            "task": spec.task,
+                            "phase": "provision",
+                            "seconds": seconds,
+                        }
+                    )
+                    + "\n"
+                )
 
 
 def prefetch_curated_models() -> None:
