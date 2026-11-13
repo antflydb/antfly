@@ -15860,7 +15860,6 @@ pub const NativeFile = struct {
                 }
                 const was_durable_header_null = self.durable_header == null;
                 if (self.durable_header == null) self.durable_header = previous;
-                self.header.checkpoints[self.header.active_checkpoint] = next;
                 // §9.3: a ride-along redo-log commit still appends -- just
                 // like a ride-along copy-on-write commit still physically
                 // writes its pages today (`PageWriteBatch.flushCount`
@@ -15868,9 +15867,34 @@ pub const NativeFile = struct {
                 // above) -- but never syncs. The next commit whose own
                 // `durable` promotes a shared group covers it, exactly as
                 // §3.2a already describes for pages.
+                //
+                // Append (when a redo log backs this file) *before*
+                // publishing `next` into `self.header`, and let a failed
+                // append propagate without ever having touched the header.
+                // The reverse order (publish `self.header` first, append
+                // second -- what this used to do) left `self.header`'s
+                // `commit_sequence` permanently ahead of `redo.writer
+                // .last_sequence` the moment an append failed for any
+                // reason (`error.LogFull`, a transient I/O fault, ...):
+                // nothing here or in `commitTransactionWithDurability`'s
+                // own `errdefer` ever rolled the header back, so every
+                // later commit on this same file instance computed its own
+                // next sequence from the now-wrongly-advanced header --
+                // and could then never equal `redo.writer.last_sequence +
+                // 1` again. One ordinary transient append failure turned
+                // into a one-way ratchet: every subsequent commit,
+                // foreground or background, permanently failed with
+                // `error.SequenceOutOfOrder` (surfacing as the far less
+                // specific `error.OutcomeUnknown`), not a retryable,
+                // one-off error a caller's own retry could ever clear.
+                // Reproduced by "crash sweep: graph add-index mid-scenario"
+                // (gr_idx's/body_text's own background ride-along catch-up
+                // commits), independent of any crash or injected fault --
+                // the uncrashed discovery pass alone could hit it.
                 if (self.redo) |*redo| {
                     try redo.appendRecord(self.allocator, next.commit_sequence, CompactCheckpoint.fromCheckpointSlot(next));
                 }
+                self.header.checkpoints[self.header.active_checkpoint] = next;
                 recoveryDebugLog("ride-along commit (non-durable) commit_sequence={d} captured_durable_header={} durable_header_commit_sequence={d}", .{
                     next.commit_sequence,
                     was_durable_header_null,
@@ -28686,6 +28710,69 @@ test "lite redo log a commit that stages nothing still durably flushes a pending
     const kept = (try reopened.getDocumentAlloc(a, "ride-along-doc")).?;
     defer a.free(kept);
     try std.testing.expectEqualStrings("pending", kept);
+}
+
+// Writer-race investigation, continued: a ride-along (non-durable) commit
+// whose own `redo.appendRecord` fails must never advance `self.header`'s
+// `commit_sequence` past what the log actually holds. Before this fix,
+// `commitTransactionWithDurability`'s ride-along branch published `next`
+// into `self.header` *before* attempting the append; a failed append
+// (`error.LogFull`, a transient I/O fault, or -- deterministically,
+// below -- a corrupted continuity counter) left that advance in place
+// with nothing to roll it back, so every later commit on this same file
+// computed its own next sequence from the now-wrongly-advanced header and
+// could never again equal `redo.writer.last_sequence + 1`: one ordinary
+// append failure became a one-way ratchet into permanent
+// `error.SequenceOutOfOrder` (surfacing as the far less specific
+// `error.OutcomeUnknown`) for the rest of the file's life. Reproduced by
+// "crash sweep: graph add-index mid-scenario" (gr_idx's/body_text's own
+// background ride-along catch-up commits) with no crash or injected
+// fault at all -- the uncrashed discovery pass alone could hit it, since
+// nothing here depends on concurrency.
+test "lite redo log a failed ride-along append never advances the header's commit_sequence past the log" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-ride-along-fail.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer file.close();
+
+    // A durable baseline commit.
+    try file.beginTransaction();
+    try file.putDocument("base-doc", "base");
+    try file.commitTransaction();
+    const baseline_sequence = file.activeCheckpoint().commit_sequence;
+    try std.testing.expectEqual(baseline_sequence, file.redo.?.writer.last_sequence.?);
+
+    // Force the ride-along commit below to fail its own `redo.appendRecord`
+    // call deterministically, without any I/O fault or concurrency:
+    // corrupt the writer's own continuity counter so the commit's
+    // correctly-computed `next.commit_sequence` (`baseline_sequence + 1`,
+    // derived from `self.header`, which this leaves untouched) can never
+    // equal `last_sequence + 1`.
+    file.redo.?.writer.last_sequence = baseline_sequence + 5;
+
+    try file.beginTransaction();
+    try file.putDocument("ride-along-doc", "must not stick");
+    try std.testing.expectError(error.SequenceOutOfOrder, file.commitTransactionWithDurability(false, null));
+
+    // The failed append must never have advanced `self.header`'s own
+    // commit_sequence -- the whole point of this fix.
+    try std.testing.expectEqual(baseline_sequence, file.activeCheckpoint().commit_sequence);
+
+    // Restore the writer's real continuity counter (undoing only this
+    // test's own corruption, not anything the product did) and prove the
+    // file is still writable: a later commit computes its sequence from
+    // the correctly-unadvanced header and succeeds, instead of being
+    // permanently wedged by the earlier failure.
+    file.redo.?.writer.last_sequence = baseline_sequence;
+    try file.beginTransaction();
+    try file.putDocument("after-doc", "recovered");
+    try file.commitTransaction();
+    try std.testing.expectEqual(baseline_sequence + 1, file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(baseline_sequence + 1, file.redo.?.writer.last_sequence.?);
 }
 
 // Writer-race investigation, continued: the legacy (`use_redo_log = false`)
