@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 import process from "node:process";
-import { CompiledQuery, Kysely, type PostgresPool, type DatabaseIntrospector } from "kysely";
+import { CompiledQuery, type DatabaseIntrospector, Kysely, type PostgresPool } from "kysely";
 import { type MigrationResultSet, Migrator, type MigratorProps } from "kysely/migration";
 import {
   type AntflyMigrationLockSettings,
