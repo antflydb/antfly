@@ -2605,6 +2605,133 @@ revision), then the `ReadView` type itself on `perf/lwa-readview`:
   `readDecodedScoresAtCheckpointWithState`, confirming the
   `readBatchAtCheckpoint` overlay pre-pass fix above directly.
 
+### 9.7d Retirement signal and accounting under redo (`perf/lwa-redo-retire`)
+
+`NativeFile.retirementNeedsService` loads the on-disk allocator ledger
+and asks it "is there eligible retirement work" -- correct under the
+legacy commit path, blind under redo: a superseded overlay version
+(§9.3a) is retirement debt (an old external-value chain included) that
+only `checkpointRedoLog`'s next fold turns into a real, ledger-tracked
+`Retirement`. "The overlay has anything at all" was tried as the
+signal and reverted: it fires for a plain, never-overwritten bulk
+insert too, which supersedes nothing, and broke 13 other reclamation/
+retirement tests on contact.
+
+**The signal.** `SharedRedoOverlay.pending_retirement_versions`
+(`redo_overlay.zig`) is an O(1) counter, not a scan: `appendVersion`
+already does a `getOrPut` per commit to chain a new version onto its
+key's existing head (§9.3c's own description of this structure); when
+that lookup finds an existing head (`gop.found_existing`), the head
+just superseded is one more version a fold would discover and retire,
+so the counter increments there, for free. `reclaim`'s existing walk
+(dropping versions a floor advance makes unreachable) already visits
+exactly the nodes it frees; decrementing there, from `destroyChain`'s
+now-`usize` return, keeps the counter an accurate live count with no
+second pass. `NativeFile.redoCheckpointWouldRetire` reads it (one lock,
+one load) and `retirementNeedsServiceCoreWithCancel` treats a nonzero
+count as unconditionally true, the same tier as the existing
+`checkpointDue`/`budgetedCheckpointDue` checks: there is no epoch/
+reader-fence question to ask about debt that has no `Retirement` item
+yet.
+
+**Acting on it safely.** `reclaimPagesImpl`'s existing ledger-only body
+(free-map read, `drainRetirement`, a new allocator checkpoint) turns
+out to be unsafe to run at all while any page-shaped write (an
+external-value chain) is still staged: that content was written to a
+real page id without ever touching the ledger (`checkpointRedoLog`'s
+own "page-shaped exception" comment), so the ledger's free map does
+not know those pages are occupied -- reproduced directly: running this
+function's existing body against a redo file with one staged chain
+reused that chain's own page id for the new free-map-root page,
+corrupting it (`check()`'s `unexpected_page_kind` afterward). The fix
+gates the whole body on `SharedRedoOverlay.pagesEmpty`: if anything
+page-shaped is still staged, fold first (`checkpointRedoLog`) when
+capacity pressure justifies the fold's own real, syncing commit (the
+same `reserve_retirement_capacity`/`max_file_bytes` gate
+`budgetedCheckpointDue` already uses), otherwise skip the body this
+call (the debt is real but the next idle-flush/threshold checkpoint
+will fold it for free; forcing a sync here for an unbudgeted ride-along
+caller is not worth it).
+
+**Scope deliberately not covered.** A *first-ever* diverted write for a
+key already live in the real, on-disk tree (overwrite or delete, never
+previously touched in this uncheckpointed window) also creates debt
+the fold will retire, but detecting it would need a real tree lookup
+per write -- the O(1)-per-commit constraint rules it out, and neither
+target test needs it (both start from a key that does not exist on
+disk yet). Left for whoever revisits this once a cheap "does this key
+already resolve to something real" signal exists elsewhere.
+
+**A second, independent regression found and contained, not fixed.**
+Wiring the signal into `Store.startMaintenanceAssumeLocked` (which
+decides whether to spin up a *background* maintenance thread) newly
+started that thread for a retirement reason under redo for the first
+time ever -- previously impossible, since redo debt alone used to make
+this whole check always false. Doing so exposed a pre-existing
+concurrency bug in the background loop's interaction with a live redo
+commit: four crash-sweep/close+reopen regression tests (full-text
+index creation/retirement-turn combinations) started failing with
+`OutcomeUnknown`, reproduced as present with *only* the signal change
+and *no* other part of this patch, i.e. not caused by the
+`reclaimPagesImpl` fix above. This overlaps the write-serialization
+race already being worked on separately (`perf/lwa-writer-race`,
+`publishCheckpoint` and the commit path), so it was not chased further
+here. Contained by splitting the check:
+`retirementNeedsServiceLedgerOnlyWithCancel` (ledger-only, the
+pre-existing behavior, unaffected by any of this) is what
+`startMaintenanceAssumeLocked` calls; every other caller -- explicit
+test assertions, `maintainOnceWithCancel`'s own foreground-driven
+service call, `reclaimRetirementPressure`'s admission check, all
+direct/synchronous callers that already control their own timing --
+keeps the full, redo-aware `retirementNeedsServiceWithCancel`. Revisit
+once the writer-race fix lands: the split may no longer be needed.
+
+**Of the two target tests, one still fails for an unrelated, confirmed
+pre-existing reason; the regression tests above are now gated, not
+broken.**
+
+- "lite reclamation ride-along passes force no sync before the next
+  durable write": the signal and sync-count assertions now pass. The
+  final `checkWithCancel().valid` assertion still fails
+  (`unexpected_page_kind` before `reclaimPagesImpl`'s own gate above,
+  `truncated_file` after it): `checkpointPrefixSize`
+  (`page_count * page_size`) has no redo awareness at all, and a
+  diverting commit advances `page_count` to hand the *next* diverting
+  commit a fresh page id without the file ever being physically grown
+  to match (that growth is deferred to the next fold, same as the
+  page's own bytes). Reproduced with zero retirement/maintenance calls
+  involved at all (eight plain `write.commit()`s, then `check()`
+  immediately): a write/fold-path gap, not a retirement/accounting one
+  -- likely `perf/lwa-redo-data`'s territory.
+- "lite reclamation capacity reserve drains wide value graphs": still
+  fails, but earlier and for a different reason than before this fix
+  (confirmed by instrumentation, not inferred): at the point it fails,
+  `pending_retirement_versions` is genuinely `0` -- the test's 256 KiB
+  value exceeds the redo log's own region, scaled down to a quarter of
+  the configured budget (§9.7a's own "floored at 64 KiB" comment), so
+  the write never diverts into the overlay at all; there is no debt yet
+  for the new signal to see. The failure is the pre-existing, legacy-
+  shared `budgetedCheckpointDue` ledger-delta threshold not clearing
+  with the margin it has under legacy, because the log reservation
+  eats into the same budget (confirmed: the identical test passes
+  under `use_redo_log = false`, where that reservation does not exist,
+  and never even reaches the failing retry branch). A budget/threshold-
+  tuning interaction with the log's own capacity reservation, not an
+  overlay-debt-visibility problem.
+
+Gate (`--test-filter "reclamation" --test-filter "retirement"
+--test-filter "ride-along" --test-filter "ride along" --test-filter
+"reuse" --test-filter "redo" --test-filter "prepared"
+--skip-test-filter "WS4-for-dense repair-issue ride-along"`, the last
+one a confirmed-unrelated pre-existing hang reproduced independently
+of this branch): 199 tests, 183 passed / 15 failed before, 185 passed
+/ 13 failed after -- every test that passed before still passes; two
+of the pre-existing 15 failures ("lite allocator v4 releasing the last
+old reader starts idle retirement", "crash sweep: sustained
+full_index writes survive a crash during ride-along merge and
+retirement") now pass as a side effect; the two target tests remain
+among the 13 for the independent reasons above.
+
 ### 9.8 Gates (from step (c) on)
 
 Unchanged from the task's own list, restated for traceability:
