@@ -1614,7 +1614,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // in this batch. The precommit producer path has neither that snapshot nor
             // the composed neighbor input/skip hash. Retain this request for postcommit
             // replay; synchronous levels still wait for its generated coverage there.
-            if (request.requires_committed_graph or request.neighbor_context_json.len != 0) return false;
+            if (request.requires_committed_graph or (request.neighbor_context_json.len != 0 or request.context_sources_json.len != 0)) return false;
             // An upstream asset's field is not a field of the primary row.
             // Chunk/vector descendants must consume accepted producer bytes
             // after commit, with the upstream causal witness. Precomputing them

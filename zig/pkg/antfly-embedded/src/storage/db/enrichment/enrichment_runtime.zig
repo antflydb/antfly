@@ -3374,6 +3374,10 @@ fn logicalRequestFingerprint(supplied: enrichment_types.GeneratedEnrichmentReque
         hash.update(&length);
         hash.update(bytes);
     }
+    if (request.context_sources_json.len != 0) {
+        hash.update("context_sources_json");
+        hash.update(request.context_sources_json);
+    }
     inline for (.{ "expected_dims", "chunk_size", "chunk_overlap", "reprocess_generation" }) |field| {
         var value: [8]u8 = undefined;
         std.mem.writeInt(u64, &value, @field(request, field), .little);
@@ -15146,7 +15150,7 @@ const DocumentPreparationPipeline = struct {
         const privacy = @import("../../../privacy/document.zig");
         return request.kind == .asset and request.input_kind == .document and
             request.upstream_artifact_name.len == 0 and request.source_template.len == 0 and
-            request.neighbor_context_json.len == 0 and request.group_source_json.len == 0 and
+            (request.neighbor_context_json.len == 0 and request.context_sources_json.len == 0) and request.group_source_json.len == 0 and
             request.prior_context_json.len == 0 and !request.requires_committed_graph and
             !privacy.isManagedArtifactName(requestArtifactName(request)) and
             privacy.consumerPolicyVersion(requestArtifactName(request)) == null and

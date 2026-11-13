@@ -792,7 +792,7 @@ fn rewriteEnrichments(a: A, root: *std.json.Value, names: *std.StringHashMapUnma
             const name = names.get(original_name) orelse return error.InvalidPrivacyCatalog;
             try string(a, entry, "name", name);
             const kind = getString(entry.*, "kind");
-            if (std.mem.eql(u8, kind, "group") or entry.object.contains("neighbor_context")) return error.PrivacyUnsupportedArtifactInput;
+            if (std.mem.eql(u8, kind, "group") or entry.object.contains("neighbor_context") or entry.object.contains("context_sources") or getString(entry.*, "context_sources_json").len != 0) return error.PrivacyUnsupportedArtifactInput;
             const upstream = getString(entry.*, "source_artifact_name");
             if (upstream.len != 0) {
                 try string(a, entry, "source_artifact_name", names.get(upstream) orelse return error.PrivacyUnknownArtifactSource);

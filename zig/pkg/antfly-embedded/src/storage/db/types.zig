@@ -635,16 +635,20 @@ pub const EnrichmentConfig = struct {
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
     neighbor_context: ?EnrichmentNeighborContextConfig = null,
+    /// Canonical context-source declaration (see
+    /// `enrichment/context_sources.zig`); public `context_sources`/`refresh`
+    /// objects are canonicalized into this form at the API edge.
+    context_sources_json: []const u8 = "",
     execution: ?EnrichmentExecutionConfig = null,
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
         var out = cfg;
-        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json" }) |field| @field(out, field) = "";
+        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json", "context_sources_json" }) |field| @field(out, field) = "";
         out.source = null;
         out.prior_context = null;
         out.neighbor_context = null;
         errdefer out.deinit(alloc);
-        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json" }) |field| {
+        inline for (.{ "name", "field", "template", "source_artifact_name", "vector_space", "chunker_json", "content_type", "producer_json", "context_sources_json" }) |field| {
             const value = @field(cfg, field);
             if (value.len > 0) @field(out, field) = try alloc.dupe(u8, value);
         }
@@ -665,6 +669,7 @@ pub const EnrichmentConfig = struct {
         if (self.chunker_json.len > 0) alloc.free(self.chunker_json);
         if (self.content_type.len > 0) alloc.free(self.content_type);
         if (self.producer_json.len > 0) alloc.free(self.producer_json);
+        if (self.context_sources_json.len > 0) alloc.free(self.context_sources_json);
         if (self.neighbor_context) |*context| context.deinit(alloc);
         self.* = undefined;
     }
@@ -744,6 +749,7 @@ pub fn enrichmentConfigHash(cfg: EnrichmentConfig) u64 {
         hashLengthPrefixedBytes(&hasher, @tagName(context.direction));
         hashU32(&hasher, context.limit);
     }
+    if (cfg.context_sources_json.len != 0) hashLengthPrefixedBytes(&hasher, cfg.context_sources_json);
     return hasher.final();
 }
 

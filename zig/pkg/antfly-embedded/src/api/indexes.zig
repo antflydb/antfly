@@ -19,6 +19,7 @@ pub const db_mod = @import("../storage/db/selected_root.zig").db;
 pub const managed_embedder = @import("../inference/managed_embedder.zig");
 pub const document_content_hash = @import("../storage/db/document_content_hash.zig");
 pub const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
+pub const context_sources = @import("../storage/db/enrichment/context_sources.zig");
 /// Deterministic topological order, including chunk -> media-output -> chunk
 /// pipelines. Kind/name order only breaks ties between independent producers.
 /// External dependencies are left to catalog validation or the installed DB.
@@ -125,6 +126,27 @@ pub fn collectArtifactEnrichmentsFromValueWithOptions(
                             else => return error.InvalidEnrichmentConfig,
                         };
                         if (owned.content_type.len == 0) owned.content_type = try alloc.dupe(u8, "application/json");
+                    }
+                    if (item.object.get("context_sources")) |sources| {
+                        if (sources != .null) {
+                            // Public objects are canonicalized here; the raw
+                            // stored form is never accepted alongside them.
+                            if (owned.context_sources_json.len > 0) return error.InvalidEnrichmentConfig;
+                            owned.context_sources_json = context_sources.canonicalFromPublicAlloc(alloc, sources, item.object.get("refresh"), null) catch |err| switch (err) {
+                                error.OutOfMemory => return err,
+                                else => return error.InvalidEnrichmentConfig,
+                            };
+                        }
+                    } else if (item.object.get("refresh")) |refresh| {
+                        if (refresh != .null) return error.InvalidEnrichmentConfig;
+                    } else if (owned.context_sources_json.len > 0) {
+                        // Stored form (backup/restore): validate the grammar;
+                        // hosts re-resolve table identities before admission.
+                        var stored = context_sources.parseStoredJson(alloc, owned.context_sources_json) catch |err| switch (err) {
+                            error.OutOfMemory => return err,
+                            else => return error.InvalidEnrichmentConfig,
+                        };
+                        stored.deinit();
                     }
                     if (owned.kind == .embedding) {
                         if (embedding_producer_json) |raw| {
@@ -280,6 +302,7 @@ pub fn artifactEnrichmentConfigsEqual(
         std.mem.eql(u8, a.content_type, b.content_type) and
         try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
         neighborContextConfigsEqual(a.neighbor_context, b.neighbor_context) and
+        std.mem.eql(u8, a.context_sources_json, b.context_sources_json) and
         std.meta.eql(a.execution, b.execution);
 }
 

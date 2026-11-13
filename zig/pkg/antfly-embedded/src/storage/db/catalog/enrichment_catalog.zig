@@ -46,6 +46,10 @@ pub const EnrichmentConfig = struct {
     /// Canonicalized neighbor-context configuration for asset producers.
     /// Empty means the producer input carries no graph adjacency sample.
     neighbor_context_json: []const u8 = "",
+    /// Canonical context-source declaration with resolved table identities
+    /// (`enrichment/context_sources.zig` stored form). Empty means the
+    /// producer consumes no cross-document context.
+    context_sources_json: []const u8 = "",
     execution_json: []const u8 = "",
     /// Graph shorthand owns this producer until explicitly upserted. Only
     /// unreferenced producers with this provenance may be removed with a graph.
@@ -53,9 +57,9 @@ pub const EnrichmentConfig = struct {
 
     pub fn clone(alloc: Allocator, cfg: EnrichmentConfig) !EnrichmentConfig {
         var out = cfg;
-        inline for (.{ "name", "source_field", "source_template", "source_artifact_name", "group_source_json", "prior_context_json", "vector_space", "chunker_json", "content_type", "producer_json", "neighbor_context_json", "execution_json" }) |field| @field(out, field) = "";
+        inline for (.{ "name", "source_field", "source_template", "source_artifact_name", "group_source_json", "prior_context_json", "vector_space", "chunker_json", "content_type", "producer_json", "neighbor_context_json", "context_sources_json", "execution_json" }) |field| @field(out, field) = "";
         errdefer out.deinit(alloc);
-        inline for (.{ "name", "source_field", "source_template", "source_artifact_name", "group_source_json", "prior_context_json", "vector_space", "chunker_json", "content_type", "producer_json", "neighbor_context_json", "execution_json" }) |field| {
+        inline for (.{ "name", "source_field", "source_template", "source_artifact_name", "group_source_json", "prior_context_json", "vector_space", "chunker_json", "content_type", "producer_json", "neighbor_context_json", "context_sources_json", "execution_json" }) |field| {
             const value = @field(cfg, field);
             if (value.len > 0) @field(out, field) = try alloc.dupe(u8, value);
         }
@@ -74,6 +78,7 @@ pub const EnrichmentConfig = struct {
         if (self.content_type.len > 0) alloc.free(@constCast(self.content_type));
         if (self.producer_json.len > 0) alloc.free(@constCast(self.producer_json));
         if (self.neighbor_context_json.len > 0) alloc.free(@constCast(self.neighbor_context_json));
+        if (self.context_sources_json.len > 0) alloc.free(@constCast(self.context_sources_json));
         if (self.execution_json.len > 0) alloc.free(@constCast(self.execution_json));
         self.* = undefined;
     }

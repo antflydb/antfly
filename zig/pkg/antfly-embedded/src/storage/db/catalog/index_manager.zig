@@ -49,6 +49,7 @@ const enrichment_types = @import("../enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("../enrichment/artifact_codec.zig");
 const graph_edge_contender = @import("../graph_edge_contender.zig");
 const enrichment_config_validation = @import("../enrichment/config_validation.zig");
+const enrichment_context_sources = @import("../enrichment/context_sources.zig");
 const enrichment_neighbor_context = @import("../enrichment/neighbor_context.zig");
 const asset_producer_mod = @import("../enrichment/asset_producer.zig");
 const backfill_state_mod = @import("../backfill_state.zig");
@@ -16008,6 +16009,16 @@ pub const IndexManager = struct {
         }
     };
 
+    /// Whether any admitted asset enrichment declares context sources. The
+    /// commit path consults this before computing dependency notices so tables
+    /// without dependents pay nothing.
+    pub fn hasAssetContextSources(self: *const IndexManager) bool {
+        for (self.enrichments.items) |entry| {
+            if (entry.kind == .asset and entry.context_sources_json.len != 0) return true;
+        }
+        return false;
+    }
+
     pub fn hasAssetNeighborContext(self: *const IndexManager) bool {
         for (self.enrichments.items) |entry| {
             if (entry.kind == .asset and entry.neighbor_context_json.len != 0) return true;
@@ -16474,6 +16485,7 @@ pub const IndexManager = struct {
                     .group_source_json = entry.group_source_json,
                     .prior_context_json = entry.prior_context_json,
                     .neighbor_context_json = if (entry.neighbor_context_json.len > 0) entry.neighbor_context_json else "",
+                    .context_sources_json = entry.context_sources_json,
                     .execution_json = if (entry.execution_json.len > 0) entry.execution_json else "",
                 });
             }
@@ -25976,6 +25988,7 @@ pub const IndexManager = struct {
                 !std.mem.eql(u8, existing.group_source_json, cfg.group_source_json) or
                 !std.mem.eql(u8, existing.prior_context_json, cfg.prior_context_json) or
                 !std.mem.eql(u8, existing.neighbor_context_json, cfg.neighbor_context_json) or
+                !std.mem.eql(u8, existing.context_sources_json, cfg.context_sources_json) or
                 !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
@@ -26018,6 +26031,7 @@ pub const IndexManager = struct {
                     var context = try enrichment_neighbor_context.parseConfigJson(self.alloc, cfg.neighbor_context_json);
                     context.deinit(self.alloc);
                 }
+                if (cfg.context_sources_json.len > 0) try validateContextSourcesConfig(self.alloc, cfg);
                 if (cfg.source_artifact_name.len > 0) {
                     // Asset-consumes-asset: the upstream chain must resolve
                     // to admitted assets and terminate without revisiting
@@ -35715,7 +35729,7 @@ pub fn onlineDirectVectorConfig(alloc: Allocator, cfg: types.IndexConfig) !bool 
 /// and protocol-15 transfer readiness are separate admission requirements.
 pub fn onlineBaseEmbeddingProducer(cfg: enrichment_catalog.EnrichmentConfig) bool {
     return cfg.kind == .embedding and cfg.embedding_input == .text and
-        cfg.source_artifact_name.len == 0 and cfg.neighbor_context_json.len == 0 and
+        cfg.source_artifact_name.len == 0 and (cfg.neighbor_context_json.len == 0 and cfg.context_sources_json.len == 0) and
         cfg.chunk_size == 0 and cfg.chunk_overlap == 0 and cfg.chunker_json.len == 0 and
         (cfg.source_field.len != 0 or cfg.source_template.len != 0);
 }
@@ -35811,7 +35825,7 @@ pub fn consumesGeneratedChunkVector(alloc: Allocator, cfg: types.IndexConfig, pr
     const producer = for (producers) |entry| {
         if (entry.kind == .embedding and std.mem.eql(u8, entry.name, embedding_name)) break entry;
     } else return false;
-    if (producer.embedding_input != .text or producer.expected_dims != dims or producer.neighbor_context_json.len != 0 or
+    if (producer.embedding_input != .text or producer.expected_dims != dims or (producer.neighbor_context_json.len != 0 or producer.context_sources_json.len != 0) or
         !std.mem.eql(u8, producer.source_artifact_name, chunk_name)) return false;
     return for (producers) |entry| {
         if (entry.kind == .chunk and std.mem.eql(u8, entry.name, chunk_name)) break true;
@@ -36108,6 +36122,26 @@ fn publicEnrichmentKindToInternal(kind: types.EnrichmentKind) enrichment_catalog
     };
 }
 
+/// Context sources feed rendered prompt text, so only asset producers that
+/// consume prompt text may declare them (as with neighbor context). Unsupported
+/// predicates, budgets, and reserved fields were rejected by the grammar.
+fn validateContextSourcesConfig(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig) !void {
+    if (cfg.kind != .asset) return error.InvalidEnrichmentConfig;
+    var parsed = enrichment_context_sources.parseStoredJson(alloc, cfg.context_sources_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEnrichmentConfig,
+    };
+    defer parsed.deinit();
+    var producer = try @import("../enrichment/asset_producer.zig").parseProducerConfig(alloc, cfg.producer_json);
+    defer producer.deinit(alloc);
+    if (!enrichment_config_validation.producerConsumesPromptText(producer.type)) return error.InvalidEnrichmentConfig;
+    for (parsed.sources) |source| {
+        // A named foreign table must have been resolved to an immutable
+        // identity by the host before reaching the catalog.
+        if (source.table.len != 0 and source.table_id.len == 0) return error.UnresolvedContextSourceTable;
+    }
+}
+
 fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichment_catalog.EnrichmentConfig {
     const execution_json = if (cfg.execution) |execution| blk: {
         const json = try std.json.Stringify.valueAlloc(alloc, execution, .{});
@@ -36124,6 +36158,14 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         break :blk json;
     } else "";
     errdefer if (neighbor_context_json.len > 0) alloc.free(neighbor_context_json);
+    const context_sources_json = if (cfg.context_sources_json.len > 0) blk: {
+        // Re-canonicalize: the stored form is the only accepted shape here,
+        // public objects are converted (and table names resolved) at the edge.
+        var parsed = try enrichment_context_sources.parseStoredJson(alloc, cfg.context_sources_json);
+        defer parsed.deinit();
+        break :blk try parsed.canonicalJsonAlloc(alloc);
+    } else "";
+    errdefer if (context_sources_json.len > 0) alloc.free(context_sources_json);
     const group_source_json = if (cfg.source) |source| try canonicalEnrichmentPart(alloc, source) else "";
     errdefer if (group_source_json.len > 0) alloc.free(group_source_json);
     const prior_context_json = if (cfg.prior_context) |context| try canonicalEnrichmentPart(alloc, context) else "";
@@ -36146,6 +36188,7 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         .content_type = if (cfg.kind == .group) try alloc.dupe(u8, "application/json") else if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.kind == .group) try alloc.dupe(u8, "{\"type\":\"copy\"}") else if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
         .neighbor_context_json = neighbor_context_json,
+        .context_sources_json = context_sources_json,
         .execution_json = execution_json,
     };
 }
@@ -36168,6 +36211,7 @@ fn internalEnrichmentConfigsEqual(alloc: Allocator, a: enrichment_catalog.Enrich
         std.mem.eql(u8, a.content_type, b.content_type) and
         try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
         std.mem.eql(u8, a.neighbor_context_json, b.neighbor_context_json) and
+        std.mem.eql(u8, a.context_sources_json, b.context_sources_json) and
         std.mem.eql(u8, a.execution_json, b.execution_json);
 }
 
@@ -36209,6 +36253,7 @@ pub fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentCo
         .content_type = if (cfg.group_source_json.len > 0) "" else if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.group_source_json.len > 0) "" else if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
         .neighbor_context = neighbor_context,
+        .context_sources_json = if (cfg.context_sources_json.len > 0) try alloc.dupe(u8, cfg.context_sources_json) else "",
         .execution = execution,
     };
     errdefer out.deinit(alloc);

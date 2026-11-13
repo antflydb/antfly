@@ -60,7 +60,7 @@ pub fn CaptureSession(comptime Txn: type) type {
 pub fn captureSession(alloc: std.mem.Allocator, txn: anytype, request: @import("enrichment/enrichment_types.zig").GeneratedEnrichmentRequest, plan: *const manager.IndexManager.WritePlanSnapshot) !?CaptureSession(@TypeOf(txn)) {
     const authority = (try publication.authority(txn)) orelse return null;
     if ((request.kind != .dense_embedding and request.kind != .sparse_embedding) or
-        request.embedding_input != .text or request.neighbor_context_json.len != 0) return error.OnlineMergeArtifactTailsUnsupported;
+        request.embedding_input != .text or (request.neighbor_context_json.len != 0 or request.context_sources_json.len != 0)) return error.OnlineMergeArtifactTailsUnsupported;
     const matches = for (plan.generated_templates) |template| {
         if (@import("artifact_producer_input.zig").sameDefinition(request, template)) break true;
     } else false;

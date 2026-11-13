@@ -64,6 +64,7 @@ pub const Error = error{
     ContextBudgetExceeded,
     RequiredContextMissing,
     InvalidContextBinding,
+    UnknownContextSourceTable,
     OutOfMemory,
 };
 
@@ -599,6 +600,67 @@ fn formatDurationMs(buf: []u8, ms: u64) []const u8 {
     if (ms % 60_000 == 0) return std.fmt.bufPrint(buf, "{d}m", .{ms / 60_000}) catch unreachable;
     if (ms % 1000 == 0) return std.fmt.bufPrint(buf, "{d}s", .{ms / 1000}) catch unreachable;
     return std.fmt.bufPrint(buf, "{d}ms", .{ms}) catch unreachable;
+}
+
+/// Host hook that maps a public table name to its immutable identity. Hosts
+/// return null for unknown or unauthorized tables (admission then fails), and
+/// should map the enrichment's own table to its own identity.
+pub const TableResolver = struct {
+    ptr: *anyopaque,
+    resolve_fn: *const fn (ptr: *anyopaque, alloc: Allocator, table: []const u8) anyerror!?[]u8,
+
+    pub fn resolve(self: TableResolver, alloc: Allocator, table: []const u8) !?[]u8 {
+        return self.resolve_fn(self.ptr, alloc, table);
+    }
+};
+
+/// Canonicalize public `context_sources` (and optional `refresh`) into the
+/// stored form, resolving every named table through `resolver`. Without a
+/// resolver, named tables stay unresolved and catalog admission rejects them;
+/// unnamed sources target the enrichment's own table.
+pub fn canonicalFromPublicAlloc(alloc: Allocator, sources_value: std.json.Value, refresh_value: ?std.json.Value, resolver: ?TableResolver) ![]u8 {
+    var config = try parsePublicValue(alloc, sources_value, refresh_value, false);
+    defer config.deinit();
+    try resolveTables(alloc, &config, resolver);
+    return config.canonicalJsonAlloc(alloc);
+}
+
+/// Re-resolve table identities of an already stored declaration from table
+/// names (restore, import, or a host re-validating a client-supplied stored
+/// form). Client-provided identities are never trusted.
+pub fn reresolveStoredAlloc(alloc: Allocator, stored: []const u8, resolver: ?TableResolver) ![]u8 {
+    var config = try parseStoredJson(alloc, stored);
+    defer config.deinit();
+    for (config.sources) |*source| @constCast(source).table_id = "";
+    try resolveTables(alloc, &config, resolver);
+    return config.canonicalJsonAlloc(alloc);
+}
+
+fn resolveTables(alloc: Allocator, config: *Config, resolver: ?TableResolver) !void {
+    const r = resolver orelse return;
+    const a = config.arena.allocator();
+    for (config.sources) |*source| {
+        if (source.table.len == 0) continue;
+        const id = (try r.resolve(alloc, source.table)) orelse return error.UnknownContextSourceTable;
+        defer alloc.free(id);
+        if (id.len == 0 or id.len > max_name_bytes) return error.UnknownContextSourceTable;
+        @constCast(source).table_id = try a.dupe(u8, id);
+    }
+}
+
+/// Distinct foreign table identities referenced by a declaration.
+pub fn foreignTableIdsAlloc(alloc: Allocator, config: *const Config, own_table_id: []const u8) ![][]const u8 {
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer out.deinit(alloc);
+    for (config.sources) |source| {
+        if (source.table_id.len == 0 or std.mem.eql(u8, source.table_id, own_table_id)) continue;
+        var seen = false;
+        for (out.items) |id| if (std.mem.eql(u8, id, source.table_id)) {
+            seen = true;
+        };
+        if (!seen) try out.append(alloc, source.table_id);
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 // ---------------------------------------------------------------------------
@@ -1548,6 +1610,37 @@ test "rendering is canonical, fingerprinted, and enforces budgets explicitly" {
     // Unordered members are a caller bug, not silently reordered output.
     const unordered = [_]ConsumedInput{ .{ .key = "r2", .projection = "{}" }, .{ .key = "r1", .projection = "{}" } };
     try testing.expectError(error.InvalidContextBinding, renderAlloc(alloc, &.{.{ .bound = &bindings.items[1], .members = &unordered }}));
+}
+
+test "table names resolve to immutable identities and client identities are not trusted" {
+    const alloc = testing.allocator;
+    const Map = struct {
+        fn resolve(_: *anyopaque, a: Allocator, table: []const u8) anyerror!?[]u8 {
+            if (std.mem.eql(u8, table, "policies")) return try a.dupe(u8, "tbl-42");
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const resolver = TableResolver{ .ptr = &dummy, .resolve_fn = Map.resolve };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const public = try parseValue(arena.allocator(), "{\"p\":{\"query\":{\"table\":\"policies\",\"filter_query\":{\"field\":\"org\",\"term\":{\"$source\":\"/org\"}}},\"fields\":[\"text\"]}}");
+    const stored = try canonicalFromPublicAlloc(alloc, public, null, resolver);
+    defer alloc.free(stored);
+    try testing.expect(std.mem.indexOf(u8, stored, "\"table_id\":\"tbl-42\"") != null);
+    // A forged identity in a stored form is replaced by re-resolution.
+    const forged = try std.mem.replaceOwned(u8, alloc, stored, "tbl-42", "tbl-evil");
+    defer alloc.free(forged);
+    const fixed = try reresolveStoredAlloc(alloc, forged, resolver);
+    defer alloc.free(fixed);
+    try testing.expectEqualStrings(stored, fixed);
+    const unknown = try parseValue(arena.allocator(), "{\"p\":{\"document\":{\"table\":\"nope\",\"key_from\":\"/k\"},\"fields\":[\"x\"]}}");
+    try testing.expectError(error.UnknownContextSourceTable, canonicalFromPublicAlloc(alloc, unknown, null, resolver));
+    var config = try parseStoredJson(alloc, stored);
+    defer config.deinit();
+    const foreign = try foreignTableIdsAlloc(alloc, &config, "tbl-1");
+    defer alloc.free(foreign);
+    try testing.expectEqual(@as(usize, 1), foreign.len);
 }
 
 test "duration parsing" {

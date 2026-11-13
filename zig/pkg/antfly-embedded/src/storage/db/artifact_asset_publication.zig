@@ -26,7 +26,7 @@ const keys = @import("../internal_keys.zig");
 
 pub fn authorize(alloc: std.mem.Allocator, txn: anytype, request: requests.GeneratedEnrichmentRequest, plan: *const manager.IndexManager.WritePlanSnapshot) !?producer_input.TemplateAuthority {
     if (try publication.authority(txn) == null) return null;
-    if ((request.kind != .asset and request.kind != .chunk_text) or request.neighbor_context_json.len != 0) return error.OnlineMergeArtifactTailsUnsupported;
+    if ((request.kind != .asset and request.kind != .chunk_text) or (request.neighbor_context_json.len != 0 or request.context_sources_json.len != 0)) return error.OnlineMergeArtifactTailsUnsupported;
     const bound = (try producer_input.authorizeTemplate(alloc, txn, request, plan)) orelse return error.ArtifactCatalogDrift;
     if (request.kind == .asset and bound.requirement.scope != .document) return error.OnlineMergeArtifactTailsUnsupported;
     return bound;
@@ -201,7 +201,7 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
     }
     if (config.kind != .asset or command.producer_scope_key.len != 0) return error.InvalidBatchRequest;
     const producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(owned, config.producer_json);
-    if (producer.type == .document_extraction or config.neighbor_context_json.len != 0) return error.OnlineMergeArtifactTailsUnsupported;
+    if (producer.type == .document_extraction or (config.neighbor_context_json.len != 0 or config.context_sources_json.len != 0)) return error.OnlineMergeArtifactTailsUnsupported;
     const extraction_source = try sourceIsExtraction(owned, configs, config.source_artifact_name);
     var fences: std.ArrayList(UpstreamFence) = .empty;
     for (command.mutations) |effect| {

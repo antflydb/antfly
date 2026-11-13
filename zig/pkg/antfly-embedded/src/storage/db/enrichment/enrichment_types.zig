@@ -220,6 +220,10 @@ pub const GeneratedEnrichmentRequest = struct {
     /// non-empty, the runtime samples the document's same-shard graph
     /// adjacency into the rendered producer input before dispatch.
     neighbor_context_json: []const u8 = "",
+    /// Canonical context-source declaration (`context_sources.zig` stored
+    /// form). When non-empty, the runtime binds, registers, and renders named
+    /// cross-document context into the producer input before dispatch.
+    context_sources_json: []const u8 = "",
     group_source_json: []const u8 = "",
     group_artifact_name: []const u8 = "",
     group_configuration: [32]u8 = @splat(0),
@@ -289,6 +293,7 @@ pub fn freeGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReques
     if (request.group_artifact_name.len > 0) alloc.free(request.group_artifact_name);
     if (request.prior_context_json.len > 0) alloc.free(request.prior_context_json);
     if (request.neighbor_context_json.len > 0) alloc.free(request.neighbor_context_json);
+    if (request.context_sources_json.len > 0) alloc.free(request.context_sources_json);
     if (request.execution_json.len > 0) alloc.free(request.execution_json);
     if (request.upstream_artifact_name.len > 0) alloc.free(request.upstream_artifact_name);
     for (request.consumer_indexes) |name| alloc.free(name);
@@ -322,6 +327,8 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
     errdefer if (prior_context_json.len > 0) alloc.free(prior_context_json);
     const neighbor_context_json = if (request.neighbor_context_json.len > 0) try alloc.dupe(u8, request.neighbor_context_json) else "";
     errdefer if (neighbor_context_json.len > 0) alloc.free(neighbor_context_json);
+    const context_sources_json = if (request.context_sources_json.len > 0) try alloc.dupe(u8, request.context_sources_json) else "";
+    errdefer if (context_sources_json.len > 0) alloc.free(context_sources_json);
     const execution_json = if (request.execution_json.len > 0) try alloc.dupe(u8, request.execution_json) else "";
     errdefer if (execution_json.len > 0) alloc.free(execution_json);
     const upstream_artifact_name = if (request.upstream_artifact_name.len > 0) try alloc.dupe(u8, request.upstream_artifact_name) else "";
@@ -361,6 +368,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .group_configuration = request.group_configuration,
         .prior_context_json = prior_context_json,
         .neighbor_context_json = neighbor_context_json,
+        .context_sources_json = context_sources_json,
         .execution_json = execution_json,
         .upstream_artifact_name = upstream_artifact_name,
         .consumer_indexes = consumer_indexes,
