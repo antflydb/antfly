@@ -1923,6 +1923,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "distributed min-hop paths stream bounded pages and admit each vertex once",
         "distributed min-hop pages preserve",
         "distributed min-hop page ownership",
+        "api http graph operator limits",
         "distributed frontier reservations precede allocation and release on deinit",
         "anchor-only aggregate fails closed at the shared anchor scan ceiling",
         "k shortest paths preserve parallel typed edge identities",

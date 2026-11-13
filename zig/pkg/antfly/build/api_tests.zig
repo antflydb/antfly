@@ -1371,6 +1371,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed min-hop paths stream bounded pages and admit each vertex once",
             "distributed min-hop pages preserve",
             "distributed min-hop page ownership",
+            "api http graph operator limits",
             "distributed graph edges response round trips owned edges",
             "internal batch parser owns and round trips graph mutations",
             "internal batch graph endpoint cleanup command",
