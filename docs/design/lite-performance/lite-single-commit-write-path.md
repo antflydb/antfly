@@ -2449,25 +2449,89 @@ Merge that branch once it's refined.
 
 Per the task's own ordering ("start with derived catch-up's document
 reads, then batch reads, then everything else"), delivered as targeted
-fixes on the existing primitives first, with the `ReadView` type itself
-and the `CheckpointedTree` rename as the next, not-yet-started step:
+fixes on the existing primitives first (this subsection's own earlier
+revision), then the `ReadView` type itself on `perf/lwa-readview`:
 
-- Done: the three fixes listed at the top of this section (`Cursor`'s
-  merge, `getDocumentsAtCheckpointWithState`'s pre-pass,
+- Done earlier: the three fixes listed at the top of this section
+  (`Cursor`'s merge, `getDocumentsAtCheckpointWithState`'s pre-pass,
   `readBackingPages`'s read-ahead window).
-- Not done: the actual `ReadView` type; routing `Cursor`/`Txn`'s read
-  API through it instead of each having its own merge; the
-  `CheckpointedTree` rename/visibility restriction; collapsing
-  `ReadGeneration` into (or onto) `ReadView`.
+- Done on `perf/lwa-readview`: `NativeFile.readMark(checkpoint)` /
+  `redoOverlayEntryAt(root, mark, key)` (cherry-picked from
+  `perf/lwa-wal`'s `467c37d8c1`) -- the actual (C, M) split
+  `redoOverlayEntry` needed: every caller used to resolve the overlay at
+  `checkpoint.commit_sequence` directly, correct only when the physical
+  checkpoint and the logical commit sequence coincide, wrong for the
+  live, current generation under redo mode. `readMark` picks
+  `committedSequence()` when `checkpoint` is the file's own current one,
+  `checkpoint.commit_sequence` otherwise (an already-checkpointed older
+  generation, where the two already coincide by construction).
+- Done: the `ReadView` type itself (`native.zig`) -- `open`/`openAt`/
+  `borrowed` constructors (the first two pin with the exact two calls
+  `pinInitializedReadGeneration` makes, in the same order; `borrowed`
+  describes a view over a pin some longer-lived caller already holds,
+  e.g. a `Txn`'s own `ReadPin`), and read methods (point get, batch get,
+  index-value family, metadata/index catalog cursors, and a document
+  tree-cursor-plus-overlay-scan pair for `docstore.Cursor`'s own merge)
+  delegating to the existing checkpoint-taking primitives with `mark`
+  now computed via `readMark` rather than reused from `checkpoint`
+  directly.
+- Done: `CheckpointedTree` rename (from `DocumentIndexCursor`) with a
+  doc comment marking it as intended only for `checkpointRedoLog`'s
+  fold, vacuum, recovery, and `ReadView`'s own internals -- kept `pub`
+  (not a hard compile-time restriction yet: Zig's privacy model means a
+  non-`pub` type's name cannot appear in another file's own field
+  declarations at all, which `docstore.Cursor` needs for its tree-side
+  field, so fully hiding it would have required the full `MergedCursor`
+  abstraction below instead of a rename; deferred, see below). `Txn`'s
+  own direct `CatalogCursor`/`OverlayScanState` construction is gone --
+  `openCursor`/`get`/`getManySorted`/`valueIdentity`/`valueFingerprint`/
+  `openIndexValue`/`readIndexValueInto`/`checksumIndexValue`/
+  `readAuthenticatedIndexValue`/`copyIndexValueTo` all build a borrowed
+  `ReadView` over the `Txn`'s own already-pinned generation/checkpoint
+  and call through it.
+- Done: `OverlayScanState.initForPrefix`'s "must equal the live
+  checkpoint exactly" gate, removed (now an alias for
+  `initForPrefixUnchecked`) -- found it silently emptying the overlay
+  for `index_storage.zig`'s directory listing and
+  `native_catalog_sink.zig`'s `loadAllAlloc` (the dense/sparse/graph/
+  full-text native-catalog seed this section's own §9.3d audit had
+  marked safe), both reached through a `ReadGeneration`'s separately-
+  opened file with a tracked-but-genuinely-current checkpoint -- the
+  exact same bug class as `docstore.Cursor`'s original one, just not
+  yet found there. Per-key resolution was already checkpoint-
+  independent; only enumeration needed widening.
+- Not done: `docstore.Cursor`'s three-way merge still does its own
+  disk/overlay comparison loop (now against `ReadView.
+  openDocumentTreeCursor`/`openDocumentOverlayScan`/
+  `documentOverlayEntry`/`readValueChainAlloc` instead of constructing
+  `CheckpointedTree`/`OverlayScanState`/`redoOverlayEntry` directly, but
+  the comparison/consumption logic itself did not move into a
+  `native.zig`-side `MergedCursor`). Building that abstraction --
+  genuinely hiding `CheckpointedTree`, and supporting `Cursor`'s keys-
+  only/length-only short-circuits against its own disk-side candidate
+  without materializing a full value -- is the next step toward fully
+  collapsing this into one primitive. `ReadGeneration` itself also has
+  not been collapsed onto `ReadView`; it keeps its own pin lifecycle,
+  with `Txn.readView()` building a `borrowed` `ReadView` over it per
+  call.
 - Not done: the reclaim agent's planned redo on/off differential oracle
-  against the `ReadView` API -- waiting on the API actually existing.
-- Test added for this section specifically: "lite derived catch-up sees
-  a document and its full-text entry written without a checkpoint,
-  before and after a crash and reopen" (`crash_consistency_test.zig`) --
-  exercises the real catch-up API end to end (write, no checkpoint, run
-  catch-up, assert visible; then crash/reopen and repeat), rather than
-  probing `ReadView`'s own internals directly, since the type does not
-  exist yet.
+  against the `ReadView` API.
+- Tests added: "lite derived catch-up sees a document..." (earlier
+  revision, `crash_consistency_test.zig`); "lite ReadView: get, batch
+  get, and a catalog range scan across put, overwrite, delete, a
+  checkpoint, and a reopen" (`native.zig`) -- exercises `ReadView.open`
+  directly across the overlay/tree boundary a checkpoint creates and
+  across a close+reopen (recovery must replay the log before any
+  `ReadView` can pin it); "native catalog sink: a mid-stream index
+  admission is visible to `loadAllAlloc` before any checkpoint"
+  (`native_catalog_sink.zig`) -- the exact seam every full-text/dense/
+  sparse/graph native-catalog managed index seeds through and writes
+  through, exercising "admit a record mid-stream, no checkpoint" at
+  that layer directly, since the real end-to-end `db.addIndex` path
+  currently fails on its first call for an unrelated, separately-owned
+  write-path bug (a `LogFull`/`OutcomeUnknown` case in index creation's
+  own `deleteTree`, traced but not fixed by this branch -- see the
+  `perf/lwa-readview` report).
 
 ### 9.8 Gates (from step (c) on)
 
