@@ -3817,6 +3817,60 @@ pub const Store = struct {
         }
     }
 
+    /// Explicit, caller-requested redo-log checkpoint, for a test or a
+    /// future operator-facing "flush now" need. Properly serialized with
+    /// every other writer on this file through the same `lockStoreExclusive`
+    /// lease `maybeCheckpointRedoLogOnIdleTurn`'s own background turn below
+    /// uses -- `self.file.checkpointRedoLog()` (`NativeFile`'s, not this
+    /// one) is never safe to call directly once ride-along is running:
+    /// nothing else excludes it from a foreground commit or the idle-turn's
+    /// own background call racing the exact same `NativeFile` instance.
+    /// Confirmed live: the redo differential oracle's own `.checkpoint` op
+    /// used to call `side.store.file.checkpointRedoLog()` directly, and
+    /// with the idle-turn's background task left enabled (rather than
+    /// disabled via `ride_along_flush_unavailable`, its own former
+    /// workaround), an unsynchronized `self.transaction_header` check-then-set
+    /// race between the two produced either a clean `TransactionAlreadyActive`
+    /// (one call's `beginTransaction` loses the race cleanly) or, on tighter
+    /// timing, both calls passing the `transaction_header != null` check
+    /// before either sets it, corrupting `self.ledger`/the page allocator
+    /// concurrently mid-`putDocumentBatch` -- a real segfault, not merely an
+    /// error return. This is the fix: give every caller that wants a
+    /// checkpoint *now*, not just the idle turn, the same lock.
+    ///
+    /// Returns whatever the underlying call returns (`error
+    /// .InvalidTransactionState` when this file has no redo log, in
+    /// particular -- callers that only want to checkpoint an active redo
+    /// log should check `self.file.redo != null` first, same as before).
+    /// `error.FileBusy` while another maintenance cycle or an in-flight
+    /// vacuum's change capture owns the workspace -- an *explicit* request
+    /// deliberately does not silently no-op here the way the idle turn's
+    /// own best-effort skip just below does: a caller asking for a
+    /// checkpoint *now* needs to know whether it actually happened. The
+    /// idle turn's own skip is fine to stay silent because nothing is
+    /// waiting on its result; this call's result is the caller's only
+    /// signal. (Confirmed live: an earlier version of this returned success
+    /// unconditionally on that branch, and the always-on background
+    /// maintenance loop -- started after the first writer slot release,
+    /// unrelated to ride-along -- made this skip happen often enough, even
+    /// with ride-along fully disabled, that the redo differential oracle's
+    /// own `.checkpoint` op silently no-opped on a schedule the test had no
+    /// way to detect, leaving the log's overlay to grow unflushed past what
+    /// the test's own page/size bookkeeping expected -- surfacing later as
+    /// an unrelated-looking `error.EndOfStream` short read on a page a
+    /// since-skipped checkpoint never got around to writing.) Callers that
+    /// want "force it through no matter what" instead of "tell me if it
+    /// didn't happen" should retry on `error.FileBusy`, same as any other
+    /// `performVacuum`-style busy signal in this file.
+    pub fn checkpointRedoLog(self: *Store) !void {
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, .allocator_service);
+        defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
+        lockStoreExclusive(self);
+        defer self.mutex.unlock();
+        if (self.maintenance_running or self.generation_workspace_active or self.file.change_capture != null) return error.FileBusy;
+        try self.file.checkpointRedoLog();
+    }
+
     /// Step 4's background trigger, called from `rideAlongFlushLoop`'s
     /// periodic wake (every `ride_along_idle_ns`, started eagerly for any
     /// redo-log file -- see `openWithOptions`/`createWithOptions`).
@@ -8032,7 +8086,7 @@ test "lite online vacuum preserves the redo log across the generation swap while
     write = try store.beginWrite();
     try write.put("doc", "after-vacuum-redo-write");
     try write.commit();
-    try store.file.checkpointRedoLog();
+    try store.checkpointRedoLog();
     var after_fold = try store.beginRead();
     defer after_fold.abort();
     try std.testing.expectEqualStrings("after-vacuum-redo-write", try after_fold.get("doc"));
@@ -10112,7 +10166,7 @@ test "lite docstore cursor merges the redo overlay across put, overwrite, delete
     // Checkpoint: alpha/beta/gamma move into the real tree. The cursor
     // must see exactly the same results, now page-sourced instead of
     // overlay-sourced.
-    try store.file.checkpointRedoLog();
+    try store.checkpointRedoLog();
     try checkCursorSees(&store, &.{
         .{ .key = "alpha", .value = "one" },
         .{ .key = "beta", .value = "two" },
