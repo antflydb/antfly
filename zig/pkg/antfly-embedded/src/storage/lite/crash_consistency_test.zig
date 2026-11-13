@@ -3177,7 +3177,17 @@ test "crash sweep: commit failing after staging under a persistent io fault does
     defer db_mod.test_visibility_wait_timeout_ms = null;
 
     handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text }) catch |err| switch (err) {
-        error.CommitVisibilityNotSatisfied, error.InputOutput => {},
+        // With the redo log on, a persistent fault on this commit's own
+        // write surfaces as `error.OutcomeUnknown`, not a raw I/O error:
+        // `NativeFile.publishCheckpoint`'s redo branch documents that a
+        // failed append or sync always reports `OutcomeUnknown` (never the
+        // underlying error) so callers treat the commit exactly as
+        // uncertain as the legacy two-slot path would (see that
+        // function's own "A failed sync (not append...) still reports
+        // `OutcomeUnknown`" comment). This test's own assertions -- no
+        // leak, no hang -- do not depend on which of the three this
+        // particular op/fault combination surfaces as.
+        error.CommitVisibilityNotSatisfied, error.InputOutput, error.OutcomeUnknown => {},
         else => return err,
     };
 
