@@ -100,6 +100,7 @@ def run_clients(url, drivers, http_url=None):
             (CLIENTS, ["node", "node.mjs"]),
         ],
         "kysely": [
+            (CLIENTS, ["node", "--test", "worker-progress.test.mjs"]),
             (CLIENTS, ["node", "kysely.mjs"]),
         ],
         "go": [(CLIENTS / "go", ["go", "run", "."])],

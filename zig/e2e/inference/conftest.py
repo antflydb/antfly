@@ -559,6 +559,24 @@ class InferenceServer:
             self.output.close()
 
 
+def _model_provision_plan(items):
+    selected, groups = [], []
+    for item in items:
+        required = tuple(
+            name
+            for marker in item.iter_markers("inference_models")
+            for name in marker.args
+        )
+        if required:
+            # A concrete declaration replaces broad file/family defaults. Keep
+            # module/function markers together as one complete test dependency.
+            groups.append(required)
+        else:
+            marker = item.get_closest_marker("inference_model")
+            selected.append((Path(item.path).name, marker.args[0] if marker else None))
+    return selected, tuple(groups)
+
+
 @pytest.fixture(scope="session")
 def base_url(request):
     """Return the base URL of the inference server under test.
@@ -618,23 +636,8 @@ def base_url(request):
     except RuntimeError:
         pytest.skip("Set ANTFLY_INFERENCE_URL or ANTFLY_BIN to run E2E tests")
 
-    prefetch_test_models(
-        [
-            (
-                Path(item.path).name,
-                marker.args[0]
-                if (marker := item.get_closest_marker("inference_model"))
-                else None,
-            )
-            for item in request.session.items
-        ],
-        required_models=tuple(
-            name
-            for item in request.session.items
-            for marker in item.iter_markers("inference_models")
-            for name in marker.args
-        ),
-    )
+    selected, groups = _model_provision_plan(request.session.items)
+    prefetch_test_models(selected, required_model_groups=groups)
     models_path = str(models_dir())
     ml_path = str(ml_dir())
 

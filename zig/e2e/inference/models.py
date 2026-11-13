@@ -1048,7 +1048,9 @@ def _env_model_specs() -> list[ModelSpec]:
 
 
 def prefetch_test_models(
-    items: list[tuple[str, str | None]], *, required_models: tuple[str, ...] = ()
+    items: list[tuple[str, str | None]],
+    *,
+    required_model_groups: tuple[tuple[str, ...], ...] = (),
 ) -> None:
     """Provision only the selected tests' default families, before server start.
 
@@ -1082,34 +1084,51 @@ def prefetch_test_models(
             continue
         else:
             tasks.update(families.get(file, ()))
-    explicit = [spec for spec in _env_model_specs() if spec.task in tasks]
-    explicit_keys = {(spec.task, spec.request_name.lower()) for spec in explicit}
+    env_specs = _env_model_specs()
+    explicit = [spec for spec in env_specs if spec.task in tasks]
+    explicit_keys = {(spec.task, spec.request_name.lower()) for spec in env_specs}
     planned = [
         spec
         for task, spec in DEFAULT_E2E_MODELS.items()
         if task in tasks
         and not (
             task == "generators"
-            and os.environ.get("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL")
+            and os.environ.get("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", "").strip()
         )
     ]
     planned.extend(explicit)
-    for name in required_models:
-        if name not in CURATED_BY_NAME:
-            raise ValueError(f"Unknown required E2E model: {name}")
-        planned.append(CURATED_BY_NAME[name])
+
+    def download_allowed(spec: ModelSpec) -> bool:
+        key = (spec.task, spec.request_name.lower())
+        return (
+            not spec.large
+            or key in explicit_keys
+            or run_large_model_tests()
+            or (spec.repo == "antflydb/clipclap" and run_clipclap_contract_tests())
+        )
+
+    # Resolve every declaration before doing I/O. Dependencies belong to a test,
+    # not to its scheduling affinity: an unavailable gated prerequisite must
+    # defer the entire optional group instead of downloading unused siblings.
+    groups: list[list[ModelSpec]] = []
+    for names in required_model_groups:
+        group = []
+        for name in names:
+            spec = CURATED_BY_NAME.get(name.strip().lower())
+            if spec is None:
+                raise ValueError(f"Unknown required E2E model: {name}")
+            group.append(spec)
+        groups.append(group)
+    for group in groups:
+        if all(download_allowed(spec) or model_available(spec) for spec in group):
+            planned.extend(group)
     seen: set[tuple[str, str]] = set()
     for spec in planned:
         key = (spec.task, spec.request_name.lower())
         if key in seen:
             continue
         seen.add(key)
-        if (
-            spec.large
-            and key not in explicit_keys
-            and not run_large_model_tests()
-            and not (spec.repo == "antflydb/clipclap" and run_clipclap_contract_tests())
-        ):
+        if not download_allowed(spec):
             continue
         started = time.monotonic()
         ensure_model(spec)

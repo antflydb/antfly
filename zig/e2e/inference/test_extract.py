@@ -117,7 +117,7 @@ def test_extract_include_confidence_and_spans(api):
                 assert "end" in item
 
 
-@pytest.mark.inference_models("antflydb/florence-2-base")
+@pytest.mark.inference_models(GLINER_MODEL, "antflydb/florence-2-base")
 def test_extract_from_images_via_reader(api):
     """Image-backed extraction should route through /read before schema extraction."""
     if not _has_reader_model(api):
