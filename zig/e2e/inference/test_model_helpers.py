@@ -1040,7 +1040,55 @@ def test_model_provisioning_follows_selected_family_and_affinity(monkeypatch):
     assert [s.task for s in pulled] == ["transcribers"]
     pulled.clear()
     prefetch_test_models([("test_models.py", "eviction")])
-    assert [s.task for s in pulled] == ["embedders"]
+    assert pulled == []
     pulled.clear()
     prefetch_test_models([("test_model_helpers.py", None)])
+    assert pulled == []
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_eviction_provisions_its_concrete_pair_without_dense_defaults(
+    monkeypatch, enabled
+):
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    monkeypatch.setattr(models, "run_large_model_tests", lambda: False)
+    monkeypatch.setattr(models, "run_clipclap_contract_tests", lambda: enabled)
+    pulled = []
+    monkeypatch.setattr(models, "ensure_model", pulled.append)
+    prefetch_test_models(
+        [("test_models.py", "eviction")],
+        required_models=("antflydb/clipclap", "antflydb/florence-2-base"),
+    )
+    assert [s.repo for s in pulled] == (
+        ["antflydb/clipclap", "antflydb/florence-2-base"]
+        if enabled
+        else ["antflydb/florence-2-base"]
+    )
+
+
+def test_sparse_only_selection_does_not_provision_dense_embeddings(monkeypatch):
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    pulled = []
+    monkeypatch.setattr(models, "ensure_model", pulled.append)
+    sparse = "sparse-encoder-testing/splade-bert-tiny-nq-onnx"
+    prefetch_test_models(
+        [("test_sparse_embed.py", None)], required_models=(sparse, sparse)
+    )
+    assert [s.repo for s in pulled] == [sparse]
+
+
+def test_structural_catalog_checks_do_not_provision_weights(monkeypatch):
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    pulled = []
+    monkeypatch.setattr(models, "ensure_model", pulled.append)
+    prefetch_test_models([("test_models.py", None)])
+    assert pulled == []
+
+
+def test_unknown_required_model_fails_before_provisioning(monkeypatch):
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    pulled = []
+    monkeypatch.setattr(models, "ensure_model", pulled.append)
+    with pytest.raises(ValueError, match="Unknown required E2E model"):
+        prefetch_test_models([("test_embed.py", None)], required_models=("typo/model",))
     assert pulled == []

@@ -1046,7 +1046,9 @@ def _env_model_specs() -> list[ModelSpec]:
     return specs
 
 
-def prefetch_test_models(items: list[tuple[str, str | None]]) -> None:
+def prefetch_test_models(
+    items: list[tuple[str, str | None]], *, required_models: tuple[str, ...] = ()
+) -> None:
     """Provision only the selected tests' default families, before server start.
 
     Catalog discovery must never pull weights. Explicit requests retain their
@@ -1061,13 +1063,11 @@ def prefetch_test_models(items: list[tuple[str, str | None]]) -> None:
         "test_classify.py": {"classifiers"},
         "test_extract.py": {"extractors"},
         "test_embed.py": {"embedders"},
-        "test_sparse_embed.py": {"embedders"},
         "test_rerank.py": {"rerankers"},
         "test_read.py": {"readers"},
         "test_dictate.py": {"transcribers"},
         "test_transcribe.py": {"transcribers"},
         "test_transcription_sessions.py": {"transcribers"},
-        "test_models.py": {"embedders", "classifiers", "extractors", "readers"},
     }
     tasks: set[str] = set()
     for file, affinity in items:
@@ -1076,7 +1076,9 @@ def prefetch_test_models(items: list[tuple[str, str | None]]) -> None:
         elif affinity == "reader":
             tasks.add("readers")
         elif affinity == "eviction":
-            tasks.add("embedders")
+            # Scheduling affinity is independent of model dependencies.
+            # The compound test declares its concrete pair with inference_models.
+            continue
         else:
             tasks.update(families.get(file, ()))
     explicit = [spec for spec in _env_model_specs() if spec.task in tasks]
@@ -1091,13 +1093,22 @@ def prefetch_test_models(items: list[tuple[str, str | None]]) -> None:
         )
     ]
     planned.extend(explicit)
+    for name in required_models:
+        if name not in CURATED_BY_NAME:
+            raise ValueError(f"Unknown required E2E model: {name}")
+        planned.append(CURATED_BY_NAME[name])
     seen: set[tuple[str, str]] = set()
     for spec in planned:
         key = (spec.task, spec.request_name.lower())
         if key in seen:
             continue
         seen.add(key)
-        if spec.large and key not in explicit_keys and not run_large_model_tests():
+        if (
+            spec.large
+            and key not in explicit_keys
+            and not run_large_model_tests()
+            and not (spec.repo == "antflydb/clipclap" and run_clipclap_contract_tests())
+        ):
             continue
         ensure_model(spec)
 

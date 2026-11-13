@@ -627,7 +627,13 @@ def base_url(request):
                 else None,
             )
             for item in request.session.items
-        ]
+        ],
+        required_models=tuple(
+            name
+            for item in request.session.items
+            for marker in item.iter_markers("inference_models")
+            for name in marker.args
+        ),
     )
     models_path = str(models_dir())
     ml_path = str(ml_dir())
@@ -1002,6 +1008,10 @@ def pytest_configure(config):
     """Model downloads are handled lazily by the request helpers when enabled."""
     config.addinivalue_line(
         "markers", "inference_model(name): primary model affinity for CI scheduling"
+    )
+    config.addinivalue_line(
+        "markers",
+        "inference_models(*names): concrete curated models required before catalog discovery",
     )
     if os.environ.get("ANTFLY_INFERENCE_DOWNLOAD") == "1":
         print(
