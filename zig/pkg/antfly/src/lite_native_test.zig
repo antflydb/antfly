@@ -40,6 +40,9 @@ test {
     // already is, so its unit/torn-tail/corruption tests run under
     // lite-storage-test.
     _ = @import("antfly_local_sources").storage_lite_redo_log;
+    // Differential oracle (redo log vs legacy commit path): also a pure
+    // test file production code never imports, forced in the same way.
+    _ = @import("antfly_local_sources").storage_lite_redo_differential_test;
 }
 
 /// Implementation source choices for this compilation root.

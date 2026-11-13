@@ -175,10 +175,35 @@ pub const Writer = struct {
         header.encode(&header_buf);
 
         const offset = self.base_offset + self.tail;
-        try self.file.writePositionalAll(self.io, &header_buf, offset);
+        // Writer-race investigation (docs/design/lite-performance/
+        // lite-single-commit-write-path.md §8/§9): the payload is written
+        // *before* the header, not after. These are two separate
+        // `writePositionalAll` calls -- not atomic with each other -- and
+        // this region is a fixed, preallocated extent (§9.1), so "ran out
+        // of bytes" never naturally happens; the only way `replay` can
+        // tell a torn write apart from real corruption is by looking at
+        // whether a *complete, valid* header exists here at all
+        // (`isAllZero`/magic-mismatch -> torn; a complete header whose
+        // payload fails its own CRC -> corrupt, a hard stop). Writing the
+        // header last means every torn write -- whether it's the payload
+        // call that fails, or the header call itself only partially lands
+        // -- leaves this record's own header incomplete or still
+        // all-zero, which `replay` already treats as a benign end of the
+        // valid prefix. The old order (header first) could leave a
+        // *complete, correctly-formed* header whose claimed CRC covers a
+        // payload that a subsequent failed write never actually wrote --
+        // indistinguishable from genuine corruption, since the
+        // preallocated region never reads back short. Reproduced via
+        // "crash sweep: full text recovers from one transient io fault
+        // with no crash": a `.write`-kind fault landing on the payload
+        // call, after the header call already succeeded, surfaced as
+        // `error.NativeRedoLogCorrupt` on reopen rather than the clean,
+        // retryable torn-tail recovery this design promises for exactly
+        // this case.
         if (payload.len != 0) {
             try self.file.writePositionalAll(self.io, payload, offset + header_len);
         }
+        try self.file.writePositionalAll(self.io, &header_buf, offset);
 
         self.tail += record_len;
         self.last_sequence = commit_sequence;
@@ -801,6 +826,92 @@ test "replay stops at a torn tail when the file is physically shorter than the r
     try testing.expectEqual(@as(u64, 1), outcome.valid_count);
     try testing.expectEqual(good_tail, outcome.valid_bytes);
     try testing.expectEqual(StopReason.torn_tail, outcome.stop_reason);
+}
+
+// Writer-race investigation (docs/design/lite-performance/
+// lite-single-commit-write-path.md §8/§9). `Writer.append` writes the
+// payload *before* the header -- two separate `writePositionalAll` calls,
+// not atomic with each other. This test proves why the order matters by
+// constructing both halves of a torn append directly (the way a real
+// transient I/O fault, interrupting one of the two calls, would leave the
+// bytes) and checking `replay`'s verdict on each:
+//
+// - payload landed, header did not (what the *current*, fixed order
+//   produces when the second call -- now the header -- fails): the header
+//   bytes are still the region's untouched zero-fill, so `replay` sees a
+//   benign end of the valid prefix (`end_of_region`), and a resumed
+//   `Writer` can append right over it.
+// - header landed, payload did not (what the *old*, header-first order
+//   produced when the second call -- then the payload -- failed): a
+//   complete, well-formed header whose claimed CRC covers payload bytes
+//   that were never written reads back as a hard, unrecoverable
+//   `corrupt_record` -- indistinguishable from real corruption, because
+//   this region is a fixed, preallocated extent (§9.1) that never reads
+//   back short. This is the exact failure `recoverRedoLog` surfaced as
+//   `error.NativeRedoLogCorrupt` from "crash sweep: full text recovers
+//   from one transient io fault with no crash" (a `.write`-kind fault
+//   landing on the payload call after the header call had already
+//   succeeded) before `Writer.append`'s write order was fixed.
+test "a torn append leaves a benign end of region, never a false corrupt_record, regardless of which of its two writes failed" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+
+    {
+        var region = try makeTempRegion(io, capacity);
+        defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+        var writer = Writer.init(region.file, io, 0, capacity);
+        try writer.append(1, "one");
+        try writer.sync();
+        const good_tail = writer.tail;
+
+        // Simulate the payload call succeeding and the header call (the
+        // second write `Writer.append` issues, after the fix) never
+        // landing: write only the payload for a would-be record 2: header
+        // position stays the region's untouched zero-fill.
+        try region.file.writePositionalAll(io, "two", good_tail + header_len);
+
+        const outcome = try replay(testing.allocator, region.file, io, 0, capacity, null, null, null);
+        try testing.expectEqual(@as(u64, 1), outcome.valid_count);
+        try testing.expectEqual(@as(u64, 1), outcome.last_sequence.?);
+        try testing.expectEqual(good_tail, outcome.valid_bytes);
+        try testing.expectEqual(StopReason.end_of_region, outcome.stop_reason);
+
+        // A writer resuming from this outcome appends right over the
+        // orphaned payload bytes -- no manual cleanup needed.
+        var resumed = Writer.initAt(region.file, io, 0, capacity, outcome.valid_bytes, outcome.last_sequence);
+        try resumed.append(2, "two");
+        try resumed.sync();
+        const resumed_outcome = try replay(testing.allocator, region.file, io, 0, capacity, null, null, null);
+        try testing.expectEqual(@as(u64, 2), resumed_outcome.valid_count);
+        try testing.expectEqual(StopReason.end_of_region, resumed_outcome.stop_reason);
+    }
+
+    {
+        var region = try makeTempRegion(io, capacity);
+        defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+        var writer = Writer.init(region.file, io, 0, capacity);
+        try writer.append(1, "one");
+        try writer.sync();
+        const good_tail = writer.tail;
+
+        // The old, header-first order's own failure mode, reproduced
+        // directly: a complete, well-formed header for record 2, correct
+        // CRC and all, with the payload bytes it claims never written
+        // (left as the region's untouched zero-fill). This is what the
+        // old `Writer.append` order could produce; `Writer` itself can no
+        // longer produce this shape, but `replay` must still call it what
+        // it is -- a real, unrecoverable corruption -- since nothing else
+        // can tell this apart from genuine on-disk damage.
+        var header_buf: [header_len]u8 = undefined;
+        const header: RecordHeader = .{ .payload_len = 3, .commit_sequence = 2, .crc32 = Crc32.hash("two") };
+        header.encode(&header_buf);
+        try region.file.writePositionalAll(io, &header_buf, good_tail);
+
+        const outcome = try replay(testing.allocator, region.file, io, 0, capacity, null, null, null);
+        try testing.expectEqual(@as(u64, 1), outcome.valid_count);
+        try testing.expectEqual(good_tail, outcome.valid_bytes);
+        try testing.expectEqual(StopReason.corrupt_record, outcome.stop_reason);
+    }
 }
 
 test "replay detects payload corruption via checksum mismatch" {

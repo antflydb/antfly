@@ -416,6 +416,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_lite_connection;
     _ = @import("antfly_local_sources").storage_lite_crash_consistency_test;
     _ = @import("antfly_local_sources").storage_lite_crash_sim_io;
+    _ = @import("antfly_local_sources").storage_lite_redo_differential_test;
     _ = @import("antfly_local_sources").storage_lite_docstore;
     _ = @import("antfly_local_sources").storage_lite_index_storage;
     _ = @import("antfly_local_sources").storage_lite_artifact_source;

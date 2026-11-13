@@ -465,6 +465,25 @@ pub const State = struct {
     pub fn count(self: *const State, page: u64) u32 {
         return if (page < self.counts.items.len) self.counts.items[@intCast(page)] else 0;
     }
+    /// True for a page this ledger owns as part of its own on-disk
+    /// bookkeeping (the current free-map root, or any page on the active
+    /// snapshot/pending/delta chains, tracked via `metadata`/
+    /// `builder_metadata` rather than through `counts`) -- the same
+    /// "self-describing, legitimately uncounted" exemption
+    /// `validateIndexedOwnership` already grants a `.metadata`/
+    /// `.allocator_chain` retirement candidate (`page == state.root_page
+    /// or current_metadata.contains(page)`). A caller that finds such a
+    /// page at `count() == 0` must not read that as "nothing has ever
+    /// retained this, it is free to claim" -- `preparePersist`'s own
+    /// rotation is about to retire exactly these pages in this same
+    /// persist cycle, and retaining one first double-books it (counted
+    /// as both live and pending retirement at once).
+    pub fn isSelfDescribingPage(self: *const State, page: u64) bool {
+        if (page == self.root_page) return true;
+        for (self.metadata.items) |p| if (p == page) return true;
+        for (self.builder_metadata.items) |p| if (p == page) return true;
+        return false;
+    }
     pub fn retain(self: *State, page: u64) !void {
         const current = self.count(page);
         if (current == free or current == max_references) return error.InvalidNativeAllocator;
