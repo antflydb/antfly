@@ -21,6 +21,9 @@ const abi = @import("kernel_owner_abi");
 const error_identity = @import("kernel_error_identity");
 const maintenance = @import("antfly_local_sources").storage_maintenance;
 const system_store_client = @import("kernel_system_store_client.zig");
+const kernel_runtime_services = @import("kernel_runtime_services.zig");
+const scraping = @import("antfly_scraping");
+const common_config = @import("antfly_local_sources").common_config;
 
 pub const LocalTransitionAction = abi.LocalTransitionAction;
 pub const LocalTransitionPhase = abi.LocalTransitionPhase;
@@ -96,12 +99,12 @@ pub const Context = struct {
     }
 
     /// Keep the remote-content publisher live across the compiled owner boundary.
-    pub fn configureRemoteContent(self: *Context, config: ?*const @import("antfly_scraping").RemoteContentConfig) !void {
+    pub fn configureRemoteContent(self: *Context, config: ?*const scraping.RemoteContentConfig) !void {
         const remote = config orelse return self.configureRemoteContentSecurity("");
         const Adapter = struct {
             fn acquire(raw: *anyopaque, out: *abi.OwnedBytes) callconv(.c) abi.Status {
-                const facade: *const @import("antfly_scraping").RemoteContentConfig = @ptrCast(@alignCast(raw));
-                const bytes = @import("antfly_local_sources").common_config.remoteContentSnapshotJsonAlloc(std.heap.smp_allocator, facade) catch |err| return switch (err) {
+                const facade: *const scraping.RemoteContentConfig = @ptrCast(@alignCast(raw));
+                const bytes = common_config.remoteContentSnapshotJsonAlloc(std.heap.smp_allocator, facade) catch |err| return switch (err) {
                     error.OutOfMemory => .out_of_memory,
                     error.Timeout => .timeout,
                     error.Canceled => .cancelled,
@@ -113,11 +116,39 @@ pub const Context = struct {
             fn release(_: *anyopaque, bytes: abi.OwnedBytes) callconv(.c) void {
                 std.heap.smp_allocator.free(bytes.slice());
             }
+            fn probe(raw: *anyopaque, out: *kernel_runtime_services.CachedRemoteContentSource.Revision) callconv(.c) abi.Status {
+                const facade: *const scraping.RemoteContentConfig = @ptrCast(@alignCast(raw));
+                var snapshot = facade.acquire() catch |err| return switch (err) {
+                    error.OutOfMemory => .out_of_memory,
+                    error.Timeout => .timeout,
+                    error.Canceled => .cancelled,
+                    else => .resource_temporarily_unavailable,
+                };
+                defer snapshot.deinit();
+                out.* = .{};
+                if (snapshot.revision) |revision| out.* = .{ .value = revision, .known = 1 };
+                return .ok;
+            }
+            fn acquireIfChanged(raw: *anyopaque, previous: ?*const [32]u8, out: *kernel_runtime_services.CachedRemoteContentSource.Update) callconv(.c) abi.Status {
+                const facade: *const scraping.RemoteContentConfig = @ptrCast(@alignCast(raw));
+                const update = common_config.remoteContentSnapshotUpdateAlloc(std.heap.smp_allocator, facade, previous) catch |err| return switch (err) {
+                    error.OutOfMemory => .out_of_memory,
+                    error.Timeout => .timeout,
+                    error.Canceled => .cancelled,
+                    else => .resource_temporarily_unavailable,
+                };
+                out.* = .{ .revision = update.revision };
+                if (update.json) |bytes| out.bytes = .{ .ptr = bytes.ptr, .len = bytes.len };
+                return .ok;
+            }
         };
-        const services = @import("kernel_runtime_services.zig");
-        const source = services.RemoteContentSource{ .version = 2, .context = @ptrCast(@constCast(remote)), .acquire = Adapter.acquire, .release = Adapter.release };
+        const source = kernel_runtime_services.CachedRemoteContentSource{
+            .source = .{ .version = 3, .context = @ptrCast(@constCast(remote)), .acquire = Adapter.acquire, .release = Adapter.release },
+            .probe = Adapter.probe,
+            .acquire_if_changed = Adapter.acquireIfChanged,
+        };
         try self.ensure();
-        try statusToError(services.antfly_storage_context_configure_remote_content_source(self.handle, &source));
+        try statusToError(kernel_runtime_services.antfly_storage_context_configure_remote_content_source(self.handle, &source.source));
     }
 
     pub fn configureRemoteContentSecurity(self: *Context, security_json: []const u8) !void {
