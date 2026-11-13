@@ -6920,15 +6920,49 @@ pub const NativeFile = struct {
         try self.file.writePositionalAll(io, &header_buf, 0);
         if (!self.no_sync) try self.file.sync(io);
 
+        try self.attachFreshRedoState(io, offset, capacity, checkpoint.commit_sequence);
+    }
+
+    /// Shared tail of `enableRedoLog` and `prepareVacuum`'s own redo-log
+    /// reservation (§9's "the vacuumed generation should come out as a
+    /// redo-log file too" -- `replaceWithPreparedGeneration` used to drop
+    /// `self.redo` unconditionally on every vacuum, permanently reverting
+    /// any redo-log store to the legacy commit path after its first
+    /// vacuum): wires up `self.redo` for a file whose log region at
+    /// `(offset, capacity)` is freshly reserved and has nothing in it yet
+    /// to replay -- true both for a brand-new file (`enableRedoLog`'s own
+    /// precondition) and for a vacuum's private, freshly-built compacted
+    /// image (every live mutation already landed in the compacted tree
+    /// itself via the ordinary copy pass, never through this fresh log).
+    /// `self.inode_lock_ref` must already resolve to this file's own real
+    /// registry entry (true for both callers: `enableRedoLog` runs after
+    /// `createWithIo`/`createWithOptions`'s own bootstrap; `prepareVacuum`
+    /// calls this on `prepared`, after `inode_lock.open` on its tmp path).
+    fn attachFreshRedoState(self: *NativeFile, io: std.Io, offset: u64, capacity: u64, checkpoint_sequence: u64) !void {
+        std.debug.assert(self.redo == null);
         self.manifest_commits_enabled = false;
         const entry = self.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
         const shared = try inode_lock.ensureRedoOverlay(entry, io, {}, struct {
-            // A freshly-created file has nothing to replay -- the shared
-            // overlay this populates stays empty until the first commit
-            // appends to it.
+            // Nothing to replay: the shared overlay this populates stays
+            // empty until the first commit appends to it.
             fn populate(_: void, _: *redo_overlay.SharedRedoOverlay, _: Allocator) anyerror!void {}
         }.populate);
-        self.redo = RedoCommitState{ .writer = redo_log.Writer.init(self.file, io, offset, capacity), .shared = shared, .checkpoint_sequence = checkpoint.commit_sequence };
+        // `durable_sequence = checkpoint_sequence`: the same convention
+        // `recoverRedoLog` uses when its own replay finds nothing past the
+        // checkpoint (`outcome.last_sequence orelse checkpoint.commit_sequence`,
+        // this file's own doc comment a few lines up) -- an empty log
+        // attached to an already-durable checkpoint means that checkpoint's
+        // sequence *is* the highest durable one so far, not zero. For
+        // `enableRedoLog`'s brand-new-file caller this is a no-op either
+        // way (the bootstrap checkpoint's own sequence is already the
+        // zero/initial value); for `prepareVacuum`'s caller it is load-
+        // bearing -- the vacuum's own checkpoint just became durable via a
+        // real sync, not a log append, and `durableSequence()`/every
+        // caller that compares an acknowledged write's sequence against it
+        // (`Store.Ticket`'s own durability wait, cross-process readers via
+        // `publishRedoLogState` below) must see that immediately, not
+        // revert to "nothing is durable yet" the moment a vacuum lands.
+        self.redo = RedoCommitState{ .writer = redo_log.Writer.init(self.file, io, offset, capacity), .shared = shared, .checkpoint_sequence = checkpoint_sequence, .durable_sequence = checkpoint_sequence };
     }
 
     /// Replays the valid log prefix past the on-disk checkpoint's own
@@ -13837,6 +13871,24 @@ pub const NativeFile = struct {
 
         const before_size = (try self.file.stat(io)).size;
         const previous = self.activeCheckpoint();
+        // §9's "the vacuumed generation should come out as a redo-log file
+        // too": a vacuum used to always rebuild a plain, non-redo compacted
+        // image (`attachFreshRedoState`'s own doc comment), permanently
+        // reverting any redo-log store to the legacy commit path after its
+        // first vacuum -- every long-lived database would lose the whole
+        // point of the redo-log write path the moment maintenance first
+        // compacted it. Reserve the same capacity the original file
+        // already has (`self.header.redo_log_capacity`) in the compacted
+        // image too, rather than recomputing docstore.zig's own
+        // size-under-budget policy (§9.7a) here -- that scaling is a
+        // `Store.createWithOptions`-level decision keyed off
+        // `reclamation.max_storage_bytes`, which this layer already
+        // respects via `self.max_file_bytes`/`vacuum_workspace_limit`;
+        // preserving whatever capacity this file was already reserving is
+        // the same budget by construction.
+        const reserve_redo_log = self.redo != null;
+        var redo_log_offset_bytes: u64 = 0;
+        var redo_log_capacity_bytes: u64 = 0;
 
         const page_size: usize = @intCast(self.header.page_size);
         var random: [16]u8 = undefined;
@@ -13885,6 +13937,18 @@ pub const NativeFile = struct {
             if (next_page_id >= limit / self.header.page_size) return error.LiteStorageBudgetExceeded;
         }
         if (!indexed) free_map_root_page = try appendFreeMapPageToFile(self.allocator, compact_file, io, page_size, &next_page_id, next_page_id + 1, &.{});
+        if (reserve_redo_log and !indexed) {
+            // Mirrors `enableRedoLog`'s own non-indexed branch: bump
+            // `page_count` past the reserved span with no free-map update
+            // (a plain free map tolerates `page_count` running ahead of
+            // its own last-written content -- that function's own doc
+            // comment).
+            const page_size_u64: u64 = self.header.page_size;
+            const log_pages = std.math.divCeil(u64, @max(self.header.redo_log_capacity, 1), page_size_u64) catch unreachable;
+            redo_log_offset_bytes = next_page_id * page_size_u64;
+            redo_log_capacity_bytes = log_pages * page_size_u64;
+            next_page_id += log_pages;
+        }
 
         var checkpoint = CheckpointSlot{
             .commit_sequence = previous.commit_sequence + 1,
@@ -13934,11 +13998,40 @@ pub const NativeFile = struct {
             defer graph.deinit(self.allocator);
             var pages = PageAllocator{ .file = &writer, .free_pages = &.{}, .next_page_id = next_page_id, .ledger = state, .can_reuse = false };
             defer pages.deinit();
+            if (reserve_redo_log) {
+                // Mirrors `enableRedoLog`'s own indexed branch: reserve the
+                // log region's page-id span through the real allocator
+                // *before* the free-map root page, the same order that
+                // function uses, so the ledger's own coverage and the
+                // checkpoint's `page_count` (set by `persistAllocator`
+                // below, from `pages.next_page_id`) land in lockstep.
+                const page_size_u64: u64 = self.header.page_size;
+                const log_pages = std.math.divCeil(u64, @max(self.header.redo_log_capacity, 1), page_size_u64) catch unreachable;
+                redo_log_offset_bytes = next_page_id * page_size_u64;
+                redo_log_capacity_bytes = log_pages * page_size_u64;
+                for (0..log_pages) |_| _ = try pages.allocateFresh();
+            }
             checkpoint.free_map_root_page = try pages.allocate();
             try writer.persistAllocator(&pages, &checkpoint);
             next_page_id = pages.next_page_id;
             compact_header.checkpoints = .{ checkpoint, checkpoint };
         }
+        // Deferred until after the agenda-bootstrap projection below (not
+        // set on `compact_header` yet): that projection runs a real
+        // transaction (`beginTransaction`/`commitTransaction`) against a
+        // bare `NativeFile` literal whose own `.redo` is `null` by
+        // construction -- setting `redo_log_capacity` on its header before
+        // that would make `self.header.redo_log_capacity != 0` (a redo-log
+        // signal several call sites outside this function trust, e.g.
+        // `decodeFreeMapAlloc`) disagree with `self.redo == null` (the
+        // actual diversion state) for the span of that one migration pass,
+        // the same inconsistent-intermediate-state hazard this design's own
+        // §9.3d per-subsystem audit exists to rule out. The page-id span
+        // itself is already reserved above either way (`redo_log_offset_
+        // bytes`/`redo_log_capacity_bytes`, computed from `next_page_id`
+        // before this function ever allocates more), so deferring only the
+        // header *field write* changes nothing about where the region
+        // physically ends up.
 
         if (indexed and !self.header.indexed_reclamation) {
             // Legacy formats have no agenda. Bootstrap it once from the source
@@ -13974,6 +14067,8 @@ pub const NativeFile = struct {
             compact_header = projection.header;
             next_page_id = projection.activeCheckpoint().page_count;
         }
+        compact_header.redo_log_offset = redo_log_offset_bytes;
+        compact_header.redo_log_capacity = redo_log_capacity_bytes;
         var encoded_header: [header_size]u8 = undefined;
         encodeHeader(&encoded_header, compact_header);
         try compact_file.writePositionalAll(io, &encoded_header, 0);
@@ -14012,7 +14107,26 @@ pub const NativeFile = struct {
         // anything using the registry on that inode, the same class of
         // bug this registry exists to rule out everywhere else.
         const inode_entry = try inode_lock.open(io, tmp_path);
-        return .{ .prepared = .{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = tmp_path, .file = compact_file, .header = compact_header, .no_sync = self.no_sync, .page_cache_policy = .metadata_only, .page_cache = .{ .resource_manager = self.page_cache.resource_manager }, .max_file_bytes = self.vacuum_workspace_limit, .inode_lock_ref = .init(inode_entry) }, .report = .{
+        const prepared: NativeFile = .{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = tmp_path, .file = compact_file, .header = compact_header, .no_sync = self.no_sync, .page_cache_policy = .metadata_only, .page_cache = .{ .resource_manager = self.page_cache.resource_manager }, .max_file_bytes = self.vacuum_workspace_limit, .inode_lock_ref = .init(inode_entry) };
+        // `prepared.redo` stays `null` here, deliberately, even when
+        // `reserve_redo_log` reserved the page-id span and header fields
+        // for one above: `prepared` is still under construction --
+        // `Store.performVacuum`'s own `preparePublicationSequence` and
+        // catch-up-round machinery still run real, undiverted ledger/
+        // free-map writes against it before this generation is ever
+        // adopted. Attaching `self.redo` this early made every one of
+        // those internal writes divert into the (empty, not-yet-shared)
+        // overlay instead of writing real pages -- `next_page_id`/
+        // `checkpoint.page_count` kept advancing as if they had, so the
+        // adopted header ended up claiming pages the file was never
+        // actually extended to hold (`PageWriteBatch.flush`'s own
+        // diversion check, confirmed live: `checkpointPrefixSize >
+        // file_size` on the very first read after an *online* vacuum,
+        // `recoverActiveCheckpoint`'s `candidates == 0`). Attaching
+        // `self.redo` happens instead in `replaceWithPreparedGeneration`,
+        // after every such internal write this generation will ever make
+        // is already done and the swap has settled.
+        return .{ .prepared = prepared, .report = .{
             .before_size = before_size,
             .after_size = after_size,
             .reclaimed_bytes = if (before_size > after_size) before_size - after_size else 0,
@@ -17371,27 +17485,59 @@ pub const NativeFile = struct {
         // have published to this entry since (the swap runs under the
         // writer-lease admission gate's own exclusivity).
         if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.resetCommittedSequence(entry, self.activeCheckpoint().commit_sequence);
-        // §9.3a/§9.4: `prepared` (built by `prepareVacuum`) never carries a
-        // redo-log region of its own -- its header's `redo_log_capacity` is
-        // always 0 -- but the live `self.redo`, if this file had one, still
-        // points its `writer` at the *old* file's fd and byte offsets,
-        // which the swap above just moved into `prepared.file` (about to be
-        // closed by this call's caller) and which no longer correspond to
-        // anything in the compacted file either way. Drop it so this
-        // handle's commit behavior matches the header it just adopted;
-        // uncheckpointed overlay content is not lost by this, because
-        // every committed mutation already reached the compacted file
-        // through `copyVacuumCatalogRecords`/`copyVacuumDocumentRecords`'s
-        // overlay-aware `LiveRecordCursor`/`OverlayScanState` scans.
-        if (self.redo) |*redo| {
-            redo.deinit(self.allocator);
-            self.redo = null;
-            // `enableRedoLog` turned this off when the file first became a
-            // redo-log file (log-based durability replaces manifest-based);
-            // the compacted file has no log region, so ordinary
-            // manifest-commit durability is the correct mode for it again.
+        // §9.3a/§9.4/§9 (vacuum redo-log retention): the live `self.redo`,
+        // if this file had one, still points its `writer` at the *old*
+        // file's fd and byte offsets, which the swap above just moved into
+        // `prepared.file` (about to be closed by this call's caller) and
+        // which no longer correspond to anything in the compacted file
+        // either way -- always drop it; uncheckpointed overlay content is
+        // not lost by this, because every committed mutation already
+        // reached the compacted file through `copyVacuumCatalogRecords`/
+        // `copyVacuumDocumentRecords`'s overlay-aware `LiveRecordCursor`/
+        // `OverlayScanState` scans.
+        if (self.redo) |*redo| redo.deinit(self.allocator);
+        self.redo = null;
+        // The adopted header carries a reserved log region whenever
+        // `prepareVacuum` found one on the source file (`reserve_redo_log`)
+        // -- attach `self.redo` to it now, fresh, rather than reverting to
+        // manifest-commit durability, or every redo-log store would
+        // permanently lose the whole point of the redo-log write path the
+        // moment maintenance first vacuumed it. Deliberately *not* done
+        // any earlier (inside `prepareVacuum`, on `prepared` itself):
+        // `prepared` was still under construction there --
+        // `Store.performVacuum`'s own `preparePublicationSequence` and
+        // catch-up-round machinery still had real, undiverted ledger/
+        // free-map writes left to make against it before this generation
+        // was ever adopted, and attaching redo state that early made every
+        // one of those internal writes divert into an overlay instead of
+        // writing real pages (confirmed live: `next_page_id`/`checkpoint.
+        // page_count` kept advancing as if they had, so the adopted header
+        // ended up claiming pages the file was never actually extended to
+        // hold -- `recoverActiveCheckpoint`'s `candidates == 0` on the very
+        // first read after an *online* vacuum). By this point every such
+        // write this generation will ever make is already done, the swap
+        // has settled, and `self.file`/`self.inode_lock_ref` are their
+        // final, adopted values -- exactly `enableRedoLog`'s own
+        // "nothing to replay yet" case (every live mutation already
+        // reached the compacted tree through the ordinary copy pass, never
+        // through this brand-new, still-empty log region), just reached
+        // from a swapped-in generation instead of a freshly bootstrapped
+        // file.
+        if (self.header.redo_log_capacity != 0) {
+            try self.attachFreshRedoState(io, self.header.redo_log_offset, self.header.redo_log_capacity, self.activeCheckpoint().commit_sequence);
+        } else {
             self.manifest_commits_enabled = true;
         }
+        // Cross-process readers (§9.3b) cache this inode's log state from
+        // the shared lock region's own published watermarks; push this
+        // generation's fresh ones (a brand-new, still-empty log: tail 0,
+        // `checkpoint_sequence`/`durable_sequence` both the vacuum's own
+        // just-synced checkpoint) immediately, or a reader could keep
+        // trusting the *old* generation's stale watermarks -- harmless
+        // ("stale but safe" per this call's own doc comment) but needlessly
+        // so, and actively wrong once this process's own fd/offsets no
+        // longer correspond to anything the stale watermarks describe.
+        self.publishRedoLogState();
         self.invalidateLedger();
         prepared.invalidateLedger();
         self.durable_header = null;
@@ -30857,6 +31003,110 @@ test "lite redo log a pin survives checkpoint and reclaim: a superseded multi-pa
     const pinned_value = (try file.getDocumentAtCheckpointAlloc(a, checkpoint_at_large, "doc")).?;
     defer a.free(pinned_value);
     try std.testing.expectEqualSlices(u8, large, pinned_value);
+}
+
+// Regression: `prepareVacuum`/`replaceWithPreparedGeneration` used to
+// always rebuild a plain, non-redo compacted image -- `attachFreshRedoState`'s
+// own doc comment -- permanently reverting any redo-log store to the legacy
+// manifest-commit path after its first vacuum. Every long-lived database
+// would lose the whole point of the redo-log write path (one fsync per
+// write, §9.3) the moment routine maintenance first compacted it. Proves
+// the fix at the write-amplification level a vacuum must never regress:
+// an identical sequence of ordinary single-key commits costs exactly the
+// same number of real pwrite/fsync calls whether or not the file was
+// vacuumed first.
+test "lite redo log vacuum preserves the write path: commits after vacuum match a non-vacuumed file's per-write pwrite/fsync counts" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A minimal counting `std.Io`: delegates every call to the real
+    // `std.testing.io`, additionally recording each durable sync and
+    // write/pwrite submission into `write_amplification_trace` (the same
+    // technique `write_amplification_bench_test.zig`'s own `countingIo`
+    // uses, duplicated here rather than exported from that file, since
+    // this is the only other caller).
+    var counted_vtable: std.Io.VTable = std.testing.io.vtable.*;
+    const CountingShim = struct {
+        fn fileSync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+            _ = userdata;
+            try std.testing.io.vtable.fileSync(std.testing.io.userdata, file);
+            wal_trace.recordSync();
+        }
+        fn fileWritePositional(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+            _ = userdata;
+            const written = try std.testing.io.vtable.fileWritePositional(std.testing.io.userdata, file, header, data, splat, offset);
+            wal_trace.recordWrite(written);
+            return written;
+        }
+    };
+    counted_vtable.fileSync = CountingShim.fileSync;
+    counted_vtable.fileWritePositional = CountingShim.fileWritePositional;
+    const counting_io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &counted_vtable };
+
+    const baseline_path = try testPath(a, tmp, "redo-vacuum-wa-baseline.aflite");
+    defer a.free(baseline_path);
+    var baseline = try NativeFile.createWithRedoLog(a, counting_io, baseline_path, .{}, NativeFile.default_redo_log_capacity_bytes);
+    defer baseline.close();
+    try baseline.putDocument("seed", "seed-value");
+
+    const subject_path = try testPath(a, tmp, "redo-vacuum-wa-subject.aflite");
+    defer a.free(subject_path);
+    var subject = try NativeFile.createWithRedoLog(a, counting_io, subject_path, .{}, NativeFile.default_redo_log_capacity_bytes);
+    defer subject.close();
+    try subject.putDocument("seed", "seed-value");
+    var image = try subject.prepareVacuum(null);
+    defer image.deinit();
+    try subject.publishVacuum(&image);
+
+    // The regression this test exists to catch.
+    try std.testing.expect(subject.redo != null);
+    try std.testing.expect(subject.header.redo_log_capacity != 0);
+    try std.testing.expectEqual(baseline.header.redo_log_capacity, subject.header.redo_log_capacity);
+
+    const updates = 20;
+    const totalWrites = struct {
+        fn run(report: wal_trace.Report) u64 {
+            var total: u64 = 0;
+            for (report.stages) |s| total += s.write_calls_calling_thread + s.write_calls_background;
+            return total;
+        }
+    }.run;
+
+    wal_trace.reset();
+    wal_trace.registerCallingThread();
+    for (0..updates) |i| {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "baseline-{d}", .{i});
+        try baseline.putDocument(key, "value");
+    }
+    const baseline_report = wal_trace.snapshot();
+    const baseline_writes = totalWrites(baseline_report);
+    const baseline_syncs = baseline_report.totalSyncs(.calling_thread) + baseline_report.totalSyncs(.background);
+
+    wal_trace.reset();
+    for (0..updates) |i| {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "subject-{d}", .{i});
+        try subject.putDocument(key, "value");
+    }
+    const subject_report = wal_trace.snapshot();
+    const subject_writes = totalWrites(subject_report);
+    const subject_syncs = subject_report.totalSyncs(.calling_thread) + subject_report.totalSyncs(.background);
+
+    // The actual claim this test exists to prove: a vacuumed redo-log file
+    // costs exactly the same number of physical pwrite/fsync calls per
+    // ordinary commit as one that was never vacuumed -- whatever that
+    // per-write cost is (measured at 2 syncs/write for this direct
+    // `putDocument` call path, not necessarily the single-fsync-per-group
+    // figure group commit achieves through `docstore.Store`), it must be
+    // identical on both sides, not merely "non-zero" on the vacuumed one.
+    try std.testing.expectEqual(baseline_writes, subject_writes);
+    try std.testing.expectEqual(baseline_syncs, subject_syncs);
+    try std.testing.expect(subject_syncs > 0);
+
+    try std.testing.expect((try baseline.check()).valid);
+    try std.testing.expect((try subject.check()).valid);
 }
 
 // §9 (redo + indexed reclamation): `checkpointRedoLog`'s real build folds

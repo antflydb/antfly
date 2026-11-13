@@ -7978,6 +7978,68 @@ test "lite online vacuum retires generations without waiting for pinned readers"
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
+// Regression: `NativeFile.prepareVacuum`/`replaceWithPreparedGeneration`
+// used to always rebuild a plain, non-redo compacted image, permanently
+// reverting a redo-log store to the legacy manifest-commit path after its
+// first vacuum -- every long-lived database would lose the whole point of
+// the redo-log write path the moment maintenance first vacuumed it. Mirrors
+// "lite online vacuum retires generations without waiting for pinned
+// readers" above (a reader opened before the vacuum keeps working after
+// it, unaffected by this fix), extended to confirm the redo log itself
+// survives the swap and keeps serving ordinary commits afterward.
+test "lite online vacuum preserves the redo log across the generation swap while a reader stays pinned on the old one" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "reader-generation-vacuum-redo.aflite");
+    defer alloc.free(path);
+    // Redo-log is the default (`CreateOptions.use_redo_log`'s own doc
+    // comment); explicit here only so this test's intent reads without
+    // requiring that default's own knowledge.
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .use_redo_log = true });
+    defer store.close();
+    var write = try store.beginWrite();
+    try write.put("doc", "old");
+    try write.commit();
+    try std.testing.expect(store.file.redo != null);
+
+    var pinned = try store.beginRead();
+    defer pinned.abort();
+
+    write = try store.beginWrite();
+    try write.put("doc", "new");
+    try write.commit();
+
+    _ = try store.vacuum();
+
+    // The regression this test exists to catch.
+    try std.testing.expect(store.file.redo != null);
+    try std.testing.expect(store.file.header.redo_log_capacity != 0);
+
+    // The pinned reader, opened before the vacuum, is unaffected by it --
+    // same assertions as the non-redo test above.
+    try std.testing.expect(pinned.read_generation.?.retired);
+    try std.testing.expectEqualStrings("old", try pinned.get("doc"));
+
+    var fresh = try store.beginRead();
+    defer fresh.abort();
+    try std.testing.expectEqualStrings("new", try fresh.get("doc"));
+
+    // Writes after the vacuum still go through the redo log: a checkpoint
+    // fold succeeds (it would return `error.InvalidTransactionState` if
+    // `self.redo` had reverted to `null`), and the folded content is
+    // still correct.
+    write = try store.beginWrite();
+    try write.put("doc", "after-vacuum-redo-write");
+    try write.commit();
+    try store.file.checkpointRedoLog();
+    var after_fold = try store.beginRead();
+    defer after_fold.abort();
+    try std.testing.expectEqualStrings("after-vacuum-redo-write", try after_fold.get("doc"));
+
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
 test "lite group commit hands leadership to a bounded queued group" {
     try testQueuedMutationGroups(.normal);
 }
