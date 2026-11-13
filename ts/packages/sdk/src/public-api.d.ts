@@ -13826,7 +13826,12 @@ export interface components {
              *
              *     - `0.0` = fastest, lowest recall
              *     - `0.5` = balanced default
-             *     - `1.0` = highest recall
+             *     - `1.0` = exact dense top-k over the eligible indexed vectors
+             *
+             *     Full effort on dense HBC indexes establishes exactness using certified bounds and
+             *     authoritative scoring. It may examine every eligible vector;
+             *     latency scales with corpus size and can be substantially higher
+             *     than approximate search at values below `1.0`.
              *
              *     When omitted, Antfly uses the balanced default effort (`0.5`) unless
              *     lower-level vector search overrides are provided internally.

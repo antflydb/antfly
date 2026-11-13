@@ -2494,7 +2494,10 @@ pub const IndexManager = struct {
         native_vector_locations: std.AutoHashMapUnmanaged(u64, CachedNativeProjection) = .empty,
         native_vector_projection_bytes: std.ArrayListUnmanaged(u8) = .empty,
         native_projection_borrows: vector_block_store_mod.ProjectionBorrowScope = .{},
-        native_projection_borrow_budget: ?resource_manager_mod.BudgetedAllocator = null,
+        native_projection_budget: ?resource_manager_mod.BudgetedAllocator = null,
+        native_projection_peak_vectors: usize = 0,
+        native_projection_peak_copy_bytes: usize = 0,
+        native_projection_completed_waves: usize = 0,
         /// Bounded payload destinations and request descriptors owned only
         /// while one native positional-read wave is active. This makes the
         /// concurrency experiment visible to the same dense-search resource
@@ -2566,10 +2569,10 @@ pub const IndexManager = struct {
             while (vector_it.next()) |entry| self.context.manager.alloc.free(entry.value_ptr.*);
             self.vector_cache.deinit(self.context.manager.alloc);
             self.clearNativeVectorLocations();
-            self.native_vector_locations.deinit(self.context.manager.alloc);
-            self.native_vector_projection_bytes.deinit(self.context.manager.alloc);
-            self.native_projection_borrows.deinit(self.projectionBorrowAllocator());
-            if (self.native_projection_borrow_budget) |*budget| budget.deinit();
+            self.native_vector_locations.deinit(self.projectionAllocator());
+            self.native_vector_projection_bytes.deinit(self.projectionAllocator());
+            self.native_projection_borrows.deinit(self.projectionAllocator());
+            if (self.native_projection_budget) |*budget| budget.deinit();
             if (self.residual_arena) |*arena| arena.deinit();
             if (self.residual_budget) |*budget| budget.deinit();
             self.context.manager.observeDenseWorkingBytes(self.working_slice, &self.working_bytes_current, 0);
@@ -2580,12 +2583,21 @@ pub const IndexManager = struct {
         }
 
         fn clearNativeVectorLocations(self: *@This()) void {
-            self.native_vector_locations.clearRetainingCapacity();
-            self.native_vector_projection_bytes.clearRetainingCapacity();
-            self.native_projection_borrows.clear();
+            self.clearNativeVectorProjections();
             if (self.native_vector_generation) |generation| generation.release();
             self.native_vector_generation = null;
             self.native_vector_source_sequence = null;
+        }
+
+        fn clearNativeVectorProjections(self: *@This()) void {
+            // A wave only grows until completion. Sampling at its boundary
+            // records its peak without adding a counter/lock per candidate.
+            self.native_projection_peak_vectors = @max(self.native_projection_peak_vectors, self.native_vector_locations.count());
+            self.native_projection_peak_copy_bytes = @max(self.native_projection_peak_copy_bytes, self.native_vector_projection_bytes.capacity);
+            if (self.native_vector_locations.count() > 0 or self.native_projection_borrows.leases.items.len > 0) self.native_projection_completed_waves += 1;
+            self.native_vector_locations.clearRetainingCapacity();
+            self.native_vector_projection_bytes.clearRetainingCapacity();
+            self.native_projection_borrows.clear();
             self.observeWorkingBytes();
         }
 
@@ -2608,7 +2620,7 @@ pub const IndexManager = struct {
         ) void {
             if (self.native_vector_locations.contains(vector_id)) return;
             if (projection.borrowed) {
-                self.native_vector_locations.put(self.context.manager.alloc, vector_id, .{
+                self.native_vector_locations.put(self.projectionAllocator(), vector_id, .{
                     .location = projection.located,
                     .byte_offset = 0,
                     .byte_len = projection.value.bytes.len,
@@ -2618,10 +2630,10 @@ pub const IndexManager = struct {
             }
             const old_len = self.native_vector_projection_bytes.items.len;
             self.native_vector_projection_bytes.appendSlice(
-                self.context.manager.alloc,
+                self.projectionAllocator(),
                 projection.value.bytes,
             ) catch return;
-            self.native_vector_locations.put(self.context.manager.alloc, vector_id, .{
+            self.native_vector_locations.put(self.projectionAllocator(), vector_id, .{
                 .location = projection.located,
                 .byte_offset = old_len,
                 .byte_len = projection.value.bytes.len,
@@ -2654,11 +2666,11 @@ pub const IndexManager = struct {
             return .{ .located = cached.location, .value = value };
         }
 
-        fn projectionBorrowAllocator(self: *@This()) Allocator {
-            if (self.native_projection_borrow_budget == null) {
-                if (self.context.manager.resource_manager) |manager| self.native_projection_borrow_budget = resource_manager_mod.BudgetedAllocator.init(manager, self.working_slice, self.context.manager.alloc, 1);
+        fn projectionAllocator(self: *@This()) Allocator {
+            if (self.native_projection_budget == null) {
+                if (self.context.manager.resource_manager) |manager| self.native_projection_budget = resource_manager_mod.BudgetedAllocator.init(manager, self.working_slice, self.context.manager.alloc, 1);
             }
-            return if (self.native_projection_borrow_budget) |*budget| budget.allocator() else self.context.manager.alloc;
+            return if (self.native_projection_budget) |*budget| budget.allocator() else self.context.manager.alloc;
         }
 
         fn cacheDecodedVector(self: *@This(), index: *hbc_mod.HBCIndex, vector_id: u64, vector: []const f32) void {
@@ -2695,7 +2707,7 @@ pub const IndexManager = struct {
 
         fn rawWorkingBytes(self: *const @This()) u64 {
             return self.vector_cache_bytes +| self.raw_cache_key_bytes +| self.raw_read_value_bytes +|
-                @as(u64, @intCast(self.native_vector_projection_bytes.capacity)) +| self.native_vector_io_bytes;
+                (if (self.native_projection_budget == null) @as(u64, @intCast(self.native_vector_projection_bytes.capacity)) else 0) +| self.native_vector_io_bytes;
         }
 
         fn setNativeVectorIoBytes(self: *@This(), bytes: u64) void {
@@ -19539,6 +19551,7 @@ pub const IndexManager = struct {
                 .working_slice = .dense_search_working_set,
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
+                .cache_vectors = (req.search_effort orelse 0) < 1,
                 .block_cache_admission = if (decoded_residency_lease != null) .transient else .retain,
                 .decoded_residency_lease = decoded_residency_lease,
             };
@@ -19576,6 +19589,7 @@ pub const IndexManager = struct {
                 .working_slice = .dense_search_working_set,
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
+                .cache_vectors = (req.search_effort orelse 0) < 1,
                 .block_cache_admission = if (decoded_residency_lease != null) .transient else .retain,
                 .decoded_residency_lease = decoded_residency_lease,
             };
@@ -33034,17 +33048,19 @@ pub const IndexManager = struct {
         if (scratch.bounded_projections.len != 0 and scratch.bounded_projections.len != vector_ids.len) return error.InvalidArgument;
         const required_batch_floats = std.math.mul(usize, vector_ids.len, dims) catch return error.BufferTooSmall;
         if (batch_scratch.len < required_batch_floats) return error.BufferTooSmall;
-        const bounded_query_norm = if (error_bounds != null) switch (metric) {
-            .inner_product => vector_mod.norm(query),
-            .cosine => query_measure,
-            .l2_squared => 0,
-        } else 0;
+        const bounded_query_norm = if (error_bounds != null)
+            scratch.query_norm_upper orelse vector_mod.projectionQueryNormUpper(query)
+        else
+            0;
 
         const load_session = blk: {
             const session = active_dense_vector_load_session orelse break :blk null;
             if (session.context != loader) break :blk null;
             break :blk session;
         };
+        if (error_bounds != null and scratch.projection_cache_scope == .wave) {
+            if (load_session) |session| session.clearNativeVectorProjections();
+        }
         var native_vector_io_accounted = false;
         defer if (native_vector_io_accounted) load_session.?.setNativeVectorIoBytes(0);
 
@@ -33338,7 +33354,7 @@ pub const IndexManager = struct {
                 }
                 const borrow_enabled = if (manager.resource_manager) |resources| resources.dense_projection_borrow_enabled else false;
                 const read_stats = if (if (borrow_enabled) load_session else null) |session|
-                    try generation.opened.readProjectionsIntoBatchBorrowed(manager.io, projection_requests[0..request_count], &session.native_projection_borrows, session.projectionBorrowAllocator())
+                    try generation.opened.readProjectionsIntoBatchBorrowed(manager.io, projection_requests[0..request_count], &session.native_projection_borrows, session.projectionAllocator())
                 else
                     try generation.opened.readProjectionsIntoBatch(manager.io, projection_requests[0..request_count]);
                 if (profile) |p| {
@@ -33779,14 +33795,7 @@ pub const IndexManager = struct {
             if (encoded.len != query.len) return error.InvalidVectorDimensions;
             if (value.quantization_error_norm) |error_norm| {
                 const decoded_norm = value.decoded_norm_lower_bound orelse return error.CorruptedVectorBlock;
-                const distance = vector_mod.distanceToQueryF16(query, query_measure, encoded, value.scale, metric);
-                return vector_mod.boundedDistanceFromProjectionMetadata(
-                    distance,
-                    query_norm,
-                    error_norm,
-                    decoded_norm,
-                    metric,
-                );
+                return vector_mod.certifiedDistanceToQueryF16(query, query_measure, query_norm, encoded, value.scale, error_norm, decoded_norm, metric);
             }
             return vector_mod.distanceToQueryF16BoundedWithQueryNorm(query, query_measure, query_norm, encoded, value.scale, metric);
         }
@@ -49173,6 +49182,200 @@ test "native float16 residual rerank returns authoritative float32 score" {
     try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(actual)));
 }
 
+test "certified exact search streams real source projections within one admitted wave" {
+    const alloc = std.testing.allocator;
+    const count = 768;
+    const dims = 40;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer primary.close();
+    var search_budgets = resource_manager_mod.Options.defaultBudgets();
+    search_budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{ .hard_limit_bytes = 8 * 1024 * 1024 };
+    var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = search_budgets });
+    defer resources.deinit(alloc);
+    var memory = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var manager = try IndexManager.initWithOptions(alloc, path, .{ .resource_manager = &resources });
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&primary, &.{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":40,\"metric\":\"inner_product\",\"embedding_name\":\"semantic_idx\",\"external\":true}",
+    }});
+    const vectors = try alloc.alloc(f32, count * dims);
+    defer alloc.free(vectors);
+    const writes = try alloc.alloc(mapper.DenseEmbeddingWrite, count);
+    defer alloc.free(writes);
+    const keys = try alloc.alloc([]u8, count);
+    defer alloc.free(keys);
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| alloc.free(key);
+    var random_state = std.Random.DefaultPrng.init(0xc37e_900d);
+    for (writes, 0..) |*write, row| {
+        keys[row] = try std.fmt.allocPrint(alloc, "doc:{d}", .{row});
+        initialized += 1;
+        const vector = vectors[row * dims ..][0..dims];
+        for (vector) |*component| component.* = random_state.random().float(f32) * 2 - 1;
+        _ = vector_mod.normalize(vector);
+        write.* = .{ .index_name = @constCast("semantic_idx"), .doc_key = keys[row], .vector = vector, .artifact_key = null };
+    }
+    try manager.applyDenseEmbeddingWritesByNameWithOptions(&primary, "semantic_idx", writes, .{ .mode = .bulk_ingest });
+    const entry = manager.denseIndex("semantic_idx").?;
+    try std.testing.expect(!entry.index.external_vector_projection_build_retain);
+    _ = try entry.index.publishExperimentalPostingCheckpoint(9);
+    const posting_generation = entry.index.experimental_posting_read_generation.?;
+    const sequence = posting_generation.covered_source_sequence.load(.acquire);
+    var block_writer = try vector_block_mod.Writer.initWithEncoding(alloc, 1, 0, 1, sequence, .float16);
+    defer block_writer.deinit();
+    const artifacts = try alloc.alloc(IndexManager.DenseArtifactReadKey, count);
+    defer alloc.free(artifacts);
+    var artifact_count: usize = 0;
+    defer for (artifacts[0..artifact_count]) |artifact| alloc.free(artifact.key);
+    for (keys, 0..) |key, row| {
+        artifacts[row] = IndexManager.DenseArtifactReadKey.init(try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, key, "semantic_idx"), row);
+        artifact_count += 1;
+    }
+    std.mem.sort(IndexManager.DenseArtifactReadKey, artifacts, {}, struct {
+        fn less(_: void, lhs: IndexManager.DenseArtifactReadKey, rhs: IndexManager.DenseArtifactReadKey) bool {
+            const l = vector_block_mod.keyHash(lhs.key);
+            const r = vector_block_mod.keyHash(rhs.key);
+            return if (l == r) std.mem.lessThan(u8, lhs.key, rhs.key) else l < r;
+        }
+    }.less);
+    for (artifacts) |artifact| try block_writer.appendVector(artifact.key, sequence, 1, vectors[artifact.position * dims ..][0..dims]);
+    const block = try block_writer.build();
+    defer alloc.free(block);
+    var source_store = try vector_block_store_mod.Store.open(alloc, memory.storage(), "/certified-source");
+    defer source_store.deinit();
+    source_store.covered_source_sequence = sequence;
+    try source_store.publishGeneration(1, sequence, &.{.{ .shard_id = 0, .bytes = block }}, true);
+    const generation = try SharedVectorBlockGeneration.create(alloc, try vector_block_store_mod.Store.openWithBlocks(alloc, memory.storage(), "/certified-source"));
+    manager.installVectorBlockGeneration(generation);
+    // Prepare a different authority, then publish its real CURRENT pointer
+    // after the first bounded read and before that wave's exact completion.
+    var next_writer = try vector_block_mod.Writer.initWithEncoding(alloc, 2, 0, 1, sequence + 1, .float16);
+    defer next_writer.deinit();
+    const replacement: [dims]f32 = @splat(0);
+    for (artifacts) |artifact| try next_writer.appendVector(artifact.key, sequence + 1, 2, &replacement);
+    const next_block = try next_writer.build();
+    defer alloc.free(next_block);
+    const Publication = struct {
+        var writer: ?*vector_block_store_mod.Store = null;
+        var storage: ?*lsm_backend_mod.MemoryStorage = null;
+        var block_bytes: ?[]const u8 = null;
+        var next_sequence: u64 = 0;
+        var published = false;
+        fn bounded(raw: *anyopaque, ids: []const u64, metadata: []const ?[]const u8, query_vector: []const f32, measure: f32, metric: vector_mod.DistanceMetric, distances: []f32, bounds: []f32, batch: []f32, dimension_count: usize, scratch: hbc_mod.HBCIndex.ExternalVectorBatchDistanceScratch, profile: ?*hbc_mod.SearchProfile) !void {
+            try IndexManager.scoreDenseVectorsForHbcBatchBounded(raw, ids, metadata, query_vector, measure, metric, distances, bounds, batch, dimension_count, scratch, profile);
+            if (block_bytes) |bytes| {
+                block_bytes = null;
+                writer.?.covered_source_sequence = next_sequence;
+                try writer.?.publishGeneration(2, next_sequence, &.{.{ .shard_id = 0, .bytes = bytes }}, true);
+                const context: *IndexManager.DenseVectorLoadContext = @ptrCast(@alignCast(raw));
+                const opened = try vector_block_store_mod.Store.openWithBlocks(context.manager.alloc, storage.?.storage(), "/certified-source");
+                context.manager.installVectorBlockGeneration(try SharedVectorBlockGeneration.create(context.manager.alloc, opened));
+                published = true;
+            }
+        }
+    };
+    Publication.writer = &source_store;
+    Publication.storage = &memory;
+    Publication.block_bytes = next_block;
+    Publication.next_sequence = sequence + 1;
+    Publication.published = false;
+    defer {
+        Publication.writer = null;
+        Publication.storage = null;
+        Publication.block_bytes = null;
+        Publication.published = false;
+    }
+    entry.index.setExternalVectorBatchBoundedDistanceLoader(entry.vector_loader_context.?, Publication.bounded);
+    const query = vectors[0..dims];
+    var expected = hbc_mod.SearchResults.init(alloc, 10);
+    defer expected.deinit();
+    for (keys, 0..) |key, row| expected.addResult(deterministicDenseVectorId(key), vector_mod.distanceToQuery(query, 0, vectors[row * dims ..][0..dims], .inner_product), 0);
+    expected.sort();
+    var session: IndexManager.DenseVectorLoadSession = .{
+        .context = entry.vector_loader_context.?,
+        .working_slice = .dense_search_working_set,
+        .cache_vectors = false,
+        .cache_raw_values = false,
+    };
+    defer session.deinit();
+    const previous = IndexManager.active_dense_vector_load_session;
+    IndexManager.active_dense_vector_load_session = &session;
+    defer IndexManager.active_dense_vector_load_session = previous;
+    var result = try entry.index.searchProfiledRequest(.{ .query = query, .k = 10, .search_effort = 1, .load_metadata = false });
+    defer result.results.deinit();
+    for (expected.getHits(), result.results.getHits()) |want, got| {
+        try std.testing.expectEqual(want.vector_id, got.vector_id);
+        try std.testing.expectEqual(want.distance, got.distance);
+    }
+    try std.testing.expect(result.profile.exact_vectors_pruned_by_bound > 0);
+    try std.testing.expectEqual(@as(u64, count), result.profile.exact_vectors_scored + result.profile.exact_vectors_pruned_by_bound);
+    // Every source projection and metadata row is read once. Only competitive
+    // vectors consume their lossless residuals; exact completion reuses the
+    // wave's pinned locations and compact bytes.
+    try std.testing.expectEqual(@as(u64, count), result.profile.rerank_vector_projection_reads);
+    try std.testing.expectEqual(@as(u64, count), result.profile.rerank_metadata_vectors_loaded);
+    try std.testing.expectEqual(result.profile.exact_vectors_scored, result.profile.rerank_vector_residual_reads);
+    try std.testing.expect(Publication.published);
+    const current_generation = manager.acquireVectorBlockGeneration().?;
+    defer current_generation.release();
+    try std.testing.expect(current_generation != generation);
+    try std.testing.expectEqual(sequence + 1, current_generation.opened.store.covered_source_sequence);
+    try std.testing.expect(session.native_vector_locations.count() <= 128);
+    try std.testing.expect(session.native_vector_locations.count() < count / 2);
+    try std.testing.expect(session.native_vector_projection_bytes.capacity < count * dims * 2);
+    try std.testing.expect(session.native_projection_budget.?.liveBytesThreadSafe() > 0);
+    try std.testing.expect(session.native_vector_generation == generation);
+    try std.testing.expect(!IndexManager.denseVectorBoundedProjectionAvailable(entry.vector_loader_context.?, sequence + 2));
+    session.clearNativeVectorProjections();
+    try std.testing.expect(session.native_projection_completed_waves >= 2);
+    try std.testing.expect(session.native_projection_peak_vectors <= 128);
+    try std.testing.expect(session.native_projection_peak_copy_bytes <= 2 * 128 * dims * @sizeOf(f16));
+    try std.testing.expectEqual(@as(usize, 0), session.native_vector_locations.count());
+    try std.testing.expect(session.native_vector_generation == generation);
+
+    // Optional retention must fail before allocating uncharged projection bytes.
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{ .hard_limit_bytes = 1 };
+    var denied_resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer denied_resources.deinit(alloc);
+    const denied_path = try std.fs.path.join(alloc, &.{ path, "denied" });
+    defer alloc.free(denied_path);
+    var denied_manager = try IndexManager.initWithOptions(alloc, denied_path, .{ .resource_manager = &denied_resources });
+    defer denied_manager.deinit();
+    var denied_context: IndexManager.DenseVectorLoadContext = .{ .manager = &denied_manager, .index_name = @constCast("semantic_idx") };
+    var denied_session: IndexManager.DenseVectorLoadSession = .{ .context = &denied_context, .working_slice = .dense_search_working_set };
+    defer denied_session.deinit();
+    const artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, keys[0], "semantic_idx");
+    defer alloc.free(artifact);
+    const location = (try generation.opened.locateHashed(artifact, vector_block_mod.keyHash(artifact), sequence, null)).vector;
+    denied_session.cacheNativeVectorLocation(1, try generation.opened.viewProjection(location));
+    try std.testing.expect(denied_session.native_projection_budget.?.denied());
+    try std.testing.expectEqual(@as(usize, 0), denied_session.native_vector_locations.count());
+    try std.testing.expectEqual(@as(usize, 0), denied_session.native_vector_projection_bytes.capacity);
+    try std.testing.expectEqual(@as(u64, 0), denied_resources.sliceStats(.dense_search_working_set).used_bytes);
+    // A new HBC read still targets the old posting boundary. With its source
+    // lease released and CURRENT newer, bounded scoring must decline and the
+    // ordinary authoritative fallback must preserve the old query results.
+    session.clearNativeVectorLocations();
+    var fallback = try entry.index.searchProfiledRequest(.{ .query = query, .k = 10, .search_effort = 1, .load_metadata = false });
+    defer fallback.results.deinit();
+    try std.testing.expectEqual(@as(u64, 0), fallback.profile.exact_vectors_pruned_by_bound);
+    for (expected.getHits(), fallback.results.getHits()) |want, got| {
+        try std.testing.expectEqual(want.vector_id, got.vector_id);
+        try std.testing.expectEqual(want.distance, got.distance);
+    }
+}
+
 test "native rerank exact completion reuses location and reads one residual" {
     try testNativeRerankLocationReuse(false, false);
 }
@@ -49240,7 +49443,7 @@ fn testNativeRerankLocationReuse(pooled_query: bool, borrow_pages: bool) !void {
         var requests = [_]vector_block_store_mod.ProjectionReadRequest{.{ .located = location, .scratch = &read_bytes }};
         _ = try generation.opened.readProjectionsIntoBatch(null, &requests);
         _ = try generation.opened.readProjectionsIntoBatch(null, &requests);
-        _ = try generation.opened.readProjectionsIntoBatchBorrowed(null, &requests, &session.native_projection_borrows, session.projectionBorrowAllocator());
+        _ = try generation.opened.readProjectionsIntoBatchBorrowed(null, &requests, &session.native_projection_borrows, session.projectionAllocator());
         try std.testing.expect(requests[0].borrowed);
         projection = .{ .located = location, .value = requests[0].value.?, .borrowed = true };
         try std.testing.expectEqual(@as(u64, 0), resource_manager_mod.ProjectionPageCache.Cache.reclaim(resources.projectionPageCache().?, std.math.maxInt(u64)));
@@ -49249,7 +49452,8 @@ fn testNativeRerankLocationReuse(pooled_query: bool, borrow_pages: bool) !void {
     const cached_projection = session.nativeVectorLocation(17, 9) orelse return error.TestExpectedCachedProjection;
     try std.testing.expectEqual(borrow_pages, cached_projection.value.bytes.ptr == projection.value.bytes.ptr);
     if (borrow_pages) try std.testing.expectEqual(@as(usize, 0), session.native_vector_projection_bytes.items.len);
-    try std.testing.expect(session.working_bytes_current >= session.native_vector_projection_bytes.capacity);
+    const projection_bytes = if (session.native_projection_budget) |*budget| budget.liveBytesThreadSafe() else 0;
+    try std.testing.expect(session.working_bytes_current + projection_bytes >= session.native_vector_projection_bytes.capacity);
 
     const previous_session = IndexManager.active_dense_vector_load_session;
     IndexManager.active_dense_vector_load_session = &session;

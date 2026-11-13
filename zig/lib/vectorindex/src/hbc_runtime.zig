@@ -181,6 +181,19 @@ pub const NativeProjectionPlane = struct {
     /// residual checksum.
     residual_locations: ?NativeResidualLocationPlane = null,
 
+    pub fn slice(self: @This(), start: usize, end: usize) @This() {
+        return .{
+            .dims = self.dims,
+            .values = self.values[start * self.dims .. end * self.dims],
+            .scales = self.scales[start..end],
+            .error_norms = self.error_norms[start..end],
+            .decoded_norm_lower_bounds = self.decoded_norm_lower_bounds[start..end],
+            .checksums = if (self.checksums.len == 0) &.{} else self.checksums[start..end],
+            .verification = if (self.verification) |states| states[start..end] else null,
+            .residual_locations = if (self.residual_locations) |locations| locations.slice(start, end) else null,
+        };
+    }
+
     pub fn validateRow(self: @This(), row: usize) !void {
         if (row >= self.scales.len or row >= self.checksums.len or self.dims == 0 or
             row >= self.values.len / self.dims) return error.InvalidQuantizedDirectory;

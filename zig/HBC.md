@@ -49,6 +49,38 @@ Final rerank must use borrowed/external vector loading where possible. Search
 scratch belongs in `dense.search_working_set`; retained HBC nodes and quantized
 payloads remain in `hbc.node_metadata_cache`.
 
+Full effort (`search_effort: 1.0`) preserves complete published-snapshot
+coverage. It does not require loading every full-precision vector: fresh native
+postings with validated float16 projections can reject members whose
+deterministic lower distance bound is strictly worse than an already established
+exact top-k cutoff. When a posting has no local projection plane, the matching
+authoritative vector generation can supply deterministic intervals through its
+bounded-scoring interface. Overlapping intervals and ties still receive
+authoritative scores. Exact heaps use the public `(distance, vector_id)` ordering,
+including when already-exact source rows arrive before deferred completions.
+Filters run before screening; missing or stale bounded
+representations fall back to authoritative scoring. RaBitQ estimates never
+certify these rejections.
+
+This optimization still visits all postings and validates their membership. It
+reduces full-vector reads rather than guaranteeing sublinear search. Profiles
+separate `hbc_exact_projection_vectors_scored`,
+`hbc_exact_vectors_pruned_by_bound`, and `hbc_exact_vectors_scored`.
+
+Exact scoring streams waves of at most 128 members, including oversized and
+dirty postings. Source projections and locations are retained only through
+their wave's exact completion; the source-generation lease stays pinned across
+waves. Projection bytes, location maps, and borrowed-page descriptors reserve
+their resource budget before allocation. Failure to retain optional locations
+falls back to ordinary authoritative reads. Source-provided exact scores and
+resolved metadata are reused rather than fetched twice.
+
+Both local and authoritative projection paths use the shared certified SIMD
+kernel. It includes reconstruction error and arithmetic error in both the
+projection and float32 scoring kernels, and declines pruning at unsafe
+magnitudes. Its norm guard shares the score traversal. The request's query norm
+is computed once, and the finite exact max-heap provides an O(1) cutoff per wave.
+
 ## Multi-bit RaBitQ codes
 
 `quantization_bits` (dense index config, 1 to 8, default 1) adds extended
