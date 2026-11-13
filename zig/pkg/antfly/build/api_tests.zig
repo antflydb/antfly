@@ -1368,6 +1368,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "canonical relationship predicates",
             "projected graph endpoint routing recognizes every source form",
             "distributed graph edge reader finds fact owners outside the source endpoint shard",
+            "distributed min-hop BFS batches layers and expands cyclic vertices once",
             "distributed graph edges response round trips owned edges",
             "internal batch parser owns and round trips graph mutations",
             "internal batch graph endpoint cleanup command",
