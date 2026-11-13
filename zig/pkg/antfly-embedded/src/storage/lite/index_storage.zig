@@ -1388,6 +1388,16 @@ test "lite native staged atomic writes bound heap and survive concurrent commits
     {
         var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
         defer docs.close();
+        // The redo log (the default) starts a background ride-along flush
+        // loop on this Store's first commit (`applyMutationGroup`'s own
+        // `ensureRideAlongFlushStarted` call, gated on `self.file.redo !=
+        // null` -- a mechanism that does not exist at all for a legacy,
+        // non-redo file). Left running, it can land its own ride-along
+        // commit at an unpredictable point between this test's `before`
+        // snapshot and `writer.finish()`, perturbing the exact
+        // commit_sequence delta this test checks for reasons that have
+        // nothing to do with what it is actually testing.
+        docs.ride_along_flush_unavailable.store(true, .release);
         docs.file.page_cache_enabled.store(false, .monotonic);
         var indexes = Store.init(budget.allocator(), &docs);
         const storage = indexes.storage();
