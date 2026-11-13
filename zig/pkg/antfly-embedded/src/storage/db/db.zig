@@ -38555,6 +38555,15 @@ pub const DB = struct {
         if (!installed or admission != .admitted) return false;
         if (item.kind == .dense_vector) {
             const entry = self.core.denseIndex(item.name) orelse return false;
+            if (entry.index.leann) |store| {
+                // LEANN has no HBC posting/capture certificate. Its own
+                // committed graph (plus exact pending buffer) is the serving
+                // authority, including for replicated graph publication.
+                if (item.projection_checkpoint_published_count) |certified| {
+                    if (certified != item.doc_count) return false;
+                }
+                return if (store.coverageTarget()) |target| store.graphCovers(target) else true;
+            }
             if (item.projection_checkpoint_published_count) |certified| {
                 const checkpoint: apply_state.ProjectionCheckpoint = .{
                     .applied_sequence = item.projection_checkpoint_applied_sequence,
@@ -38771,6 +38780,18 @@ pub const DB = struct {
     const DenseServingCounts = struct { doc_count: u64, node_count: u64, root_node: u64, revision: u64 };
 
     fn denseServingCounts(index: *hbc_mod.HBCIndex) DenseServingCounts {
+        if (index.leann) |store| {
+            // LEANN owns a graph and an exact pending buffer, not an HBC
+            // posting generation. The wrapper's empty HBC root cannot report
+            // the vectors that LEANN already serves.
+            const serving = store.stats();
+            return .{
+                .doc_count = serving.live,
+                .node_count = serving.graph_nodes,
+                .root_node = 0,
+                .revision = store.appliedRaftIndex(),
+            };
+        }
         if (index.nativeServingSnapshot()) |serving_snapshot| return .{
             .doc_count = serving_snapshot.active_count,
             .node_count = serving_snapshot.node_count,
@@ -150360,6 +150381,15 @@ test "db applies leader-planned leann records through ordered apply" {
     try std.testing.expect(leann_store.isReplicated());
     try std.testing.expectEqual(@as(u64, n), entry.index.stats().active_count);
     try std.testing.expectEqual(raft_index, leann_store.appliedRaftIndex());
+    const public_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, public_stats);
+    const public_index = for (public_stats.indexes) |item| {
+        if (std.mem.eql(u8, item.name, "leann_idx")) break item;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, n), public_index.doc_count);
+    try std.testing.expectEqual(leann_store.stats().graph_nodes, public_index.node_count);
+    try std.testing.expectEqual(types.DenseNativeStoragePhase.legacy, public_index.dense_native_storage_phase);
+    try std.testing.expect(public_index.serving_snapshot_ready);
 
     // Replaying an applied entry is a no-op.
     const before = try leann_store.replicated.?.replica.encodeState(alloc);

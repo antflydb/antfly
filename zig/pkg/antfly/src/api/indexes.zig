@@ -3505,7 +3505,19 @@ fn appendCoverageFingerprint(alloc: std.mem.Allocator, out: *std.ArrayListUnmana
 
 fn embeddingsArtifactVisible(item: anytype, sparse: bool) bool {
     if (sparse) return item.doc_count > 0;
+    // Current owners explicitly certify their serving snapshot. LEANN can
+    // serve an exact pending buffer before it has graph nodes; HBC root/node
+    // counts are only a compatibility fallback for older observations.
+    if (@hasField(@TypeOf(item), "serving_snapshot_ready"))
+        return item.doc_count > 0 and item.serving_snapshot_ready;
     return item.doc_count > 0 and (item.node_count > 0 or item.root_node > 0);
+}
+
+test "certified dense exact buffers are visible without HBC roots" {
+    const Observation = struct { doc_count: u64 = 3, node_count: u64 = 0, root_node: u64 = 0, serving_snapshot_ready: bool };
+    try std.testing.expect(embeddingsArtifactVisible(Observation{ .serving_snapshot_ready = true }, false));
+    try std.testing.expect(!embeddingsArtifactVisible(Observation{ .serving_snapshot_ready = false, .node_count = 1, .root_node = 1 }, false));
+    try std.testing.expect(embeddingsArtifactVisible(.{ .doc_count = @as(u64, 3), .node_count = @as(u64, 1), .root_node = @as(u64, 1) }, false));
 }
 
 fn embeddingsArtifactPublishComplete(item: anytype, sparse: bool, expected_doc_count: u64) bool {
@@ -7363,6 +7375,9 @@ fn consumerTests() type {
             try std.testing.expect(pending.backfill_active);
             item.doc_count = 50;
             item.node_count = 1;
+            const uncertified = embeddingsRuntimeView(item, 200, .external, false, 7, 41, null, true);
+            try std.testing.expect(uncertified.backfill_active);
+            item.serving_snapshot_ready = true;
             const ready = embeddingsRuntimeView(item, 200, .external, false, 7, 41, null, true);
             try std.testing.expect(!ready.backfill_active);
             try std.testing.expectEqual(@as(f64, 1.0), ready.backfill_progress);
