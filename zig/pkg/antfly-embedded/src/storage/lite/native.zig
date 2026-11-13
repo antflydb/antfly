@@ -11518,8 +11518,90 @@ pub const NativeFile = struct {
     }
 
     /// Reuse bounded native working storage independently of the result arena.
+    ///
+    /// Regression: the real tree walk this delegates to
+    /// (`readBatchAtCheckpoint` -> `resolveBatchReferences` ->
+    /// `readDocumentBatchWithPath`) has no overlay knowledge at all -- it
+    /// resolves every key to a real B-tree page reference or 0 ("not
+    /// found"), never consulting `SharedRedoOverlay`. A key whose only
+    /// version lives in the redo-log overlay (committed, not yet folded
+    /// into a real page by `checkpointRedoLog`) therefore always resolves
+    /// as absent here, even though the single-key `getDocumentAtCheckpointAlloc`
+    /// (which checks `redoOverlayEntry` first) finds it immediately on
+    /// the very same handle. Found as derived catch-up's own document
+    /// read (`document_collectors.zig`'s `txn.getManySorted`, which
+    /// bottoms out here) reporting `error.ReplayDocumentNotVisible` for a
+    /// document the replay-journal scan -- already overlay-aware, via
+    /// `docstore.Cursor` -- had just found moments earlier in the same
+    /// catch-up pass.
+    ///
+    /// Fixed by resolving every key's overlay entry directly first (the
+    /// same primitive the single-key path already trusts); only keys
+    /// that come back genuinely absent from the overlay go through the
+    /// real batch/tree path below, same as before this fix. A live
+    /// tombstone in the overlay stays correctly absent (`values[i]`
+    /// stays null) without ever consulting the tree, which may still
+    /// hold a stale, now-superseded page for that key.
     pub fn getDocumentsAtCheckpointWithState(self: *NativeFile, allocator: Allocator, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, state: *DocumentBatchReadState) !void {
-        return self.readBatchAtCheckpoint(allocator, temporary, checkpoint, keys, buffers, values, @as(?ScoreSink, null), state, null, false);
+        if (self.redo == null or keys.len == 0) {
+            return self.readBatchAtCheckpoint(allocator, temporary, checkpoint, keys, buffers, values, @as(?ScoreSink, null), state, null, false);
+        }
+        if (buffers) |out| if (out.len != keys.len) return error.InvalidBatch;
+        if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
+        errdefer {
+            if (buffers == null) for (values) |value| if (value) |bytes| allocator.free(bytes);
+            @memset(values, null);
+        }
+
+        const remaining_keys = try temporary.alloc([]const u8, keys.len);
+        defer temporary.free(remaining_keys);
+        const remaining_positions = try temporary.alloc(usize, keys.len);
+        defer temporary.free(remaining_positions);
+        var remaining_count: usize = 0;
+        for (keys, 0..) |key, i| {
+            if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
+            const entry = (try self.redoOverlayEntry(.documents, checkpoint, key)) orelse {
+                remaining_keys[remaining_count] = key;
+                remaining_positions[remaining_count] = i;
+                remaining_count += 1;
+                continue;
+            };
+            defer self.allocator.free(entry.value);
+            if (entry.is_delete) continue;
+            if (entry.external_value_root_page != 0) {
+                const resolved_value = try self.readValuePagesAtCheckpointAlloc(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint);
+                if (buffers) |bufs| {
+                    defer allocator.free(resolved_value);
+                    if (resolved_value.len > bufs[i].len) return error.BufferTooSmall;
+                    @memcpy(bufs[i][0..resolved_value.len], resolved_value);
+                    values[i] = bufs[i][0..resolved_value.len];
+                } else {
+                    values[i] = resolved_value;
+                }
+            } else if (buffers) |bufs| {
+                if (entry.value.len > bufs[i].len) return error.BufferTooSmall;
+                @memcpy(bufs[i][0..entry.value.len], entry.value);
+                values[i] = bufs[i][0..entry.value.len];
+            } else {
+                values[i] = try allocator.dupe(u8, entry.value);
+            }
+        }
+        if (remaining_count == 0) return;
+
+        const sub_keys = remaining_keys[0..remaining_count];
+        const sub_positions = remaining_positions[0..remaining_count];
+        const sub_values = try temporary.alloc(?[]const u8, remaining_count);
+        defer temporary.free(sub_values);
+        @memset(sub_values, null);
+        const sub_buffers: ?[]const []u8 = if (buffers) |bufs| blk: {
+            const filtered = try temporary.alloc([]u8, remaining_count);
+            for (sub_positions, 0..) |orig_i, j| filtered[j] = bufs[orig_i];
+            break :blk filtered;
+        } else null;
+        defer if (sub_buffers) |filtered| temporary.free(filtered);
+        try self.readBatchAtCheckpoint(allocator, temporary, checkpoint, sub_keys, sub_buffers, sub_values, @as(?ScoreSink, null), state, null, false);
+        for (sub_positions, sub_values) |orig_i, v| values[orig_i] = v;
     }
 
     /// Fixed-width scores are decoded while the authenticated record is borrowed.
