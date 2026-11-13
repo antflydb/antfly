@@ -1046,19 +1046,25 @@ test "lite native index storage handles large files rename and delete tree" {
     const append_suffix = " native append keeps old pages streaming";
     const before_append_page_count = docs.file.activeCheckpoint().page_count;
     try storage.appendFileAbsolute(allocator, "/dense/a/blob", append_suffix, true);
-    // +1 over the count this test originally asserted, for this bare
-    // commit's own reserved manifest page (`reserveBareCommitManifestPage`).
-    try std.testing.expectEqual(before_append_page_count + 7, docs.file.activeCheckpoint().page_count);
+    // Under the redo log (the default), only the external value chain's own
+    // tail pages are real (the "one page-shaped exception" a diverting
+    // transactional commit still makes, per RedoCommitState's own doc
+    // comment): one fresh tail page for the appended bytes, plus the
+    // previous tail rewritten (copy-on-write) with its new `next` pointer.
+    // The catalog entry's own update (new external_value_len/root) is
+    // purely logical and costs no real pages, unlike the legacy B-tree
+    // rebuild (tree node, free map, manifest reservation) this count used
+    // to include.
+    try std.testing.expectEqual(before_append_page_count + 2, docs.file.activeCheckpoint().page_count);
     try std.testing.expectEqual(@as(u64, @intCast(large.len + append_suffix.len)), try storage.fileSize("/dense/a/blob"));
 
     const before_rename_page_count = docs.file.activeCheckpoint().page_count;
     try storage.renameAbsolute("/dense/a/blob", "/dense/a/blob2");
-    // Two packed records share one page, plus tree node, descriptor and free
-    // map, plus one commit-manifest reservation for this durable commit's
-    // own fresh since-last-durable window (`reserveBareCommitManifestPage`,
-    // via `PageAllocator.allocateFresh` -- always a fresh id, never a reused
-    // one).
-    try std.testing.expectEqual(before_rename_page_count + 5, docs.file.activeCheckpoint().page_count);
+    // A rename is a delete-old/put-new catalog mutation pair over the same
+    // external value chain -- purely logical under redo diversion, no real
+    // pages at all (unlike the legacy B-tree rebuild this count used to
+    // include).
+    try std.testing.expectEqual(before_rename_page_count, docs.file.activeCheckpoint().page_count);
     try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/dense/a/blob", 8));
     const after_rename_check = try docs.file.check();
     try std.testing.expect(after_rename_check.valid);
