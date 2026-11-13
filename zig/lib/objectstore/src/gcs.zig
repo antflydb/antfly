@@ -95,6 +95,21 @@ pub const Auth = union(enum) {
     }
 };
 
+/// Optional operation-owned diagnostics. No identifiers, credentials or payload
+/// values are included. The observer must outlive every synchronous request.
+pub const HttpDiagnostic = struct {
+    method: HttpMethod,
+    body_bytes: usize,
+    attempts: usize,
+    elapsed_ns: u64,
+    status: ?u16 = null,
+    failure: ?anyerror = null,
+};
+pub const DiagnosticObserver = struct {
+    ptr: ?*anyopaque = null,
+    report: *const fn (?*anyopaque, HttpDiagnostic) void,
+};
+
 pub const JsonApiConfig = struct {
     endpoint: []u8,
     upload_endpoint: []u8,
@@ -107,6 +122,7 @@ pub const JsonApiConfig = struct {
     request_deadline_ns: ?u64 = null,
     /// Transport policy; request-specific replay admission never raises its limits.
     http_client_config: ?httpx.ClientConfig = null,
+    diagnostics: ?DiagnosticObserver = null,
     /// Optional borrowed application runtime. When absent, the client owns a
     /// threaded fallback for standalone library use.
     io: ?std.Io = null,
@@ -186,6 +202,7 @@ const HttpxTransport = struct {
     client: httpx.Client,
 
     deadline_ns: ?u64 = null,
+    diagnostics: ?DiagnosticObserver = null,
 
     fn init(alloc: Allocator, request_timeout_ms: ?u64, shared_io: ?std.Io) !HttpxTransport {
         return initConfigured(alloc, request_timeout_ms, shared_io, null);
@@ -252,7 +269,24 @@ const HttpxTransport = struct {
 
         const control = google_auth.RequestControl{ .deadline_ns = options.deadline_ns orelse self.deadline_ns };
         try control.check();
+        const Trace = struct {
+            attempts: usize = 0,
+            parent: ?httpx.AttemptObserver,
+            fn before(raw: *anyopaque, context: httpx.AttemptObserver.Context) !void {
+                const trace: *@This() = @ptrCast(@alignCast(raw));
+                if (trace.parent) |parent| try parent.before(parent.ptr, context);
+                trace.attempts += 1;
+            }
+            fn after(raw: *anyopaque, response_: ?*const httpx.Response) void {
+                const trace: *@This() = @ptrCast(@alignCast(raw));
+                if (trace.parent) |parent| parent.after(parent.ptr, response_);
+            }
+        };
+        var trace: Trace = .{ .parent = self.client.config.attempt_observer };
+        const traced = self.diagnostics != null;
+        const started = if (traced) platform.time.monotonicNs() else 0;
         var response = self.client.request(method.toHttpx(), url, .{
+            .attempt_observer = if (traced) .{ .ptr = &trace, .before = Trace.before, .after = Trace.after, .delivery = if (trace.parent) |parent| parent.delivery else null, .output_tokens = if (trace.parent) |parent| parent.output_tokens else 0 } else null,
             .headers = request_headers.items,
             // Synchronous execution joins every attempt before returning.
             // The caller keeps this immutable slice alive, including retries.
@@ -264,8 +298,17 @@ const HttpxTransport = struct {
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
             else
                 null,
-        }) catch |err| return if (err == error.Cancelled) error.Canceled else err;
+        }) catch |err| {
+            if (self.diagnostics) |observer| observer.report(observer.ptr, .{ .method = method, .body_bytes = if (body) |bytes| bytes.len else 0, .attempts = trace.attempts, .elapsed_ns = platform.time.monotonicNs() - started, .failure = err });
+            return if (err == error.Cancelled) error.Canceled else err;
+        };
         defer response.deinit();
+        // A terminal HTTP status is still a successful transport result. Keep
+        // its attempts/timing before provider status mapping, including 412s
+        // that higher layers may authenticate as an ambiguous successful create.
+        if (self.diagnostics) |observer| {
+            if (response.status.code >= 300) observer.report(observer.ptr, .{ .method = method, .body_bytes = if (body) |bytes| bytes.len else 0, .attempts = trace.attempts, .elapsed_ns = platform.time.monotonicNs() - started, .status = response.status.code });
+        }
 
         var result = try transportResponseAlloc(
             alloc,
@@ -337,6 +380,7 @@ pub const JsonApiClient = struct {
         errdefer alloc.destroy(transport);
         transport.* = try HttpxTransport.initConfigured(alloc, cfg.request_timeout_ms, cfg.io, cfg.http_client_config);
         transport.deadline_ns = cfg.request_deadline_ns;
+        transport.diagnostics = cfg.diagnostics;
         return .{
             .alloc = alloc,
             .cfg = cfg,
@@ -344,6 +388,12 @@ pub const JsonApiClient = struct {
             .request_fn = HttpxTransport.request,
             .owned_httpx = transport,
         };
+    }
+
+    /// Configure only while this owned client is quiescent, before dispatch.
+    pub fn setDiagnostics(self: *JsonApiClient, observer: ?DiagnosticObserver) void {
+        self.cfg.diagnostics = observer;
+        if (self.owned_httpx) |transport| transport.diagnostics = observer;
     }
 
     pub fn initWithRequestFn(

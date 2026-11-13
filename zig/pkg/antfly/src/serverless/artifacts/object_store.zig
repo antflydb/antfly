@@ -275,14 +275,13 @@ pub const ObjectStore = struct {
         self.version_operations.store(if (supported) 2 else 1, .release);
         return supported;
     }
-    fn generation(self: *ObjectStore, id: []const u8, token: CancellationToken) !?[]u8 {
+    fn generation(self: *ObjectStore, a: std.mem.Allocator, id: []const u8, token: CancellationToken) !?[]u8 {
         if (comptime @import("builtin").os.tag == .freestanding) {
             if (self.cloud_reader != null or self.cloud_writer != null) return error.HostedObjectVersionUnsupported;
             return null;
         }
         // Range reads may borrow an arena-owned store. Reclaim selectors after
         // every request rather than retaining one parse per posting block.
-        const a = std.heap.page_allocator;
         var record = if (self.cloud_writer) |writer| try writer.lookup(a, id, token) else null;
         if (record == null) if (self.cloud_reader) |reader| {
             record = try reader.lookup(a, id, token);
@@ -315,6 +314,14 @@ pub const ObjectStore = struct {
     }
 
     fn putInScope(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
+        const probe = @import("../../api/lake_execution_probe_hooks.zig");
+        const started = probe.start();
+        return self.putInScopeImpl(alloc, scope, contents, cancellation) catch |err| {
+            probe.failureTimed("artifact_create_and_capture", started, err);
+            return err;
+        };
+    }
+    fn putInScopeImpl(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
         if (comptime @import("builtin").os.tag == .freestanding) return self.putHosted(alloc, scope, contents, cancellation);
         try cancellation.check();
         if (self.read_only) return error.ArtifactStoreReadOnly;
@@ -325,8 +332,8 @@ pub const ObjectStore = struct {
             break :scoped try alloc.dupe(u8, &id);
         } else try makeArtifactIdAlloc(alloc, checksum);
         errdefer alloc.free(artifact_id);
-        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
-        defer self.alloc.free(key);
+        const key = try keyForArtifactIdAlloc(alloc, self.prefix, artifact_id);
+        defer alloc.free(key);
 
         // Keep local registration and physical publication on the same side
         // of retirement. Shared barriers preserve parallel upload throughput.
@@ -339,7 +346,9 @@ pub const ObjectStore = struct {
         _ = std.fmt.hexToBytes(&digest, checksum) catch unreachable;
         var checksum_base64_buf: [std.base64.standard.Encoder.calcSize(digest.len)]u8 = undefined;
         const checksum_base64 = std.base64.standard.Encoder.encode(&checksum_base64_buf, &digest);
-        var result = self.client.putObject(self.bucket, key, contents, .{
+        var client = self.client;
+        client.allocator = alloc;
+        var result = client.putObject(self.bucket, key, contents, .{
             .content_type = "application/octet-stream",
             .checksum_sha256_base64 = if (self.s3_client != null) checksum_base64 else null,
             // GCS exposes provider-computed CRC32C/MD5 metadata. A caller-owned
@@ -366,7 +375,7 @@ pub const ObjectStore = struct {
             },
             else => |normalized| return normalized,
         };
-        defer result.deinit(self.client.allocator);
+        defer result.deinit(alloc);
         try self.captureGeneration(artifact_id, contents.len, result.version_id, cancellation);
 
         return .{
@@ -414,8 +423,9 @@ pub const ObjectStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |value| std.heap.page_allocator.free(value);
+        const selector_allocator = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(alloc);
+        const selected_generation = try self.generation(selector_allocator, artifact_id, cancellation);
+        defer if (selected_generation) |value| selector_allocator.free(value);
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         var result = self.client.getObject(self.bucket, key, .{
@@ -435,8 +445,9 @@ pub const ObjectStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |value| std.heap.page_allocator.free(value);
+        const selector_allocator = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(alloc);
+        const selected_generation = try self.generation(selector_allocator, artifact_id, cancellation);
+        defer if (selected_generation) |value| selector_allocator.free(value);
         const key = try keyForArtifactIdAlloc(alloc, self.prefix, artifact_id);
         defer alloc.free(key);
         var client = self.client;
@@ -472,8 +483,9 @@ pub const ObjectStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |value| std.heap.page_allocator.free(value);
+        const selector_allocator = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(alloc);
+        const selected_generation = try self.generation(selector_allocator, artifact_id, cancellation);
+        defer if (selected_generation) |value| selector_allocator.free(value);
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         var result = self.client.getObject(self.bucket, key, .{
@@ -513,8 +525,9 @@ pub const ObjectStore = struct {
         remaining: ?*u64,
     ) ![]u8 {
         try cancellation.check();
-        const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |value| std.heap.page_allocator.free(value);
+        const selector_allocator = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(alloc);
+        const selected_generation = try self.generation(selector_allocator, artifact_id, cancellation);
+        defer if (selected_generation) |value| selector_allocator.free(value);
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
         const end = std.math.add(u64, offset, std.math.cast(u64, len) orelse return error.InvalidRange) catch return error.InvalidRange;
@@ -557,8 +570,9 @@ pub const ObjectStore = struct {
         cancellation: CancellationToken,
     ) !artifact_store.ArtifactMetadata {
         try cancellation.check();
-        const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |value| std.heap.page_allocator.free(value);
+        const selector_allocator = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(alloc);
+        const selected_generation = try self.generation(selector_allocator, artifact_id, cancellation);
+        defer if (selected_generation) |value| selector_allocator.free(value);
         const checksum_value = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         const checksum = try alloc.dupe(u8, checksum_value);
         errdefer alloc.free(checksum);
@@ -592,15 +606,16 @@ pub const ObjectStore = struct {
 
     fn verifyContentWithBudget(
         self: *ObjectStore,
-        _: std.mem.Allocator,
+        alloc: std.mem.Allocator,
         artifact_id: []const u8,
         expected_byte_len: u64,
         expected_checksum: []const u8,
         cancellation: CancellationToken,
         remaining: ?*u64,
     ) !void {
-        const selected_generation = try self.generation(artifact_id, cancellation);
-        defer if (selected_generation) |selected| std.heap.page_allocator.free(selected);
+        const selector_allocator = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(alloc);
+        const selected_generation = try self.generation(selector_allocator, artifact_id, cancellation);
+        defer if (selected_generation) |selected| selector_allocator.free(selected);
         const checksum = try artifact_store.sha256ChecksumFromArtifactId(artifact_id);
         if (!std.mem.eql(u8, checksum, expected_checksum)) return error.ArtifactIntegrityMismatch;
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
@@ -1710,55 +1725,96 @@ test "external lake execution GCS ambiguous creates authenticate existing conten
     defer a.free(metadata_path);
     const metadata = try std.fmt.allocPrint(a, "{{\"name\":\"{s}\",\"generation\":\"42\",\"size\":\"7\"}}", .{key});
     defer a.free(metadata);
-    for ([_]bool{ false, true }) |corrupt| {
-        const Check = struct {
-            fn create(info: httpx.testing_mod.RequestInfo) !void {
-                try std.testing.expectEqualStrings("payload", info.body);
-                try std.testing.expect(std.mem.indexOf(u8, info.query, "ifGenerationMatch=0") != null);
+    for ([_]bool{ false, true }) |idle_timeout| {
+        for ([_]bool{ false, true }) |corrupt| {
+            const Check = struct {
+                fn create(info: httpx.testing_mod.RequestInfo) !void {
+                    try std.testing.expectEqualStrings("payload", info.body);
+                    try std.testing.expect(std.mem.indexOf(u8, info.query, "ifGenerationMatch=0") != null);
+                }
+                fn read(info: httpx.testing_mod.RequestInfo) !void {
+                    try std.testing.expect(std.mem.indexOf(u8, info.query, "generation=42") != null);
+                    try std.testing.expectEqualStrings("bytes=0-6", info.header("Range").?);
+                }
+            };
+            var server = try httpx.testing_mod.TestServer.start(a, io, &.{
+                // The server accepted the bytes but the success reply was lost.
+                .{ .method = .POST, .path = "/upload/storage/v1/b/bucket/o", .max_uses = 1, .assert_request = Check.create, .respond = .{ .delay_ns = if (idle_timeout) 150 * std.time.ns_per_ms else 0, .disconnect_before_response = true } },
+                .{ .method = .POST, .path = "/upload/storage/v1/b/bucket/o", .max_uses = 1, .assert_request = Check.create, .respond = .{ .status = 412 } },
+                .{ .path = metadata_path, .max_uses = 1, .respond = .{ .body = metadata } },
+                .{ .path = metadata_path, .assert_request = Check.read, .respond = .{ .status = 206, .headers = &.{ .{ .name = "Content-Range", .value = "bytes 0-6/7" }, .{ .name = "x-goog-generation", .value = "42" } }, .body = if (corrupt) "corrupt" else payload } },
+            });
+            defer server.deinit();
+            const Task = struct {
+                fn serve(ts: *httpx.testing_mod.TestServer) std.Io.Cancelable!void {
+                    for (0..4) |_| ts.handleOne() catch return;
+                }
+            };
+            var group: std.Io.Group = .init;
+            try group.concurrent(io, Task.serve, .{&server});
+            defer group.cancel(io);
+            var transport_memory: @import("antfly_local_sources").sql_memory_budget = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+            const transport_allocator = transport_memory.allocator();
+            var private_memory: @import("antfly_local_sources").sql_memory_budget = .{ .backing = a, .limit = 1024 * 1024 };
+            const private_allocator = private_memory.allocator();
+            var json = try objectstore.Gcs.JsonApiClient.init(transport_allocator, .{
+                .endpoint = try std.fmt.allocPrint(transport_allocator, "{s}/storage/v1", .{server.baseUrl()}),
+                .upload_endpoint = try std.fmt.allocPrint(transport_allocator, "{s}/upload/storage/v1", .{server.baseUrl()}),
+                .io = io,
+                .request_timeout_ms = if (idle_timeout) null else 3000,
+                .http_client_config = .{ .keep_alive = false, .timeouts = .{ .read_ms = 100 }, .retry_policy = .{ .initial_delay_ms = 1 } },
+            });
+            var client = json.client();
+            defer client.deinit();
+            var backend = try ObjectStore.initWithClientOptions(transport_allocator, client, "bucket", "", .{ .skip_bucket_probe = true });
+            defer backend.deinit();
+            var store = backend.artifactStore();
+            store.allocator = private_allocator;
+            if (corrupt) {
+                try std.testing.expectError(error.ArtifactIntegrityMismatch, store.put(payload));
+            } else {
+                var value = try store.put(payload);
+                defer value.deinit(private_allocator);
+                try std.testing.expectEqualStrings(id, value.artifact_id);
+                try std.testing.expectEqualStrings(checksum, value.checksum);
+                try std.testing.expectEqualStrings("42", value.provider_version.?);
             }
-            fn read(info: httpx.testing_mod.RequestInfo) !void {
-                try std.testing.expect(std.mem.indexOf(u8, info.query, "generation=42") != null);
-                try std.testing.expectEqualStrings("bytes=0-6", info.header("Range").?);
-            }
-        };
-        var server = try httpx.testing_mod.TestServer.start(a, io, &.{
-            // The server accepted the bytes but the success reply was lost.
-            .{ .method = .POST, .path = "/upload/storage/v1/b/bucket/o", .max_uses = 1, .assert_request = Check.create, .respond = .{ .disconnect_before_response = true } },
-            .{ .method = .POST, .path = "/upload/storage/v1/b/bucket/o", .max_uses = 1, .assert_request = Check.create, .respond = .{ .status = 412 } },
-            .{ .path = metadata_path, .max_uses = 1, .respond = .{ .body = metadata } },
-            .{ .path = metadata_path, .assert_request = Check.read, .respond = .{ .status = 206, .headers = &.{ .{ .name = "Content-Range", .value = "bytes 0-6/7" }, .{ .name = "x-goog-generation", .value = "42" } }, .body = if (corrupt) "corrupt" else payload } },
-        });
-        defer server.deinit();
-        const Task = struct {
-            fn serve(ts: *httpx.testing_mod.TestServer) std.Io.Cancelable!void {
-                for (0..4) |_| ts.handleOne() catch return;
-            }
-        };
-        var group: std.Io.Group = .init;
-        try group.concurrent(io, Task.serve, .{&server});
-        defer group.cancel(io);
-        var json = try objectstore.Gcs.JsonApiClient.init(a, .{
-            .endpoint = try std.fmt.allocPrint(a, "{s}/storage/v1", .{server.baseUrl()}),
-            .upload_endpoint = try std.fmt.allocPrint(a, "{s}/upload/storage/v1", .{server.baseUrl()}),
-            .io = io,
-            .request_timeout_ms = 3000,
-            .http_client_config = .{ .keep_alive = false, .retry_policy = .{ .initial_delay_ms = 1 } },
-        });
-        var client = json.client();
-        defer client.deinit();
-        var backend = try ObjectStore.initWithClientOptions(a, client, "bucket", "", .{ .skip_bucket_probe = true });
-        defer backend.deinit();
-        var store = backend.artifactStore();
-        if (corrupt) {
-            try std.testing.expectError(error.ArtifactIntegrityMismatch, store.put(payload));
-        } else {
-            var value = try store.put(payload);
-            defer value.deinit(a);
-            try std.testing.expectEqualStrings(id, value.artifact_id);
-            try std.testing.expectEqualStrings(checksum, value.checksum);
-            try std.testing.expectEqualStrings("42", value.provider_version.?);
+            try group.await(io);
+            try std.testing.expectEqualSlices(usize, &.{ 1, 1, 1, 1 }, server.route_hits);
+            try std.testing.expect(private_memory.peak > 0 and transport_memory.peak > 0);
+            // The request-local allocator remains healthy, but the actual
+            // shared HTTP/TLS owner must refuse unadmitted transient growth.
+            transport_memory.limit = transport_memory.live;
+            try std.testing.expectError(error.OutOfMemory, store.put("another payload"));
+            try std.testing.expect(transport_memory.isLocallyExhausted());
+            try std.testing.expect(store.allocator.ptr == private_allocator.ptr);
         }
-        try group.await(io);
-        try std.testing.expectEqualSlices(usize, &.{ 1, 1, 1, 1 }, server.route_hits);
     }
+}
+
+test "external lake execution generation selectors obey caller quota and reclaim scratch" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    const scope = try artifact_store.UploadScope.forPublication(@splat(57), 1, std.testing.io);
+    var writer: @import("cloud_generations.zig").Writer = .{ .a = a, .reader = .{ .client = memory.client(), .bucket = "absent", .prefix = "maps" }, .scope = scope };
+    defer writer.deinit();
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("selector", &digest, .{});
+    const id = try scope.artifactId(&std.fmt.bytesToHex(digest, .lower));
+    try writer.capture(&id, 1, "generation", .none);
+    var store = try ObjectStore.initWithClientOptions(a, memory.client(), "absent", "maps", .{ .skip_bucket_probe = true });
+    defer store.deinit();
+    store.cloud_writer = &writer;
+    var quota: @import("antfly_local_sources").sql_memory_budget = .{ .backing = a, .limit = 0 };
+    try std.testing.expectError(error.OutOfMemory, store.getRangeAllocWithCancellation(quota.allocator(), &id, 0, 1, .none));
+    quota.limit = 4096;
+    var arena = std.heap.ArenaAllocator.init(quota.allocator());
+    defer arena.deinit();
+    const scratch = @import("antfly_local_sources").sql_memory_budget.reclaimingAllocator(arena.allocator());
+    const selected = (try store.generation(scratch, &id, .none)).?;
+    try std.testing.expectEqualStrings("generation", selected);
+    scratch.free(selected);
+    try std.testing.expect(quota.peak > 0);
+    try std.testing.expectEqual(@as(usize, 0), quota.live);
 }

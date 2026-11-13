@@ -265,3 +265,15 @@ and logical artifact puts do not establish WAN throughput or HTTP request counts
 
 Active cases keep their frozen executable/controller/worker/validator inputs.
 Do not replace those inputs when rebuilding the workspace during a scale check.
+
+
+The timeout follow-up distinguishes socket idle timeouts from exhausted total
+request deadlines. Conditional upload replay stays bounded and authenticates an
+existing object after an ambiguous 412. Source-receipt operation timings are
+mandatory for fresh fused cases, and forbidden for resumes/reopen-only cases.
+Owner evidence separately reports the full-build, shared transport and mutable
+map budgets; these nested allocation domains must not be summed as independent
+RSS observations. Fresh bulk mutation batching starts only after stage admission.
+The generation publication fixture records metadata amplification separately from
+native construction throughput; neither that fixture nor the earlier failed 1M
+run establishes a successful large-corpus performance result.

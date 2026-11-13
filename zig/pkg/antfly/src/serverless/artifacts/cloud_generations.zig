@@ -500,7 +500,7 @@ pub const Reader = struct {
         return node;
     }
     const Step = union(enum) { next: Ref, found: ?Record };
-    fn select(node: Node, a: A, id: []const u8, digest: [32]u8, depth: u8) !Step {
+    fn select(node: Node, a: A, scratch: A, id: []const u8, digest: [32]u8, depth: u8) !Step {
         if (node.depth != depth) return error.InvalidCloudGenerationMap;
         if (node.leaf) {
             var lo: usize = 0;
@@ -511,10 +511,10 @@ pub const Reader = struct {
             }
             return .{ .found = if (lo < node.records.len and std.mem.eql(u8, node.records[lo].id, id)) try node.records[lo].clone(a) else null };
         }
-        for (node.children) |child| if (child.slot == slot(digest, depth)) return .{ .next = try cloneRef(std.heap.page_allocator, child.ref) };
+        for (node.children) |child| if (child.slot == slot(digest, depth)) return .{ .next = try cloneRef(scratch, child.ref) };
         return .{ .found = null };
     }
-    fn cachedStep(self: *Reader, a: A, ref: Ref, id: []const u8, digest: [32]u8, depth: u8) !?Step {
+    fn cachedStep(self: *Reader, a: A, scratch: A, ref: Ref, id: []const u8, digest: [32]u8, depth: u8) !?Step {
         lock(&self.navigation().mu);
         defer self.navigation().mu.unlock();
         self.navigation().clock +|= 1;
@@ -523,7 +523,7 @@ pub const Reader = struct {
             if (value.ref.byte_len != ref.byte_len or !std.mem.eql(u8, value.ref.checksum, ref.checksum)) return error.ArtifactIntegrityMismatch;
             value.used = self.navigation().clock;
             self.decoded_hits += 1;
-            return try select(value.node, a, id, digest, depth);
+            return try select(value.node, a, scratch, id, digest, depth);
         };
         return null;
     }
@@ -591,13 +591,13 @@ pub const Reader = struct {
         var arena = std.heap.ArenaAllocator.init(memory.allocator());
         defer arena.deinit();
         var owned_ref: ?Ref = null;
-        defer if (owned_ref) |value| freeRef(std.heap.page_allocator, value);
+        defer if (owned_ref) |value| freeRef(memory.allocator(), value);
         var depth: u8 = 0;
         while (true) : (depth += 1) {
             try token.check();
-            const step = (try self.cachedStep(a, ref, id, digest, depth)) orelse cold: {
+            const step = (try self.cachedStep(a, memory.allocator(), ref, id, digest, depth)) orelse cold: {
                 const node = try self.read(arena.allocator(), ref, depth, token);
-                break :cold try select(node, a, id, digest, depth);
+                break :cold try select(node, a, memory.allocator(), id, digest, depth);
             };
             const retained = switch (step) {
                 .found => |record| {
@@ -606,7 +606,7 @@ pub const Reader = struct {
                 },
                 .next => |next| next,
             };
-            if (owned_ref) |value| freeRef(std.heap.page_allocator, value);
+            if (owned_ref) |value| freeRef(memory.allocator(), value);
             owned_ref = retained;
             ref = retained;
             _ = arena.reset(.free_all);
@@ -641,6 +641,17 @@ pub const VacuumCut = struct {
         if (self.marks) |root| try root.validate();
     }
 };
+/// Mutation batches are independent of the durable leaf size. Fresh bulk
+/// owners amortize path copies; ordinary incremental owners retain 128 records.
+pub const BatchPolicy = struct {
+    records: usize = leaf_records,
+    payload_bytes: usize = 1024 * 1024,
+    pub const bulk: BatchPolicy = .{ .records = 4096 };
+    fn validate(self: @This()) !void {
+        if (self.records == 0 or self.records > 4096 or self.payload_bytes == 0 or self.payload_bytes > 1024 * 1024)
+            return error.InvalidCloudGenerationMap;
+    }
+};
 pub const Writer = struct {
     a: A,
     reader: Reader,
@@ -650,6 +661,14 @@ pub const Writer = struct {
     complete: bool = false,
     disabled: bool = false,
     pending: std.ArrayList(Record) = .empty,
+    pending_index: std.StringHashMapUnmanaged(usize) = .empty,
+    pending_bytes: usize = 0,
+    batch_policy: BatchPolicy = .{},
+    flushing: []const Record = &.{},
+    flushing_index: std.StringHashMapUnmanaged(usize) = .empty,
+    flushes: u64 = 0,
+    peak_pending_records: usize = 0,
+    peak_pending_bytes: usize = 0,
     mu: std.atomic.Mutex = .unlocked,
     io: ?std.Io = null,
     flush_mu: std.Io.Mutex = .init,
@@ -661,25 +680,33 @@ pub const Writer = struct {
     fn rootSnapshot(self: *Writer) !?Ref {
         lock(&self.mu);
         defer self.mu.unlock();
-        return if (self.reader.root) |root| try cloneRef(std.heap.page_allocator, root) else null;
+        return if (self.reader.root) |root| try cloneRef(self.a, root) else null;
     }
     pub fn deinit(self: *Writer) void {
         self.reader.deinit();
         for (self.pending.items) |*record| record.deinit(self.a);
         self.pending.deinit(self.a);
+        self.pending_index.deinit(self.a);
+        std.debug.assert(self.flushing.len == 0);
         if (self.reader.root) |root| freeRef(self.a, root);
+    }
+    fn stagedRecord(self: *Writer, id: []const u8) ?Record {
+        if (self.pending_index.get(id)) |index| return self.pending.items[index];
+        if (self.flushing_index.get(id)) |index| return self.flushing[index];
+        return null;
     }
     pub fn lookup(self: *Writer, a: A, id: []const u8, token: Token) !?Record {
         const root: ?Ref = held: {
             lock(&self.mu);
             defer self.mu.unlock();
-            for (self.pending.items) |record| if (std.mem.eql(u8, record.id, id)) return try record.clone(a);
-            break :held if (self.reader.root) |ref| try cloneRef(std.heap.page_allocator, ref) else null;
+            if (self.stagedRecord(id)) |record| return try record.clone(a);
+            break :held if (self.reader.root) |ref| try cloneRef(self.a, ref) else null;
         };
-        defer if (root) |ref| freeRef(std.heap.page_allocator, ref);
+        defer if (root) |ref| freeRef(self.a, ref);
         return self.reader.lookupAt(a, id, root, token);
     }
     pub fn capture(self: *Writer, id: []const u8, bytes: u64, generation: ?[]const u8, incoming: Token) !void {
+        try self.batch_policy.validate();
         _ = self.active.fetchAdd(1, .acq_rel);
         defer _ = self.active.fetchSub(1, .acq_rel);
         try incoming.check();
@@ -695,10 +722,10 @@ pub const Writer = struct {
                 self.complete = false;
                 return;
             }
-            for (self.pending.items) |prior| if (std.mem.eql(u8, prior.id, id) and std.mem.eql(u8, prior.generation, version)) {
+            if (self.stagedRecord(id)) |prior| {
                 if (prior.bytes != bytes) return error.ArtifactIntegrityMismatch;
-                return;
-            };
+                if (std.mem.eql(u8, prior.generation, version)) return;
+            }
         }
         var record: Record = .{ .id = id, .bytes = bytes, .generation = version };
         try record.validate();
@@ -707,16 +734,16 @@ pub const Writer = struct {
         // Provider lookups/proofs run concurrently. Only journal ownership and
         // publication of an immutable root require the short bookkeeping lock.
         const root = try self.rootSnapshot();
-        defer if (root) |ref| freeRef(std.heap.page_allocator, ref);
-        if (try self.reader.lookupAt(std.heap.page_allocator, id, root, token)) |previous| {
+        defer if (root) |ref| freeRef(self.a, ref);
+        if (try self.reader.lookupAt(self.a, id, root, token)) |previous| {
             var prior = previous;
-            defer prior.deinit(std.heap.page_allocator);
+            defer prior.deinit(self.a);
             if (prior.bytes != bytes) return error.ArtifactIntegrityMismatch;
             if (std.mem.eql(u8, prior.generation, version)) return;
         }
         if (self.qualified_retention) {
-            const path = try key(std.heap.page_allocator, self.reader.prefix, id);
-            defer std.heap.page_allocator.free(path);
+            const path = try key(self.a, self.reader.prefix, id);
+            defer self.a.free(path);
             if (try self.reader.client.versionRetention(self.reader.bucket, path, version, remote(token))) |proof| record.retention_until_ms = proof.until_ms;
         }
         const should_flush = appended: while (true) {
@@ -725,24 +752,26 @@ pub const Writer = struct {
                 self.mu.unlock();
                 return;
             }
-            if (self.pending.items.len >= leaf_records * 2) {
+            if (self.pending.items.len >= self.batch_policy.records * 2 or self.pending_bytes >= self.batch_policy.payload_bytes * 2) {
                 self.mu.unlock();
                 try self.flush(token);
                 continue;
             }
             defer self.mu.unlock();
             if (self.disabled) return;
-            for (self.pending.items) |prior| if (std.mem.eql(u8, prior.id, id)) {
+            if (self.stagedRecord(id)) |prior| {
                 if (prior.bytes != bytes) return error.ArtifactIntegrityMismatch;
                 if (std.mem.eql(u8, prior.generation, version)) return;
-            };
-            const owned = try record.clone(self.a);
-            self.pending.append(self.a, owned) catch |err| {
-                var value = owned;
-                value.deinit(self.a);
-                return err;
-            };
-            break :appended self.pending.items.len >= leaf_records;
+            }
+            var owned = try record.clone(self.a);
+            errdefer owned.deinit(self.a);
+            try self.pending.ensureUnusedCapacity(self.a, 1);
+            try self.pending_index.put(self.a, owned.id, self.pending.items.len);
+            self.pending.appendAssumeCapacity(owned);
+            self.pending_bytes += owned.id.len + owned.generation.len + @sizeOf(Record);
+            self.peak_pending_records = @max(self.peak_pending_records, self.pending.items.len);
+            self.peak_pending_bytes = @max(self.peak_pending_bytes, self.pending_bytes);
+            break :appended self.pending.items.len >= self.batch_policy.records or self.pending_bytes >= self.batch_policy.payload_bytes;
         };
         if (should_flush) try self.flush(token);
     }
@@ -751,6 +780,9 @@ pub const Writer = struct {
         defer self.mu.unlock();
         for (self.pending.items) |*record| record.deinit(self.a);
         self.pending.clearRetainingCapacity();
+        self.pending_index.clearRetainingCapacity();
+        self.pending_bytes = 0;
+        std.debug.assert(self.flushing.len == 0);
         if (self.reader.root) |root| freeRef(self.a, root);
         self.reader.root = null;
         self.reader.deinit();
@@ -770,6 +802,14 @@ pub const Writer = struct {
         return if (self.reader.root) |root| try cloneRef(self.a, root) else null;
     }
     fn flush(self: *Writer, token: Token) !void {
+        const probe = @import("../../api/lake_execution_probe_hooks.zig");
+        const started = probe.start();
+        return self.flushImpl(token) catch |err| {
+            probe.failureTimed("generation_map_flush", started, err);
+            return err;
+        };
+    }
+    fn flushImpl(self: *Writer, token: Token) !void {
         const io = try self.operationIo();
         // Waiting flushers suspend; network I/O never holds the spinlock.
         try self.flush_mu.lock(io);
@@ -781,9 +821,19 @@ pub const Writer = struct {
             if (self.disabled or self.pending.items.len == 0) return;
             batch = self.pending;
             self.pending = .empty;
+            self.pending_bytes = 0;
+            self.flushing = batch.items;
+            self.flushing_index = self.pending_index;
+            self.pending_index = .empty;
+            self.flushes += 1;
             break :detached self.reader.root;
         };
         defer {
+            lock(&self.mu);
+            self.flushing = &.{};
+            self.flushing_index.deinit(self.a);
+            self.flushing_index = .empty;
+            self.mu.unlock();
             for (batch.items) |*record| record.deinit(self.a);
             batch.deinit(self.a);
         }
@@ -995,6 +1045,14 @@ pub const Writer = struct {
         return self.publish(.{ .depth = depth, .leaf = false, .children = children[0..count] }, token);
     }
     fn publish(self: *Writer, node: Node, token: Token) !Ref {
+        const probe = @import("../../api/lake_execution_probe_hooks.zig");
+        const started = probe.start();
+        return self.publishImpl(node, token) catch |err| {
+            probe.failureTimed("generation_map_publish", started, err);
+            return err;
+        };
+    }
+    fn publishImpl(self: *Writer, node: Node, token: Token) !Ref {
         try node.validate(node.depth);
         const bytes = try std.json.Stringify.valueAlloc(self.a, node, .{});
         defer self.a.free(bytes);
@@ -1745,4 +1803,89 @@ test "external lake inline map navigation removes cold dependency reads and fenc
     reader.root.?.generation = "different-root";
     defer reader.root = original;
     try std.testing.expectError(error.CloudGenerationMapUnavailable, reader.lookup(arena.allocator(), &id, .none));
+}
+
+test "external lake global frontier bulk journal stays visible while a flush publishes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var provider = @import("cloud_generations_test_provider.zig").Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    const Gate = struct {
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        fn put(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.entered.set(self.io);
+            try self.release.waitTimeout(self.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        }
+        fn finish(writer: *Writer) !?Ref {
+            return writer.finish(.none);
+        }
+    };
+    var gate: Gate = .{ .io = io };
+    provider.put_hook = .{ .ptr = &gate, .call = Gate.put };
+    const scope = try api.UploadScope.forPublication(@splat(53), 1, io);
+    var writer: Writer = .{ .a = a, .io = io, .reader = .{ .client = client, .bucket = "bucket", .prefix = "maps" }, .scope = scope, .batch_policy = BatchPolicy.bulk, .complete = true };
+    defer writer.deinit();
+    const id = try scope.artifactId(&std.fmt.bytesToHex(hash("journal-record"), .lower));
+    try writer.capture(&id, 7, "payload-generation", .none);
+    var pending = try io.concurrent(Gate.finish, .{&writer});
+    var joined = false;
+    defer if (!joined) {
+        if (pending.cancel(io)) |ref| {
+            if (ref) |value| freeRef(a, value);
+        } else |_| {}
+    };
+    defer gate.release.set(io);
+    try gate.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+    try std.testing.expect(writer.reader.root == null);
+    var captured = (try writer.lookup(a, &id, .none)).?;
+    defer captured.deinit(a);
+    try std.testing.expectEqualStrings("payload-generation", captured.generation);
+    gate.release.set(io);
+    joined = true;
+    const root = (try pending.await(io)).?;
+    defer freeRef(a, root);
+    try std.testing.expectEqual(@as(usize, 0), writer.flushing.len);
+}
+
+test "external lake global frontier bulk journal admits bytes validates policy and rolls back failed allocations" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn run(alloc: A) !void {
+            var provider = @import("cloud_generations_test_provider.zig").Provider.init(std.testing.allocator);
+            defer provider.deinit();
+            const scope = try api.UploadScope.forPublication(@splat(54), 1, std.testing.io);
+            var writer: Writer = .{ .a = alloc, .reader = .{ .client = provider.client(), .bucket = "bucket", .prefix = "maps" }, .scope = scope, .batch_policy = BatchPolicy.bulk };
+            defer writer.deinit();
+            const id = try scope.artifactId(&std.fmt.bytesToHex(hash("record"), .lower));
+            try writer.capture(&id, 7, "generation", .none);
+            var captured = (try writer.lookup(alloc, &id, .none)).?;
+            defer captured.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 7), captured.bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{});
+    var provider = @import("cloud_generations_test_provider.zig").Provider.init(a);
+    defer provider.deinit();
+    var client = provider.client();
+    try client.makeBucket("bucket");
+    const scope = try api.UploadScope.forPublication(@splat(55), 1, std.testing.io);
+    var writer: Writer = .{ .a = a, .reader = .{ .client = client, .bucket = "bucket", .prefix = "maps" }, .scope = scope, .batch_policy = .{ .records = 4096, .payload_bytes = 512 } };
+    defer writer.deinit();
+    var generation: [500]u8 = @splat('v');
+    for (0..10) |i| {
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, i, .big);
+        const id = try scope.artifactId(&std.fmt.bytesToHex(hash(&bytes), .lower));
+        try writer.capture(&id, 1, &generation, .none);
+    }
+    try std.testing.expectEqual(@as(u64, 10), writer.flushes);
+    try std.testing.expectEqual(@as(usize, 1), writer.peak_pending_records);
+    writer.batch_policy.records = 0;
+    const id = try scope.artifactId(&std.fmt.bytesToHex(hash("invalid"), .lower));
+    try std.testing.expectError(error.InvalidCloudGenerationMap, writer.capture(&id, 1, "generation", .none));
 }

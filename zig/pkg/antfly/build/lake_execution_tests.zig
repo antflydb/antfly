@@ -26,6 +26,11 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     const identity_tests = b.addTest(.{ .root_module = identity_module, .filters = &.{"external lake execution bulk identity publication"} });
     imports.build_info.linkTest(identity_tests.root_module);
     b.step("lake-identity-publication-test", "Measure bounded identity chunks and verify the complete stored corpus").dependOn(&b.addRunArtifact(identity_tests).step);
+    const generation_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/lake_generation_publication_test_root.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, generation_module, false, true);
+    const generation_tests = b.addTest(.{ .root_module = generation_module, .filters = &.{ "external lake execution generation publication", "external lake global frontier" } });
+    imports.build_info.linkTest(generation_tests.root_module);
+    b.step("lake-generation-publication-test", "Measure generation-map mutation amplification and verify every captured version").dependOn(&b.addRunArtifact(generation_tests).step);
     const provider = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/lake_execution_provider_probe_root.zig"), .target = target, .optimize = optimize, .pic = true });
     test_imports.configure(b, provider, false, true);
     // This fixture owns source implementations rather than production storage

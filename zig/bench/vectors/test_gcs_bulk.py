@@ -394,6 +394,25 @@ class EvidenceTests(unittest.TestCase):
         # Adapt a copied historical record to the new inventory contract. Live
         # inventory attestation is covered separately by the GCS probe checks.
         self.row["records"]["PARQUET_BULK_INVENTORY"] = [dict(files=files)]
+        # Historical observations predate separate owner accounting. These
+        # synthetic fields exercise admission validation, not measured peaks.
+        self.row["records"]["PARQUET_BULK_OWNER_MEMORY"] = [
+            dict(role=role, peak_bytes=1, limit_bytes=limit)
+            for role, limit in (
+                ("build", 1024**3),
+                ("transport", 128 * 1024**2),
+                ("generation_map", 64 * 1024**2),
+            )
+        ]
+        self.row["records"]["PARQUET_BULK_GENERATION_WORK"] = [
+            dict(
+                batch_records=128,
+                batch_bytes=1024**2,
+                flushes=1,
+                peak_pending_records=1,
+                peak_pending_bytes=256,
+            )
+        ]
         self.cfg = dict(
             variant="optimized", rows=1024, interrupt=1, source_objects=files
         )
@@ -414,6 +433,52 @@ class EvidenceTests(unittest.TestCase):
                     phase[key].pop(i)
             with self.assertRaises(ValueError):
                 self.validate(row)
+
+    def test_source_operations_require_complete_ordered_success_evidence(self):
+        good = [
+            dict(operation=name, elapsed_ns=1, error_name=None)
+            for name in worker.SOURCE_OPERATIONS
+        ]
+        worker.validate_source_operations({"PARQUET_BULK_OPERATION": good}, fresh=True)
+        worker.validate_source_operations({}, fresh=False)
+        for operations in (
+            [],
+            good[:-1],
+            good + good[:1],
+            list(reversed(good)),
+            [dict(item, elapsed_ns=-1) for item in good],
+            [dict(item, elapsed_ns=True) for item in good],
+            [dict(item, error_name="Timeout") for item in good],
+            [dict(operation=item["operation"], elapsed_ns=1) for item in good],
+        ):
+            with self.assertRaises(RuntimeError):
+                worker.validate_source_operations(
+                    {"PARQUET_BULK_OPERATION": operations}, fresh=True
+                )
+        with self.assertRaises(RuntimeError):
+            worker.validate_source_operations(
+                {"PARQUET_BULK_OPERATION": good}, fresh=False
+            )
+
+    def test_owner_evidence_rejects_missing_duplicate_and_exceeded_quotas(self):
+        for change in ("missing", "duplicate", "over", "bool", "generation_batch"):
+            with self.subTest(change=change):
+                row = copy.deepcopy(self.row)
+                owners = row["records"]["PARQUET_BULK_OWNER_MEMORY"]
+                if change == "missing":
+                    owners.pop()
+                elif change == "duplicate":
+                    owners.append(copy.deepcopy(owners[0]))
+                elif change == "over":
+                    owners[1]["peak_bytes"] = owners[1]["limit_bytes"] + 1
+                elif change == "bool":
+                    owners[0]["peak_bytes"] = True
+                else:
+                    row["records"]["PARQUET_BULK_GENERATION_WORK"][0][
+                        "peak_pending_records"
+                    ] = 8193
+                with self.assertRaises(RuntimeError):
+                    self.validate(row)
 
     def test_negative_bool_and_missing_numeric_evidence_fail(self):
         for record, key, value in [

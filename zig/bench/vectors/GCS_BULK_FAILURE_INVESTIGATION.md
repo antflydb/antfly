@@ -199,3 +199,82 @@ Launch any long suite under an explicit durable supervisor with retained exit
 records, and keep cancellation ownership over its worker sessions. Only after a
 successful 1M publication and reopen/recall should a paired control or 10M case
 be interpreted as a performance comparison.
+
+
+## Timeout investigation and third-review implementation
+
+A read-only census of the failed follow-up prefix found 24,430 immutable objects
+containing 3,519,057,288 bytes. Its last 256 KiB object was created at
+2026-11-13T00:37:12.102 UTC, after the supervisor's failure record at
+00:37:04.482 UTC. A subsequent GCS Date comparison differed from local time by
+about 0.03 seconds. This strongly suggests an ambiguous in-flight upload, but
+cannot identify the exact timed-out request or the original socket stall.
+Clustering had not begun; the 2,712-second bulk-receipt phase was publication work.
+
+The socket/TLS layer returns plain `Timeout` on idle expiry, but the HTTP retry
+classifier previously excluded that tag. A local reproduction with replay-safe
+POST, a 25 ms idle timer and three admitted retries stopped after about 26 ms
+with one attempt and zero retries. The implementation now treats that idle
+failure as transient while retaining the existing total-deadline, cancellation,
+method/precondition and retry-count checks. Delayed accepted uploads exercise
+412 recovery and pinned content authentication, including corruption rejection.
+
+Sampled 3,376-, 5,828- and 5,831-byte objects were generation-map JSON nodes.
+The receipt window included approximately 11,009 objects below 32 KiB alongside
+11,892 full 256 KiB chunks. Not every small object was sampled or classified.
+The mutation writer flushed every 128 records and repeatedly copied radix paths.
+The fresh fused owner now uses a bounded hash-indexed journal with larger
+mutation waves; durable leaves and all generation/retention semantics stay the
+same. Its benchmark reads every captured version back through a new map reader.
+
+The final static review additionally restricted batching to actual stage
+admission, classified local map-budget denials before parent exhaustion, and
+added HTTP-status attribution for exhausted 429/503 responses. Expected 412s
+remain recoverable status observations. Source-operation evidence and separate
+owner limits are validated by the qualification harness. See the bulk-builder
+design for lifetimes, limits and failure behavior. The historical 1M result
+remains failed; these changes do not retroactively qualify it.
+
+The subsequent review closed the remaining operation-local allocation escape:
+cold map reads, traversal references and writer root snapshots now consume
+the admitted map/build budget. Regression coverage rejects both cold and warm
+lookups when their owner has no remaining capacity. Expected 404/412 responses
+have an independent 64-record diagnostic allowance, so large conflict replays
+cannot hide the later exhausted 429/503 response.
+
+The final allocation pass also charges provider-selector record/copy scratch
+to the caller and verifies exhausted-quota rejection before object I/O. Private
+OOM attribution now preserves backing allocation failures despite earlier
+recovered quota denials. Mixed histories stay conservatively `OutOfMemory`
+rather than claiming an unproven limit cause. The native owner records backing
+allocation failure across private owners; successful allocation and normal
+resize refusal cannot erase or fabricate that evidence.
+
+## Final live correctness validation
+
+The frozen 1,024-row local-to-GCS ADC check at 2026-11-13T02:32:25Z qualified
+with executable SHA-256
+`67df940572971836fcb3aa5ad8842850a2c7f13f05ae99fdac5bbfb2abeed8c9`.
+Native construction took 15.976 seconds; the child including reopen/recall took
+23.060 seconds and the full supervisor took 25.070 seconds. The source object
+generation and frozen input hashes were unchanged. All seven required source
+operations, owner limits, generation-journal evidence, and completed/stopped
+scratch-sampler checks passed. Observed owner peaks were 35,280,326 build bytes,
+2,814,588 transport bytes and 95,486 generation-map bytes; process peak RSS was
+53,280,768 bytes. Full retained local evidence is under
+`zig/.benchmark-results/gcs-bulk/journal-final-live-1024-20261113T023225Z/`; a
+portable summary is in `bulk_generation_publication_results.json`.
+
+This small case proves current build/reopen correctness and evidence wiring.
+It does not replace the failed historical 1M result or establish a paired large
+GCS performance improvement.
+
+Final local regression validation: the corrected native integration suite
+passed all 77 build steps with 32 tests passed, one guarded S3 skip and zero
+failures/leaks. The combined native/library invocation built the runtime probe
+and passed its publication/library targets, but initially failed compilation
+of the new selector fixture because string literals were used for owned mutable
+store fields. The fixture now uses the normal borrowing initializer; the
+complete integration rerun above includes it. All 51 Python lifecycle and
+qualification regressions passed, as did Ruff, Zig formatting and diff checks.
+Standard repository CI remains subject to exact-head maintainer approval.

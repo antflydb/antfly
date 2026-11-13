@@ -214,14 +214,14 @@ pub const Stage = struct {
             probe.failure("exact_vector_flush", err, null);
             return err;
         };
-        try self.vectors.finishBulkIngestSessionWithOptions(.{ .compact = false });
+        try probe.call("source_seal", local.storage_lsm_backend.Backend.finishBulkIngestSessionWithOptions, .{ &self.vectors, @as(local.storage_lsm_backend.Backend.BulkIngestFinishOptions, .{ .compact = false }) });
         self.source_session = false;
-        try self.vectors.checkpointRecoveryManifest();
+        try probe.call("source_recovery_manifest", local.storage_lsm_backend.Backend.checkpointRecoveryManifest, .{&self.vectors});
         self.tracker.finish() catch |err| {
             probe.failure("identity_chunk_finish", err, null);
             return err;
         };
-        var checkpoint = try self.vectors.pinNativeCheckpoint();
+        var checkpoint = try probe.call("source_pin_checkpoint", local.storage_lsm_backend.Backend.pinNativeCheckpoint, .{&self.vectors});
         var checkpoint_open = true;
         defer if (checkpoint_open) checkpoint.deinit();
         var bytes: u64 = self.allowance *| 3;
@@ -236,11 +236,11 @@ pub const Stage = struct {
         publication_io.install(&self.store.io_phase, self.io, if (provider.source.scanner.shared_reader) |reader| reader.scheduler else local.sql_parallel_scheduler.global(), .{ .ptr = self, .check = checkCensus });
         defer publication_io.deinit();
         if (provider.bulk_checkpoints) {
-            generation = try files.publishCheckpointPaged(self.a, &checkpoint, generation, "vectors/", self.store, self.token, budget, null);
-            generation = try work.publishPartition(self.a, self.store, checkpoint.storage, generation, self.spool_path, partition, self.token, budget, true);
+            generation = try probe.call("source_checkpoint_publish", files.publishCheckpointPaged, .{ self.a, &checkpoint, generation, "vectors/", self.store, self.token, budget, @as(?files.Reuse, null) });
+            generation = try probe.call("source_sample_publish", work.publishPartition, .{ self.a, self.store, checkpoint.storage, generation, self.spool_path, partition, self.token, budget, true });
         }
-        const root: work.Root = .{ .spool_from_exact = true, .binding = self.binding, .recipe = self.recipe, .dims = self.dims, .algorithm = self.algorithm, .input_allowance = self.allowance, .generation = generation, .partition = partition, .file_directory = try self.plan.publishDirectory(self.a, self.store, generation.domain, self.token), .rng_hi = self.index.rng.hi, .rng_lo = self.index.rng.lo };
-        if (provider.bulk_checkpoints) try work.save(self.a, provider, self.store, self.name, root, self.token);
+        const root: work.Root = .{ .spool_from_exact = true, .binding = self.binding, .recipe = self.recipe, .dims = self.dims, .algorithm = self.algorithm, .input_allowance = self.allowance, .generation = generation, .partition = partition, .file_directory = try probe.call("source_identity_directory", state.Plan.publishDirectory, .{ &self.plan, self.a, self.store, generation.domain, self.token }), .rng_hi = self.index.rng.hi, .rng_lo = self.index.rng.lo };
+        if (provider.bulk_checkpoints) try probe.call("source_receipt_save", work.save, .{ self.a, provider, self.store, self.name, root, self.token });
         self.finished = root;
         checkpoint.deinit();
         checkpoint_open = false;

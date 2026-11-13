@@ -142,6 +142,54 @@ def nonnegative_counts(record, fields):
     return all(type(record.get(key)) is int and record[key] >= 0 for key in fields)
 
 
+def validate_owner_memory(records):
+    owners = records.get("PARQUET_BULK_OWNER_MEMORY", [])
+    limits = {
+        "build": 1024**3,
+        "transport": 128 * 1024**2,
+        "generation_map": 64 * 1024**2,
+    }
+    if (
+        len(owners) != len(limits)
+        or {item.get("role") for item in owners} != set(limits)
+        or any(
+            not nonnegative_counts(item, ("peak_bytes", "limit_bytes"))
+            or item["limit_bytes"] != limits.get(item.get("role"))
+            or item["peak_bytes"] > item["limit_bytes"]
+            for item in owners
+        )
+    ):
+        raise RuntimeError("missing or invalid admitted owner memory evidence")
+    if any(
+        item["peak_bytes"] == 0 for item in owners if item["role"] != "generation_map"
+    ):
+        raise RuntimeError("missing build or transport allocation observation")
+
+
+SOURCE_OPERATIONS = (
+    "source_seal",
+    "source_recovery_manifest",
+    "source_pin_checkpoint",
+    "source_checkpoint_publish",
+    "source_sample_publish",
+    "source_identity_directory",
+    "source_receipt_save",
+)
+
+
+def validate_source_operations(records, *, fresh):
+    operations = records.get("PARQUET_BULK_OPERATION", [])
+    if [item.get("operation") for item in operations] != (
+        list(SOURCE_OPERATIONS) if fresh else []
+    ) or any(
+        not nonnegative_counts(item, ("elapsed_ns",))
+        or "error_name" not in item
+        or item["error_name"] is not None
+        for item in operations
+    ):
+        raise RuntimeError("missing, failed or repeated source operation evidence")
+
+
 def validate_evidence(cfg, row, receipt=None):
     from bench_bulk_pipeline import BULK_PHASE_NAMES, validate_phases
 
@@ -173,11 +221,37 @@ def validate_evidence(cfg, row, receipt=None):
                     "PARQUET_BULK_WORK",
                     "PARQUET_BULK_PROJECTION",
                     "PARQUET_BULK_SOURCE",
+                    "PARQUET_BULK_OWNER_MEMORY",
+                    "PARQUET_BULK_GENERATION_WORK",
+                    "PARQUET_BULK_OPERATION",
                 )
             )
         ):
             raise RuntimeError("verification-only reopen performed construction")
         return
+    validate_owner_memory(records)
+    generation = records.get("PARQUET_BULK_GENERATION_WORK", [])
+    fresh_bulk = cfg["variant"] == "optimized" and receipt is None
+    validate_source_operations(records, fresh=fresh_bulk)
+    expected_batch = 4096 if fresh_bulk else 128
+    if (
+        len(generation) != 1
+        or not nonnegative_counts(
+            generation[0],
+            (
+                "batch_records",
+                "batch_bytes",
+                "flushes",
+                "peak_pending_records",
+                "peak_pending_bytes",
+            ),
+        )
+        or generation[0]["batch_records"] != expected_batch
+        or generation[0]["batch_bytes"] != 1024**2
+        or generation[0]["peak_pending_records"] > 2 * expected_batch
+        or generation[0]["peak_pending_bytes"] > 2 * 1024**2 + 8192
+    ):
+        raise RuntimeError("missing or unbounded generation mutation evidence")
     if any(
         calls[name] != 1
         for name in (

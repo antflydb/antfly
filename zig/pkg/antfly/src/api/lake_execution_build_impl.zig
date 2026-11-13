@@ -174,6 +174,13 @@ pub fn priorInventory(a: A, store: stores.ArtifactStore, ref: local.serverless_m
 fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo, reuse: bool, identity_spill_bytes: u64, policy: BuildPolicy) ![]u8 {
     var allocations: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = backing };
     const a = allocations.allocator();
+    var cloud_memory: local.sql_memory_budget = .{ .backing = a, .limit = 64 * 1024 * 1024 };
+    defer if (comptime @hasDecl(@import("root"), "lakeExecutionProbeMemory"))
+        @import("root").lakeExecutionProbeMemory("generation_map", cloud_memory.peak, cloud_memory.limit);
+    return buildAttemptWithCloudMemory(a, artifact_store, table, source, store_identity, context, cancellation, clock, lease, embedding_options, memo, reuse, identity_spill_bytes, policy, &cloud_memory) catch |err|
+        return @import("../serverless/build/lake_build_limits.zig").classifyPrivateAllocationFailure(err, &cloud_memory);
+}
+fn buildAttemptWithCloudMemory(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease, embedding_options: ?local.inference_managed_embedder.InitOptions, memo: ?@import("lake_vector_enrichment.zig").Memo, reuse: bool, identity_spill_bytes: u64, policy: BuildPolicy, cloud_memory: *local.sql_memory_budget) ![]u8 {
     try context.ensureActive();
     try cancellation.check();
     var current = try catalog.parse(a, table.lake_index_catalog_json);
@@ -205,18 +212,22 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     if (cloud_object) |object| object.cloud_io = context.io;
     const cloud_seed_candidate = if (!reuse) @as(?catalog.Publication, null) else if (current.value.checkpoint) |saved| if (saved.cloud_generations != null and std.meta.eql(saved.signature, signature) and std.meta.eql(saved.namespace, current.value.namespace)) @as(?catalog.Publication, saved) else current.value.published else current.value.published;
     const cloud_seed = if (cloud_seed_candidate) |seed_| if (std.meta.eql(seed_.namespace, current.value.namespace) and std.mem.eql(u8, &seed_.signature.store, &store_identity)) @as(?catalog.Publication, seed_) else null else null;
-    var cloud_binding: ?cloud_api.Binding = if (cloud_object != null and cloud_seed != null) try cloud_api.Binding.init(std.heap.page_allocator, cloud_object.?, cloud_seed.?, cancellation) else null;
+    var map_alloc: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = cloud_memory.allocator() };
+    var cloud_binding: ?cloud_api.Binding = if (cloud_object != null and cloud_seed != null) try cloud_api.Binding.init(a, cloud_object.?, cloud_seed.?, cancellation) else null;
     defer if (cloud_binding) |*held| held.deinit();
     // Fresh/checkpoint artifacts may not belong to the previous closure. A
     // builder verifies and records them; a query's complete binding stays strict.
-    if (cloud_binding) |*held| held.reader.complete = false;
-    var cloud_memory: local.sql_memory_budget = .{ .backing = std.heap.page_allocator, .limit = 64 * 1024 * 1024 };
-    var map_alloc: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = cloud_memory.allocator() };
-    var cloud_writer: ?maps.Writer = if (cloud_object) |object| if (object.fs_client == null and object.client.vtable.version_retention != null) .{ .a = map_alloc.allocator(), .io = context.io, .vacuum_progress = if (cloud_seed) |seed_| if (seed_.cloud_generations) |cloud| cloud.vacuum else .{} else .{}, .reader = .{ .io = context.io, .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .shared = maps.sharedNavigation(object.cloud_cache_scope), .root = if (cloud_binding) |held| try maps.cloneRef(map_alloc.allocator(), held.reader.root.?) else null }, .scope = scope, .qualified_retention = object.cloud_retention_qualified, .cancellation = cancellation, .complete = cloud_api.seedComplete(cloud_seed, current.value.checkpoint, signature, current.value.namespace, !reuse or (current.value.published == null and current.value.checkpoint == null)) } else null else null;
+    if (cloud_binding) |*held| {
+        held.reader.complete = false;
+        held.reader.cache_allocator = map_alloc.allocator();
+    }
+    var cloud_writer: ?maps.Writer = if (cloud_object) |object| if (object.fs_client == null and object.client.vtable.version_retention != null) .{ .a = map_alloc.allocator(), .io = context.io, .vacuum_progress = if (cloud_seed) |seed_| if (seed_.cloud_generations) |cloud| cloud.vacuum else .{} else .{}, .reader = .{ .cache_allocator = map_alloc.allocator(), .io = context.io, .client = object.client, .bucket = object.bucket, .prefix = object.prefix, .shared = maps.sharedNavigation(object.cloud_cache_scope), .root = if (cloud_binding) |held| try maps.cloneRef(map_alloc.allocator(), held.reader.root.?) else null }, .scope = scope, .qualified_retention = object.cloud_retention_qualified, .cancellation = cancellation, .complete = cloud_api.seedComplete(cloud_seed, current.value.checkpoint, signature, current.value.namespace, !reuse or (current.value.published == null and current.value.checkpoint == null)) } else null else null;
     const previous_writer = if (cloud_object) |object| object.cloud_writer else null;
     if (cloud_writer) |*writer| cloud_object.?.cloud_writer = writer;
     defer if (cloud_writer) |*writer| {
         cloud_object.?.cloud_writer = previous_writer;
+        if (comptime @hasDecl(@import("root"), "lakeExecutionProbeFamily"))
+            std.debug.print("PARQUET_BULK_GENERATION_WORK {{\"batch_records\":{},\"batch_bytes\":{},\"flushes\":{},\"peak_pending_records\":{},\"peak_pending_bytes\":{}}}\n", .{ writer.batch_policy.records, writer.batch_policy.payload_bytes, writer.flushes, writer.peak_pending_records, writer.peak_pending_bytes });
         writer.deinit();
     };
     // The descriptor and source navigation negotiate the same identity epoch.
@@ -341,6 +352,12 @@ fn buildAttempt(backing: A, artifact_store: *stores.ArtifactStore, table: record
     else
         null;
     defer if (bulk_stage) |stage| stage.deinit();
+    // The optimization flag alone is not bulk admission: ordinary new text,
+    // sparse and incremental vector indexes also enable identity fusion.
+    // No upload workers are active at this handoff.
+    if (bulk_stage != null) {
+        if (cloud_writer) |*writer| writer.batch_policy = maps.BatchPolicy.bulk;
+    }
     provider.bulk_stage = bulk_stage;
     const previous_contributions = if (current.value.published) |previous| if (!mapped_predecessor and reusable_directory and std.meta.eql(previous.namespace, current.value.namespace) and std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and std.mem.eql(u8, &previous.signature.store, &signature.store)) previous.file_contributions else &.{} else &.{};
     const contributions_api = @import("lake_index_contributions.zig");

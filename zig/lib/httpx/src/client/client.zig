@@ -808,6 +808,9 @@ const retryable_transport_errors = .{
     error.ConnectionAborted,
     error.ConnectionTimedOut,
     error.ConnectionTimeout,
+    // Socket idle timers preserve this tag through TLS. The retry loop checks
+    // the total request deadline before considering transport replay.
+    error.Timeout,
     error.BrokenPipe,
     error.ConnectionClosed,
     error.ConnectionRefused,
@@ -6648,7 +6651,7 @@ test "residual terminal TLS errors remain outside PUT retry aliases" {
     try std.testing.expect(types.Method.PUT.isIdempotent());
     try std.testing.expect((types.RetryPolicy{}).retry_on_connection_error);
     try std.testing.expect((types.RetryPolicy{}).max_retries > 0);
-    inline for (.{ error.Timeout, error.Canceled, error.Cancelled, error.TlsTransportReadFailed, error.TlsAlert, error.TlsBadLength, error.TlsBadRecordMac, error.TlsConnectionTruncated, error.TlsDecodeError, error.TlsRecordOverflow, error.TlsUnexpectedMessage, error.TlsIllegalParameter, error.TlsSequenceOverflow }) |err| {
+    inline for (.{ error.Canceled, error.Cancelled, error.TlsTransportReadFailed, error.TlsAlert, error.TlsBadLength, error.TlsBadRecordMac, error.TlsConnectionTruncated, error.TlsDecodeError, error.TlsRecordOverflow, error.TlsUnexpectedMessage, error.TlsIllegalParameter, error.TlsSequenceOverflow }) |err| {
         try std.testing.expect(!isRetryableTransportError(err));
         try std.testing.expect(!isSafeUnsentRetryError(err));
     }
@@ -7760,5 +7763,51 @@ test "request replay admission does not follow a redirect" {
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 503), response.status.code);
         try std.testing.expectEqualSlices(usize, &.{ 1, 1, 0 }, server.route_hits);
+    }
+}
+
+test "socket idle timeouts retry admitted requests without extending total deadlines" {
+    const TestServer = @import("../testing.zig").TestServer;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = struct { method: types.Method = .POST, replay_safe: bool = false, retries: u32 = 3, deadline_ms: u64 = 0, success: bool = false };
+    for ([_]Case{
+        .{ .method = .GET, .success = true },
+        .{ .replay_safe = true, .success = true },
+        .{},
+        .{ .replay_safe = true, .retries = 0 },
+        .{ .replay_safe = true, .deadline_ms = 50 },
+    }) |case| {
+        var server = try TestServer.start(a, io, &.{
+            .{ .method = case.method, .path = "/", .max_uses = 1, .respond = .{ .delay_ns = 150 * std.time.ns_per_ms, .disconnect_before_response = true } },
+            .{ .method = case.method, .path = "/", .respond = .{ .body = "recovered" } },
+        });
+        defer server.deinit();
+        const Task = struct {
+            fn run(s: *TestServer) Io.Cancelable!void {
+                for (0..2) |_| s.handleOne() catch return;
+            }
+        };
+        var group: Io.Group = .init;
+        try group.concurrent(io, Task.run, .{&server});
+        defer group.cancel(io);
+        var client = Client.initWithConfig(a, io, .{
+            .keep_alive = false,
+            .timeouts = .{ .read_ms = 100, .request_ms = case.deadline_ms },
+            .retry_policy = .{ .max_retries = case.retries, .initial_delay_ms = 1 },
+        });
+        defer client.deinit();
+        const result = client.request(case.method, server.baseUrl(), .{ .borrowed_body = "payload", .replay_safe = case.replay_safe });
+        if (case.success) {
+            var response = try result;
+            defer response.deinit();
+            try std.testing.expectEqualStrings("recovered", response.body.?);
+            try group.await(io);
+            try std.testing.expectEqualSlices(usize, &.{ 1, 1 }, server.route_hits);
+        } else {
+            try std.testing.expectError(error.Timeout, result);
+            group.cancel(io);
+            try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, server.route_hits);
+        }
     }
 }

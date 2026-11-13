@@ -35,3 +35,20 @@ pub inline fn failure(comptime operation: []const u8, err: anyerror, cause: ?any
         }
     }
 }
+
+/// Only major phase boundaries emit successful timing records. Payload-level
+/// callers use failureTimed so diagnostics cannot grow with corpus size.
+pub inline fn call(comptime operation: []const u8, comptime function: anytype, args: anytype) @TypeOf(@call(.auto, function, args)) {
+    const started = start();
+    const result = @call(.auto, function, args) catch |err| {
+        failureTimed(operation, started, err);
+        return err;
+    };
+    if (comptime @hasDecl(@import("root"), "lakeExecutionProbeFamily"))
+        std.debug.print("PARQUET_BULK_OPERATION {{\"operation\":\"{s}\",\"elapsed_ns\":{},\"error_name\":null}}\n", .{ operation, start() - started });
+    return result;
+}
+pub inline fn failureTimed(comptime operation: []const u8, started: u64, err: anyerror) void {
+    if (comptime @hasDecl(@import("root"), "lakeExecutionProbeFamily"))
+        std.debug.print("PARQUET_BULK_FAILURE_OPERATION {{\"operation\":\"{s}\",\"elapsed_ns\":{},\"error_name\":\"{s}\",\"cause\":null}}\n", .{ operation, start() - started, @errorName(err) });
+}

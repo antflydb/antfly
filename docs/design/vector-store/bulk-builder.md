@@ -841,3 +841,90 @@ enabled. Raising the shared SST chunk size would change persisted-file offset
 interpretation and is not part of this optimization. Additional asynchronous
 publication queues need separate latency, ordering, cancellation and scheduler
 admission evidence before adoption.
+
+
+### Cloud upload retry, admission and bounded generation journals
+
+Socket read/write idle expiry preserves the `Timeout` tag through TLS. It is a
+transient attempt failure when the complete request still has time remaining.
+The HTTP retry loop checks cancellation and the total deadline before admitting
+replay, then applies method/precondition safety and the configured retry ceiling.
+An exhausted total deadline, an unsafe POST, a single-use streamed body or a
+partially delivered writer response cannot acquire replay permission from this
+classification. GCS create-only uploads retain `ifGenerationMatch=0`; an
+ambiguous commit can become 412, whose existing generation and content must be
+authenticated by the artifact caller before accepting it.
+
+Allocation ownership follows resource lifetime. Native attempts admit the
+artifact store, object clients and their shared HTTP/TLS resources beneath a
+128 MiB transport budget. Per-call keys and object-result metadata use the
+caller's allocator through a local client copy. The vector producer retains its
+256 MiB private budget; generation-map mutable ownership retains a separate
+64 MiB budget. These budgets are backed by the existing full-build working-set
+allocator (1 GiB by default), rather than being additional unaccounted heaps.
+A private budget denial is classified where that owner is available as
+`LakeSidecarBuildLimitExceeded`, including denials that never reach its parent.
+These are allocation-domain limits, not a process RSS limit: process-shared
+navigation caches, runtime stacks and external-library state have separate
+owners. The qualifier records and checks each build, transport and map owner.
+
+Durable generation-map leaves still hold at most 128 records. Mutation batching
+is independent of that representation. Only after an actual fresh fused bulk
+stage has been admitted does its attempt select up to 4,096 journal records or
+1 MiB of accounted record payload before a flush. Ordinary fresh indexes,
+incremental publications and receipt resumes retain 128-record mutation batches.
+The identity-fusion optimization flag alone does not constitute bulk admission.
+No persisted format, version selector, retention proof or publication fence
+changes with this policy.
+
+Pending records have a bounded hash index. A detached flushing batch retains its
+index until the replacement root is installed, so generation lookups can still
+resolve already-captured uploads during asynchronous map publication. Parallel
+captures apply backpressure at twice the mutation threshold; a single record can
+cross the byte threshold, and the active flushing batch remains independently
+owned. The map's allocator admits containers and publication scratch as well as
+record strings. Flush failures drain children, retain the preceding root and
+invalidate completeness; orphan immutable objects never grant serving authority.
+
+The `lake-generation-publication-test` fixture compares both policies over
+16,384 deterministic scoped identities, publishes the real encoded radix maps,
+and reopens every captured payload generation and length. It measures metadata
+puts/gets, encoded bytes, flushes, journal payload and allocation peaks. Raw
+observations live in
+[`bulk_generation_publication_results.json`](../../../zig/bench/vectors/bulk_generation_publication_results.json).
+The paired observation reduced metadata puts from 13,625 to 1,092 (92.0%),
+reads from 13,352 to 7,822, and encoded writes from 122,272,584 to 10,892,012
+bytes. Flushes decreased from 128 to four. Observed writer allocation peaks were
+6,266,396 and 5,556,343 bytes respectively, both below 64 MiB.
+This measures metadata amplification with a scripted immutable provider; elapsed
+times are local shared-host observations, not GCS or whole-build speedups.
+
+Qualification emits successful timings once at the seven source-receipt
+boundaries: seal, recovery manifest, checkpoint pin, checkpoint publication,
+sample publication, identity-directory publication and receipt save. Fresh fused
+cases require that exact ordered successful sequence; resumes and verification
+reopens cannot claim repeated source construction. Lower-level map flush,
+map publication and artifact creation report failures with elapsed time. HTTP
+transport failures retain method, body length, attempt count and elapsed time;
+terminal HTTP response statuses retain the same attribution even when transport
+itself succeeded. Expected 412 recovery remains a status observation, not a
+failed build. An explicit diagnostic observer is installed on the provider-owned GCS client
+before dispatch; library modules do not depend on application-root declarations.
+It composes with the existing attempt/delivery observer rather than replacing its
+admission semantics. Status diagnostics have separate 64-record allowances for expected 404/412
+responses and other statuses per probe attempt and never include object URLs, credentials or payload values.
+
+Generation-map lookup scratch and traversal/root reference snapshots use the
+admitted owner allocator. Cold lookups retain their individual 8 MiB cap inside
+the aggregate 64 MiB map and 1 GiB build limits. Shared navigation caches retain
+their independent process-owned lifetime and budget.
+
+Provider generation selectors use the caller's admitted reclaiming allocator,
+including lookup results and the returned selector copy. Arena-backed callers
+refund this transient capacity after each request. Private-budget OOM
+classification distinguishes policy denial from failed backing allocation.
+Mixed recovered failure histories conservatively preserve `OutOfMemory`; a
+historical optional quota denial cannot turn a physical allocation failure
+into a claimed configured-limit failure. The native attempt also records
+backing allocation failure across all private owners, using an atomic marker
+set only on failed allocation (ordinary resize refusal is not OOM evidence).
