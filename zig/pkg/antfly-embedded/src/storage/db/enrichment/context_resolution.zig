@@ -472,7 +472,8 @@ fn resolveQuery(a: Allocator, alloc: Allocator, reader: Reader, bound: *const ct
         // A full top-N subscribes only to values ranking at or above its
         // boundary (range-aware blocks); otherwise to the whole domain.
         const boundary = if (kept.len == 0) null else ctx.resolveFieldPath(kept[kept.len - 1].row, order.field);
-        const ordered_tuples = try ctx.orderedTuplesAlloc(a, bound, boundary, full and kept.len != 0);
+        // Snapshot sources register nothing.
+        const ordered_tuples = if (source.isLive()) try ctx.orderedTuplesAlloc(a, bound, boundary, full and kept.len != 0) else &.{};
         for (ordered_tuples) |t| try tuples.append(a, .{ .spec = bound.spec, .tuple = t, .residual = residual });
         for (kept) |m| try members.append(a, .{ .key = m.key, .projection = try ctx.projectAlloc(a, m.row, source.fields) });
     } else {
