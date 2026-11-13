@@ -5595,42 +5595,90 @@ const PageWriteBatch = struct {
             var end = start + 1;
             while (end < count and self.page_ids[end] - self.page_ids[end - 1] == 1) : (end += 1) {}
             if (self.diverting and file.redo != null and !file.redo.?.checkpointing) {
-                // §9.3/§9.1: diverted into the redo log's in-memory staging
-                // instead of a physical pwrite -- no manifest bookkeeping
-                // either (meaningless under redo-log commit; see
-                // `NativeFile.manifest_commits_enabled`, already `false`
-                // for this file). Run-coalescing above exists only to
-                // batch *syscalls*; staging bytes in memory has no such
-                // benefit, so each page in the run is staged individually.
                 // `self.diverting` (propagated from the owning
-                // `PageAllocator`, see its own doc comment) scopes this to
-                // the one legitimate page-shaped exception -- an external
-                // value chain staged through `pageAllocatorForDivertingCommit`
-                // during an ordinary (non-fold) transactional commit. A
-                // bare commit's own pages (`pageAllocatorFromFreeMap`,
-                // `diverting = false`) always take the real-pwrite branch
-                // below, matching `putIndexedDocumentBatch`'s and
-                // `publishBareCommit`'s own doc comments ("a bare commit
-                // never diverts") -- `file.redo != null` alone used to be
-                // this check's only condition, which silently broke that
-                // invariant for every bare commit once `use_redo_log`
-                // became the default (every page it wrote, not just
-                // page-shaped external values, got staged here instead of
-                // written, leaving `checkpoint.page_count` running ahead
-                // of bytes that were never actually on disk until the next
-                // `checkpointRedoLog` fold -- confirmed via a direct repro:
-                // a bare `putDocument`'s own `document_root_page` offset
-                // read back as past-EOF).
+                // `PageAllocator`, see its own doc comment) scopes this
+                // branch to the one legitimate page-shaped exception -- an
+                // external value chain staged through
+                // `pageAllocatorForDivertingCommit` during an ordinary
+                // (non-fold) transactional commit. A bare commit's own
+                // pages (`pageAllocatorFromFreeMap`, `diverting = false`)
+                // always take the real-pwrite branch below, matching
+                // `putIndexedDocumentBatch`'s and `publishBareCommit`'s own
+                // doc comments ("a bare commit never diverts") --
+                // `file.redo != null` alone used to be this check's only
+                // condition, which silently broke that invariant for every
+                // bare commit once `use_redo_log` became the default.
                 // Only page-shaped writes (external value chains) reach
-                // this at all now -- see `RedoCommitState`'s own doc
-                // comment -- since `flushTransactionWrites` diverts the
-                // B-tree roots logically, before any page is ever built.
-                const redo = &file.redo.?;
-                for (self.page_ids[start..end], start..end) |page_id, i| {
-                    redo.appendPending(file.allocator, file.runtimeIo(), page_id, self.buffer[i * size ..][0..size]) catch |zig017_err| {
+                // this at all -- see `RedoCommitState`'s own doc comment --
+                // since `flushTransactionWrites` diverts the B-tree roots
+                // logically, before any page is ever built.
+                //
+                // §9 (heap-bound writes): staging every page through
+                // `redo.appendPending` instead of writing it -- buffering a
+                // full copy in `redo.pending` (tracked) and another in the
+                // overlay (untracked, via `std.heap.page_allocator`) until
+                // this commit's own eventual `appendRecord`/overflow check,
+                // which only ever runs once, at the end of the whole
+                // commit -- makes peak memory proportional to a single
+                // external value chain's own size. For a *catalog* value
+                // (`file.direct_value_pages`, see its own doc comment:
+                // `writeCatalogValue`, `CatalogAppendState`,
+                // `putIndexCatalogRecordFromFile`), that is unbounded by
+                // the caller's own private-flush chunking (which only
+                // bounds the staged catalog *mutation*, never the
+                // page-shaped bytes underneath it), so these pages are
+                // written for real, immediately, exactly like the
+                // non-diverting branch below (same run-coalesced write,
+                // same test instrumentation) -- always safe: each is a
+                // fresh, append-only id (`pageAllocatorForDivertingCommit`'s
+                // own doc comment) that nothing can reference until this
+                // same commit's logical mutation durably publishes, so a
+                // torn or orphaned page here on an abort or a crash is
+                // exactly as harmless as the one a bare, non-diverting
+                // commit already risks the same way. No separate durable
+                // copy belongs in the redo log for it either, matching
+                // `commitTransactionWithDurability`'s and
+                // `publishCheckpoint`'s own "page-shaped only" fallback,
+                // which already writes these pages directly rather than
+                // ever embedding them in a log record. No manifest
+                // bookkeeping, unlike the non-diverting branch below --
+                // meaningless under a redo-log commit; see
+                // `NativeFile.manifest_commits_enabled`, already `false`
+                // for this file.
+                //
+                // A document's own value chain (`file.direct_value_pages ==
+                // false`) keeps staging through `redo.appendPending`
+                // exactly as before: one document write is one external
+                // value, written once, with no comparable unbounded
+                // private-flush accumulation to begin with, and other
+                // tests already depend on the current page_count-runs-ahead-
+                // of-physical-size behavior for a still-diverting
+                // document write (`check()`'s own redo-aware tolerance,
+                // vacuum/cross-process recovery).
+                if (file.direct_value_pages) {
+                    if (builtin.is_test) {
+                        if (file.test_page_write_fail_after) |remaining| {
+                            if (remaining == 0) return zig017_failure: {
+                                zig017_return_error = error.TestPageWriteFailure;
+                                break :zig017_failure error.TestPageWriteFailure;
+                            };
+                            file.test_page_write_fail_after = remaining - 1;
+                        }
+                        _ = file.test_page_write_calls.fetchAdd(1, .monotonic);
+                        _ = file.test_page_writes.fetchAdd(@intCast(end - start), .monotonic);
+                    }
+                    file.file.writePositionalAll(file.runtimeIo(), self.buffer[start * size .. end * size], self.page_ids[start] * @as(u64, size)) catch |zig017_err| {
                         zig017_return_error = zig017_err;
                         return zig017_err;
                     };
+                } else {
+                    const redo = &file.redo.?;
+                    for (self.page_ids[start..end], start..end) |page_id, i| {
+                        redo.appendPending(file.allocator, file.runtimeIo(), page_id, self.buffer[i * size ..][0..size]) catch |zig017_err| {
+                            zig017_return_error = zig017_err;
+                            return zig017_err;
+                        };
+                    }
                 }
             } else {
                 if (builtin.is_test) {
@@ -6528,6 +6576,34 @@ pub const NativeFile = struct {
     /// (`enableRedoLog`) or opened from one (`recoverRedoLog`). See
     /// `RedoCommitState`'s own doc comment.
     redo: ?RedoCommitState = null,
+    /// Scopes `PageWriteBatch.flushCount`'s page-shaped diverting exception
+    /// (an external value chain staged through `pageAllocatorForDivertingCommit`
+    /// during an ordinary transactional commit -- `RedoCommitState`'s own
+    /// doc comment) to catalog value writes specifically, never document
+    /// ones. Set transiently, for the duration of the synchronous call,
+    /// by every catalog-exclusive value-writing entry point
+    /// (`writeCatalogValue`, `CatalogAppendState.append`/`finish`,
+    /// `putIndexCatalogRecordFromFile`) -- never by `writeDocumentValue` or
+    /// anything document-shaped, which keep staging through
+    /// `redo.appendPending` (buffered until this commit's own
+    /// `appendRecord`/overflow check) exactly as before. A catalog value's
+    /// own private-flush chunking (`CatalogDeleteBatch`, the 64-key subtree
+    /// delete batches) only bounds the staged *mutation*, never a single
+    /// large external value underneath one of its puts, so without this a
+    /// big atomic import's own page-shaped bytes would buffer in full
+    /// (`redo.pending`, plus the overlay's own untracked copy) regardless
+    /// of how many small commits the caller's own code paths it through --
+    /// unbounded by the caller's own chunking. Writing these pages for
+    /// real, immediately, is always safe (see `flushCount`'s own doc
+    /// comment on this), and a document's own value chain has no
+    /// comparable unbounded-accumulation path to begin with (one document
+    /// write is one external value, written once, not staged incrementally
+    /// across many private flushes the way a catalog append is) --
+    /// changing its behavior too would only risk the redo-log-core
+    /// invariants other tests (`check()`'s own redo-aware tolerance for
+    /// page_count running ahead of physical size, vacuum/cross-process
+    /// recovery) already depend on, for no corresponding benefit.
+    direct_value_pages: bool = false,
     durable_header: ?Header = null,
     last_synced_header: ?Header = null,
     change_capture: ?*ChangeCapture = null,
@@ -6673,6 +6749,19 @@ pub const NativeFile = struct {
 
     test_page_write_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_page_write_fail_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
+    /// `test_page_write_fail_after`'s own counterpart for a catalog
+    /// mutation that diverts purely logically (no page-shaped content at
+    /// all -- a small put/delete under the redo log's default diversion,
+    /// `flushTransactionWrites`'s own diverting branch). A fault-injection
+    /// test written against the legacy B-tree rebuild could rely on
+    /// `test_page_write_fail_after` firing partway through a batch of real
+    /// page writes; under full logical diversion that batch may never
+    /// touch a real page at all, so this counts/fails on logical mutations
+    /// instead. Checked in `flushTransactionWrites`'s diverting loop, once
+    /// per mutation.
+    test_logical_write_fail_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
+    /// `test_page_writes`'s own counterpart for `test_logical_write_fail_after`.
+    test_logical_mutations: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     /// Counts durability barriers (`syncIfRequired`'s underlying `file.sync`
     /// calls), independent of filesystem speed. Used to assert syncs/commit.
     test_sync_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
@@ -10370,6 +10459,8 @@ pub const NativeFile = struct {
         defer builder.deinit();
         const chunk_size = self.maxValuePagePayloadBytes();
         const read_size = buffer.len / chunk_size * chunk_size;
+        self.direct_value_pages = true;
+        defer self.direct_value_pages = false;
         var offset: usize = 0;
         while (offset < len) {
             const n = @min(read_size, len - offset);
@@ -14837,6 +14928,8 @@ pub const NativeFile = struct {
     }
 
     fn writeCatalogValue(self: *NativeFile, pages: *PageAllocator, value: []const u8, options: WriteOptions) !u64 {
+        self.direct_value_pages = true;
+        defer self.direct_value_pages = false;
         return (try self.writeValueTree(pages, value, options)).page;
     }
 
@@ -15011,6 +15104,8 @@ pub const NativeFile = struct {
         }
 
         fn append(self: *CatalogAppendState, suffix: []const u8) !void {
+            self.builder.file.direct_value_pages = true;
+            defer self.builder.file.direct_value_pages = false;
             const len = try std.math.add(usize, self.len, suffix.len);
             if (len > std.math.maxInt(u32)) return error.RecordTooLarge;
             const capacity = self.builder.file.maxValuePagePayloadBytes();
@@ -15029,6 +15124,8 @@ pub const NativeFile = struct {
         }
 
         fn finish(self: *CatalogAppendState) !ExtentRef {
+            self.builder.file.direct_value_pages = true;
+            defer self.builder.file.direct_value_pages = false;
             if (self.used != 0) {
                 try self.builder.pushValue(self.tail[0..self.used]);
                 self.used = 0;
@@ -16363,7 +16460,16 @@ pub const NativeFile = struct {
                 }
             }.less);
             if (diverting) {
-                for (batch.items) |m| try self.redo.?.appendLogicalMutation(self.allocator, self.runtimeIo(), @intCast(root), m, pending_sequence);
+                for (batch.items) |m| {
+                    if (builtin.is_test) {
+                        if (self.test_logical_write_fail_after) |remaining| {
+                            if (remaining == 0) return error.TestPageWriteFailure;
+                            self.test_logical_write_fail_after = remaining - 1;
+                        }
+                        _ = self.test_logical_mutations.fetchAdd(1, .monotonic);
+                    }
+                    try self.redo.?.appendLogicalMutation(self.allocator, self.runtimeIo(), @intCast(root), m, pending_sequence);
+                }
                 diverted_anything = true;
             } else if (root == @backingInt(TransactionWrites.Root.documents)) {
                 const docs = try self.allocator.alloc(DocumentMutation, batch.items.len);

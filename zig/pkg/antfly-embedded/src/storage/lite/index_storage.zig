@@ -863,7 +863,13 @@ test "lite native index storage persists logical files across reopen" {
 
         const checkpoint = docs.file.activeCheckpoint();
         try std.testing.expectEqual(@as(u64, 0), checkpoint.catalog_root_page);
-        try std.testing.expect(checkpoint.index_catalog_root_page != 0);
+        // Under the redo log (the default), every one of these writes
+        // diverts logically into the overlay and is never folded into a
+        // real B-tree root until a checkpointRedoLog fold runs, so
+        // index_catalog_root_page legitimately stays 0 here too -- the
+        // data itself is still live and correctly readable through every
+        // catalog read path (ReadView/MergedCursor), verified below via
+        // snapshotIndexCatalogRecordsAlloc and, after reopen, readFileAlloc.
         const records = try docs.file.snapshotIndexCatalogRecordsAlloc(allocator);
         defer native.NativeFile.freeSnapshotCatalogRecords(allocator, records);
         try std.testing.expectEqual(@as(usize, 2), records.len);
@@ -1040,19 +1046,25 @@ test "lite native index storage handles large files rename and delete tree" {
     const append_suffix = " native append keeps old pages streaming";
     const before_append_page_count = docs.file.activeCheckpoint().page_count;
     try storage.appendFileAbsolute(allocator, "/dense/a/blob", append_suffix, true);
-    // +1 over the count this test originally asserted, for this bare
-    // commit's own reserved manifest page (`reserveBareCommitManifestPage`).
-    try std.testing.expectEqual(before_append_page_count + 7, docs.file.activeCheckpoint().page_count);
+    // Under the redo log (the default), only the external value chain's own
+    // tail pages are real (the "one page-shaped exception" a diverting
+    // transactional commit still makes, per RedoCommitState's own doc
+    // comment): one fresh tail page for the appended bytes, plus the
+    // previous tail rewritten (copy-on-write) with its new `next` pointer.
+    // The catalog entry's own update (new external_value_len/root) is
+    // purely logical and costs no real pages, unlike the legacy B-tree
+    // rebuild (tree node, free map, manifest reservation) this count used
+    // to include.
+    try std.testing.expectEqual(before_append_page_count + 2, docs.file.activeCheckpoint().page_count);
     try std.testing.expectEqual(@as(u64, @intCast(large.len + append_suffix.len)), try storage.fileSize("/dense/a/blob"));
 
     const before_rename_page_count = docs.file.activeCheckpoint().page_count;
     try storage.renameAbsolute("/dense/a/blob", "/dense/a/blob2");
-    // Two packed records share one page, plus tree node, descriptor and free
-    // map, plus one commit-manifest reservation for this durable commit's
-    // own fresh since-last-durable window (`reserveBareCommitManifestPage`,
-    // via `PageAllocator.allocateFresh` -- always a fresh id, never a reused
-    // one).
-    try std.testing.expectEqual(before_rename_page_count + 5, docs.file.activeCheckpoint().page_count);
+    // A rename is a delete-old/put-new catalog mutation pair over the same
+    // external value chain -- purely logical under redo diversion, no real
+    // pages at all (unlike the legacy B-tree rebuild this count used to
+    // include).
+    try std.testing.expectEqual(before_rename_page_count, docs.file.activeCheckpoint().page_count);
     try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/dense/a/blob", 8));
     const after_rename_check = try docs.file.check();
     try std.testing.expect(after_rename_check.valid);
@@ -1247,19 +1259,36 @@ test "lite native index storage recovers previous checkpoint after interrupted u
         const storage = index_store.storage();
 
         try storage.writeFileAbsolute("/indexes/ft/stable.tbl", "stable");
+        // The redo log (the default, `opts.use_redo_log orelse true`) is this
+        // file's only durability record for an ordinary commit -- the
+        // on-disk checkpoint slot stays untouched until a real
+        // `checkpointRedoLog` fold ever advances it (`publishCheckpoint`'s
+        // own doc comment: "build step (d) is the only thing that ever
+        // advances it for a redo-log file"), so the legacy dual-slot
+        // ping-pong this test used to truncate against no longer holds a
+        // second, independently-recoverable generation. Simulate the crash
+        // against the log's own tail instead, the same technique "lite redo
+        // log ride-along commit is lost on a crash before its sync; the
+        // durable commit survives" (native.zig) already establishes.
+        const tail_after_stable = docs.file.redo.?.writer.tail;
 
         var writer = try storage.beginAtomicWrite(allocator, "/indexes/ft/stable.tbl");
         try writer.appendSlice("replacement");
         try writer.finish();
+        try std.testing.expect(docs.file.redo.?.writer.tail > tail_after_stable);
 
-        const active_slot = docs.file.header.active_checkpoint;
-        const previous_slot: u8 = if (active_slot == 0) 1 else 0;
-        const previous = docs.file.header.checkpoints[previous_slot];
-        try std.testing.expect(previous.commit_sequence > 0);
-        try std.testing.expect(docs.file.activeCheckpoint().commit_sequence > previous.commit_sequence);
-
-        try docs.file.file.setLength(docs.file.runtime(), previous.page_count * @as(u64, docs.file.header.page_size));
-        try docs.file.file.sync(docs.file.runtime());
+        // Simulate a crash that landed every byte through "stable"'s own
+        // sync and nothing past it -- what an injected power loss right
+        // after that `writer.sync()` call and before "replacement"'s own
+        // append reached a durable barrier would leave. The file's total
+        // size must stay exactly what it was (a fixed, preallocated redo
+        // region, §9.1); zero the tail in place rather than truncating it.
+        const io = docs.file.runtime();
+        const capacity = docs.file.header.redo_log_capacity;
+        const zeroed = try allocator.alloc(u8, @intCast(capacity - tail_after_stable));
+        defer allocator.free(zeroed);
+        @memset(zeroed, 0);
+        try docs.file.file.writePositionalAll(io, zeroed, docs.file.header.redo_log_offset + tail_after_stable);
     }
 
     {
@@ -1359,6 +1388,16 @@ test "lite native staged atomic writes bound heap and survive concurrent commits
     {
         var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
         defer docs.close();
+        // The redo log (the default) starts a background ride-along flush
+        // loop on this Store's first commit (`applyMutationGroup`'s own
+        // `ensureRideAlongFlushStarted` call, gated on `self.file.redo !=
+        // null` -- a mechanism that does not exist at all for a legacy,
+        // non-redo file). Left running, it can land its own ride-along
+        // commit at an unpredictable point between this test's `before`
+        // snapshot and `writer.finish()`, perturbing the exact
+        // commit_sequence delta this test checks for reasons that have
+        // nothing to do with what it is actually testing.
+        docs.ride_along_flush_unavailable.store(true, .release);
         docs.file.page_cache_enabled.store(false, .monotonic);
         var indexes = Store.init(budget.allocator(), &docs);
         const storage = indexes.storage();
@@ -1552,7 +1591,14 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
                 if (entry.value_ptr.bytes[4] == @backingInt(native.PageKind.value)) payload_pages += 1;
             }
             try std.testing.expectEqual(hot_pages.items.len, payload_pages);
-            try std.testing.expect(docs.file.page_cache.pages.contains(docs.file.activeCheckpoint().index_catalog_root_page));
+            // Under the redo log (the default), this single-key catalog
+            // write diverts logically into the overlay and never builds a
+            // real B-tree root page at all, so index_catalog_root_page
+            // stays 0 here -- there is no catalog-tree page for cache
+            // admission to pin in the first place. The external value
+            // pages this loop actually exercises (hot_pages/payload_pages,
+            // above) remain real, page-shaped writes under diversion, so
+            // the cache-admission policy they verify is unaffected.
         }
 
         // Policy is local to the sink, and can be changed before publication.
@@ -2145,9 +2191,15 @@ test "lite mapped publication failure consumes writer and preserves old artifact
     var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 128 * 1024 };
     var writer = try storage.beginAtomicWrite(budget.allocator(), "/mapped");
     try writer.appendSlice("new");
-    docs.file.test_page_write_fail_after = 0;
+    // "new" is a 3-byte inline value -- under the redo log's default
+    // diversion this catalog mutation never touches a real page at all
+    // (`flushTransactionWrites`'s own diverting branch), so
+    // `test_page_write_fail_after` would never fire.
+    // `test_logical_write_fail_after` is its counterpart for a purely
+    // logical diverting mutation.
+    docs.file.test_logical_write_fail_after = 0;
     try std.testing.expectError(error.TestPageWriteFailure, writer.vtable.finish_mapped.?(writer.ptr));
-    docs.file.test_page_write_fail_after = null;
+    docs.file.test_logical_write_fail_after = null;
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     const retained = try storage.readFileAlloc(a, "/mapped", 100);
     defer a.free(retained);
