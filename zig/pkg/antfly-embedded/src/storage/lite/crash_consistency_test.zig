@@ -1705,24 +1705,60 @@ test "WS4 phase 2 round 2: a synchronous full_text write lands in one native com
     const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
     // Deterministic settle: see the no-worker test above's identical note.
     try store.sync();
-    const before_sequence = store.file.activeCheckpoint().commit_sequence;
+    // `committedSequence()`, not `activeCheckpoint().commit_sequence`: this
+    // scenario's whole point is background index workers committing
+    // concurrently with the write under measurement, and
+    // `activeCheckpoint().commit_sequence` reads `self.header`'s live
+    // commit_sequence field directly -- the same field `stageMutation`
+    // provisionally bumps once per *staged mutation* while some other
+    // transaction is still open (collapsed back to a single real advance
+    // only at that transaction's own commit). Reading it from outside the
+    // store's own lock, racing a concurrent worker's in-flight,
+    // multi-mutation batch, can catch that provisional, not-yet-committed
+    // count and wildly overstate how many commits actually happened
+    // (observed directly: commits_for_this_write below, before
+    // `committedSequence()` was substituted here, swinging between 5 and
+    // 36 run to run with no code change at all -- traced to a concurrent
+    // worker's own 20-30-mutation batch still being staged, each staged
+    // mutation bumping this same field, at the exact moment this read
+    // landed). `committedSequence()` -- `redo.durable_sequence` for a
+    // redo-log file -- only advances when a commit actually becomes
+    // durable, never provisionally.
+    const before_sequence = store.file.committedSequence();
 
     try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
 
-    const after_ack_sequence = store.file.activeCheckpoint().commit_sequence;
+    const after_ack_sequence = store.file.committedSequence();
     const commits_for_this_write = after_ack_sequence - before_sequence;
-    // Same bound as the no-worker scenario above: the inline publication
-    // itself is still exactly one commit: see that test's comment for why
-    // a handful more land end to end (unrelated background bookkeeping WS7
-    // owns driving to zero). Proves the inline fast path engaged here too
-    // -- without it, this write would additionally wake and wait on a
-    // worker, but would not by itself add more *commits* before the ack
-    // returns, so the real claim this bound guards is the search-visible
-    // assertion immediately below: that only holds if the write's own
-    // index effects are already durable at ack time, which requires the
-    // inline path, not the worker (a worker applies asynchronously, after
-    // `batch()` has already returned).
-    try std.testing.expect(commits_for_this_write <= 6);
+    // Unlike the no-worker scenario above, this configuration's own
+    // background index worker is genuinely committing concurrently with
+    // the measured write (that is the whole point of running it "with
+    // background index workers running"), so this bound cannot be the
+    // tight "inline publication is exactly one commit" one the no-worker
+    // test asserts. 25 runs with `recovery_debug_log` on, read directly
+    // (not inferred from `commits_for_this_write`), show exactly this
+    // shape every time: one ride-along commit capturing a pre-chain
+    // `durable_header` baseline, one durable commit consuming it, that
+    // pattern repeating zero to two more times purely from the
+    // background worker's own unrelated catch-up commits landing before
+    // and/or after this write's own single commit happens to be staged
+    // (visible directly in the trace: the write's own `Txn.commitStaged`
+    // -- `mutation_count=26`, `index_catalog_mutation_count=4` in a
+    // representative run -- sits in the middle of the sequence, with
+    // background ride-along/durable pairs on either side), and finally
+    // one trailing ride-along after this write's own commit, again the
+    // worker's. Observed range across 25 runs: 5-7, never above 7 --
+    // `<= 6` from before this comment is the no-worker bound, carried
+    // over here by mistake rather than re-derived for this scenario; `<=
+    // 8` leaves one extra background ride-along/durable pair of headroom
+    // above the observed maximum. None of this is the measured write
+    // paying for extra commits of its *own* -- its own inline publication
+    // is still exactly the one commit the no-worker test proves -- it is
+    // this test's own assertion window being wide enough to also catch
+    // whatever the background worker was doing at the same moment, by
+    // design (this scenario exists specifically to run with that worker
+    // active).
+    try std.testing.expect(commits_for_this_write <= 8);
 
     // Searchable immediately after ack, before the background worker has
     // had any chance to run.
@@ -2882,7 +2918,10 @@ test "crash sweep: full text recovers from one transient io fault with no crash"
             // reopen being the only possible recovery path: proving (b)
             // the index never stays `IndexRebuilding` forever once the
             // underlying I/O is healthy again.
-            var reopened = try openDbWithIo(allocator, path, std.testing.io, false);
+            var reopened = openDbWithIo(allocator, path, std.testing.io, false) catch |err| {
+                std.debug.print("io-fault regression: reopen itself failed kind={s} at_op={d}: {s}\n", .{ @tagName(kind), at_op, @errorName(err) });
+                return err;
+            };
             defer reopened.close();
             assertSearchable(&reopened, allocator, "body_text", "body", "ft-doc", "needle") catch |err| {
                 std.debug.print("io-fault regression failed kind={s} at_op={d}: {s}\n", .{ @tagName(kind), at_op, @errorName(err) });
