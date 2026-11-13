@@ -6918,6 +6918,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("lite-query-reader-test", "Verify native query reader reuse, exact sorting, and filtered text statistics")
         .dependOn(&addFilteredTestRunArtifact(b, lite_query_reader_tests).step);
 
+    const cleanup_job_owner_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{"cleanup job owner"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("cleanup-job-owner-test", "Verify bounded cleanup drain/retry/give-up liveness")
+        .dependOn(&addFilteredTestRunArtifact(b, cleanup_job_owner_tests).step);
+
     const lite_merge_publication_runtime_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission", "db text merge backpressure drains sustained segment debt to low watermark", "db text merge producer admission isolates quarantined dimensions", "db manual text producers merge capacity without optional workers", "db bulk ingest keeps full text merge maintenance live", "db text merge structural pause rejects manual turns", "db text merge stop does not deadlock against a producer's assisted fallback", "text merge publication handoff releases index lease before global contention", "db delete full text index drains active merge before closing generation", "db close stops text admission before joining derived publishers", "db structural mutation autonomously retries transient maintenance restart failures" },
