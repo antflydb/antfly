@@ -1169,6 +1169,36 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_runtime_io_abi_tests = b.addRunArtifact(runtime_io_abi_tests);
     b.step("runtime-io-abi-test", "Run executor contracts across independent error domains").dependOn(&run_runtime_io_abi_tests.step);
 
+    const remote_content_owner_provider_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/remote_content_owner_test_provider.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, remote_content_owner_provider_mod, false, true);
+    const remote_content_owner_provider = @import("../../../build_support/embedded/shared_library.zig").addProviderArchive(
+        b,
+        remote_content_owner_provider_mod,
+        "remote-content-owner-test-provider",
+        4 * 1024 * 1024 * 1024,
+    );
+    const remote_content_adapter_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/remote_content_owner_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, remote_content_adapter_test_mod, false, true);
+    antfly_imports.storage_boundary.configureProfile(remote_content_adapter_test_mod, true, false, .owner);
+    remote_content_adapter_test_mod.linkLibrary(remote_content_owner_provider);
+    const remote_content_adapter_tests = b.addTest(.{
+        .root_module = remote_content_adapter_test_mod,
+        .use_llvm = @import("../../../build_support/embedded/shared_library.zig").llvmBackend(target.result),
+        .filters = &.{"remote content production adapter"},
+        .max_rss = 4 * 1024 * 1024 * 1024,
+    });
+    const remote_content_adapter_run = b.addRunArtifact(remote_content_adapter_tests);
+    b.step("antfly-remote-content-adapter-test", "Verify the production remote-content adapter across the compiled owner boundary")
+        .dependOn(&remote_content_adapter_run.step);
+
     const scan_sink_provider_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/runtime_scan_sink_test_provider.zig"),
         .target = target,
@@ -3105,6 +3135,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, VOPR, integration, chaos, and recall checks");
 
     const unit_test_step = b.step("antfly-unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
+    unit_test_step.dependOn(&remote_content_adapter_run.step);
     unit_test_step.dependOn(&b.top_level_steps.get("aws-credentials-test").?.step);
     unit_test_step.dependOn(&b.top_level_steps.get("antfly-google-embedding-catalog-test").?.step);
     unit_test_step.dependOn(&b.top_level_steps.get("embedded-package-test").?.step);

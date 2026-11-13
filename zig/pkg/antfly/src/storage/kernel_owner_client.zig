@@ -99,6 +99,9 @@ pub const Context = struct {
     }
 
     /// Keep the remote-content publisher live across the compiled owner boundary.
+    /// Immutable publishers supply Snapshot.revision for allocation-free warm
+    /// acquisitions. Mutable configs without an identity must serialize/hash on
+    /// every acquisition to detect edits; never invent a fixed revision for them.
     pub fn configureRemoteContent(self: *Context, config: ?*const scraping.RemoteContentConfig) !void {
         const remote = config orelse return self.configureRemoteContentSecurity("");
         const Adapter = struct {
