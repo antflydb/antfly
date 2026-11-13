@@ -2360,20 +2360,19 @@ test "lite full text synchronous visibility is searchable immediately after an u
         defer tmp.cleanup();
         const path = try testAflitePath(allocator, tmp);
         defer allocator.free(path);
-        var lite_backend = try backend.Handle.createWithOptions(allocator, path, .{ .exclusive = true, .io = std.testing.io, .use_redo_log = false });
-        errdefer lite_backend.deinit();
-        const identity = connection.identityOpenOptions(true);
-        var db_opts = db_mod.OpenOptions{
-            .open_mode = .writer,
-            .identity_namespace = identity.identity_namespace,
-            .prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace,
-        };
-        try lite_backend.configureDbOpenOptions(&db_opts);
-        var db = try db_mod.DB.open(allocator, path, db_opts);
-        errdefer db.close();
-        try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
-        try db.runUntilIdle();
-        var handle = DbHandle{ .backend = lite_backend, .db = db };
+        // Opening through `openLegacyDbWithIo` (not inlined here) is the
+        // point, not incidental: an `errdefer lite_backend.deinit()` /
+        // `errdefer db.close()` pair declared in *this* function would stay
+        // armed for the rest of the loop body below, including past the
+        // point where `handle = .{ .backend = lite_backend, .db = db }`
+        // copies their values and `defer handle.close()` becomes the real
+        // owner -- any later failure (`batch`/`assertSearchable`) would
+        // then double-close both `db` and `lite_backend` on top of
+        // `handle`'s own close. `openLegacyDbWithIo`'s errdefers are scoped
+        // to its own body, which returns before any of that can happen
+        // (see its doc comment, and `ioFaultThenDoubleCloseScenarioLegacy`
+        // below for the shape this avoids).
+        var handle = try openLegacyDbWithIo(allocator, path, std.testing.io);
         defer handle.close();
         try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
         try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
@@ -2781,12 +2780,43 @@ test "crash sweep: full text sync visibility discovery is not flaky under the sh
 // depend on knowing exactly which op a real disk hiccup happens to land
 // on -- matching this file's own `exhaustive` crash sweep's philosophy,
 // applied to I/O faults instead of crashes.
+/// Runs the "seed, then ft-doc" scenario the sweep below drives, once, with
+/// an unreachable `at_op` (`maxInt`) armed for `kind` so the fault never
+/// fires, then reads back exactly how many `kind` calls the `ft-doc` write
+/// alone made (via `SimIo.ioFaultOpCount`, which counts from the moment
+/// `setIoFaultPlan` installs the plan). This discovery pass is what lets
+/// the real sweep below bound `at_op` to calls the write itself makes,
+/// instead of a hand-picked constant that can overshoot past the write
+/// into whatever its caller does next.
+fn discoverFaultOpCount(allocator: Allocator, kind: sim_io.IoFaultKind) !u64 {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    const sim = try sim_io.SimIo.init(allocator, std.testing.io);
+    defer sim.deinit();
+
+    var handle = try openDbWithIo(allocator, path, sim.io(), true);
+    errdefer handle.close();
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+    try handle.db.runUntilIdle();
+
+    sim.setIoFaultPlan(.{ .at_op = std.math.maxInt(u64), .kind = kind, .err = error.InputOutput });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+    const count = sim.ioFaultOpCount(kind);
+    sim.setIoFaultPlan(null);
+    handle.close();
+    return count;
+}
+
 test "crash sweep: full text recovers from one transient io fault with no crash" {
     const allocator = std.testing.allocator;
     const kinds = [_]sim_io.IoFaultKind{ .write, .sync, .create };
     for (kinds) |kind| {
+        const op_count = try discoverFaultOpCount(allocator, kind);
         var at_op: u64 = 0;
-        while (at_op < 12) : (at_op += 1) {
+        while (at_op < op_count) : (at_op += 1) {
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try testAflitePath(allocator, tmp);
@@ -2804,6 +2834,20 @@ test "crash sweep: full text recovers from one transient io fault with no crash"
             var handle = try openDbWithIo(allocator, path, sim.io(), true);
             errdefer handle.close();
             try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+            // The seed write's `sync_level = .write` returns as soon as the
+            // write itself is durable, *not* once `body_text`'s background
+            // catch-up has indexed it -- that indexing keeps running
+            // concurrently via `io.concurrent(...)` afterwards. Drain it
+            // before arming the fault (same reasoning as `openDbWithIo`'s
+            // own drain after `open`/`addIndex`, just above): without this,
+            // `at_op` counts whichever call happens to be in flight when the
+            // plan is installed, which can be the seed's own still-running
+            // catch-up rather than the `ft-doc` write this test is actually
+            // targeting -- the fault then lands on unrelated setup work
+            // instead of the operation under test, and the one real,
+            // one-shot fault's effect surfaces somewhere this test never
+            // retries.
+            try handle.db.runUntilIdle();
 
             sim.setIoFaultPlan(.{
                 .at_op = at_op,
@@ -2815,9 +2859,21 @@ test "crash sweep: full text recovers from one transient io fault with no crash"
                 // (`IoFaultPlan.repeat` defaults to false): an ordinary
                 // application retry of the exact same write must now land
                 // cleanly, proving (a) the transient error surfaced as
-                // something retryable rather than wedging the owner.
+                // something retryable rather than wedging the owner. Give
+                // the owner's own handling of the failed attempt one
+                // `runUntilIdle` turn to settle first, instead of racing
+                // it with an immediate retry.
+                handle.db.runUntilIdle() catch {};
                 try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
             };
+            // `at_op < op_count` guarantees the fault fired (and, being
+            // one-shot, already cleared itself) somewhere within the
+            // `ft-doc` write's own calls above -- but disarm explicitly
+            // anyway, defense in depth: a leftover armed plan must never
+            // reach `close()`'s own best-effort, unretried syncs
+            // (`core.syncStore`, the index status snapshot), which this
+            // test has no retry path for at all.
+            sim.setIoFaultPlan(null);
             handle.close();
 
             // Reopen with a plain, unwrapped `std.Io` -- no `SimIo`, no

@@ -11026,7 +11026,21 @@ pub const NativeFile = struct {
                 const take_overlay = overlay_key != null and (tree_key == null or std.mem.order(u8, overlay_key.?, tree_key.?) != .gt);
                 if (take_overlay) {
                     const key = overlay_key.?;
-                    const entry = (try file.redoOverlayEntry(self.overlay_root, self.index.checkpoint, key)) orelse return error.InvalidNativeRedoRecord;
+                    const entry = (try file.redoOverlayEntry(self.overlay_root, self.index.checkpoint, key)) orelse {
+                        // `candidate` (if any) was fetched above and already
+                        // cleared out of `self.pending_tree`; every other
+                        // path below either frees it (`tied`) or re-stashes
+                        // it (`self.pending_tree = candidate`) before
+                        // returning. This early return skips both, so its
+                        // key -- already allocated by
+                        // `DocumentIndexCursor.currentEntry`'s `dupe` -- must
+                        // be freed here or it leaks.
+                        if (candidate) |c| {
+                            var owned = c;
+                            owned.deinit(file.allocator);
+                        }
+                        return error.InvalidNativeRedoRecord;
+                    };
                     const tied = tree_key != null and std.mem.eql(u8, tree_key.?, key);
                     if (tied) {
                         var owned = candidate.?;
