@@ -67,7 +67,7 @@ import requests
 
 from .models import (
     DEFAULT_EXTRACTOR_MODEL,
-    bootstrap_models_for_listing,
+    prefetch_test_models,
     inference_server_command,
     maybe_pull_missing_model,
     ml_dir,
@@ -618,6 +618,17 @@ def base_url(request):
     except RuntimeError:
         pytest.skip("Set ANTFLY_INFERENCE_URL or ANTFLY_BIN to run E2E tests")
 
+    prefetch_test_models(
+        [
+            (
+                Path(item.path).name,
+                marker.args[0]
+                if (marker := item.get_closest_marker("inference_model"))
+                else None,
+            )
+            for item in request.session.items
+        ]
+    )
     models_path = str(models_dir())
     ml_path = str(ml_dir())
 
@@ -970,10 +981,6 @@ def api(base_url):
             r = self.get("/models", retry_on_missing_model=False)
             _check(r)
             payload = r.json()
-            if bootstrap_models_for_listing(payload):
-                r = self.get("/models", retry_on_missing_model=False)
-                _check(r)
-                payload = r.json()
             return payload
 
         def readyz(self):
