@@ -16860,26 +16860,54 @@ pub const NativeFile = struct {
         // down runs) can fail partway through a write already staged via
         // `stageMutation`'s `self.transactionWrites()` call. Without this,
         // an error here leaves `self.transaction_header`/`self.
-        // transaction_writes` set forever: every later `stagingTransaction()`
-        // check (that name's own doc comment) then wrongly believes a
-        // transaction is still open, silently staging every future write
-        // into the stale `TransactionWrites` instead of ever really
-        // committing it again -- confirmed reachable live, via `check()`'s
-        // own `liveStats`/`LiveRecordCursor` path hitting a `std.HashMap`
-        // `pointer_stability` double-lock panic inside the eventually-
-        // triggered `flushTransactionWrites` call on that same stale,
-        // never-cleared instance. A caller with its own abort-on-error
-        // (`docstore.zig`'s `applyMutationGroup`, `errdefer self.file.
-        // abortTransaction()`) already recovers from this correctly; a
-        // bare `NativeFile.commitTransaction()` caller with no such
-        // wrapper (every direct native-level test, crash_consistency_
-        // test.zig's own scenarios) does not. Mirrors `abortTransaction`'s
-        // own cleanup of the same two fields.
-        errdefer {
-            if (self.transaction_writes) |writes| writes.deinit(self.allocator);
-            self.transaction_writes = null;
-            self.transaction_header = null;
-        }
+        // transaction_writes` set forever (and `self.header` holding this
+        // failed attempt's partial, uncommitted mutations, and
+        // `commit_span_depth` never decremented): every later
+        // `stagingTransaction()` check (that name's own doc comment) then
+        // wrongly believes a transaction is still open, silently staging
+        // every future write into the stale `TransactionWrites` instead of
+        // ever really committing it again -- confirmed reachable live, via
+        // `check()`'s own `liveStats`/`LiveRecordCursor` path hitting a
+        // `std.HashMap` `pointer_stability` double-lock panic inside the
+        // eventually-triggered `flushTransactionWrites` call on that same
+        // stale, never-cleared instance.
+        //
+        // Calls `self.abortTransaction()` directly -- the *full* rollback
+        // (header restore, `transaction_writes` deinit, `discardTransactionTail`,
+        // manifest-window reset, `debugExitCommitSpan`), not a hand-rolled
+        // partial copy of two of its fields, which an earlier version of
+        // this errdefer was and which left two gaps: `self.header` was
+        // never restored to `previous` (this failed attempt's partial
+        // writes stayed live on the instance) and `commit_span_depth` was
+        // never decremented. The latter depended on the *caller's own*
+        // `errdefer self.abortTransaction()` to close it -- but
+        // `abortTransaction` itself decides whether it has anything to
+        // do by checking `self.transaction_header orelse return`, and this
+        // errdefer already having cleared that same field by the time any
+        // caller's own errdefer ran meant `abortTransaction` always took
+        // the early return and silently skipped its own
+        // `debugExitCommitSpan` call. Not a double-decrement -- a leak:
+        // `commit_span_depth` stayed elevated forever, so the *next*,
+        // wholly unrelated `beginTransaction` on this instance found a
+        // stale nonzero depth and panicked with "overlapped an
+        // already-open commit span", even though nothing was actually
+        // racing it. Caught live by `checkpointRedoLogNested`'s own
+        // `maybeAutoCheckpointRedoLog` path hitting
+        // `error.LiteStorageBudgetExceeded` inside `flushTransactionWrites`
+        // ("lite reclamation opportunistic redo checkpoint failure is
+        // visible and recovers"/"lite reclamation budget rejects a
+        // mutation before exhausting capacity").
+        //
+        // Calling the full `abortTransaction()` here is safe for a *later*
+        // failure too (after the success-path `self.transaction_header =
+        // null` a few lines down has already run): `abortTransaction`'s own
+        // `self.transaction_header orelse return` guard then finds `null`
+        // and returns immediately, a no-op, leaving that failure to the
+        // unconditional `defer self.debugExitCommitSpan()` and the second
+        // `errdefer` below exactly as before -- so this one `errdefer` is
+        // correct, and is the only one needed, for every failure this
+        // function can have, early or late.
+        errdefer self.abortTransaction();
         try self.flushTransactionWrites();
         var next = self.activeCheckpoint();
         const changed = next.commit_sequence != previous.checkpoints[previous.active_checkpoint].commit_sequence;
@@ -16892,20 +16920,6 @@ pub const NativeFile = struct {
         }
         self.header = previous;
         self.transaction_header = null;
-        // Registered only from here on, not right after confirming
-        // `previous` above: a failure in `flushTransactionWrites`/
-        // `sealAllocatorCheckpoint` (both fallible, both run before this
-        // point) leaves `transaction_header` still set, so the caller's own
-        // `errdefer self.abortTransaction()` is what actually closes this
-        // span -- and `abortTransaction` runs its own `debugExitCommitSpan`
-        // exactly once for that. Deferring this call unconditionally right
-        // after confirming `previous`, as an earlier version of this guard
-        // did, double-decremented `commit_span_depth` on that exact
-        // failure path (this function's own defer firing on the error
-        // return, then `abortTransaction`'s firing again right after) --
-        // caught by its own `std.debug.assert(previous > 0)` panicking,
-        // live, under `checkpointRedoLog`'s injected-fault crash-sweep
-        // coverage.
         defer self.debugExitCommitSpan();
         errdefer {
             if (!self.checkpoint_publication_uncertain) {
@@ -17423,6 +17437,20 @@ pub const NativeFile = struct {
                             self.test_fail_checkpoint_publication = null;
                             break :blk err;
                         };
+                        // WS2: release the store mutex for exactly the
+                        // fsync syscall, same protocol `syncIfRequired`
+                        // already uses for the v8/v9 slot path -- see that
+                        // function's own comment. Nothing appends to
+                        // `redo.writer` here (this branch republishes an
+                        // already-appended sequence), so there is nothing
+                        // left to serialize against besides the fsync
+                        // itself; `commit_in_sync` still fences every other
+                        // `NativeFile` mutation (a new transaction, an
+                        // allocate/reclaim, another checkpoint publish) out
+                        // for this window, exactly as it does for the
+                        // non-redo path.
+                        if (hooks) |h| h.release(h.context);
+                        defer if (hooks) |h| h.reacquire(h.context);
                         redo.writer.sync() catch |err| break :blk err;
                         break :blk {};
                     }) catch {
@@ -17559,6 +17587,29 @@ pub const NativeFile = struct {
                         break :blk err;
                     };
                     redo.appendRecord(self.allocator, checkpoint.commit_sequence, CompactCheckpoint.fromCheckpointSlot(checkpoint)) catch |err| break :blk err;
+                    // WS2 (lite-single-commit-write-path.md §9.3/§3.2a):
+                    // append under the lock (above; `redo_log.Writer` is
+                    // "not safe for concurrent use from more than one
+                    // caller," so the append itself needs full exclusion),
+                    // then release the store mutex for exactly the fsync
+                    // syscall and reacquire before touching anything else --
+                    // the same protocol `syncIfRequired` already uses for
+                    // the v8/v9 slot path. Without this, every stage
+                    // serialized behind every fsync: the legacy path lets
+                    // the *next* group's own `Txn` stage (and, at 8+
+                    // concurrent writers, start its own commit) while this
+                    // group's fsync is still running (`commit_in_sync`
+                    // fences `NativeFile` mutation, not staging); this redo
+                    // path held the lock across `redo.writer.sync()` too,
+                    // so a new `Txn.openWrite`'s `lockStore` spun for the
+                    // syscall's entire duration -- confirmed live as a
+                    // multi-hour livelock in "a new Txn opens and stages
+                    // while a group's fsync is in flight" at 8 concurrent
+                    // writers, and a throughput regression (no group-commit
+                    // fsync sharing) even below livelock-triggering
+                    // concurrency.
+                    if (hooks) |h| h.release(h.context);
+                    defer if (hooks) |h| h.reacquire(h.context);
                     redo.writer.sync() catch |err| break :blk err;
                     break :blk {};
                 }) catch {
@@ -17577,7 +17628,15 @@ pub const NativeFile = struct {
                 // from "a sync happened, through a path this counter
                 // doesn't know about."
                 if (builtin.is_test) _ = self.test_sync_calls.fetchAdd(1, .monotonic);
-                redo.durable_sequence = checkpoint.commit_sequence;
+                // Monotonic, not a bare assignment: the store mutex was
+                // released for the `sync()` call just above, so -- in
+                // principle, if some future caller is ever added that can
+                // reach this same `redo.writer`/`redo.durable_sequence`
+                // under `lockStoreExclusive` without going through this
+                // exact append-then-sync sequence -- a reacquire here must
+                // never retreat `durable_sequence` backward. Matches the
+                // republish branch above, which already uses this form.
+                if (checkpoint.commit_sequence > redo.durable_sequence) redo.durable_sequence = checkpoint.commit_sequence;
                 // §9.3b: publish right after the append this process just
                 // made durable, never before -- ride-along/deferred appends
                 // elsewhere are unsynced and must never be visible to a
