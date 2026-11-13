@@ -2292,6 +2292,183 @@ succeeds, and `close()` still returns, all within a few seconds.
 Landed as its own commit, separate from the default flip, so the two
 can be merged independently.
 
+### 9.7c ReadView: one read primitive
+
+Referred to as "§9.8" in the task that asked for it; filed here instead
+to avoid renumbering the existing §9.8 Gates section below, which
+callers already cite by number.
+
+#### Why: the overlay-blind-read bug class, found three times
+
+The default flip (§9.7a) surfaced the same bug shape at three different
+layers, fixed one at a time as each was found rather than once at the
+root:
+
+1. **`docstore.Cursor`** (3715ef1be0/a80c694997): `Txn.openCursor()`'s
+   cursor merged only `pending_tree` (a write transaction's own
+   in-flight, uncommitted writes), never `SharedRedoOverlay`. Every
+   range/prefix scan through the generic `Txn` API -- SQL range reads,
+   posting-list walks, replay-journal/derived-index catch-up,
+   reclamation and pooling scans -- was affected. Fixed with a
+   three-way merge inside `Cursor` itself (`pending_tree` over the
+   overlay over the B-tree).
+2. **`NativeFile.getDocumentsAtCheckpointWithState`** (304859e1f3): the
+   batch document read's own tree walk
+   (`readBatchAtCheckpoint`/`resolveBatchReferences`/
+   `readDocumentBatchWithPath`) has no overlay knowledge at all --
+   unlike the single-key `getDocumentAtCheckpointAlloc`, which checks
+   `redoOverlayEntry` first. This is what derived catch-up's own
+   document read (`document_collectors.zig`'s `txn.getManySorted`)
+   hit: the replay-journal scan (already fixed, via `Cursor`) found a
+   new entry, but the document read that follows to materialize it
+   could not see the document, surfacing as `error
+   .ReplayDocumentNotVisible` escalating into crash-sweep failures
+   under the true default. Fixed with an overlay pre-pass ahead of the
+   existing tree-based batch path.
+3. **`NativeFile.readBackingPages`'s read-ahead window** (the storage
+   agent's parallel find, f90ed03487 on `perf/lwa-redo-eos`): the
+   multi-page read-ahead window's overlay check covered only the exact
+   page being requested, not the rest of the window, so a diverted page
+   past the first one in a read-ahead span was read raw, straight past
+   EOF (`error.EndOfStream`).
+
+Three call sites, three independent fixes, same root cause each time:
+*some* read path forgot to consult `SharedRedoOverlay`, because nothing
+makes forgetting a compile error. The redirect behind this section: stop
+finding these one at a time. Put the merge in exactly one primitive,
+make every reader go through it, and make the raw B-tree accessor hard
+to reach any other way.
+
+#### The primitive
+
+```zig
+/// The one way to read a redo-log-capable NativeFile: a checkpoint C
+/// (the physical B-tree root this view's tree-side reads are pinned to)
+/// paired with an overlay read mark M (the logical commit sequence this
+/// view's overlay-side reads are pinned to). Captured together, at the
+/// same moment, because under redo mode they are not the same number:
+/// an ordinary commit advances M (NativeFile.committedSequence's own
+/// doc comment) without moving C at all until the next
+/// checkpointRedoLog. A ReadView over the *current* generation has C
+/// lag M; a ReadView pinned to an older, already-checkpointed
+/// generation has C == M (a real checkpoint publish is exactly the
+/// moment the two numbers coincide).
+pub const ReadView = struct {
+    file: *NativeFile,
+    checkpoint: CheckpointSlot, // C
+    mark: u64,                  // M
+    pinned: bool = false,
+
+    pub fn open(file: *NativeFile, io: Io) !ReadView { ... } // current generation: C = file.activeCheckpoint(), M = file.committedSequence()
+    pub fn openAt(file: *NativeFile, io: Io, checkpoint: CheckpointSlot) !ReadView { ... } // older generation: C == M == checkpoint.commit_sequence
+    pub fn release(self: *ReadView, io: Io) void { ... }
+
+    pub fn getDocumentAlloc(self: *const ReadView, allocator: Allocator, key: []const u8) !?[]u8;
+    pub fn getDocumentsAlloc(self: *const ReadView, allocator: Allocator, temporary: Allocator, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, state: *DocumentBatchReadState) !void;
+    pub fn openCursor(self: *const ReadView, prefix: []const u8) !MergedCursor; // docstore.Cursor's three-way merge, moved down here
+    pub fn openIndexValue(self: *const ReadView, allocator: Allocator, key: []const u8) !IndexValue;
+    pub fn readIndexValueInto(self: *const ReadView, value: IndexValue, offset: u64, out: []u8) !void;
+};
+```
+
+Every one of the three fixes above is `ReadView`-shaped already --
+`redoOverlayEntry(root, checkpoint, key)`'s own version resolution
+(`SharedRedoOverlay.resolveAlloc(..., at_or_before)`) is exactly "resolve
+at mark M", just currently called with `checkpoint.commit_sequence`
+(C) standing in for M at most call sites, which only happens to be
+correct when C and M coincide (an older, already-checkpointed
+generation, or legacy/non-redo files, where the distinction never
+existed). `ReadView.open`'s whole job is computing the *other* case
+correctly once, in one place, instead of at every call site that reads.
+
+`docstore.Cursor`/`Txn` and every read API (`get`, `getManySorted`,
+`openCursor`, `openKeyCursor`, `openIndexValue`) become thin wrappers
+that open a `ReadView` and delegate. The per-site `OverlayScanState`
+merges this branch already added (`Cursor`'s own three-way merge,
+`getDocumentsAtCheckpointWithState`'s pre-pass) move down into
+`ReadView`'s own implementation and collapse into one merge instead of
+two.
+
+#### The raw tree becomes a distinct, deliberately-named type
+
+`DocumentIndexCursor`/`CatalogCursor` (native.zig's raw B-tree walkers,
+with no overlay knowledge at all) stay exactly as they are internally,
+but under a name that says so: `CheckpointedTree`, `pub` only within
+native.zig (or exported under a name no other file would reach for by
+accident), used only by `checkpointRedoLog`'s own fold, vacuum, and
+recovery -- the three callers that correctly want the *physical* tree
+on purpose, never the live overlay. Every other reader goes through
+`ReadView`, which is the only type with both a `CheckpointedTree`
+*and* overlay access. A new read added anywhere else that reaches for
+`CheckpointedTree` directly either doesn't compile (if it stays
+non-`pub`) or is an obvious, greppable code-review smell (if a name
+change is all the guard this gets in a first pass).
+
+#### Recovery before any read
+
+`NativeFile.openWithIo`'s redo-log path (`recoverRedoLog`) already
+replays the valid log prefix into the shared overlay before returning
+a handle (§9.5) -- this was already correct; `ReadView` does not change
+`open()`'s own ordering, it just makes every caller's *first* read
+after open go through the same pinned (C, M) pair instead of each
+computing its own, inconsistently. Derived workers and catch-up pin a
+`ReadView` the normal way (`ReadView.open`, after the file is already
+open and recovered), so a worker that starts catching up immediately
+after a crash-reopen sees the just-recovered records the same way an
+ordinary live reader sees just-committed ones.
+
+#### Retention: pins already exist, nothing new needed
+
+Agreed directly with the storage agent (owns this half, as part of its
+`EndOfStream` fix): retention already works through the existing
+reader-pin machinery, no new mechanism required.
+`SharedRedoOverlay.pin`/`maybeClearPages` already keep a staged overlay
+page alive while any pin covers it, and `inode_lock.pinReader` already
+feeds `NativeFile.reuseFrontier`, which already gates `drainRetirement`
+and reclamation -- confirmed by their own new test, "a pin survives
+checkpoint and reclaim: a superseded multi-page external value stays
+readable."
+
+`ReadView.open`/`release` pin with exactly the same two calls
+`Store.pinInitializedReadGeneration`/`releaseReadGeneration` already
+make, in the same order: pin the overlay mark M first
+(`redo.shared.pin(allocator, io, M)`), then the checkpoint C
+(`inode_lock.pinReader(entry, io, .{ .data = C.commit_sequence,
+.metadata = C.commit_sequence })`); unpin in reverse on release. Once
+`ReadView` exists, `ReadGeneration` itself becomes either `ReadView`
+directly or a thin wrapper over it, so there is exactly one pin type
+in the file instead of two parallel ones.
+
+The storage agent's `readBackingPages` read-ahead fix (f90ed03487,
+`perf/lwa-redo-eos`, being refined to keep the read-ahead window) lives
+in the page-read layer below `ReadView` -- `ReadView`'s own value-chain
+reads call through it, but the fix itself doesn't overlap this design.
+Merge that branch once it's refined.
+
+#### Delivery order and status
+
+Per the task's own ordering ("start with derived catch-up's document
+reads, then batch reads, then everything else"), delivered as targeted
+fixes on the existing primitives first, with the `ReadView` type itself
+and the `CheckpointedTree` rename as the next, not-yet-started step:
+
+- Done: the three fixes listed at the top of this section (`Cursor`'s
+  merge, `getDocumentsAtCheckpointWithState`'s pre-pass,
+  `readBackingPages`'s read-ahead window).
+- Not done: the actual `ReadView` type; routing `Cursor`/`Txn`'s read
+  API through it instead of each having its own merge; the
+  `CheckpointedTree` rename/visibility restriction; collapsing
+  `ReadGeneration` into (or onto) `ReadView`.
+- Not done: the reclaim agent's planned redo on/off differential oracle
+  against the `ReadView` API -- waiting on the API actually existing.
+- Test added for this section specifically: "lite derived catch-up sees
+  a document and its full-text entry written without a checkpoint,
+  before and after a crash and reopen" (`crash_consistency_test.zig`) --
+  exercises the real catch-up API end to end (write, no checkpoint, run
+  catch-up, assert visible; then crash/reopen and repeat), rather than
+  probing `ReadView`'s own internals directly, since the type does not
+  exist yet.
+
 ### 9.8 Gates (from step (c) on)
 
 Unchanged from the task's own list, restated for traceability:
