@@ -2674,11 +2674,15 @@ pub const IndexManager = struct {
         }
 
         fn cacheDecodedVector(self: *@This(), index: *hbc_mod.HBCIndex, vector_id: u64, vector: []const f32) void {
+            if (!self.cache_vectors and self.working_slice == .dense_search_working_set) return;
             const lease = if (self.decoded_residency_lease) |*value| value else return;
             _ = index.cacheVectorForResidencyLease(lease, vector_id, vector) catch {};
         }
 
         fn ensureDecodedResidencyCapacity(self: *@This(), vector_count: usize, dims: usize) void {
+            // Exact waves do not populate decoded residency. In particular,
+            // do not recycle their pinned snapshot to change cache policy.
+            if (!self.cache_vectors and self.working_slice == .dense_search_working_set) return;
             const lease = if (self.decoded_residency_lease) |*value| value else return;
             const required_bytes = @as(u64, @intCast(vector_count)) *| hbc_mod.estimateDecodedVectorResidencyBytes(dims);
             if (lease.ensureCapacity(required_bytes)) return;
@@ -2783,7 +2787,9 @@ pub const IndexManager = struct {
         fn getTxn(self: *@This(), store: *docstore_mod.DocStore) !*docstore_mod.DocStore.Txn {
             if (self.snapshot_native_only) return error.DenseSnapshotNeedsPrimary;
             if (self.read_txn == null) {
-                self.read_txn = switch (self.read_txn_kind) {
+                // Exact queries retain one snapshot but release vector read buffers
+                // at every scoring wave. A probe cannot provide scoped reads.
+                self.read_txn = switch (if (self.working_slice == .dense_search_working_set and !self.cache_vectors) ReadTxnKind.snapshot else self.read_txn_kind) {
                     .probe => try store.beginProbeTxnWithBlockCacheAdmission(self.block_cache_admission),
                     .snapshot => try store.beginReadTxnWithBlockCacheAdmission(self.block_cache_admission),
                 };
@@ -19545,7 +19551,7 @@ pub const IndexManager = struct {
         }
 
         if (active_dense_vector_load_session == null and self.primary_store != null and entry.vector_loader_context != null) {
-            const decoded_residency_lease = entry.index.acquireDecodedVectorResidencyForSearch(req);
+            const decoded_residency_lease = if ((req.search_effort orelse 0) >= 1) null else entry.index.acquireDecodedVectorResidencyForSearch(req);
             vector_load_session = .{
                 .context = entry.vector_loader_context.?,
                 .working_slice = .dense_search_working_set,
@@ -19558,13 +19564,24 @@ pub const IndexManager = struct {
             active_dense_vector_load_session = &vector_load_session.?;
         }
         var native_location_session: ?*DenseVectorLoadSession = null;
+        var previous_cache_vectors: bool = false;
         if (active_dense_vector_load_session) |session| {
             if (entry.vector_loader_context != null and session.context == entry.vector_loader_context.?) {
                 session.clearNativeVectorLocations();
+                previous_cache_vectors = session.cache_vectors;
+                if ((req.search_effort orelse 0) >= 1) {
+                    // Query entry is a safe boundary to discard a prior probe's
+                    // borrowed values. Exact fallback needs one stable snapshot.
+                    if (session.read_txn) |*txn| if (txn.probe != null) session.recycleRawReadState();
+                    session.cache_vectors = false;
+                }
                 native_location_session = session;
             }
         }
-        defer if (native_location_session) |session| session.clearNativeVectorLocations();
+        defer if (native_location_session) |session| {
+            session.clearNativeVectorLocations();
+            session.cache_vectors = previous_cache_vectors;
+        };
 
         return try entry.index.searchWithRequest(req);
     }
@@ -19583,7 +19600,7 @@ pub const IndexManager = struct {
         }
 
         if (active_dense_vector_load_session == null and self.primary_store != null and entry.vector_loader_context != null) {
-            const decoded_residency_lease = entry.index.acquireDecodedVectorResidencyForSearch(req);
+            const decoded_residency_lease = if ((req.search_effort orelse 0) >= 1) null else entry.index.acquireDecodedVectorResidencyForSearch(req);
             vector_load_session = .{
                 .context = entry.vector_loader_context.?,
                 .working_slice = .dense_search_working_set,
@@ -19596,13 +19613,24 @@ pub const IndexManager = struct {
             active_dense_vector_load_session = &vector_load_session.?;
         }
         var native_location_session: ?*DenseVectorLoadSession = null;
+        var previous_cache_vectors: bool = false;
         if (active_dense_vector_load_session) |session| {
             if (entry.vector_loader_context != null and session.context == entry.vector_loader_context.?) {
                 session.clearNativeVectorLocations();
+                previous_cache_vectors = session.cache_vectors;
+                if ((req.search_effort orelse 0) >= 1) {
+                    // Query entry is a safe boundary to discard a prior probe's
+                    // borrowed values. Exact fallback needs one stable snapshot.
+                    if (session.read_txn) |*txn| if (txn.probe != null) session.recycleRawReadState();
+                    session.cache_vectors = false;
+                }
                 native_location_session = session;
             }
         }
-        defer if (native_location_session) |session| session.clearNativeVectorLocations();
+        defer if (native_location_session) |session| {
+            session.clearNativeVectorLocations();
+            session.cache_vectors = previous_cache_vectors;
+        };
 
         return try entry.index.searchProfiledRequest(req);
     }
@@ -33117,7 +33145,7 @@ pub const IndexManager = struct {
         // primary-only key lookups retain their ordinary small-object allocator.
         var key_arena = std.heap.ArenaAllocator.init(if (vector_block_generation != null) std.heap.page_allocator else manager.alloc);
         defer key_arena.deinit();
-        const use_pool = pooled != null and vector_block_generation != null;
+        const use_pool = pooled != null;
         const key_alloc = if (use_pool) pooled.?.allocator() else key_arena.allocator();
         var vector_block_payload_scratch: []u8 = &.{};
         var vector_block_payload_stride: usize = 0;
@@ -33480,7 +33508,18 @@ pub const IndexManager = struct {
         const read_start = platform_time.monotonicNs();
         if (load_session) |session| {
             session.ensureDecodedResidencyCapacity(key_count, dims);
-            try session.getManySorted(store, artifact_keys, raw_values);
+            if (!session.cache_vectors and session.working_slice == .dense_search_working_set and session.txn_override == null) {
+                // Own wave values in admitted scratch, never the snapshot's
+                // payload arena. The snapshot itself remains pinned.
+                const txn = try session.getTxn(store);
+                const owned = try key_alloc.alloc(?[]u8, key_count);
+                try txn.getManySortedOwnedScoped(key_alloc, artifact_keys, owned);
+                for (owned, raw_values) |value, *raw| raw.* = value;
+                session.raw_batch_reads += 1;
+                session.raw_cache_misses += key_count;
+            } else {
+                try session.getManySorted(store, artifact_keys, raw_values);
+            }
         } else {
             // This is a sorted point-read workload; avoid a broad primary LSM
             // snapshot and its mutable-state clone/rotation machinery. Keep
@@ -49306,6 +49345,7 @@ test "certified exact search streams real source projections within one admitted
         .working_slice = .dense_search_working_set,
         .cache_vectors = false,
         .cache_raw_values = false,
+        .recycle_raw_reads = false,
     };
     defer session.deinit();
     const previous = IndexManager.active_dense_vector_load_session;
@@ -49370,7 +49410,28 @@ test "certified exact search streams real source projections within one admitted
     var fallback = try entry.index.searchProfiledRequest(.{ .query = query, .k = 10, .search_effort = 1, .load_metadata = false });
     defer fallback.results.deinit();
     try std.testing.expectEqual(@as(u64, 0), fallback.profile.exact_vectors_pruned_by_bound);
+    // The production policy disables recycling: every fallback wave must
+    // release its payloads without closing the captured primary snapshot.
+    try std.testing.expect(!session.recycle_raw_reads);
+    try std.testing.expect(session.read_txn != null and session.read_txn.?.read != null);
+    try std.testing.expectEqual(@as(u64, 0), session.raw_read_value_bytes);
+    try std.testing.expectEqual(@as(usize, 0), session.vector_cache.count());
     for (expected.getHits(), fallback.results.getHits()) |want, got| {
+        try std.testing.expectEqual(want.vector_id, got.vector_id);
+        try std.testing.expectEqual(want.distance, got.distance);
+    }
+    // A reused caller session may normally cache vectors. The manager must
+    // suppress exact-scan retention without replacing its captured snapshot.
+    const changed_artifact = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &replacement);
+    defer alloc.free(changed_artifact);
+    try primary.put(artifact, changed_artifact);
+    session.cache_vectors = true;
+    var reused = try manager.searchDenseEntryProfiledWithRequest(entry, .{ .query = query, .k = 10, .search_effort = 1, .load_metadata = false });
+    defer reused.results.deinit();
+    try std.testing.expect(session.cache_vectors);
+    try std.testing.expectEqual(@as(u64, 0), session.raw_read_value_bytes);
+    try std.testing.expectEqual(@as(usize, 0), session.vector_cache.count());
+    for (expected.getHits(), reused.results.getHits()) |want, got| {
         try std.testing.expectEqual(want.vector_id, got.vector_id);
         try std.testing.expectEqual(want.distance, got.distance);
     }

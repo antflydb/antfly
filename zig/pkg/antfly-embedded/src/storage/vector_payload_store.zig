@@ -3408,6 +3408,18 @@ fn checkDenseBatchReads(positional: bool, encoding: vector_block.Encoding) !void
     const copied_before_reads = source.statsSnapshot().catalog_metadata_bytes_copied;
     const shared_before_reads = source.statsSnapshot().catalog_metadata_bytes_shared;
     const repeated = @as([70][]const u8, @splat(key));
+    // Exact-search fallback owns every payload in one wave's arena, while
+    // preserving the old primary snapshot and its source-version lease.
+    const payload_capacity = old.payload_session.?.arena.queryCapacity();
+    var wave = std.heap.ArenaAllocator.init(alloc);
+    defer wave.deinit();
+    for (0..8) |_| {
+        var owned: [70]?[]u8 = undefined;
+        try old.getManySortedOwnedScoped(wave.allocator(), &repeated, &owned);
+        for (owned) |value| try std.testing.expectEqualSlices(u8, first, value.?);
+        try std.testing.expectEqual(payload_capacity, old.payload_session.?.arena.queryCapacity());
+        _ = wave.reset(.retain_capacity);
+    }
     var values: [70]?[]const u8 = undefined;
     const stats = try old.consumeDenseManySorted(alloc, &repeated, &values, 3, sink.sink());
     try std.testing.expectEqual(@as(u64, 3), stats.batches);

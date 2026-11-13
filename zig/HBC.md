@@ -73,7 +73,10 @@ their wave's exact completion; the source-generation lease stays pinned across
 waves. Projection bytes, location maps, and borrowed-page descriptors reserve
 their resource budget before allocation. Failure to retain optional locations
 falls back to ordinary authoritative reads. Source-provided exact scores and
-resolved metadata are reused rather than fetched twice.
+resolved metadata are reused rather than fetched twice. Primary-store fallback
+also owns resolved payloads in admitted per-wave scratch: it retains one read
+snapshot and source-version lease, rather than retaining every payload in the
+transaction arena. Exact scans do not populate decoded-vector residency.
 
 Both local and authoritative projection paths use the shared certified SIMD
 kernel. It includes reconstruction error and arithmetic error in both the
