@@ -264,6 +264,30 @@ fn generateOp(arena: Allocator, random: std.Random, keyspace: *Keyspace) !Op {
 // Driver
 // ---------------------------------------------------------------------
 
+/// §9.4b's idle-flush background task (`Store.rideAlongFlushLoop`,
+/// `ensureRideAlongFlushStarted` only ever arms it the first time a
+/// redo-log file commits anything) races `self.file` against this
+/// oracle's own foreground vacuum/checkpoint/reopen calls through
+/// `maybeCheckpointRedoLogOnIdleTurn`'s *own* `self.file.checkpointRedoLog()`
+/// call -- confirmed live while qualifying the vacuum redo-log-retention
+/// fix: a segfault inside `stageMutation`'s `arena.dupe`, reached from
+/// this exact background path, racing a foreground commit on the same
+/// store. Before that fix this path was permanently dead after a file's
+/// first vacuum (`self.file.redo` stayed `null` forever, so `maybeCheckpoint
+/// RedoLogOnIdleTurn`'s own `self.file.redo orelse return` always returned
+/// immediately) -- this oracle is the first thing to run it for real
+/// across a vacuum. The race is in `docstore.zig`'s commit-path
+/// coordination between this idle-turn call and a foreground writer, not
+/// in the redo-log-retention fix itself, and overlaps `perf/lwa-writer-
+/// race` (publishCheckpoint and redo appends) -- reported, not fixed,
+/// here. Disabling the task per `Side` keeps this oracle doing the one
+/// thing it exists for (overlay-blind-read divergence between the two
+/// commit paths) without also tripping a second, separately-owned
+/// concurrency bug on every run.
+fn disableRideAlong(store: *docstore.Store) void {
+    store.ride_along_flush_unavailable.store(true, .release);
+}
+
 const Side = struct {
     allocator: Allocator,
     path: []const u8,
@@ -278,6 +302,12 @@ const Side = struct {
             .no_sync = true,
             .reclamation = .{ .page_reuse = self.page_reuse },
         });
+        disableRideAlong(&self.store);
+        if (envFlag("ANTFLY_LITE_REDO_ORACLE_TRACE")) {
+            if (self.store.file.inode_lock_ref.load(.acquire)) |entry| {
+                std.debug.print("TRACE reopen inode={d} redo_null={} redo_log_capacity={d}\n", .{ entry.inode, self.store.file.redo == null, self.store.file.header.redo_log_capacity });
+            }
+        }
     }
 
     fn close(self: *Side) void {
@@ -286,6 +316,11 @@ const Side = struct {
 };
 
 fn applyOp(side: *Side, op: Op) !void {
+    defer if (envFlag("ANTFLY_LITE_REDO_ORACLE_TRACE")) {
+        if (side.store.file.transaction_header != null or side.store.file.transaction_writes != null or side.store.file.transaction_pages != null or side.store.file.flushing_transaction) {
+            std.debug.print("DBGTXW after applyOp op={s} redo_side={} transaction_header={} transaction_writes={} transaction_pages={} flushing={}\n", .{ @tagName(op), side.use_redo_log, side.store.file.transaction_header != null, side.store.file.transaction_writes != null, side.store.file.transaction_pages != null, side.store.file.flushing_transaction });
+        }
+    };
     switch (op) {
         .put => |p| {
             var txn = try side.store.beginWrite();
@@ -336,6 +371,11 @@ fn applyOp(side: *Side, op: Op) !void {
         },
         .vacuum => {
             _ = try side.store.vacuum();
+            if (envFlag("ANTFLY_LITE_REDO_ORACLE_TRACE")) {
+                if (side.store.file.inode_lock_ref.load(.acquire)) |entry| {
+                    std.debug.print("TRACE vacuum inode={d} redo_null={} redo_log_capacity={d}\n", .{ entry.inode, side.store.file.redo == null, side.store.file.header.redo_log_capacity });
+                }
+            }
         },
         .reopen => try side.reopen(),
     }
@@ -365,6 +405,9 @@ fn compareAll(allocator: Allocator, seed: u64, step: usize, op: Op, redo: *Side,
     // a clean, fully-valid file -- the `tail_bytes` tolerance
     // `crash_consistency_test.zig` needs for an interrupted append has no
     // place in an uncrashed step.
+    if (envFlag("ANTFLY_LITE_REDO_ORACLE_TRACE") and redo.store.file.transaction_writes != null) {
+        std.debug.print("DBGTXW step={d} op={s} redo.store.file.transaction_writes is non-null before check()\n", .{ step, @tagName(op) });
+    }
     const redo_check = try redo.store.file.check();
     const legacy_check = try legacy.store.file.check();
     if (!redo_check.valid) return fail(seed, step, op, "redo check() invalid issue={s}", .{redo_check.issue orelse "<none>"});
@@ -602,6 +645,7 @@ fn runSeed(allocator: Allocator, seed: u64, steps: usize, page_reuse: bool) !voi
         .use_redo_log = true,
         .page_reuse = page_reuse,
     };
+    disableRideAlong(&redo.store);
     defer redo.close();
     var legacy = Side{
         .allocator = allocator,
@@ -615,6 +659,7 @@ fn runSeed(allocator: Allocator, seed: u64, steps: usize, page_reuse: bool) !voi
         .use_redo_log = false,
         .page_reuse = page_reuse,
     };
+    disableRideAlong(&legacy.store);
     defer legacy.close();
 
     var keyspace = Keyspace{ .arena = arena };
@@ -622,6 +667,10 @@ fn runSeed(allocator: Allocator, seed: u64, steps: usize, page_reuse: bool) !voi
     var step: usize = 0;
     while (step < steps) : (step += 1) {
         const op = try generateOp(arena, random, &keyspace);
+        if (envFlag("ANTFLY_LITE_REDO_ORACLE_TRACE")) {
+            var buf: [256]u8 = undefined;
+            std.debug.print("TRACE step={d} op={s}\n", .{ step, op.describe(&buf) });
+        }
         applyOp(&redo, op) catch |err| {
             std.debug.print("redo differential oracle: seed={d} step={d} applying to redo side failed: {s}\n", .{ seed, step, @errorName(err) });
             return err;

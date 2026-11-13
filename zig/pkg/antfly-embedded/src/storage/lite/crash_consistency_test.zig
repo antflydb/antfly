@@ -1015,6 +1015,54 @@ fn runRedoIndexedCheckpointReclaim(allocator: Allocator, path: []const u8, io: s
     try file.checkpointRedoLog();
 }
 
+/// Regression coverage for the vacuum redo-log-retention fix
+/// (`native.zig`'s `prepareVacuum`/`replaceWithPreparedGeneration`): a
+/// vacuum used to always rebuild a plain, non-redo compacted image,
+/// permanently reverting a redo-log store to the legacy commit path after
+/// its first vacuum. Writes before the vacuum, the vacuum's own
+/// rename+sync, and writes after it (through the redo log again) are all
+/// within this sweep's crash range, so a crash landing anywhere --
+/// including the moment the vacuum itself becomes durable, or mid-append
+/// of the very first commit the freshly-reserved post-vacuum log region
+/// ever receives -- must still recover correctly.
+fn runVacuumThenRedoWrites(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    var file = try native.NativeFile.createWithRedoLog(allocator, io, path, .{}, native.NativeFile.default_redo_log_capacity_bytes);
+    defer file.close();
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "seed", .before = null, .after = "seed-value" }} });
+    try file.beginTransaction();
+    try file.putDocument("seed", "seed-value");
+    try file.commitTransaction();
+
+    var image = try file.prepareVacuum(null);
+    defer image.deinit();
+    try file.publishVacuum(&image);
+
+    // First commit into the vacuumed generation's own, freshly reserved
+    // (and, before this fix, never-reserved-at-all) log region.
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "after-vacuum-1", .before = null, .after = "one" }} });
+    try file.beginTransaction();
+    try file.putDocument("after-vacuum-1", "one");
+    try file.commitTransaction();
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "after-vacuum-2", .before = null, .after = "two" }} });
+    try file.beginTransaction();
+    try file.putDocument("after-vacuum-2", "two");
+    try file.commitTransaction();
+
+    // Folds the post-vacuum log -- only reachable at all if the vacuum
+    // really did leave `self.redo` populated (`checkpointRedoLog` returns
+    // `error.InvalidTransactionState` otherwise, which would fail this
+    // scenario's own discovery pass outright, before the sweep even
+    // starts injecting crashes).
+    try file.checkpointRedoLog();
+
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "after-fold", .before = null, .after = "three" }} });
+    try file.beginTransaction();
+    try file.putDocument("after-fold", "three");
+    try file.commitTransaction();
+}
+
 /// Fixed, fully comptime-known (writer, round) interleaving: 4 logical
 /// writers each committing 3 sequential rounds, writer-major order. Every
 /// key/value pair is a comptime string so `Checkpoint.expectations` below
@@ -1595,6 +1643,12 @@ test "crash sweep: deterministic concurrent writers" {
 
 test "crash sweep: redo log checkpoint with indexed reclamation retires pages" {
     var report = try runCrashSweep(std.testing.allocator, .{ .name = "redo-indexed-checkpoint-reclaim", .run = runRedoIndexedCheckpointReclaim }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep: a vacuum followed by ordinary redo writes survives a crash anywhere, including right after the vacuum itself" {
+    var report = try runCrashSweep(std.testing.allocator, .{ .name = "vacuum-then-redo-writes", .run = runVacuumThenRedoWrites }, .{});
     defer report.deinit();
     try reportFailures(&report);
 }
