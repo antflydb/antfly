@@ -2479,7 +2479,7 @@ fn IndexReadPathType(comptime batch: bool) type {
 /// `pub` so existing, already-reviewed callers keep compiling), but a
 /// deliberate, greppable code-review smell: `grep -n CheckpointedTree`
 /// should only ever turn up the handful of sites listed above.
-pub const CheckpointedTree = struct {
+const CheckpointedTree = struct {
     file: *NativeFile,
     checkpoint: CheckpointSlot,
     path: IndexReadPath = .{},
@@ -5965,42 +5965,241 @@ pub const ReadView = struct {
         return self.file.indexCatalogDirectoryCursor(self.checkpoint, prefix);
     }
 
-    /// The raw document-root tree walker, with no overlay knowledge --
-    /// see `CheckpointedTree`'s own doc comment. For a caller (today:
-    /// `docstore.Cursor`) that needs direct control over the tree side
-    /// of its own merge (keys-only/length-only short-circuits that must
-    /// not materialize a full value) and already merges the overlay
-    /// itself via `openDocumentOverlayScan` below. Everyone else should
-    /// prefer `openMetadataCursor`/`openIndexCursor`/`openDocumentAlloc`-
-    /// family methods, which already merge both halves.
-    pub fn openDocumentTreeCursor(self: *const ReadView, key_allocator: Allocator) CheckpointedTree {
-        return CheckpointedTree.initWithKeyAllocator(self.file, self.checkpoint, key_allocator);
+    /// A two-way (checkpointed tree, redo-log overlay) merged cursor
+    /// over the document root, scoped to `prefix`. The only way to walk
+    /// the document root other than the fully-resolved
+    /// `getDocumentAlloc`/`getDocumentsAlloc` family -- `MergedCursor`
+    /// hides `CheckpointedTree` (non-`pub`) behind this one constructor,
+    /// per §9.7c's "the raw tree becomes a distinct type, reachable
+    /// only through `ReadView`." `docstore.Cursor` layers its own
+    /// transaction's `pending_tree` on top of this (design doc: "pending
+    /// writes of the transaction itself layer on top, in docstore").
+    pub fn openMergedDocumentCursor(self: *const ReadView, key_allocator: Allocator, prefix: []const u8) !MergedCursor {
+        return .{
+            .tree = CheckpointedTree.initWithKeyAllocator(self.file, self.checkpoint, key_allocator),
+            .overlay = try NativeFile.OverlayScanState.initForPrefixUnchecked(key_allocator, self.file, .documents, prefix),
+            .mark = self.mark,
+        };
+    }
+};
+
+/// §9.7c (ReadView): the two-way (checkpointed tree, redo-log overlay)
+/// merge-join every document-root scan needs -- extracted, not
+/// reinvented, from `docstore.Cursor`'s own original three-way merge
+/// (`pending_tree` over this over the real B-tree): the comparison,
+/// tie-breaking (a tie always favors the overlay, the newer state),
+/// and lookahead-buffering rules here are exactly the ones that merge
+/// already used for its own "redo" vs "disk" half, just relocated so
+/// `CheckpointedTree` no longer needs to be `pub`. `docstore.Cursor`
+/// now holds one of these instead of a `CheckpointedTree` plus an
+/// `OverlayScanState`, and compares its own `pending_tree` candidate
+/// against whatever this type returns.
+pub const MergedCursor = struct {
+    pub const Direction = enum { forward, backward };
+
+    tree: CheckpointedTree,
+    overlay: NativeFile.OverlayScanState,
+    mark: u64,
+    /// The tree's own already-fetched candidate, held here whenever the
+    /// overlay's candidate won a comparison without a tie: `tree`'s own
+    /// position has already advanced past it, so losing track of it
+    /// here would silently skip it forever, not just defer it to the
+    /// next call. `null` means either nothing is buffered yet, or the
+    /// last `advance` call fully consumed (returned, or matched a tie
+    /// against) whatever it held.
+    tree_lookahead: ?DocumentIndexEntry = null,
+    /// Index into `overlay.keys` of the overlay's own current
+    /// candidate, `null` once exhausted in the current direction.
+    overlay_index: ?usize = null,
+
+    pub const Entry = union(enum) {
+        disk: DocumentIndexEntry,
+        overlay: struct { key: []const u8, entry: CatalogEntry },
+
+        pub fn key(self: Entry) []const u8 {
+            return switch (self) {
+                .disk => |d| d.key,
+                .overlay => |o| o.key,
+            };
+        }
+
+        /// Frees whichever side owns allocated memory: `disk`'s own
+        /// key (`DocumentIndexEntry.deinit`'s own contract) or
+        /// `overlay`'s resolved entry value (the owned copy
+        /// `SharedRedoOverlay.resolveAlloc` returns, via
+        /// `redoOverlayEntryAt`). `overlay`'s own `key` is borrowed
+        /// from `MergedCursor.overlay`'s own keys array and must never
+        /// be freed here.
+        pub fn deinit(self: *Entry, allocator: Allocator) void {
+            switch (self.*) {
+                .disk => |*d| d.deinit(allocator),
+                .overlay => |*o| allocator.free(o.entry.value),
+            }
+        }
+    };
+
+    pub fn deinit(self: *MergedCursor) void {
+        self.clearTreeLookahead();
+        self.overlay.deinit();
+        self.tree.deinit();
+        self.* = undefined;
     }
 
-    /// The document root's overlay enumeration alone (gate-free, per
-    /// `OverlayScanState.initForPrefixUnchecked`'s own doc comment) --
-    /// pairs with `openDocumentTreeCursor` for a caller building its
-    /// own merge against the raw tree directly.
-    pub fn openDocumentOverlayScan(self: *const ReadView, allocator: Allocator, prefix: []const u8) !NativeFile.OverlayScanState {
-        return NativeFile.OverlayScanState.initForPrefixUnchecked(allocator, self.file, .documents, prefix);
+    fn clearTreeLookahead(self: *MergedCursor) void {
+        if (self.tree_lookahead) |*entry| entry.deinit(self.tree.file.allocator);
+        self.tree_lookahead = null;
     }
 
-    /// The document root's resolved overlay entry for one key, at this
-    /// view's own mark -- the same primitive `getDocumentAlloc` uses
-    /// internally, exposed directly for a caller (`docstore.Cursor`)
-    /// that needs the entry's own flags (`is_delete`, the external-value
-    /// pointer) rather than an already-materialized value.
-    pub fn documentOverlayEntry(self: *const ReadView, key: []const u8) !?CatalogEntry {
-        return self.file.redoOverlayEntryAt(.documents, self.mark, key);
+    fn fetchTree(self: *MergedCursor, direction: Direction) !?DocumentIndexEntry {
+        if (self.tree_lookahead) |entry| {
+            self.tree_lookahead = null;
+            return entry;
+        }
+        return switch (direction) {
+            .forward => try self.tree.next(),
+            .backward => try self.tree.prev(),
+        };
     }
 
-    /// Resolves an external value chain's bytes -- the materialization
-    /// step a `documentOverlayEntry`/catalog-cursor result with a
-    /// non-zero `external_value_root_page` still needs, for a caller
-    /// (`docstore.Cursor`) that holds the entry itself rather than
-    /// going through `getDocumentAlloc`'s own all-in-one resolution.
-    pub fn readValueChainAlloc(self: *const ReadView, allocator: Allocator, root_page: u64, len: usize) ![]u8 {
-        return self.file.readValuePagesAtCheckpointAlloc(allocator, root_page, len, self.checkpoint);
+    pub fn first(self: *MergedCursor) !?Entry {
+        self.clearTreeLookahead();
+        self.tree_lookahead = try self.tree.first();
+        self.overlay_index = if (self.overlay.keys.len > 0) 0 else null;
+        return self.advance(.forward);
+    }
+
+    pub fn last(self: *MergedCursor) !?Entry {
+        self.clearTreeLookahead();
+        self.tree_lookahead = try self.tree.last();
+        self.overlay_index = if (self.overlay.keys.len > 0) self.overlay.keys.len - 1 else null;
+        return self.advance(.backward);
+    }
+
+    pub fn seekAtOrAfter(self: *MergedCursor, key: []const u8, strict: bool) !?Entry {
+        self.clearTreeLookahead();
+        self.tree_lookahead = try self.tree.seekAtOrAfter(key, strict);
+        const idx = self.overlay.indexAtOrAfter(key, strict);
+        self.overlay_index = if (idx < self.overlay.keys.len) idx else null;
+        return self.advance(.forward);
+    }
+
+    pub fn seekAtOrBefore(self: *MergedCursor, key: []const u8, strict: bool) !?Entry {
+        self.clearTreeLookahead();
+        self.tree_lookahead = try self.tree.seekAtOrBefore(key, strict);
+        const count = self.overlay.countAtOrBefore(key, strict);
+        self.overlay_index = if (count > 0) count - 1 else null;
+        return self.advance(.backward);
+    }
+
+    /// `continued`: true to pick up where the last `next`/`advance`
+    /// call left off (reusing a buffered tree lookahead instead of a
+    /// fresh seek) -- false (a direction change) forces `seekAtOrAfter`
+    /// from `current_key` instead, mirroring `docstore.Cursor`'s own
+    /// `last_direction`-gated choice between `takeBufferedDisk()` and a
+    /// fresh seek.
+    pub fn next(self: *MergedCursor, current_key: []const u8, continued: bool) !?Entry {
+        if (!continued) {
+            self.clearTreeLookahead();
+            self.tree_lookahead = try self.tree.seekAtOrAfter(current_key, true);
+        }
+        const idx = self.overlay.indexAtOrAfter(current_key, true);
+        self.overlay_index = if (idx < self.overlay.keys.len) idx else null;
+        return self.advance(.forward);
+    }
+
+    pub fn prev(self: *MergedCursor, current_key: []const u8, continued: bool) !?Entry {
+        if (!continued) {
+            self.clearTreeLookahead();
+            self.tree_lookahead = try self.tree.seekAtOrBefore(current_key, true);
+        }
+        const count = self.overlay.countAtOrBefore(current_key, true);
+        self.overlay_index = if (count > 0) count - 1 else null;
+        return self.advance(.backward);
+    }
+
+    /// Advances past a tombstoned overlay winner on its own (the
+    /// overlay already proves that key dead; nothing left for the
+    /// caller to check there). A `.disk` winner is returned exactly as
+    /// the tree gave it, unresolved -- the caller decides liveness
+    /// (`RecordPageReader.documentValueAlloc`/`documentValueLen`/
+    /// `documentIsLive`, the keys-only/length-only short-circuits
+    /// `MergedCursor` deliberately knows nothing about) and, if it
+    /// turns out dead, calls `advance` again directly to continue past
+    /// it -- `tree_lookahead` is already `null` at that point (a
+    /// `.disk` return always clears it), so the next call fetches
+    /// fresh, exactly like finding a live one would have.
+    pub fn advance(self: *MergedCursor, direction: Direction) !?Entry {
+        var disk = try self.fetchTree(direction);
+        errdefer if (disk) |*d| d.deinit(self.tree.file.allocator);
+        while (true) {
+            const overlay_key: ?[]const u8 = if (self.overlay_index) |idx| self.overlay.keys[idx] else null;
+            const Source = enum { overlay, disk };
+            var winner: ?Source = null;
+            var winner_key: []const u8 = undefined;
+            if (overlay_key) |k| {
+                winner = .overlay;
+                winner_key = k;
+            }
+            if (disk) |d| {
+                const better = if (winner != null) switch (direction) {
+                    .forward => std.mem.order(u8, d.key, winner_key) == .lt,
+                    .backward => std.mem.order(u8, d.key, winner_key) == .gt,
+                } else true;
+                if (better) {
+                    winner = .disk;
+                    winner_key = d.key;
+                }
+            }
+            const chosen = winner orelse return null;
+
+            // A tie always sets `chosen = .overlay` (the `better`
+            // check above requires a strict order for disk to win), so
+            // `chosen == .disk` here implies `overlay_key` is either
+            // `null` or strictly past `winner_key` -- nothing to
+            // consume on the overlay side.
+            if (chosen == .disk) {
+                self.tree_lookahead = null;
+                return .{ .disk = disk.? };
+            }
+
+            // `chosen == .overlay`: advance the overlay's own position
+            // past this key regardless of what it resolves to below --
+            // visited either way.
+            self.overlay_index = switch (direction) {
+                .forward => if (self.overlay_index.? + 1 < self.overlay.keys.len) self.overlay_index.? + 1 else null,
+                .backward => if (self.overlay_index.? > 0) self.overlay_index.? - 1 else null,
+            };
+            // `overlay.keys` enumerates every key with *any* version
+            // currently in the live map, regardless of this cursor's
+            // own `mark` -- correct and necessary for the *current*
+            // generation (every version predates "now" by definition),
+            // but a `ReadView` pinned to an older, already-superseded
+            // mark can enumerate a key whose entire chain postdates it
+            // (e.g. a brand-new key created only after this pin's own
+            // snapshot was taken). `resolveAlloc` then correctly
+            // returns `null` -- "nothing at or before this mark" --
+            // which must be treated exactly like the real tree never
+            // having had this key diverted away from it at this mark:
+            // resolved *before* deciding whether to consume a tied
+            // `disk` candidate below, so a phantom overlay entry never
+            // wrongly discards a disk candidate that is, in fact, the
+            // correct answer for this view.
+            const entry = try self.tree.file.redoOverlayEntryAt(.documents, self.mark, winner_key);
+            if (disk != null and std.mem.eql(u8, disk.?.key, winner_key) and entry != null) {
+                var consumed = disk.?;
+                consumed.deinit(self.tree.file.allocator);
+                disk = try self.fetchTree(direction);
+            }
+            if (entry == null) continue; // phantom: disk (if tied) stays live for the next iteration.
+            if (entry.?.is_delete) {
+                self.tree.file.allocator.free(entry.?.value);
+                continue;
+            }
+            // Whatever disk candidate remains (possibly null) must
+            // survive to the next call.
+            self.tree_lookahead = disk;
+            return .{ .overlay = .{ .key = winner_key, .entry = entry.? } };
+        }
     }
 };
 
