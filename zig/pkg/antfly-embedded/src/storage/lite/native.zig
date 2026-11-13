@@ -16785,6 +16785,19 @@ pub const NativeFile = struct {
                 }) catch {
                     return error.OutcomeUnknown;
                 };
+                // §9.7c (ReadView): `redo.writer.sync()` above is this
+                // commit's own durability barrier, exactly like
+                // `syncIfRequired`'s call below is for a non-redo file --
+                // but it calls through `redo_log.Writer.sync` directly,
+                // never through `syncIfRequired` itself, so it never used
+                // to bump this counter. Several tests across both redo
+                // and legacy modes assert an exact `test_sync_calls`
+                // delta per durable commit; without this, a redo-log
+                // file's own foreground writes always read back as zero
+                // syncs, with no way to distinguish "no sync happened"
+                // from "a sync happened, through a path this counter
+                // doesn't know about."
+                if (builtin.is_test) _ = self.test_sync_calls.fetchAdd(1, .monotonic);
                 redo.durable_sequence = checkpoint.commit_sequence;
                 // §9.3b: publish right after the append this process just
                 // made durable, never before -- ride-along/deferred appends
