@@ -84,6 +84,28 @@ export function createPhaseTimings({
   };
 }
 
+/** Track buffered SDK operations through body consumption and decoding.
+ * Fetch itself stops at response headers. Keep stream ownership with the SDK;
+ * do not clone, buffer again, or change the response returned to its caller.
+ */
+export function profileClientOperations(client, profile) {
+  const originals = new Map();
+  for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE"]) {
+    const original = client[method];
+    if (typeof original !== "function") continue;
+    const wrapped = function (...args) {
+      return profile.track("HTTP", () => Reflect.apply(original, this, args));
+    };
+    originals.set(method, { original, wrapped });
+    client[method] = wrapped;
+  }
+  return () => {
+    for (const [method, { original, wrapped }] of originals) {
+      if (client[method] === wrapped) client[method] = original;
+    }
+  };
+}
+
 /** Wait for a terminal result while retaining the worker's latest bounded progress. */
 export function waitForWorkerResult(child, mode, { timeoutMs = 60_000 } = {}) {
   return new Promise((resolve, reject) => {

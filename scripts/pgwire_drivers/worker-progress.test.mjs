@@ -16,7 +16,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { test } from "node:test";
-import { createPhaseTimings, waitForWorkerResult } from "./worker-progress.mjs";
+import { createPhaseTimings, profileClientOperations, waitForWorkerResult } from "./worker-progress.mjs";
 
 const child = () => Object.assign(new EventEmitter(), { pid: 123 });
 
@@ -90,4 +90,68 @@ test("diagnostic transport failure does not change query failures or results", a
     const failure = new Error("query failure");
     await assert.rejects(profile.track("CREATE", async () => { throw failure; }), (error) => error === failure);
   } finally { profile.close(); }
+});
+
+
+test("HTTP progress remains active after headers until the SDK consumes the body", async (t) => {
+  const { AntflyClient } = await import("../../ts/packages/sdk/dist/index.js");
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let controller;
+  let clock = 0;
+  let headers;
+  const headersReceived = new Promise((resolve) => { headers = resolve; });
+  t.mock.method(globalThis, "fetch", async () => {
+    const response = new Response(new ReadableStream({ start(value) { controller = value; } }),
+      { headers: { "Content-Type": "application/json" } });
+    headers();
+    return response;
+  });
+  const messages = [];
+  const profile = createPhaseTimings({ now: () => clock, connected: () => true,
+    send: (message, callback) => { messages.push(message); callback(); } });
+  const client = new AntflyClient({ baseUrl: "http://body-profile.test" });
+  const restore = profileClientOperations(client.api, profile);
+  try {
+    let settled = false;
+    const result = client.api.GET("/db/v1/databases").then((value) => { settled = true; return value; });
+    await headersReceived;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    assert.equal(profile.snapshot().active_count, 1);
+    clock = 1000;
+    t.mock.timers.tick(1000);
+    assert.equal(messages.at(-1).timings.active[0].phase, "HTTP");
+    assert.equal(messages.at(-1).timings.active[0].duration_ms, 1000);
+    controller.enqueue(new TextEncoder().encode('[{"name":"default"}]'));
+    controller.close();
+    assert.deepEqual((await result).data, [{ name: "default" }]);
+    assert.equal(profile.snapshot().active_count, 0);
+    assert.equal(profile.snapshot().queries.HTTP.calls, 1);
+    assert.equal(profile.snapshot().queries.HTTP.milliseconds, 1000);
+  } finally { restore(); profile.close(); }
+});
+
+test("body-read errors retain their identity and finish the HTTP operation", async (t) => {
+  const { AntflyClient } = await import("../../ts/packages/sdk/dist/index.js");
+  let controller;
+  t.mock.method(globalThis, "fetch", async () => new Response(
+    new ReadableStream({ start(value) { controller = value; } }),
+    { headers: { "Content-Type": "application/json" } },
+  ));
+  const profile = createPhaseTimings();
+  const client = new AntflyClient({ baseUrl: "http://body-profile.test" });
+  const original = client.api.GET;
+  const restore = profileClientOperations(client.api, profile);
+  try {
+    const failure = new Error("body interrupted");
+    const result = client.api.GET("/db/v1/databases");
+    const rejected = assert.rejects(result, (error) => error === failure);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(profile.snapshot().active_count, 1);
+    controller.error(failure);
+    await rejected;
+    assert.equal(profile.snapshot().active_count, 0);
+    assert.equal(profile.snapshot().queries.HTTP.calls, 1);
+  } finally { restore(); profile.close(); }
+  assert.equal(client.api.GET, original);
 });

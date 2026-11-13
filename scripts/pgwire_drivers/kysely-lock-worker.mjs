@@ -16,7 +16,7 @@
 // Run through test_pgwire_drivers.py after building @antfly/sdk.
 import { inspect } from "node:util";
 import pg from "pg";
-import { createPhaseTimings } from "./worker-progress.mjs";
+import { createPhaseTimings, profileClientOperations } from "./worker-progress.mjs";
 import { AntflyClient } from "../../ts/packages/sdk/dist/index.js";
 import {
 	AntflyPersistentMigrationLock,
@@ -30,8 +30,6 @@ if (process.argv[2] === "exit-before-report") process.exit(17);
 // contender timeout must distinguish a slow owner DDL/release from stale reads.
 // Parameters and connection URLs are never included in these diagnostics.
 const profile = createPhaseTimings();
-const fetch = globalThis.fetch;
-globalThis.fetch = (...args) => profile.track("HTTP", () => fetch(...args));
 const wrapped = Symbol("migration query timings");
 class TimedPool extends pg.Pool {
 	async connect() {
@@ -58,6 +56,7 @@ const client = new AntflyClient({
 		password: decodeURIComponent(url.password),
 	},
 });
+const restoreClientProfiling = profileClientOperations(client.api, profile);
 const runtime = createAntflyPostgres({
 	pg: { ...pg, Pool: TimedPool },
 	client,
@@ -98,6 +97,7 @@ try {
 	process.send({ error: inspect(error, { depth: 5 }), timings: profile.snapshot() });
 	process.exitCode = 1;
 } finally {
+	restoreClientProfiling();
 	profile.close();
 	await runtime.close();
 	process.disconnect();
