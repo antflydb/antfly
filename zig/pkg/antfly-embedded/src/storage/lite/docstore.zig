@@ -2550,7 +2550,12 @@ pub const Store = struct {
             self.file.activeCheckpoint().page_count *| self.file.header.page_size >= self.maintenance_policy.options.minimum_reclaim_bytes;
         if (!cheap_already_due) {
             const retirement_check_started = if (@import("builtin").is_test) std.Io.Clock.awake.now(self.file.runtime()).nanoseconds else 0;
-            const retirement = self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false;
+            // §9 (redo retirement signal): ledger-only here on purpose --
+            // see `retirementNeedsServiceLedgerOnlyWithCancel`'s own doc
+            // comment. Starting the background `maintenanceLoop` is the
+            // one caller of this check that isn't a direct, synchronous
+            // call the caller already controls the timing of.
+            const retirement = self.file.retirementNeedsServiceLedgerOnlyWithCancel(&self.maintenance_cancel) catch false;
             if (@import("builtin").is_test) {
                 const elapsed: u64 = @intCast(@max(0, std.Io.Clock.awake.now(self.file.runtime()).nanoseconds - retirement_check_started));
                 _ = self.test_retirement_check_count.fetchAdd(1, .release);
