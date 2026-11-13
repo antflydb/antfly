@@ -5495,7 +5495,8 @@ pub const Txn = struct {
             const temporary = (try self.batchScratch()).allocator();
             const alloc = if (buffers == null) self.resultAllocator() else self.scratch.allocator();
             if (unique_count == keys.len and self.parent.prefix.len == 0 and self.parent.pending_count == 0) {
-                return (try self.parent.readFile()).getDocumentsAtCheckpointWithState(alloc, temporary, self.parent.checkpoint, keys, buffers, values, try self.nativeState());
+                const view = try self.parent.readView();
+                return view.getDocumentsWithState(alloc, temporary, keys, buffers, values, try self.nativeState());
             }
             const pending_keys = try temporary.alloc([]const u8, unique_count);
             const positions = try temporary.alloc(usize, unique_count);
@@ -5526,7 +5527,8 @@ pub const Txn = struct {
                 i = end;
             }
             if (count == 0) return;
-            try (try self.parent.readFile()).getDocumentsAtCheckpointWithState(alloc, temporary, self.parent.checkpoint, pending_keys[0..count], if (pending_buffers) |out| out[0..count] else null, loaded[0..count], try self.nativeState());
+            const view = try self.parent.readView();
+            try view.getDocumentsWithState(alloc, temporary, pending_keys[0..count], if (pending_buffers) |out| out[0..count] else null, loaded[0..count], try self.nativeState());
             for (loaded[0..count], positions[0..count]) |value, position| {
                 var end = position + 1;
                 while (end < keys.len and std.mem.eql(u8, keys[position], keys[end])) : (end += 1) {}
