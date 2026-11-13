@@ -2882,7 +2882,10 @@ test "crash sweep: full text recovers from one transient io fault with no crash"
             // reopen being the only possible recovery path: proving (b)
             // the index never stays `IndexRebuilding` forever once the
             // underlying I/O is healthy again.
-            var reopened = try openDbWithIo(allocator, path, std.testing.io, false);
+            var reopened = openDbWithIo(allocator, path, std.testing.io, false) catch |err| {
+                std.debug.print("io-fault regression: reopen itself failed kind={s} at_op={d}: {s}\n", .{ @tagName(kind), at_op, @errorName(err) });
+                return err;
+            };
             defer reopened.close();
             assertSearchable(&reopened, allocator, "body_text", "body", "ft-doc", "needle") catch |err| {
                 std.debug.print("io-fault regression failed kind={s} at_op={d}: {s}\n", .{ @tagName(kind), at_op, @errorName(err) });
