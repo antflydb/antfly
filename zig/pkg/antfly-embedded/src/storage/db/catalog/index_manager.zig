@@ -1577,6 +1577,9 @@ pub const IndexManager = struct {
     /// dependency-generation fence is linearizable even on stores whose
     /// batches are not serializable transactions.
     context_dependency_mutex: std.atomic.Mutex = .unlocked,
+    /// Delivers staged context notices after generated records commit
+    /// (installed by the owning DB; outside every apply lock when invoked).
+    context_drain: ?struct { ptr: *anyopaque, drain_fn: *const fn (*anyopaque) void } = null,
     context_table_id: []const u8 = "",
     context_inbound: []const @import("../enrichment/context_notices.zig").DeclaredConfig = &.{},
     resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
@@ -16084,26 +16087,93 @@ pub const IndexManager = struct {
         var parsed = enrichment_context_sources.parseStoredJson(self.alloc, cfg.context_sources_json) catch return error.InvalidEnrichmentConfig;
         defer parsed.deinit();
         for (parsed.sources) |source| {
-            if (source.table.len == 0) continue;
-            for (self.resolvers.items) |resolver| {
+            // Promotion: resolvers writing the read table from this output.
+            if (source.table.len != 0) for (self.resolvers.items) |resolver| {
                 if (!std.mem.eql(u8, resolver.table, source.table)) continue;
-                if (self.artifactDependsOn(resolver.source_artifact, cfg.name)) return error.ContextSourceFeedbackCycle;
+                if (self.contextDependsOn(resolver.source_artifact, cfg)) return error.ContextSourceFeedbackCycle;
+            };
+            // Generated inputs on this table must be strictly upstream.
+            if (!source.targetsOwnTable()) continue;
+            for (source.artifact_names) |artifact| {
+                if (self.contextDependsOn(artifact, cfg)) return error.ContextSourceFeedbackCycle;
+            }
+            if (source.kind == .graph and source.graph.include_generated) {
+                for (self.graph_indexes.items) |entry| {
+                    if (!std.mem.eql(u8, entry.config.name, source.graph.graph_index)) continue;
+                    for (entry.artifact_sources) |artifact_source| {
+                        if (self.contextDependsOn(artifact_source.artifact_name, cfg)) return error.ContextSourceFeedbackCycle;
+                    }
+                }
+            }
+        }
+        // Admitting `cfg` must not close a cycle for an existing consumer.
+        for (self.enrichments.items) |entry| {
+            if (entry.context_sources_json.len == 0 or std.mem.eql(u8, entry.name, cfg.name)) continue;
+            var other = enrichment_context_sources.parseStoredJson(self.alloc, entry.context_sources_json) catch continue;
+            defer other.deinit();
+            for (other.sources) |source| {
+                if (!source.targetsOwnTable()) continue;
+                for (source.artifact_names) |artifact| {
+                    if (std.mem.eql(u8, artifact, cfg.name) and self.contextDependsOnWith(cfg.name, entry.name, cfg)) return error.ContextSourceFeedbackCycle;
+                }
             }
         }
     }
 
-    /// Whether `artifact` is `root` or consumes it through source chains.
-    fn artifactDependsOn(self: *const IndexManager, artifact: []const u8, root: []const u8) bool {
-        var current = artifact;
-        var hops: usize = 0;
-        while (current.len != 0 and hops <= self.enrichments.items.len) : (hops += 1) {
-            if (std.mem.eql(u8, current, root)) return true;
-            var next: []const u8 = "";
-            for (self.enrichments.items) |entry| if (std.mem.eql(u8, entry.name, current)) {
-                next = entry.source_artifact_name;
-                break;
+    /// Whether producing `artifact` (transitively) requires `root`'s output:
+    /// through upstream artifact streams and through other enrichments'
+    /// context sources that read generated artifacts on this table.
+    fn contextDependsOn(self: *const IndexManager, artifact: []const u8, root: enrichment_catalog.EnrichmentConfig) bool {
+        return self.contextDependsOnWith(artifact, root.name, root);
+    }
+
+    fn contextDependsOnWith(self: *const IndexManager, artifact: []const u8, target: []const u8, candidate: enrichment_catalog.EnrichmentConfig) bool {
+        var stack: [64][]const u8 = undefined;
+        var depth: usize = 1;
+        stack[0] = artifact;
+        var visited: usize = 0;
+        while (depth > 0) {
+            depth -= 1;
+            const current = stack[depth];
+            if (std.mem.eql(u8, current, target)) return true;
+            visited += 1;
+            if (visited > 4 * (self.enrichments.items.len + 1)) return true;
+            const entry: ?enrichment_catalog.EnrichmentConfig = if (std.mem.eql(u8, current, candidate.name)) candidate else blk: {
+                for (self.enrichments.items) |e| if (std.mem.eql(u8, e.name, current)) break :blk e;
+                break :blk null;
             };
-            current = next;
+            const node = entry orelse continue;
+            if (node.source_artifact_name.len != 0 and depth < stack.len) {
+                stack[depth] = node.source_artifact_name;
+                depth += 1;
+            }
+            if (node.context_sources_json.len == 0) continue;
+            var parsed = enrichment_context_sources.parseStoredJson(self.alloc, node.context_sources_json) catch continue;
+            defer parsed.deinit();
+            for (parsed.sources) |source| {
+                if (!source.targetsOwnTable()) continue;
+                for (source.artifact_names) |name| {
+                    if (std.mem.eql(u8, name, target)) return true;
+                    for (self.enrichments.items) |e| if (std.mem.eql(u8, e.name, name) and depth < stack.len) {
+                        stack[depth] = e.name;
+                        depth += 1;
+                    };
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Cheap gate for generated-record staging: does any declaration (own or
+    /// inbound) read generated artifacts or generated graph edges?
+    pub fn contextReadsGenerated(self: *const IndexManager) bool {
+        for (self.enrichments.items) |entry| {
+            if (std.mem.indexOf(u8, entry.context_sources_json, "_artifacts.") != null or
+                std.mem.indexOf(u8, entry.context_sources_json, "\"include_generated\":true") != null) return true;
+        }
+        for (self.context_inbound) |d| {
+            if (std.mem.indexOf(u8, d.stored_json, "_artifacts.") != null or
+                std.mem.indexOf(u8, d.stored_json, "\"include_generated\":true") != null) return true;
         }
         return false;
     }

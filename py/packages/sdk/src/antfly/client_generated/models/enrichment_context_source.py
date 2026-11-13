@@ -29,13 +29,19 @@ class EnrichmentContextSource:
 
         Attributes:
             fields (list[str]): Projected fields consumed by the producer (dotted paths). Only these fields, predicate
-                fields, and the order field participate in fingerprints and invalidation. Fields starting with `_` are reserved
-                and rejected.
+                fields, and the order field participate in fingerprints and invalidation. `_artifacts.<artifact>[.<path>]` reads
+                a row's generated output (asset: parsed JSON or text; chunk: array of chunk payloads; embedding: document
+                vector) and may be used in projections and predicates; when the artifact is regenerated, dependents are
+                invalidated like for a field change. Admission rejects artifacts that depend on the consuming enrichment
+                (directly, through artifact streams, through other context sources, or across tables). Other fields starting
+                with `_` are reserved and rejected.
             document (EnrichmentContextDocument | Unset):
             query (EnrichmentContextQuery | Unset):
-            graph (EnrichmentContextGraph | Unset): Bounded breadth-first traversal over explicitly written edges of a graph
-                index. Field- and artifact-derived (generated) edges are never traversed by live context. Members render with
-                depth, edge type, and direction.
+            graph (EnrichmentContextGraph | Unset): Bounded breadth-first traversal over the edges of a graph index. By
+                default only explicitly written edges are traversed; `include_generated` also follows field-derived and
+                enrichment-generated edges, whose changes invalidate dependents when their edge artifacts are written or
+                removed. Generated edges must not depend on the consuming enrichment. Members render with depth, edge type, and
+                direction.
             search (EnrichmentContextSearch | Unset): Ranked retrieval (requires `tracking: snapshot`): either full-text
                 relevance (`text` + `text_field`) or dense k-NN (`vector` binding + `vector_index`). Members render in rank
                 order.

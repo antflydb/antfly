@@ -5784,6 +5784,7 @@ pub const DB = struct {
         runtime_cfg.root_incarnation = self.root_incarnation;
         if (runtime_cfg.secret_store == null) runtime_cfg.secret_store = self.secret_store;
         if (runtime_cfg.remote_content == null) runtime_cfg.remote_content = self.remote_content;
+        self.core.index_manager.context_drain = .{ .ptr = self, .drain_fn = drainContextHook };
         if (runtime_cfg.context_source_reader == null) runtime_cfg.context_source_reader = self.context_source_host_reader orelse
             @import("context_source_db_reader.zig").ownTable(DB, self, self.context_source_table_id);
         if (runtime_cfg.resource_manager == null) runtime_cfg.resource_manager = self.core.index_manager.resource_manager;
@@ -10288,6 +10289,7 @@ pub const DB = struct {
         self.context_source_table_id = self.core.index_manager.context_table_id;
         self.context_source_host_reader = reader;
         self.context_notice_dispatcher = dispatcher;
+        self.core.index_manager.context_drain = .{ .ptr = self, .drain_fn = drainContextHook };
         // Persist the topology so a reopened source table stages notices for
         // dependents in tables the host has not opened yet.
         const Persisted = struct { table_id: []const u8, inbound: []const @import("enrichment/context_notices.zig").DeclaredConfig };
@@ -10386,8 +10388,53 @@ pub const DB = struct {
         return result;
     }
 
+    fn drainContextHook(ptr: *anyopaque) void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        self.drainContextNoticeOutboxBestEffort();
+    }
+
+    /// One bounded reconcile page while generated-record markers remain.
+    pub fn advanceContextReconcile(self: *DB, page_rows: u32) !bool {
+        if (!try context_dependency_db.hasGeneratedPending(self.alloc, self.core.store)) return true;
+        const cursor = try context_dependency_db.reconcileCursorAlloc(self.alloc, self.core.store);
+        defer if (cursor) |value| self.alloc.free(value);
+        const Collect = struct {
+            alloc: Allocator,
+            rows: std.ArrayListUnmanaged(@import("enrichment/context_notices.zig").RowChange) = .empty,
+            limit: u32,
+            fn visit(raw: ?*anyopaque, entry: types.ScanVisitEntry) !void {
+                const c: *@This() = @ptrCast(@alignCast(raw.?));
+                const doc = entry.document_json orelse return;
+                const key = try c.alloc.dupe(u8, entry.id);
+                errdefer c.alloc.free(key);
+                try c.rows.append(c.alloc, .{ .key = key, .next = try c.alloc.dupe(u8, doc) });
+                if (c.rows.items.len >= c.limit) return error.Canceled;
+            }
+        };
+        var collect = Collect{ .alloc = self.alloc, .limit = if (page_rows == 0) 256 else page_rows };
+        defer {
+            for (collect.rows.items) |r| {
+                self.alloc.free(r.key);
+                if (r.next) |v| self.alloc.free(v);
+            }
+            collect.rows.deinit(self.alloc);
+        }
+        const from = cursor orelse "";
+        self.scanVisit(self.alloc, from, "", .{ .include_documents = true, .resume_from_key = from.len != 0 }, .{ .context = &collect, .visit = Collect.visit }) catch |err| switch (err) {
+            error.Canceled => {},
+            else => return err,
+        };
+        const done = collect.rows.items.len < collect.limit;
+        try context_dependency_db.reconcilePage(self.alloc, self.core.store, self.core.index_manager, self.core.nextDerivedSequence(), collect.rows.items, done);
+        return done;
+    }
+
     fn drainContextNoticeOutboxBestEffort(self: *DB) void {
         if (!self.core.index_manager.hasContextDependents()) return;
+        _ = self.advanceContextReconcile(256) catch |err| blk: {
+            std.log.warn("context reconcile deferred: {s}", .{@errorName(err)});
+            break :blk false;
+        };
         // Bounded incremental shadow backfill: one page per commit until the
         // table's rows are covered for the current dependent field set.
         _ = self.advanceContextShadowBackfill(256) catch |err| blk: {
@@ -55162,6 +55209,9 @@ fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionConte
         return port.publish(port.ptr, batch, &.{}, null, &request, Request.apply);
     };
     if (work != null and unit_work != null) return error.InvalidBatchRequest;
+    // Generated artifacts and edges can be context inputs: record the intent
+    // durably before the record so a crash before staging is reconciled.
+    const context_token = try context_dependency_db.markGeneratedPending(ctx.alloc, ctx.store, ctx.index_manager, batch);
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, batch);
     defer sync_targets.deinit(ctx.alloc);
     var replication_mutation = acquireReplicationMutationSharedContext(ctx);
@@ -55233,6 +55283,12 @@ fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionConte
         // the consumer only after the request and its dispatch marker are
         // durable; queue admission alone never credits producer completion.
         if (ctx.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+    }
+    if (context_token != null) {
+        context_dependency_db.stageGenerated(ctx.alloc, ctx.store, ctx.index_manager, sequence, batch, context_token) catch |err| {
+            std.log.warn("context artifact notices deferred to reconcile: {s}", .{@errorName(err)});
+        };
+        if (ctx.index_manager.context_drain) |hook| hook.drain_fn(hook.ptr);
     }
     return sequence;
 }
@@ -57392,6 +57448,7 @@ fn appendGeneratedBatchFromEnrichment(
     defer batch_ctx.alloc.free(replay_deleted_keys);
     var replay_batch = batch;
     replay_batch.deleted_keys = replay_deleted_keys;
+    const context_token = try context_dependency_db.markGeneratedPending(batch_ctx.alloc, batch_ctx.store, batch_ctx.index_manager, replay_batch);
     var sync_targets = try collectManagedSyncTargets(batch_ctx.alloc, batch_ctx.index_manager, replay_batch);
     defer sync_targets.deinit(batch_ctx.alloc);
 
@@ -57661,6 +57718,12 @@ fn appendGeneratedBatchFromEnrichment(
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(&batch_ctx, sequence, sync_targets);
     releaseReplicationMutationShared(&replication_mutation);
     try deferred_replication_gates.waitForDurabilityAndAuthority(batch_ctx.replication_write_gate);
+    if (context_token != null) {
+        context_dependency_db.stageGenerated(batch_ctx.alloc, batch_ctx.store, batch_ctx.index_manager, sequence, replay_batch, context_token) catch |err| {
+            std.log.warn("context artifact notices deferred to reconcile: {s}", .{@errorName(err)});
+        };
+        if (batch_ctx.index_manager.context_drain) |hook| hook.drain_fn(hook.ptr);
+    }
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
     if (ctx.executor.hasWorkers()) {
         ctx.executor.forceSequence(sequence);
@@ -153791,4 +153854,70 @@ test "db context sources publish snapshot context as unverified with scheduled r
     // Snapshot sources are never invalidated by row changes.
     try db.batch(.{ .writes = &.{.{ .key = "p:2", .value = "{\"org\":\"o\",\"at\":9,\"title\":\"y\"}" }}, .sync_level = .write });
     try std.testing.expectEqual(context_dependency_store.Freshness.unverified, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+}
+
+fn contextSourcesTestArtifactAlloc(db: *DB, alloc: Allocator, doc: []const u8, artifact: []const u8) !?[]u8 {
+    const key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc, "asset", artifact);
+    defer alloc.free(key);
+    return db.core.getStoreValue(alloc, key);
+}
+
+test "db context sources consume generated artifacts downstream and reject artifact feedback" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("context-sources-artifacts");
+    defer tmp.cleanup();
+    var producer = GateAssetProducer{};
+    producer.allowAll();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const generator = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}";
+    try db.addEnrichment(.{ .name = "classify", .kind = .asset, .field = "label_source", .content_type = "text/plain", .producer_json = generator });
+    const declaration = try contextSourcesTestDeclarationAlloc(alloc,
+        \\{"peers":{"query":{"filter_query":{"field":"org","term":{"$source":"/org"}}},"fields":["title","_artifacts.classify"],"max_documents":10}}
+    );
+    defer alloc.free(declaration);
+    try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = generator, .context_sources_json = declaration });
+    var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
+    try db.initOptionalEnrichmentRuntime(&config);
+    _ = try db.advanceContextShadowBackfill(64);
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "p:1", .value = "{\"org\":\"o1\",\"title\":\"t1\",\"label_source\":\"alpha\"}" },
+        .{ .key = "doc:a", .value = "{\"org\":\"o2\",\"body\":\"hello\"}" },
+    }, .sync_level = .write });
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"org\":\"o1\",\"body\":\"hello\"}" }}, .sync_level = .write });
+    // Whichever runs first, the dependent converges on the generated value.
+    for (0..6) |_| try contextSourcesTestCatchUp(&db);
+    {
+        const out = (try contextSourcesTestArtifactAlloc(&db, alloc, "doc:a", "summary")).?;
+        defer alloc.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "asset:alpha") != null);
+        try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    }
+    // Regenerating the upstream artifact invalidates and rebuilds downstream.
+    try db.batch(.{ .writes = &.{.{ .key = "p:1", .value = "{\"org\":\"o1\",\"title\":\"t1\",\"label_source\":\"beta\"}" }}, .sync_level = .write });
+    for (0..6) |_| try contextSourcesTestCatchUp(&db);
+    {
+        const out = (try contextSourcesTestArtifactAlloc(&db, alloc, "doc:a", "summary")).?;
+        defer alloc.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "asset:beta") != null);
+        try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    }
+    // Lineage records the consumed artifact revision.
+    var impact = try db.contextImpact(alloc, "", "p:1", null, "", 16);
+    defer impact.deinit(alloc);
+    try std.testing.expect(impact.rows.items.len >= 2);
+
+    // Feedback: reading one's own output, or an artifact derived from it.
+    const self_ref = try contextSourcesTestDeclarationAlloc(alloc,
+        \\{"me":{"query":{"filter_query":{"field":"org","term":{"$source":"/org"}}},"fields":["_artifacts.loop"]}}
+    );
+    defer alloc.free(self_ref);
+    try std.testing.expectError(error.ContextSourceFeedbackCycle, db.addEnrichment(.{ .name = "loop", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = generator, .context_sources_json = self_ref }));
+    try db.addEnrichment(.{ .name = "echo", .kind = .asset, .source_artifact_name = "summary", .content_type = "text/plain", .producer_json = generator });
+    const via_echo = try contextSourcesTestDeclarationAlloc(alloc,
+        \\{"peers":{"query":{"filter_query":{"field":"org","term":{"$source":"/org"}}},"fields":["title","_artifacts.echo"],"max_documents":10}}
+    );
+    defer alloc.free(via_echo);
+    try std.testing.expectError(error.ContextSourceFeedbackCycle, db.upsertEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = generator, .context_sources_json = via_echo }));
 }

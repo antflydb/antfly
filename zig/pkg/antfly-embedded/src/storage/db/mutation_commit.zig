@@ -2675,6 +2675,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .key = table_catalog_mod.key,
                 .value = &table_catalog_value,
             });
+            var context_graph_artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
+            defer context_graph_artifact_keys.deinit(S.ownerField(self, "alloc").*);
+            for (changed_graph_artifact_keys.items) |key| try context_graph_artifact_keys.append(S.ownerField(self, "alloc").*, key);
+            for (deleted_artifact_keys) |key| if (@import("../internal_keys.zig").isGraphEdgeArtifactKey(key)) try context_graph_artifact_keys.append(S.ownerField(self, "alloc").*, key);
             // Context-source dependencies: shadow updates, change notices,
             // and dependent cleanup commit atomically with the primary rows.
             try @import("context_dependency_db.zig").stageForBatch(
@@ -2686,6 +2690,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 effective_req.deletes,
                 effective_req.graph_writes,
                 effective_req.graph_deletes,
+                context_graph_artifact_keys.items,
                 &write_buffers.store_writes,
                 &owned_child_range_outbox_keys,
                 &owned_child_range_outbox_values,

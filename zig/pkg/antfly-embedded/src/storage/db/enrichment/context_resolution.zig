@@ -66,7 +66,11 @@ pub const Reader = struct {
     /// Opaque position the subsequent reads are at least as fresh as.
     frontier_fn: ?*const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8) anyerror![]u8 = null,
     /// Direct (non-generated) adjacency of one node, at most `limit` edges.
-    edges_fn: ?*const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, graph_index: []const u8, node: []const u8, edge_types: []const []const u8, direction: ctx.GraphSpec.Direction, limit: u32) anyerror![]Edge = null,
+    edges_fn: ?*const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, graph_index: []const u8, node: []const u8, edge_types: []const []const u8, direction: ctx.GraphSpec.Direction, options: EdgeOptions) anyerror![]Edge = null,
+    /// Current values of a row's generated artifacts as a JSON object
+    /// `{"<artifact>": value|null}` (asset: parsed JSON or text; chunk:
+    /// array of payloads; embedding: vector).
+    artifacts_fn: ?*const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, key: []const u8, names: []const []const u8) anyerror![]u8 = null,
     /// Ranked retrieval (full-text relevance or vector k-NN), rank order.
     search_fn: ?*const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, query: SearchQuery) anyerror!Page = null,
 
@@ -78,6 +82,12 @@ pub const Reader = struct {
     pub fn identity(self: Reader, table_id: []const u8) []const u8 {
         return if (table_id.len == 0) self.own_table_id else table_id;
     }
+};
+
+pub const EdgeOptions = struct {
+    limit: u32,
+    /// Include field-derived and enrichment-generated edges.
+    include_generated: bool = false,
 };
 
 pub const Edge = struct {
@@ -141,7 +151,8 @@ pub fn prefilterJsonAlloc(alloc: Allocator, bound: *const ctx.Bound) ![]u8 {
     var pushed: usize = 0;
     try out.appendSlice(alloc, "{\"bool\":{\"filter\":[");
     for (bound.source.conjuncts, bound.values) |c, set| {
-        if (!c.isEquality()) continue;
+        // Artifact values are not in the table's text index.
+        if (!c.isEquality() or ctx.artifactOfField(c.field) != null) continue;
         var strings: usize = 0;
         for (set) |v| {
             if (v.len > 0 and v[0] == '"') strings += 1;
@@ -214,7 +225,7 @@ pub fn resolveAlloc(alloc: Allocator, reader: Reader, bindings: *const ctx.Bindi
                     try absent.append(a, .{ .source = source_name, .table_id = table_identity, .key = key, .revision = @splat(0) });
                     continue;
                 };
-                const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+                const parsed = try logicalRow(a, reader, source, key, raw);
                 const member = ctx.ConsumedInput{ .key = key, .projection = try ctx.projectAlloc(a, parsed, source.fields) };
                 const members = try a.alloc(ctx.ConsumedInput, 1);
                 members[0] = member;
@@ -303,6 +314,17 @@ pub fn resolveAlloc(alloc: Allocator, reader: Reader, bindings: *const ctx.Bindi
     };
 }
 
+/// Parse a row and, when the source reads generated artifacts, attach them
+/// under `_artifacts` so projections and predicates see one logical row.
+fn logicalRow(a: Allocator, reader: Reader, source: *const ctx.Source, key: []const u8, raw: []const u8) !std.json.Value {
+    var row = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+    if (source.artifact_names.len == 0 or row != .object) return row;
+    const artifacts_fn = reader.artifacts_fn orelse return error.ContextArtifactsUnavailable;
+    const values = try artifacts_fn(reader.ptr, a, source.table_id, key, source.artifact_names);
+    try row.object.put(a, "_artifacts", try std.json.parseFromSliceLeaky(std.json.Value, a, values, .{}));
+    return row;
+}
+
 const Candidate = struct {
     key: []const u8,
     row: std.json.Value,
@@ -325,8 +347,11 @@ fn resolveQuery(a: Allocator, alloc: Allocator, reader: Reader, bound: *const ct
             defer page.deinit(alloc);
             for (page.rows) |row| {
                 if (seen.contains(row.key)) continue;
-                const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, row.value, .{});
-                if (!try ctx.rowMatches(a, bound, parsed)) continue;
+                // Equality prefilter first: artifact reads only for candidates.
+                const plain = try std.json.parseFromSliceLeaky(std.json.Value, a, row.value, .{});
+                if (source.artifact_names.len == 0 and !try ctx.rowMatches(a, bound, plain)) continue;
+                const parsed = if (source.artifact_names.len == 0) plain else try logicalRow(a, reader, source, row.key, row.value);
+                if (source.artifact_names.len != 0 and !try ctx.rowMatches(a, bound, parsed)) continue;
                 const key = try a.dupe(u8, row.key);
                 try seen.put(a, key, {});
                 try matches.append(a, .{ .key = key, .row = parsed });
@@ -391,7 +416,7 @@ fn resolveGraph(a: Allocator, alloc: Allocator, reader: Reader, bound: *const ct
         }.lt);
         for (frontier.items) |node| {
             if (source.isLive()) try tuples.append(a, .{ .spec = bound.spec, .tuple = ctx.graphTuple(bound.spec, node) });
-            const edges = try edges_fn(reader.ptr, alloc, source.table_id, g.graph_index, node, g.edge_types, g.direction, g.max_fanout + 1);
+            const edges = try edges_fn(reader.ptr, alloc, source.table_id, g.graph_index, node, g.edge_types, g.direction, .{ .limit = g.max_fanout + 1, .include_generated = g.include_generated });
             defer freeEdges(alloc, edges);
             if (edges.len > g.max_fanout) return error.ContextBudgetExceeded;
             for (edges) |edge| {
@@ -416,7 +441,7 @@ fn resolveGraph(a: Allocator, alloc: Allocator, reader: Reader, bound: *const ct
     for (order.items) |v| {
         if (source.isLive()) try tuples.append(a, .{ .spec = bound.spec, .tuple = ctx.documentTuple(bound.spec, v.key) });
         const raw = try reader.lookup_fn(reader.ptr, a, source.table_id, v.key);
-        const projection = if (raw) |doc| try ctx.projectAlloc(a, try std.json.parseFromSliceLeaky(std.json.Value, a, doc, .{}), source.fields) else "null";
+        const projection = if (raw) |doc| try ctx.projectAlloc(a, try logicalRow(a, reader, source, v.key, doc), source.fields) else "null";
         var extra = std.ArrayListUnmanaged(u8).empty;
         try extra.print(a, "\"depth\":{d},\"edge_type\":", .{v.depth});
         try ctx.appendJsonString(a, &extra, v.edge_type);
@@ -436,7 +461,7 @@ fn resolveSearch(a: Allocator, alloc: Allocator, reader: Reader, bound: *const c
     defer page.deinit(alloc);
     var members = std.ArrayListUnmanaged(ctx.ConsumedInput).empty;
     for (page.rows[0..@min(page.rows.len, s.k)], 0..) |row, rank| {
-        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, row.value, .{});
+        const parsed = try logicalRow(a, reader, source, row.key, row.value);
         try members.append(a, .{ .key = try a.dupe(u8, row.key), .projection = try ctx.projectAlloc(a, parsed, source.fields), .extra = try std.fmt.allocPrint(a, "\"rank\":{d}", .{rank + 1}) });
     }
     return members.items;
@@ -491,11 +516,12 @@ pub const MemoryTables = struct {
     }
 
     pub fn reader(self: *MemoryTables, own: []const u8) Reader {
-        return .{ .ptr = self, .own_table_id = own, .lookup_fn = lookup, .query_fn = query, .frontier_fn = frontier, .edges_fn = edges, .search_fn = search };
+        return .{ .ptr = self, .own_table_id = own, .lookup_fn = lookup, .query_fn = query, .frontier_fn = frontier, .edges_fn = edges, .search_fn = search, .artifacts_fn = artifacts };
     }
 
     /// Edges are rows of table "edges:<graph_index>" keyed "<source>|<type>|<target>".
-    fn edges(p: *anyopaque, alloc: Allocator, _: []const u8, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: ctx.GraphSpec.Direction, limit: u32) anyerror![]Edge {
+    fn edges(p: *anyopaque, alloc: Allocator, _: []const u8, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: ctx.GraphSpec.Direction, options: EdgeOptions) anyerror![]Edge {
+        const limit = options.limit;
         const self: *MemoryTables = @ptrCast(@alignCast(p));
         var name_buf: [128]u8 = undefined;
         const table = try std.fmt.bufPrint(&name_buf, "edges:{s}", .{graph_index});
@@ -526,6 +552,28 @@ pub const MemoryTables = struct {
             if (out.items.len >= limit) break;
             try out.append(alloc, .{ .edge_type = try alloc.dupe(u8, typ), .neighbor = try alloc.dupe(u8, if (out_match) dst else src), .outgoing = out_match });
         }
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// Artifacts are rows of table "artifacts" keyed "<doc>|<name>".
+    fn artifacts(p: *anyopaque, alloc: Allocator, _: []const u8, key: []const u8, names: []const []const u8) anyerror![]u8 {
+        const self: *MemoryTables = @ptrCast(@alignCast(p));
+        var out = std.ArrayListUnmanaged(u8).empty;
+        errdefer out.deinit(alloc);
+        try out.append(alloc, '{');
+        for (names, 0..) |name, i| {
+            if (i != 0) try out.append(alloc, ',');
+            try ctx.appendJsonString(alloc, &out, name);
+            try out.append(alloc, ':');
+            var buf: [256]u8 = undefined;
+            const id = try std.fmt.bufPrint(&buf, "{s}|{s}", .{ key, name });
+            var value: []const u8 = "null";
+            if (self.rowsFor("artifacts")) |rows| for (rows.items) |row| if (std.mem.eql(u8, row.key, id)) {
+                value = row.value;
+            };
+            try out.appendSlice(alloc, value);
+        }
+        try out.append(alloc, '}');
         return out.toOwnedSlice(alloc);
     }
 
@@ -723,4 +771,32 @@ test "ordered top-N, graph traversal, and snapshot search resolve with exact sub
     var tight_bindings = try ctx.bindForKeyAlloc(alloc, &tight, "dep", try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{}", .{}));
     defer tight_bindings.deinit();
     try testing.expectError(error.ContextBudgetExceeded, resolveAlloc(alloc, tables.reader(""), &tight_bindings, .{}));
+}
+
+test "context reads generated artifacts as fields and predicates" {
+    const alloc = testing.allocator;
+    var tables = MemoryTables{ .alloc = alloc };
+    defer tables.deinit();
+    try tables.put("own", "p1", "{\"org\":\"o\",\"title\":\"one\"}");
+    try tables.put("own", "p2", "{\"org\":\"o\",\"title\":\"two\"}");
+    try tables.put("artifacts", "p1|classify", "{\"label\":\"policy\",\"score\":0.9}");
+    try tables.put("artifacts", "p2|classify", "{\"label\":\"faq\",\"score\":0.7}");
+    try tables.put("artifacts", "p1|summary", "\"short summary\"");
+    var config = try ctx.parsePublicJson(alloc,
+        \\{"policies":{"query":{"filter_query":{"conjuncts":[{"field":"org","term":{"$source":"/org"}},{"field":"_artifacts.classify.label","term":"policy"}]}},"fields":["title","_artifacts.summary"]}}
+    , "");
+    defer config.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var bindings = try ctx.bindForKeyAlloc(alloc, &config, "dep", try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"org\":\"o\"}", .{}));
+    defer bindings.deinit();
+    const filter = try prefilterJsonAlloc(alloc, &bindings.items[0]);
+    defer alloc.free(filter);
+    try testing.expect(std.mem.indexOf(u8, filter, "_artifacts") == null);
+    var r = try resolveAlloc(alloc, tables.reader(""), &bindings, .{});
+    defer r.deinit(alloc);
+    try testing.expectEqualStrings(
+        "{\"policies\":{\"count\":1,\"members\":[{\"key\":\"p1\",\"value\":{\"_artifacts.summary\":\"short summary\",\"title\":\"one\"}}]}}",
+        r.rendered.json,
+    );
 }

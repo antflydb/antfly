@@ -38,7 +38,7 @@ const dependency_db = @import("../storage/db/context_dependency_db.zig");
 
 pub const root_identity = "lite:default";
 
-fn rootOf(handle: *h.Handle) *h.Handle {
+pub fn rootOf(handle: *h.Handle) *h.Handle {
     var current = handle;
     while (current.parent_handle) |parent| current = parent;
     return current;
@@ -190,6 +190,45 @@ pub fn resolveEnrichment(handle: *h.Handle, alloc: std.mem.Allocator, raw_json: 
     if (resolved) |value| {
         if (cfg.context_sources_json.len != 0) alloc.free(cfg.context_sources_json);
         cfg.context_sources_json = value;
+    }
+}
+
+/// Reject a declaration that would close a generated-data cycle across
+/// tables: following context reads of `_artifacts.X` (and upstream artifact
+/// streams) from the candidate must never reach the candidate again.
+pub fn rejectCrossTableCycle(handle: *h.Handle, owner: *db_mod.DB, candidate: db_mod.types.EnrichmentConfig) !void {
+    const root = rootOf(handle);
+    var arena = std.heap.ArenaAllocator.init(root.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const owner_id = (try identityForDb(a, root, owner)) orelse return;
+    const Node = struct { table: []const u8, name: []const u8 };
+    var stack = std.ArrayListUnmanaged(Node).empty;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    // Seed with what the candidate reads.
+    try pushReads(a, &stack, owner_id, candidate.context_sources_json, "");
+    var steps: usize = 0;
+    while (stack.pop()) |node| {
+        steps += 1;
+        if (steps > 10_000) return error.ContextSourceFeedbackCycle;
+        if (std.mem.eql(u8, node.table, owner_id) and std.mem.eql(u8, node.name, candidate.name)) return error.ContextSourceFeedbackCycle;
+        const id = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ node.table, node.name });
+        if ((try seen.getOrPut(a, id)).found_existing) continue;
+        const db = dbForIdentity(root, node.table) orelse continue;
+        for (db.core.index_manager.enrichments.items) |entry| {
+            if (!std.mem.eql(u8, entry.name, node.name)) continue;
+            if (entry.source_artifact_name.len != 0) try stack.append(a, .{ .table = node.table, .name = entry.source_artifact_name });
+            if (entry.context_sources_json.len != 0) try pushReads(a, &stack, node.table, entry.context_sources_json, "");
+        }
+    }
+}
+
+fn pushReads(a: std.mem.Allocator, stack: anytype, table: []const u8, stored: []const u8, _: []const u8) !void {
+    var config = ctx.parseStoredJson(a, stored) catch return;
+    defer config.deinit();
+    for (config.sources) |source| {
+        const target = if (source.table_id.len == 0) table else source.table_id;
+        for (source.artifact_names) |name| try stack.append(a, .{ .table = try a.dupe(u8, target), .name = try a.dupe(u8, name) });
     }
 }
 
@@ -499,4 +538,22 @@ test "capi Lite cross-table context sources invalidate dependents in another tab
     defer a.free(impact);
     try std.testing.expect(std.mem.indexOf(u8, impact, "\"key\":\"doc:a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, impact, "\"complete\":true") != null);
+
+    // Generated-data cycles across tables are rejected at admission.
+    var orgs_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_open_table(id, .fromSlice("orgs"), &orgs_handle));
+    defer api.antfly_db_close(orgs_handle);
+    const orgsum =
+        \\{"name":"orgsum","kind":"asset","field":"voice","content_type":"text/plain",
+        \\ "producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        \\ "context_sources":{"root":{"query":{"table":"default","filter_query":{"field":"org","term":{"$source":"/org"}}},"fields":["_artifacts.rootsum"]}}}
+    ;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_enrichment_json(orgs_handle, .fromSlice(orgsum)));
+    const rootsum =
+        \\{"name":"rootsum","kind":"asset","field":"body","content_type":"text/plain",
+        \\ "producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        \\ "context_sources":{"orgs":{"document":{"table":"orgs","key_from":"/org"},"fields":["_artifacts.orgsum"]}}}
+    ;
+    try std.testing.expect(api.antfly_db_add_enrichment_json(id, .fromSlice(rootsum)) != .ok);
+    try std.testing.expect(handle.db.core.index_manager.getEnrichment(.asset, "rootsum") == null);
 }

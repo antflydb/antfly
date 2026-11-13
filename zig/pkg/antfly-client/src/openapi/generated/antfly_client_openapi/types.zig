@@ -15579,7 +15579,7 @@ pub const EnrichmentContextDocument = struct {
     }
 };
 
-/// Bounded breadth-first traversal over explicitly written edges of a graph index. Field- and artifact-derived (generated) edges are never traversed by live context. Members render with depth, edge type, and direction.
+/// Bounded breadth-first traversal over the edges of a graph index. By default only explicitly written edges are traversed; `include_generated` also follows field-derived and enrichment-generated edges, whose changes invalidate dependents when their edge artifacts are written or removed. Generated edges must not depend on the consuming enrichment. Members render with depth, edge type, and direction.
 pub const EnrichmentContextGraph = struct {
     table: ?[]const u8 = null,
     graph_index: []const u8,
@@ -15590,6 +15590,8 @@ pub const EnrichmentContextGraph = struct {
     depth: ?i64 = null,
     /// Maximum edges per visited node; exceeding it fails explicitly.
     max_fanout: ?i64 = null,
+    /// Also traverse field-derived and enrichment-generated edges.
+    include_generated: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -15600,6 +15602,7 @@ pub const EnrichmentContextGraph = struct {
         .{ "direction", "direction", true },
         .{ "depth", "depth", true },
         .{ "max_fanout", "max_fanout", true },
+        .{ "include_generated", "include_generated", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -15636,6 +15639,10 @@ pub const EnrichmentContextGraph = struct {
         }
         if (self.max_fanout) |value| {
             try jw.objectField("max_fanout");
+            try jw.write(value);
+        }
+        if (self.include_generated) |value| {
+            try jw.objectField("include_generated");
             try jw.write(value);
         }
         try jw.endObject();
@@ -15753,7 +15760,7 @@ pub const EnrichmentContextSource = struct {
     query: ?EnrichmentContextQuery = null,
     graph: ?EnrichmentContextGraph = null,
     search: ?EnrichmentContextSearch = null,
-    /// Projected fields consumed by the producer (dotted paths). Only these fields, predicate fields, and the order field participate in fingerprints and invalidation. Fields starting with `_` are reserved and rejected.
+    /// Projected fields consumed by the producer (dotted paths). Only these fields, predicate fields, and the order field participate in fingerprints and invalidation. `_artifacts.<artifact>[.<path>]` reads a row's generated output (asset: parsed JSON or text; chunk: array of chunk payloads; embedding: document vector) and may be used in projections and predicates; when the artifact is regenerated, dependents are invalidated like for a field change. Admission rejects artifacts that depend on the consuming enrichment (directly, through artifact streams, through other context sources, or across tables). Other fields starting with `_` are reserved and rejected.
     fields: []const []const u8,
     /// Document sources only: a missing referenced document fails the rebuild explicitly instead of rendering null.
     required: ?bool = null,

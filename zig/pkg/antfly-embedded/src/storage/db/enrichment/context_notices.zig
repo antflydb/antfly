@@ -84,12 +84,17 @@ pub const SourceSpecs = struct {
     items: []SpecBinding,
     union_fields: []const []const u8,
     fields_digest: Digest,
+    /// Generated artifacts read by any spec (sorted, unique).
+    artifact_names: []const []const u8 = &.{},
+    /// Some graph spec traverses field-derived or generated edges.
+    generated_edges: bool = false,
 
     pub fn deinit(self: *SourceSpecs) void {
         for (self.configs) |*c| c.deinit();
         self.alloc.free(self.configs);
         self.alloc.free(self.items);
         self.alloc.free(self.union_fields);
+        self.alloc.free(self.artifact_names);
         self.* = undefined;
     }
 
@@ -158,18 +163,40 @@ pub fn buildSourceSpecs(alloc: Allocator, own_table_id: []const u8, declared: []
         try unique.append(alloc, f);
     }
     var h = std.crypto.hash.sha2.Sha256.init(.{});
+    // Shadows are nested (tree) projections; the marker invalidates flat ones.
+    h.update("shadow.tree.v2");
     for (unique.items) |f| {
         h.update(f);
         h.update(&.{0});
     }
     var digest: Digest = undefined;
     h.final(&digest);
+    var artifacts = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer artifacts.deinit(alloc);
+    var generated_edges = false;
+    for (items.items) |binding| {
+        for (binding.source.artifact_names) |name| {
+            var seen = false;
+            for (artifacts.items) |existing| if (std.mem.eql(u8, existing, name)) {
+                seen = true;
+            };
+            if (!seen) try artifacts.append(alloc, name);
+        }
+        if (binding.source.kind == .graph and binding.source.graph.include_generated) generated_edges = true;
+    }
+    std.mem.sort([]const u8, artifacts.items, {}, struct {
+        fn lt(_: void, l: []const u8, r: []const u8) bool {
+            return std.mem.lessThan(u8, l, r);
+        }
+    }.lt);
     return .{
         .alloc = alloc,
         .configs = try configs.toOwnedSlice(alloc),
         .items = try items.toOwnedSlice(alloc),
         .union_fields = try unique.toOwnedSlice(alloc),
         .fields_digest = digest,
+        .artifact_names = try artifacts.toOwnedSlice(alloc),
+        .generated_edges = generated_edges,
     };
 }
 
@@ -368,7 +395,7 @@ pub fn planStageNotices(
         if (change.next) |raw| {
             const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch null;
             if (parsed) |row| if (row == .object) {
-                next_projection = try ctx.projectAlloc(a, row, specs.union_fields);
+                next_projection = try ctx.projectTreeAlloc(a, row, specs.union_fields);
                 next = try std.json.parseFromSliceLeaky(std.json.Value, a, next_projection.?, .{});
             };
         }
@@ -378,8 +405,8 @@ pub fn planStageNotices(
 
         for (specs.items) |binding| {
             const residual = binding.source.hasResidual();
-            const prev_row: []const u8 = if (!residual) "" else if (previous_unknown) "?" else if (previous) |row| try ctx.projectAlloc(a, row, binding.source.relevant_fields) else "";
-            const next_row: []const u8 = if (!residual) "" else if (next) |row| try ctx.projectAlloc(a, row, binding.source.relevant_fields) else "";
+            const prev_row: []const u8 = if (!residual) "" else if (previous_unknown) "?" else if (previous) |row| try ctx.projectTreeAlloc(a, row, binding.source.relevant_fields) else "";
+            const next_row: []const u8 = if (!residual) "" else if (next) |row| try ctx.projectTreeAlloc(a, row, binding.source.relevant_fields) else "";
             if (previous_unknown) {
                 const change_kind: ctx.ChangeKind = if (binding.source.kind == .document)
                     (if (next == null) .document_deleted else .document_changed)
@@ -454,10 +481,10 @@ pub const EdgeChange = struct {
 pub fn planStageEdgeNotices(alloc: Allocator, plan: *store.Plan, specs: *const SourceSpecs, own_table_id: []const u8, sequence: u64, first_ordinal: u32, edges: []const EdgeChange) !StageResult {
     var result = StageResult{ .next_ordinal = first_ordinal };
     for (edges) |edge| {
-        if (edge.artifact_derived) continue;
         for (specs.items) |binding| {
             const g = binding.source.graph;
             if (binding.source.kind != .graph or !std.mem.eql(u8, g.graph_index, edge.graph_index)) continue;
+            if (edge.artifact_derived and !g.include_generated) continue;
             if (g.edge_types.len != 0) {
                 var admitted = false;
                 for (g.edge_types) |t| if (std.mem.eql(u8, t, edge.edge_type)) {
@@ -500,7 +527,7 @@ pub fn planBackfillShadows(alloc: Allocator, reader: store.Reader, plan: *store.
         }
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch continue;
         if (parsed != .object) continue;
-        const projection = try ctx.projectAlloc(a, parsed, specs.union_fields);
+        const projection = try ctx.projectTreeAlloc(a, parsed, specs.union_fields);
         try plan.putOwned(try alloc.dupe(u8, skey), try encodeShadowAlloc(alloc, specs.fields_digest, projection));
         written += 1;
     }
@@ -894,4 +921,22 @@ test "notice encoding round trips" {
     try testing.expectEqualStrings("k\x00", decoded.notice.key);
     try testing.expectEqual(ctx.RefreshMode.manual, decoded.notice.refresh.mode);
     try testing.expectEqualSlices(u8, "\x01\x02", decoded.notice.resume_after);
+}
+
+test "derived graph edges notify only sources that include generated edges" {
+    const alloc = testing.allocator;
+    const config =
+        \\{"sources":{"direct":{"graph":{"graph_index":"kg","edge_types":[],"direction":"out","depth":1,"max_fanout":10},"fields":["t"],"max_documents":10,"max_bytes":4096,"overflow":"error"},
+        \\ "derived":{"graph":{"graph_index":"kg","edge_types":[],"direction":"out","depth":1,"max_fanout":10,"include_generated":true},"fields":["t"],"max_documents":10,"max_bytes":4096,"overflow":"error"}},
+        \\ "refresh":{"mode":"background","debounce_ms":0}}
+    ;
+    var specs = try buildSourceSpecs(alloc, "t", &.{.{ .dependent_table_id = "", .artifact = "summary", .stored_json = config }});
+    defer specs.deinit();
+    try testing.expect(specs.generated_edges);
+    var plan = store.Plan.init(alloc);
+    defer plan.deinit();
+    const generated = try planStageEdgeNotices(alloc, &plan, &specs, "t", 1, 0, &.{.{ .graph_index = "kg", .source = "a", .target = "b", .edge_type = "rel", .artifact_derived = true }});
+    try testing.expectEqual(@as(usize, 1), generated.notices);
+    const direct = try planStageEdgeNotices(alloc, &plan, &specs, "t", 2, 0, &.{.{ .graph_index = "kg", .source = "a", .target = "b", .edge_type = "rel" }});
+    try testing.expectEqual(@as(usize, 2), direct.notices);
 }

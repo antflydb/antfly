@@ -243,7 +243,7 @@ pub fn registerLiteIndexEnrichments(handle: *Handle, config_json: []const u8, ro
         _ = try handle.database().*.upsertEnrichment(cfg);
     }
     for (collected.items) |cfg| if (cfg.context_sources_json.len != 0) {
-        try @import("tables.zig").ensureDiscovered(handle);
+        try @import("tables.zig").ensureDiscovered(@import("context_dependencies.zig").rootOf(handle));
         try @import("context_dependencies.zig").sync(handle);
         break;
     };
@@ -9480,10 +9480,14 @@ pub fn antfly_db_add_enrichment_json(
     defer config.deinit(handle.alloc);
     const context_dependencies = @import("context_dependencies.zig");
     context_dependencies.resolveEnrichment(handle, handle.alloc, config_json.bytes(), &config) catch |err| return capi.mapErrorContext(err, @src().fn_name);
+    if (config.context_sources_json.len != 0) {
+        @import("tables.zig").ensureDiscovered(@import("context_dependencies.zig").rootOf(handle)) catch |err| return capi.mapError(err);
+        context_dependencies.rejectCrossTableCycle(handle, handle.database(), config) catch |err| return capi.mapErrorContext(err, @src().fn_name);
+    }
     handle.database().*.addEnrichment(config) catch |err| return capi.mapError(err);
     if (config.context_sources_json.len != 0) {
         // Every namespace must be open so inbound dependents are complete.
-        @import("tables.zig").ensureDiscovered(handle) catch |err| return capi.mapError(err);
+        @import("tables.zig").ensureDiscovered(@import("context_dependencies.zig").rootOf(handle)) catch |err| return capi.mapError(err);
     }
     context_dependencies.sync(handle) catch |err| return capi.mapError(err);
     refreshLiteManagedEmbeddingRuntime(handle) catch |err| return capi.mapError(err);

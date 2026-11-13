@@ -39,6 +39,7 @@ pub fn ownTable(comptime DB: type, db: *DB, own_table_id: []const u8) context_re
         .query_fn = Impl.queryOwn,
         .frontier_fn = Impl.frontierOwn,
         .edges_fn = Impl.edgesOwn,
+        .artifacts_fn = Impl.artifactsOwn,
         .search_fn = Impl.searchOwn,
     };
 }
@@ -63,10 +64,20 @@ pub fn Adapter(comptime DB: type) type {
             return frontier(db, alloc);
         }
 
-        fn edgesOwn(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: context_sources.GraphSpec.Direction, limit: u32) anyerror![]context_resolution.Edge {
+        fn edgesOwn(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: context_sources.GraphSpec.Direction, options: context_resolution.EdgeOptions) anyerror![]context_resolution.Edge {
             const db: *DB = @ptrCast(@alignCast(ptr));
             if (!isOwn(db, table_id)) return error.ContextSourceTableUnavailable;
-            return edges(db, alloc, graph_index, node, types, direction, limit);
+            return edges(db, alloc, graph_index, node, types, direction, options);
+        }
+
+        fn artifactsOwn(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, key: []const u8, names: []const []const u8) anyerror![]u8 {
+            const db: *DB = @ptrCast(@alignCast(ptr));
+            if (!isOwn(db, table_id)) return error.ContextSourceTableUnavailable;
+            return artifacts(db, alloc, key, names);
+        }
+
+        pub fn artifacts(db: *DB, alloc: Allocator, key: []const u8, names: []const []const u8) ![]u8 {
+            return @import("context_dependency_db.zig").artifactValuesJsonAlloc(alloc, db.core.store, db.core.index_manager, key, names);
         }
 
         fn searchOwn(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, q: context_resolution.SearchQuery) anyerror!context_resolution.Page {
@@ -75,10 +86,11 @@ pub fn Adapter(comptime DB: type) type {
             return search(db, alloc, q);
         }
 
-        /// Explicitly written edges only. Field- and artifact-derived edges
-        /// change through document writes or enrichment output, which graph
-        /// notices do not observe; live context therefore never reads them.
-        pub fn edges(db: *DB, alloc: Allocator, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: context_sources.GraphSpec.Direction, limit: u32) ![]context_resolution.Edge {
+        /// Explicitly written edges, plus field-derived and generated edges
+        /// when `include_generated` (their changes are observed through the
+        /// graph edge artifacts staged by commits and generated records).
+        pub fn edges(db: *DB, alloc: Allocator, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: context_sources.GraphSpec.Direction, options: context_resolution.EdgeOptions) ![]context_resolution.Edge {
+            const limit = options.limit;
             var out = std.ArrayListUnmanaged(context_resolution.Edge).empty;
             errdefer {
                 for (out.items) |e| {
@@ -101,7 +113,7 @@ pub fn Adapter(comptime DB: type) type {
                 defer graph_mod.GraphIndex.freeEdges(alloc, page.edges);
                 scanned += page.scanned_rows;
                 for (page.edges) |edge| {
-                    if (edge.artifact_derived or edge.field_derived) continue;
+                    if (!options.include_generated and (edge.artifact_derived or edge.field_derived)) continue;
                     if (out.items.len >= limit) break;
                     const outgoing = std.mem.eql(u8, edge.source, node) and direction != .in;
                     const neighbor = if (outgoing) edge.target else edge.source;
@@ -245,7 +257,7 @@ pub fn Registry(comptime DB: type) type {
         const Impl = Adapter(DB);
 
         pub fn reader(self: *Self) context_resolution.Reader {
-            return .{ .ptr = self, .own_table_id = self.own_table_id, .lookup_fn = lookupImpl, .query_fn = queryImpl, .frontier_fn = frontierImpl, .edges_fn = edgesImpl, .search_fn = searchImpl };
+            return .{ .ptr = self, .own_table_id = self.own_table_id, .lookup_fn = lookupImpl, .query_fn = queryImpl, .frontier_fn = frontierImpl, .edges_fn = edgesImpl, .search_fn = searchImpl, .artifacts_fn = artifactsImpl };
         }
 
         fn target(self: *Self, table_id: []const u8) !*DB {
@@ -263,9 +275,14 @@ pub fn Registry(comptime DB: type) type {
             return Impl.query(try self.target(table_id), alloc, filter, offset, limit);
         }
 
-        fn edgesImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: context_sources.GraphSpec.Direction, limit: u32) anyerror![]context_resolution.Edge {
+        fn edgesImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: context_sources.GraphSpec.Direction, options: context_resolution.EdgeOptions) anyerror![]context_resolution.Edge {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            return Impl.edges(try self.target(table_id), alloc, graph_index, node, types, direction, limit);
+            return Impl.edges(try self.target(table_id), alloc, graph_index, node, types, direction, options);
+        }
+
+        fn artifactsImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, key: []const u8, names: []const []const u8) anyerror![]u8 {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return Impl.artifacts(try self.target(table_id), alloc, key, names);
         }
 
         fn searchImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, q: context_resolution.SearchQuery) anyerror!context_resolution.Page {

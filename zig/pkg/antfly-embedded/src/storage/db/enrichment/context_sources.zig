@@ -158,6 +158,9 @@ pub const GraphSpec = struct {
     direction: Direction = .out,
     depth: u8 = 1,
     max_fanout: u32 = 100,
+    /// Also traverse field-derived and enrichment-generated edges. Their
+    /// producers must not depend on the consuming enrichment.
+    include_generated: bool = false,
 
     pub const Direction = enum { out, in, both };
 };
@@ -194,6 +197,9 @@ pub const Source = struct {
     /// Fields whose change can alter this source's result: projected fields,
     /// residual predicate fields, and the order field (sorted, unique).
     relevant_fields: []const []const u8 = &.{},
+    /// Generated artifacts this source reads through `_artifacts.` paths
+    /// (sorted, unique).
+    artifact_names: []const []const u8 = &.{},
     /// `document` only: a missing referenced document fails explicitly.
     required: bool = false,
     max_documents: u32 = default_max_documents,
@@ -246,7 +252,7 @@ pub const Source = struct {
             hashField(&h, self.graph.start_from);
             for (self.graph.edge_types) |t| hashField(&h, t);
             hashField(&h, @tagName(self.graph.direction));
-            hashField(&h, &.{ self.graph.depth, 0 });
+            hashField(&h, &.{ self.graph.depth, @intFromBool(self.graph.include_generated) });
         }
         if (self.kind == .search) {
             hashField(&h, self.search.text.literal);
@@ -302,6 +308,13 @@ pub const Config = struct {
     pub fn findSpec(self: *const Config, spec: Digest) ?*const Source {
         for (self.sources) |*source| if (std.mem.eql(u8, &source.specDigest(), &spec)) return source;
         return null;
+    }
+
+    /// Whether any live source reads generated data (artifacts or derived
+    /// graph edges), which requires artifact-change notices.
+    pub fn readsGenerated(self: *const Config) bool {
+        for (self.sources) |s| if (s.isLive() and (s.artifact_names.len != 0 or s.graph.include_generated)) return true;
+        return false;
     }
 
     pub fn hasSnapshot(self: *const Config) bool {
@@ -470,7 +483,9 @@ fn appendSourceJson(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), source: 
                 if (i != 0) try out.append(alloc, ',');
                 try appendJsonString(alloc, out, t);
             }
-            try out.print(alloc, "],\"direction\":\"{s}\",\"depth\":{d},\"max_fanout\":{d}}}", .{ @tagName(g.direction), g.depth, g.max_fanout });
+            try out.print(alloc, "],\"direction\":\"{s}\",\"depth\":{d},\"max_fanout\":{d}", .{ @tagName(g.direction), g.depth, g.max_fanout });
+            if (g.include_generated) try out.appendSlice(alloc, ",\"include_generated\":true");
+            try out.append(alloc, '}');
         },
         .search => {
             const q = source.search;
@@ -693,8 +708,20 @@ fn parseSource(a: Allocator, name: []const u8, value: std.json.Value, allow_iden
     try relevant.appendSlice(a, fields.items);
     for (source.conjuncts) |c| if (!c.isEquality()) try relevant.append(a, c.field);
     if (source.order_by) |o| try relevant.append(a, o.field);
+    for (source.conjuncts) |c| if (c.isEquality()) try relevant.append(a, c.field);
     sortUniqueStrings(&relevant);
-    source.relevant_fields = relevant.items;
+    var artifacts = std.ArrayListUnmanaged([]const u8).empty;
+    for (relevant.items) |field| if (artifactOfField(field)) |artifact| try artifacts.append(a, artifact);
+    sortUniqueStrings(&artifacts);
+    source.artifact_names = artifacts.items;
+    // Keep `relevant_fields` to non-equality fields plus projections, as
+    // before; equality fields were only needed to collect artifact names.
+    var trimmed = std.ArrayListUnmanaged([]const u8).empty;
+    try trimmed.appendSlice(a, fields.items);
+    for (source.conjuncts) |c| if (!c.isEquality()) try trimmed.append(a, c.field);
+    if (source.order_by) |o| try trimmed.append(a, o.field);
+    sortUniqueStrings(&trimmed);
+    source.relevant_fields = trimmed.items;
     return source;
 }
 
@@ -790,6 +817,9 @@ fn parseGraphField(a: Allocator, g: *GraphSpec, key: []const u8, field: std.json
         g.depth = @intCast(try uintField(field, 1, max_graph_depth));
     } else if (std.mem.eql(u8, key, "max_fanout")) {
         g.max_fanout = @intCast(try uintField(field, 1, max_graph_fanout));
+    } else if (std.mem.eql(u8, key, "include_generated")) {
+        if (field != .bool) return error.InvalidContextSourcesConfig;
+        g.include_generated = field.bool;
     } else return error.InvalidContextSourcesConfig;
 }
 
@@ -981,12 +1011,26 @@ fn validName(name: []const u8) bool {
     return true;
 }
 
-/// Field paths are dotted top-level names. Fields starting with `_` are
-/// reserved for engine-owned metadata (artifacts, embeddings, chunks); reading
-/// them would let a context source observe generated output and form a hidden
-/// producer feedback loop, so they are rejected.
+/// Virtual namespace exposing a row's generated artifacts to context sources:
+/// `_artifacts.<artifact>[.<path>]` reads the named asset (parsed JSON or
+/// text), chunk stream (array of chunk payloads), or document embedding
+/// (vector). Admission rejects artifacts that depend on the consuming
+/// enrichment, so a context source is always strictly downstream.
+pub const artifacts_prefix = "_artifacts.";
+
+/// Artifact named by a virtual `_artifacts.` field path, if any.
+pub fn artifactOfField(path: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, path, artifacts_prefix)) return null;
+    const rest = path[artifacts_prefix.len..];
+    const end = std.mem.indexOfScalar(u8, rest, '.') orelse rest.len;
+    return rest[0..end];
+}
+
+/// Field paths are dotted names. Other fields starting with `_` are reserved
+/// for engine-owned metadata and rejected.
 fn validFieldPath(path: []const u8) bool {
     if (path.len == 0 or path.len > max_pointer_bytes) return false;
+    if (artifactOfField(path)) |artifact| return validName(artifact) and !std.mem.endsWith(u8, path, ".");
     if (path[0] == '_') return false;
     var segments = std.mem.splitScalar(u8, path, '.');
     while (segments.next()) |segment| if (segment.len == 0) return false;
@@ -1200,6 +1244,33 @@ pub fn projectAlloc(alloc: Allocator, row: std.json.Value, fields: []const []con
         try appendCanonicalValue(alloc, &out, value);
     }
     try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Projection that keeps the nested structure of dotted paths, so the result
+/// is itself a row on which the same paths resolve (shadows and notice rows
+/// are re-evaluated as rows). Keys are sorted; missing paths are omitted.
+pub fn projectTreeAlloc(alloc: Allocator, row: std.json.Value, fields: []const []const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root = std.json.ObjectMap.empty;
+    for (fields) |field| {
+        const value = resolveFieldPath(row, field) orelse continue;
+        var node = &root;
+        var segments = std.mem.splitScalar(u8, field, '.');
+        var segment = segments.next().?;
+        while (segments.next()) |next| {
+            const slot = try node.getOrPut(a, segment);
+            if (!slot.found_existing or slot.value_ptr.* != .object) slot.value_ptr.* = .{ .object = .empty };
+            node = &slot.value_ptr.object;
+            segment = next;
+        }
+        try node.put(a, segment, value);
+    }
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try appendCanonicalValue(alloc, &out, .{ .object = root });
     return try out.toOwnedSlice(alloc);
 }
 
@@ -1949,8 +2020,8 @@ pub fn touchedTuplesAlloc(
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    const old_projection: ?[]u8 = if (previous) |row| try projectAlloc(a, row, source.relevant_fields) else null;
-    const new_projection: ?[]u8 = if (next) |row| try projectAlloc(a, row, source.relevant_fields) else null;
+    const old_projection: ?[]u8 = if (previous) |row| try projectTreeAlloc(a, row, source.relevant_fields) else null;
+    const new_projection: ?[]u8 = if (next) |row| try projectTreeAlloc(a, row, source.relevant_fields) else null;
     const projection_equal = old_projection != null and new_projection != null and
         std.mem.eql(u8, old_projection.?, new_projection.?);
 
@@ -2600,4 +2671,36 @@ test "pinned analyzer tokenizes deterministically" {
     try testing.expectEqualStrings("café", tokens[0]);
     try testing.expectEqualStrings("panels", tokens[1]);
     try testing.expectEqualStrings("solar", tokens[2]);
+}
+
+test "artifact virtual fields are admitted and recorded per source" {
+    const alloc = testing.allocator;
+    var config = try parsePublicJson(alloc,
+        \\{"labels":{"query":{"filter_query":{"conjuncts":[{"field":"org","term":{"$source":"/org"}},{"field":"_artifacts.classify.label","term":"policy"},
+        \\  {"field":"_artifacts.emb","similar":{"vector":{"$source":"/v"},"threshold":0.8,"dims":2,"model":"m"}}]}},"fields":["title","_artifacts.summary"]},
+        \\ "g":{"graph":{"graph_index":"kg","include_generated":true},"fields":["title"]}}
+    , "");
+    defer config.deinit();
+    const labels = config.find("labels").?;
+    try testing.expectEqual(@as(usize, 3), labels.artifact_names.len);
+    try testing.expectEqualStrings("classify", labels.artifact_names[0]);
+    try testing.expectEqualStrings("emb", labels.artifact_names[1]);
+    try testing.expectEqualStrings("summary", labels.artifact_names[2]);
+    try testing.expect(config.readsGenerated());
+    try testing.expectEqualStrings("summary", artifactOfField("_artifacts.summary").?);
+    try testing.expect(artifactOfField("title") == null);
+    try testing.expectError(error.InvalidContextSourcesConfig, parsePublicJson(alloc, "{\"a\":{\"document\":{\"key_from\":\"/k\"},\"fields\":[\"_embeddings\"]}}", ""));
+    try testing.expectError(error.InvalidContextSourcesConfig, parsePublicJson(alloc, "{\"a\":{\"document\":{\"key_from\":\"/k\"},\"fields\":[\"_artifacts.\"]}}", ""));
+}
+
+test "tree projection keeps nested paths resolvable" {
+    const alloc = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const row = try parseValue(arena.allocator(), "{\"_artifacts\":{\"c\":{\"label\":\"x\",\"n\":1},\"s\":\"t\"},\"a\":{\"b\":2},\"z\":3}");
+    const tree = try projectTreeAlloc(alloc, row, &.{ "_artifacts.c.label", "a.b", "missing" });
+    defer alloc.free(tree);
+    try testing.expectEqualStrings("{\"_artifacts\":{\"c\":{\"label\":\"x\"}},\"a\":{\"b\":2}}", tree);
+    const again = try parseValue(arena.allocator(), tree);
+    try testing.expectEqualStrings("x", resolveFieldPath(again, "_artifacts.c.label").?.string);
 }

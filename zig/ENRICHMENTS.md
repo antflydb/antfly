@@ -584,7 +584,8 @@ and next values determine exactly which dependents change:
 | `match` (filter mode) | yes | residual test with the pinned `antfly.context.simple.v1` analyzer (part of the source identity) |
 | `similar` (threshold) | yes | residual cosine/dot test against a vector stored in a document field; `model` names the embedding space and is part of the source identity |
 | `order_by` top-N | yes | relevant only if the row ranks at or above the recorded boundary (ties by key) |
-| `graph`, depth 1-3 | yes | adjacency tuple per visited node plus document tuple per member; only explicitly written edges are traversed |
+| `graph`, depth 1-3 | yes | adjacency tuple per visited node plus document tuple per member; generated and field-derived edges with `include_generated` |
+| `_artifacts.<name>` fields and predicates | yes | logical rows include generated artifacts; generated records stage notices |
 | scored full-text, nearest-k, hybrid, reranked | snapshot only | membership is relative to the corpus |
 
 Equality conjuncts build the tuple a dependent subscribes to. Every other
@@ -604,10 +605,9 @@ Graph traversal discovers its subscriptions while reading. The runtime
 registers the bound tuples, reads, registers what the traversal discovered,
 re-reads, and publishes only if both reads render identically; afterwards
 every change finds a registration and advances the fenced generation.
-Field-derived and artifact-derived edges change through document writes or
-enrichment output that adjacency notices do not observe, and generated edges
-would create producer feedback, so live context never traverses them.
-Admission also rejects a context source reading a table that this table's
+Field-derived and generated edges are traversed only with
+`include_generated`; their edge artifacts drive adjacency notices. Admission
+also rejects a context source reading a table that this table's
 resolvers promote into from the enrichment's own output (directly or through
 downstream artifacts).
 
@@ -616,6 +616,37 @@ kind) register no subscriptions. Their dependents publish with freshness
 `unverified` and `validated_at_ms`, rebuild on `refresh_interval` through the
 due-ordered refresh queue or manually, and keep full lineage, so audit and
 impact analysis still work.
+
+### Generated data as context input
+
+Context sources can consume what other enrichments produced, as long as they
+are strictly downstream of it:
+
+- `_artifacts.<artifact>[.<path>]` exposes a row's generated output in
+  projections and predicates: an asset renders as parsed JSON (or text), a
+  chunk stream as the array of its chunk payloads, and a document embedding as
+  its vector (so `similar` can run over generated embeddings).
+- Graph sources with `include_generated` also traverse field-derived and
+  enrichment-generated edges.
+
+On the source side the shadow and every notice row are *logical rows*: the
+document fields plus `_artifacts` for the artifacts dependents read. A
+document write reads the current artifacts; a generated record (the runtime's
+publication of new artifact bytes or graph edge artifacts) stages notices for
+the artifacts and edges it changed, using the shadow's fields with the new
+artifact values substituted. A durable marker is written before such a record
+and cleared when its notices are staged; a leftover marker after a crash runs a
+bounded, resumable reconcile that compares every row's logical value with its
+shadow and stages exactly the differences. Field-derived edge artifacts staged
+by ordinary commits are routed the same way. Freshness converges: a dependent
+that read an artifact before it was regenerated is invalidated when the new
+bytes publish.
+
+Admission rejects feedback: an artifact (or a graph index's generated edge
+source) is readable only if it does not depend on the consuming enrichment
+through upstream artifact streams, other enrichments' context sources, or
+promotion into the read table. The embedded Lite host checks the same across
+tables before admitting a declaration.
 
 ### Indexed invalidation
 
@@ -720,9 +751,6 @@ not a decision explanation.
   table's context) and graph selectors (#1635).
 - Fan-out benchmarks (invalidation latency, rebuild latency, producer calls,
   subscription storage, bulk-update work).
-- Similarity over enrichment-generated embeddings (today `similar` reads
-  vectors stored in document fields) and live traversal of generated edges;
-  both need the upstream artifact's freshness as an input plus cycle checks.
 - Range-aware subscription indexes: residual predicates without equality
   conjuncts currently fan out to every dependent of the declaration and are
   filtered per subscriber.

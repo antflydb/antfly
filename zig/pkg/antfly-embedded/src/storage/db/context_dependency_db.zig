@@ -33,6 +33,9 @@ const enrichment_types = @import("enrichment/enrichment_types.zig");
 const ctx = @import("enrichment/context_sources.zig");
 const store = @import("enrichment/context_dependency_store.zig");
 const notices = @import("enrichment/context_notices.zig");
+const internal_keys = @import("../internal_keys.zig");
+const artifact_ids = @import("artifact_ids.zig");
+const artifact_codec = @import("enrichment/artifact_codec.zig");
 
 pub const shadows_complete_key = "\x00\x00__metadata__:context_dependency:shadows_complete";
 
@@ -105,6 +108,8 @@ pub fn stageForBatch(
     deletes: []const []const u8,
     graph_writes: []const types.GraphEdgeWrite,
     graph_deletes: []const types.GraphEdgeDelete,
+    /// Field-derived graph edge artifacts written or removed by this batch.
+    graph_artifact_keys: []const []const u8,
     store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
     owned_keys: *std.ArrayListUnmanaged([]u8),
     owned_values: *std.ArrayListUnmanaged([]u8),
@@ -112,7 +117,7 @@ pub fn stageForBatch(
     owned_delete_keys: *std.ArrayListUnmanaged([]u8),
 ) !void {
     if (!manager.hasContextDependents()) return;
-    if (writes.len == 0 and deletes.len == 0 and graph_writes.len == 0 and graph_deletes.len == 0) return;
+    if (writes.len == 0 and deletes.len == 0 and graph_writes.len == 0 and graph_deletes.len == 0 and graph_artifact_keys.len == 0) return;
     const declared = try manager.contextDeclarationsAlloc(alloc);
     defer alloc.free(declared);
     var specs = try notices.buildSourceSpecs(alloc, manager.context_table_id, declared);
@@ -127,13 +132,21 @@ pub fn stageForBatch(
     if (!specs.isEmpty()) {
         var changes = std.ArrayListUnmanaged(notices.RowChange).empty;
         defer changes.deinit(alloc);
-        for (writes) |w| if (isUserDocumentKey(w.key)) try changes.append(alloc, .{ .key = w.key, .next = w.value });
+        var rows_arena = std.heap.ArenaAllocator.init(alloc);
+        defer rows_arena.deinit();
+        for (writes) |w| if (isUserDocumentKey(w.key)) {
+            // Logical row: document fields plus the generated artifacts read
+            // by dependents (unchanged by this write, so read as committed).
+            const next = if (specs.artifact_names.len == 0) w.value else try logicalRowAlloc(rows_arena.allocator(), reader, manager, w.key, w.value, specs.artifact_names);
+            try changes.append(alloc, .{ .key = w.key, .next = next });
+        };
         for (deletes) |k| if (isUserDocumentKey(k)) try changes.append(alloc, .{ .key = k, .next = null });
         const complete = try shadowsComplete(alloc, reader, specs.fields_digest);
         const staged = try notices.planStageNotices(alloc, reader, &plan, &specs, manager.context_table_id, sequence, 0, changes.items, complete);
         var edges = std.ArrayListUnmanaged(notices.EdgeChange).empty;
         defer edges.deinit(alloc);
         inline for (.{ graph_writes, graph_deletes }) |list| for (list) |e| try edges.append(alloc, .{ .graph_index = e.index_name, .source = e.source, .target = e.target, .edge_type = e.edge_type });
+        if (specs.generated_edges) try appendDerivedEdgesAlloc(rows_arena.allocator(), &edges, alloc, graph_artifact_keys);
         _ = try notices.planStageEdgeNotices(alloc, &plan, &specs, manager.context_table_id, sequence, staged.next_ordinal, edges.items);
     }
     // A deleted dependent retires its live subscriptions and lineage.
@@ -167,6 +180,262 @@ pub fn stageForBatch(
         owned_delete_keys.appendAssumeCapacity(key);
         delete_keys.appendAssumeCapacity(key);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Generated data as context input
+// ---------------------------------------------------------------------------
+
+/// `{"<artifact>": value|null}` for a row's generated artifacts. Asset bytes
+/// render as parsed JSON (or a JSON string), chunk streams as an array of
+/// payloads in chunk order, and document embeddings as a vector.
+pub fn artifactValuesJsonAlloc(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, doc_key: []const u8, names: []const []const u8) ![]u8 {
+    var reader = try StoreReader.init(primary);
+    defer reader.deinit();
+    return artifactValuesFromReaderAlloc(alloc, reader.reader(), manager, doc_key, names);
+}
+
+fn appendPayloadValue(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), raw: []const u8) !void {
+    const public = try @import("../hierarchy_navigation.zig").publicArtifactPayloadAlloc(alloc, raw);
+    defer alloc.free(public);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    if (std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), public, .{})) |value| {
+        try ctx.appendCanonicalValue(alloc, out, value);
+    } else |_| {
+        if (std.unicode.utf8ValidateSlice(public)) try ctx.appendJsonString(alloc, out, public) else try out.appendSlice(alloc, "null");
+    }
+}
+
+fn artifactValuesFromReaderAlloc(alloc: Allocator, reader: store.Reader, manager: anytype, doc_key: []const u8, names: []const []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    for (names, 0..) |name, i| {
+        if (i != 0) try out.append(alloc, ',');
+        try ctx.appendJsonString(alloc, &out, name);
+        try out.append(alloc, ':');
+        const start = out.items.len;
+        if (manager.getEnrichment(.asset, name) != null) {
+            const key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", name);
+            defer alloc.free(key);
+            if (try reader.get(alloc, key)) |raw| {
+                defer alloc.free(raw);
+                try appendPayloadValue(alloc, &out, raw);
+            }
+        } else if (manager.getEnrichment(.embedding, name) != null) {
+            const key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, name);
+            defer alloc.free(key);
+            if (try reader.get(alloc, key)) |raw| {
+                defer alloc.free(raw);
+                if (artifact_codec.denseEmbeddingVectorView(raw) catch null) |vector| {
+                    try out.append(alloc, '[');
+                    for (vector, 0..) |f, j| {
+                        if (j != 0) try out.append(alloc, ',');
+                        try out.print(alloc, "{d}", .{f});
+                    }
+                    try out.append(alloc, ']');
+                }
+            }
+        } else if (manager.getEnrichment(.chunk, name) != null) {
+            const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", name);
+            defer alloc.free(prefix);
+            const record_prefix = try std.mem.concat(alloc, u8, &.{ prefix, &.{internal_keys.chunk_record_kind} });
+            defer alloc.free(record_prefix);
+            const Collect = struct {
+                alloc: Allocator,
+                out: *std.ArrayListUnmanaged(u8),
+                count: usize = 0,
+                fn visit(p: *anyopaque, _: []const u8, value: []const u8) anyerror!bool {
+                    const self: *@This() = @ptrCast(@alignCast(p));
+                    if (self.count != 0) try self.out.append(self.alloc, ',');
+                    try appendPayloadValue(self.alloc, self.out, value);
+                    self.count += 1;
+                    return self.count < 4096;
+                }
+            };
+            try out.append(alloc, '[');
+            var collect = Collect{ .alloc = alloc, .out = &out };
+            try reader.scanPrefix(alloc, record_prefix, .{ .ptr = &collect, .visit_fn = Collect.visit });
+            try out.append(alloc, ']');
+        }
+        if (out.items.len == start) try out.appendSlice(alloc, "null");
+    }
+    try out.append(alloc, '}');
+    return out.toOwnedSlice(alloc);
+}
+
+/// Document JSON plus `_artifacts` (the read artifacts), as one logical row.
+fn logicalRowAlloc(a: Allocator, reader: store.Reader, manager: anytype, doc_key: []const u8, doc_json: []const u8, names: []const []const u8) ![]const u8 {
+    var row = std.json.parseFromSliceLeaky(std.json.Value, a, doc_json, .{}) catch return doc_json;
+    if (row != .object) return doc_json;
+    const values = try artifactValuesFromReaderAlloc(a, reader, manager, doc_key, names);
+    try row.object.put(a, "_artifacts", try std.json.parseFromSliceLeaky(std.json.Value, a, values, .{}));
+    return std.json.Stringify.valueAlloc(a, row, .{});
+}
+
+/// Graph edge artifacts (field-derived or generated) as edge changes.
+fn appendDerivedEdgesAlloc(a: Allocator, edges: *std.ArrayListUnmanaged(notices.EdgeChange), list_alloc: Allocator, keys: []const []const u8) !void {
+    for (keys) |key| {
+        if (!internal_keys.isGraphEdgeArtifactKey(key)) continue;
+        const identity = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(a, key)) orelse continue;
+        try edges.append(list_alloc, .{
+            .graph_index = identity.index_name,
+            .source = if (identity.logical_source.len != 0) identity.logical_source else identity.doc_key,
+            .target = identity.target_doc_key,
+            .edge_type = identity.edge_type,
+            .artifact_derived = true,
+        });
+    }
+}
+
+var marker_counter = std.atomic.Value(u64).init(0);
+
+pub const pending_prefix = "\x00\x00__metadata__:context_dependency:generated_pending:";
+const reconcile_cursor_key = "\x00\x00__metadata__:context_dependency:reconcile_cursor";
+
+fn readsGenerated(manager: anytype, batch: anytype) bool {
+    if (!manager.hasContextDependents() or !manager.contextReadsGenerated()) return false;
+    return batch.changed_artifact_keys.len != 0 or batch.deleted_keys.len != 0 or batch.graph_writes.len != 0;
+}
+
+/// Durable intent written before a generated record that may change context
+/// inputs. Cleared when its notices are staged; a leftover marker (crash in
+/// between) triggers a reconcile that compares shadows with current values.
+pub fn markGeneratedPending(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, batch: anytype) !?u64 {
+    if (!readsGenerated(manager, batch)) return null;
+    // Unique per marker within the process; addresses vary across processes.
+    const n = marker_counter.fetchAdd(1, .monotonic);
+    const token = std.hash.Wyhash.hash(@intFromPtr(primary) ^ @intFromPtr(&marker_counter), std.mem.asBytes(&n));
+    const key = try std.fmt.allocPrint(alloc, "{s}{x:0>16}", .{ pending_prefix, token });
+    defer alloc.free(key);
+    try primary.put(key, "");
+    return token;
+}
+
+/// Stage notices for artifacts and generated edges changed by a committed
+/// generated record. Next values are the shadow's document fields with the
+/// current artifacts substituted (an artifact change never changes fields).
+pub fn stageGenerated(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, sequence: u64, batch: anytype, token: ?u64) !void {
+    const t = token orelse return;
+    const declared = try manager.contextDeclarationsAlloc(alloc);
+    defer alloc.free(declared);
+    var specs = try notices.buildSourceSpecs(alloc, manager.context_table_id, declared);
+    defer specs.deinit();
+    var reader_state = try StoreReader.init(primary);
+    defer reader_state.deinit();
+    const reader = reader_state.reader();
+    var plan = store.Plan.init(alloc);
+    defer plan.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    if (!specs.isEmpty() and (specs.artifact_names.len != 0 or specs.generated_edges)) {
+        var docs = std.StringArrayHashMapUnmanaged(void).empty;
+        var edge_keys = std.ArrayListUnmanaged([]const u8).empty;
+        inline for (.{ batch.changed_artifact_keys, batch.deleted_keys }) |keys| for (keys) |key| {
+            if (internal_keys.isGraphEdgeArtifactKey(key)) {
+                try edge_keys.append(a, key);
+                continue;
+            }
+            const ref = (artifact_ids.decodeArtifactRefAlloc(a, key) catch null) orelse continue;
+            for (specs.artifact_names) |name| if (std.mem.eql(u8, name, ref.name)) {
+                try docs.put(a, ref.document_id, {});
+                break;
+            };
+        };
+        var changes = std.ArrayListUnmanaged(notices.RowChange).empty;
+        for (docs.keys()) |doc| {
+            const values = try artifactValuesFromReaderAlloc(a, reader, manager, doc, specs.artifact_names);
+            const shadow = try reader.get(a, try notices.shadowKeyAlloc(a, doc));
+            var base: std.json.Value = .{ .object = .empty };
+            if (shadow) |raw| if (raw.len >= 32 and std.mem.eql(u8, raw[0..32], &specs.fields_digest)) {
+                base = std.json.parseFromSliceLeaky(std.json.Value, a, raw[32..], .{}) catch base;
+            };
+            if (shadow == null) {
+                // No shadow yet: take the document itself.
+                const doc_key = try internal_keys.documentKeyAlloc(a, doc);
+                if (try reader.get(a, doc_key)) |raw| base = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch base;
+            }
+            if (base != .object) continue;
+            try base.object.put(a, "_artifacts", try std.json.parseFromSliceLeaky(std.json.Value, a, values, .{}));
+            try changes.append(a, .{ .key = doc, .next = try std.json.Stringify.valueAlloc(a, base, .{}) });
+        }
+        const complete = try shadowsComplete(alloc, reader, specs.fields_digest);
+        const staged = try notices.planStageNotices(alloc, reader, &plan, &specs, manager.context_table_id, sequence, 0x4000_0000, changes.items, complete);
+        if (specs.generated_edges) {
+            var edges = std.ArrayListUnmanaged(notices.EdgeChange).empty;
+            defer edges.deinit(alloc);
+            try appendDerivedEdgesAlloc(a, &edges, alloc, edge_keys.items);
+            for (batch.graph_writes) |e| try edges.append(alloc, .{ .graph_index = e.index_name, .source = e.source, .target = e.target, .edge_type = e.edge_type, .artifact_derived = true });
+            _ = try notices.planStageEdgeNotices(alloc, &plan, &specs, manager.context_table_id, sequence, staged.next_ordinal, edges.items);
+        }
+    }
+    const key = try std.fmt.allocPrint(alloc, "{s}{x:0>16}", .{ pending_prefix, t });
+    defer alloc.free(key);
+    try plan.delete(key);
+    try commitPlan(alloc, primary, &plan);
+}
+
+pub fn hasGeneratedPending(alloc: Allocator, primary: *docstore_mod.DocStore) !bool {
+    var reader = try StoreReader.init(primary);
+    defer reader.deinit();
+    const Probe = struct {
+        found: bool = false,
+        fn visit(p: *anyopaque, _: []const u8, _: []const u8) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            self.found = true;
+            return false;
+        }
+    };
+    var probe = Probe{};
+    try reader.reader().scanPrefix(alloc, pending_prefix, .{ .ptr = &probe, .visit_fn = Probe.visit });
+    return probe.found;
+}
+
+/// One reconcile page after an interrupted generated record: recompute
+/// logical rows (document plus artifacts) and stage exactly the differences
+/// from their shadows. With `done`, the pending markers are cleared.
+pub fn reconcilePage(alloc: Allocator, primary: *docstore_mod.DocStore, manager: anytype, sequence: u64, rows: []const notices.RowChange, done: bool) !void {
+    const declared = try manager.contextDeclarationsAlloc(alloc);
+    defer alloc.free(declared);
+    var specs = try notices.buildSourceSpecs(alloc, manager.context_table_id, declared);
+    defer specs.deinit();
+    var reader_state = try StoreReader.init(primary);
+    defer reader_state.deinit();
+    const reader = reader_state.reader();
+    var plan = store.Plan.init(alloc);
+    defer plan.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var changes = std.ArrayListUnmanaged(notices.RowChange).empty;
+    for (rows) |row| {
+        const raw = row.next orelse continue;
+        try changes.append(arena.allocator(), .{ .key = row.key, .next = if (specs.artifact_names.len == 0) raw else try logicalRowAlloc(arena.allocator(), reader, manager, row.key, raw, specs.artifact_names) });
+    }
+    if (!specs.isEmpty()) _ = try notices.planStageNotices(alloc, reader, &plan, &specs, manager.context_table_id, sequence, 0x6000_0000, changes.items, true);
+    if (done) {
+        const Collect = struct {
+            plan: *store.Plan,
+            fn visit(p: *anyopaque, key: []const u8, _: []const u8) anyerror!bool {
+                const self: *@This() = @ptrCast(@alignCast(p));
+                try self.plan.delete(key);
+                return true;
+            }
+        };
+        var collect = Collect{ .plan = &plan };
+        try reader.scanPrefix(alloc, pending_prefix, .{ .ptr = &collect, .visit_fn = Collect.visit });
+        try plan.delete(reconcile_cursor_key);
+    } else if (rows.len != 0) {
+        try plan.put(reconcile_cursor_key, rows[rows.len - 1].key);
+    }
+    try commitPlan(alloc, primary, &plan);
+}
+
+pub fn reconcileCursorAlloc(alloc: Allocator, primary: *docstore_mod.DocStore) !?[]u8 {
+    var reader = try StoreReader.init(primary);
+    defer reader.deinit();
+    return reader.reader().get(alloc, reconcile_cursor_key);
 }
 
 fn shadowsComplete(alloc: Allocator, reader: store.Reader, fields_digest: ctx.Digest) !bool {
@@ -204,7 +473,14 @@ pub fn backfillShadowPage(alloc: Allocator, primary: *docstore_mod.DocStore, man
     defer txn_reader.deinit();
     var plan = store.Plan.init(alloc);
     defer plan.deinit();
-    const written = try notices.planBackfillShadows(alloc, txn_reader.reader(), &plan, &specs, rows);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var logical = std.ArrayListUnmanaged(notices.RowChange).empty;
+    for (rows) |row| {
+        const raw = row.next orelse continue;
+        try logical.append(arena.allocator(), .{ .key = row.key, .next = if (specs.artifact_names.len == 0) raw else try logicalRowAlloc(arena.allocator(), txn_reader.reader(), manager, row.key, raw, specs.artifact_names) });
+    }
+    const written = try notices.planBackfillShadows(alloc, txn_reader.reader(), &plan, &specs, logical.items);
     try commitPlan(alloc, primary, &plan);
     return written;
 }
