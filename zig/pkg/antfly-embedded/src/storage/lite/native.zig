@@ -5925,6 +5925,21 @@ pub const NativeFile = struct {
     transaction_writes_generation: u64 = 0,
     flushing_transaction: bool = false,
     transaction_pages: ?*PageAllocator = null,
+    /// §9 (redo + indexed reclamation): page ids `checkpointRedoLog`
+    /// flushed from the overlay's page-shaped staging area (external
+    /// value chains a diverting commit wrote without ever touching the
+    /// ledger) for *this* transaction, consumed once by
+    /// `flushTransactionWrites`'s own real (non-diverting) fold, right
+    /// after its root loop and before `persistAllocator`. See
+    /// `checkpointRedoLog`'s own doc comment for why this cannot simply
+    /// be retained inline where the bytes are flushed: `putDocumentBatch`/
+    /// `putCatalogBatchForRoot`, called from inside an open transaction,
+    /// only *stage* into `TransactionWrites.maps` there -- the real
+    /// `IndexEditor` pass (and the `retainRecord` call that retains each
+    /// chain's own *root* page) does not run until `flushTransactionWrites`
+    /// processes those maps later. Owned by `checkpointRedoLog`; cleared
+    /// (and freed) by whichever of the two reaches it first.
+    redo_fold_retain_pending: ?[]const u64 = null,
     /// Accumulates (page_id, crc) for every data page `PageWriteBatch`
     /// physically writes since the *last durable checkpoint publish* --
     /// across staging (`stageMutation`'s eager external-value writes,
@@ -6600,26 +6615,6 @@ pub const NativeFile = struct {
         // work either.
         if (!has_logical_work) return;
 
-        // Flush every still-staged page (external value chains) directly
-        // to its real location before the logical fold below: a
-        // reference to one of these from a folded head (`external_value_root_page`)
-        // only stores the page_id, never re-derives or re-writes the
-        // page's own bytes, so without this explicit flush the
-        // referenced page would stay parked in the overlay forever
-        // (`maybeClearPages`, called after this function's own commit,
-        // assumes every staged page has *already* been folded into a
-        // real, physical one by this point -- this is what actually
-        // makes that assumption true, rather than relying on the
-        // logical fold to do it incidentally, which it never did).
-        {
-            const pages = try redo.shared.takeAllPagesAlloc(std.heap.page_allocator, io);
-            defer std.heap.page_allocator.free(pages);
-            for (pages) |p| {
-                defer std.heap.page_allocator.free(p.bytes);
-                try self.file.writePositionalAll(io, p.bytes, p.page_id * @as(u64, self.header.page_size));
-            }
-        }
-
         // Disables every diversion point (`PageWriteBatch.flushCount`,
         // `flushTransactionWrites`'s logical-mutation branch,
         // `commitTransactionWithDurability`, `publishCheckpoint`) for the
@@ -6640,6 +6635,59 @@ pub const NativeFile = struct {
         // touched it.
         try self.beginTransaction();
         errdefer self.abortTransaction();
+
+        // Flush every still-staged page (external value chains) directly
+        // to its real location before the logical fold below: a
+        // reference to one of these from a folded head (`external_value_root_page`)
+        // only stores the page_id, never re-derives or re-writes the
+        // page's own bytes, so without this explicit flush the
+        // referenced page would stay parked in the overlay forever
+        // (`maybeClearPages`, called after this function's own commit,
+        // assumes every staged page has *already* been folded into a
+        // real, physical one by this point -- this is what actually
+        // makes that assumption true, rather than relying on the
+        // logical fold to do it incidentally, which it never did).
+        const staged_pages = try redo.shared.takeAllPagesAlloc(std.heap.page_allocator, io);
+        defer {
+            for (staged_pages) |p| std.heap.page_allocator.free(p.bytes);
+            std.heap.page_allocator.free(staged_pages);
+        }
+        for (staged_pages) |p| {
+            try self.file.writePositionalAll(io, p.bytes, p.page_id * @as(u64, self.header.page_size));
+        }
+        // §9 (redo + indexed reclamation): every page just flushed was
+        // allocated and written by an earlier *diverting* commit
+        // (`pageAllocatorForDivertingCommit`'s own doc comment -- "the
+        // one page-shaped exception a diverting commit still makes"),
+        // which never touches the ledger at all, unlike every other
+        // path that physically writes a page through this file's real,
+        // ledger-backed `PageAllocator.writePage`. The fold below (the
+        // `root_idx` loop just past this) runs inside this already-open
+        // transaction, so `putDocumentBatch`/`putCatalogBatchForRoot`
+        // only *stage* into `TransactionWrites.maps` here -- the real
+        // `IndexEditor` pass that actually writes each document/catalog
+        // record (and, via `writePage`'s own `.document`/`.catalog`
+        // branch calling `retainRecord`, retains each chain's own
+        // *root* page for exactly this reason) does not run until
+        // `flushTransactionWrites` processes those maps later, inside
+        // `commitTransactionWithDurability` below. Handing the page ids
+        // to `self` here, for `flushTransactionWrites`'s own fold to
+        // pick up right after it -- not retaining them here directly --
+        // avoids double-retaining a root the real build is about to
+        // retain itself, while still covering a chain's own
+        // *continuation* pages beyond that root, which nothing else
+        // retains at all (a normal, non-diverting commit retains those
+        // at `.data`-kind write time; these were written raw, by a
+        // commit that never touched a ledger). Left uncovered,
+        // `validateIndexedOwnership`'s reachability walk finds a
+        // referenced page the ledger never counted (indistinguishable
+        // from an `allocateFresh` page whose own retain never ran) and
+        // fails with `error.InvalidNativeAllocator`.
+        if (staged_pages.len != 0 and self.header.indexed_reclamation) {
+            const pending = try self.allocator.alloc(u64, staged_pages.len);
+            for (staged_pages, pending) |p, *out| out.* = p.page_id;
+            self.redo_fold_retain_pending = pending;
+        }
         for (0..3) |root_idx| {
             // A fully-owned snapshot, folded outside `shared`'s own lock
             // (`snapshotHeadsAlloc`'s own doc comment) -- `putDocumentBatch`/
@@ -6693,6 +6741,14 @@ pub const NativeFile = struct {
         // `commitTransactionWithDurability`, `publishCheckpoint`, all
         // running their ordinary non-redo behavior because `checkpointing`
         // is true) syncs them and writes a real, physical checkpoint slot.
+        // `flushTransactionWrites` itself consumes and frees
+        // `self.redo_fold_retain_pending` (see that field's own doc
+        // comment); this only cleans up if something above returned an
+        // error before `flushTransactionWrites` ever ran.
+        errdefer if (self.redo_fold_retain_pending) |pending| {
+            self.allocator.free(pending);
+            self.redo_fold_retain_pending = null;
+        };
         try self.commitTransactionWithDurability(true, null);
 
         // Everything above is durable now; only space reclamation is
@@ -8338,7 +8394,17 @@ pub const NativeFile = struct {
         var window: AllocatorProofWindow = undefined;
         window.initInto(self);
         defer window.deinit();
-        if (state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
+        // §9 (redo + indexed reclamation): a diverting commit advances
+        // `checkpoint.page_count` on its own, directly, for a fresh
+        // external value chain (`pageAllocatorForDivertingCommit`)
+        // without ever touching the ledger, so `checkpoint.page_count`
+        // legitimately runs ahead of the ledger's own `covered_pages`
+        // between two real checkpoints. A ledger that claims to cover
+        // *more* pages than the checkpoint's own page_count is still
+        // always invalid, redo or not: no page beyond page_count exists
+        // yet for anything to be owned within.
+        const allow_behind = self.header.redo_log_capacity != 0;
+        if (if (allow_behind) state.root.covered_pages > checkpoint.page_count else state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
         if (!std.meta.eql(self.activeCheckpoint(), checkpoint)) return error.InvalidNativeAllocator;
         var expected = allocator_v4.State.init(self.allocator);
         defer expected.deinit();
@@ -8362,7 +8428,17 @@ pub const NativeFile = struct {
             const old_payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, slot.free_map_root_page, .free_map, slot);
             defer self.allocator.free(old_payload);
             const old_root = try allocator_v4.State.decodeRoot(old_payload);
-            if (old_root.covered_pages != slot.page_count or state.count(slot.free_map_root_page) == allocator_v4.free) return error.InvalidNativeAllocator;
+            // Same `allow_behind` lag as this function's own
+            // `covered_pages` check above -- `slot` here can be a
+            // ride-along (non-durable) checkpoint snapshot whose
+            // `page_count` several diverting commits already advanced
+            // in memory (`flushTransactionWrites`'s own `next.page_count
+            // = writes.pages.next_page_id;`, unconditional regardless of
+            // `diverting`), while its *free_map_root_page* is untouched
+            // since those commits never rebuild the free map -- so this
+            // slot's own stored root legitimately still covers fewer
+            // pages than `slot.page_count` now says.
+            if ((if (allow_behind) old_root.covered_pages > slot.page_count else old_root.covered_pages != slot.page_count) or state.count(slot.free_map_root_page) == allocator_v4.free) return error.InvalidNativeAllocator;
             // The fallback may name an older ledger. Read it independently;
             // loading it into the owner's cache would discard current state.
             var old_state = try allocator_v4.State.load(self.allocator, .{ .context = self, .allocate = ledgerReadOnlyAllocate, .read = ledgerReadAny, .write = ledgerReadOnlyWrite, .payload_bytes = self.maxPagePayloadBytes(), .cancel_requested = if (cancel) |token| &token.requested else null }, slot.free_map_root_page);
@@ -14855,6 +14931,32 @@ pub const NativeFile = struct {
             // The next root may resolve external index keys written here.
             try writes.pages.flush();
         }
+        // §9 (redo + indexed reclamation): `checkpointRedoLog`'s own
+        // `redo_fold_retain_pending` (see that field's own doc comment)
+        // names page ids a diverting commit wrote raw, bypassing the
+        // ledger entirely, that the fold just above did not already
+        // retain as a side effect of writing their owning document's
+        // record (`retainRecord`, reached through `writePage`, retains
+        // only the chain's own root page -- the one `external_value_root_page`
+        // actually points to). Only ever set when `!diverting` (this
+        // field exists for `checkpointRedoLog`'s own real build alone),
+        // but checked here regardless of that, so a page still at count
+        // 0 after the fold -- a continuation page nothing else ever
+        // touches -- gets picked up before `persistAllocator` below
+        // finalizes the ledger, rather than leaving
+        // `validateIndexedOwnership`'s later reachability walk to find
+        // a referenced page the ledger never counted.
+        if (self.redo_fold_retain_pending) |pending| {
+            defer {
+                self.allocator.free(pending);
+                self.redo_fold_retain_pending = null;
+            }
+            if (writes.pages.ledger) |state| {
+                for (pending) |page_id| {
+                    if (state.count(page_id) == 0) try state.retain(page_id);
+                }
+            }
+        }
         var next = self.activeCheckpoint();
         // Diverting never touches a real page, so nothing above bumped
         // `commit_sequence` the way a copy-on-write build normally does
@@ -16099,6 +16201,25 @@ pub const NativeFile = struct {
         const retired_header = self.header;
         self.header = prepared.header;
         prepared.header = retired_header;
+        // `self.inode_lock_ref` now names a different `inode_lock.Entry`
+        // (the swap above) -- `prepared`'s own, which may carry a
+        // `last_committed_sequence` from `prepared`'s own, entirely
+        // separate lineage (its own vacuum/compaction attempt, possibly
+        // itself a retried or abandoned one) that has no relationship to
+        // the header this call is adopting. A monotonic merge
+        // (`publishCommittedSequenceToInode`) is the wrong operation here:
+        // if that unrelated leftover happens to be *higher* than the
+        // adopted header's own `commit_sequence`, merging would strand
+        // this inode's registered sequence permanently ahead of a header
+        // that can never publish a commit at that number -- every future
+        // publish would then fail the `base < latest` backstop forever,
+        // even though nothing is actually racing (reproduced: see
+        // `resetCommittedSequence`'s own doc comment). Reset it outright
+        // instead: the adopted header's own sequence is this inode's one
+        // and only truth immediately after the swap, and nothing else may
+        // have published to this entry since (the swap runs under the
+        // writer-lease admission gate's own exclusivity).
+        if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.resetCommittedSequence(entry, self.activeCheckpoint().commit_sequence);
         // §9.3a/§9.4: `prepared` (built by `prepareVacuum`) never carries a
         // redo-log region of its own -- its header's `redo_log_capacity` is
         // always 0 -- but the live `self.redo`, if this file had one, still
@@ -28985,4 +29106,46 @@ test "lite redo log versioned overlay lets a pinned older checkpoint see its own
     const v2_after_checkpoint = (try file.getDocumentAlloc(a, "k")).?;
     defer a.free(v2_after_checkpoint);
     try std.testing.expectEqualStrings("v2", v2_after_checkpoint);
+}
+
+// §9 (redo + indexed reclamation): `checkpointRedoLog`'s real build folds
+// external value chains a diverting commit wrote raw, bypassing the
+// ledger entirely (`pageAllocatorForDivertingCommit`'s own doc comment).
+// `putDocumentBatch`/`putCatalogBatchForRoot`'s `retainRecord` retains
+// each chain's own root page as a side effect of writing the owning
+// document record, but a multi-page chain's *continuation* pages were
+// never retained at all -- `check()`'s reachability walk
+// (`validateIndexedOwnership`) found them referenced but uncounted and
+// failed with `error.InvalidNativeAllocator`, the exact symptom a live,
+// in-process cleanup job hit mid-session (not at crash recovery, where
+// `recoverRedoLog` already reconciles this before `check()` ever runs).
+// Two more call sites shared the same strict-equality assumption a
+// diverting commit's own `checkpoint.page_count` advance (without
+// touching the ledger or free map) breaks: `validateIndexedAllocator`'s
+// own `covered_pages` check, and its per-slot `old_root.covered_pages`
+// check against a ride-along (non-durable) checkpoint snapshot. All
+// three now tolerate the lag redo-log mode permits, and
+// `flushTransactionWrites` retains a chain's continuation pages itself
+// once the fold's own retains land.
+test "lite redo plus indexed reclamation check() passes across repeated mid-session checkpoints" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-indexed-check.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{ .indexed_reclamation = true }, NativeFile.default_redo_log_capacity_bytes);
+    defer file.close();
+    const value: [8192]u8 = @splat('a');
+    for (0..2) |round| {
+        for (0..3) |i| {
+            var buf: [8]u8 = undefined;
+            const key = try std.fmt.bufPrint(&buf, "k{d}-{d}", .{ round, i });
+            try file.beginTransaction();
+            try file.putDocument(key, &value);
+            try file.commitTransaction();
+        }
+        try file.checkpointRedoLog();
+        const report = try file.check();
+        try std.testing.expect(report.valid);
+    }
 }

@@ -62,7 +62,7 @@ const magic: [8]u8 = "AFLLOCK1".*;
 // enables. A v1 region is simply rebuilt (the file is a disposable
 // locking aid, not a migrated artifact), same as any other
 // magic/version mismatch.
-// v3 (this bump): §9.3b's cross-process WAL index adds four live,
+// v3: §9.3b's cross-process WAL index adds four live,
 // mutable fields after `writer_release_epoch` -- `log_checkpoint_sequence`,
 // `log_durable_sequence`, `log_durable_offset` (all `Value(u64)`) and
 // `log_generation` (`Value(u32)`, a seqlock word guarding the first three
@@ -73,7 +73,23 @@ const magic: [8]u8 = "AFLLOCK1".*;
 // rebuilt on open the same way a v1 region was when v2 landed (see the
 // comment above this constant's previous value) -- same
 // magic/version-mismatch policy as always, not a migrated format.
-const format_version: u32 = 3;
+// v4 (this bump): adds `db_inode`, the data file's own inode number at
+// the moment this region was created, to the immutable/checksummed span
+// (`header_checksum`'s slice grows from 16..32 to 16..48). `openSized`
+// compares it against the current data file's inode on every open, so a
+// sidecar left behind after the data file at this path was replaced (a
+// stale, or even foreign, `<path>.aflite-lock`) is caught instead of
+// silently trusted -- the same "prove no live peer, then rebuild"
+// liveness check a corrupt header already goes through, not a new
+// mechanism. `db_inode` itself is 8 bytes, but the field grows
+// `header_bytes` by 16 (96 to 112), not 8: `ticketOwnerOffset`'s own
+// comment requires `header_bytes` to stay a multiple of 16 (the ticket
+// ring's `u128` words need 16-byte alignment), so an explicit 8-byte
+// reserved field pads back up to that, exactly like `_immutable_reserved`/
+// `_reserved`/`_log_reserved` already do for 8-byte alignment elsewhere
+// in this header. A v3 (or earlier) region is rebuilt the same way any
+// earlier version mismatch always was.
+const format_version: u32 = 4;
 
 /// Fixed size of the header itself. The header's own `region_bytes` and
 /// `max_readers` fields (not this constant) are the source of truth for
@@ -81,7 +97,7 @@ const format_version: u32 = 3;
 /// header -- but `max_readers` itself is fixed forever at a region's
 /// first creation; see `max_readers`'s own doc comment for why this
 /// module deliberately does not support growing it later.
-const header_bytes = 96;
+const header_bytes = 112;
 
 /// `Header` is the first `header_bytes` of the region, native-endian (the
 /// region is only ever read by the same machine that wrote it -- unlike
@@ -103,6 +119,24 @@ const Header = extern struct {
     format_version: u32,
     header_checksum: u32,
     region_bytes: u64,
+    /// v4: the data file's own inode number, read at this region's
+    /// creation and never touched again -- part of the immutable,
+    /// checksummed span like `region_bytes`/`max_readers` below.
+    /// `openSized` compares this against the current data file's inode on
+    /// every open, so a sidecar left behind after the data file at this
+    /// path was replaced (its inode changed, or an entirely different
+    /// file now lives there) is treated as stale/foreign rather than
+    /// silently trusted. See `openSized`'s own db-inode comparison for
+    /// the exact policy (prove no live peer, then rebuild; otherwise
+    /// `RegionCorrupt`).
+    db_inode: u64,
+    /// Pads `db_inode` out to 16 bytes total, so `header_bytes` stays a
+    /// multiple of 16 -- required for `ticketOwnerOffset`'s own 16-byte
+    /// alignment of the ticket ring's `u128` words, which this field's
+    /// own doc comment explains depends on `header_bytes` always being
+    /// one. Part of the immutable, checksummed span, like `db_inode`
+    /// itself.
+    _db_inode_reserved: [8]u8 = @splat(0),
     /// §8.3: number of `ReaderSlot`s immediately following the header
     /// (at byte offset `header_bytes`), permanently fixed at the
     /// region's first creation. An `openSized` call against an existing
@@ -262,8 +296,9 @@ fn headerChecksum(header: *const Header) u32 {
     const Crc32c = @import("antfly_hash").Crc32c;
     // Exactly the immutable-identity span of `Header` (see its own
     // comment): `region_bytes` through the end of `_immutable_reserved`,
-    // offsets 16..32. Two things make this slice specific, not just "the
-    // rest of the struct":
+    // offsets 16..48 (16..32 before v4's `db_inode` and its own padding
+    // field extended it by 16 bytes). Two things make this slice
+    // specific, not just "the rest of the struct":
     //
     // 1. It excludes `magic`/`format_version`/`header_checksum` (offsets
     //    0..16): those are checked directly in `isValidHeader`, and
@@ -274,7 +309,7 @@ fn headerChecksum(header: *const Header) u32 {
     //    (with the real, now-nonzero checksum in that spot) computes a
     //    different one. A header would then fail validation against
     //    itself immediately after being correctly written.
-    // 2. It excludes everything from offset 32 onward (`writer_holder`
+    // 2. It excludes everything from offset 48 onward (`writer_holder`
     //    and later): those fields are live and mutated by ordinary
     //    operation, so a checksum covering them would compare a
     //    creation-time snapshot against a post-use recomputation and
@@ -284,7 +319,7 @@ fn headerChecksum(header: *const Header) u32 {
     //    reopening and so never compares a valid header's checksum
     //    against a fresh recomputation of it).
     const bytes = std.mem.asBytes(header);
-    return Crc32c.hash(bytes[16..32]);
+    return Crc32c.hash(bytes[16..48]);
 }
 
 /// Packs a pid with a *liveness slot index* into a holder/generation word
@@ -456,6 +491,50 @@ const FdEntry = struct {
 // appropriate here the same way it is in `inode_lock.zig`'s own `open`.
 var fd_registry_mutex: Io.Mutex = .init;
 var fd_registry: std.AutoHashMapUnmanaged(Io.File.INode, *FdEntry) = .empty;
+
+/// Resolves `db_path` to an absolute, symlink-resolved path before
+/// `openSized` derives its own `<db_path>.aflite-lock` sidecar name from
+/// it: two different relative or symlinked spellings of the same data
+/// file -- even from two entirely separate processes, each independently
+/// canonicalizing its own spelling -- must converge on the exact same
+/// sidecar name, or two writers can each believe they hold the region's
+/// only exclusive ticket while actually holding two unrelated ones. The
+/// data-file counterpart of `inode_lock.zig`'s own `canonicalPathAlloc`
+/// (duplicated here, deliberately, rather than shared across modules:
+/// this module has no other dependency on `inode_lock.zig`, and the two
+/// callers canonicalize for related but distinct reasons -- this one
+/// purely for sidecar-name convergence at call time, that one to freeze
+/// a path *before* `Entry.path` caches it, against a cwd change that
+/// might happen before a later lazy reopen). An existing data file
+/// resolves directly; one with no backing file yet -- or, for a handful
+/// of this module's own tests, ever -- resolves its parent directory
+/// through an open handle and joins the basename back on, mirroring
+/// `native.zig`'s own `writerLockPathAlloc`.
+fn canonicalPathAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
+    if (Io.Dir.cwd().realPathFileAlloc(io, path, allocator)) |resolved| {
+        // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8`,
+        // over-allocated by one byte for the terminator. Re-dupe into a
+        // plain `[]u8` sized to exactly `.len` and free the sentinel
+        // original here, under its own matching type -- a caller that
+        // stored the sentinel slice itself into a plain `[]const u8`
+        // field (dropping the sentinel from its *type*, not its
+        // allocation) and freed it that way later would ask the
+        // allocator to free one byte fewer than was actually allocated,
+        // caught by `SafeAllocator` as a size mismatch.
+        defer allocator.free(resolved);
+        return try allocator.dupe(u8, resolved);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    const dirname = std.fs.path.dirname(path) orelse ".";
+    const basename = std.fs.path.basename(path);
+    var parent = try Io.Dir.cwd().openDir(io, dirname, .{});
+    defer parent.close(io);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const parent_len = try parent.realPath(io, &buf);
+    return try std.fs.path.join(allocator, &.{ buf[0..parent_len], basename });
+}
 
 /// Returns this process's single shared `FdEntry` for `region_path`,
 /// opening and registering one on first use and incrementing its
@@ -765,8 +844,26 @@ pub const Region = struct {
     /// rebuilding out from under a still-running writer or reader would
     /// silently break its exclusion/pin guarantees.
     pub fn openSized(allocator: std.mem.Allocator, io: Io, db_path: []const u8, max_readers: u32) !Region {
-        const region_path = try std.fmt.allocPrint(allocator, "{s}.aflite-lock", .{db_path});
+        // Canonicalize before deriving the sidecar name from it: two
+        // different relative or symlinked spellings of the same data
+        // file -- even from two entirely separate processes, each
+        // independently canonicalizing its own spelling -- must converge
+        // on the exact same `<path>.aflite-lock`, or two writers can each
+        // believe they hold the region's only exclusive ticket. See
+        // `canonicalPathAlloc`'s own doc comment.
+        const canonical_db_path = try canonicalPathAlloc(allocator, io, db_path);
+        defer allocator.free(canonical_db_path);
+        const region_path = try std.fmt.allocPrint(allocator, "{s}.aflite-lock", .{canonical_db_path});
         defer allocator.free(region_path);
+        // Best-effort: most callers reach this only once a real data file
+        // exists at `db_path` (`inode_lock.ensureRegion`, every migrated
+        // writer/reader path), and for those this is the data file's real
+        // inode, checked against the header below. A handful of this
+        // module's own tests exercise the sidecar alone, with no backing
+        // data file ever created at `db_path` -- for those this is simply
+        // 0, and the comparison below treats 0 on either side as "not
+        // tied to a real file," never a mismatch.
+        const db_inode: u64 = if (Io.Dir.cwd().statFile(io, canonical_db_path, .{})) |st| st.inode else |_| 0;
 
         const dir = Io.Dir.cwd();
         // Deliberately *not* a function-scoped `defer setup_file.close`:
@@ -802,11 +899,25 @@ pub const Region = struct {
         if (!need_init) {
             const n = try setup_file.readPositionalAll(io, &existing_raw, 0);
             need_init = n != existing_raw.len or !isValidHeader(&existing_raw);
+            if (!need_init) {
+                // A structurally valid header for a *different* data
+                // file: the data file this sidecar used to sit next to
+                // was removed and replaced (its inode changed) without
+                // its old sidecar going with it, or this path's sidecar
+                // was never this data file's own to begin with. Treat
+                // exactly like corruption -- same liveness proof before
+                // rebuilding, same `RegionCorrupt` if that proof fails.
+                const existing_header: *const Header = @ptrCast(@alignCast(&existing_raw));
+                if (existing_header.db_inode != 0 and db_inode != 0 and existing_header.db_inode != db_inode) {
+                    need_init = true;
+                }
+            }
         }
         if (need_init and !fresh_file) {
             // A file that already existed and is at least header-sized,
-            // but fails validation: prove no live process is relying on
-            // it before even considering a rebuild.
+            // but fails validation (or belongs to a different data file,
+            // per the inode check above): prove no live process is
+            // relying on it before even considering a rebuild.
             try ensureNoLivePeer(raw_fd, &existing_raw, size);
         }
         if (need_init) {
@@ -827,6 +938,7 @@ pub const Region = struct {
                 .format_version = format_version,
                 .header_checksum = 0,
                 .region_bytes = region_bytes,
+                .db_inode = db_inode,
                 .max_readers = max_readers,
                 .writer_holder = .init(0),
                 .writer_ticket_tail = .init(0),
@@ -2675,6 +2787,179 @@ test "shared lock region refuses a corrupt header instead of rebuilding under a 
     _ = try reapBounded(child_pid, 2000);
 }
 
+// The inode cross-check's own "no live peer" half, mirroring the
+// checksum-corruption test right above it: a sidecar whose recorded
+// `db_inode` no longer matches the data file actually at this path (the
+// data file was deleted and replaced) is treated exactly like a
+// corrupt header -- rebuilt once no live peer holds it.
+test "shared lock region rebuilds a sidecar whose db_inode no longer matches the data file" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-inode-check.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    {
+        const f = try Io.Dir.cwd().createFile(io, db_path, .{});
+        f.close(io);
+    }
+    const old_inode = (try Io.Dir.cwd().statFile(io, db_path, .{})).inode;
+    {
+        var region = try Region.open(a, io, db_path);
+        try std.testing.expectEqual(old_inode, region.header().db_inode);
+        region.close();
+    }
+
+    // Replace the data file at the same path with a new one: a new
+    // inode, the same sidecar name, no live peer holding the old
+    // sidecar (it was just closed above).
+    try Io.Dir.cwd().deleteFile(io, db_path);
+    {
+        const f = try Io.Dir.cwd().createFile(io, db_path, .{});
+        f.close(io);
+    }
+    const new_inode = (try Io.Dir.cwd().statFile(io, db_path, .{})).inode;
+    try std.testing.expect(new_inode != old_inode);
+
+    var rebuilt = try Region.open(a, io, db_path);
+    defer rebuilt.close();
+    try std.testing.expectEqual(new_inode, rebuilt.header().db_inode);
+    // A freshly rebuilt region is uncontended and acquirable, same
+    // observable proof the checksum-corruption case above uses.
+    try std.testing.expect(rebuilt.tryAcquireWriter(99));
+    rebuilt.releaseWriter();
+}
+
+// The inode cross-check's own "live peer" half, mirroring the
+// checksum-corruption test above it exactly (same reasoning for why the
+// live peer must be a genuinely separate process, not a second
+// in-process handle): a db_inode mismatch with a real separate process
+// still holding its liveness slot on the current sidecar must refuse to
+// rebuild, not silently wipe state that process is relying on.
+test "shared lock region refuses a db_inode mismatch instead of rebuilding under a live peer" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-inode-check-live.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    {
+        const f = try Io.Dir.cwd().createFile(io, db_path, .{});
+        f.close(io);
+    }
+
+    var ready_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&ready_fds));
+
+    const child_pid = std.c.fork();
+    if (child_pid == 0) {
+        _ = std.posix.system.close(ready_fds[0]);
+        // The genuinely separate "live peer" process: opens the region
+        // against the data file as it exists right now (claiming its
+        // own liveness slot) and parks, never releasing it.
+        var peer = Region.open(a, io, db_path) catch std.c._exit(1);
+        _ = peer.tryAcquireWriter(@bitCast(std.c.getpid()));
+        var sig: [1]u8 = .{1};
+        _ = std.c.write(ready_fds[1], @ptrCast(&sig), 1);
+        parkForever();
+    }
+    _ = std.posix.system.close(ready_fds[1]);
+    defer _ = std.posix.system.close(ready_fds[0]);
+    var sig: [1]u8 = undefined;
+    try readBounded(ready_fds[0], &sig, 2000);
+
+    // Replace the data file at the same path, exactly as the "no live
+    // peer" case does, but this time with a real separate process still
+    // holding its liveness slot on the sidecar the old data file's
+    // inode was recorded into.
+    try Io.Dir.cwd().deleteFile(io, db_path);
+    {
+        const f = try Io.Dir.cwd().createFile(io, db_path, .{});
+        f.close(io);
+    }
+
+    try std.testing.expectError(RegionError.RegionCorrupt, Region.open(a, io, db_path));
+
+    _ = std.c.kill(child_pid, std.c.SIG.KILL);
+    _ = try reapBounded(child_pid, 2000);
+}
+
+// A symlink alias and its target must converge on the exact same
+// sidecar: two different spellings of the same data file opening what
+// each believes is its own exclusive writer ticket would otherwise
+// silently break mutual exclusion (and, by the same mechanism, reader
+// pins) between them. Checked both within this process (two `Region`
+// handles sharing one mmap through `canonicalPathAlloc` resolving both
+// spellings to the same string) and across a fork (a genuinely separate
+// process, independently canonicalizing its own spelling).
+test "shared lock region: a symlink alias and its target share one region, same process and across a fork" {
+    if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const dir_path = buf[0..dir_len];
+
+    const target_path = try std.fmt.allocPrint(a, "{s}/region-alias-target.aflite", .{dir_path});
+    defer a.free(target_path);
+    const alias_path = try std.fmt.allocPrint(a, "{s}/region-alias-link.aflite", .{dir_path});
+    defer a.free(alias_path);
+    {
+        const f = try Io.Dir.cwd().createFile(io, target_path, .{});
+        f.close(io);
+    }
+    try Io.Dir.cwd().symLink(io, target_path, alias_path, .{});
+
+    const own_pid: u32 = @bitCast(std.c.getpid());
+
+    // The writer ticket is taken through the *alias* spelling.
+    var via_alias = try Region.open(a, io, alias_path);
+    defer via_alias.close();
+    try std.testing.expect(via_alias.tryAcquireWriter(own_pid));
+
+    // Same process, the *target* spelling: must see it as already held,
+    // not open an independent region of its own that would freely
+    // acquire.
+    var via_target = try Region.open(a, io, target_path);
+    defer via_target.close();
+    try std.testing.expect(!via_target.tryAcquireWriter(own_pid));
+
+    // A genuinely different process, forked after the parent already
+    // holds the ticket: must see the same thing through the target
+    // spelling too -- not two independent regions that each think they
+    // hold the only exclusive hold.
+    var pipe_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&pipe_fds));
+    const child_pid = std.c.fork();
+    if (child_pid == 0) {
+        _ = std.posix.system.close(pipe_fds[0]);
+        var child_region = Region.open(std.heap.page_allocator, io, target_path) catch std.c._exit(1);
+        const child_pid_val: u32 = @bitCast(std.c.getpid());
+        const blocked = !child_region.tryAcquireWriter(child_pid_val);
+        var report: [1]u8 = .{if (blocked) 1 else 0};
+        _ = std.c.write(pipe_fds[1], @ptrCast(&report), 1);
+        std.c._exit(0);
+    }
+    _ = std.posix.system.close(pipe_fds[1]);
+    defer _ = std.posix.system.close(pipe_fds[0]);
+
+    var report: [1]u8 = undefined;
+    try readBounded(pipe_fds[0], &report, 2000);
+    try std.testing.expectEqual(@as(c_int, 0), try reapBounded(child_pid, 2000));
+    try std.testing.expectEqual(@as(u8, 1), report[0]);
+
+    via_alias.releaseWriter();
+}
+
 // §8.4's dead-writer recovery: a real `kill -9` (not a clean exit) drops
 // the kernel's fcntl lock on the dead child's liveness byte exactly as a
 // genuine crash would, with no cooperation from the dying process at all.
@@ -3354,7 +3639,7 @@ test "shared lock region: Header stays exactly header_bytes with the §9.3b WAL-
     // this test exists so `zig build test`'s normal reporting surfaces
     // the intent in a test name too, matching the file's own convention
     // of also exercising every comptime invariant through a named test.
-    try std.testing.expectEqual(@as(usize, 96), @sizeOf(Header));
+    try std.testing.expectEqual(@as(usize, 112), @sizeOf(Header));
 }
 
 test "shared lock region: publishLogState/readLogState round-trip a consistent triple" {
@@ -3446,7 +3731,11 @@ test "shared lock region: a v2 region is rebuilt on open by a v3 binary" {
 
     var region = try Region.open(a, io, db_path);
     defer region.close();
-    try std.testing.expectEqual(@as(u32, 3), region.header().format_version);
+    // Current `format_version` (bumped past 3 since this test was
+    // written; see that constant's own history), not a hardcoded literal
+    // -- the point of this test is "rebuilt to whatever the binary's own
+    // version is," not "rebuilt to exactly 3."
+    try std.testing.expectEqual(format_version, region.header().format_version);
     const state = region.readLogState();
     try std.testing.expectEqual(@as(u64, 0), state.checkpoint_sequence);
 }
