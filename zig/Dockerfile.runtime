@@ -76,7 +76,7 @@ ARG TARGETARCH
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates wget libstdc++6 && \
-    if [ "${TARGETARCH}" = amd64 ]; then apt-get install -y --no-install-recommends libopenblas0-pthread; fi && \
+    if [ "${TARGETARCH}" = amd64 ] || [ "${TARGETARCH}" = arm64 ]; then apt-get install -y --no-install-recommends libopenblas0-pthread; fi && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd --gid 10001 antfly && \
     useradd --uid 10001 --gid antfly --create-home --home-dir /home/antfly --shell /usr/sbin/nologin antfly && \

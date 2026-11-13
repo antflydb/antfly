@@ -64,6 +64,7 @@ const Timing = struct {
 
 const ReadBenchmarkResult = struct {
     load_ns: u64,
+    executor: enum { encoder_decoder, generation } = .encoder_decoder,
     timing: Timing,
     image_bytes: usize,
     last_text: []const u8,
@@ -77,7 +78,15 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const image_data = try c_file.readFile(allocator, opts.image_path);
     defer allocator.free(image_data);
 
+    // Generator-backed readers use the resident server executor, which owns
+    // recurrent state, vision preparation, completion and memory admission.
+    var manifest = try @import("models/manifest.zig").loadFromDir(allocator, opts.model_dir);
+    defer manifest.deinit();
+    if (manifest.isGenerativeReader()) return runGenerativeReader(allocator, io, opts, image_data);
+
     var session_manager = backends.SessionManager.initWithIo(allocator, io);
+    session_manager.native_call_policy = .in_process;
+    session_manager.process_termination_available = false;
     configureBackendPreference(&session_manager, opts.backend);
 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
@@ -114,6 +123,76 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .cache_dtype = opts.cache_dtype,
     });
     if (debug_cuda_session) std.log.info("read: inference done model={s}", .{opts.model_dir});
+    defer result.deinit();
+    try writeResultJson(allocator, io, opts.model_dir, result);
+}
+
+/// Adapt the common encoded-read executor to the CLI's existing output and
+/// timing format. Encoder-decoder readers retain their richer region/field
+/// and kernel telemetry interface; generator-backed readers return plain text.
+const GenerativeReader = struct {
+    node: *@import("server/server.zig").Node,
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+
+    fn read(self: *@This(), bytes: []const u8, options: readers_mod.ReadOptions) !readers_mod.Result {
+        reading_pipeline.resetLastReadTelemetry();
+        var batch = try self.node.readEncodedImagesReportedDirect(self.allocator, self.model_dir, .{
+            .images = &.{.{ .bytes = bytes, .mime_type = try encodedImageMime(bytes) }},
+            .prompt = options.prompt,
+            .max_tokens = if (options.max_tokens) |count| std.math.cast(i64, count) orelse return error.InvalidMaxTokens else null,
+        });
+        defer batch.deinit(self.allocator);
+        if (batch.items.len != 1) return error.InvalidReadResultCount;
+        return .{
+            .allocator = self.allocator,
+            .text = try self.allocator.dupe(u8, batch.items[0].text),
+            .completion = batch.items[0].completion,
+            .completion_tokens = batch.items[0].completion_tokens,
+        };
+    }
+
+    fn snapshotMetalGeneratedQuantStats(_: *@This(), _: std.mem.Allocator) metal_generated_quant_stats.Stats {
+        // The generation executor does not expose encoder-decoder kernel counters.
+        return .{};
+    }
+};
+
+fn encodedImageMime(bytes: []const u8) ![]const u8 {
+    return @import("pipelines/image.zig").mimeEssenceForEncoded(bytes) orelse error.UnsupportedImageFormat;
+}
+
+fn runGenerativeReader(allocator: std.mem.Allocator, io: std.Io, opts: Options, image_data: []const u8) !void {
+    // /read uses its selected model's cache policy. Do not silently accept an
+    // encoder-decoder-only cache override which this executor cannot honor.
+    if (opts.cache_dtype != null) return error.UnsupportedReaderCacheDtype;
+    const server = @import("server/server.zig");
+    const model_dir = try std.Io.Dir.cwd().realPathFileAlloc(io, opts.model_dir, allocator);
+    defer allocator.free(model_dir);
+    var node = try server.Node.init(allocator, .{
+        .models_dir = std.fs.path.dirname(model_dir) orelse ".",
+        .native_call_policy = .in_process,
+        .process_termination_available = false,
+    });
+    defer node.deinit();
+    try node.attachIo(io);
+    const backend: ?backends.BackendType = switch (opts.backend) {
+        .auto => null,
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+    };
+    const start = nowNs();
+    try node.warmModel(allocator, .{ .name = model_dir, .kind = .reader, .backend = backend });
+    const load_ns = nowNs() - start;
+    var reader = GenerativeReader{ .node = &node, .allocator = allocator, .model_dir = model_dir };
+    if (opts.measure_iters != null) {
+        var bench = try runWarmBenchmark(allocator, &reader, image_data, opts, load_ns);
+        defer allocator.free(bench.last_text);
+        bench.executor = .generation;
+        return writeBenchmarkJson(allocator, io, opts.model_dir, opts, bench);
+    }
+    var result = try reader.read(image_data, .{ .prompt = opts.prompt, .max_tokens = opts.max_tokens });
     defer result.deinit();
     try writeResultJson(allocator, io, opts.model_dir, result);
 }
@@ -174,7 +253,7 @@ fn parseArgs(args: []const []const u8) !Options {
 
 fn runWarmBenchmark(
     allocator: std.mem.Allocator,
-    reader: *readers_mod.LoadedReader,
+    reader: anytype,
     image_data: []const u8,
     opts: Options,
     load_ns: u64,
@@ -406,6 +485,10 @@ fn writeBenchmarkJson(allocator: std.mem.Allocator, io: std.Io, model_name: []co
     } else {
         try buf.appendSlice(allocator, "null");
     }
+    try buf.appendSlice(allocator, ",\"executor\":");
+    try jsonEncodeString(&buf, allocator, @tagName(result.executor));
+    try buf.appendSlice(allocator, ",\"encoder_decoder_telemetry_available\":");
+    try appendBoolJson(&buf, allocator, result.executor == .encoder_decoder);
     try buf.appendSlice(allocator, ",\"image_bytes\":");
     try appendIntJson(&buf, allocator, result.image_bytes);
     try buf.appendSlice(allocator, ",\"warmup_iters\":");
@@ -706,4 +789,11 @@ test "Florence CUDA pinned OCR reads invoice fixture" {
     var cpu_result = try cpu_reader.read(image_data, .{ .prompt = "<OCR>", .max_tokens = 128, .execution_control = control });
     defer cpu_result.deinit();
     try std.testing.expectEqualStrings(cpu_result.text, result.text);
+}
+
+test "standalone reader derives MIME from encoded bytes rather than filename" {
+    try std.testing.expectEqualStrings("image/png", try encodedImageMime("\x89PNG\r\n\x1a\nrest"));
+    try std.testing.expectEqualStrings("image/jpeg", try encodedImageMime("\xff\xd8\xffrest"));
+    try std.testing.expectEqualStrings("image/webp", try encodedImageMime("RIFF1234WEBPrest"));
+    try std.testing.expectError(error.UnsupportedImageFormat, encodedImageMime("not an image"));
 }

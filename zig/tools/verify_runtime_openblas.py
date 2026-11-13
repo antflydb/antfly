@@ -22,6 +22,7 @@ Uses tiny shared-library fixtures, not a system OpenBLAS installation. Pass
 
 import argparse
 import os
+import platform
 from pathlib import Path
 import subprocess
 import tempfile
@@ -159,7 +160,19 @@ def main():
     parser.add_argument("--openblas-library")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    with tempfile.TemporaryDirectory(prefix="antfly-openblas-test-") as tmp:
+    arch = {
+        "x86_64": "x86_64",
+        "amd64": "x86_64",
+        "aarch64": "aarch64",
+        "arm64": "aarch64",
+    }.get(platform.machine().lower())
+    if platform.system() != "Linux" or arch is None:
+        parser.error("run on Linux x86-64 or Arm64 (the probes execute natively)")
+    # Zig never evicts caches: keep fixture builds in this checkout, clean
+    # them on exit, and never put a throwaway build cache under /tmp.
+    fixture_root = root / ".zig-cache" / "openblas-fixtures"
+    fixture_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="run-", dir=fixture_root) as tmp:
         out = Path(tmp)
         (out / "fixture.c").write_text(FIXTURE)
         libs = {}
@@ -185,22 +198,25 @@ def main():
         (out / "probe.zig").write_text(PROBE)
         cache = ["--cache-dir", out / "cache", "--global-cache-dir", out / "global"]
         run([args.zig, "test", root / "pkg/inference/build/blas.zig", *cache])
-        obj = out / "avx2.o"
-        run(
-            [
-                args.zig,
-                "build-obj",
-                root / "lib/linalg/src/x86_avx2.zig",
-                "-target",
-                "x86_64-linux-gnu",
-                "-mcpu=baseline+avx+avx2+fma+f16c",
-                "-O",
-                "fast",
-                "-fPIC",
-                f"-femit-bin={obj}",
-                *cache,
-            ]
-        )
+        objects = []
+        if arch == "x86_64":
+            obj = out / "avx2.o"
+            run(
+                [
+                    args.zig,
+                    "build-obj",
+                    root / "lib/linalg/src/x86_avx2.zig",
+                    "-target",
+                    f"{arch}-linux-gnu",
+                    "-mcpu=baseline+avx+avx2+fma+f16c",
+                    "-O",
+                    "fast",
+                    "-fPIC",
+                    f"-femit-bin={obj}",
+                    *cache,
+                ]
+            )
+            objects.append(obj)
         for abi, enabled in (("gnu", True), ("gnu", False), ("musl", True)):
             active = enabled and abi == "gnu"
             (out / "options.zig").write_text(
@@ -214,9 +230,9 @@ def main():
                     args.zig,
                     "test",
                     "-lc",
-                    obj,
+                    *objects,
                     "-target",
-                    f"x86_64-linux-{abi}",
+                    f"{arch}-linux-{abi}",
                     "-mcpu=baseline",
                     "-O",
                     "safe",
@@ -300,10 +316,10 @@ def main():
                 args.zig,
                 "test",
                 "-lc",
-                obj,
+                *objects,
                 linked,
                 "-target",
-                "x86_64-linux-gnu",
+                f"{arch}-linux-gnu",
                 "-mcpu=baseline",
                 "-O",
                 "safe",
