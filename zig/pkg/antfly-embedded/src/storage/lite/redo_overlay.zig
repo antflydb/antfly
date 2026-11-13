@@ -208,35 +208,56 @@ pub const SharedRedoOverlay = struct {
         return self.pages.count() == 0;
     }
 
-    /// One staged page, fully owned, returned by `takeAllPagesAlloc`.
+    /// One staged page, fully owned, returned by `snapshotAllPagesAlloc`.
     pub const OwnedPage = struct {
         page_id: u64,
         bytes: []u8,
     };
 
-    /// Removes and returns every currently staged page, fully owned (not
-    /// a copy -- the map no longer references `bytes` after this call,
-    /// ownership transfers to the caller). For the undiverted fallback
-    /// (`NativeFile.publishCheckpoint`'s own comment): a commit whose own
-    /// diverted content is page-shaped only (no accompanying logical
-    /// mutation -- a bare commit's own document-index/free-map/namespace
-    /// pages, not just the external-value-chain case `pending`'s own doc
-    /// comment originally anticipated) has nothing `checkpointRedoLog`'s
-    /// logical-heads fold would ever "absorb," so the caller flushes
-    /// these directly to their real page_id locations instead. Unlike
-    /// `maps`' pin-aware `reclaim`, a page has no "older version some
-    /// reader might still need" to preserve -- once durably written to
-    /// its real location, the overlay's own copy is immediately
-    /// redundant, so this clears unconditionally, pins or not.
-    pub fn takeAllPagesAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io) ![]OwnedPage {
+    /// Returns a fully-owned *copy* of every currently staged page,
+    /// without removing any of them from the overlay -- see
+    /// `removePages`'s own doc comment for why a caller that is about to
+    /// flush these to their real, physical locations must defer removal
+    /// until after that write durably lands, instead of removing them
+    /// first (what this used to do, under the name `takeAllPagesAlloc`,
+    /// before a reader was found reaching `readBackingPages` for exactly
+    /// such a page in the window between the old remove-then-write and
+    /// the write's own completion: the overlay already said "not staged,"
+    /// and the real location did not have it yet either -- neither on
+    /// disk nor rebuilt from the log, for the span of that one caller's
+    /// own flush loop).
+    pub fn snapshotAllPagesAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io) ![]OwnedPage {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         var list = try std.ArrayListUnmanaged(OwnedPage).initCapacity(allocator, self.pages.count());
-        errdefer list.deinit(allocator);
+        errdefer {
+            for (list.items) |p| allocator.free(p.bytes);
+            list.deinit(allocator);
+        }
         var it = self.pages.iterator();
-        while (it.next()) |kv| list.appendAssumeCapacity(.{ .page_id = kv.key_ptr.*, .bytes = kv.value_ptr.* });
-        self.pages.clearRetainingCapacity();
+        while (it.next()) |kv| list.appendAssumeCapacity(.{ .page_id = kv.key_ptr.*, .bytes = try allocator.dupe(u8, kv.value_ptr.*) });
         return try list.toOwnedSlice(allocator);
+    }
+
+    /// Removes exactly the given page ids from the overlay, once their
+    /// content is durably reflected at their own real, physical location
+    /// (a caller that has just finished writing every page
+    /// `snapshotAllPagesAlloc` returned). Unlike `maps`' pin-aware
+    /// `reclaim`, a page has no "older version some reader might still
+    /// need" to preserve once its real location holds the same bytes --
+    /// this removes unconditionally, pins or not, the same posture
+    /// `takeAllPagesAlloc` always had for pages, just moved to run after
+    /// the physical write instead of before it. Every caller of this
+    /// function and `snapshotAllPagesAlloc` already runs under the
+    /// store's own single-writer exclusion for the whole span between
+    /// them, so no other writer can have restaged a page this call is
+    /// about to remove with different content in between.
+    pub fn removePages(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, flushed: []const OwnedPage) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        for (flushed) |p| {
+            if (self.pages.fetchRemove(p.page_id)) |kv| allocator.free(kv.value);
+        }
     }
 
     /// Drops every staged page, once a checkpoint has folded them all

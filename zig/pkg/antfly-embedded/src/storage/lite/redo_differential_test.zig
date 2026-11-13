@@ -499,7 +499,7 @@ fn compareAll(allocator: Allocator, seed: u64, step: usize, op: Op, redo: *Side,
     // past `dirN/scope`, so the "immediate children only" skip-subtree
     // branch participates without changing expected output versus a plain
     // scan -- see this file's own doc comment).
-    try compareCatalogScan(allocator, seed, step, op, redo, legacy);
+    try compareCatalogScan(allocator, seed, step, op, &redo_txn, &legacy_txn);
 }
 
 const CursorEntry = struct { key: []const u8, value: []const u8 };
@@ -570,11 +570,27 @@ fn compareRangeScan(seed: u64, step: usize, op: Op, redo_txn: *docstore.Txn, leg
     }
 }
 
-fn compareCatalogScan(allocator: Allocator, seed: u64, step: usize, op: Op, redo: *Side, legacy: *Side) !void {
+// `redo_txn`/`legacy_txn` (already open for the whole `compareAll` call)
+// hold a *pinned* checkpoint+read-generation (`Txn.openRead`'s own
+// `pinInitializedReadGeneration`), captured once and held for this
+// transaction's whole lifetime. The two raw `.file.activeCheckpoint()`
+// calls this function used to make instead grabbed a *fresh*, entirely
+// unpinned snapshot right before each cursor open -- with nothing
+// registered to stop a concurrent ride-along fold (`checkpointRedoLog`,
+// running on a background thread the whole time this oracle's `Side`
+// stays open) from reusing a page that snapshot's own root still
+// reaches, in the window between capturing it and this function's own
+// page reads actually running. Using the already-pinned `Txn`'s own
+// `.checkpoint`/`.readFile()` instead closes that window the same way
+// every other read in `compareAll` (point get, batch get, cursor/range
+// scans, all driven through `redo_txn`/`legacy_txn`) already was.
+fn compareCatalogScan(allocator: Allocator, seed: u64, step: usize, op: Op, redo_txn: *docstore.Txn, legacy_txn: *docstore.Txn) !void {
+    const redo_file = try redo_txn.readFile();
+    const legacy_file = try legacy_txn.readFile();
     {
-        var rc = try redo.store.file.indexCatalogCursor(redo.store.file.activeCheckpoint(), "");
+        var rc = try redo_file.indexCatalogCursor(redo_txn.checkpoint, "");
         defer rc.deinit();
-        var lc = try legacy.store.file.indexCatalogCursor(legacy.store.file.activeCheckpoint(), "");
+        var lc = try legacy_file.indexCatalogCursor(legacy_txn.checkpoint, "");
         defer lc.deinit();
         var count: usize = 0;
         while (true) {
@@ -599,9 +615,9 @@ fn compareCatalogScan(allocator: Allocator, seed: u64, step: usize, op: Op, redo
     }
     // Directory-cursor pass over the reserved index-catalog root.
     {
-        var rc = try redo.store.file.indexCatalogDirectoryCursor(redo.store.file.activeCheckpoint(), native_catalog_sink.reserved_prefix);
+        var rc = try redo_file.indexCatalogDirectoryCursor(redo_txn.checkpoint, native_catalog_sink.reserved_prefix);
         defer rc.deinit();
-        var lc = try legacy.store.file.indexCatalogDirectoryCursor(legacy.store.file.activeCheckpoint(), native_catalog_sink.reserved_prefix);
+        var lc = try legacy_file.indexCatalogDirectoryCursor(legacy_txn.checkpoint, native_catalog_sink.reserved_prefix);
         defer lc.deinit();
         var count: usize = 0;
         while (true) {

@@ -7236,7 +7236,17 @@ pub const NativeFile = struct {
         // real, physical one by this point -- this is what actually
         // makes that assumption true, rather than relying on the
         // logical fold to do it incidentally, which it never did).
-        const staged_pages = try redo.shared.takeAllPagesAlloc(std.heap.page_allocator, io);
+        // Snapshotted, not removed, until every page is durably written
+        // below (`SharedRedoOverlay.snapshotAllPagesAlloc`'s own doc
+        // comment): removing first (what this used to do) left a window,
+        // for however long this loop takes to reach a given page, where a
+        // concurrent reader on another thread (this fold's own exclusive
+        // writer lock excludes other writers, never readers) would find
+        // that page in neither the overlay (already removed) nor its real
+        // location (not yet written) -- `readBackingPages`'s own
+        // overlay-then-disk order makes exactly that gap observable as
+        // `error.EndOfStream`.
+        const staged_pages = try redo.shared.snapshotAllPagesAlloc(std.heap.page_allocator, io);
         defer {
             for (staged_pages) |p| std.heap.page_allocator.free(p.bytes);
             std.heap.page_allocator.free(staged_pages);
@@ -7244,6 +7254,7 @@ pub const NativeFile = struct {
         for (staged_pages) |p| {
             try self.file.writePositionalAll(io, p.bytes, p.page_id * @as(u64, self.header.page_size));
         }
+        redo.shared.removePages(std.heap.page_allocator, io, staged_pages);
         // §9.7c (ReadView): `self.header.checkpoints[active].page_count`
         // still reflects the *last already-published* checkpoint here --
         // the commit that triggered this fold (log-full, mid-`publishCheckpoint`)
@@ -17012,12 +17023,13 @@ pub const NativeFile = struct {
                         // to their own locations instead, then fall
                         // through to publish `next` exactly as this
                         // ride-along branch always does.
-                        const pages = try redo.shared.takeAllPagesAlloc(std.heap.page_allocator, self.runtimeIo());
+                        const pages = try redo.shared.snapshotAllPagesAlloc(std.heap.page_allocator, self.runtimeIo());
                         defer std.heap.page_allocator.free(pages);
                         for (pages) |p| {
                             defer std.heap.page_allocator.free(p.bytes);
                             try self.file.writePositionalAll(self.runtimeIo(), p.bytes, p.page_id * @as(u64, self.header.page_size));
                         }
+                        redo.shared.removePages(std.heap.page_allocator, self.runtimeIo(), pages);
                         redo.pending.clearRetainingCapacity();
                     }
                 }
@@ -17535,12 +17547,13 @@ pub const NativeFile = struct {
                 // Flush the real pages directly to their own locations
                 // instead, then fall through to publish `checkpoint`
                 // exactly as this function always does.
-                const pages = try redo.shared.takeAllPagesAlloc(std.heap.page_allocator, self.runtimeIo());
+                const pages = try redo.shared.snapshotAllPagesAlloc(std.heap.page_allocator, self.runtimeIo());
                 defer std.heap.page_allocator.free(pages);
                 for (pages) |p| {
                     defer std.heap.page_allocator.free(p.bytes);
                     try self.file.writePositionalAll(self.runtimeIo(), p.bytes, p.page_id * @as(u64, self.header.page_size));
                 }
+                redo.shared.removePages(std.heap.page_allocator, self.runtimeIo(), pages);
                 redo.pending.clearRetainingCapacity();
                 // §9 (redo log full under a reader pin): this commit's
                 // own page-shaped content is already flushed above and
