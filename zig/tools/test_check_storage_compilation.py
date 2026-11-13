@@ -243,14 +243,15 @@ class BuildFailureEvidence(unittest.TestCase):
             ("warm", set()),
             (
                 "read coordination",
-                {"antfly-runtime-distributed", "antfly-runtime-local_query"},
+                {"antfly-runtime-distributed", "antfly-storage-kernel"},
             ),
             ("write coordination", {"antfly-runtime-distributed"}),
-            ("physical DB", {"antfly-storage-kernel", "antfly-runtime-local_query"}),
+            ("physical DB", {"antfly-storage-kernel"}),
             (
                 "physical local query",
-                {"antfly-storage-kernel", "antfly-runtime-local_query"},
+                {"antfly-storage-kernel"},
             ),
+            ("opaque query dispatcher", {"antfly-runtime-local_query"}),
             ("owner integration test", {"storage-owner-tests"}),
             ("consumer test root", {"api-table-read-tests"}),
             *(
@@ -265,7 +266,6 @@ class BuildFailureEvidence(unittest.TestCase):
                 "storage contract",
                 {
                     "antfly-storage-kernel",
-                    "antfly-runtime-local_query",
                     "antfly-runtime-distributed",
                     "storage-owner-tests",
                 },
@@ -381,7 +381,8 @@ class BuildFailureEvidence(unittest.TestCase):
                     measurement.shutil,
                     "disk_usage",
                     side_effect=lambda *_: mock.Mock(
-                        free=(8 if low_disk and len(seen) == 8 else 64) << 30
+                        free=(8 if low_disk and len(seen) == len(expected) - 3 else 64)
+                        << 30
                     ),
                 ),
             ):
@@ -671,7 +672,7 @@ class ParallelAuditIsolation(unittest.TestCase):
         sources = {
             "api/table_reads.zig": (
                 "read coordination",
-                {"antfly-runtime-distributed", "antfly-runtime-local_query"},
+                {"antfly-runtime-distributed", "antfly-storage-kernel"},
             ),
             "api/table_writes.zig": (
                 "write coordination",
@@ -679,11 +680,15 @@ class ParallelAuditIsolation(unittest.TestCase):
             ),
             "storage/db/db.zig": (
                 "physical DB",
-                {"antfly-storage-kernel", "antfly-runtime-local_query"},
+                {"antfly-storage-kernel"},
             ),
             "storage/query.zig": (
                 "physical local query",
-                {"antfly-storage-kernel", "antfly-runtime-local_query"},
+                {"antfly-storage-kernel"},
+            ),
+            "storage/local_query_dispatch.zig": (
+                "opaque query dispatcher",
+                {"antfly-runtime-local_query"},
             ),
             "storage/kernel_owner_test.zig": (
                 "owner integration test",
@@ -697,7 +702,6 @@ class ParallelAuditIsolation(unittest.TestCase):
                 "storage contract",
                 {
                     "antfly-storage-kernel",
-                    "antfly-runtime-local_query",
                     "antfly-runtime-distributed",
                     "storage-owner-tests",
                 },
@@ -816,7 +820,7 @@ class ParallelAuditIsolation(unittest.TestCase):
                 self.assertLess(len(seen), len(sources))
                 self.assertTrue(any(row["status"] == "failed" for row in rows))
                 return
-            self.assertEqual(len(rows), 11)
+            self.assertEqual(len(rows), len(sources) + 4)
             self.assertTrue(all(row["status"] == "completed" for row in rows))
             self.assertCountEqual(seen, [label for label, _ in sources.values()])
             self.assertEqual(len(first_mutation), 2)

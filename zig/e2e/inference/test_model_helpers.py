@@ -25,6 +25,7 @@ import requests
 from . import models
 from .conftest import (
     InferenceServer,
+    api as api_fixture,
     _backend_selection_diagnostic,
     _managed_model_id,
     _parse_backend_exceptions,
@@ -42,7 +43,7 @@ from .models import (
     _env_model_specs,
     _looks_like_model_dir,
     _model_path,
-    bootstrap_models_for_listing,
+    prefetch_test_models,
     find_local_model_path,
 )
 from .test_generate import (
@@ -526,14 +527,9 @@ def test_explicit_large_generator_is_bootstrapped(monkeypatch):
     monkeypatch.setenv(
         "ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", DEFAULT_GENERATOR_MODEL
     )
-    monkeypatch.setattr(models, "model_available", lambda spec: False)
     pulled = []
     monkeypatch.setattr(models, "ensure_model", pulled.append)
-    listing = {
-        category: [{"name": "already-present"}] for category in models.LISTING_BOOTSTRAP
-    }
-
-    assert bootstrap_models_for_listing(listing)
+    prefetch_test_models([("test_chat.py", None), ("test_generate.py", None)])
     assert [spec.repo for spec in pulled] == [DEFAULT_GENERATOR_MODEL]
     assert pulled[0].pull_ref == "hf:ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_0"
     assert pulled[0].projector == "Q8_0"
@@ -1001,3 +997,50 @@ def test_diarization_missing_dependency_pulls_speaker_model(monkeypatch):
     monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "0")
     assert not models.maybe_pull_missing_model("/ai/v1/read", payload, response)
     assert pulled == [models.SPEAKER_MODEL]
+
+
+def test_model_listing_is_passive_even_when_downloads_are_enabled(monkeypatch):
+    from unittest.mock import Mock
+
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("model discovery must not provision weights")
+
+    monkeypatch.setattr(models, "ensure_model", forbidden)
+    session = Mock(headers={})
+    response = session.get.return_value
+    response.status_code = 200
+    response.json.return_value = {
+        category: {} for category in models.DEFAULT_E2E_MODELS
+    }
+    monkeypatch.setattr(requests, "Session", lambda: session)
+    fixture = api_fixture.__wrapped__("http://passive-model-listing.test")
+    client = next(fixture)
+    assert client.models() == response.json.return_value
+    assert session.get.call_count == 1
+    with pytest.raises(StopIteration):
+        next(fixture)
+    session.close.assert_called_once()
+
+
+def test_model_provisioning_follows_selected_family_and_affinity(monkeypatch):
+    for name in (*models.GENERATOR_ENV_VARS, *models.READER_ENV_VARS):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ANTFLY_INFERENCE_DOWNLOAD", "1")
+    monkeypatch.setenv(
+        "ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL", DEFAULT_GENERATOR_MODEL
+    )
+    pulled = []
+    monkeypatch.setattr(models, "ensure_model", pulled.append)
+    prefetch_test_models([("test_read.py", "generator"), ("test_chat.py", None)])
+    assert [s.task for s in pulled] == ["generators"]
+    pulled.clear()
+    prefetch_test_models([("test_transcribe.py", None), ("test_dictate.py", None)])
+    assert [s.task for s in pulled] == ["transcribers"]
+    pulled.clear()
+    prefetch_test_models([("test_models.py", "eviction")])
+    assert [s.task for s in pulled] == ["embedders"]
+    pulled.clear()
+    prefetch_test_models([("test_model_helpers.py", None)])
+    assert pulled == []
