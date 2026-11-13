@@ -76,7 +76,11 @@ falls back to ordinary authoritative reads. Source-provided exact scores and
 resolved metadata are reused rather than fetched twice. Primary-store fallback
 also owns resolved payloads in admitted per-wave scratch: it retains one read
 snapshot and source-version lease, rather than retaining every payload in the
-transaction arena. Exact scans do not populate decoded-vector residency.
+transaction arena. Direct-document vector fields use the same wave-scoped
+read policy. Cache-residency transitions preserve captured primary snapshots.
+A complete native source generation needs only its immutable generation lease;
+a primary read snapshot is acquired lazily if fallback requires it. Exact scans
+do not populate decoded-vector residency.
 
 Both local and authoritative projection paths use the shared certified SIMD
 kernel. It includes reconstruction error and arithmetic error in both the
