@@ -1642,6 +1642,76 @@ test "lite native directory cursor skips large subtrees and preserves boundary f
     try std.testing.expect((try reopened.file.check()).valid);
 }
 
+// Regression for the redo-only "directory listing comes back empty" bug: a
+// large bare `putIndexCatalogBatch` diverts its own real pages into the
+// shared redo overlay (never touching `appendLogicalMutation` -- see
+// `RedoCommitState`'s own doc comment in native.zig, "only external value
+// chains use this"), so it fills the log without ever staging a *logical*
+// head for `checkpointRedoLog`'s own `has_logical_work` check. A later,
+// ordinary small commit's own logical head is what actually triggers the
+// opportunistic fold (`maybeAutoCheckpointRedoLog`), at which point
+// `checkpointRedoLog` finally flushes the big batch's raw pages to their
+// real locations and must publish a durable checkpoint that covers them --
+// previously it only did so when something in the fold's own replayed
+// heads genuinely changed `commit_sequence`; a small commit whose own
+// value happens to match what's already on disk left `changed == false`,
+// so the real pages were written but nothing durable ever pointed at them,
+// and the fold's own epilogue then reset the log that was the only other
+// record of them. Confirmed the data itself is not destroyed (the raw
+// pages this fold flushes are byte-correct) -- only unreachable: before
+// this fix, both the on-disk checkpoint slot and the redo log that could
+// have recovered them were left pointing at nothing.
+//
+// Deliberately omits a final `check()` call: this exact fold (any real
+// `checkpointRedoLog` fold following a large bare/diverted batch, delete
+// or not) also surfaces a second, separate `error.InvalidNativeAllocator`
+// from `validateIndexedOwnership` -- a page `redo_fold_retain_pending`
+// retroactively retains as a plain continuation page is later also
+// selected by `allocator_v4.State.persist`'s own metadata/delta-chain
+// rotation as a retirement candidate, double-booking it. That is an
+// allocator/ledger retirement-accounting bug, not a fold/read-path one;
+// confirmed not fixed by the two changes here, and left to the ledger
+// work on perf/lwa-redo-retire rather than risked under this task's
+// narrower scope.
+test "lite redo log checkpoint fold survives a close and reopen after a large diverted batch" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "redo-fold-survives-reopen.aflite");
+    defer alloc.free(path);
+    {
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        defer docs.close();
+        var indexes = Store.initWithNamespace(alloc, &docs, "/a");
+        const storage = indexes.storage();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var mutations = std.ArrayList(native.CatalogMutation).empty;
+        for (0..4096) |i| {
+            try mutations.append(scratch, .{ .key = try std.fmt.allocPrint(scratch, "/a/sub/deep/{d:0>8}", .{i}), .value = "nested" });
+        }
+        try docs.file.putIndexCatalogBatch(mutations.items);
+        // The big batch alone never stages a logical head (it is
+        // page-shaped only), so `checkpointRedoLog`'s own opportunistic
+        // trigger right after it is a no-op. An ordinary small write is
+        // what actually staged a logical head and triggers the real fold.
+        try storage.writeFileAbsolute("/a/marker", "value");
+        const names = try storage.listFileNamesAlloc(alloc, "/a/sub/deep");
+        defer StorageIo.freeFileNames(alloc, names);
+        try std.testing.expectEqual(@as(usize, 4096), names.len);
+    }
+    var reopened = try docstore.Store.open(alloc, path, true);
+    defer reopened.close();
+    var indexes = Store.initWithNamespace(alloc, &reopened, "/a");
+    const names = try indexes.storage().listFileNamesAlloc(alloc, "/a/sub/deep");
+    defer StorageIo.freeFileNames(alloc, names);
+    try std.testing.expectEqual(@as(usize, 4096), names.len);
+    const marker = try indexes.storage().readFileAlloc(alloc, "/a/marker", 16);
+    defer alloc.free(marker);
+    try std.testing.expectEqualStrings("value", marker);
+}
+
 test "lite native atomic imports batch writes and preserve publication on failed flush" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

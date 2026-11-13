@@ -7119,6 +7119,30 @@ pub const NativeFile = struct {
             if (required > self.header.checkpoints[self.header.active_checkpoint].page_count) {
                 self.header.checkpoints[self.header.active_checkpoint].page_count = required;
             }
+            // Force `commitTransactionWithDurability`'s own `changed` check
+            // (`next.commit_sequence != previous.checkpoints[...].commit_sequence`,
+            // `previous` being the snapshot `beginTransaction` took just
+            // above, before this bump) to see this fold as having changed
+            // something, even if every logical head below turns out to be
+            // a content no-op (`putCatalogBatchForRoot`'s own "small index
+            // files include WAL control records" shortcut, which returns
+            // without ever staging into `transaction_writes` when a
+            // mutation's value already matches what's on disk). Without
+            // this, `changed == false` takes the plain-`sync()` branch
+            // instead of `publishCheckpoint`, so the real on-disk
+            // checkpoint slot is never advanced to cover the pages just
+            // physically written above -- yet the epilogue below still
+            // unconditionally reclaims the overlay and resets/zeros the
+            // log on the assumption ("everything above is durable now")
+            // that a fresh durable checkpoint was just published. The
+            // result: the pages are physically correct on disk, but
+            // nothing durable (neither the checkpoint slot nor the
+            // now-wiped log) points to them any more -- invisible, not
+            // merely stale, on the next open. Bumping here is safe: every
+            // reader of `commit_sequence` through this fold's own
+            // transaction only ever sees the final, already-published
+            // value `self.header` settles on past this point.
+            self.header.checkpoints[self.header.active_checkpoint].commit_sequence += 1;
         }
         // §9 (redo + indexed reclamation): every page just flushed was
         // allocated and written by an earlier *diverting* commit
@@ -10044,7 +10068,28 @@ pub const NativeFile = struct {
         // reset to the same contents. Avoid growing catalog history for those
         // writes. Bound comparison work to one inline record; bulk mutations
         // and spilled values retain the normal publication path.
-        if (!self.flushing_transaction and root == .index and mutations.len == 1 and !self.checkpoint_publication_uncertain) {
+        //
+        // Never while `checkpointRedoLog`'s own fold is replaying a head
+        // (`self.redo.?.checkpointing`): `getCatalogRecordSizeFromRoot`
+        // consults the redo overlay (`redoOverlayEntry`) before ever
+        // falling back to the real tree, and the head being replayed *is*
+        // the overlay's own current entry for this key -- so this "does it
+        // already match?" check is comparing the mutation against itself
+        // and always "matches," silently treating the fold's own replay as
+        // a no-op. For a delete this is actively wrong:
+        // `getCatalogRecordSizeFromRoot` reports `null` for a key the
+        // overlay already marks deleted (the exact mutation being folded),
+        // so `mutation.is_delete and size == null` looks like "already
+        // absent, nothing to do" and returns without ever staging the
+        // delete into `transaction_writes` -- the real tree (which still
+        // has the key, unmodified) never gets edited, and
+        // `checkpointRedoLog`'s epilogue then reclaims the overlay entry
+        // and may reset the log, discarding the only durable record of the
+        // delete. The real tree is the only thing this fold's own replay
+        // should ever compare against.
+        if (!self.flushing_transaction and root == .index and mutations.len == 1 and !self.checkpoint_publication_uncertain and
+            !(self.redo != null and self.redo.?.checkpointing))
+        {
             const mutation = mutations[0];
             const size = try self.getCatalogRecordSizeFromRoot(root, mutation.key);
             if (mutation.is_delete and size == null) return self.syncIfRequired(null);
