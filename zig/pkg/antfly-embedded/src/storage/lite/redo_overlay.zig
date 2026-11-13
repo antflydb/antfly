@@ -55,15 +55,21 @@ pub const VersionedOverlayEntry = struct {
     /// version this overlay has ever held for the key.
     older: ?*VersionedOverlayEntry = null,
 
-    /// Frees this node and every older node it chains to.
-    pub fn destroyChain(head: *VersionedOverlayEntry, allocator: Allocator) void {
+    /// Frees this node and every older node it chains to. Returns the
+    /// number of nodes freed, so a caller tracking how many *superseded*
+    /// versions remain outstanding (`SharedRedoOverlay.pending_retirement_versions`)
+    /// can keep that count accurate without a second walk.
+    pub fn destroyChain(head: *VersionedOverlayEntry, allocator: Allocator) usize {
         var current: ?*VersionedOverlayEntry = head;
+        var freed: usize = 0;
         while (current) |node| {
             const next = node.older;
             allocator.free(node.value);
             allocator.destroy(node);
             current = next;
+            freed += 1;
         }
+        return freed;
     }
 
     /// The newest version in this chain whose `sequence` is `<=
@@ -121,13 +127,31 @@ pub const SharedRedoOverlay = struct {
     /// per live pin (not deduplicated by value): `unpin` removes exactly
     /// the one instance `pin` added, the same shape a multiset needs.
     pins: std.ArrayListUnmanaged(u64) = .empty,
+    /// §9 (redo retirement signal): the number of versions currently
+    /// chained as `.older` somewhere in `maps` -- i.e. versions a newer
+    /// write in this same uncheckpointed window has already superseded,
+    /// across every key and root. Each is a version `checkpointRedoLog`'s
+    /// next fold would discover and retire (its own external-value chain
+    /// included, per that function's "page-shaped exception" doc comment)
+    /// that the on-disk allocator ledger cannot see yet, because retiring
+    /// a chain is something only the real B-tree fold does today -- the
+    /// ledger has no independent way to learn "this chain is now garbage"
+    /// before that fold runs. `appendVersion` increments this by exactly
+    /// one whenever it pushes a version onto an *existing* chain (never
+    /// for a key's first version in this window -- that one supersedes
+    /// nothing); `reclaim` decrements it by however many superseded
+    /// versions a floor advance actually frees. O(1) per commit: a plain
+    /// counter, no scan, piggybacking on `appendVersion`'s own
+    /// `getOrPut` and `reclaim`'s own walk -- see
+    /// `NativeFile.redoCheckpointWouldRetire`, the only reader.
+    pending_retirement_versions: u64 = 0,
 
     pub fn deinit(self: *SharedRedoOverlay, allocator: Allocator) void {
         for (&self.maps) |*map| {
             var it = map.iterator();
             while (it.next()) |kv| {
                 allocator.free(kv.key_ptr.*);
-                kv.value_ptr.*.destroyChain(allocator);
+                _ = kv.value_ptr.*.destroyChain(allocator);
             }
             map.deinit(allocator);
         }
@@ -270,12 +294,27 @@ pub const SharedRedoOverlay = struct {
         const gop = try self.maps[root].getOrPut(allocator, key);
         if (gop.found_existing) {
             node.older = gop.value_ptr.*;
+            // The previous head is now superseded (chained as `.older`):
+            // one more version `reclaim` will eventually free and that a
+            // fold would discover as garbage. A key's *first* version in
+            // this window (the `else` branch below) supersedes nothing.
+            self.pending_retirement_versions += 1;
         } else {
             const owned_key = try allocator.dupe(u8, key);
             errdefer allocator.free(owned_key);
             gop.key_ptr.* = owned_key;
         }
         gop.value_ptr.* = node;
+    }
+
+    /// The number of superseded-but-not-yet-reclaimed versions across
+    /// every key and root -- see this struct's own field doc comment.
+    /// Nonzero means a fold (`checkpointRedoLog`) would find at least one
+    /// chain to retire that the allocator ledger does not know about yet.
+    pub fn pendingRetirementVersions(self: *SharedRedoOverlay, io: std.Io) u64 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.pending_retirement_versions;
     }
 
     /// Resolves `root`/`key` as of `at_or_before` (a reader's own pinned
@@ -466,7 +505,11 @@ pub const SharedRedoOverlay = struct {
                 if (kept) |keep_node| {
                     if (keep_node.older) |stale| {
                         keep_node.older = null;
-                        stale.destroyChain(allocator);
+                        // `stale` is exactly the superseded run
+                        // `appendVersion` counted one-by-one as it grew;
+                        // freeing it here is the only place that run ever
+                        // shrinks, so mirror the count back out.
+                        self.pending_retirement_versions -|= stale.destroyChain(allocator);
                     }
                     if (min_pin == null) drop_keys.append(allocator, kv.key_ptr.*) catch continue;
                 } else {
@@ -479,7 +522,12 @@ pub const SharedRedoOverlay = struct {
             for (drop_keys.items) |key| {
                 if (map.fetchRemove(key)) |removed| {
                     allocator.free(removed.key);
-                    removed.value.destroyChain(allocator);
+                    // `removed.value` is `keep_node` itself (its own
+                    // `.older` was already severed and separately
+                    // accounted for above) -- it was never counted as
+                    // superseded, so its own removal here does not
+                    // decrement `pending_retirement_versions`.
+                    _ = removed.value.destroyChain(allocator);
                 }
             }
         }
