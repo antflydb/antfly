@@ -8905,7 +8905,25 @@ pub const NativeFile = struct {
         // yet for anything to be owned within.
         const allow_behind = self.header.redo_log_capacity != 0;
         if (if (allow_behind) state.root.covered_pages > checkpoint.page_count else state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
-        if (!std.meta.eql(self.activeCheckpoint(), checkpoint)) return error.InvalidNativeAllocator;
+        // §9 (redo + indexed reclamation): `state` was loaded against, and
+        // `checkpoint` names, one specific generation -- but neither caller
+        // of this function holds any lock that stops another generation
+        // from becoming active while this call is still reading (`check()`
+        // in particular calls through `NativeFile.checkAtFileSizeWithCancel`
+        // with no store-level lock at all, by design, so a live redo-log
+        // file's background `rideAlongFlushLoop`/`maybeCheckpointRedoLogOnIdleTurn`
+        // can publish a newer checkpoint -- a real, correct commit, not a
+        // corruption -- between this function's caller capturing
+        // `checkpoint` and this line re-reading `self.activeCheckpoint()`).
+        // That is a genuine supersession, not an ownership defect: `state`
+        // and `checkpoint` remain fully self-consistent with each other
+        // (copy-on-write means `checkpoint`'s own pages are never mutated
+        // in place), so this is reported as its own distinct, retryable
+        // condition rather than folded into `error.InvalidNativeAllocator`
+        // -- a caller that captures a fresh checkpoint and retries (see
+        // `checkAtFileSizeWithCancel`) converges once the background
+        // publisher goes quiet; one that doesn't still fails closed.
+        if (!std.meta.eql(self.activeCheckpoint(), checkpoint)) return error.NativeCheckpointSuperseded;
         var expected = allocator_v4.State.init(self.allocator);
         defer expected.deinit();
         var active_graph = try self.indexedGraphUsingLeaves(checkpoint, &expected, null, true, cancel);
@@ -8941,14 +8959,20 @@ pub const NativeFile = struct {
             if ((if (allow_behind) old_root.covered_pages > slot.page_count else old_root.covered_pages != slot.page_count) or state.count(slot.free_map_root_page) == allocator_v4.free) return error.InvalidNativeAllocator;
             // The fallback may name an older ledger. Read it independently;
             // loading it into the owner's cache would discard current state.
-            var old_state = try allocator_v4.State.load(self.allocator, .{ .context = self, .allocate = ledgerReadOnlyAllocate, .read = ledgerReadAny, .write = ledgerReadOnlyWrite, .payload_bytes = self.maxPagePayloadBytes(), .cancel_requested = if (cancel) |token| &token.requested else null }, slot.free_map_root_page);
+            var pinned_old_ctx = CheckpointPinnedLedgerContext{ .file = self, .checkpoint = slot };
+            var old_state = try allocator_v4.State.load(self.allocator, .{ .context = &pinned_old_ctx, .allocate = pinnedLedgerReadOnlyAllocate, .read = pinnedLedgerReadAny, .write = pinnedLedgerReadOnlyWrite, .payload_bytes = self.maxPagePayloadBytes(), .cancel_requested = if (cancel) |token| &token.requested else null }, slot.free_map_root_page);
             defer old_state.deinit();
             for (old_state.metadata.items) |page| {
                 if (cancel) |token| try token.check();
                 if (state.count(page) == allocator_v4.free) return error.InvalidNativeAllocator;
             }
             if (active) {
-                if (!std.meta.eql(slot, checkpoint)) return error.InvalidNativeAllocator;
+                // Same supersession as the entry check above (this
+                // function's own doc comment on `error.NativeCheckpointSuperseded`):
+                // `self.header.active_checkpoint`/its slot can legitimately
+                // have moved on since `checkpoint` was captured, with no
+                // lock held across this call to stop it.
+                if (!std.meta.eql(slot, checkpoint)) return error.NativeCheckpointSuperseded;
                 try self.validateIndexedOwnership(checkpoint, state, graph, &expected, cancel);
             }
         }
@@ -8965,6 +8989,53 @@ pub const NativeFile = struct {
             else => return error.InvalidNativeAllocator,
         };
         return try a.dupe(u8, try decodePagePayload(raw, kind));
+    }
+
+    /// §9 (redo + indexed reclamation): a checkpoint-pinned twin of
+    /// `ledgerReadAny`, for the one caller (`check()`, via
+    /// `checkAtFileSizeWithCancel`/`validateIndexedAllocator`'s own
+    /// `old_state` load) that reads a ledger with no writer-exclusive lock
+    /// held across the whole call -- `ledgerReadAny`'s `file.readPageAlloc`
+    /// reads through `self.activeCheckpoint()` (today's, whatever that
+    /// happens to be *right now*), which is exactly right for every other
+    /// caller (always under the single-writer lock, so it cannot move
+    /// mid-call) but wrong here: a redo-log file's background
+    /// `rideAlongFlushLoop`/`checkpointRedoLog` can publish a newer
+    /// checkpoint between any two of this multi-page load's own reads,
+    /// and -- with page reuse enabled -- can have already retired and
+    /// reused one of the very pages this load is mid-way through reading,
+    /// so two reads of "the same" page id inside one `State.load` call
+    /// could silently return two different generations' content. That
+    /// torn view is what let `State.load`'s own `next_id`-vs-delta-chain
+    /// consistency checks fire spuriously (confirmed via the redo
+    /// differential oracle, seed 1). Reading through the *specific*
+    /// checkpoint the caller is loading, instead of whatever is active at
+    /// the instant each individual page read happens, makes the whole
+    /// load self-consistent regardless of how much the live file moves on
+    /// underneath it; `validateIndexedAllocator`'s own
+    /// `NativeCheckpointSuperseded` retry (same doc comment) is the
+    /// complementary half -- it catches "the checkpoint identity itself
+    /// moved on", this catches "a page read mid-load could have torn".
+    const CheckpointPinnedLedgerContext = struct { file: *NativeFile, checkpoint: CheckpointSlot };
+
+    fn pinnedLedgerReadAny(context: *anyopaque, a: Allocator, page: u64) ![]u8 {
+        const ctx: *CheckpointPinnedLedgerContext = @ptrCast(@alignCast(context));
+        const raw = try ctx.file.readPageAllocForCheckpoint(a, page, ctx.checkpoint);
+        defer a.free(raw);
+        const kind: PageKind = switch (raw[4]) {
+            @backingInt(PageKind.free_map) => .free_map,
+            @backingInt(PageKind.allocator) => .allocator,
+            else => return error.InvalidNativeAllocator,
+        };
+        return try a.dupe(u8, try decodePagePayload(raw, kind));
+    }
+
+    fn pinnedLedgerReadOnlyAllocate(_: *anyopaque) !u64 {
+        return error.ReadOnly;
+    }
+
+    fn pinnedLedgerReadOnlyWrite(_: *anyopaque, _: u64, _: []const u8) !void {
+        return error.ReadOnly;
     }
 
     fn publicationEpoch(self: *NativeFile) u64 {
@@ -9652,35 +9723,76 @@ pub const NativeFile = struct {
         if (file_size < truncation_floor) return invalidCheck(report, "truncated_file");
 
         if (self.header.indexed_reclamation) {
-            // A writer/rebased cache contains transient traversal inventories,
-            // which need not describe the current on-disk metadata graph.
-            // Explicit integrity validates a fresh ledger as well as fresh pages.
-            var state = (if (checkpoint.free_map_root_page == 0) allocator_v4.State.init(self.allocator) else allocator_v4.State.load(self.allocator, .{
-                .context = self,
-                .allocate = ledgerReadOnlyAllocate,
-                .read = ledgerReadAny,
-                .write = ledgerReadOnlyWrite,
-                .payload_bytes = self.maxPagePayloadBytes(),
-                .cancel_requested = if (cancel) |token| &token.requested else null,
-            }, checkpoint.free_map_root_page)) catch |err| {
-                if (err == error.MaintenanceCanceled) return err;
-                return invalidCheck(report, issueForPageCheckError(err));
-            };
-            defer state.deinit();
-            const records = self.validateIndexedAllocator(checkpoint, &state, cancel) catch |err| {
-                if (err == error.MaintenanceCanceled) return err;
-                return invalidCheck(report, issueForPageCheckError(err));
-            };
-            const live = try self.liveStats(cancel);
-            var valid = report;
-            valid.record_count = records + self.redoOverlayEntryCount();
-            valid.live_file_count = live.record_count;
-            valid.live_bytes = live.bytes;
-            valid.live_accounting = live.accounting;
-            valid.compact_size = live.compact_size;
-            valid.reclaimable_bytes = file_size -| live.compact_size;
-            if (valid.tail_bytes != 0) return invalidCheck(valid, "tail_bytes");
-            return valid;
+            // §9 (redo + indexed reclamation): `check()` deliberately holds
+            // no store-level lock across this whole block (that is the
+            // point of it being callable concurrently with a live
+            // writer/background maintenance for diagnostics), so a
+            // redo-log file's own `rideAlongFlushLoop`/
+            // `maybeCheckpointRedoLogOnIdleTurn` can publish a newer,
+            // perfectly valid checkpoint while this is still running --
+            // `validateIndexedAllocator` reports that as
+            // `error.NativeCheckpointSuperseded`, distinct from a real
+            // ownership defect, specifically so this loop can re-capture a
+            // fresh checkpoint and retry instead of reporting a false
+            // `invalid_allocator`. Bounded, not infinite: a background
+            // publisher that never goes quiet for even one validation pass
+            // is itself worth surfacing rather than retrying forever.
+            const max_supersede_retries = 8;
+            var attempt: usize = 0;
+            var current_checkpoint = checkpoint;
+            while (true) {
+                // A writer/rebased cache contains transient traversal
+                // inventories, which need not describe the current on-disk
+                // metadata graph. Explicit integrity validates a fresh
+                // ledger as well as fresh pages. Reads pin to
+                // `current_checkpoint` specifically (`pinnedLedgerReadAny`'s
+                // own doc comment) -- `check()` holds no lock across this
+                // call, so a plain `ledgerReadAny`/`self.activeCheckpoint()`
+                // read could tear across a concurrent background checkpoint
+                // publish, especially with page reuse enabled.
+                var pinned_ctx = CheckpointPinnedLedgerContext{ .file = self, .checkpoint = current_checkpoint };
+                var state = (if (current_checkpoint.free_map_root_page == 0) allocator_v4.State.init(self.allocator) else allocator_v4.State.load(self.allocator, .{
+                    .context = &pinned_ctx,
+                    .allocate = pinnedLedgerReadOnlyAllocate,
+                    .read = pinnedLedgerReadAny,
+                    .write = pinnedLedgerReadOnlyWrite,
+                    .payload_bytes = self.maxPagePayloadBytes(),
+                    .cancel_requested = if (cancel) |token| &token.requested else null,
+                }, current_checkpoint.free_map_root_page)) catch |err| {
+                    if (err == error.MaintenanceCanceled) return err;
+                    return invalidCheck(report, issueForPageCheckError(err));
+                };
+                defer state.deinit();
+                const records = self.validateIndexedAllocator(current_checkpoint, &state, cancel) catch |err| {
+                    if (err == error.MaintenanceCanceled) return err;
+                    if (err == error.NativeCheckpointSuperseded and attempt < max_supersede_retries) {
+                        attempt += 1;
+                        current_checkpoint = self.activeCheckpoint();
+                        continue;
+                    }
+                    return invalidCheck(report, issueForPageCheckError(err));
+                };
+                const live = try self.liveStats(cancel);
+                // A retried attempt validated `current_checkpoint`, not the
+                // (possibly now superseded) `checkpoint` `report` above was
+                // built from -- recompute the size-derived fields against
+                // the checkpoint actually validated, or a retry's own
+                // larger, perfectly legitimate `expected_size` reads back
+                // as a spurious `tail_bytes` mismatch against the stale
+                // one.
+                const current_expected_size = try checkpointPrefixSize(current_checkpoint, self.header.page_size);
+                var valid = report;
+                valid.valid_prefix_size = @min(file_size, current_expected_size);
+                valid.tail_bytes = if (file_size > current_expected_size) file_size - current_expected_size else 0;
+                valid.record_count = records + self.redoOverlayEntryCount();
+                valid.live_file_count = live.record_count;
+                valid.live_bytes = live.bytes;
+                valid.live_accounting = live.accounting;
+                valid.compact_size = live.compact_size;
+                valid.reclaimable_bytes = file_size -| live.compact_size;
+                if (valid.tail_bytes != 0) return invalidCheck(valid, "tail_bytes");
+                return valid;
+            }
         }
         var reachable_pages = std.AutoHashMapUnmanaged(u64, void){};
         defer reachable_pages.deinit(self.allocator);
@@ -19604,6 +19716,11 @@ fn issueForPageCheckError(err: anyerror) []const u8 {
     return switch (err) {
         error.InvalidPageId => "invalid_page_id",
         error.InvalidNativeAllocator => "invalid_allocator",
+        // Exhausted its bounded retry budget in `checkAtFileSizeWithCancel`
+        // -- a background checkpoint publisher that never went quiet for
+        // even one validation pass, not an ownership defect. See
+        // `validateIndexedAllocator`'s own doc comment on this error.
+        error.NativeCheckpointSuperseded => "checkpoint_contended",
         error.TruncatedNativePage => "truncated_page",
         error.InvalidNativePageMagic => "invalid_page_magic",
         error.InvalidNativePageKind => "invalid_page_kind",
