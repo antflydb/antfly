@@ -3142,6 +3142,16 @@ pub const CatalogCursor = struct {
         const key = (try self.next()) orelse return null;
         defer file.allocator.free(key.key);
         const value = if (key.page_id == 0) blk: {
+            // `next()` only ever returns a `page_id == 0` key once its own
+            // resolve of this exact key, at this exact checkpoint,
+            // already succeeded (§9.7c: a phantom resolve there is
+            // treated as absent and never surfaced as a key at all) --
+            // this second resolve, moments later with nothing able to
+            // have changed in between, is expected to agree. A `null`
+            // here would mean that invariant broke, not a legitimately
+            // absent key, so this stays a hard error rather than quietly
+            // skipping (which `nextRecordAlloc`'s own one-key-at-a-time
+            // contract has no loop to do safely).
             const entry = (try file.redoOverlayEntry(self.overlay_root.?, self.index.checkpoint, key.key)) orelse return error.InvalidNativeRedoRecord;
             defer file.allocator.free(entry.value);
             break :blk try file.catalogEntryValueAtCheckpointAlloc(allocator, entry, self.index.checkpoint);
@@ -3194,8 +3204,30 @@ pub const CatalogCursor = struct {
                     self.pending_tree = candidate;
                     continue;
                 }
-                const entry = (try file.redoOverlayEntry(self.overlay_root.?, self.index.checkpoint, key)) orelse return error.InvalidNativeRedoRecord;
-                defer file.allocator.free(entry.value);
+                // §9.7c (ReadView): resolve before deciding whether to
+                // consume `candidate` -- the overlay enumerates every key
+                // with *any* version currently in the live map, regardless
+                // of this cursor's own pinned checkpoint, so a cursor
+                // pinned to an older, already-superseded checkpoint can
+                // enumerate a key whose entire chain postdates it (a
+                // brand-new key created only after this pin's own
+                // snapshot was taken). `resolveAlloc` then correctly
+                // returns `null` -- "nothing at or before this
+                // checkpoint" -- which must be treated exactly like the
+                // real tree never having had this key diverted away from
+                // it at this checkpoint (continue to the tree's own
+                // candidate, if any, on the next iteration), not as
+                // corruption; and if `candidate` happens to tie with this
+                // phantom key, it must stay buffered rather than being
+                // freed as if the overlay had genuinely superseded it
+                // (same bug class as `MergedCursor.advance`'s own fix).
+                const entry = try file.redoOverlayEntry(self.overlay_root.?, self.index.checkpoint, key);
+                _ = self.overlay.takeFront();
+                if (entry == null) {
+                    self.pending_tree = candidate;
+                    continue;
+                }
+                defer file.allocator.free(entry.?.value);
                 const tied = tree_key != null and std.mem.eql(u8, tree_key.?, key);
                 if (tied) {
                     var owned = candidate.?;
@@ -3203,8 +3235,7 @@ pub const CatalogCursor = struct {
                 } else {
                     self.pending_tree = candidate;
                 }
-                _ = self.overlay.takeFront();
-                if (entry.is_delete) continue;
+                if (entry.?.is_delete) continue;
                 return .{ .key = try file.allocator.dupe(u8, key), .page_id = 0 };
             }
             const owned = candidate orelse break;
@@ -11026,21 +11057,34 @@ pub const NativeFile = struct {
                 const take_overlay = overlay_key != null and (tree_key == null or std.mem.order(u8, overlay_key.?, tree_key.?) != .gt);
                 if (take_overlay) {
                     const key = overlay_key.?;
-                    const entry = (try file.redoOverlayEntry(self.overlay_root, self.index.checkpoint, key)) orelse {
-                        // `candidate` (if any) was fetched above and already
-                        // cleared out of `self.pending_tree`; every other
-                        // path below either frees it (`tied`) or re-stashes
-                        // it (`self.pending_tree = candidate`) before
-                        // returning. This early return skips both, so its
-                        // key -- already allocated by
-                        // `DocumentIndexCursor.currentEntry`'s `dupe` -- must
-                        // be freed here or it leaks.
-                        if (candidate) |c| {
-                            var owned = c;
-                            owned.deinit(file.allocator);
-                        }
-                        return error.InvalidNativeRedoRecord;
-                    };
+                    // §9.7c (ReadView): resolve before deciding whether
+                    // `candidate` is actually superseded -- the overlay
+                    // enumerates every key with *any* version currently
+                    // in the live map, regardless of this cursor's own
+                    // pinned checkpoint, so a cursor pinned to an older,
+                    // already-superseded checkpoint can enumerate a key
+                    // whose entire chain postdates it. `resolveAlloc`
+                    // then correctly returns `null` -- "nothing at or
+                    // before this checkpoint" -- which must be treated
+                    // like the real tree never having had this key
+                    // diverted away from it at this checkpoint (re-stash
+                    // `candidate`, exactly as the non-tied branch below
+                    // already does, and continue to find the next real
+                    // candidate), not as corruption; `candidate` must
+                    // never be freed here, only in the genuinely-tied
+                    // case (same bug class as `MergedCursor.advance`'s
+                    // own fix, and the mirror image of this function's
+                    // own leak fix -- that fix made the error path free
+                    // `candidate` instead of leaking it; this one makes
+                    // the error path not exist at all, re-stashing
+                    // `candidate` instead, same as every other "not
+                    // actually superseded" path in this loop).
+                    const entry = try file.redoOverlayEntry(self.overlay_root, self.index.checkpoint, key);
+                    _ = self.overlay.takeFront();
+                    if (entry == null) {
+                        self.pending_tree = candidate;
+                        continue;
+                    }
                     const tied = tree_key != null and std.mem.eql(u8, tree_key.?, key);
                     if (tied) {
                         var owned = candidate.?;
@@ -11048,12 +11092,11 @@ pub const NativeFile = struct {
                     } else {
                         self.pending_tree = candidate;
                     }
-                    _ = self.overlay.takeFront();
-                    if (entry.is_delete) {
-                        file.allocator.free(entry.value);
+                    if (entry.?.is_delete) {
+                        file.allocator.free(entry.?.value);
                         continue;
                     }
-                    self.overlay_value = entry.value;
+                    self.overlay_value = entry.?.value;
                     return entry;
                 }
 
@@ -30199,6 +30242,83 @@ test "lite redo log score-batch read sees a graph-metric score document logged b
     try std.testing.expectEqual(@as(f64, 11), decoded[1]);
     try std.testing.expectEqual(@as(f64, 13), decoded[2]);
     try std.testing.expect(std.math.isNan(decoded[3]));
+}
+
+test "lite redo log catalog cursor pinned to an older mark skips a key created only after it, instead of erroring" {
+    // §9.7c (ReadView): OverlayScanState's gate-free enumeration (per
+    // the earlier fix in this branch) means a cursor pinned to an
+    // older, already-superseded checkpoint can enumerate a key whose
+    // entire version chain postdates that pin -- a brand-new key
+    // created only after the pin's own snapshot was taken.
+    // `redoOverlayEntry` correctly resolves nothing for it ("nothing
+    // at or before this checkpoint"); `CatalogCursor.next` used to
+    // treat that as corruption (`error.InvalidNativeRedoRecord`)
+    // rather than "absent for this view". Exercises the fix directly
+    // through `ReadView.openAt`/`openMetadataCursor`, the same seam a
+    // genuinely pinned reader (an older `ReadGeneration`, or a vacuum
+    // snapshot opened before a concurrent write lands) would use.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-catalog-pinned-mark.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer file.close();
+
+    try file.beginTransaction();
+    try file.putCatalogRecord("k/alpha", "one");
+    try file.commitTransaction();
+
+    // Pin a view right here, before the next write -- its own mark is
+    // fixed at the sequence "k/alpha" alone committed at.
+    var old_view = try ReadView.openAt(&file, std.testing.io, file.activeCheckpoint());
+    defer old_view.release(std.testing.io);
+
+    // A brand-new key under the same prefix, created only after
+    // old_view's own pin -- old_view must never see it.
+    try file.beginTransaction();
+    try file.putCatalogRecord("k/beta", "two");
+    try file.commitTransaction();
+
+    {
+        var cursor = try old_view.openMetadataCursor("k/");
+        defer cursor.deinit();
+        var i: usize = 0;
+        while (try cursor.nextRecordAlloc(a)) |record| {
+            defer {
+                a.free(record.key);
+                a.free(record.value);
+            }
+            try std.testing.expectEqual(@as(usize, 0), i);
+            try std.testing.expectEqualStrings("k/alpha", record.key);
+            try std.testing.expectEqualStrings("one", record.value);
+            i += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), i);
+    }
+
+    // A fresh, current-generation view sees both.
+    {
+        var view = try ReadView.open(&file, std.testing.io);
+        defer view.release(std.testing.io);
+        var cursor = try view.openMetadataCursor("k/");
+        defer cursor.deinit();
+        var i: usize = 0;
+        const expected_keys = [_][]const u8{ "k/alpha", "k/beta" };
+        const expected_values = [_][]const u8{ "one", "two" };
+        while (try cursor.nextRecordAlloc(a)) |record| {
+            defer {
+                a.free(record.key);
+                a.free(record.value);
+            }
+            try std.testing.expect(i < expected_keys.len);
+            try std.testing.expectEqualStrings(expected_keys[i], record.key);
+            try std.testing.expectEqualStrings(expected_values[i], record.value);
+            i += 1;
+        }
+        try std.testing.expectEqual(expected_keys.len, i);
+    }
 }
 
 test "lite redo log vacuum captures uncheckpointed overlay and demotes the file rather than corrupting it" {
