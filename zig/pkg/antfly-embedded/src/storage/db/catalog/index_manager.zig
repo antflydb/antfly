@@ -1568,6 +1568,17 @@ pub const IndexManager = struct {
     graph_retirement_closed: std.atomic.Value(bool) = .init(false),
     algebraic_indexes: std.ArrayListUnmanaged(AlgebraicIndex),
     enrichments: std.ArrayListUnmanaged(enrichment_catalog.EnrichmentConfig),
+    /// Host-supplied context-dependency topology (in memory; hosts re-supply
+    /// it on open). `context_table_id` names this table; `context_inbound`
+    /// lists foreign enrichments whose context sources read this table.
+    context_host_arena: ?*std.heap.ArenaAllocator = null,
+    /// Serializes read-modify-write of context dependency state between the
+    /// enrichment runtime (register/publish) and notice application, so the
+    /// dependency-generation fence is linearizable even on stores whose
+    /// batches are not serializable transactions.
+    context_dependency_mutex: std.atomic.Mutex = .unlocked,
+    context_table_id: []const u8 = "",
+    context_inbound: []const @import("../enrichment/context_notices.zig").DeclaredConfig = &.{},
     resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
     retired_resolvers: std.ArrayListUnmanaged(resolver_catalog.ResolverConfig) = .empty,
     cached_has_generated_enrichment_targets: std.atomic.Value(bool),
@@ -7425,6 +7436,11 @@ pub const IndexManager = struct {
 
     fn deinitWithBackendDisposition(self: *IndexManager, abandon_after_crash: bool) void {
         self.waitForGraphMetricSchedulePins();
+        if (self.context_host_arena) |arena| {
+            arena.deinit();
+            self.alloc.destroy(arena);
+            self.context_host_arena = null;
+        }
         self.leann_reembed_cache.deinit(self.alloc);
         if (self.write_plan_cache) |cached| {
             self.write_plan_cache = null;
@@ -16008,6 +16024,58 @@ pub const IndexManager = struct {
             return self.out or self.in;
         }
     };
+
+    /// Replace the host context-dependency topology. Callers hold the apply
+    /// lock so commits observe one consistent topology.
+    pub fn setContextDependencyHost(self: *IndexManager, table_id: []const u8, inbound: []const @import("../enrichment/context_notices.zig").DeclaredConfig) !void {
+        const arena = try self.alloc.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(self.alloc);
+        errdefer {
+            arena.deinit();
+            self.alloc.destroy(arena);
+        }
+        const a = arena.allocator();
+        const copy = try a.alloc(@import("../enrichment/context_notices.zig").DeclaredConfig, inbound.len);
+        for (inbound, copy) |d, *c| c.* = .{
+            .dependent_table_id = try a.dupe(u8, d.dependent_table_id),
+            .artifact = try a.dupe(u8, d.artifact),
+            .stored_json = try a.dupe(u8, d.stored_json),
+        };
+        const owned_table_id = try a.dupe(u8, table_id);
+        if (self.context_host_arena) |old| {
+            old.deinit();
+            self.alloc.destroy(old);
+        }
+        self.context_host_arena = arena;
+        self.context_table_id = owned_table_id;
+        self.context_inbound = copy;
+    }
+
+    pub fn lockContextDependencies(self: *IndexManager) void {
+        self.lockAtomicWithBackoff(&self.context_dependency_mutex);
+    }
+
+    pub fn unlockContextDependencies(self: *IndexManager) void {
+        self.context_dependency_mutex.unlock();
+    }
+
+    /// Whether writes to this table can affect any context dependency (own
+    /// enrichments or registered foreign dependents). Cheap: no allocation.
+    pub fn hasContextDependents(self: *const IndexManager) bool {
+        return self.context_inbound.len != 0 or self.hasAssetContextSources();
+    }
+
+    /// Own and inbound declarations, for building source-side specs.
+    pub fn contextDeclarationsAlloc(self: *const IndexManager, alloc: Allocator) ![]@import("../enrichment/context_notices.zig").DeclaredConfig {
+        var out = std.ArrayListUnmanaged(@import("../enrichment/context_notices.zig").DeclaredConfig).empty;
+        errdefer out.deinit(alloc);
+        for (self.enrichments.items) |entry| {
+            if (entry.kind != .asset or entry.context_sources_json.len == 0) continue;
+            try out.append(alloc, .{ .dependent_table_id = "", .artifact = entry.name, .stored_json = entry.context_sources_json });
+        }
+        try out.appendSlice(alloc, self.context_inbound);
+        return try out.toOwnedSlice(alloc);
+    }
 
     /// Whether any admitted asset enrichment declares context sources. The
     /// commit path consults this before computing dependency notices so tables

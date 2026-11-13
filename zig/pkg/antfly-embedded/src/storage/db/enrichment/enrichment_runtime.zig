@@ -49,6 +49,9 @@ const derived_types = @import("../derived/derived_types.zig");
 const enrichment_types = @import("enrichment_types.zig");
 const enrichment_config_validation = @import("config_validation.zig");
 const enrichment_neighbor_context = @import("neighbor_context.zig");
+const enrichment_context_sources = @import("context_sources.zig");
+const context_dependency_store = @import("context_dependency_store.zig");
+const context_resolution = @import("context_resolution.zig");
 const enrichment_artifact_codec = @import("artifact_codec.zig");
 const enrichment_worker = @import("enrichment_worker.zig");
 const enrichment_lease = @import("enrichment_lease.zig");
@@ -178,6 +181,9 @@ pub fn releaseConfigProviders(alloc: Allocator, config: *Config) void {
 
 pub const Config = struct {
     neighbor_context_graph_source: ?NeighborContextGraphSource = null,
+    /// Host reader for `context_sources`. The resident DB serves its own
+    /// table; hosts with a table registry also serve foreign identities.
+    context_source_reader: ?context_resolution.Reader = null,
     owner_id: []const u8 = "local",
     /// Injected by the resident DB, never borrowed from restored producer
     /// metadata or caller configuration. Ordered checkpoint-backed work fails
@@ -6335,6 +6341,8 @@ const AssetProducerBatchItem = struct {
     state_key: []u8,
     state_value: []u8,
     producer_context: ?@import("../artifact_producer_context.zig").Token = null,
+    /// Captured context dependencies published atomically with the output.
+    context_publish: ?*ContextPublish = null,
 
     fn asRequest(self: *const @This()) asset_producer_mod.Request {
         return .{
@@ -6425,6 +6433,7 @@ fn freePlainDenseBatchItems(alloc: Allocator, items: []PlainDenseBatchItem) void
 fn freeAssetProducerBatchItem(alloc: Allocator, item: AssetProducerBatchItem) void {
     var context = item.producer_context;
     if (context) |*value| value.deinit();
+    if (item.context_publish) |publish| publish.destroy(alloc);
     if (item.config_json.len > 0) alloc.free(item.config_json);
     alloc.free(item.raw_doc);
     alloc.free(@constCast(item.source_text));
@@ -8351,6 +8360,7 @@ const UnsupportedEnrichmentRuntime = struct {
             .activity_epoch = newActivityEpoch(config, config.clock orelse platform_clock.Clock.real()),
             .config = .{
                 .neighbor_context_graph_source = config.neighbor_context_graph_source,
+                .context_source_reader = config.context_source_reader,
                 .root_incarnation = config.root_incarnation,
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
@@ -8927,6 +8937,7 @@ const PlatformEnrichmentRuntime = struct {
             .activity_epoch = newActivityEpoch(config, config.clock orelse backend_runtime.clock()),
             .config = .{
                 .neighbor_context_graph_source = config.neighbor_context_graph_source,
+                .context_source_reader = config.context_source_reader,
                 .root_incarnation = config.root_incarnation,
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
@@ -17651,6 +17662,37 @@ fn processAsset(
         }
     }
 
+    // Context sources are producer input too: bind them against the source
+    // row, register their subscriptions durably *before* reading (so any
+    // later input change finds them), resolve, and fold the rendered block in
+    // before the skip state below. Budget and required-input refusals are
+    // explicit request failures; the last good artifact stays retained but is
+    // reported failed, never current.
+    var context_publish: ?*ContextPublish = null;
+    defer if (context_publish) |publish| publish.destroy(runtime.alloc);
+    if (request.context_sources_json.len > 0 and
+        enrichment_config_validation.producerConsumesPromptText(producer_cfg.type))
+    {
+        // Ordered (replicated serverless) publication has no dependency
+        // fence yet; refuse explicitly rather than publish unfenced output.
+        if (context != null) return error.ContextSourcesUnsupportedInOrderedPublication;
+        context_publish = (captureContextSources(runtime, request, artifact_name, raw, window, scope) catch |err| {
+            std.log.warn("context source capture deferred artifact={s} doc_key_bytes={d}: {s}", .{ artifact_name, request.doc_key.len, @errorName(err) });
+            return err;
+        }) orelse return;
+        const block = try enrichment_context_sources.producerBlockAlloc(runtime.alloc, &context_publish.?.resolution.rendered);
+        defer runtime.alloc.free(block);
+        const combined = try std.mem.join(runtime.alloc, "\n", &.{ source_text, block });
+        runtime.alloc.free(@constCast(source_text));
+        source_text = combined;
+        if (source_parts_json) |parts| {
+            if (try appendNeighborContextTextPartAlloc(runtime.alloc, parts, block)) |amended| {
+                runtime.alloc.free(parts);
+                source_parts_json = amended;
+            }
+        }
+    }
+
     if (prior_input) |value| {
         const marker = try std.fmt.allocPrint(runtime.alloc, "[prior_context {x}]\n{s}", .{ &value.fingerprint, value.text });
         defer runtime.alloc.free(marker);
@@ -17676,6 +17718,12 @@ fn processAsset(
         if (existing) |value| {
             defer runtime.alloc.free(value);
             if (try reusableLocalAsset(runtime, request.doc_key, artifact_name, raw, value) and try reusablePrivateAsset(runtime, artifact_name, key, source_text, raw, producer_cfg.config_json, value)) {
+                if (context_publish) |publish| {
+                    // Equivalent inputs: the retained output becomes current
+                    // through the captured frontier without a producer call or
+                    // a new lineage version.
+                    try storePutBatchGuardedWithRetry(runtime, &.{}, &.{}, .{ .doc_key = request.doc_key, .digest = sourceRecordDigest(raw), .dependency = .{ .artifact = artifact_name, .publish = publish, .new_version = false } });
+                }
                 try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
                 try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
                 // Private outputs also require their destination-owned witness.
@@ -17715,7 +17763,9 @@ fn processAsset(
         .state_key = state_key,
         .state_value = state_value,
         .producer_context = context,
+        .context_publish = context_publish,
     }, scope);
+    context_publish = null;
     context_owned = false;
     config_json_owned = false;
     raw_owned = context != null;
@@ -17724,6 +17774,161 @@ fn processAsset(
     key_owned = false;
     state_key_owned = false;
     state_value_owned = false;
+}
+
+/// Captured, resolved context for one asset request. Owned by the deferred
+/// batch item until its output publishes (or the item is dropped).
+const ContextPublish = struct {
+    resolution: context_resolution.Resolution,
+    capture: context_dependency_store.Capture,
+    tuples: []enrichment_context_sources.SubscriptionTuple,
+
+    fn destroy(self: *ContextPublish, alloc: Allocator) void {
+        self.resolution.deinit(alloc);
+        alloc.free(self.tuples);
+        alloc.destroy(self);
+    }
+};
+
+const ContextDependencyFence = struct {
+    artifact: []const u8,
+    publish: *const ContextPublish,
+    new_version: bool,
+    producer_recipe: ?[32]u8 = null,
+};
+
+/// Register-before-read capture. Returns null when the request already
+/// recorded an explicit failure (budget overflow, missing required input).
+fn captureContextSources(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_name: []const u8,
+    raw: []const u8,
+    window: *GeneratedReplayWindow,
+    scope: *FailureScope,
+) !?*ContextPublish {
+    const alloc = runtime.alloc;
+    var config = enrichment_context_sources.parseStoredJson(alloc, request.context_sources_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEnrichmentConfig,
+    };
+    defer config.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const config_digest = config.digest();
+    var bindings = enrichment_context_sources.bindAlloc(alloc, &config, parsed.value) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.ContextBudgetExceeded, error.InvalidContextBinding => {
+            try recordContextFailure(runtime, request, artifact_name, null, &.{}, config_digest, @errorName(err));
+            try recordIsolatedRequestErrorNamed(runtime, window, request, @errorName(err), scope.attemptNumber(runtime));
+            return null;
+        },
+        else => return err,
+    };
+    defer bindings.deinit();
+    const tuples = try bindings.allTuplesAlloc(alloc);
+    var tuples_owned = true;
+    defer if (tuples_owned) alloc.free(tuples);
+    const capture = try registerContextDependencies(runtime, request.doc_key, artifact_name, tuples, config_digest);
+    const reader = runtime.config.context_source_reader orelse return error.ContextSourceTableUnavailable;
+    var resolution = context_resolution.resolveAlloc(alloc, reader, &bindings, .{}) catch |err| switch (err) {
+        error.ContextBudgetExceeded, error.RequiredContextMissing, error.InvalidContextBinding => {
+            try recordContextFailure(runtime, request, artifact_name, capture, tuples, config_digest, @errorName(err));
+            try recordIsolatedRequestErrorNamed(runtime, window, request, @errorName(err), scope.attemptNumber(runtime));
+            return null;
+        },
+        else => return err,
+    };
+    errdefer resolution.deinit(alloc);
+    const publish = try alloc.create(ContextPublish);
+    publish.* = .{ .resolution = resolution, .capture = capture, .tuples = tuples };
+    tuples_owned = false;
+    return publish;
+}
+
+/// Plan against, and commit through, a fenced runtime write batch.
+fn commitContextDependencyPlan(
+    runtime: *EnrichmentRuntime,
+    comptime planFn: anytype,
+    args: anytype,
+) !@typeInfo(@typeInfo(@TypeOf(planFn)).@"fn".return_type.?).error_union.payload {
+    runtime.index_manager.lockContextDependencies();
+    defer runtime.index_manager.unlockContextDependencies();
+    var publication_store = try RuntimePublicationStore.init(runtime);
+    defer publication_store.deinit();
+    const live_store = publication_store.store(runtime);
+    const fence = try requiredRuntimeStoreWriteFence(runtime, replayWriteGeneration(runtime));
+    var batch = try live_store.*.beginBatch();
+    errdefer batch.abort();
+    try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
+    var txn_reader = context_dependency_store.TxnReader(@TypeOf(batch)){ .txn = &batch };
+    var plan = context_dependency_store.Plan.init(runtime.alloc);
+    defer plan.deinit();
+    const result = try @call(.auto, planFn, .{ runtime.alloc, txn_reader.reader(), &plan } ++ args);
+    if (plan.puts.items.len == 0 and plan.deletes.items.len == 0) {
+        batch.abort();
+        return result;
+    }
+    try context_dependency_store.applyPlanToTxn(&batch, &plan);
+    try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
+    try batch.commit();
+    if (publication_store.lease != null) try live_store.sync(false);
+    return result;
+}
+
+fn registerContextDependencies(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    tuples: []const enrichment_context_sources.SubscriptionTuple,
+    config_digest: enrichment_context_sources.Digest,
+) !context_dependency_store.Capture {
+    return commitContextDependencyPlan(runtime, context_dependency_store.planRegister, .{ doc_key, artifact_name, tuples, config_digest });
+}
+
+fn recordContextFailure(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    artifact_name: []const u8,
+    capture: ?context_dependency_store.Capture,
+    tuples: []const enrichment_context_sources.SubscriptionTuple,
+    config_digest: enrichment_context_sources.Digest,
+    failure: []const u8,
+) !void {
+    const effective = capture orelse try registerContextDependencies(runtime, request.doc_key, artifact_name, tuples, config_digest);
+    commitContextDependencyPlan(runtime, context_dependency_store.planFailure, .{ request.doc_key, artifact_name, effective, failure }) catch |err| switch (err) {
+        // A newer invalidation already re-queued this document.
+        error.DependencyGenerationSuperseded => {},
+        else => return err,
+    };
+}
+
+/// Publish captured dependencies inside the caller's guarded batch. A
+/// superseded generation means an input changed after the context read; the
+/// invalidation already re-queued the document, so this output must not land.
+fn applyContextPublishTxn(runtime: *EnrichmentRuntime, batch: anytype, doc_key: []const u8, dependency: ContextDependencyFence) !void {
+    var txn_reader = context_dependency_store.TxnReader(@TypeOf(batch.*)){ .txn = batch };
+    var plan = context_dependency_store.Plan.init(runtime.alloc);
+    defer plan.deinit();
+    const resolution = &dependency.publish.resolution;
+    var recipe_hex: [64]u8 = undefined;
+    const recipe = if (dependency.producer_recipe) |r| std.fmt.bufPrint(&recipe_hex, "{x}", .{&r}) catch unreachable else "";
+    _ = context_dependency_store.planPublish(runtime.alloc, txn_reader.reader(), &plan, doc_key, dependency.artifact, .{
+        .capture = dependency.publish.capture,
+        .tuples = dependency.publish.tuples,
+        .input_fingerprint = resolution.rendered.fingerprint,
+        .frontier = resolution.frontier,
+        .producer_recipe = recipe,
+        .published_at_ms = @intCast(@divTrunc(runtime.clock.nowRealtimeNs(), std.time.ns_per_ms)),
+        .inputs = resolution.inputs,
+        .queries = resolution.queries,
+        .absent = resolution.absent,
+        .new_version = dependency.new_version,
+    }) catch |err| switch (err) {
+        error.DependencyGenerationSuperseded => return error.EnrichmentSourceChanged,
+        else => return err,
+    };
+    try context_dependency_store.applyPlanToTxn(batch, &plan);
 }
 
 /// Sample the document's same-shard adjacency from the graph index named by
@@ -19309,7 +19514,7 @@ fn applyAssetProducerBatchOutput(
     const producer_recipe = local.requestRecipe(item.request);
     const receipt = local.encode(producer_recipe, item.raw_doc, validated);
     try writes.append(runtime.alloc, .{ .key = receipt_key, .value = &receipt });
-    try storePutBatchGuarded(runtime, writes.items, &.{}, .{ .doc_key = item.request.doc_key, .digest = sourceRecordDigest(item.raw_doc), .upstream_name = item.request.upstream_artifact_name, .upstream_digest = item.upstream_digest, .producer_name = requestArtifactName(item.request), .producer_recipe = producer_recipe });
+    try storePutBatchGuarded(runtime, writes.items, &.{}, .{ .doc_key = item.request.doc_key, .digest = sourceRecordDigest(item.raw_doc), .upstream_name = item.request.upstream_artifact_name, .upstream_digest = item.upstream_digest, .producer_name = requestArtifactName(item.request), .producer_recipe = producer_recipe, .dependency = if (item.context_publish) |publish| .{ .artifact = requestArtifactName(item.request), .publish = publish, .new_version = true, .producer_recipe = producer_recipe } else null });
 
     try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, item.artifact_key);
 
@@ -40014,6 +40219,9 @@ const LocalSourceFence = struct {
     upstream_absent: bool = false,
     producer_name: []const u8 = "",
     producer_recipe: ?[32]u8 = null,
+    /// Context dependencies to publish in the same batch, fenced on the
+    /// dependency generation captured before the context was read.
+    dependency: ?ContextDependencyFence = null,
 };
 
 fn requireLocalAssetSource(runtime: *EnrichmentRuntime, txn: anytype, doc_key: []const u8, name: []const u8, parent: []const u8, output: []const u8) !void {
@@ -40087,6 +40295,9 @@ fn storePutBatchGuardedWithRetry(runtime: *EnrichmentRuntime, writes: []const KV
 }
 
 fn storePutBatchGuarded(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8, source: ?LocalSourceFence) !void {
+    const dependency_locked = if (source) |guard| guard.dependency != null else false;
+    if (dependency_locked) runtime.index_manager.lockContextDependencies();
+    defer if (dependency_locked) runtime.index_manager.unlockContextDependencies();
     var publication_store = try RuntimePublicationStore.init(runtime);
     defer publication_store.deinit();
     const live_store = publication_store.store(runtime);
@@ -40099,6 +40310,7 @@ fn storePutBatchGuarded(runtime: *EnrichmentRuntime, writes: []const KVPair, del
     errdefer batch.abort();
     try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
     if (source) |guard| try validateLocalSourceFence(runtime, &batch, guard);
+    if (source) |guard| if (guard.dependency) |dependency| try applyContextPublishTxn(runtime, &batch, guard.doc_key, dependency);
     for (writes) |write| try @import("../artifact_publication.zig").requireLegacyMaterialization(&batch, write.key);
     for (deletes) |key| try @import("../artifact_publication.zig").requireLegacyMaterialization(&batch, key);
     try updateDenseArtifactTargetCountersTxn(runtime, &batch, writes, deletes);

@@ -698,6 +698,50 @@ pub const Reader = struct {
     }
 };
 
+/// `Reader` over any storage transaction/batch exposing `get(key) ![]const u8`
+/// (`error.NotFound` when absent) and `openCursor()` with
+/// `seekAtOrAfter`/`next`/`close`. Planning against the same write batch that
+/// commits the plan makes the generation check and the publication atomic.
+pub fn TxnReader(comptime Txn: type) type {
+    return struct {
+        txn: *Txn,
+
+        pub fn reader(self: *@This()) Reader {
+            return .{ .ptr = self, .get_fn = getImpl, .scan_fn = scanImpl };
+        }
+
+        fn getImpl(p: *anyopaque, alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            const value = self.txn.get(key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            return try alloc.dupe(u8, value);
+        }
+
+        fn scanImpl(p: *anyopaque, lower: []const u8, upper: []const u8, visitor: Reader.Visitor) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            var cursor = try self.txn.openCursor();
+            defer cursor.close();
+            var entry = try cursor.seekAtOrAfter(lower);
+            while (entry) |e| {
+                if (!std.mem.lessThan(u8, e.key, upper)) return;
+                if (!try visitor.visit_fn(visitor.ptr, e.key, e.value)) return;
+                entry = try cursor.next();
+            }
+        }
+    };
+}
+
+/// Apply a plan to a write transaction/batch with `put` and `delete`.
+pub fn applyPlanToTxn(txn: anytype, plan: *const Plan) !void {
+    for (plan.deletes.items) |key| txn.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+    for (plan.puts.items) |e| try txn.put(e.key, e.value);
+}
+
 pub fn prefixUpperAlloc(alloc: Allocator, prefix: []const u8) ![]u8 {
     var upper = try alloc.dupe(u8, prefix);
     var i = upper.len;

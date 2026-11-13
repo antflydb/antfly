@@ -1,0 +1,783 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Change notices: how an input-table write reaches dependent artifacts.
+//!
+//! Source side (the table being written)
+//! -------------------------------------
+//! A table that is the target of any context source keeps a *shadow* per row:
+//! the canonical projection of only the fields its dependents declare
+//! (predicate and projected fields). In the same atomic batch as a write or
+//! delete, `planStageNotices` compares the shadow (previous) with the new row
+//! (next), computes the subscription tuples touched for every dependent spec
+//! (`context_sources.touchedTuplesAlloc`), updates the shadow, and stages
+//! compact notices in a durable outbox. Irrelevant updates (equal projection
+//! and tuples) stage nothing, so unrelated tenants and unconsumed fields never
+//! reach dependents. A row written before its spec was registered has no
+//! covering shadow; it stages a spec-wide notice (safe over-invalidation)
+//! until `planBackfillShadows` has covered the table.
+//!
+//! Delivery
+//! --------
+//! Outbox entries are drained after commit (and on open/maintenance) to the
+//! dependent table: locally when it is the same DB, or through the host's
+//! dispatcher. An entry is deleted only after the dependent applied it, so a
+//! crash, restart, leader transfer, or failed dispatch re-delivers; applying
+//! is idempotent (it only advances generations and coalesces reasons).
+//!
+//! Dependent side
+//! --------------
+//! `planApplyNotice` performs the indexed subscription lookup (bounded pages)
+//! and returns the dependents to rebuild now, to queue with debounce, and a
+//! continuation notice when the fan-out page budget was reached. Reporting
+//! invalidation (stale freshness, generation bump) is never debounced; only
+//! the rebuild is.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const ctx = @import("context_sources.zig");
+const store = @import("context_dependency_store.zig");
+
+pub const Digest = ctx.Digest;
+pub const shadow_kind: u8 = 0x5f;
+pub const outbox_family: u8 = 0x04;
+pub const notice_format: u32 = 1;
+pub const default_fanout_page: usize = 512;
+
+// ---------------------------------------------------------------------------
+// Specs that target a source table
+// ---------------------------------------------------------------------------
+
+pub const SpecBinding = struct {
+    dependent_table_id: []const u8,
+    artifact: []const u8,
+    source: *const ctx.Source,
+    spec: Digest,
+    refresh: ctx.Refresh,
+};
+
+pub const DeclaredConfig = struct {
+    /// Dependent table identity ("" for this DB's own enrichments).
+    dependent_table_id: []const u8,
+    artifact: []const u8,
+    /// Canonical stored context-sources JSON.
+    stored_json: []const u8,
+};
+
+/// Every context source, across own and inbound dependents, that reads this
+/// table — plus the union of fields the shadow must capture.
+pub const SourceSpecs = struct {
+    alloc: Allocator,
+    configs: []ctx.Config,
+    items: []SpecBinding,
+    union_fields: []const []const u8,
+    fields_digest: Digest,
+
+    pub fn deinit(self: *SourceSpecs) void {
+        for (self.configs) |*c| c.deinit();
+        self.alloc.free(self.configs);
+        self.alloc.free(self.items);
+        self.alloc.free(self.union_fields);
+        self.* = undefined;
+    }
+
+    pub fn isEmpty(self: *const SourceSpecs) bool {
+        return self.items.len == 0;
+    }
+};
+
+/// `own_table_id` identifies this table; own enrichments' sources with an
+/// empty identity also target it.
+pub fn buildSourceSpecs(alloc: Allocator, own_table_id: []const u8, declared: []const DeclaredConfig) !SourceSpecs {
+    var configs = std.ArrayListUnmanaged(ctx.Config).empty;
+    errdefer {
+        for (configs.items) |*c| c.deinit();
+        configs.deinit(alloc);
+    }
+    for (declared) |d| {
+        const config = ctx.parseStoredJson(alloc, d.stored_json) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            // A malformed inbound declaration must not block writes to this
+            // table; the dependent's own admission rejects it.
+            else => continue,
+        };
+        try configs.append(alloc, config);
+    }
+    var items = std.ArrayListUnmanaged(SpecBinding).empty;
+    errdefer items.deinit(alloc);
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    defer fields.deinit(alloc);
+    var config_index: usize = 0;
+    for (declared) |d| {
+        if (ctx.parseStoredJson(alloc, d.stored_json)) |probe| {
+            var p = probe;
+            p.deinit();
+        } else |_| continue;
+        const config = &configs.items[config_index];
+        config_index += 1;
+        for (config.sources) |*source| {
+            const targets_this = if (source.table_id.len == 0)
+                d.dependent_table_id.len == 0 or std.mem.eql(u8, d.dependent_table_id, own_table_id)
+            else
+                std.mem.eql(u8, source.table_id, own_table_id);
+            if (!targets_this) continue;
+            try items.append(alloc, .{
+                .dependent_table_id = d.dependent_table_id,
+                .artifact = d.artifact,
+                .source = source,
+                .spec = source.specDigest(),
+                .refresh = config.refresh,
+            });
+            for (source.fields) |f| try fields.append(alloc, f);
+            for (source.conjuncts) |c| try fields.append(alloc, c.field);
+        }
+    }
+    std.mem.sort([]const u8, fields.items, {}, struct {
+        fn lt(_: void, l: []const u8, r: []const u8) bool {
+            return std.mem.lessThan(u8, l, r);
+        }
+    }.lt);
+    var unique = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer unique.deinit(alloc);
+    for (fields.items) |f| {
+        if (unique.items.len != 0 and std.mem.eql(u8, unique.items[unique.items.len - 1], f)) continue;
+        try unique.append(alloc, f);
+    }
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    for (unique.items) |f| {
+        h.update(f);
+        h.update(&.{0});
+    }
+    var digest: Digest = undefined;
+    h.final(&digest);
+    return .{
+        .alloc = alloc,
+        .configs = try configs.toOwnedSlice(alloc),
+        .items = try items.toOwnedSlice(alloc),
+        .union_fields = try unique.toOwnedSlice(alloc),
+        .fields_digest = digest,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Keys and records
+// ---------------------------------------------------------------------------
+
+pub fn shadowKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    errdefer list.deinit(alloc);
+    try list.append(alloc, store.user_namespace);
+    for (doc_key) |b| {
+        if (b == 0) try list.appendSlice(alloc, &.{ 0, 0xff }) else try list.append(alloc, b);
+    }
+    try list.appendSlice(alloc, &.{ 0, 0, shadow_kind });
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn outboxKey(sequence: u64, ordinal: u32) [16]u8 {
+    var out: [16]u8 = undefined;
+    @memcpy(out[0..4], &store.familyPrefix(outbox_family));
+    std.mem.writeInt(u64, out[4..12], sequence, .big);
+    std.mem.writeInt(u32, out[12..16], ordinal, .big);
+    return out;
+}
+
+pub const Notice = struct {
+    dependent_table_id: []const u8,
+    artifact: []const u8,
+    source_name: []const u8,
+    source_table_id: []const u8,
+    key: []const u8,
+    spec: Digest,
+    tuple: Digest = @splat(0),
+    /// Spec-wide: every subscriber of `spec` (tuple ignored).
+    all: bool = false,
+    change: ctx.ChangeKind,
+    refresh: ctx.Refresh,
+    sequence: u64,
+    /// Fan-out continuation cursor (subscription key) when non-empty.
+    resume_after: []const u8 = "",
+};
+
+pub fn encodeNoticeAlloc(alloc: Allocator, n: Notice) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.print(alloc, "{{\"format\":{d},\"dependent_table_id\":", .{notice_format});
+    try ctx.appendJsonString(alloc, &out, n.dependent_table_id);
+    try out.appendSlice(alloc, ",\"artifact\":");
+    try ctx.appendJsonString(alloc, &out, n.artifact);
+    try out.appendSlice(alloc, ",\"source\":");
+    try ctx.appendJsonString(alloc, &out, n.source_name);
+    try out.appendSlice(alloc, ",\"source_table_id\":");
+    try ctx.appendJsonString(alloc, &out, n.source_table_id);
+    try out.appendSlice(alloc, ",\"key\":");
+    try ctx.appendJsonString(alloc, &out, n.key);
+    try out.print(alloc, ",\"spec\":\"{x}\",\"tuple\":\"{x}\",\"all\":{},\"change\":\"{s}\",\"refresh\":\"{s}\",\"debounce_ms\":{d},\"sequence\":{d},\"resume_after\":\"{x}\"}}", .{
+        &n.spec, &n.tuple, n.all, @tagName(n.change), @tagName(n.refresh.mode), n.refresh.debounce_ms, n.sequence, n.resume_after,
+    });
+    return try out.toOwnedSlice(alloc);
+}
+
+pub const DecodedNotice = struct {
+    arena: std.heap.ArenaAllocator,
+    notice: Notice,
+
+    pub fn deinit(self: *DecodedNotice) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn decodeNoticeAlloc(alloc: Allocator, raw: []const u8) !DecodedNotice {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const value = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch return error.InvalidContextNotice;
+    if (value != .object) return error.InvalidContextNotice;
+    const o = value.object;
+    const str = struct {
+        fn get(obj: std.json.ObjectMap, name: []const u8) ![]const u8 {
+            const v = obj.get(name) orelse return error.InvalidContextNotice;
+            if (v != .string) return error.InvalidContextNotice;
+            return v.string;
+        }
+        fn int(obj: std.json.ObjectMap, name: []const u8) !u64 {
+            const v = obj.get(name) orelse return error.InvalidContextNotice;
+            if (v != .integer or v.integer < 0) return error.InvalidContextNotice;
+            return @intCast(v.integer);
+        }
+        fn digest(obj: std.json.ObjectMap, name: []const u8) !Digest {
+            const hex = try get(obj, name);
+            if (hex.len != 64) return error.InvalidContextNotice;
+            var out: Digest = undefined;
+            _ = std.fmt.hexToBytes(&out, hex) catch return error.InvalidContextNotice;
+            return out;
+        }
+    };
+    if (try str.int(o, "format") != notice_format) return error.InvalidContextNotice;
+    const resume_hex = try str.get(o, "resume_after");
+    const resume_after = try a.alloc(u8, resume_hex.len / 2);
+    _ = std.fmt.hexToBytes(resume_after, resume_hex) catch return error.InvalidContextNotice;
+    const all = o.get("all") orelse return error.InvalidContextNotice;
+    if (all != .bool) return error.InvalidContextNotice;
+    return .{ .arena = arena, .notice = .{
+        .dependent_table_id = try str.get(o, "dependent_table_id"),
+        .artifact = try str.get(o, "artifact"),
+        .source_name = try str.get(o, "source"),
+        .source_table_id = try str.get(o, "source_table_id"),
+        .key = try str.get(o, "key"),
+        .spec = try str.digest(o, "spec"),
+        .tuple = try str.digest(o, "tuple"),
+        .all = all.bool,
+        .change = std.meta.stringToEnum(ctx.ChangeKind, try str.get(o, "change")) orelse return error.InvalidContextNotice,
+        .refresh = .{
+            .mode = std.meta.stringToEnum(ctx.RefreshMode, try str.get(o, "refresh")) orelse return error.InvalidContextNotice,
+            .debounce_ms = try str.int(o, "debounce_ms"),
+        },
+        .sequence = try str.int(o, "sequence"),
+        .resume_after = resume_after,
+    } };
+}
+
+// ---------------------------------------------------------------------------
+// Source side: shadow + outbox staging
+// ---------------------------------------------------------------------------
+
+pub const RowChange = struct {
+    key: []const u8,
+    /// Logical JSON of the new row; null for a delete (including TTL expiry).
+    next: ?[]const u8,
+};
+
+pub const StageResult = struct {
+    notices: usize = 0,
+    next_ordinal: u32 = 0,
+};
+
+/// Shadow value: fields digest (32 bytes) followed by the canonical
+/// projection JSON of the union fields.
+fn encodeShadowAlloc(alloc: Allocator, digest: Digest, projection: []const u8) ![]u8 {
+    return std.mem.concat(alloc, u8, &.{ &digest, projection });
+}
+
+/// Stage notices for a batch of row changes. `sequence` orders the outbox;
+/// `first_ordinal` lets several stages share one sequence.
+pub fn planStageNotices(
+    alloc: Allocator,
+    reader: store.Reader,
+    plan: *store.Plan,
+    specs: *const SourceSpecs,
+    own_table_id: []const u8,
+    sequence: u64,
+    first_ordinal: u32,
+    changes: []const RowChange,
+    shadows_complete: bool,
+) !StageResult {
+    var result = StageResult{ .next_ordinal = first_ordinal };
+    if (specs.isEmpty()) return result;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    for (changes) |change| {
+        _ = arena.reset(.retain_capacity);
+        const a = arena.allocator();
+        const skey = try shadowKeyAlloc(a, change.key);
+        const previous_raw: ?[]const u8 = switch (plan.pending(skey)) {
+            .put => |v| v,
+            .deleted => null,
+            .untouched => try reader.get(a, skey),
+        };
+        var previous: ?std.json.Value = null;
+        var previous_unknown = false;
+        if (previous_raw) |raw| {
+            if (raw.len >= 32 and std.mem.eql(u8, raw[0..32], &specs.fields_digest)) {
+                previous = std.json.parseFromSliceLeaky(std.json.Value, a, raw[32..], .{}) catch null;
+                if (previous == null) previous_unknown = true;
+            } else previous_unknown = true;
+        } else if (!shadows_complete) {
+            // Pre-registration row (or backfill still running): its previous
+            // contribution is unknown, so notify spec-wide.
+            previous_unknown = true;
+        }
+        var next: ?std.json.Value = null;
+        var next_projection: ?[]u8 = null;
+        if (change.next) |raw| {
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch null;
+            if (parsed) |row| if (row == .object) {
+                next_projection = try ctx.projectAlloc(a, row, specs.union_fields);
+                next = try std.json.parseFromSliceLeaky(std.json.Value, a, next_projection.?, .{});
+            };
+        }
+        if (!previous_unknown and previous == null and next == null) continue;
+        if (!previous_unknown and previous != null and next_projection != null and previous_raw != null and
+            std.mem.eql(u8, previous_raw.?[32..], next_projection.?)) continue;
+
+        for (specs.items) |binding| {
+            if (previous_unknown) {
+                const change_kind: ctx.ChangeKind = if (binding.source.kind == .document)
+                    (if (next == null) .document_deleted else .document_changed)
+                else
+                    (if (next == null) .member_removed else .member_changed);
+                if (binding.source.kind == .document) {
+                    // Document subscriptions are keyed by the row key, so the
+                    // exact tuple is known even without a shadow.
+                    try stage(alloc, plan, binding, own_table_id, change.key, ctx.documentTuple(binding.spec, change.key), false, change_kind, sequence, &result);
+                } else {
+                    try stage(alloc, plan, binding, own_table_id, change.key, @splat(0), true, change_kind, sequence, &result);
+                }
+                continue;
+            }
+            var touched = try ctx.touchedTuplesAlloc(a, binding.source, change.key, previous, next);
+            defer touched.deinit(a);
+            if (touched.all) {
+                try stage(alloc, plan, binding, own_table_id, change.key, @splat(0), true, touched.all_change, sequence, &result);
+                continue;
+            }
+            for (touched.tuples) |t| try stage(alloc, plan, binding, own_table_id, change.key, t.tuple, false, t.change, sequence, &result);
+        }
+
+        if (next_projection) |projection| {
+            try plan.putOwned(try alloc.dupe(u8, skey), try encodeShadowAlloc(alloc, specs.fields_digest, projection));
+        } else {
+            try plan.delete(skey);
+        }
+    }
+    return result;
+}
+
+fn stage(alloc: Allocator, plan: *store.Plan, binding: SpecBinding, own_table_id: []const u8, key: []const u8, tuple: Digest, all: bool, change: ctx.ChangeKind, sequence: u64, result: *StageResult) !void {
+    const value = try encodeNoticeAlloc(alloc, .{
+        .dependent_table_id = binding.dependent_table_id,
+        .artifact = binding.artifact,
+        .source_name = binding.source.name,
+        .source_table_id = own_table_id,
+        .key = key,
+        .spec = binding.spec,
+        .tuple = tuple,
+        .all = all,
+        .change = change,
+        .refresh = binding.refresh,
+        .sequence = sequence,
+    });
+    errdefer alloc.free(value);
+    const okey = outboxKey(sequence, result.next_ordinal);
+    try plan.putOwned(try alloc.dupe(u8, &okey), value);
+    result.next_ordinal += 1;
+    result.notices += 1;
+}
+
+pub const BackfillResult = struct {
+    rows: usize,
+    resume_after: ?[]u8,
+};
+
+/// Write covering shadows for existing rows in one bounded page. Callers
+/// pass rows from a document scan (key + logical JSON); the scan cursor is
+/// the caller's. Writes nothing for rows whose shadow already covers the
+/// current fields.
+pub fn planBackfillShadows(alloc: Allocator, reader: store.Reader, plan: *store.Plan, specs: *const SourceSpecs, rows: []const RowChange) !usize {
+    var written: usize = 0;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    for (rows) |row| {
+        _ = arena.reset(.retain_capacity);
+        const a = arena.allocator();
+        const raw = row.next orelse continue;
+        const skey = try shadowKeyAlloc(a, row.key);
+        if (try reader.get(a, skey)) |existing| {
+            if (existing.len >= 32 and std.mem.eql(u8, existing[0..32], &specs.fields_digest)) continue;
+        }
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch continue;
+        if (parsed != .object) continue;
+        const projection = try ctx.projectAlloc(a, parsed, specs.union_fields);
+        try plan.putOwned(try alloc.dupe(u8, skey), try encodeShadowAlloc(alloc, specs.fields_digest, projection));
+        written += 1;
+    }
+    return written;
+}
+
+// ---------------------------------------------------------------------------
+// Dependent side
+// ---------------------------------------------------------------------------
+
+pub const Target = struct {
+    artifact: []u8,
+    doc_key: []u8,
+};
+
+pub const ApplyResult = struct {
+    /// Rebuild now (background, no debounce).
+    rebuild: std.ArrayListUnmanaged(Target) = .empty,
+    /// Already queued in the debounce queue by the plan.
+    debounced: usize = 0,
+    /// Marked stale only (manual refresh).
+    stale_only: usize = 0,
+    /// Remaining fan-out to re-enqueue (owned encoded notice), if any.
+    continuation: ?[]u8 = null,
+
+    pub fn deinit(self: *ApplyResult, alloc: Allocator) void {
+        for (self.rebuild.items) |t| {
+            alloc.free(t.artifact);
+            alloc.free(t.doc_key);
+        }
+        self.rebuild.deinit(alloc);
+        if (self.continuation) |c| alloc.free(c);
+        self.* = undefined;
+    }
+};
+
+/// Apply one notice to this dependent DB's subscriptions. `range_*` bound
+/// the dependents this shard owns.
+pub fn planApplyNotice(
+    alloc: Allocator,
+    reader: store.Reader,
+    plan: *store.Plan,
+    notice: Notice,
+    now_ms: u64,
+    range_lower: []const u8,
+    range_upper: []const u8,
+    page: usize,
+) !ApplyResult {
+    var result = ApplyResult{};
+    errdefer result.deinit(alloc);
+    const background = notice.refresh.mode == .background;
+    const options = store.InvalidateOptions{
+        .source = notice.source_name,
+        .change = notice.change,
+        .table_id = notice.source_table_id,
+        .key = notice.key,
+        .queue_rebuild = background,
+        .range_lower = range_lower,
+        .range_upper = range_upper,
+        .resume_after = notice.resume_after,
+        .max_targets = page,
+    };
+    var invalidated = if (notice.all)
+        try store.planInvalidateSpec(alloc, reader, plan, notice.spec, options)
+    else
+        try store.planInvalidateTuple(alloc, reader, plan, notice.spec, notice.tuple, options);
+    defer invalidated.deinit(alloc);
+    for (invalidated.targets.items) |t| {
+        // A spec may be shared by identical declarations on several
+        // enrichments; only the notice's artifact is rebuilt by it.
+        if (!std.mem.eql(u8, t.artifact, notice.artifact)) continue;
+        if (!background) {
+            result.stale_only += 1;
+        } else if (notice.refresh.debounce_ms != 0) {
+            try store.planQueueDebounced(plan, now_ms +| notice.refresh.debounce_ms, t.artifact, t.doc_key);
+            result.debounced += 1;
+        } else {
+            const artifact = try alloc.dupe(u8, t.artifact);
+            errdefer alloc.free(artifact);
+            try result.rebuild.append(alloc, .{ .artifact = artifact, .doc_key = try alloc.dupe(u8, t.doc_key) });
+        }
+    }
+    if (invalidated.resume_after) |cursor| {
+        var next = notice;
+        next.resume_after = cursor;
+        result.continuation = try encodeNoticeAlloc(alloc, next);
+    }
+    return result;
+}
+
+pub const OutboxEntry = struct {
+    key: []u8,
+    value: []u8,
+};
+
+pub fn readOutboxAlloc(alloc: Allocator, reader: store.Reader, limit: usize) ![]OutboxEntry {
+    var out = std.ArrayListUnmanaged(OutboxEntry).empty;
+    errdefer {
+        for (out.items) |e| {
+            alloc.free(e.key);
+            alloc.free(e.value);
+        }
+        out.deinit(alloc);
+    }
+    const Collect = struct {
+        alloc: Allocator,
+        out: *std.ArrayListUnmanaged(OutboxEntry),
+        limit: usize,
+        fn visit(p: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            const k = try self.alloc.dupe(u8, key);
+            errdefer self.alloc.free(k);
+            try self.out.append(self.alloc, .{ .key = k, .value = try self.alloc.dupe(u8, value) });
+            return self.out.items.len < self.limit;
+        }
+    };
+    var collect = Collect{ .alloc = alloc, .out = &out, .limit = limit };
+    try reader.scanPrefix(alloc, &store.familyPrefix(outbox_family), .{ .ptr = &collect, .visit_fn = Collect.visit });
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn freeOutbox(alloc: Allocator, entries: []OutboxEntry) void {
+    for (entries) |e| {
+        alloc.free(e.key);
+        alloc.free(e.value);
+    }
+    alloc.free(entries);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+const policies_config =
+    \\{"sources":{"policies":{"query":{"table":"policies","table_id":"tp","filter_query":{"conjuncts":[
+    \\ {"field":"org","term":{"$source":"/org"}},{"field":"status","term":"approved"}]}},
+    \\ "fields":["text"],"max_documents":10,"max_bytes":4096,"overflow":"error"},
+    \\ "org":{"document":{"table":"orgs","table_id":"to","key_from":"/org"},"fields":["voice"],"required":false,"max_bytes":4096,"overflow":"error"}},
+    \\ "refresh":{"mode":"background","debounce_ms":0}}
+;
+
+fn stageOne(alloc: Allocator, s: *store.MemoryStore, specs: *const SourceSpecs, table: []const u8, seq: u64, key: []const u8, next: ?[]const u8) !usize {
+    var plan = store.Plan.init(alloc);
+    defer plan.deinit();
+    const r = try planStageNotices(alloc, s.reader(), &plan, specs, table, seq, 0, &.{.{ .key = key, .next = next }}, true);
+    try s.apply(&plan);
+    return r.notices;
+}
+
+test "source specs select only sources targeting this table" {
+    const alloc = testing.allocator;
+    var specs = try buildSourceSpecs(alloc, "tp", &.{.{ .dependent_table_id = "td", .artifact = "summary", .stored_json = policies_config }});
+    defer specs.deinit();
+    try testing.expectEqual(@as(usize, 1), specs.items.len);
+    try testing.expectEqualStrings("policies", specs.items[0].source.name);
+    try testing.expectEqual(@as(usize, 3), specs.union_fields.len); // org, status, text
+    var none = try buildSourceSpecs(alloc, "other", &.{.{ .dependent_table_id = "td", .artifact = "summary", .stored_json = policies_config }});
+    defer none.deinit();
+    try testing.expect(none.isEmpty());
+}
+
+test "end to end: staged notices invalidate exactly the affected dependents" {
+    const alloc = testing.allocator;
+    var source_store = store.MemoryStore{ .alloc = alloc };
+    defer source_store.deinit();
+    var dependent_store = store.MemoryStore{ .alloc = alloc };
+    defer dependent_store.deinit();
+    var specs = try buildSourceSpecs(alloc, "tp", &.{.{ .dependent_table_id = "td", .artifact = "summary", .stored_json = policies_config }});
+    defer specs.deinit();
+
+    // Dependents: doc-a binds org o1, doc-b binds org o2.
+    var config = try ctx.parseStoredJson(alloc, policies_config);
+    defer config.deinit();
+    for ([_][2][]const u8{ .{ "doc-a", "{\"org\":\"o1\"}" }, .{ "doc-b", "{\"org\":\"o2\"}" } }) |dep| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const doc = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), dep[1], .{});
+        var bindings = try ctx.bindAlloc(alloc, &config, doc);
+        defer bindings.deinit();
+        const tuples = try bindings.allTuplesAlloc(alloc);
+        defer alloc.free(tuples);
+        var plan = store.Plan.init(alloc);
+        defer plan.deinit();
+        const c = try store.planRegister(alloc, dependent_store.reader(), &plan, dep[0], "summary", tuples, config.digest());
+        try dependent_store.apply(&plan);
+        plan.deinit();
+        plan = store.Plan.init(alloc);
+        _ = try store.planPublish(alloc, dependent_store.reader(), &plan, dep[0], "summary", .{ .capture = c, .tuples = tuples, .input_fingerprint = @splat(1) });
+        try dependent_store.apply(&plan);
+    }
+
+    const Deliver = struct {
+        fn run(a: Allocator, src: *store.MemoryStore, dst: *store.MemoryStore) ![]const u8 {
+            const entries = try readOutboxAlloc(a, src.reader(), 100);
+            defer freeOutbox(a, entries);
+            var rebuilt = std.ArrayListUnmanaged(u8).empty;
+            defer rebuilt.deinit(a);
+            var plan = store.Plan.init(a);
+            defer plan.deinit();
+            for (entries) |e| {
+                var decoded = try decodeNoticeAlloc(a, e.value);
+                defer decoded.deinit();
+                var applied = try planApplyNotice(a, dst.reader(), &plan, decoded.notice, 0, "", "", 16);
+                defer applied.deinit(a);
+                for (applied.rebuild.items) |t| {
+                    try rebuilt.appendSlice(a, t.doc_key);
+                    try rebuilt.append(a, ' ');
+                }
+                try plan.delete(e.key);
+            }
+            try dst.apply(&plan);
+            try src.apply(&plan);
+            return try a.dupe(u8, rebuilt.items);
+        }
+    };
+
+    // First approved policy for o1 (empty result before): doc-a only.
+    try testing.expectEqual(@as(usize, 1), try stageOne(alloc, &source_store, &specs, "tp", 1, "p1", "{\"org\":\"o1\",\"status\":\"approved\",\"text\":\"t\"}"));
+    const r1 = try Deliver.run(alloc, &source_store, &dependent_store);
+    defer alloc.free(r1);
+    try testing.expectEqualStrings("doc-a ", r1);
+
+    // Unconsumed field edit: nothing staged.
+    try testing.expectEqual(@as(usize, 0), try stageOne(alloc, &source_store, &specs, "tp", 2, "p1", "{\"org\":\"o1\",\"status\":\"approved\",\"text\":\"t\",\"note\":\"x\"}"));
+    // Draft in another org: nothing.
+    try testing.expectEqual(@as(usize, 0), try stageOne(alloc, &source_store, &specs, "tp", 3, "p9", "{\"org\":\"o2\",\"status\":\"draft\",\"text\":\"t\"}"));
+    // Move p1 from o1 to o2: leaves o1 and enters o2 -> both dependents.
+    try testing.expectEqual(@as(usize, 2), try stageOne(alloc, &source_store, &specs, "tp", 4, "p1", "{\"org\":\"o2\",\"status\":\"approved\",\"text\":\"t\"}"));
+    const r2 = try Deliver.run(alloc, &source_store, &dependent_store);
+    defer alloc.free(r2);
+    try testing.expect(std.mem.indexOf(u8, r2, "doc-a") != null and std.mem.indexOf(u8, r2, "doc-b") != null);
+    // Delete (or TTL expiry): leaves o2.
+    try testing.expectEqual(@as(usize, 1), try stageOne(alloc, &source_store, &specs, "tp", 5, "p1", null));
+    const r3 = try Deliver.run(alloc, &source_store, &dependent_store);
+    defer alloc.free(r3);
+    try testing.expectEqualStrings("doc-b ", r3);
+    try testing.expectEqual(@as(usize, 0), source_store.countPrefix(&store.familyPrefix(outbox_family)));
+
+    var state = (try store.loadState(alloc, dependent_store.reader(), null, "doc-b", "summary")).?;
+    defer state.deinit(alloc);
+    try testing.expectEqual(store.Freshness.stale, state.freshness);
+    try testing.expectEqual(@as(usize, 2), state.reasons.len);
+}
+
+test "rows without covering shadows notify spec-wide until backfilled" {
+    const alloc = testing.allocator;
+    var s = store.MemoryStore{ .alloc = alloc };
+    defer s.deinit();
+    var specs = try buildSourceSpecs(alloc, "tp", &.{.{ .dependent_table_id = "td", .artifact = "summary", .stored_json = policies_config }});
+    defer specs.deinit();
+    var plan = store.Plan.init(alloc);
+    defer plan.deinit();
+    const r = try planStageNotices(alloc, s.reader(), &plan, &specs, "tp", 1, 0, &.{.{ .key = "old", .next = "{\"org\":\"o1\",\"status\":\"approved\"}" }}, false);
+    try testing.expectEqual(@as(usize, 1), r.notices);
+    const entry = plan.puts.items[0];
+    var decoded = try decodeNoticeAlloc(alloc, entry.value);
+    defer decoded.deinit();
+    try testing.expect(decoded.notice.all);
+
+    var bplan = store.Plan.init(alloc);
+    defer bplan.deinit();
+    try testing.expectEqual(@as(usize, 1), try planBackfillShadows(alloc, s.reader(), &bplan, &specs, &.{.{ .key = "older", .next = "{\"org\":\"o2\",\"status\":\"approved\"}" }}));
+    try s.apply(&bplan);
+    var plan2 = store.Plan.init(alloc);
+    defer plan2.deinit();
+    const r2 = try planStageNotices(alloc, s.reader(), &plan2, &specs, "tp", 2, 0, &.{.{ .key = "older", .next = "{\"org\":\"o2\",\"status\":\"approved\",\"z\":1}" }}, false);
+    try testing.expectEqual(@as(usize, 0), r2.notices);
+}
+
+test "fan-out continuation, manual refresh, and debounce" {
+    const alloc = testing.allocator;
+    var s = store.MemoryStore{ .alloc = alloc };
+    defer s.deinit();
+    const spec: Digest = @splat(3);
+    const tuple: Digest = @splat(4);
+    var buf: [16]u8 = undefined;
+    var plan = store.Plan.init(alloc);
+    defer plan.deinit();
+    for (0..5) |i| _ = try store.planRegister(alloc, s.reader(), &plan, try std.fmt.bufPrint(&buf, "d{d}", .{i}), "x", &.{.{ .spec = spec, .tuple = tuple }}, @splat(1));
+    try s.apply(&plan);
+    const base = Notice{ .dependent_table_id = "", .artifact = "x", .source_name = "s", .source_table_id = "t", .key = "k", .spec = spec, .tuple = tuple, .change = .member_added, .refresh = .{}, .sequence = 1 };
+    var total: usize = 0;
+    var current: ?DecodedNotice = null;
+    defer if (current) |*c| c.deinit();
+    var pages: usize = 0;
+    while (true) : (pages += 1) {
+        var p = store.Plan.init(alloc);
+        defer p.deinit();
+        var applied = try planApplyNotice(alloc, s.reader(), &p, if (current) |c| c.notice else base, 0, "", "", 2);
+        defer applied.deinit(alloc);
+        total += applied.rebuild.items.len;
+        try s.apply(&p);
+        const cont = applied.continuation orelse break;
+        const next = try decodeNoticeAlloc(alloc, cont);
+        if (current) |*c| c.deinit();
+        current = next;
+    }
+    try testing.expectEqual(@as(usize, 2), pages);
+    try testing.expectEqual(@as(usize, 5), total);
+
+    var manual = base;
+    manual.refresh = .{ .mode = .manual };
+    var mp = store.Plan.init(alloc);
+    defer mp.deinit();
+    var applied = try planApplyNotice(alloc, s.reader(), &mp, manual, 0, "", "", 16);
+    defer applied.deinit(alloc);
+    try testing.expectEqual(@as(usize, 5), applied.stale_only);
+    try testing.expectEqual(@as(usize, 0), applied.rebuild.items.len);
+
+    var debounced = manual;
+    debounced.refresh = .{ .mode = .background, .debounce_ms = 2000 };
+    var dp = store.Plan.init(alloc);
+    defer dp.deinit();
+    var da = try planApplyNotice(alloc, s.reader(), &dp, debounced, 1000, "", "", 16);
+    defer da.deinit(alloc);
+    try testing.expectEqual(@as(usize, 5), da.debounced);
+    try s.apply(&dp);
+    var drain = store.Plan.init(alloc);
+    defer drain.deinit();
+    const early = try store.planDrainDebounced(alloc, s.reader(), &drain, 2000, 100);
+    defer store.freeTargets(alloc, early);
+    try testing.expectEqual(@as(usize, 0), early.len);
+    const due = try store.planDrainDebounced(alloc, s.reader(), &drain, 3000, 100);
+    defer store.freeTargets(alloc, due);
+    try testing.expectEqual(@as(usize, 5), due.len);
+}
+
+test "notice encoding round trips" {
+    const alloc = testing.allocator;
+    const raw = try encodeNoticeAlloc(alloc, .{ .dependent_table_id = "d\"q", .artifact = "a", .source_name = "s", .source_table_id = "t", .key = "k\x00", .spec = @splat(1), .tuple = @splat(2), .change = .member_changed, .refresh = .{ .mode = .manual, .debounce_ms = 5 }, .sequence = 9, .resume_after = "\x01\x02" });
+    defer alloc.free(raw);
+    var decoded = try decodeNoticeAlloc(alloc, raw);
+    defer decoded.deinit();
+    try testing.expectEqualStrings("d\"q", decoded.notice.dependent_table_id);
+    try testing.expectEqualStrings("k\x00", decoded.notice.key);
+    try testing.expectEqual(ctx.RefreshMode.manual, decoded.notice.refresh.mode);
+    try testing.expectEqualSlices(u8, "\x01\x02", decoded.notice.resume_after);
+}

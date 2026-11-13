@@ -2675,6 +2675,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .key = table_catalog_mod.key,
                 .value = &table_catalog_value,
             });
+            // Context-source dependencies: shadow updates, change notices,
+            // and dependent cleanup commit atomically with the primary rows.
+            try @import("context_dependency_db.zig").stageForBatch(
+                S.ownerField(self, "alloc").*,
+                S.ownerField(self, "core").*.store,
+                S.ownerField(self, "core").*.index_manager,
+                sequence,
+                effective_req.writes,
+                effective_req.deletes,
+                &write_buffers.store_writes,
+                &owned_child_range_outbox_keys,
+                &owned_child_range_outbox_values,
+                &write_buffers.delete_keys,
+                &write_buffers.owned_delete_keys,
+            );
             try appendDocumentChildRangeOutboxWrites(
                 S.ownerField(self, "alloc").*,
                 sequence,

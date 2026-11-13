@@ -196,6 +196,12 @@ const replication_record_mod = @import("replication_record.zig");
 
 const replay_stream_mod = @import("derived/replay_stream.zig");
 const derived_types = @import("derived/derived_types.zig");
+const context_dependency_db = @import("context_dependency_db.zig");
+const context_dependency_store = @import("enrichment/context_dependency_store.zig");
+
+fn contextNowMs() u64 {
+    return @intCast(@divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms));
+}
 const derived_worker = @import("derived/derived_worker.zig");
 const derived_executor_mod = @import("derived/derived_executor.zig");
 const background_runtime_mod = @import("../background_runtime.zig");
@@ -3178,6 +3184,14 @@ pub const DB = struct {
     resolver_workers_enabled: bool,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    /// Immutable identity of this DB's table for context-source dependencies
+    /// (empty for a standalone single-table DB). Set by multi-table hosts.
+    context_source_table_id: []const u8 = "",
+    /// Host reader serving foreign table identities for context sources.
+    /// Without one, only this table's own documents can be context.
+    context_source_host_reader: ?@import("enrichment/context_resolution.zig").Reader = null,
+    /// Host delivery of change notices to foreign dependent tables.
+    context_notice_dispatcher: ?context_dependency_db.Dispatcher = null,
     enrichment_owner: EnrichmentOwner = .{},
     query_recovery_owner: DetachedEnrichmentRuntime = .{},
     // Keep one reconstruction service owner when live producers are removed.
@@ -5758,6 +5772,8 @@ pub const DB = struct {
         runtime_cfg.root_incarnation = self.root_incarnation;
         if (runtime_cfg.secret_store == null) runtime_cfg.secret_store = self.secret_store;
         if (runtime_cfg.remote_content == null) runtime_cfg.remote_content = self.remote_content;
+        if (runtime_cfg.context_source_reader == null) runtime_cfg.context_source_reader = self.context_source_host_reader orelse
+            @import("context_source_db_reader.zig").ownTable(DB, self, self.context_source_table_id);
         if (runtime_cfg.resource_manager == null) runtime_cfg.resource_manager = self.core.index_manager.resource_manager;
         if (runtime_cfg.io == null) runtime_cfg.io = self.backend_runtime.inferenceIo();
         runtime_cfg.relational_base_rows = relationalColumns(self) != null;
@@ -8983,6 +8999,7 @@ pub const DB = struct {
         var committed = false;
         var tracked = opts;
         tracked.primary_committed = opts.primary_committed orelse &committed;
+        defer if (tracked.primary_committed.?.*) self.drainContextNoticeOutboxBestEffort();
         self.batchInternalWithVisibility(req, profile, tracked) catch |err| {
             if (tracked.primary_committed.?.*) switch (err) {
                 error.TextMergeBackpressureTimeout,
@@ -10234,6 +10251,203 @@ pub const DB = struct {
     pub const appendGraphTransformDelete = local_mutation.appendGraphTransformDelete;
 
     pub const coalesceKeyValueRequest = local_mutation.coalesceKeyValueRequest;
+
+    /// Table identity recorded in context-source lineage and subscriptions.
+    pub fn contextSourceTableId(self: *const DB) []const u8 {
+        return self.context_source_table_id;
+    }
+
+    /// Install the host's context-dependency topology: this table's immutable
+    /// identity, foreign enrichments whose context sources read this table
+    /// (`inbound`), a reader serving foreign tables to this table's own
+    /// enrichments, and a dispatcher delivering notices to foreign dependents.
+    /// Hosts call this on open and whenever a dependent enrichment changes.
+    /// The reader takes effect for enrichment workers started afterwards.
+    pub fn setContextDependencyHost(
+        self: *DB,
+        table_id: []const u8,
+        inbound: []const @import("enrichment/context_notices.zig").DeclaredConfig,
+        reader: ?@import("enrichment/context_resolution.zig").Reader,
+        dispatcher: ?context_dependency_db.Dispatcher,
+    ) !void {
+        self.core.lockApply();
+        defer self.core.unlockApply();
+        try self.core.index_manager.setContextDependencyHost(table_id, inbound);
+        self.context_source_table_id = self.core.index_manager.context_table_id;
+        self.context_source_host_reader = reader;
+        self.context_notice_dispatcher = dispatcher;
+    }
+
+    /// Apply change notices addressed to this table's dependents: advance
+    /// dependency generations, report staleness, and journal rebuilds through
+    /// the ordinary generated-enrichment replay. Idempotent; safe to retry.
+    pub fn applyContextNotices(self: *DB, encoded: []const []const u8) !usize {
+        const range = self.core.byteRange();
+        var summary = try context_dependency_db.applyNotices(self.alloc, self.core.store, self.core.index_manager, encoded, contextNowMs(), range.start, range.end);
+        defer summary.deinit(self.alloc);
+        const invalidated = summary.invalidated;
+        try self.journalContextRebuilds(&summary);
+        return invalidated;
+    }
+
+    fn journalContextRebuilds(self: *DB, summary: *context_dependency_db.ApplySummary) !void {
+        if (summary.rebuild_refs.len == 0) return;
+        var pending = derived_types.DerivedBatch{ .generated_enrichment_refs = summary.rebuild_refs };
+        summary.rebuild_refs = &.{};
+        defer derived_types.deinitDerivedBatch(self.alloc, &pending);
+        const sequence = try appendDerivedBatchRecord(self, pending);
+        self.executor.notifySequence(sequence);
+        if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+        self.notifyResolverReplayRuntimes(sequence);
+    }
+
+    /// Deliver committed change notices from this table's outbox. Own-table
+    /// notices apply locally; foreign ones go to the host dispatcher. An entry
+    /// is removed only after delivery succeeds, so failures retry on the next
+    /// drain (every commit, open, and maintenance pass). Hosts with replicated
+    /// owners call this only on the active leader.
+    pub fn drainContextNoticeOutbox(self: *DB, limit: usize) !context_dependency_db.DrainResult {
+        var result = context_dependency_db.DrainResult{};
+        const entries = try context_dependency_db.readOutbox(self.alloc, self.core.store, if (limit == 0) 256 else limit);
+        defer @import("enrichment/context_notices.zig").freeOutbox(self.alloc, entries);
+        result.remaining = limit != 0 and entries.len == limit;
+        var local = std.ArrayListUnmanaged([]const u8).empty;
+        defer local.deinit(self.alloc);
+        var done = std.ArrayListUnmanaged([]const u8).empty;
+        defer done.deinit(self.alloc);
+        for (entries) |entry| {
+            if (try context_dependency_db.isLocalNotice(self.alloc, entry.value, self.context_source_table_id)) {
+                try local.append(self.alloc, entry.value);
+                continue;
+            }
+            const dispatcher = self.context_notice_dispatcher orelse {
+                result.remaining = true;
+                continue;
+            };
+            const dependent = try context_dependency_db.dependentOf(self.alloc, entry.value);
+            defer self.alloc.free(dependent);
+            dispatcher.deliver(dispatcher.ptr, self.alloc, dependent, entry.value) catch |err| {
+                std.log.warn("context notice delivery deferred dependent={s} err={s}", .{ dependent, @errorName(err) });
+                result.remaining = true;
+                continue;
+            };
+            try done.append(self.alloc, entry.key);
+            result.delivered += 1;
+        }
+        if (local.items.len != 0) {
+            _ = try self.applyContextNotices(local.items);
+            for (entries) |entry| {
+                for (local.items) |value| if (value.ptr == entry.value.ptr) try done.append(self.alloc, entry.key);
+            }
+            result.local = local.items.len;
+        } else {
+            // Debounced rebuilds also drain on idle commits.
+            var summary = try context_dependency_db.drainDebounced(self.alloc, self.core.store, self.core.index_manager, contextNowMs());
+            defer summary.deinit(self.alloc);
+            try self.journalContextRebuilds(&summary);
+        }
+        try context_dependency_db.deleteOutboxKeys(self.core.store, done.items);
+        return result;
+    }
+
+    fn drainContextNoticeOutboxBestEffort(self: *DB) void {
+        if (!self.core.index_manager.hasContextDependents()) return;
+        // Bounded incremental shadow backfill: one page per commit until the
+        // table's rows are covered for the current dependent field set.
+        _ = self.advanceContextShadowBackfill(256) catch |err| blk: {
+            std.log.warn("context shadow backfill deferred: {s}", .{@errorName(err)});
+            break :blk false;
+        };
+        var rounds: usize = 0;
+        while (rounds < 8) : (rounds += 1) {
+            const result = self.drainContextNoticeOutbox(256) catch |err| {
+                std.log.warn("context notice drain deferred: {s}", .{@errorName(err)});
+                return;
+            };
+            if (!result.remaining or result.delivered + result.local == 0) return;
+        }
+    }
+
+    const context_shadow_cursor_key = "\x00\x00__metadata__:context_dependency:shadows_cursor";
+
+    /// Advance the persisted shadow backfill by one page. Returns true when
+    /// shadows are complete for the current dependent field set.
+    pub fn advanceContextShadowBackfill(self: *DB, page_rows: u32) !bool {
+        {
+            var reader = try context_dependency_db.StoreReader.init(self.core.store);
+            defer reader.deinit();
+            if (try context_dependency_db.shadowsCompleteForCurrent(self.alloc, reader.reader(), self.core.index_manager)) return true;
+        }
+        const cursor = try self.core.getStoreValue(self.alloc, context_shadow_cursor_key);
+        defer if (cursor) |value| self.alloc.free(value);
+        const page = try self.backfillContextShadows(cursor orelse "", page_rows);
+        defer if (page.next_key) |key| self.alloc.free(key);
+        if (page.next_key) |key| {
+            try self.core.store.put(context_shadow_cursor_key, key);
+        } else {
+            try self.core.store.putBatch(&.{}, &.{context_shadow_cursor_key});
+        }
+        return page.done;
+    }
+
+    /// Cover existing rows with shadows after a dependent declaration was
+    /// added, one page per call. Returns true when the table is complete; until
+    /// then writes to uncovered rows notify spec-wide (safe over-invalidation).
+    pub fn backfillContextShadows(self: *DB, resume_after: []const u8, page_rows: u32) !struct { done: bool, next_key: ?[]u8 } {
+        const Collect = struct {
+            alloc: Allocator,
+            rows: std.ArrayListUnmanaged(@import("enrichment/context_notices.zig").RowChange) = .empty,
+            limit: u32,
+            fn visit(raw: ?*anyopaque, entry: types.ScanVisitEntry) !void {
+                const c: *@This() = @ptrCast(@alignCast(raw.?));
+                const doc = entry.document_json orelse return;
+                const key = try c.alloc.dupe(u8, entry.id);
+                errdefer c.alloc.free(key);
+                try c.rows.append(c.alloc, .{ .key = key, .next = try c.alloc.dupe(u8, doc) });
+                if (c.rows.items.len >= c.limit) return error.Canceled;
+            }
+        };
+        var collect = Collect{ .alloc = self.alloc, .limit = if (page_rows == 0) 256 else page_rows };
+        defer {
+            for (collect.rows.items) |r| {
+                self.alloc.free(r.key);
+                if (r.next) |v| self.alloc.free(v);
+            }
+            collect.rows.deinit(self.alloc);
+        }
+        self.scanVisit(self.alloc, resume_after, "", .{ .include_documents = true, .resume_from_key = resume_after.len != 0 }, .{ .context = &collect, .visit = Collect.visit }) catch |err| switch (err) {
+            error.Canceled => {},
+            else => return err,
+        };
+        _ = try context_dependency_db.backfillShadowPage(self.alloc, self.core.store, self.core.index_manager, collect.rows.items);
+        if (collect.rows.items.len < collect.limit) {
+            try context_dependency_db.markShadowsComplete(self.alloc, self.core.store, self.core.index_manager);
+            return .{ .done = true, .next_key = null };
+        }
+        return .{ .done = false, .next_key = try self.alloc.dupe(u8, collect.rows.items[collect.rows.items.len - 1].key) };
+    }
+
+    /// Authoritative dependency state of one dependent artifact.
+    pub fn contextDependencyState(self: *DB, alloc: Allocator, doc_key: []const u8, artifact: []const u8) !?context_dependency_store.State {
+        var reader = try context_dependency_db.StoreReader.init(self.core.store);
+        defer reader.deinit();
+        return context_dependency_store.loadState(alloc, reader.reader(), null, doc_key, artifact);
+    }
+
+    /// Retained lineage manifest of one published version (null when pruned).
+    pub fn contextDependencyManifest(self: *DB, alloc: Allocator, doc_key: []const u8, artifact: []const u8, version: u64) !?[]u8 {
+        const key = try context_dependency_store.historyKeyAlloc(alloc, doc_key, artifact, version);
+        defer alloc.free(key);
+        return self.core.getStoreValue(alloc, key);
+    }
+
+    /// Direct reverse lineage of an input revision on this shard.
+    pub fn contextImpact(self: *DB, alloc: Allocator, table_id: []const u8, input_key: []const u8, revision: ?context_dependency_store.Digest, resume_after: []const u8, limit: usize) !context_dependency_store.ImpactPage {
+        var reader = try context_dependency_db.StoreReader.init(self.core.store);
+        defer reader.deinit();
+        const range = self.core.byteRange();
+        return context_dependency_store.queryImpact(alloc, reader.reader(), table_id, input_key, revision, resume_after, limit, range.start, range.end);
+    }
 
     pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
         if (comptime storage_engine.enabled) return storage_engine.call("get", .{ self, alloc, key });
@@ -153337,4 +153551,109 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
         count += 1;
     }
     try std.testing.expect(count > 3);
+}
+
+fn contextSourcesTestDeclarationAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
+    var config = try @import("enrichment/context_sources.zig").parsePublicJson(alloc, raw, "");
+    defer config.deinit();
+    return config.canonicalJsonAlloc(alloc);
+}
+
+fn contextSourcesTestCatchUp(db: *DB) !void {
+    try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+}
+
+test "db context sources invalidate and rebuild dependents on consumed input changes only" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("context-sources-document");
+    defer tmp.cleanup();
+    var producer = GateAssetProducer{};
+    producer.allowAll();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const declaration = try contextSourcesTestDeclarationAlloc(alloc,
+        \\{"organization":{"document":{"key_from":"/org"},"fields":["voice"]}}
+    );
+    defer alloc.free(declaration);
+    try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .context_sources_json = declaration });
+    var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
+    try db.initOptionalEnrichmentRuntime(&config);
+    // Registration covers existing rows (none yet) with shadows.
+    try std.testing.expect(try db.advanceContextShadowBackfill(64));
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "org:1", .value = "{\"voice\":\"warm\",\"logo\":\"a.png\"}" },
+        .{ .key = "doc:a", .value = "{\"body\":\"hello\",\"org\":\"org:1\"}" },
+    }, .sync_level = .write });
+    try contextSourcesTestCatchUp(&db);
+    {
+        var state = (try db.contextDependencyState(alloc, "doc:a", "summary")).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(context_dependency_store.Freshness.current, state.freshness);
+        try std.testing.expectEqual(@as(u64, 1), state.published_version);
+    }
+    const after_first = producer.successful_requests.load(.acquire);
+    try std.testing.expect(after_first >= 1);
+
+    // An unconsumed field changes: no notice, no producer call.
+    try db.batch(.{ .writes = &.{.{ .key = "org:1", .value = "{\"voice\":\"warm\",\"logo\":\"b.png\"}" }}, .sync_level = .write });
+    try contextSourcesTestCatchUp(&db);
+    {
+        var state = (try db.contextDependencyState(alloc, "doc:a", "summary")).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(context_dependency_store.Freshness.current, state.freshness);
+        try std.testing.expectEqual(@as(u64, 1), state.published_version);
+    }
+
+    // The consumed field changes: staleness is reported at commit, then the
+    // dependent rebuilds with the new context.
+    try db.batch(.{ .writes = &.{.{ .key = "org:1", .value = "{\"voice\":\"cold\",\"logo\":\"b.png\"}" }}, .sync_level = .write });
+    {
+        var state = (try db.contextDependencyState(alloc, "doc:a", "summary")).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(context_dependency_store.Freshness.stale, state.freshness);
+        try std.testing.expectEqual(@as(usize, 1), state.reasons.len);
+        try std.testing.expectEqualStrings("org:1", state.reasons[0].key);
+        try std.testing.expectEqual(@import("enrichment/context_sources.zig").ChangeKind.document_changed, state.reasons[0].change);
+    }
+    try contextSourcesTestCatchUp(&db);
+    {
+        var state = (try db.contextDependencyState(alloc, "doc:a", "summary")).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(context_dependency_store.Freshness.current, state.freshness);
+        try std.testing.expectEqual(@as(u64, 2), state.published_version);
+    }
+    try std.testing.expect(producer.successful_requests.load(.acquire) > after_first);
+
+    // Both retained versions consumed org:1 (different revisions).
+    var impact = try db.contextImpact(alloc, "", "org:1", null, "", 16);
+    defer impact.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), impact.rows.items.len);
+    const v1 = (try db.contextDependencyManifest(alloc, "doc:a", "summary", 1)).?;
+    defer alloc.free(v1);
+    try std.testing.expect(std.mem.indexOf(u8, v1, "\"key\":\"org:1\"") != null);
+
+    // A missing optional document becoming present invalidates.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{\"body\":\"later\",\"org\":\"org:2\"}" }}, .sync_level = .write });
+    try contextSourcesTestCatchUp(&db);
+    try db.batch(.{ .writes = &.{.{ .key = "org:2", .value = "{\"voice\":\"bright\"}" }}, .sync_level = .write });
+    {
+        var state = (try db.contextDependencyState(alloc, "doc:b", "summary")).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(context_dependency_store.Freshness.stale, state.freshness);
+        try std.testing.expectEqual(@import("enrichment/context_sources.zig").ChangeKind.document_created, state.reasons[0].change);
+    }
+    try contextSourcesTestCatchUp(&db);
+    {
+        var state = (try db.contextDependencyState(alloc, "doc:b", "summary")).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(context_dependency_store.Freshness.current, state.freshness);
+        try std.testing.expectEqual(@as(u64, 2), state.published_version);
+    }
+
+    // Deleting a dependent retires its dependency state and lineage.
+    try db.batch(.{ .deletes = &.{"doc:b"}, .sync_level = .write });
+    try std.testing.expect((try db.contextDependencyState(alloc, "doc:b", "summary")) == null);
+    try std.testing.expect((try db.contextDependencyManifest(alloc, "doc:b", "summary", 1)) == null);
 }
