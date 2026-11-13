@@ -60,6 +60,19 @@ npm trust github @antfly/embedded --file embedded-release-publish.yml \
 Repeat for the platform packages. PyPI pending publisher configuration is
 separate; see [licensing maintenance](licensing.md).
 
+## Rust SDK releases
+
+`antfly-sdk` uses `rs/antfly/sdk/vX.Y.Z` tags and the independent
+`rust-sdk-release.yml` workflow dispatched on `main`, with environment
+`crates-io`. Configure that exact workflow as the crate's trusted publisher;
+the embedded publisher does not publish this SDK. The existing `0.0.0` setup
+package has already established the crate name and ownership.
+
+The read-only preparation job verifies main ancestry, package version, bundled
+OpenAPI input, tests, and Cargo packaging. Publication verifies the sealed
+source commit and digest and uploads the `.crate` without executing source
+with credentials. Re-run failed jobs to retain the same packaged bytes.
+
 ## Embedded releases
 
 `embedded-release-publish.yml` runs after successful tagged release builds on main. It accepts stable and RC release requests; nightlies only build artifacts. The `workflow_run` entry point authenticates the producer and immutable release source, then dispatches the publisher on `main`. Registry OIDC jobs run only under `workflow_dispatch`, because crates.io rejects `workflow_run` tokens. Manual dispatch with an immutable tag and build run ID is the recovery path. All publishers verify the source commit and package digests before writing registry versions. npm publication is serialized and refuses to move `latest` or `next` backward; retry the newest release if an older build finishes late.
