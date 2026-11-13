@@ -14739,8 +14739,51 @@ pub const NativeFile = struct {
     /// `self.allocator.free(entry.value)` once done with it, exactly like
     /// any other `...Alloc` function in this file.
     pub fn redoOverlayEntry(self: *NativeFile, root: TransactionWrites.Root, checkpoint: CheckpointSlot, key: []const u8) !?CatalogEntry {
+        return self.redoOverlayEntryAt(root, self.readMark(checkpoint), key);
+    }
+
+    /// §9.7c (ReadView): the overlay read mark M corresponding to
+    /// `checkpoint` (C) -- the *logical* commit sequence to resolve the
+    /// overlay at, which is not always C's own `commit_sequence` number.
+    /// Under redo mode, an ordinary commit advances the logical sequence
+    /// (`committedSequence`) without moving the physical checkpoint slot
+    /// at all until the next `checkpointRedoLog` -- so for the *current*
+    /// generation, C trails M, and resolving the overlay at C's own
+    /// number (as every caller of `redoOverlayEntry` effectively did
+    /// before this existed) incorrectly treats every version newer than
+    /// the last real checkpoint as if it postdated this read, when it
+    /// is, in fact, exactly what this read is supposed to see. For an
+    /// older, already-checkpointed generation, C's own number already
+    /// equals the logical sequence that was current at the moment that
+    /// checkpoint published (publishing *is* the moment the two numbers
+    /// last coincided), so no correction is needed there -- `checkpoint
+    /// .commit_sequence == activeCheckpoint().commit_sequence` is
+    /// exactly the dividing line between the two cases.
+    ///
+    /// Found via `getDocumentsAtCheckpointWithState`'s batch read (and,
+    /// before that, `docstore.Cursor`'s own overlay branch) silently
+    /// treating a just-committed, not-yet-checkpointed document as
+    /// though it postdated the read: both called `redoOverlayEntry`
+    /// with `checkpoint.commit_sequence` directly, which stayed stuck at
+    /// an old, pre-redo value for the entire life of the current
+    /// generation. Centralizing the correction here, rather than
+    /// recomputing it at each call site, is the §9.7c ReadView design's
+    /// whole point: every reader is pinned to a (C, M) pair captured
+    /// together, not forced to derive M from C itself on every read.
+    pub fn readMark(self: *const NativeFile, checkpoint: CheckpointSlot) u64 {
+        if (checkpoint.commit_sequence == self.activeCheckpoint().commit_sequence) return self.committedSequence();
+        return checkpoint.commit_sequence;
+    }
+
+    /// `redoOverlayEntry`, but resolving at an explicit mark `M` instead
+    /// of deriving one from a `CheckpointSlot` -- the primitive
+    /// `ReadView`'s own read methods call directly, already holding the
+    /// correct `M` for their pinned (C, M) pair; `redoOverlayEntry`
+    /// itself is now a thin wrapper computing `M` via `readMark` for
+    /// callers that have only a `CheckpointSlot` in hand.
+    pub fn redoOverlayEntryAt(self: *NativeFile, root: TransactionWrites.Root, mark: u64, key: []const u8) !?CatalogEntry {
         const redo = self.redo orelse return null;
-        const resolved = (try redo.shared.resolveAlloc(self.allocator, self.runtimeIo(), @backingInt(root), key, checkpoint.commit_sequence)) orelse return null;
+        const resolved = (try redo.shared.resolveAlloc(self.allocator, self.runtimeIo(), @backingInt(root), key, mark)) orelse return null;
         return .{
             .previous_page = 0,
             .key = key,
