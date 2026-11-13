@@ -53,6 +53,13 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     if (handle.lite_scheduling_owner) |owner|
         table.db.borrowed_group_source_state = try owner.groupSourceState(&table.db);
     @import("entity_sink.zig").attach(handle, &table.db);
+    {
+        // Context dependencies: identity, cross-table reads, and inbound
+        // dependents before any write or enrichment worker reaches this table.
+        const identity = try @import("context_dependencies.zig").identityAlloc(alloc, id);
+        defer alloc.free(identity);
+        try @import("context_dependencies.zig").attach(handle, &table.db, identity);
+    }
     try api.refreshLiteManagedEmbeddingRuntimeForDatabase(handle, &table.db);
     if (handle.embedded_open_options.start_optional_runtime_workers) table.db.startResidentBackgroundWorkersIfNeeded();
     return table;

@@ -1388,6 +1388,14 @@ components:
         neighbor_context:
           $ref: "#/components/schemas/EnrichmentNeighborContextConfig"
           description: "Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission."
+        context_sources:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/EnrichmentContextSource"
+          maxProperties: 16
+          description: "Named cross-document context consumed by this asset producer, rendered as a canonical `{\"context\":{<name>:...}}` block appended to the producer input and folded into its skip state. Changes to consumed inputs (projected fields, query membership, insertion of a first match, deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild the artifact; unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt text. Supported by embedded runtimes (single-table and multi-table Lite); distributed tables reject the declaration explicitly."
+        refresh:
+          $ref: "#/components/schemas/EnrichmentRefreshConfig"
         execution:
           $ref: "#/components/schemas/ExecutionPolicy"
           description: "Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity."
@@ -1463,6 +1471,82 @@ components:
           maximum: 128
           default: 8
           description: Earlier segments available for context and the maximum later segments invalidated at each affected position of an original source change. A move invalidates the old and new neighborhoods independently; recomputed outputs never extend either interval.
+    EnrichmentContextSource:
+      type: object
+      additionalProperties: false
+      required: [fields]
+      description: "One named context source: exactly one of `document` (a referenced row) or `query` (the bounded matching set of a parameterized equality query, including the empty set)."
+      properties:
+        document:
+          $ref: "#/components/schemas/EnrichmentContextDocument"
+        query:
+          $ref: "#/components/schemas/EnrichmentContextQuery"
+        fields:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            type: string
+            minLength: 1
+          description: "Projected fields consumed by the producer (dotted paths). Only these fields participate in the input fingerprint and invalidation. Fields starting with `_` are reserved and rejected."
+        required:
+          type: boolean
+          default: false
+          description: "Document sources only: a missing referenced document fails the rebuild explicitly instead of rendering null."
+        max_documents:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 10000
+          default: 100
+          description: "Query sources only: maximum matching members. Exceeding it fails explicitly; truncated context is never published."
+        max_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 16777216
+          default: 1048576
+          description: "Maximum rendered bytes for this source."
+        overflow:
+          type: string
+          enum: [error]
+          default: error
+    EnrichmentContextDocument:
+      type: object
+      additionalProperties: false
+      required: [key_from]
+      properties:
+        table:
+          type: string
+          description: "Table holding the referenced document; omitted means the enrichment's own table. Resolved to an immutable table identity at admission, so renaming or recreating a table cannot retarget the dependency."
+        key_from:
+          type: string
+          description: "JSON pointer into the source document yielding the referenced key."
+    EnrichmentContextQuery:
+      type: object
+      additionalProperties: false
+      required: [filter_query]
+      properties:
+        table:
+          type: string
+          description: "Table queried; omitted means the enrichment's own table."
+        filter_query:
+          type: object
+          description: "A `{\"conjuncts\":[...]}` of `term`/`terms` equality conjuncts (or one bare conjunct). Values are literals or typed bindings `{\"$source\":\"/json/pointer\"}` from the source document (never text interpolation); at most one bound `terms` set. Ranges, disjunctions, full-text, and semantic top-k are rejected at admission. Members are canonically ordered by key."
+    EnrichmentRefreshConfig:
+      type: object
+      additionalProperties: false
+      description: "Rebuild policy for context-source invalidation. Invalidation (stale freshness) is always reported immediately; debounce only coalesces rebuild work."
+      properties:
+        mode:
+          type: string
+          enum: [background, manual]
+          default: background
+          description: "`background` journals rebuilds automatically; `manual` only marks dependents stale (rebuild with the reprocess endpoints)."
+        debounce:
+          type: string
+          pattern: "^[0-9]+(ms|s|m|h)$"
+          description: "Coalescing delay before a background rebuild (for example `2s`)."
     EnrichmentNeighborContextConfig:
       type: object
       additionalProperties: false

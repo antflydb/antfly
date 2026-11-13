@@ -12,8 +12,10 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.chunker_config import ChunkerConfig
+    from ..models.enrichment_config_context_sources import EnrichmentConfigContextSources
     from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
     from ..models.enrichment_producer_config import EnrichmentProducerConfig
+    from ..models.enrichment_refresh_config import EnrichmentRefreshConfig
     from ..models.execution_policy import ExecutionPolicy
     from ..models.grouped_artifact_source import GroupedArtifactSource
     from ..models.prior_artifact_context import PriorArtifactContext
@@ -66,6 +68,15 @@ class EnrichmentConfig:
                 key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts
                 ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed
                 adjacency re-runs the producer.
+            context_sources (EnrichmentConfigContextSources | Unset): Named cross-document context consumed by this asset
+                producer, rendered as a canonical `{"context":{<name>:...}}` block appended to the producer input and folded
+                into its skip state. Changes to consumed inputs (projected fields, query membership, insertion of a first match,
+                deletion, TTL expiry, or a missing optional document becoming present) invalidate and rebuild the artifact;
+                unrelated rows and unconsumed fields do not. Only valid on asset enrichments whose producer consumes prompt
+                text. Supported by embedded runtimes (single-table and multi-table Lite); distributed tables reject the
+                declaration explicitly.
+            refresh (EnrichmentRefreshConfig | Unset): Rebuild policy for context-source invalidation. Invalidation (stale
+                freshness) is always reported immediately; debounce only coalesces rebuild work.
             execution (ExecutionPolicy | Unset): Non-semantic execution policy for one producer or index maintenance
                 operation. These fields tune how work is batched and do not change generated artifact identity.
             transcriber (TranscriberEnrichmentConfig | Unset): Speech-to-text provider for the `transcriber` enrichment
@@ -108,6 +119,8 @@ class EnrichmentConfig:
     producer: EnrichmentProducerConfig | Unset = UNSET
     producer_json: str | Unset = UNSET
     neighbor_context: EnrichmentNeighborContextConfig | Unset = UNSET
+    context_sources: EnrichmentConfigContextSources | Unset = UNSET
+    refresh: EnrichmentRefreshConfig | Unset = UNSET
     execution: ExecutionPolicy | Unset = UNSET
     transcriber: TranscriberEnrichmentConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -163,6 +176,14 @@ class EnrichmentConfig:
         if not isinstance(self.neighbor_context, Unset):
             neighbor_context = self.neighbor_context.to_dict()
 
+        context_sources: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.context_sources, Unset):
+            context_sources = self.context_sources.to_dict()
+
+        refresh: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.refresh, Unset):
+            refresh = self.refresh.to_dict()
+
         execution: dict[str, Any] | Unset = UNSET
         if not isinstance(self.execution, Unset):
             execution = self.execution.to_dict()
@@ -213,6 +234,10 @@ class EnrichmentConfig:
             field_dict["producer_json"] = producer_json
         if neighbor_context is not UNSET:
             field_dict["neighbor_context"] = neighbor_context
+        if context_sources is not UNSET:
+            field_dict["context_sources"] = context_sources
+        if refresh is not UNSET:
+            field_dict["refresh"] = refresh
         if execution is not UNSET:
             field_dict["execution"] = execution
         if transcriber is not UNSET:
@@ -223,8 +248,10 @@ class EnrichmentConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.chunker_config import ChunkerConfig
+        from ..models.enrichment_config_context_sources import EnrichmentConfigContextSources
         from ..models.enrichment_neighbor_context_config import EnrichmentNeighborContextConfig
         from ..models.enrichment_producer_config import EnrichmentProducerConfig
+        from ..models.enrichment_refresh_config import EnrichmentRefreshConfig
         from ..models.execution_policy import ExecutionPolicy
         from ..models.grouped_artifact_source import GroupedArtifactSource
         from ..models.prior_artifact_context import PriorArtifactContext
@@ -299,6 +326,20 @@ class EnrichmentConfig:
         else:
             neighbor_context = EnrichmentNeighborContextConfig.from_dict(_neighbor_context)
 
+        _context_sources = d.pop("context_sources", UNSET)
+        context_sources: EnrichmentConfigContextSources | Unset
+        if isinstance(_context_sources, Unset):
+            context_sources = UNSET
+        else:
+            context_sources = EnrichmentConfigContextSources.from_dict(_context_sources)
+
+        _refresh = d.pop("refresh", UNSET)
+        refresh: EnrichmentRefreshConfig | Unset
+        if isinstance(_refresh, Unset):
+            refresh = UNSET
+        else:
+            refresh = EnrichmentRefreshConfig.from_dict(_refresh)
+
         _execution = d.pop("execution", UNSET)
         execution: ExecutionPolicy | Unset
         if isinstance(_execution, Unset):
@@ -333,6 +374,8 @@ class EnrichmentConfig:
             producer=producer,
             producer_json=producer_json,
             neighbor_context=neighbor_context,
+            context_sources=context_sources,
+            refresh=refresh,
             execution=execution,
             transcriber=transcriber,
         )

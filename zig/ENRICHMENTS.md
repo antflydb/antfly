@@ -546,6 +546,135 @@ the group convergence-authority watermark form one mandatory v15 admission-
 safety profile and wait until every current metadata voter supports v15.
 Activity never enters that codec.
 
+## Context Sources And Dependency Tracking
+
+Asset enrichments whose producer consumes prompt text may declare named
+`context_sources` (#1634): one referenced document (`document`) or the bounded
+matching set of a parameterized equality query (`query`, including the empty
+set). Producers receive one documented input contract appended to their
+rendered source: `[context sha256:<fingerprint>]` followed by
+`{"context":{<name>:{"key","value"}|null|{"count","members":[...]}}}`. Members
+are ordered by key and values are canonical projections of the declared
+`fields`, so equivalent inputs fingerprint identically and the block is part of
+the producer skip state.
+
+Code map (`zig/pkg/antfly-embedded/src/storage/db/`):
+
+- `enrichment/context_sources.zig`: grammar, typed `$source` bindings,
+  canonical projection/rendering, fingerprints, subscription tuples, and the
+  row-change to touched-tuple function.
+- `enrichment/context_dependency_store.zig`: durable state and planners.
+- `enrichment/context_resolution.zig`: reads through a host `Reader`,
+  recall-safe prefilter plus exact re-verification, budgets, lineage capture.
+- `enrichment/context_notices.zig`: source-side shadows, outbox notices, and
+  dependent-side indexed invalidation.
+- `context_dependency_db.zig`, `context_source_db_reader.zig`: DB glue.
+- `capi/context_dependencies.zig`: multi-table Lite host and C ABI.
+
+### Indexed invalidation
+
+A dependent subscribes to the digests of its bound predicate tuples
+(`spec || bound values`); a document source subscribes to the referenced key.
+Every table read by some context source keeps a per-row *shadow* (the
+canonical projection of only the declared predicate and projected fields).
+Inside the primary commit batch, each write or delete compares shadow and new
+row, computes the tuples it leaves, enters, or changes, updates the shadow, and
+stages compact notices in a durable outbox. Unchanged projections and rows
+matching no tuple stage nothing, so unrelated tenants and unconsumed fields
+never reach dependents. Dependents resolve notices with a prefix lookup on
+`(spec, tuple)`; no write scans dependent artifacts. Rows written before a
+declaration existed have no covering shadow and notify spec-wide (safe
+over-invalidation) until the bounded, resumable shadow backfill completes.
+
+### Lost-change protocol and fencing
+
+1. Bind the source row and **register** the subscriptions (unioned with any
+   previous binding) durably, capturing the dependency generation.
+2. Read and render the context.
+3. Publish the artifact, state record, and lineage in **one guarded batch**
+   that re-checks the captured generation under the dependency lock.
+
+Any input change committed after the read is applied after the registration
+and therefore finds it; applying a notice advances the generation, so the
+superseded computation fails its fence (`EnrichmentSourceChanged`) and the
+re-queued rebuild publishes instead. A changed declaration is itself an
+invalidation. Rebinding keeps old tuples until the new publication replaces
+them. Notice application and publication serialize on a per-DB dependency
+lock, which keeps the fence linearizable on stores whose batches are not
+serializable transactions.
+
+### Durable state
+
+Authoritative records are document scoped and move with the row through
+splits, restore, and replication:
+
+- one state record per `(document, artifact)`: generation, freshness
+  (`pending`, `current`, `stale`, `failed`), queued rebuild, input
+  fingerprint, configuration digest, opaque frontier vector (one position per
+  source table identity, never a scalar across tables), registered tuples, and
+  bounded, coalesced invalidation reasons;
+- immutable lineage manifests per published version (consumed input
+  identities and projected-content revisions, query identity and membership
+  fingerprint, absent optional references, producer recipe, frontier), pruned
+  beyond `retain_versions`.
+
+Global subscription, impact, and debounce rows are *verified hints*: they are
+only acted on after the authoritative record confirms them, stale hints are
+collected lazily, and split preparation copies the moved range's hints so a
+destination never misses invalidation. Deleting a dependent row retires its
+live subscriptions and its lineage.
+
+### Delivery and scheduling
+
+The outbox is drained after each commit (and on demand). Own-table notices
+apply locally; foreign ones go to the host dispatcher. An entry is deleted only
+after the dependent applied it, so delivery survives crashes, restarts, and
+unavailable dependents. Rebuilds become ordinary generated-enrichment replay
+refs (the native work journal). `refresh.mode = manual` only reports
+staleness; `refresh.debounce` defers the rebuild through a due-ordered queue
+while staleness is reported immediately. Large fan-out is paged
+(512 dependents per step) with a durable continuation.
+
+Budgets fail explicitly: `max_documents`, `max_bytes`, a bounded prefilter scan,
+and missing `required` documents record a request failure and mark freshness
+`failed` while the last successful artifact stays retained (not current).
+
+### Lineage and impact
+
+Reverse queries read impact hints by `(input table, key[, revision])`,
+confirm each against its retained manifest (so retention racing a lookup can
+only omit a pruned version, never fabricate one), distinguish historical
+versions from the current one, and optionally follow same-document artifact
+chains transitively as live rebuild *candidates*. Results are bounded and
+report `complete=false` whenever a budget stopped them. A dependency
+establishes possible impact, not that regenerated output differs, and it is
+not a decision explanation.
+
+### Capability by runtime
+
+| Runtime | Context sources |
+| --- | --- |
+| Embedded single DB | own-table document and query sources |
+| Embedded Lite (multi-table) | cross-table sources, `lite:<id>` identities, persisted inbound topology, C ABI inspection/impact/refresh |
+| Ordered (replicated serverless) publication | rejected explicitly at runtime |
+| Distributed server tables | rejected explicitly at admission |
+
+### Remaining work
+
+- Distributed tables: replicate dependent-side notice application through the
+  owning raft group (leader-gated drain, `TableWriteSource` dispatch to every
+  group of the dependent table) and resolve table identities from metadata.
+- HTTP surface: artifact `freshness`, the per-artifact dependency manifest,
+  `POST /dependencies/impact`, and `freshness=require_current&wait_timeout=`
+  reads (the storage and C ABI primitives exist).
+- Execution identity: context reads currently use the host's internal read
+  path; row/field authorization filters and revocation semantics for retained
+  artifacts still need a policy hook.
+- Downstream propagation across tables (an artifact consumed by another
+  table's context) and graph selectors (#1635).
+- Fan-out benchmarks (invalidation latency, rebuild latency, producer calls,
+  subscription storage, bulk-update work).
+
 ## Full-Text Routing From Enrichments
 
 Generated lexical content is configured at the enrichment level. Full-text

@@ -1055,6 +1055,14 @@ fn validatePublicArtifactEnrichmentObject(object: anytype) !void {
 }
 
 fn validatePublicArtifactEnrichmentField(field: []const u8, value: std.json.Value) !void {
+    // Context-source dependencies (#1634) are implemented by the embedded
+    // engine (single DB and multi-table Lite). Distributed tables reject the
+    // declaration explicitly until notice delivery between raft groups is
+    // replicated; accepting it would advertise invalidation they cannot keep.
+    if (std.mem.eql(u8, field, "context_sources") or std.mem.eql(u8, field, "context_sources_json") or std.mem.eql(u8, field, "refresh")) {
+        std.log.warn("artifact enrichment rejected: field={s} is not supported by distributed tables (embedded runtimes only)", .{field});
+        return error.InvalidArtifactEnrichmentRequest;
+    }
     if (!public_index_contract.isAllowedEnrichmentRequestField(field)) return error.InvalidArtifactEnrichmentRequest;
     if (value == .null) return;
     if (std.mem.eql(u8, field, "producer")) {

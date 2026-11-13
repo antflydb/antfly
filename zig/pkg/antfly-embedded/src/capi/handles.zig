@@ -99,6 +99,9 @@ pub const Handle = struct {
     embedded_catalog_loaded: bool = false,
     embedded_tables_discovered: bool = false,
     embedded_table_records: std.StringHashMapUnmanaged(u64) = .empty,
+    /// Context-dependency host readers (see context_dependencies.zig); they
+    /// outlive every table DB's enrichment workers and are freed at close.
+    context_dependency_hosts: std.ArrayListUnmanaged(*anyopaque) = .empty,
     embedded_table_errors: std.StringHashMapUnmanaged([]const u8) = .empty,
     embedded_next_table_id: u64 = 2,
     sql_cursors: std.AutoHashMapUnmanaged(u64, *@import("sql_cursor.zig").Cursor) = .empty,
@@ -305,6 +308,7 @@ pub fn closeHandle(handle: *Handle) void {
     if (handle.db_live) {
         if (handle.lease_snapshot) handle.db.closeImmutableSnapshot() else handle.db.close();
     }
+    @import("context_dependencies.zig").deinitHosts(handle);
     var cached = handle.embedding_cache_pending.valueIterator();
     while (cached.next()) |value| handle.alloc.free(value.*);
     handle.embedding_cache_pending.deinit(handle.alloc);

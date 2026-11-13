@@ -199,6 +199,18 @@ const derived_types = @import("derived/derived_types.zig");
 const context_dependency_db = @import("context_dependency_db.zig");
 const context_dependency_store = @import("enrichment/context_dependency_store.zig");
 
+fn copyContextDependencyHints(alloc: Allocator, source: *docstore_mod.DocStore, dest: *docstore_mod.DocStore, lower: []const u8, upper: []const u8) !void {
+    var reader = try context_dependency_db.StoreReader.init(source);
+    defer reader.deinit();
+    var plan = context_dependency_store.Plan.init(alloc);
+    defer plan.deinit();
+    if (try context_dependency_store.copyHintsForRange(alloc, reader.reader(), &plan, lower, upper) == 0) return;
+    const writes = try alloc.alloc(docstore_mod.KVPair, plan.puts.items.len);
+    defer alloc.free(writes);
+    for (plan.puts.items, writes) |e, *w| w.* = .{ .key = e.key, .value = e.value };
+    try dest.putBatch(writes, &.{});
+}
+
 fn contextNowMs() u64 {
     return @intCast(@divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms));
 }
@@ -10276,6 +10288,30 @@ pub const DB = struct {
         self.context_source_table_id = self.core.index_manager.context_table_id;
         self.context_source_host_reader = reader;
         self.context_notice_dispatcher = dispatcher;
+        // Persist the topology so a reopened source table stages notices for
+        // dependents in tables the host has not opened yet.
+        const Persisted = struct { table_id: []const u8, inbound: []const @import("enrichment/context_notices.zig").DeclaredConfig };
+        const encoded = try std.json.Stringify.valueAlloc(self.alloc, Persisted{ .table_id = table_id, .inbound = inbound }, .{});
+        defer self.alloc.free(encoded);
+        try self.core.store.put(context_dependency_host_key, encoded);
+    }
+
+    const context_dependency_host_key = "\x00\x00__metadata__:context_dependency:host";
+
+    /// Re-install the persisted topology (identity and inbound dependents)
+    /// with fresh host callbacks. Returns false when none was persisted.
+    pub fn restoreContextDependencyHost(
+        self: *DB,
+        reader: ?@import("enrichment/context_resolution.zig").Reader,
+        dispatcher: ?context_dependency_db.Dispatcher,
+    ) !bool {
+        const raw = (try self.core.getStoreValue(self.alloc, context_dependency_host_key)) orelse return false;
+        defer self.alloc.free(raw);
+        const Persisted = struct { table_id: []const u8, inbound: []const @import("enrichment/context_notices.zig").DeclaredConfig };
+        const parsed = std.json.parseFromSlice(Persisted, self.alloc, raw, .{ .ignore_unknown_fields = true }) catch return false;
+        defer parsed.deinit();
+        try self.setContextDependencyHost(parsed.value.table_id, parsed.value.inbound, reader, dispatcher);
+        return true;
     }
 
     /// Apply change notices addressed to this table's dependents: advance
@@ -60524,6 +60560,10 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     try range_state_mod.saveRange(dest_store, byte_range);
     try self.core.saveSchemaCloneTo(dest_store);
     try relational_index_catalog.copyToUnpublished(self.alloc, self.core.store, dest_store);
+    // Context-dependency state is document scoped and moves with the rows;
+    // its global subscription/impact/debounce hints are copied for the moved
+    // range so invalidation never misses a dependent after the split.
+    try copyContextDependencyHints(self.alloc, self.core.store, dest_store, byte_range.start, byte_range.end);
     try @import("relational_integrity_range.zig").copyToUnpublished(self.alloc, self.backend_runtime.io(), self.core.store, dest_store, byte_range.start, byte_range.end);
     // Replicated apply reopens prepared shards from their local manifest;
     // it cannot consult metadata while metadata is waiting for that apply.
