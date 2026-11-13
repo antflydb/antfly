@@ -30,7 +30,7 @@ private func lifecycleDirectory(_ config: Configuration = Configuration()) throw
   try JSONEncoder().encode(config).write(to: file.appendingPathComponent("settings.json"))
   return file
 }
-@Test @MainActor func reapplyingActiveCarbonShortcutDoesNotRegisterItTwice() throws {
+@Test @MainActor func reapplyingActiveCarbonShortcutDoesNotRegisterItTwice() async throws {
   var config = Configuration()
   config.effectiveShortcut = .controlOptionSpace
   let directory = try lifecycleDirectory(config)
@@ -40,11 +40,13 @@ private func lifecycleDirectory(_ config: Configuration = Configuration()) throw
     directory: directory, registerHotkey: false, shortcutManager: shortcut, keyboardAccess: { true }
   )
   store.setUpShortcut()
+  await store.settingsTask?.value
   store.setUpShortcut()
+  await store.settingsTask?.value
   #expect(shortcut.registrations == [.controlOptionSpace])
   #expect(store.shortcutSetupStatus.contains("enabled and saved"))
 }
-@Test @MainActor func settingsAndCredentialsSaveWhileShortcutPermissionIsDenied() throws {
+@Test @MainActor func settingsAndCredentialsSaveWhileShortcutPermissionIsDenied() async throws {
   let directory = try lifecycleDirectory()
   defer { try? FileManager.default.removeItem(at: directory) }
   let shortcut = TestShortcut()
@@ -58,6 +60,7 @@ private func lifecycleDirectory(_ config: Configuration = Configuration()) throw
   store.config.dictionary = ["Persisted"]
   store.token = "test-only-secret"
   store.save()
+  await store.settingsTask?.value
   let data = try Data(contentsOf: directory.appendingPathComponent("settings.json"))
   let saved = try Configuration.decode(data)
   #expect(saved.server == store.config.server && saved.dictionary == ["Persisted"])
@@ -164,9 +167,11 @@ private final class DiscoveryProtocol: URLProtocol, @unchecked Sendable {
   store.config.server = "https://saved.example"
   store.connectionChanged()
   store.save()
+  await store.settingsTask?.value
   #expect(credentials["https://saved.example"] == "secret")
   store.token = ""
   store.save()
+  await store.settingsTask?.value
   #expect(credentials["https://saved.example"] == "")
   store.discoveryTask?.cancel()
 }
@@ -193,6 +198,7 @@ private final class DiscoveryProtocol: URLProtocol, @unchecked Sendable {
   #expect(store.state == .idle)
   store.config.retainAudio = false
   store.save()
+  await store.settingsTask?.value
   await release.send()
   await archive?.value
   #expect(
@@ -263,7 +269,7 @@ private final class DiscoveryProtocol: URLProtocol, @unchecked Sendable {
   #expect(store.state == .idle && store.phase == .canceled)
 }
 
-@Test @MainActor func oversizedSettingsCannotReplaceSavedPreferencesOrCredentials() throws {
+@Test @MainActor func oversizedSettingsCannotReplaceSavedPreferencesOrCredentials() async throws {
   let directory = try lifecycleDirectory()
   defer { try? FileManager.default.removeItem(at: directory) }
   let file = directory.appendingPathComponent("settings.json")
@@ -274,6 +280,7 @@ private final class DiscoveryProtocol: URLProtocol, @unchecked Sendable {
     credentialReader: { _ in "" }, credentialWriter: { _, _ in writes += 1 })
   store.config.presets[0].appIDs = [String(repeating: "a", count: Configuration.maxEncodedBytes)]
   store.save()
+  await store.settingsTask?.value
   #expect(store.message.contains("Settings exceed"))
   #expect(try Data(contentsOf: file) == saved)
   #expect(writes == 0)

@@ -64,6 +64,34 @@ public actor AntflyClient {
   public func models() async throws -> String {
     String(decoding: try await json("ai/v1/models", method: "GET"), as: UTF8.self)
   }
+  public static let speechAssetTimeout: TimeInterval = 30 * 60
+  /// Exercise the released engine's asset installation path without microphone audio.
+  /// Call only after the user opts into downloads in the managed engine configuration.
+  public func checkAppleSpeechAssets(language: String = "en-US") async throws {
+    try Task.checkCancellation()
+    var probe = Preset(id: "asset-check", name: "Language setup", style: "verbatim")
+    probe.model = "transcribers/apple-speech"
+    probe.language = language
+    let silence = try PCMRecording(samples: Data(count: 16000 * 4), sampleRate: 16000).wav()
+    let setupConfiguration = session.configuration
+    setupConfiguration.timeoutIntervalForRequest = Self.speechAssetTimeout + 30
+    setupConfiguration.timeoutIntervalForResource = Self.speechAssetTimeout + 30
+    let setupSession = URLSession(configuration: setupConfiguration)
+    defer { setupSession.invalidateAndCancel() }
+    var body = dictationBody(preset: probe, dictionary: [])
+    body["audio"] = "attachment:0"
+    var upload = request(
+      "ai/v1/dictate",
+      body: try AttachmentEnvelope.audio(metadata: encode(body), recording: silence))
+    upload.setValue(AttachmentEnvelope.contentType, forHTTPHeaderField: "Content-Type")
+    upload.setValue(
+      String(Int(Self.speechAssetTimeout * 1000)),
+      forHTTPHeaderField: "X-Antfly-Inference-Timeout-Ms")
+    upload.timeoutInterval = Self.speechAssetTimeout + 30
+    _ = try await consumeDictation(
+      upload, cleanup: false, transport: setupSession, events: { _ in }, progress: { _ in })
+    try Task.checkCancellation()
+  }
   private func dictationBody(preset: Preset, dictionary: [String]) -> [String: Any] {
     var body: [String: Any] = [
       "model": preset.model, "style": preset.requestStyle,
@@ -80,10 +108,12 @@ public actor AntflyClient {
     events: @Sendable @escaping (DictationProgress) async -> Void = { _ in },
     progress: @Sendable @escaping (String) async -> Void
   ) async throws -> DictationResult {
+    try preset.outputMode.validateProcessor(preset.cleanupModel)
     if let formatting, formatting.commands || formatting.pressEnter {
       let began = ProcessInfo.processInfo.systemUptime
       var recognition = preset
       recognition.cleanupModel = ""
+      recognition.outputMode = .verbatim
       var raw = try await dictate(
         audio: audio, preset: recognition, dictionary: dictionary,
         events: events, progress: progress)
@@ -119,6 +149,9 @@ public actor AntflyClient {
     formatting: VoiceFormatting.Options? = nil, context: CleanupContext? = nil,
     events: @Sendable @escaping (DictationProgress) async -> Void = { _ in }
   ) async throws -> DictationResult {
+    do { try preset.outputMode.validateProcessor(preset.cleanupModel) } catch {
+      throw DictationError.cleanupFailed(raw: text, message: error.localizedDescription)
+    }
     guard text.utf8.count <= 65536 else {
       throw DictationError.invalid("Transcript exceeds the cleanup limit.")
     }
@@ -208,7 +241,7 @@ public actor AntflyClient {
     }
   }
   private func consumeDictation(
-    _ upload: URLRequest, cleanup: Bool,
+    _ upload: URLRequest, cleanup: Bool, transport: URLSession? = nil,
     events: @Sendable @escaping (DictationProgress) async -> Void,
     progress: @Sendable @escaping (String) async -> Void
   ) async throws -> DictationResult {
@@ -222,7 +255,7 @@ public actor AntflyClient {
     var complete = false
     var done = false
     do {
-      let (bytes, response) = try await session.bytes(for: upload)
+      let (bytes, response) = try await (transport ?? session).bytes(for: upload)
       defer { bytes.task.cancel() }
       guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
         var body = Data()
@@ -294,6 +327,7 @@ public actor AntflyClient {
         throw DictationError.invalid("Cleanup returned empty text for speech.")
       }
     } catch is CancellationError { throw CancellationError() } catch {
+      try Task.checkCancellation()
       if recognized != nil {
         throw DictationError.cleanupFailed(raw: raw, message: error.localizedDescription)
       }
