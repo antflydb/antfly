@@ -9510,7 +9510,35 @@ pub const NativeFile = struct {
         };
 
         if (checkpoint.page_count == 0) return invalidCheck(report, "invalid_page_count");
-        if (file_size < expected_size) return invalidCheck(report, "truncated_file");
+        // §9 (redo + indexed reclamation): a diverting commit advances
+        // `checkpoint.page_count` on its own, to hand out fresh page ids
+        // for external value chains (`pageAllocatorForDivertingCommit`),
+        // before the file's own physical extent grows to match -- that
+        // growth only happens at the next `checkpointRedoLog` fold (or
+        // the "page-shaped only" pre-flush `publishCheckpoint` runs when
+        // the log itself is close to full). `decodeFreeMapAlloc`'s own
+        // `allow_behind` already tolerates exactly this gap for the free
+        // map's `covered_page_count`; `expected_size` here, built from
+        // the same `page_count`, inherits the identical gap and must be
+        // tolerated the same way, or every `check()` call on a live,
+        // still-diverting redo-log file reports `truncated_file` for
+        // pages that are not missing -- they are staged in the shared
+        // redo overlay, recoverable from the log, exactly like any other
+        // page in that gap. The floor this check still enforces for a
+        // redo-log file is the one thing that is never deferred: the
+        // fixed prefix every opener reads before any divert can happen
+        // at all (header, both checkpoint slots, and the log's own
+        // reserved region) -- a file truncated short of *that* is
+        // genuinely corrupt, not merely mid-divert. Every individual
+        // page read below (reachable-chain walks, the indexed-allocator
+        // graph walk) already goes through the overlay-aware primitives,
+        // so a page that is *not* actually recoverable -- truly missing,
+        // not merely undiverted -- still fails there, not here.
+        const truncation_floor = if (self.header.redo_log_capacity != 0)
+            self.header.redo_log_offset +| self.header.redo_log_capacity
+        else
+            expected_size;
+        if (file_size < truncation_floor) return invalidCheck(report, "truncated_file");
 
         if (self.header.indexed_reclamation) {
             // A writer/rebased cache contains transient traversal inventories,
@@ -29073,6 +29101,62 @@ test "lite redo log commit stages pages without a physical pwrite and recovers a
     const beta = (try reopened.getDocumentAlloc(a, "beta")).?;
     defer a.free(beta);
     try std.testing.expectEqualStrings("two", beta);
+}
+
+// Regression: a diverting commit's own `flushTransactionWrites` advances
+// `next.page_count` unconditionally to cover whatever fresh page ids an
+// external value's extent tree needed (`pageAllocatorForDivertingCommit`),
+// but never grows the file's own physical extent to match -- those pages
+// are logged (`appendRecord`), not pwritten at their own offsets, until
+// the next `checkpointRedoLog` fold. `decodeFreeMapAlloc` already
+// tolerates exactly this gap for the free map's own `covered_page_count`
+// (its own `allow_behind` parameter); `checkAtFileSizeWithCancel`'s
+// `file_size < expected_size` truncation check, built from the same
+// `page_count`, did not, so `check()` on a live, still-diverting redo-log
+// file reported `truncated_file` for pages that were never missing --
+// merely not yet folded. Eight ordinary durable commits, each with its
+// own large (externally-chained) value and no checkpoint in between, is
+// enough to grow `page_count` well past the file's real physical size.
+test "lite check tolerates page_count run ahead of physical size on a still-diverting redo-log file" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-check-page-count-ahead.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 2 * 1024 * 1024);
+    defer file.close();
+    try std.testing.expect(file.redo != null);
+
+    const value = try a.alloc(u8, 64 * 1024);
+    defer a.free(value);
+    @memset(value, 'v');
+
+    var key_buf: [16]u8 = undefined;
+    for (0..8) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "doc{d}", .{i});
+        try file.beginTransaction();
+        try file.putDocument(key, value);
+        try file.commitTransaction();
+    }
+
+    // The bug: `page_count` ran ahead of the file's own real size (no
+    // fold has run), and the old, un-redo-aware truncation check in
+    // `checkAtFileSizeWithCancel` treated that gap as corruption.
+    const checkpoint = file.activeCheckpoint();
+    const real_size = (try file.file.stat(file.runtimeIo())).size;
+    try std.testing.expect(checkpoint.page_count * @as(u64, file.header.page_size) > real_size);
+
+    const report = try file.check();
+    try std.testing.expect(report.valid);
+
+    // A genuinely short file -- truncated below even the fixed prefix
+    // every opener needs (header, both checkpoint slots, the log's own
+    // reserved region) -- must still fail. The relaxed check only widens
+    // the floor for a redo-log file, never removes it.
+    const short_report = try file.checkAtFileSizeWithCancel(file.header.redo_log_offset, null);
+    try std.testing.expect(!short_report.valid);
+    try std.testing.expectEqualStrings("truncated_file", short_report.issue.?);
 }
 
 // The regression this guards against: `readBackingPages`'s redo-overlay
