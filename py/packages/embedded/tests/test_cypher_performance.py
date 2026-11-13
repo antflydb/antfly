@@ -72,11 +72,19 @@ def scalar_graph_db(require_native, tmp_path_factory, request):
 
 
 def populate(db, count):
-    for start in range(0, count, 500):
-        db.sql(
-            "INSERT INTO docs (_id,id,score) VALUES "
-            + ",".join(f"('n{i}','n{i}',{i})" for i in range(start, min(start + 500, count)))
-        )
+    # These fixtures exercise query plans, not SQL INSERT parsing or per-row
+    # autocommit. Use the public batch boundary to build the identical corpus,
+    # then drain derived work once before handing it to a query or mutation.
+    # The mutation tests below still execute their original SQL statements.
+    with db.open_table("docs") as table:
+        for start in range(0, count, 1000):
+            table.batch_json(
+                {
+                    "inserts": {f"n{i}": {"id": f"n{i}", "score": i} for i in range(start, min(start + 1000, count))},
+                    "sync_level": "write",
+                }
+            )
+    db.run_until_idle()
 
 
 @pytest.fixture(scope="module", params=[af.Storage.LITE, af.Storage.DIRECTORY])

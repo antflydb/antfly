@@ -2860,7 +2860,7 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Install build tools
-        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils gdb libopenblas0-pthread
+        run: bash .ci-dependency-policy/scripts/ci/install_ubuntu_packages.sh build-essential pkg-config ca-certificates git curl xz-utils gdb libopenblas0-pthread postgresql-client
 
       - name: Prepare ARC test cache dirs
         run: |

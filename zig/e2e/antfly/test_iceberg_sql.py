@@ -1490,9 +1490,15 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             )
             if response.ok:
                 break
-            assert response.status_code == 503 and time.monotonic() < deadline, (
-                response.text + server.debug_logs()
-            )
+            # A publication can replace the binding between capture and read.
+            # Rebind this fresh, receipt-constrained request, but never retry
+            # arbitrary conflicts or relax the original visibility deadline.
+            binding_changed = response.status_code == 409 and response.json() == {
+                "error": "catalog changed during query binding"
+            }
+            assert (
+                response.status_code == 503 or binding_changed
+            ) and time.monotonic() < deadline, response.text + server.debug_logs()
             time.sleep(0.1)
         # Keep the archive publication fixed while exercising incremental
         # accepted cuts. Otherwise the background writer can drain a batch
