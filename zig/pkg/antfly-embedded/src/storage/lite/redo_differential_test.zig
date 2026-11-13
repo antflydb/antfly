@@ -622,6 +622,10 @@ fn runSeed(allocator: Allocator, seed: u64, steps: usize, page_reuse: bool) !voi
     var step: usize = 0;
     while (step < steps) : (step += 1) {
         const op = try generateOp(arena, random, &keyspace);
+        if (envFlag("ANTFLY_LITE_REDO_ORACLE_TRACE")) {
+            var buf: [256]u8 = undefined;
+            std.debug.print("TRACE step={d} op={s}\n", .{ step, op.describe(&buf) });
+        }
         applyOp(&redo, op) catch |err| {
             std.debug.print("redo differential oracle: seed={d} step={d} applying to redo side failed: {s}\n", .{ seed, step, @errorName(err) });
             return err;
