@@ -63113,22 +63113,36 @@ fn denseTargetCountForIndexContextWithCoverage(
     if (ctx.index_manager.denseIndex(index_name)) |entry| {
         if (densePublicationTargetUsesArtifactCounter(entry)) {
             const artifact_count = try DB.loadDenseArtifactTargetCounter(ctx.alloc, ctx.store, index_name);
-            if (artifact_count != null and artifact_count.? == 0) {
+            // The range-local source cardinality below counts every primary
+            // document in range, regardless of whether it targets this
+            // index -- a sound "pending work" proxy only for a generator
+            // that auto-produces from every document (chunk_name: each
+            // document is chunked and embedded unconditionally). It says
+            // nothing about an `external` index (vectors arrive out of
+            // band, nothing in this corpus is required to ever supply
+            // one -- the "damaged_idx" scheduler-starvation fixture in "db
+            // progressive managed admission serves a checkpointed partial
+            // generation" is exactly such an index, sharing a document
+            // range with others that do have real work, which made an
+            // earlier, unscoped version of this guard defer on it forever)
+            // or a multi-source (`embedding_names.len > 1`) index, whose
+            // producer set is not verified here to be "every document in
+            // range" either. Scope strictly to chunk_name.
+            if (entry.chunk_name != null and artifact_count != null and artifact_count.? == 0) {
                 // A fresh/untouched artifact-backed generation's counter is
                 // trivially zero before any producer (enrichment, for a
-                // chunk/embedding-name generator) has written even its
-                // first artifact -- indistinguishable, by count alone,
-                // from a genuinely empty corpus. Same defense
-                // denseTargetCountFromCoverage's bootstrap branch applies
-                // to the non-artifact-counter path: check the range-local
-                // source cardinality before trusting a zero counter as
-                // the real target, so a managed admission whose chunked
-                // embeddings simply haven't been produced yet can never
-                // be certified "clean, 0 published" while source material
-                // is still waiting on enrichment (finalizeCoveredDense-
-                // ProjectionCheckpointClaimed trusted this zero
-                // unconditionally and could never re-certify once that
-                // vacuous match left `.clean` behind).
+                // chunk generator) has written even its first artifact --
+                // indistinguishable, by count alone, from a genuinely
+                // empty corpus. Same defense denseTargetCountFromCoverage's
+                // bootstrap branch applies to the non-artifact-counter
+                // path: check the range-local source cardinality before
+                // trusting a zero counter as the real target, so a managed
+                // admission whose chunked embeddings simply haven't been
+                // produced yet can never be certified "clean, 0 published"
+                // while source material is still waiting on enrichment
+                // (finalizeCoveredDenseProjectionCheckpointClaimed trusted
+                // this zero unconditionally and could never re-certify
+                // once that vacuous match left `.clean` behind).
                 const generation = ctx.index_manager.coverageGenerationForIndex(index_name) orelse return null;
                 const coverage_counts = try loadDerivedCoverageCounters(ctx.alloc, ctx.store, index_name, generation, ctx.index_manager.byte_range, ctx);
                 const source_total = coverage_counts.source_total orelse return null;
