@@ -1429,6 +1429,204 @@ pub fn graphTuple(spec: Digest, node: []const u8) Digest {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Range-aware (interval) subscriptions
+// ---------------------------------------------------------------------------
+//
+// Values map to order-preserving 64-bit keys (numbers by IEEE order, strings
+// by their first 8 bytes, booleans 0/1), tagged by type. A dependent's
+// interval subscribes to a small canonical cover of dyadic blocks
+// `(level, key >> level)`; a changed value touches exactly its 64 ancestor
+// blocks plus the root. Matching blocks prove only that the value *may* lie in
+// the interval (string keys truncate, open bounds are widened), so the exact
+// per-subscriber residual test still decides. No row change fans out to
+// dependents whose interval cannot contain it.
+
+pub const max_interval_blocks: usize = 16;
+const root_level: u8 = 64;
+
+pub const OrderKey = struct { tag: u8, key: u64 };
+
+pub fn orderKey(value: std.json.Value) ?OrderKey {
+    return switch (value) {
+        .integer => |n| floatKey(@floatFromInt(n)),
+        .float => |f| floatKey(f),
+        .number_string => |text| floatKey(std.fmt.parseFloat(f64, text) catch return null),
+        .string => |text| blk: {
+            var buf: [8]u8 = @splat(0);
+            const n = @min(text.len, 8);
+            @memcpy(buf[0..n], text[0..n]);
+            break :blk .{ .tag = 's', .key = std.mem.readInt(u64, &buf, .big) };
+        },
+        .bool => |b| .{ .tag = 'b', .key = @intFromBool(b) },
+        else => null,
+    };
+}
+
+fn floatKey(value: f64) ?OrderKey {
+    if (!std.math.isFinite(value)) return null;
+    const f = if (value == 0) 0 else value;
+    const bits: u64 = @bitCast(f);
+    return .{ .tag = 'n', .key = if (bits >> 63 == 1) ~bits else bits | (@as(u64, 1) << 63) };
+}
+
+pub const Block = struct { level: u8, prefix: u64 };
+
+/// Canonical dyadic cover of `[lo, hi]` with at most `max_interval_blocks`
+/// blocks (coarsened by raising the minimum level when needed).
+pub fn coverBlocks(out: *std.ArrayListUnmanaged(Block), a: Allocator, lo: u64, hi: u64) !void {
+    var floor: u7 = 0;
+    while (true) : (floor += 1) {
+        out.clearRetainingCapacity();
+        const l0: u128 = lo >> @intCast(floor);
+        const h0: u128 = hi >> @intCast(floor);
+        const bits: u8 = 64 - @as(u8, floor);
+        var l = l0;
+        while (l <= h0) {
+            var k: u8 = 0;
+            while (k < bits) : (k += 1) {
+                const size = @as(u128, 1) << @intCast(k + 1);
+                if (l & (size - 1) != 0 or l + size - 1 > h0) break;
+            }
+            try out.append(a, .{ .level = k + floor, .prefix = @intCast(l >> @intCast(k)) });
+            l += @as(u128, 1) << @intCast(k);
+            if (out.items.len > max_interval_blocks) break;
+        }
+        if (out.items.len <= max_interval_blocks or floor == 63) return;
+    }
+}
+
+fn blockTuple(base: Digest, tag: u8, block: Block) Digest {
+    var h = Sha256.init(.{});
+    hashField(&h, "interval");
+    h.update(&base);
+    if (block.level >= root_level) {
+        hashField(&h, "root");
+    } else {
+        h.update(&.{ tag, block.level });
+        var be: [8]u8 = undefined;
+        std.mem.writeInt(u64, &be, block.prefix, .big);
+        h.update(&be);
+    }
+    var out: Digest = undefined;
+    h.final(&out);
+    return out;
+}
+
+/// Field indexed by intervals: the first `range`/`prefix` conjunct, else the
+/// top-N order field.
+pub fn intervalField(source: *const Source) ?[]const u8 {
+    for (source.conjuncts) |c| if (c.op == .range or c.op == .prefix) return c.field;
+    if (source.order_by) |o| return o.field;
+    return null;
+}
+
+fn intervalConjunct(source: *const Source) ?usize {
+    for (source.conjuncts, 0..) |c, i| if (c.op == .range or c.op == .prefix) return i;
+    return null;
+}
+
+/// A dependent's interval `[lo, hi]` (null = whole domain).
+const Interval = ?struct { tag: u8, lo: u64, hi: u64 };
+
+fn canonicalKey(a: Allocator, canonical: []const u8) ?OrderKey {
+    const value = std.json.parseFromSliceLeaky(std.json.Value, a, canonical, .{}) catch return null;
+    return orderKey(value);
+}
+
+fn rangeInterval(a: Allocator, lower: ?[]const u8, upper: ?[]const u8) Interval {
+    const lo = if (lower) |v| canonicalKey(a, v) else null;
+    const hi = if (upper) |v| canonicalKey(a, v) else null;
+    if (lower != null and lo == null) return null;
+    if (upper != null and hi == null) return null;
+    if (lo == null and hi == null) return null;
+    if (lo != null and hi != null and lo.?.tag != hi.?.tag) return null;
+    const tag = if (lo) |k| k.tag else hi.?.tag;
+    const l = if (lo) |k| k.key else 0;
+    const h = if (hi) |k| k.key else std.math.maxInt(u64);
+    if (l > h) return .{ .tag = tag, .lo = 1, .hi = 0 };
+    return .{ .tag = tag, .lo = l, .hi = h };
+}
+
+fn prefixInterval(prefix: []const u8) Interval {
+    var lo: [8]u8 = @splat(0);
+    var hi: [8]u8 = @splat(0xff);
+    const n = @min(prefix.len, 8);
+    @memcpy(lo[0..n], prefix[0..n]);
+    @memcpy(hi[0..n], prefix[0..n]);
+    return .{ .tag = 's', .lo = std.mem.readInt(u64, &lo, .big), .hi = std.mem.readInt(u64, &hi, .big) };
+}
+
+fn intervalTuplesAlloc(a: Allocator, bases: []const Digest, interval: Interval) ![]const Digest {
+    var blocks = std.ArrayListUnmanaged(Block).empty;
+    var tag: u8 = 0;
+    if (interval) |iv| {
+        if (iv.lo > iv.hi) return &.{};
+        tag = iv.tag;
+        try coverBlocks(&blocks, a, iv.lo, iv.hi);
+        if (blocks.items.len == 1 and blocks.items[0].level >= root_level) blocks.items[0] = .{ .level = root_level, .prefix = 0 };
+    } else try blocks.append(a, .{ .level = root_level, .prefix = 0 });
+    var out = std.ArrayListUnmanaged(Digest).empty;
+    for (bases) |base| for (blocks.items) |block| try out.append(a, blockTuple(base, tag, block));
+    std.mem.sort(Digest, out.items, {}, struct {
+        fn lt(_: void, l: Digest, r: Digest) bool {
+            return std.mem.lessThan(u8, &l, &r);
+        }
+    }.lt);
+    return out.items;
+}
+
+/// Tuples for a top-N source once its boundary is known: a full result
+/// subscribes only to values ranking at or above the boundary.
+pub fn orderedTuplesAlloc(a: Allocator, bound: *const Bound, boundary: ?std.json.Value, full: bool) ![]const Digest {
+    const source = bound.source;
+    const order = source.order_by orelse return bound.tuples;
+    if (bound.unsatisfiable) return &.{};
+    if (intervalConjunct(source) != null) return bound.tuples;
+    const bases = try equalityBasesAlloc(a, bound);
+    var interval: Interval = null;
+    if (full) if (boundary) |b| if (orderKey(b)) |k| {
+        interval = if (order.descending) .{ .tag = k.tag, .lo = k.key, .hi = std.math.maxInt(u64) } else .{ .tag = k.tag, .lo = 0, .hi = k.key };
+    };
+    return intervalTuplesAlloc(a, bases, interval);
+}
+
+fn equalityBasesAlloc(a: Allocator, bound: *const Bound) ![]const Digest {
+    var sets = std.ArrayListUnmanaged([]const []const u8).empty;
+    for (bound.source.conjuncts, bound.values) |c, set| if (c.isEquality()) try sets.append(a, set);
+    return expandTuplesAlloc(a, bound.spec, sets.items, max_set_values);
+}
+
+/// Row-side interval tuples: every ancestor block of each value, plus root.
+fn rowIntervalTuplesAlloc(a: Allocator, source: *const Source, bases: []const Digest, row: std.json.Value) !?[]Digest {
+    const field = intervalField(source).?;
+    var out = std.ArrayListUnmanaged(Digest).empty;
+    for (bases) |base| try out.append(a, blockTuple(base, 0, .{ .level = root_level, .prefix = 0 }));
+    const value = resolveFieldPath(row, field) orelse {
+        // A missing value can never satisfy a range/prefix; for top-N it
+        // sorts last and only matters while the result is not full (root).
+        if (intervalConjunct(source) != null) return null;
+        return out.items;
+    };
+    const items: []const std.json.Value = switch (value) {
+        .array => |array| array.items,
+        else => (&value)[0..1],
+    };
+    for (items) |item| {
+        const k = orderKey(item) orelse continue;
+        for (bases) |base| {
+            var level: u8 = 0;
+            while (level < root_level) : (level += 1) {
+                try out.append(a, blockTuple(base, k.tag, .{ .level = level, .prefix = k.key >> @intCast(level) }));
+                if (out.items.len > max_row_interval_tuples) return error.ContextBudgetExceeded;
+            }
+        }
+    }
+    return out.items;
+}
+
+pub const max_row_interval_tuples: usize = 4096;
+
 fn queryTuple(spec: Digest, values: []const []const u8) Digest {
     var h = Sha256.init(.{});
     hashField(&h, "query");
@@ -1629,7 +1827,32 @@ fn bindQuery(a: Allocator, bound: *Bound, source_doc: std.json.Value) !void {
     }
     hashField(&h, bound.residual);
     h.final(&bound.query_identity);
-    if (!bound.unsatisfiable) bound.tuples = try expandTuplesAlloc(a, bound.spec, equality_sets.items, max_set_values);
+    if (!bound.unsatisfiable) {
+        const bases = try expandTuplesAlloc(a, bound.spec, equality_sets.items, max_set_values);
+        if (intervalConjunct(source)) |j| {
+            const c = source.conjuncts[j];
+            const interval: Interval = switch (c.op) {
+                .range => blk: {
+                    var lower: ?[]const u8 = null;
+                    var upper: ?[]const u8 = null;
+                    if (c.range.gte.present()) lower = try resolveOperand(a, source_doc, c.range.gte);
+                    if (c.range.gt.present()) lower = try resolveOperand(a, source_doc, c.range.gt);
+                    if (c.range.lte.present()) upper = try resolveOperand(a, source_doc, c.range.lte);
+                    if (c.range.lt.present()) upper = try resolveOperand(a, source_doc, c.range.lt);
+                    break :blk rangeInterval(a, lower, upper);
+                },
+                .prefix => blk: {
+                    const v = (try resolveOperand(a, source_doc, .{ .literal = if (c.literals.len != 0) c.literals[0] else "", .pointer = c.source_pointer })) orelse break :blk null;
+                    break :blk prefixInterval(try literalString(a, v));
+                },
+                else => unreachable,
+            };
+            bound.tuples = try intervalTuplesAlloc(a, bases, interval);
+        } else if (source.order_by != null) {
+            // Before the boundary is known: the whole domain.
+            bound.tuples = try intervalTuplesAlloc(a, bases, null);
+        } else bound.tuples = bases;
+    }
 }
 
 /// Cartesian product of the equality value sets (no sets: one spec-wide
@@ -1968,6 +2191,24 @@ pub fn rowTuplesAlloc(alloc: Allocator, source: *const Source, spec: Digest, row
         error.ContextBudgetExceeded => return .all,
         else => |e| return e,
     };
+    if (intervalField(source) != null) {
+        const interval = (rowIntervalTuplesAlloc(a, source, expanded, row) catch |err| switch (err) {
+            error.ContextBudgetExceeded => return .all,
+            else => |e| return e,
+        }) orelse return .none;
+        std.mem.sort(Digest, interval, {}, struct {
+            fn lt(_: void, l: Digest, r: Digest) bool {
+                return std.mem.lessThan(u8, &l, &r);
+            }
+        }.lt);
+        var w: usize = 0;
+        for (interval) |d| {
+            if (w != 0 and std.mem.eql(u8, &interval[w - 1], &d)) continue;
+            interval[w] = d;
+            w += 1;
+        }
+        return .{ .tuples = try alloc.dupe(Digest, interval[0..w]) };
+    }
     return .{ .tuples = try alloc.dupe(Digest, expanded) };
 }
 
@@ -2550,7 +2791,7 @@ test "range, prefix, and filter-mode match are residual per-row predicates" {
     var bindings = try bindTest(alloc, &config, "{\"org\":\"o1\",\"since\":\"2026-06-01\",\"topic\":\"Solar Panels\"}");
     defer bindings.deinit();
     const bound = &bindings.items[0];
-    try testing.expectEqual(@as(usize, 1), bound.tuples.len);
+    try testing.expect(bound.tuples.len >= 1 and bound.tuples.len <= max_interval_blocks);
     const hit = try parseValue(a, "{\"org\":\"o1\",\"published\":\"2026-07-04\",\"sku\":\"EU-12\",\"body\":\"New solar panels, cheaper.\",\"title\":\"t\"}");
     try testing.expect(try rowMatches(alloc, bound, hit));
     for ([_][]const u8{
@@ -2569,7 +2810,7 @@ test "range, prefix, and filter-mode match are residual per-row predicates" {
     // Residual-field changes are relevant to touched tuples; unprojected ones are not.
     var touched = try touchedTuplesAlloc(alloc, source, "k", hit, try parseValue(a, "{\"org\":\"o1\",\"published\":\"2026-07-05\",\"sku\":\"EU-12\",\"body\":\"New solar panels, cheaper.\",\"title\":\"t\"}"));
     defer touched.deinit(alloc);
-    try testing.expectEqual(@as(usize, 1), touched.tuples.len);
+    try testing.expect(touched.tuples.len >= 1);
     var ignored = try touchedTuplesAlloc(alloc, source, "k", hit, try parseValue(a, "{\"org\":\"o1\",\"published\":\"2026-07-04\",\"sku\":\"EU-12\",\"body\":\"New solar panels, cheaper.\",\"title\":\"t\",\"x\":1}"));
     defer ignored.deinit(alloc);
     try testing.expectEqual(@as(usize, 0), ignored.tuples.len);
@@ -2703,4 +2944,90 @@ test "tree projection keeps nested paths resolvable" {
     try testing.expectEqualStrings("{\"_artifacts\":{\"c\":{\"label\":\"x\"}},\"a\":{\"b\":2}}", tree);
     const again = try parseValue(arena.allocator(), tree);
     try testing.expectEqualStrings("x", resolveFieldPath(again, "_artifacts.c.label").?.string);
+}
+
+test "interval subscriptions touch only dependents whose range can contain a value" {
+    const alloc = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var config = try parsePublicJson(alloc,
+        \\{"w":{"query":{"filter_query":{"field":"at","range":{"gte":{"$source":"/lo"},"lt":{"$source":"/hi"}}}},"fields":["t"],"max_documents":50}}
+    , "");
+    defer config.deinit();
+    var narrow = try bindTest(alloc, &config, "{\"lo\":100,\"hi\":200}");
+    defer narrow.deinit();
+    var wide = try bindTest(alloc, &config, "{\"lo\":-1e9,\"hi\":1e9}");
+    defer wide.deinit();
+    try testing.expect(narrow.items[0].tuples.len >= 1 and narrow.items[0].tuples.len <= max_interval_blocks);
+    const source = &config.sources[0];
+    const spec = source.specDigest();
+    const Hit = struct {
+        fn any(sub: []const Digest, row: []const Digest) bool {
+            for (sub) |s1| for (row) |r| if (std.mem.eql(u8, &s1, &r)) return true;
+            return false;
+        }
+    };
+    for ([_]struct { v: []const u8, narrow: bool, wide: bool }{
+        .{ .v = "{\"at\":150}", .narrow = true, .wide = true },
+        .{ .v = "{\"at\":100}", .narrow = true, .wide = true },
+        .{ .v = "{\"at\":5000}", .narrow = false, .wide = true },
+        .{ .v = "{\"at\":-7}", .narrow = false, .wide = true },
+        .{ .v = "{\"at\":\"150\"}", .narrow = false, .wide = false },
+    }) |case| {
+        var row = try rowTuplesAlloc(alloc, source, spec, try parseValue(a, case.v));
+        defer row.deinit(alloc);
+        const tuples: []const Digest = if (row == .tuples) row.tuples else &.{};
+        try testing.expectEqual(case.narrow, Hit.any(narrow.items[0].tuples, tuples));
+        try testing.expectEqual(case.wide, Hit.any(wide.items[0].tuples, tuples));
+    }
+    // Missing field never matches a range.
+    var missing = try rowTuplesAlloc(alloc, source, spec, try parseValue(a, "{}"));
+    defer missing.deinit(alloc);
+    try testing.expect(missing == .none);
+
+    // Prefix and top-N boundaries use the same index.
+    var prefixed = try parsePublicJson(alloc,
+        \\{"p":{"query":{"filter_query":{"field":"sku","prefix":{"$source":"/p"}}},"fields":["t"]}}
+    , "");
+    defer prefixed.deinit();
+    var pb = try bindTest(alloc, &prefixed, "{\"p\":\"EU-\"}");
+    defer pb.deinit();
+    for ([_]struct { v: []const u8, hit: bool }{ .{ .v = "{\"sku\":\"EU-12\"}", .hit = true }, .{ .v = "{\"sku\":\"US-12\"}", .hit = false } }) |case| {
+        var row = try rowTuplesAlloc(alloc, &prefixed.sources[0], prefixed.sources[0].specDigest(), try parseValue(a, case.v));
+        defer row.deinit(alloc);
+        try testing.expectEqual(case.hit, Hit.any(pb.items[0].tuples, row.tuples));
+    }
+    var ordered = try parsePublicJson(alloc,
+        \\{"top":{"query":{"filter_query":{"field":"org","term":{"$source":"/org"}},"order_by":{"field":"at","order":"desc"}},"fields":["t"],"max_documents":2}}
+    , "");
+    defer ordered.deinit();
+    var ob = try bindTest(alloc, &ordered, "{\"org\":\"o\"}");
+    defer ob.deinit();
+    const boundary_tuples = try orderedTuplesAlloc(a, &ob.items[0], std.json.Value{ .integer = 50 }, true);
+    for ([_]struct { v: []const u8, hit: bool }{ .{ .v = "{\"org\":\"o\",\"at\":90}", .hit = true }, .{ .v = "{\"org\":\"o\",\"at\":10}", .hit = false }, .{ .v = "{\"org\":\"x\",\"at\":90}", .hit = false } }) |case| {
+        var row = try rowTuplesAlloc(alloc, &ordered.sources[0], ordered.sources[0].specDigest(), try parseValue(a, case.v));
+        defer row.deinit(alloc);
+        const tuples: []const Digest = if (row == .tuples) row.tuples else &.{};
+        try testing.expectEqual(case.hit, Hit.any(boundary_tuples, tuples));
+    }
+    // Not full yet: every member of the tuple is relevant (root).
+    const open_tuples = try orderedTuplesAlloc(a, &ob.items[0], std.json.Value{ .integer = 50 }, false);
+    var low = try rowTuplesAlloc(alloc, &ordered.sources[0], ordered.sources[0].specDigest(), try parseValue(a, "{\"org\":\"o\",\"at\":10}"));
+    defer low.deinit(alloc);
+    try testing.expect(Hit.any(open_tuples, low.tuples));
+}
+
+test "dyadic cover is exact and bounded" {
+    const alloc = testing.allocator;
+    var blocks = std.ArrayListUnmanaged(Block).empty;
+    defer blocks.deinit(alloc);
+    try coverBlocks(&blocks, alloc, 4, 11);
+    try testing.expectEqual(@as(usize, 2), blocks.items.len); // [4,7] [8,11]
+    try coverBlocks(&blocks, alloc, 0, std.math.maxInt(u64));
+    try testing.expectEqual(@as(usize, 1), blocks.items.len);
+    try testing.expectEqual(@as(u8, 64), blocks.items[0].level);
+    try coverBlocks(&blocks, alloc, 3, 1 << 40);
+    try testing.expect(blocks.items.len <= max_interval_blocks);
+    for (blocks.items) |b| try testing.expect(b.level <= 64);
 }

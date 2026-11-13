@@ -162,17 +162,29 @@ pub fn Adapter(comptime DB: type) type {
             return db.get(alloc, key);
         }
 
-        pub fn query(db: *DB, alloc: Allocator, filter: []const u8, offset: u32, limit: u32) !context_resolution.Page {
-            return queryIndexed(db, alloc, filter, offset, limit) catch |err| switch (err) {
-                // No full-text index can serve the prefilter: fall back to an
-                // ordered table scan. Resolution bounds it by the declared
+        pub fn query(db: *DB, alloc: Allocator, envelope: []const u8, offset: u32, limit: u32) !context_resolution.Page {
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, envelope, .{}) catch return error.InvalidContextBinding;
+            defer parsed.deinit();
+            const search_value = parsed.value.object.get("search") orelse return error.InvalidContextBinding;
+            const scan_value = parsed.value.object.get("scan") orelse .null;
+            const search = try std.json.Stringify.valueAlloc(alloc, search_value, .{});
+            defer alloc.free(search);
+            const scan_filter: []u8 = if (scan_value == .null) try alloc.dupe(u8, "") else try std.json.Stringify.valueAlloc(alloc, scan_value, .{});
+            defer alloc.free(scan_filter);
+            // Range-only predicates: the storage-evaluated scan filter is the
+            // range-aware path (columnar block pruning on relational tables).
+            const has_text_pushdown = std.mem.indexOf(u8, search, "\"match\"") != null;
+            if (!has_text_pushdown and scan_filter.len != 0) return scanPage(db, alloc, scan_filter, offset, limit);
+            return queryIndexed(db, alloc, search, offset, limit) catch |err| switch (err) {
+                // No full-text index can serve the prefilter: fall back to a
+                // filtered table scan. Resolution bounds it by the declared
                 // candidate budget and verifies every row exactly.
-                error.UnsupportedQueryRequest => scanPage(db, alloc, offset, limit),
+                error.UnsupportedQueryRequest => scanPage(db, alloc, scan_filter, offset, limit),
                 else => err,
             };
         }
 
-        fn scanPage(db: *DB, alloc: Allocator, offset: u32, limit: u32) !context_resolution.Page {
+        fn scanPage(db: *DB, alloc: Allocator, filter: []const u8, offset: u32, limit: u32) !context_resolution.Page {
             const Collect = struct {
                 alloc: Allocator,
                 rows: std.ArrayListUnmanaged(context_resolution.Row) = .empty,
@@ -203,7 +215,7 @@ pub fn Adapter(comptime DB: type) type {
                 }
                 collect.rows.deinit(alloc);
             }
-            db.scanVisit(alloc, "", "", .{ .include_documents = true }, .{ .context = &collect, .visit = Collect.visit }) catch |err| switch (err) {
+            db.scanVisit(alloc, "", "", .{ .include_documents = true, .filter_query_json = filter }, .{ .context = &collect, .visit = Collect.visit }) catch |err| switch (err) {
                 error.Canceled => {},
                 else => return err,
             };

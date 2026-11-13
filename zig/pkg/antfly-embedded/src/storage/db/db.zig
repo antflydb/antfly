@@ -153826,6 +153826,67 @@ test "db context sources track residual ranges per subscriber and direct graph a
     try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
 }
 
+test "db context sources index range-only windows by interval and resolve them with a storage scan filter" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("context-sources-range-index");
+    defer tmp.cleanup();
+    var producer = GateAssetProducer{};
+    producer.allowAll();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const declaration = try contextSourcesTestDeclarationAlloc(alloc,
+        \\{"recent":{"query":{"filter_query":{"field":"at","range":{"gte":{"$source":"/since"}}}},"fields":["title"],"max_documents":10}}
+    );
+    defer alloc.free(declaration);
+    try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .context_sources_json = declaration });
+    var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
+    try db.initOptionalEnrichmentRuntime(&config);
+    _ = try db.advanceContextShadowBackfill(64);
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "n:1", .value = "{\"at\":20,\"title\":\"fresh\"}" },
+        .{ .key = "n:2", .value = "{\"at\":5,\"title\":\"old\"}" },
+        .{ .key = "doc:a", .value = "{\"body\":\"hello\",\"since\":10}" },
+        .{ .key = "doc:b", .value = "{\"body\":\"hello\",\"since\":100}" },
+    }, .sync_level = .write });
+    try contextSourcesTestCatchUp(&db);
+    try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:b"));
+    {
+        // Subscribed by a bounded dyadic cover, not one tuple per value.
+        var state = (try db.contextDependencyState(alloc, "doc:a", "summary")).?;
+        defer state.deinit(alloc);
+        try std.testing.expect(state.tuples.len >= 1 and state.tuples.len <= 16);
+    }
+
+    // Below both windows: nobody is touched.
+    try db.batch(.{ .writes = &.{.{ .key = "n:2", .value = "{\"at\":6,\"title\":\"older\"}" }}, .sync_level = .write });
+    try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:b"));
+    // Inside only the wider window.
+    try db.batch(.{ .writes = &.{.{ .key = "n:3", .value = "{\"at\":50,\"title\":\"mid\"}" }}, .sync_level = .write });
+    try std.testing.expectEqual(context_dependency_store.Freshness.stale, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:b"));
+    try contextSourcesTestCatchUp(&db);
+    try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    // Inside both windows.
+    try db.batch(.{ .writes = &.{.{ .key = "n:4", .value = "{\"at\":150,\"title\":\"new\"}" }}, .sync_level = .write });
+    try std.testing.expectEqual(context_dependency_store.Freshness.stale, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    try std.testing.expectEqual(context_dependency_store.Freshness.stale, try contextSourcesTestFreshness(&db, alloc, "doc:b"));
+    try contextSourcesTestCatchUp(&db);
+    try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:b"));
+    {
+        // Resolution through the pushed-down scan filter saw exactly the rows
+        // in each window.
+        var state = (try db.contextDependencyState(alloc, "doc:b", "summary")).?;
+        defer state.deinit(alloc);
+        const text = (try db.contextDependencyManifest(alloc, "doc:b", "summary", state.published_version)).?;
+        defer alloc.free(text);
+        try std.testing.expect(std.mem.indexOf(u8, text, "n:4") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "n:3") == null);
+    }
+}
+
 test "db context sources publish snapshot context as unverified with scheduled refresh" {
     const alloc = std.testing.allocator;
     var tmp = try TestDirectory.init("context-sources-snapshot");

@@ -243,6 +243,9 @@ pub const Notice = struct {
     /// parameters on the dependent side.
     prev_row: []const u8 = "",
     next_row: []const u8 = "",
+    /// Further tuples touched by the same row change (range-aware specs
+    /// touch a value's ancestor blocks); processed after `tuple` in order.
+    more_tuples: []const Digest = &.{},
 };
 
 pub fn encodeNoticeAlloc(alloc: Allocator, n: Notice) ![]u8 {
@@ -264,7 +267,9 @@ pub fn encodeNoticeAlloc(alloc: Allocator, n: Notice) ![]u8 {
     try ctx.appendJsonString(alloc, &out, n.prev_row);
     try out.appendSlice(alloc, ",\"next_row\":");
     try ctx.appendJsonString(alloc, &out, n.next_row);
-    try out.append(alloc, '}');
+    try out.appendSlice(alloc, ",\"more_tuples\":\"");
+    for (n.more_tuples) |t| try out.print(alloc, "{x}", .{&t});
+    try out.appendSlice(alloc, "\"}");
     return try out.toOwnedSlice(alloc);
 }
 
@@ -328,6 +333,13 @@ pub fn decodeNoticeAlloc(alloc: Allocator, raw: []const u8) !DecodedNotice {
         .resume_after = resume_after,
         .prev_row = if (o.get("prev_row")) |v| (if (v == .string) v.string else "") else "",
         .next_row = if (o.get("next_row")) |v| (if (v == .string) v.string else "") else "",
+        .more_tuples = blk: {
+            const v = o.get("more_tuples") orelse break :blk &.{};
+            if (v != .string or v.string.len % 64 != 0) return error.InvalidContextNotice;
+            const list = try a.alloc(Digest, v.string.len / 64);
+            for (list, 0..) |*d, i| _ = std.fmt.hexToBytes(d, v.string[i * 64 ..][0..64]) catch return error.InvalidContextNotice;
+            break :blk list;
+        },
     } };
 }
 
@@ -427,7 +439,15 @@ pub fn planStageNotices(
                 try stageRows(alloc, plan, binding, own_table_id, change.key, @splat(0), true, touched.all_change, sequence, &result, prev_row, next_row);
                 continue;
             }
-            for (touched.tuples) |t| try stageRows(alloc, plan, binding, own_table_id, change.key, t.tuple, false, t.change, sequence, &result, prev_row, next_row);
+            if (touched.tuples.len == 0) continue;
+            // One notice per row change and spec, carrying every touched tuple.
+            var kind = touched.tuples[0].change;
+            const more = try a.alloc(Digest, touched.tuples.len - 1);
+            for (touched.tuples[1..], more) |t, *d| {
+                d.* = t.tuple;
+                if (t.change != kind) kind = .member_changed;
+            }
+            try stageMany(alloc, plan, binding, own_table_id, change.key, touched.tuples[0].tuple, more, kind, sequence, &result, prev_row, next_row);
         }
 
         if (next_projection) |projection| {
@@ -441,6 +461,29 @@ pub fn planStageNotices(
 
 fn stage(alloc: Allocator, plan: *store.Plan, binding: SpecBinding, own_table_id: []const u8, key: []const u8, tuple: Digest, all: bool, change: ctx.ChangeKind, sequence: u64, result: *StageResult) !void {
     return stageRows(alloc, plan, binding, own_table_id, key, tuple, all, change, sequence, result, "", "");
+}
+
+fn stageMany(alloc: Allocator, plan: *store.Plan, binding: SpecBinding, own_table_id: []const u8, key: []const u8, tuple: Digest, more: []const Digest, change: ctx.ChangeKind, sequence: u64, result: *StageResult, prev_row: []const u8, next_row: []const u8) !void {
+    const value = try encodeNoticeAlloc(alloc, .{
+        .more_tuples = more,
+        .prev_row = prev_row,
+        .next_row = next_row,
+        .dependent_table_id = binding.dependent_table_id,
+        .artifact = binding.artifact,
+        .source_name = binding.source.name,
+        .source_table_id = own_table_id,
+        .key = key,
+        .spec = binding.spec,
+        .tuple = tuple,
+        .change = change,
+        .refresh = binding.refresh,
+        .sequence = sequence,
+    });
+    errdefer alloc.free(value);
+    const okey = outboxKey(sequence, result.next_ordinal);
+    try plan.putOwned(try alloc.dupe(u8, &okey), value);
+    result.next_ordinal += 1;
+    result.notices += 1;
 }
 
 fn stageRows(alloc: Allocator, plan: *store.Plan, binding: SpecBinding, own_table_id: []const u8, key: []const u8, tuple: Digest, all: bool, change: ctx.ChangeKind, sequence: u64, result: *StageResult, prev_row: []const u8, next_row: []const u8) !void {
@@ -631,6 +674,8 @@ pub fn planApplyNoticeWithSources(
     };
     var result = ApplyResult{};
     errdefer result.deinit(alloc);
+    var pending_continuation: ?[]u8 = null;
+    errdefer if (pending_continuation) |c| alloc.free(c);
     const background = notice.refresh.mode == .background;
     const options = store.InvalidateOptions{
         .source = notice.source_name,
@@ -649,6 +694,34 @@ pub fn planApplyNoticeWithSources(
     else
         try store.planInvalidateTuple(alloc, reader, plan, notice.spec, notice.tuple, options);
     defer invalidated.deinit(alloc);
+    // Further tuples of the same change, each fully drained before the next
+    // unless the page budget is reached (then the continuation carries them).
+    var more_index: usize = 0;
+    while (invalidated.resume_after == null and more_index < notice.more_tuples.len and invalidated.targets.items.len < page) : (more_index += 1) {
+        var next_options = options;
+        next_options.resume_after = "";
+        next_options.max_targets = page - invalidated.targets.items.len;
+        var extra = try store.planInvalidateTuple(alloc, reader, plan, notice.spec, notice.more_tuples[more_index], next_options);
+        defer extra.deinit(alloc);
+        for (extra.targets.items) |t| {
+            var duplicate = false;
+            for (invalidated.targets.items) |existing| if (std.mem.eql(u8, existing.artifact, t.artifact) and std.mem.eql(u8, existing.doc_key, t.doc_key)) {
+                duplicate = true;
+            };
+            if (duplicate) continue;
+            try invalidated.targets.append(alloc, .{ .artifact = try alloc.dupe(u8, t.artifact), .doc_key = try alloc.dupe(u8, t.doc_key), .newly_stale = t.newly_stale });
+        }
+        if (extra.resume_after) |cursor| {
+            // Continue inside this tuple next time.
+            var next = notice;
+            next.tuple = notice.more_tuples[more_index];
+            next.more_tuples = notice.more_tuples[more_index + 1 ..];
+            next.resume_after = cursor;
+            pending_continuation = try encodeNoticeAlloc(alloc, next);
+            more_index = notice.more_tuples.len;
+            break;
+        }
+    }
     for (invalidated.targets.items) |t| {
         // A spec may be shared by identical declarations on several
         // enrichments; only the notice's artifact is rebuilt by it.
@@ -664,9 +737,17 @@ pub fn planApplyNoticeWithSources(
             try result.rebuild.append(alloc, .{ .artifact = artifact, .doc_key = try alloc.dupe(u8, t.doc_key) });
         }
     }
-    if (invalidated.resume_after) |cursor| {
+    if (pending_continuation) |c| {
+        result.continuation = c;
+    } else if (invalidated.resume_after) |cursor| {
         var next = notice;
         next.resume_after = cursor;
+        result.continuation = try encodeNoticeAlloc(alloc, next);
+    } else if (more_index < notice.more_tuples.len) {
+        var next = notice;
+        next.tuple = notice.more_tuples[more_index];
+        next.more_tuples = notice.more_tuples[more_index + 1 ..];
+        next.resume_after = "";
         result.continuation = try encodeNoticeAlloc(alloc, next);
     }
     return result;
@@ -811,7 +892,8 @@ test "end to end: staged notices invalidate exactly the affected dependents" {
     // Draft in another org: nothing.
     try testing.expectEqual(@as(usize, 0), try stageOne(alloc, &source_store, &specs, "tp", 3, "p9", "{\"org\":\"o2\",\"status\":\"draft\",\"text\":\"t\"}"));
     // Move p1 from o1 to o2: leaves o1 and enters o2 -> both dependents.
-    try testing.expectEqual(@as(usize, 2), try stageOne(alloc, &source_store, &specs, "tp", 4, "p1", "{\"org\":\"o2\",\"status\":\"approved\",\"text\":\"t\"}"));
+    // One notice carries both touched tuples (leaving o1, entering o2).
+    try testing.expectEqual(@as(usize, 1), try stageOne(alloc, &source_store, &specs, "tp", 4, "p1", "{\"org\":\"o2\",\"status\":\"approved\",\"text\":\"t\"}"));
     const r2 = try Deliver.run(alloc, &source_store, &dependent_store);
     defer alloc.free(r2);
     try testing.expect(std.mem.indexOf(u8, r2, "doc-a") != null and std.mem.indexOf(u8, r2, "doc-b") != null);
@@ -939,4 +1021,69 @@ test "derived graph edges notify only sources that include generated edges" {
     try testing.expectEqual(@as(usize, 1), generated.notices);
     const direct = try planStageEdgeNotices(alloc, &plan, &specs, "t", 2, 0, &.{.{ .graph_index = "kg", .source = "a", .target = "b", .edge_type = "rel" }});
     try testing.expectEqual(@as(usize, 2), direct.notices);
+}
+
+test "range-aware notices carry every touched block and page across them" {
+    const alloc = testing.allocator;
+    var s = store.MemoryStore{ .alloc = alloc };
+    defer s.deinit();
+    const config =
+        \\{"sources":{"w":{"query":{"filter_query":{"conjuncts":[{"field":"at","range":{"gte":{"$source":"/lo"}}}]}},"fields":["t"],"max_documents":100,"max_candidates":1000,"max_bytes":4096,"overflow":"error"}},
+        \\ "refresh":{"mode":"background","debounce_ms":0}}
+    ;
+    var parsed = try ctx.parseStoredJson(alloc, config);
+    defer parsed.deinit();
+    var plan = store.Plan.init(alloc);
+    defer plan.deinit();
+    var buf: [16]u8 = undefined;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    // Dependents with thresholds 0, 10, ..., 90.
+    for (0..10) |i| {
+        const doc = try ctx.bindAlloc(alloc, &parsed, try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), try std.fmt.allocPrint(arena.allocator(), "{{\"lo\":{d}}}", .{i * 10}), .{}));
+        var bindings = doc;
+        defer bindings.deinit();
+        const tuples = try bindings.allTuplesAlloc(alloc);
+        defer alloc.free(tuples);
+        _ = try store.planRegister(alloc, s.reader(), &plan, try std.fmt.bufPrint(&buf, "d{d}", .{i}), "x", tuples, parsed.digest());
+    }
+    try s.apply(&plan);
+    var specs = try buildSourceSpecs(alloc, "t", &.{.{ .dependent_table_id = "", .artifact = "x", .stored_json = config }});
+    defer specs.deinit();
+    var stage_plan = store.Plan.init(alloc);
+    defer stage_plan.deinit();
+    const staged = try planStageNotices(alloc, s.reader(), &stage_plan, &specs, "t", 1, 0, &.{.{ .key = "row", .next = "{\"at\":35,\"t\":\"x\"}" }}, true);
+    try testing.expectEqual(@as(usize, 1), staged.notices);
+    var decoded = try decodeNoticeAlloc(alloc, stage_plan.puts.items[0].value);
+    defer decoded.deinit();
+    try testing.expect(decoded.notice.more_tuples.len > 0);
+    // Dependents with lo <= 35 (d0..d3) are reached through the value's
+    // ancestor blocks; small pages continue across tuples.
+    var current: ?DecodedNotice = null;
+    defer if (current) |*c| c.deinit();
+    var reached = std.StringHashMapUnmanaged(void).empty;
+    defer {
+        var it = reached.keyIterator();
+        while (it.next()) |k| alloc.free(k.*);
+        reached.deinit(alloc);
+    }
+    var rounds: usize = 0;
+    while (true) : (rounds += 1) {
+        try testing.expect(rounds < 64);
+        var p = store.Plan.init(alloc);
+        defer p.deinit();
+        var applied = try planApplyNotice(alloc, s.reader(), &p, if (current) |c| c.notice else decoded.notice, 0, "", "", 2);
+        defer applied.deinit(alloc);
+        for (applied.rebuild.items) |t| if (!reached.contains(t.doc_key)) try reached.put(alloc, try alloc.dupe(u8, t.doc_key), {});
+        try s.apply(&p);
+        const cont = applied.continuation orelse break;
+        const next = try decodeNoticeAlloc(alloc, cont);
+        if (current) |*c| c.deinit();
+        current = next;
+    }
+    // Block matching over-approximates; per-subscriber residual filtering
+    // (applied by the DB with source lookup) narrows further. Every true
+    // dependent must be reached.
+    for ([_][]const u8{ "d0", "d1", "d2", "d3" }) |d| try testing.expect(reached.contains(d));
+    try testing.expect(!reached.contains("d9"));
 }

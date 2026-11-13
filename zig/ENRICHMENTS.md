@@ -580,10 +580,10 @@ and next values determine exactly which dependents change:
 | Source | Live | Mechanism |
 | --- | --- | --- |
 | `term`, `terms` | yes | equality values form the indexed subscription tuple |
-| `range`, `prefix` | yes | residual per-row test |
+| `range`, `prefix` | yes | dyadic interval blocks subscribed per dependent, exact residual test at block edges; numeric bounds pushed into the storage scan filter |
 | `match` (filter mode) | yes | residual test with the pinned `antfly.context.simple.v1` analyzer (part of the source identity) |
 | `similar` (threshold) | yes | residual cosine/dot test against a vector stored in a document field; `model` names the embedding space and is part of the source identity |
-| `order_by` top-N | yes | relevant only if the row ranks at or above the recorded boundary (ties by key) |
+| `order_by` top-N | yes | interval blocks from the recorded boundary; relevant only if the row ranks at or above it (ties by key) |
 | `graph`, depth 1-3 | yes | adjacency tuple per visited node plus document tuple per member; generated and field-derived edges with `include_generated` |
 | `_artifacts.<name>` fields and predicates | yes | logical rows include generated artifacts; generated records stage notices |
 | scored full-text, nearest-k, hybrid, reranked | snapshot only | membership is relative to the corpus |
@@ -595,11 +595,30 @@ its subscription row. Source tables ship the row's previous and next
 projection of the relevant fields with each notice, and the dependent side
 evaluates both against each subscriber, so a change entirely outside one
 dependent's window, below its top-N boundary, or under its similarity
-threshold invalidates nothing. Sources without equality conjuncts share one
-spec-wide tuple, which fans out to every dependent of the declaration and is
-filtered per subscriber. Residual and ordered queries scan at most
-`max_candidates` rows after equality filtering (or the whole table when no
-full-text index serves the prefilter) and fail explicitly beyond it.
+threshold invalidates nothing.
+
+Range, prefix, and top-N conjuncts are also *indexed*, not only filtered.
+Values map to an order-preserving 64-bit key (IEEE sign-flipped numbers, the
+first eight bytes of strings, booleans), and a dependent subscribes to the
+dyadic blocks covering its interval: at most 16 blocks per equality tuple,
+coarsened outward (never narrower) when the exact cover would be larger. A
+changed row touches only the 65 blocks containing its old and new values, and
+one notice per row change carries every touched block, so a write outside
+every window reaches nobody and a write inside one reaches only dependents
+whose block contains it; the stored residual still decides exactly at the
+block edges. Prefix conjuncts index the prefix's key interval; top-N
+dependents subscribe to `[boundary, max]` (descending) or `[min, boundary]`
+(ascending) once the result is full. Only `match` and `similar` without an
+equality conjunct still share the spec-wide tuple.
+
+Reads push predicates into storage. With a full-text index, string equality
+is served as an index prefilter; otherwise, and for range-only queries, the
+resolver hands the scan a storage-evaluated filter (`terms` for string
+equality, `numeric_range` for numeric bounds) so relational tables prune
+columnar blocks and other tables skip non-matching rows before decoding into
+the resolver. Every candidate is still verified against the exact predicate.
+Residual and ordered queries examine at most `max_candidates` rows after the
+pushed-down filter and fail explicitly beyond it.
 
 Graph traversal discovers its subscriptions while reading. The runtime
 registers the bound tuples, reads, registers what the traversal discovered,
@@ -751,9 +770,9 @@ not a decision explanation.
   table's context) and graph selectors (#1635).
 - Fan-out benchmarks (invalidation latency, rebuild latency, producer calls,
   subscription storage, bulk-update work).
-- Range-aware subscription indexes: residual predicates without equality
-  conjuncts currently fan out to every dependent of the declaration and are
-  filtered per subscriber.
+- Token-indexed `match` and LSH-bucketed `similar` subscriptions: without an
+  equality conjunct these still fan out to every dependent of the
+  declaration and are filtered per subscriber.
 
 ## Full-Text Routing From Enrichments
 

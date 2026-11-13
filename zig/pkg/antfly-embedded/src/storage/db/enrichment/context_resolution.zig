@@ -181,6 +181,95 @@ pub fn prefilterJsonAlloc(alloc: Allocator, bound: *const ctx.Bound) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
+/// Storage-evaluated filter for scans (no text index required; relational
+/// tables prune columnar blocks): string equality and numeric ranges, which
+/// the stored-row predicate evaluates with the same semantics as context
+/// resolution. Everything else stays a verified residual.
+pub fn scanFilterJsonAlloc(alloc: Allocator, bound: *const ctx.Bound) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var pushed: usize = 0;
+    try out.appendSlice(alloc, "{\"bool\":{\"filter\":[");
+    var residual: ?std.json.Value = null;
+    if (bound.residual.len != 0) residual = std.json.parseFromSliceLeaky(std.json.Value, a, bound.residual, .{}) catch null;
+    for (bound.source.conjuncts, bound.values, 0..) |c, set, ci| {
+        if (ctx.artifactOfField(c.field) != null) continue;
+        if (c.isEquality()) {
+            var strings: usize = 0;
+            for (set) |v| {
+                if (v.len > 0 and v[0] == '"') strings += 1;
+            }
+            if (strings == 0 or strings != set.len) continue;
+            if (pushed != 0) try out.append(alloc, ',');
+            pushed += 1;
+            try out.appendSlice(alloc, "{\"terms\":{\"field\":");
+            try ctx.appendJsonString(alloc, &out, c.field);
+            try out.appendSlice(alloc, ",\"values\":[");
+            for (set, 0..) |v, i| {
+                if (i != 0) try out.append(alloc, ',');
+                try out.appendSlice(alloc, v);
+            }
+            try out.appendSlice(alloc, "]}}");
+        } else if (c.op == .range) {
+            const params = residual orelse continue;
+            const entries = params.object.get("c") orelse continue;
+            if (entries != .array or ci >= entries.array.items.len or entries.array.items[ci] != .object) continue;
+            const bounds = entries.array.items[ci].object;
+            var lower: ?f64 = null;
+            var upper: ?f64 = null;
+            var inclusive_min = true;
+            var inclusive_max = true;
+            var numeric = true;
+            var it = bounds.iterator();
+            while (it.next()) |entry| {
+                const v: f64 = switch (entry.value_ptr.*) {
+                    .integer => |n| @floatFromInt(n),
+                    .float => |f| f,
+                    else => blk: {
+                        numeric = false;
+                        break :blk 0;
+                    },
+                };
+                const name = entry.key_ptr.*;
+                if (std.mem.eql(u8, name, "gt") or std.mem.eql(u8, name, "gte")) {
+                    lower = v;
+                    inclusive_min = name.len == 3;
+                } else {
+                    upper = v;
+                    inclusive_max = name.len == 3;
+                }
+            }
+            if (!numeric or (lower == null and upper == null)) continue;
+            if (pushed != 0) try out.append(alloc, ',');
+            pushed += 1;
+            try out.appendSlice(alloc, "{\"numeric_range\":{\"field\":");
+            try ctx.appendJsonString(alloc, &out, c.field);
+            if (lower) |v| try out.print(alloc, ",\"min\":{d},\"inclusive_min\":{}", .{ v, inclusive_min });
+            if (upper) |v| try out.print(alloc, ",\"max\":{d},\"inclusive_max\":{}", .{ v, inclusive_max });
+            try out.appendSlice(alloc, "}}");
+        }
+    }
+    if (pushed == 0) {
+        out.clearRetainingCapacity();
+        return try out.toOwnedSlice(alloc);
+    }
+    try out.appendSlice(alloc, "]}}");
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Envelope handed to `Reader.query_fn`: `{"search":<text-index filter>,
+/// "scan":<storage filter or "">}`. Hosts choose the path they can serve.
+pub fn queryEnvelopeAlloc(alloc: Allocator, bound: *const ctx.Bound) ![]u8 {
+    const search = try prefilterJsonAlloc(alloc, bound);
+    defer alloc.free(search);
+    const scan = try scanFilterJsonAlloc(alloc, bound);
+    defer alloc.free(scan);
+    return std.fmt.allocPrint(alloc, "{{\"search\":{s},\"scan\":{s}}}", .{ search, if (scan.len == 0) "null" else scan });
+}
+
 /// Resolve every bound source and render the producer input. Errors:
 /// `RequiredContextMissing`, `ContextBudgetExceeded` (explicit refusal, never
 /// truncated output) and any host read error.
@@ -337,7 +426,7 @@ fn resolveQuery(a: Allocator, alloc: Allocator, reader: Reader, bound: *const ct
     const source = bound.source;
     var matches = std.ArrayListUnmanaged(Candidate).empty;
     if (!bound.unsatisfiable) {
-        const filter = try prefilterJsonAlloc(a, bound);
+        const filter = try queryEnvelopeAlloc(a, bound);
         const budget: u32 = if (source.hasResidual()) source.max_candidates else @max(limits.scan_floor, source.max_documents *| limits.scan_factor);
         var offset: u32 = 0;
         var seen = std.StringHashMapUnmanaged(void).empty;
@@ -380,7 +469,11 @@ fn resolveQuery(a: Allocator, alloc: Allocator, reader: Reader, bound: *const ct
             try a.dupe(u8, bound.residual)
         else
             try ctx.withBoundaryAlloc(a, bound.residual, ctx.resolveFieldPath(kept[kept.len - 1].row, order.field), kept[kept.len - 1].key, full);
-        for (bound.tuples) |t| try tuples.append(a, .{ .spec = bound.spec, .tuple = t, .residual = residual });
+        // A full top-N subscribes only to values ranking at or above its
+        // boundary (range-aware blocks); otherwise to the whole domain.
+        const boundary = if (kept.len == 0) null else ctx.resolveFieldPath(kept[kept.len - 1].row, order.field);
+        const ordered_tuples = try ctx.orderedTuplesAlloc(a, bound, boundary, full and kept.len != 0);
+        for (ordered_tuples) |t| try tuples.append(a, .{ .spec = bound.spec, .tuple = t, .residual = residual });
         for (kept) |m| try members.append(a, .{ .key = m.key, .projection = try ctx.projectAlloc(a, m.row, source.fields) });
     } else {
         std.mem.sort(Candidate, matches.items, {}, struct {
