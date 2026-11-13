@@ -2836,6 +2836,130 @@ test "crash sweep: full text recovers from one transient io fault with no crash"
     }
 }
 
+// Deterministic regression test for a use-after-free this file's own
+// io-fault sweep above found by accident: `backend.Handle.deinit` (and
+// `bridge.ContainerStorage.deinit`, which it can reach) ended every call
+// with `self.* = undefined` and had no guard against running twice. A
+// caller that explicitly closes a handle mid-scope while an
+// `errdefer`/`defer` registered earlier in that same scope is still armed
+// -- exactly `DbHandle`'s own shape just above, and an easy one for any
+// caller to fall into -- invokes `deinit` a second time the instant
+// anything *later* in that scope returns an error. The second call read
+// `self.engine` and every other field out of memory the first call had
+// already poisoned, so the switch in `deinit` could (and did) take the
+// wrong branch entirely: observed as a segmentation fault inside
+// `bridge.zig`'s hashmap iterator, reached through the
+// `.bridge_lsm_container` arm despite the handle actually being
+// `.native_single_file` the whole time. Fixed by a `closed` flag checked
+// before anything else in `deinit`, set only after `self.* = undefined`.
+//
+// Reproduces the exact shape deterministically -- one transient fault
+// during a write, an explicit `close()`, then a *manufactured* error
+// propagated out of the scope -- rather than depending on some later,
+// unrelated call (the full sweep above relies on `assertSearchable`) to
+// happen to fail on whichever (kind, at_op) combination this file's own
+// evolution leaves exercising the bug.
+fn ioFaultThenDoubleCloseScenario(allocator: Allocator, path: []const u8, sim: *sim_io.SimIo) !void {
+    var handle = try openDbWithIo(allocator, path, sim.io(), true);
+    errdefer handle.close();
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+
+    sim.setIoFaultPlan(.{ .at_op = 0, .kind = .write, .err = error.InputOutput });
+    handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text }) catch {
+        try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+    };
+
+    // Matches the crash's exact lifecycle: an explicit close while the
+    // `errdefer` above is still armed...
+    handle.close();
+    // ...then an error, from anything at all, propagated out of this
+    // scope -- deterministically forcing that still-armed `errdefer` to
+    // run `handle.close()` a second time on the now-closed handle. Before
+    // the `closed` guard, this alone -- no actual second failure required
+    // -- was enough to segfault.
+    return error.DeliberateDoubleCloseTrigger;
+}
+
+test "backend handle survives a transient io fault followed by a double close" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    const sim = try sim_io.SimIo.init(allocator, std.testing.io);
+    defer sim.deinit();
+
+    // The scenario always returns `error.DeliberateDoubleCloseTrigger` by
+    // construction (see above): what this test actually checks is that
+    // reaching it -- and so the double `deinit` -- does not crash or
+    // corrupt memory. Any other error means the scenario itself broke
+    // before it got there.
+    try std.testing.expectError(error.DeliberateDoubleCloseTrigger, ioFaultThenDoubleCloseScenario(allocator, path, sim));
+}
+
+// Same shape, under `use_redo_log: false` (legacy) -- the control. Must
+// also pass: `Handle.deinit`'s missing re-entry guard is a plain lifecycle
+// bug in `backend.zig`, with nothing in its own crash path touching
+// `self.redo` or anything else redo-specific, so nothing about this
+// scenario should depend on which storage mode created the handle.
+//
+// Opening is factored into its own function, exactly like `openDbWithIo`,
+// rather than inlined into the scenario below: an `errdefer db.close()`
+// declared before `db`'s value is moved into a `DbHandle` stays armed for
+// the rest of whatever function it was declared in, and this scenario
+// deliberately returns an error at the end to trigger the handle's own
+// stale errdefer (see `ioFaultThenDoubleCloseScenario` above) -- which
+// would, in the same breath, also re-trigger *this* one on the
+// independent, still-"open" `db` copy it was declared against, double
+// freeing `DB`'s own internals instead of (or in addition to) the
+// `backend.Handle` bug this test exists to cover. `openDbWithIo`'s own
+// identical-looking `errdefer db.close()` never hits this because nothing
+// after it in that function can fail.
+fn openLegacyDbWithIo(allocator: Allocator, path: []const u8, io: std.Io) !DbHandle {
+    var lite_backend = try backend.Handle.createWithOptions(allocator, path, .{ .exclusive = true, .io = io, .use_redo_log = false });
+    errdefer lite_backend.deinit();
+    const identity = connection.identityOpenOptions(true);
+    var db_opts = db_mod.OpenOptions{
+        .open_mode = .writer,
+        .identity_namespace = identity.identity_namespace,
+        .prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace,
+    };
+    try lite_backend.configureDbOpenOptions(&db_opts);
+    var db = try db_mod.DB.open(allocator, path, db_opts);
+    errdefer db.close();
+    try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+    try db.runUntilIdle();
+    return .{ .backend = lite_backend, .db = db };
+}
+
+fn ioFaultThenDoubleCloseScenarioLegacy(allocator: Allocator, path: []const u8, sim: *sim_io.SimIo) !void {
+    var handle = try openLegacyDbWithIo(allocator, path, sim.io());
+    errdefer handle.close();
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+
+    sim.setIoFaultPlan(.{ .at_op = 0, .kind = .write, .err = error.InputOutput });
+    handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text }) catch {
+        try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+    };
+
+    handle.close();
+    return error.DeliberateDoubleCloseTrigger;
+}
+
+test "backend handle survives a transient io fault followed by a double close LEGACY control" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    const sim = try sim_io.SimIo.init(allocator, std.testing.io);
+    defer sim.deinit();
+
+    try std.testing.expectError(error.DeliberateDoubleCloseTrigger, ioFaultThenDoubleCloseScenarioLegacy(allocator, path, sim));
+}
+
 // Deterministic regression test for a second instance of the same bug class,
 // one step earlier in the lifecycle: a transient fault during `db.addIndex`'s
 // own *post-commit* bookkeeping (after the catalog admission itself already
