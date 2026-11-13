@@ -1838,26 +1838,44 @@ pub fn remoteContentSecurityJsonAlloc(
     return try std.json.Stringify.valueAlloc(alloc, security, .{});
 }
 
-/// Preserve scoped GCS content connections as well as destination policy
-/// across the storage-owner boundary. Secret references stay unresolved until
-/// the destination has passed connection selection and scope validation.
+/// Preserve destination policy and every scoped credential (S3, HTTP and GCS)
+/// across the storage-owner boundary, where table enrichments render remote
+/// templates. Secret references stay unresolved until the destination has
+/// passed credential selection and scope validation.
 pub fn remoteContentSnapshotJsonAlloc(
     alloc: std.mem.Allocator,
     remote_content: *const scraping.RemoteContentConfig,
 ) ![]u8 {
+    const Data = scraping.RemoteContentSnapshotData;
     var snapshot = try remote_content.acquire();
     defer snapshot.deinit();
     const config = snapshot.config;
-    const entries = try alloc.alloc(scraping.RemoteContentSnapshotData.NamedGcsConnection, config.gcs_connections.count());
-    defer alloc.free(entries);
-    var it = config.gcs_connections.iterator();
-    var index: usize = 0;
-    while (it.next()) |entry| : (index += 1) {
-        entries[index] = .{ .name = entry.key_ptr.*, .connection = entry.value_ptr.* };
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    const s3 = try scratch.alloc(Data.NamedS3Credential, config.s3.count());
+    for (config.s3.keys(), config.s3.values(), s3) |name, credential, *out| {
+        out.* = .{ .name = name, .credential = credential };
     }
-    return try std.json.Stringify.valueAlloc(alloc, scraping.RemoteContentSnapshotData{
+    const http = try scratch.alloc(Data.NamedHttpCredential, config.http.count());
+    for (config.http.keys(), config.http.values(), http) |name, credential, *out| {
+        const headers = try scratch.alloc(Data.NamedHttpCredential.Header, credential.headers.count());
+        for (credential.headers.keys(), credential.headers.values(), headers) |header_name, value, *header| {
+            header.* = .{ .name = header_name, .value = value };
+        }
+        out.* = .{ .name = name, .base_url = credential.base_url, .headers = headers, .security = credential.security };
+    }
+    const gcs = try scratch.alloc(Data.NamedGcsConnection, config.gcs_connections.count());
+    for (config.gcs_connections.keys(), config.gcs_connections.values(), gcs) |name, connection, *out| {
+        out.* = .{ .name = name, .connection = connection };
+    }
+    return try std.json.Stringify.valueAlloc(alloc, Data{
         .security = config.security orelse .{},
-        .gcs_connections = entries,
+        .default_s3 = config.default_s3,
+        .s3 = s3,
+        .http = http,
+        .gcs_connections = gcs,
     }, .{});
 }
 

@@ -8115,3 +8115,56 @@ test "storage owner remote content source preserves scoped GCS connections and s
     try std.testing.expectEqualStrings("objects/sha256", before.config.gcs_connections.get("archive").?.prefix.?);
     try std.testing.expectError(error.GcsConnectionNotFoundOrOutOfScope, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "gs://originals/objects/sha256/doc.pdf?generation=123", "archive"));
 }
+
+test "storage owner remote content source preserves S3 and HTTP credentials" {
+    const Source = struct {
+        config: *@import("antfly_local_sources").common_config.Config,
+        fn acquire(raw: *anyopaque, out: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = @import("antfly_local_sources").common_config.remoteContentSnapshotJsonAlloc(std.testing.allocator, &self.config.remote_content.?) catch return .out_of_memory;
+            out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+            return .ok;
+        }
+        fn release(_: *anyopaque, bytes: kernel_owner_abi.OwnedBytes) callconv(.c) void {
+            std.testing.allocator.free(bytes.slice());
+        }
+    };
+    const alloc = std.testing.allocator;
+    // The shape Colony renders for an attached S3-compatible storage key and a
+    // GitHub installation: unresolved secret references plus a default S3 name.
+    var config = try @import("antfly_local_sources").common_config.Config.parseFromSlice(alloc,
+        \\{"remote_content":{"default_s3":"r2","s3":{"r2":{"endpoint":"account.r2.cloudflarestorage.com","region":"auto","use_ssl":true,"buckets":["media"],"access_key_id":"${secret:missing-r2-access}","secret_access_key":"${secret:missing-r2-secret}"}},"http":{"github":{"base_url":"https://api.github.com/repos/acme/","headers":{"Authorization":"${secret:missing-github-token}"},"security":{"allowed_hosts":["api.github.com"]}}}}}
+    );
+    defer config.deinit();
+    var source = Source{ .config = &config };
+    var context: ?*anyopaque = null;
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextCreate(&.{}, &context));
+    defer std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextDestroy(context)) catch unreachable;
+    const callbacks = server_api.kernel_runtime_services.RemoteContentSource{ .version = 2, .context = &source, .acquire = Source.acquire, .release = Source.release };
+    try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerContextConfigureRemoteContentSource(context, &callbacks));
+    const owner = asStorageOwnerContext(context).?;
+    owner.acquire();
+    defer owner.release();
+    const facade = owner.remoteContent().?;
+    const remote = @import("antfly_local_sources").template_remote;
+    const render_config = remote.RenderConfig{ .remote_content = facade, .io = std.testing.io };
+    // An unnamed s3:// locator selects the default credential and reaches
+    // secret resolution instead of failing with MissingS3Credentials.
+    try std.testing.expectError(error.SecretNotFound, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "s3://media/sources/clip.gif", null));
+    // Scope rejection still precedes resolution of the missing secret.
+    try std.testing.expectError(error.S3CredentialNotFoundOrOutOfScope, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "s3://elsewhere/clip.gif", "r2"));
+    // A matching HTTP base URL resolves its header secrets before any request.
+    try std.testing.expectError(error.SecretNotFound, remote.downloadRemoteContentOutcomeAllocWithRenderConfig(alloc, render_config, "https://api.github.com/repos/acme/widgets/contents/README.md", null));
+
+    var snapshot = try facade.acquire();
+    defer snapshot.deinit();
+    try std.testing.expectEqualStrings("r2", snapshot.config.default_s3.?);
+    const s3 = snapshot.config.getS3("r2").?;
+    try std.testing.expectEqualStrings("account.r2.cloudflarestorage.com", s3.endpoint.?);
+    try std.testing.expectEqualStrings("media", s3.buckets.?[0]);
+    try std.testing.expectEqualStrings("${secret:missing-r2-access}", s3.access_key_id.?);
+    const http = snapshot.config.getHttp("github").?;
+    try std.testing.expectEqualStrings("https://api.github.com/repos/acme/", http.base_url.?);
+    try std.testing.expectEqualStrings("${secret:missing-github-token}", http.headers.get("Authorization").?);
+    try std.testing.expectEqualStrings("api.github.com", http.security.?.allowed_hosts.?[0]);
+}

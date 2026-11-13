@@ -1031,7 +1031,7 @@ const RemoteContentSnapshot = struct {
     config: scraping.RemoteContentConfig,
     fn release(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        self.config.gcs_connections.deinit(std.heap.smp_allocator);
+        scraping.RemoteContentSnapshotData.deinitConfig(&self.config, std.heap.smp_allocator);
         self.parsed.deinit();
         std.heap.smp_allocator.destroy(self);
     }

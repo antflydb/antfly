@@ -378,12 +378,36 @@ pub const RemoteContentConfig = struct {
     }
 };
 
-/// JSON payload for the compiled storage owner. The derived facade borrows
-/// policy and connection values from this payload; only its GCS map is owned.
-/// Release that map before destroying the parsed payload.
+/// JSON payload for the compiled storage owner. It carries destination policy
+/// and every scoped credential (S3, HTTP and GCS), with secret references left
+/// unresolved. The derived facade borrows values from this payload; only its
+/// maps are owned. Release them with `deinitConfig` before destroying the
+/// parsed payload.
 pub const RemoteContentSnapshotData = struct {
     security: ContentSecurityConfig = .{},
+    default_s3: ?[]u8 = null,
+    s3: []const NamedS3Credential = &.{},
+    http: []const NamedHttpCredential = &.{},
     gcs_connections: []const NamedGcsConnection = &.{},
+
+    pub const NamedS3Credential = struct {
+        name: []const u8,
+        credential: S3CredentialConfig,
+    };
+
+    /// JSON cannot carry `HTTPCredentialConfig.headers` as a map, so headers
+    /// cross the boundary as a list.
+    pub const NamedHttpCredential = struct {
+        name: []const u8,
+        base_url: ?[]u8 = null,
+        headers: []const Header = &.{},
+        security: ?ContentSecurityConfig = null,
+
+        pub const Header = struct {
+            name: []const u8,
+            value: []u8,
+        };
+    };
 
     pub const NamedGcsConnection = struct {
         name: []const u8,
@@ -391,14 +415,38 @@ pub const RemoteContentSnapshotData = struct {
     };
 
     pub fn configAlloc(self: *const @This(), alloc: Allocator) !RemoteContentConfig {
-        var config = RemoteContentConfig{ .security = self.security };
-        errdefer config.gcs_connections.deinit(alloc);
+        var config = RemoteContentConfig{ .security = self.security, .default_s3 = self.default_s3 };
+        errdefer deinitConfig(&config, alloc);
+        for (self.s3) |entry| {
+            const result = try config.s3.getOrPut(alloc, entry.name);
+            if (result.found_existing) return error.InvalidRemoteContentConfig;
+            result.value_ptr.* = entry.credential;
+        }
+        for (self.http) |entry| {
+            const result = try config.http.getOrPut(alloc, entry.name);
+            if (result.found_existing) return error.InvalidRemoteContentConfig;
+            result.value_ptr.* = .{ .base_url = entry.base_url, .security = entry.security };
+            for (entry.headers) |header| {
+                const slot = try result.value_ptr.headers.getOrPut(alloc, header.name);
+                if (slot.found_existing) return error.InvalidRemoteContentConfig;
+                slot.value_ptr.* = header.value;
+            }
+        }
         for (self.gcs_connections) |entry| {
             const result = try config.gcs_connections.getOrPut(alloc, entry.name);
             if (result.found_existing) return error.InvalidRemoteContentConfig;
             result.value_ptr.* = entry.connection;
         }
         return config;
+    }
+
+    /// Releases the maps built by `configAlloc`. Keys and values stay borrowed
+    /// from the parsed payload and are not freed here.
+    pub fn deinitConfig(config: *RemoteContentConfig, alloc: Allocator) void {
+        config.s3.deinit(alloc);
+        for (config.http.values()) |*credential| credential.headers.deinit(alloc);
+        config.http.deinit(alloc);
+        config.gcs_connections.deinit(alloc);
     }
 };
 
@@ -2740,7 +2788,7 @@ test "remote content snapshot owns borrowed GCS views and rolls back allocation 
             var parsed = try std.json.parseFromSlice(RemoteContentSnapshotData, alloc, raw, .{ .allocate = .alloc_always });
             defer parsed.deinit();
             var config = try parsed.value.configAlloc(alloc);
-            defer config.gcs_connections.deinit(alloc);
+            defer RemoteContentSnapshotData.deinitConfig(&config, alloc);
             try std.testing.expectEqual(@as(?u64, 1024), config.security.?.max_download_size_bytes);
             const connection = config.gcs_connections.get("archive").?;
             try std.testing.expectEqualStrings("${secret:reader}", connection.credentials.bearer_token.?);
@@ -2750,6 +2798,39 @@ test "remote content snapshot owns borrowed GCS views and rolls back allocation 
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "remote content snapshot carries S3 and HTTP credentials and rolls back allocation failures" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            const raw =
+                \\{"default_s3":"r2","s3":[{"name":"r2","credential":{"endpoint":"account.r2.cloudflarestorage.com","use_ssl":true,"buckets":["media"],"access_key_id":"${secret:r2-access}","secret_access_key":"${secret:r2-secret}"}}],"http":[{"name":"github","base_url":"https://api.github.com/repos/acme/","headers":[{"name":"Authorization","value":"${secret:github}"},{"name":"Accept","value":"application/vnd.github.raw+json"}],"security":{"allowed_hosts":["api.github.com"]}}]}
+            ;
+            var parsed = try std.json.parseFromSlice(RemoteContentSnapshotData, alloc, raw, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            var config = try parsed.value.configAlloc(alloc);
+            defer RemoteContentSnapshotData.deinitConfig(&config, alloc);
+            try std.testing.expectEqualStrings("r2", config.default_s3.?);
+            const s3 = config.getS3("r2").?;
+            try std.testing.expectEqualStrings("account.r2.cloudflarestorage.com", s3.endpoint.?);
+            try std.testing.expectEqualStrings("media", s3.buckets.?[0]);
+            try std.testing.expectEqualStrings("${secret:r2-secret}", s3.secret_access_key.?);
+            const http = config.getHttp("github").?;
+            try std.testing.expectEqual(@as(usize, 2), http.headers.count());
+            try std.testing.expectEqualStrings("${secret:github}", http.headers.get("Authorization").?);
+            try std.testing.expectEqualStrings("api.github.com", http.security.?.allowed_hosts.?[0]);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "remote content snapshot rejects duplicate credential names" {
+    const raw =
+        \\{"s3":[{"name":"r2","credential":{}},{"name":"r2","credential":{}}]}
+    ;
+    var parsed = try std.json.parseFromSlice(RemoteContentSnapshotData, std.testing.allocator, raw, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidRemoteContentConfig, parsed.value.configAlloc(std.testing.allocator));
 }
 
 /// Keep Retry-After as a duration; supervisors persist their own retry clock.
