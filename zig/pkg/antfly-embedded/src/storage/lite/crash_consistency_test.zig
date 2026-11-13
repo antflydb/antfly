@@ -2415,6 +2415,43 @@ test "lite dense vector full index visibility is readable immediately after an u
     }
 }
 
+// Regression for the §9.7c ReadView design doc section: a document plus
+// its full-text entry, written without ever calling checkpointRedoLog,
+// must be found by derived catch-up through the real catch-up API
+// (sync_level: .full_text's own wait path) both on the live handle that
+// wrote it and, independently, on a fresh handle after a clean close and
+// reopen -- exercising "recovery replays into the overlay before any
+// reader starts" (§9.5/recoverRedoLog) feeding into the exact same
+// catch-up path the live-handle half of this test already covers.
+test "lite derived catch-up sees a document and its full-text entry written without a checkpoint, before and after a crash and reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    // Before: write on a live handle, no checkpoint, assert immediately.
+    {
+        var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+        defer handle.close();
+        try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+        try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+        try assertSearchable(&handle, allocator, "body_text", "body", "ft-doc", "needle");
+    }
+
+    // After: a fresh handle, opened from scratch. recoverRedoLog must
+    // have replayed the above into the shared overlay before this handle
+    // is usable at all; the first thing this does with it is run the
+    // exact same catch-up path again (via assertSearchable's own
+    // runUntilIdle/forceCompactTextIndexes retry loop), on a derived
+    // index this new handle has never touched before.
+    {
+        var handle = try openDbWithIo(allocator, path, std.testing.io, false);
+        defer handle.close();
+        try assertSearchable(&handle, allocator, "body_text", "body", "ft-doc", "needle");
+    }
+}
+
 test "crash sweep: full text synchronous visibility" {
     var report = try runCrashSweep(std.testing.allocator, .{
         .name = "full-text-sync-visible",
