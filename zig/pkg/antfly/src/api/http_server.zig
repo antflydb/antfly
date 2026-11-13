@@ -469,6 +469,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
             return err;
         };
         defer parsed.deinit(alloc);
+        self.server.applyGraphExecutionLimits(&parsed.req);
         if (self.request_context) |context| {
             if (context.deadline_ns) |deadline| parsed.req.execution_deadline_ns = if (parsed.req.execution_deadline_ns) |existing| @min(existing, deadline) else deadline;
             parsed.req.cancellation = context.cancellation;
@@ -512,6 +513,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
             return err;
         };
         defer parsed.deinit(alloc);
+        self.server.applyGraphExecutionLimits(&parsed.req);
         if (self.request_context) |context| {
             if (context.deadline_ns) |deadline| parsed.req.execution_deadline_ns = if (parsed.req.execution_deadline_ns) |existing| @min(existing, deadline) else deadline;
             parsed.req.cancellation = context.cancellation;
@@ -10002,6 +10004,7 @@ pub const ApiHttpServer = struct {
                     else => return err,
                 };
                 defer query_req.deinit(alloc);
+                runner.server.applyGraphExecutionLimits(&query_req.req);
                 query_req.req.execution_deadline_ns = if (query_req.req.execution_deadline_ns) |deadline| @min(deadline, runner.deadline_ns) else runner.deadline_ns;
                 runner.server.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
                     error.TableNotFound => return err,
@@ -10151,6 +10154,10 @@ pub const ApiHttpServer = struct {
         };
         if (resolver) |cache| try cache.definitions.put(alloc, try alloc.dupe(u8, table_name), definition);
         return .{ .storage = .{ .engine = definition.storage_engine }, .table_id = definition.table_id, .object_storage_generation = definition.object_storage_generation, .name = table_name, .schema_json = definition.schema_json, .read_schema_json = definition.read_schema_json, .indexes_json = definition.indexes_json, .lake_index_catalog_json = definition.lake_index_catalog_json };
+    }
+
+    fn applyGraphExecutionLimits(self: *const ApiHttpServer, req: *db_mod.types.SearchRequest) void {
+        req.graph_execution_limits = self.cfg.graph_execution_limits;
     }
 
     pub fn maybeRouteQueryToReadSchema(self: *ApiHttpServer, table_name: []const u8, query_req: *db_mod.types.SearchRequest) !void {
@@ -16116,6 +16123,7 @@ pub const ApiHttpServer = struct {
             return normalized;
         };
         defer query_req.deinit(alloc);
+        self.applyGraphExecutionLimits(&query_req.req);
         if (request_deadline_ns) |deadline| {
             query_req.req.execution_deadline_ns = deadline;
             try ensureRequestDeadline(deadline);
@@ -16587,6 +16595,7 @@ pub const ApiHttpServer = struct {
             execution_deadline_ns,
         );
         errdefer owned.deinit(alloc);
+        self.applyGraphExecutionLimits(&owned.req);
         owned.req.cancellation = cancellation;
         try ensureRequestActive(cancellation);
         try self.routeQueryToReadSchemaWithResolver(table_name, &owned.req, resolver);
@@ -40751,6 +40760,109 @@ test "api http server serves table scan as ndjson" {
     defer unsupported_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), unsupported_resp.status);
     try std.testing.expectEqualStrings("unsupported scan filter query", unsupported_resp.body);
+}
+
+test "api http graph operator limits propagate and enforce through public queries" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("graph-operator-limits");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{ .name = "graph_idx", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{
+        .{ .key = "a", .value = "{\"body\":\"a\"}" }, .{ .key = "b", .value = "{\"body\":\"b\"}" }, .{ .key = "c", .value = "{\"body\":\"c\"}" },
+    }, .sync_level = .full_index });
+    const graph = &(db.core.graphIndex("graph_idx") orelse return error.IndexNotFound).index;
+    try graph.addEdge("a", "b", "FRIEND", 1, 0, 0, "");
+    try graph.addEdge("b", "c", "FRIEND", 1, 0, 0, "");
+    var bound = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    // The internal expansion contract must preserve policy across a wire
+    // round trip before the real DB creates its local execution budget.
+    for ([_]bool{ false, true }) |raised| {
+        const wire = try std.fmt.allocPrint(a,
+            \\{{"name":"expand","index_name":"graph_idx","frontier":[{{"id":0,"key":"a"}}],"params":{{"max_depth":1}},"work_limits":{{"max_explored_nodes":{d},"max_intermediate_states":200000,"max_retained_state_bytes":134217728}}}}
+        , .{if (raised) @as(usize, 200_000) else 1});
+        defer a.free(wire);
+        var decoded = try distributed_graph.parseGraphExpandRequest(a, wire);
+        defer decoded.deinit(a);
+        const response = bound.source().graphExpandGroupLocal(a, 77, "docs", decoded, .read_index);
+        if (raised) {
+            var result = (try response).?;
+            defer result.deinit(a);
+            try std.testing.expectEqual(@as(usize, 1), result.expansions.len);
+        } else try std.testing.expectError(error.GraphWorkBudgetExceeded, response);
+    }
+    const Status = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const Reads = struct {
+        bound: *table_reads.BoundTableReadSource,
+        expected: @import("antfly_local_sources").graph_work_budget.Limits,
+        calls: usize = 0,
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualDeep(self.expected, req.graph_execution_limits);
+            self.calls += 1;
+            return self.bound.source().query(alloc, table, req, consistency);
+        }
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } };
+        }
+    };
+    const bodies = [_][]const u8{
+        \\{"limit":0,"graph_queries":{"sp":{"index":"graph_idx","shortest_path":{"from":{"key":"a"},"to":{"key":"c"},"max_depth":8,"objective":"min_hops"}}}}
+        ,
+        \\{"limit":0,"graph_searches":{"sp":{"type":"shortest_path","index_name":"graph_idx","start_nodes":{"keys":["a"]},"target_nodes":{"keys":["c"]},"params":{"max_depth":8,"weight_mode":"min_hops"}}}}
+        ,
+        \\{"limit":0,"graph_queries":{"walk":{"index":"graph_idx","traverse":{"start":{"keys":["a"]},"max_depth":2}}}}
+        ,
+        \\{"limit":0,"graph_queries":{"paths":{"index":"graph_idx","k_shortest_paths":{"from":{"key":"a"},"to":{"key":"c"},"k":2,"max_depth":8,"objective":"min_hops"}}}}
+        ,
+        \\{"limit":0,"graph_searches":{"facts":{"type":"pattern","index_name":"graph_idx","start_nodes":{"keys":["a"]},"pattern":[{"alias":"a"},{"alias":"b","edge":{"types":["FRIEND"],"direction":"out"}},{"alias":"c","edge":{"types":["FRIEND"],"direction":"out"}}],"return_aliases":["a","b","c"],"params":{"max_depth":2}}}}
+        ,
+    };
+    for ([_]bool{ false, true }) |raised| {
+        var limits = @import("antfly_local_sources").graph_work_budget.Limits{};
+        if (raised) {
+            inline for (comptime std.meta.fieldNames(@TypeOf(limits))) |field| @field(limits, field) *= 50;
+            limits.max_explored_edges = 10_000_000;
+        } else limits.max_explored_edges = 1;
+        const config_json = try std.json.Stringify.valueAlloc(a, .{ .resources = .{ .query = .{ .request_limits = .{ .graph = limits } } } }, .{});
+        defer a.free(config_json);
+        var config = try common_config.Config.parseFromSlice(a, config_json);
+        defer config.deinit();
+        var reads = Reads{ .bound = &bound, .expected = limits };
+        var server = ApiHttpServer.init(a, .{ .graph_execution_limits = config.resources.query.request_limits.graph }, .{ .ptr = undefined, .vtable = &.{ .status = Status.status } }, reads.source(), null);
+        defer server.deinit();
+        for (bodies) |body| {
+            var response = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = "/tables/docs/query", .content_type = "application/json", .body = body });
+            defer response.deinit(a);
+            if (response.status != (if (raised) @as(u16, 200) else 422)) std.debug.print("graph operator case raised={} request={s} response={s}\n", .{ raised, body, response.body });
+            try std.testing.expectEqual(@as(u16, if (raised) 200 else 422), response.status);
+            if (!raised) {
+                var diagnostic = try std.json.parseFromSlice(std.json.Value, a, response.body, .{});
+                defer diagnostic.deinit();
+                const maximum = diagnostic.value.object.get("maximum");
+                if (maximum == null) std.debug.print("missing graph budget diagnostic request={s} response={s}\n", .{ body, response.body });
+                try std.testing.expect(maximum != null);
+                try std.testing.expectEqual(@as(i64, 1), maximum.?.integer);
+            }
+        }
+        try std.testing.expectEqual(bodies.len, reads.calls);
+        // Operator ceilings cannot be supplied or raised in the public DSL.
+        var denied = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = "/tables/docs/query", .content_type = "application/json", .body = "{\"graph_execution_limits\":{\"max_explored_edges\":99999999}}" });
+        defer denied.deinit(a);
+        try std.testing.expectEqual(@as(u16, 400), denied.status);
+    }
 }
 
 test "api http server serves table query response envelope" {
