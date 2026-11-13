@@ -1220,3 +1220,68 @@ test "ensureRegion's lazy reopen after rebind uses the original directory, not a
     try std.process.setCurrentPath(io, original_cwd);
     restored = true;
 }
+
+// The regression this guards against: `Entry.path` and `Entry.region_path`
+// used to be one field, canonicalized to an absolute spelling. `ensureFd`
+// reopened *that* canonical spelling to get its dedicated flock fd --
+// fine against a real filesystem (same inode either way), but under a
+// test harness that tracks durability by path *string* (this codebase's
+// own crash simulator, `crash_sim_io.zig`), reopening under a different
+// string than whatever created and synced the file registers as a
+// second, never-synced tracking entry for the same underlying file --
+// observed as the crash simulator's own rollback deleting a file a
+// different, correctly synced entry for the *original* string would
+// have restored (crash sweep failures: "redo log checkpoint with
+// indexed reclamation retires pages", "full text synchronous
+// visibility"). This test does not need the crash simulator at all: it
+// just proves the two fields stay independently exactly what each is
+// documented to be.
+test "Entry.path stays the exact raw spelling ensureFd reopens with, independent of Entry.region_path" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const original_cwd = try Io.Dir.cwd().realPathFileAlloc(io, ".", a);
+    defer a.free(original_cwd);
+    var restored = false;
+    defer if (!restored) std.process.setCurrentPath(io, original_cwd) catch {};
+
+    var data_tmp = std.testing.tmpDir(.{});
+    defer data_tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try data_tmp.dir.realPath(io, &buf);
+    const data_dir = try a.dupe(u8, buf[0..dir_len]);
+    defer a.free(data_dir);
+
+    try std.process.setCurrentPath(io, data_dir);
+    const relative_path = "entry-path-raw.data";
+    {
+        const f = try Io.Dir.cwd().createFile(io, relative_path, .{});
+        f.close(io);
+    }
+
+    const entry = try open(io, relative_path);
+    defer unref(entry, io);
+
+    // `path` is the exact string `open` was called with -- not resolved,
+    // not made absolute.
+    try std.testing.expectEqualStrings(relative_path, entry.path);
+    // `region_path` resolved to an absolute spelling of the same file
+    // (the data file exists, so the fast tier of `canonicalPathAlloc`
+    // succeeds): different from `path`, and ending in the same name.
+    try std.testing.expect(entry.region_path != null);
+    try std.testing.expect(!std.mem.eql(u8, entry.path, entry.region_path.?));
+    try std.testing.expect(std.fs.path.isAbsolute(entry.region_path.?));
+    try std.testing.expect(std.mem.endsWith(u8, entry.region_path.?, relative_path));
+
+    // `ensureFd` (exercised indirectly through any in-process lock
+    // acquisition) must still open this same file successfully, through
+    // `path`, exactly as before `region_path` existed.
+    const fd = try ensureFd(entry, io);
+    const stat_by_path = try Io.Dir.cwd().statFile(io, relative_path, .{});
+    try std.testing.expectEqual(stat_by_path.inode, (try fd.stat(io)).inode);
+
+    try std.process.setCurrentPath(io, original_cwd);
+    restored = true;
+}
