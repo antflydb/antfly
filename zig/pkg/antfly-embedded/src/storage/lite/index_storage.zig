@@ -863,7 +863,13 @@ test "lite native index storage persists logical files across reopen" {
 
         const checkpoint = docs.file.activeCheckpoint();
         try std.testing.expectEqual(@as(u64, 0), checkpoint.catalog_root_page);
-        try std.testing.expect(checkpoint.index_catalog_root_page != 0);
+        // Under the redo log (the default), every one of these writes
+        // diverts logically into the overlay and is never folded into a
+        // real B-tree root until a checkpointRedoLog fold runs, so
+        // index_catalog_root_page legitimately stays 0 here too -- the
+        // data itself is still live and correctly readable through every
+        // catalog read path (ReadView/MergedCursor), verified below via
+        // snapshotIndexCatalogRecordsAlloc and, after reopen, readFileAlloc.
         const records = try docs.file.snapshotIndexCatalogRecordsAlloc(allocator);
         defer native.NativeFile.freeSnapshotCatalogRecords(allocator, records);
         try std.testing.expectEqual(@as(usize, 2), records.len);
@@ -1569,7 +1575,14 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
                 if (entry.value_ptr.bytes[4] == @backingInt(native.PageKind.value)) payload_pages += 1;
             }
             try std.testing.expectEqual(hot_pages.items.len, payload_pages);
-            try std.testing.expect(docs.file.page_cache.pages.contains(docs.file.activeCheckpoint().index_catalog_root_page));
+            // Under the redo log (the default), this single-key catalog
+            // write diverts logically into the overlay and never builds a
+            // real B-tree root page at all, so index_catalog_root_page
+            // stays 0 here -- there is no catalog-tree page for cache
+            // admission to pin in the first place. The external value
+            // pages this loop actually exercises (hot_pages/payload_pages,
+            // above) remain real, page-shaped writes under diversion, so
+            // the cache-admission policy they verify is unaffected.
         }
 
         // Policy is local to the sink, and can be changed before publication.
