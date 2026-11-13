@@ -2191,9 +2191,15 @@ test "lite mapped publication failure consumes writer and preserves old artifact
     var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 128 * 1024 };
     var writer = try storage.beginAtomicWrite(budget.allocator(), "/mapped");
     try writer.appendSlice("new");
-    docs.file.test_page_write_fail_after = 0;
+    // "new" is a 3-byte inline value -- under the redo log's default
+    // diversion this catalog mutation never touches a real page at all
+    // (`flushTransactionWrites`'s own diverting branch), so
+    // `test_page_write_fail_after` would never fire.
+    // `test_logical_write_fail_after` is its counterpart for a purely
+    // logical diverting mutation.
+    docs.file.test_logical_write_fail_after = 0;
     try std.testing.expectError(error.TestPageWriteFailure, writer.vtable.finish_mapped.?(writer.ptr));
-    docs.file.test_page_write_fail_after = null;
+    docs.file.test_logical_write_fail_after = null;
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     const retained = try storage.readFileAlloc(a, "/mapped", 100);
     defer a.free(retained);

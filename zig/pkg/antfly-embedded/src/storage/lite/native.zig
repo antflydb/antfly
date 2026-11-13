@@ -6700,6 +6700,19 @@ pub const NativeFile = struct {
 
     test_page_write_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_page_write_fail_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
+    /// `test_page_write_fail_after`'s own counterpart for a catalog
+    /// mutation that diverts purely logically (no page-shaped content at
+    /// all -- a small put/delete under the redo log's default diversion,
+    /// `flushTransactionWrites`'s own diverting branch). A fault-injection
+    /// test written against the legacy B-tree rebuild could rely on
+    /// `test_page_write_fail_after` firing partway through a batch of real
+    /// page writes; under full logical diversion that batch may never
+    /// touch a real page at all, so this counts/fails on logical mutations
+    /// instead. Checked in `flushTransactionWrites`'s diverting loop, once
+    /// per mutation.
+    test_logical_write_fail_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
+    /// `test_page_writes`'s own counterpart for `test_logical_write_fail_after`.
+    test_logical_mutations: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     /// Counts durability barriers (`syncIfRequired`'s underlying `file.sync`
     /// calls), independent of filesystem speed. Used to assert syncs/commit.
     test_sync_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
@@ -16369,7 +16382,16 @@ pub const NativeFile = struct {
                 }
             }.less);
             if (diverting) {
-                for (batch.items) |m| try self.redo.?.appendLogicalMutation(self.allocator, self.runtimeIo(), @intCast(root), m, pending_sequence);
+                for (batch.items) |m| {
+                    if (builtin.is_test) {
+                        if (self.test_logical_write_fail_after) |remaining| {
+                            if (remaining == 0) return error.TestPageWriteFailure;
+                            self.test_logical_write_fail_after = remaining - 1;
+                        }
+                        _ = self.test_logical_mutations.fetchAdd(1, .monotonic);
+                    }
+                    try self.redo.?.appendLogicalMutation(self.allocator, self.runtimeIo(), @intCast(root), m, pending_sequence);
+                }
                 diverted_anything = true;
             } else if (root == @backingInt(TransactionWrites.Root.documents)) {
                 const docs = try self.allocator.alloc(DocumentMutation, batch.items.len);
