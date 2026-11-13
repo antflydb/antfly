@@ -2360,20 +2360,19 @@ test "lite full text synchronous visibility is searchable immediately after an u
         defer tmp.cleanup();
         const path = try testAflitePath(allocator, tmp);
         defer allocator.free(path);
-        var lite_backend = try backend.Handle.createWithOptions(allocator, path, .{ .exclusive = true, .io = std.testing.io, .use_redo_log = false });
-        errdefer lite_backend.deinit();
-        const identity = connection.identityOpenOptions(true);
-        var db_opts = db_mod.OpenOptions{
-            .open_mode = .writer,
-            .identity_namespace = identity.identity_namespace,
-            .prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace,
-        };
-        try lite_backend.configureDbOpenOptions(&db_opts);
-        var db = try db_mod.DB.open(allocator, path, db_opts);
-        errdefer db.close();
-        try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
-        try db.runUntilIdle();
-        var handle = DbHandle{ .backend = lite_backend, .db = db };
+        // Opening through `openLegacyDbWithIo` (not inlined here) is the
+        // point, not incidental: an `errdefer lite_backend.deinit()` /
+        // `errdefer db.close()` pair declared in *this* function would stay
+        // armed for the rest of the loop body below, including past the
+        // point where `handle = .{ .backend = lite_backend, .db = db }`
+        // copies their values and `defer handle.close()` becomes the real
+        // owner -- any later failure (`batch`/`assertSearchable`) would
+        // then double-close both `db` and `lite_backend` on top of
+        // `handle`'s own close. `openLegacyDbWithIo`'s errdefers are scoped
+        // to its own body, which returns before any of that can happen
+        // (see its doc comment, and `ioFaultThenDoubleCloseScenarioLegacy`
+        // below for the shape this avoids).
+        var handle = try openLegacyDbWithIo(allocator, path, std.testing.io);
         defer handle.close();
         try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
         try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
