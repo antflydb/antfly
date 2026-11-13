@@ -2065,6 +2065,7 @@ pub const DBCore = struct {
             .max_weight = max_weight,
             .node_admission = node_admission,
             .work_budget = work_budget,
+            .max_intermediate_states = if (work_budget) |budget| budget.max_intermediate_states else graph_pattern_mod.default_max_intermediate_states,
             .owning_table = owning_table,
             // Same single-index justification as graphTraverseEdges above.
             .expand_cross_table_local = true,
@@ -2098,6 +2099,7 @@ pub const DBCore = struct {
             .max_weight = max_weight,
             .node_admission = node_admission,
             .work_budget = work_budget,
+            .max_intermediate_states = if (work_budget) |budget| budget.max_intermediate_states else graph_pattern_mod.default_max_intermediate_states,
             .owning_table = owning_table,
             // Same single-index justification as graphTraverseEdges above.
             .expand_cross_table_local = true,

@@ -130,6 +130,7 @@ pub fn boundedReachabilityWithOptionsAlloc(
     defer deinitPendingMap(alloc, &results);
 
     var frontier = PendingMap.empty;
+    defer deinitPendingMap(alloc, &frontier);
     const identity = try law.identityAlloc(alloc, .provenance_semiring);
     defer alloc.free(identity);
     try mergePending(alloc, &frontier, start_node, identity, 0);
@@ -137,6 +138,7 @@ pub fn boundedReachabilityWithOptionsAlloc(
     var depth: u32 = 0;
     while (depth < max_depth) : (depth += 1) {
         var next = PendingMap.empty;
+        errdefer deinitPendingMap(alloc, &next);
         var it = frontier.iterator();
         while (it.next()) |entry| {
             const from = entry.key_ptr.*;
@@ -148,14 +150,13 @@ pub fn boundedReachabilityWithOptionsAlloc(
                 try mergePending(alloc, &results, edge.to, product, depth + 1);
                 try mergePending(alloc, &next, edge.to, product, depth + 1);
                 if (options.work_budget) |budget| {
-                    try budget.checkIntermediateStates(next.count(), work_budget_mod.default_max_intermediate_states);
+                    try budget.checkIntermediateStates(next.count(), budget.max_intermediate_states);
                 }
             }
         }
         deinitPendingMap(alloc, &frontier);
         frontier = next;
     }
-    deinitPendingMap(alloc, &frontier);
 
     var out = std.ArrayListUnmanaged(PathResult).empty;
     errdefer {
@@ -322,4 +323,16 @@ test "bounded provenance path query can constrain reachable targets" {
     try std.testing.expectEqual(@as(usize, 2), provenance.len);
     try std.testing.expectEqualStrings("edge:ab", provenance[0]);
     try std.testing.expectEqualStrings("edge:bc", provenance[1]);
+}
+
+test "bounded provenance path query releases frontiers on configured state exhaustion" {
+    const a = std.testing.allocator;
+    const provenance = try provenanceTokenAlloc(a, &.{"edge"});
+    defer a.free(provenance);
+    const edges = [_]Edge{
+        .{ .from = "root", .to = "a", .provenance = provenance },
+        .{ .from = "root", .to = "b", .provenance = provenance },
+    };
+    var budget = work_budget_mod.WorkBudget.initWithLimits(.{ .max_intermediate_states = 1 });
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, boundedReachabilityWithOptionsAlloc(a, "root", &edges, 1, .{ .work_budget = &budget }));
 }

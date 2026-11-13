@@ -2831,6 +2831,7 @@ const FrontierState = struct {
 /// their pending states; settled parents live separately in QueryState.
 const PathFrontier = struct {
     fifo: bool,
+    memory: graph_work_budget.RetainedAllocator,
     queue: std.ArrayListUnmanaged(FrontierState) = .empty,
     head: usize = 0,
     heap: std.PriorityQueue(FrontierState, void, frontierStateOrder) = .initContext({}),
@@ -2847,21 +2848,36 @@ const PathFrontier = struct {
         self.head += 1;
         return next;
     }
-    fn push(self: *@This(), a: std.mem.Allocator, item: FrontierState) !void {
-        if (!self.fifo) return self.heap.push(a, item);
-        if (self.head >= 64 and self.head >= self.queue.items.len / 2) {
-            const pending = self.queue.items[self.head..];
-            std.mem.copyForwards(FrontierState, self.queue.items[0..pending.len], pending);
-            self.queue.items.len = pending.len;
-            self.head = 0;
-        }
-        try self.queue.append(a, item);
+    fn push(self: *@This(), item: *FrontierState) !void {
+        const budget = self.memory.budget.?;
+        try budget.checkIntermediateStates(self.count() + 1, budget.max_intermediate_states);
+        const a = self.memory.allocator();
+        if (self.fifo) {
+            if (self.head >= 64 and self.head >= self.queue.items.len / 2) {
+                const pending = self.queue.items[self.head..];
+                std.mem.copyForwards(FrontierState, self.queue.items[0..pending.len], pending);
+                self.queue.items.len = pending.len;
+                self.head = 0;
+            }
+            self.queue.ensureUnusedCapacity(a, 1) catch |err| return self.failure(err);
+        } else self.heap.ensureUnusedCapacity(a, 1) catch |err| return self.failure(err);
+        // The container now owns the slot allocation, including spare capacity
+        // and growth peaks. Transfer the entry's inline reservation only after
+        // capacity succeeds so the caller retains complete ownership on error.
+        std.debug.assert(item.retained_lease.bytes >= @sizeOf(FrontierState));
+        try item.retained_lease.resize(item.retained_lease.bytes - @sizeOf(FrontierState));
+        if (self.fifo) self.queue.appendAssumeCapacity(item.*) else self.heap.push(a, item.*) catch unreachable;
+    }
+    fn failure(self: *@This(), err: anyerror) anyerror {
+        return if (err == error.OutOfMemory and self.memory.denied) error.GraphWorkBudgetExceeded else err;
     }
     fn deinit(self: *@This(), a: std.mem.Allocator) void {
         for (self.queue.items[self.head..]) |*item| item.deinit(a);
         for (self.heap.items) |*item| item.deinit(a);
-        self.queue.deinit(a);
-        self.heap.deinit(a);
+        const tracked = self.memory.allocator();
+        self.queue.deinit(tracked);
+        self.heap.deinit(tracked);
+        std.debug.assert(self.memory.live_bytes == 0);
     }
 };
 
@@ -4206,16 +4222,24 @@ const PathEdgeStream = struct {
         const state = try self.reader.admission.ensureTable(self.table);
         try self.reader.admission.preparedEdges();
         const prepared = self.reader.admission.prepared_edges.?;
-        var wide = shard.legacy;
+        var overhead: usize = 64 * 1024 +| (self.key.len *| 12) +| (self.reader.index_name.len *| 12);
+        for (self.kinds) |kind| overhead +|= kind.len *| 6;
+        if (cursor) |value| {
+            inline for (.{ value.edge_type, value.adjacent_key, value.edge_id, value.owner_document }) |field| overhead +|= field.len *| 6;
+            if (value.physical_resume_key) |field| overhead +|= field.len *| 6;
+        }
+        const Attempt = enum { page, single, complete };
+        var attempt: Attempt = if (shard.legacy) .complete else .page;
         while (true) {
-            const room = try budget.ensureStateHeadroom(1);
-            const complete_bytes = @min(graph_pattern_mod.default_max_explored_edge_bytes, @max(1, room / 2));
-            const bytes = if (wide) complete_bytes else @min(shard.page_bytes, complete_bytes);
+            const room = try budget.ensureStateHeadroom(overhead +| 16);
+            // Retain the encoded body, final edges, and parser workspace at
+            // once. Keep ordinary pages conservative; a single-edge retry can
+            // spend the larger safe allowance without gathering a broad page.
+            const complete_bytes = @min(graph_pattern_mod.default_max_explored_edge_bytes, (room - overhead) / 8);
+            const bytes = if (attempt == .page) @min(shard.page_bytes, (room - overhead) / 16) else complete_bytes;
             const edge_allowance = @max(1, @min(budget.remaining_edges, graph_pattern_mod.default_max_explored_edges));
             const scan_allowance = @max(1, @min(budget.remaining_physical_edges, graph_pattern_mod.default_max_explored_edges));
             const keys = [_][]const u8{self.key};
-            var scratch = std.heap.ArenaAllocator.init(a);
-            defer scratch.deinit();
             const request = GraphEdgesRequest{
                 .index_name = @constCast(self.reader.index_name),
                 .key = @constCast(self.key),
@@ -4229,10 +4253,14 @@ const PathEdgeStream = struct {
                 .topology_epoch = state.topology_epoch,
                 .identity_read_generation = try state.generationForGroup(shard.group),
                 .ttl_now_ns = self.reader.ttl_now_ns,
-                .max_edges = @intCast(if (wide) @min(edge_allowance, scan_allowance) else @min(shard.page_edges, edge_allowance)),
+                .max_edges = @intCast(switch (attempt) {
+                    .page => @min(shard.page_edges, edge_allowance),
+                    .single => 1,
+                    .complete => @min(edge_allowance, scan_allowance),
+                }),
                 .max_owned_bytes = @intCast(bytes),
                 .max_scanned_rows = @intCast(scan_allowance),
-                .scratch_allocator = scratch.allocator(),
+                .scratch_allocator = a,
             };
             var response = if (!shard.legacy) self.reader.worker.executeGraphGetEdgesBatch(a, shard.group, state.table_name, request, self.reader.consistency) catch |err| blk: {
                 if (err != error.GraphEdgesBatchUnsupported) return err;
@@ -4249,19 +4277,18 @@ const PathEdgeStream = struct {
             try budget.consumePhysicalEdges(response.scanned_rows);
             if (!shard.legacy) try CanonicalEdgeBatch.validatePrefix(response, 1, request.max_scanned_rows);
             if (!shard.legacy and response.key_scanned_rows.len == 0 and response.partial_key == null) {
+                const edge_window_hit = response.scanned_rows > request.max_edges;
                 response.deinit(a);
                 response_owned = false;
-                if (!wide) {
-                    // An empty prefix does not distinguish byte pressure from
-                    // an older index that cannot certify partial keys. Widen
-                    // BOTH limits, preserving all attempted physical charges.
-                    wide = true;
-                    // This is a key-local retry, not a capability signal:
-                    // physical scans include expired and rejected rows, so
-                    // their count cannot identify a non-paging index.
-                    continue;
+                if (budget.remaining_physical_edges == 0) return budget.exhaust(.explored_edges, budget.max_edges);
+                switch (attempt) {
+                    // A count miss can require a complete-key read on an
+                    // unfenced index. This choice never escapes the key.
+                    .page => attempt = if (edge_window_hit) .complete else .single,
+                    .single => attempt = .complete,
+                    .complete => return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes),
                 }
-                return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+                continue;
             }
             const edges = if (response.partial_key != null) response.partial_edges else response.edges;
             if (response.resume_cursor) |next| {
@@ -5036,6 +5063,7 @@ fn executeDistributedPattern(
             .include_paths = graph_query.query.params.include_paths,
             .node_admission = admission.iface(),
             .work_budget = request_work_budget,
+            .max_intermediate_states = request_work_budget.max_intermediate_states,
         },
     );
     defer graph_pattern_mod.freeMatches(alloc, raw_matches);
@@ -5215,6 +5243,7 @@ fn executeDistributedConjunctivePattern(
             .materialized => .required,
         },
         .work_budget = request_work_budget,
+        .max_intermediate_states = request_work_budget.max_intermediate_states,
     };
 
     const requested_specs = try alloc.alloc(graph_pattern_mod.CountAggregateSpec, graph_query.query.aggregates.len);
@@ -5851,7 +5880,7 @@ fn mergeTraversalNode(
     if (max_depth == 0 or merged.depth < max_depth) {
         try next_frontier.ensureUnusedCapacity(alloc, 1);
         next_frontier.appendAssumeCapacity(try frontierFromState(alloc, state, merged, path_id));
-        try budget.checkIntermediateStates(next_frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
+        try budget.checkIntermediateStates(next_frontier.items.len, budget.max_intermediate_states);
     }
     if (return_node) {
         try state.nodes.append(alloc, merged);
@@ -5927,7 +5956,7 @@ fn executeDistributedTraverse(
     defer freeFrontier(alloc, frontier);
     frontier = try retainAdmittedFrontier(alloc, admission, frontier);
     try request_work_budget.consumeNodes(frontier.len);
-    try request_work_budget.checkIntermediateStates(frontier.len, graph_pattern_mod.default_max_intermediate_states);
+    try request_work_budget.checkIntermediateStates(frontier.len, request_work_budget.max_intermediate_states);
 
     for (frontier) |item| {
         _ = try state.putTraversalSeenIfAbsent(
@@ -7120,7 +7149,7 @@ fn findDistributedShortestPath(
     defer target_set.deinit(alloc);
 
     const min_hops = graph_query.query.params.weight_mode == .min_hops;
-    var frontier = PathFrontier{ .fifo = min_hops };
+    var frontier = PathFrontier{ .fifo = min_hops, .memory = .{ .backing = alloc, .budget = request_work_budget } };
     defer frontier.deinit(alloc);
     const roots = try resolveStartFrontier(alloc, &state, table_name, req, base_result, prior_results, graph_query.query.start_nodes, true);
     defer freeFrontier(alloc, roots);
@@ -7152,8 +7181,7 @@ fn findDistributedShortestPath(
         );
         errdefer owned_item.deinit(alloc);
         try request_work_budget.consumeNode();
-        try request_work_budget.checkIntermediateStates(frontier.count() + 1, graph_pattern_mod.default_max_intermediate_states);
-        try frontier.push(alloc, owned_item);
+        try frontier.push(&owned_item);
     }
 
     var edge_routes = PathEdgeRoutes{ .memory = .{ .backing = alloc, .budget = request_work_budget } };
@@ -7275,8 +7303,7 @@ fn findDistributedShortestPath(
                                 request_work_budget,
                             );
                             errdefer next_item.deinit(alloc);
-                            try request_work_budget.checkIntermediateStates(frontier.count() + 1, graph_pattern_mod.default_max_intermediate_states);
-                            try frontier.push(alloc, next_item);
+                            try frontier.push(&next_item);
                         }
                         if (stream == null) break;
                     }
@@ -7392,8 +7419,7 @@ fn findDistributedShortestPath(
                         request_work_budget,
                     );
                     errdefer next_item.deinit(alloc);
-                    try request_work_budget.checkIntermediateStates(frontier.count() + 1, graph_pattern_mod.default_max_intermediate_states);
-                    try frontier.push(alloc, next_item);
+                    try frontier.push(&next_item);
                 }
             }
         }
@@ -19531,6 +19557,7 @@ const ShortestPathTestHarness = struct {
         only_source: ?[]const u8 = null,
         other: ?*graph_mod.GraphIndex = null,
         wire: bool = true,
+        remote_wire: bool = false,
         rank_by_group: bool = false,
         conflict: bool = false,
         repeat_page: bool = false,
@@ -19580,24 +19607,33 @@ const ShortestPathTestHarness = struct {
                 scoped.keys = @constCast(&empty_keys);
                 scoped.resume_cursor = null;
             }
+            const producer = if (state.remote_wire) state.alloc else a;
             var result = if (state.empty_prefix_once) blk: {
                 // A valid empty prefix after skipped/expired physical rows and
                 // an indivisible payload says nothing about paging capability.
                 state.empty_prefix_once = false;
-                break :blk GraphEdgesResponse{ .edges = &.{}, .scanned_rows = 65, .key_offsets = try a.dupe(u32, &.{0}) };
-            } else try @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(a, graph, scoped, request.ttl_now_ns);
+                break :blk GraphEdgesResponse{ .edges = &.{}, .scanned_rows = 65, .key_offsets = try producer.dupe(u32, &.{0}) };
+            } else try @import("antfly_local_sources").api_local_graph.readGraphEdgesRequest(producer, graph, scoped, request.ttl_now_ns);
             var moved = false;
-            defer if (!moved) result.deinit(a);
+            defer if (!moved) result.deinit(producer);
             if (state.rank_by_group) for ([_][]graph_mod.Edge{ result.edges, result.partial_edges }) |part| for (part) |*edge| {
-                if (edge.winner_key_hex.len > 0) a.free(edge.winner_key_hex);
+                if (edge.winner_key_hex.len > 0) producer.free(edge.winner_key_hex);
                 edge.winner_key_hex = "";
-                edge.winner_key_hex = try a.dupe(u8, if (state.conflict or group == 22) "61" else "62");
+                edge.winner_key_hex = try producer.dupe(u8, if (state.conflict or group == 22) "61" else "62");
                 edge.winner_rank = if (state.conflict or group == 22) 1 else 2;
             };
             if (state.wire) {
-                const body = try encodeGraphEdgesResponse(a, result);
-                defer a.free(body);
-                return parseGraphEdgesResponse(a, body);
+                const scratch = if (state.remote_wire) request.scratch_allocator orelse a else a;
+                // Encoding belongs to the producer. Only the received body
+                // and decoding allocations consume coordinator memory.
+                const encoded = try encodeGraphEdgesResponse(producer, result);
+                defer producer.free(encoded);
+                if (state.remote_wire) {
+                    const body = try scratch.dupe(u8, encoded);
+                    defer scratch.free(body);
+                    return parseGraphEdgesResponseWithScratch(a, scratch, body);
+                }
+                return parseGraphEdgesResponse(a, encoded);
             }
             moved = true;
             return result;
@@ -20029,6 +20065,64 @@ test "distributed min-hop pages preserve small initial reads after an empty pref
     defer result.deinit(a);
     try std.testing.expectEqual(@as(u32, 2), result.path.length);
     try std.testing.expectEqual(@as(usize, 3), state.page_calls);
+}
+
+test "distributed min-hop pages preserve constrained remote payload decoding" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    const metadata = try a.alloc(u8, 50 * 1024);
+    defer a.free(metadata);
+    @memset(metadata, '\n');
+    metadata[0] = '{';
+    metadata[metadata.len - 1] = '}';
+    for ([_][]const u8{ "n0", "n1", "n2", "n3" }) |target| try graph.addEdge("root", target, "FRIEND", 1, 0, 0, metadata);
+    const catalog = H.FakeCatalog.iface();
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    var state = H.State{ .graph = &graph, .remote_wire = true, .only_source = "root" };
+    var admission = GraphNodeAdmissionContext.init(a, catalog, H.FakeWorker.iface(&state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+    defer admission.deinit();
+    const query = db_mod.types.NamedGraphQuery{ .name = "path", .query = .{ .query_type = .shortest_path, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"root"} }, .target_nodes = .{ .keys = &.{"n0"} }, .params = .{ .max_depth = 8, .edge_types = &.{"FRIEND"} } } };
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 512 * 1024 });
+    var result = (try findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null)).?;
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(u32, 1), result.path.length);
+    try std.testing.expectEqual(@as(usize, 2), state.page_calls);
+}
+
+test "distributed min-hop pages preserve frontier capacity accounting and raised state limits" {
+    for ([_]bool{ true, false }) |fifo| {
+        const a = std.testing.allocator;
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+        var frontier = PathFrontier{ .fifo = fifo, .memory = .{ .backing = a, .budget = &budget } };
+        defer frontier.deinit(a);
+        for (0..256) |_| {
+            var item = try initFrontierState(a, "node", null, 0, 0, 0, null, &budget);
+            errdefer item.deinit(a);
+            try frontier.push(&item);
+        }
+        while (frontier.pop()) |value| {
+            var item = value;
+            item.deinit(a);
+        }
+        try std.testing.expect(frontier.memory.live_bytes > 0);
+        try std.testing.expectEqual(frontier.memory.live_bytes, budget.retained_state_bytes);
+    }
+    const a = std.heap.smp_allocator;
+    var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_intermediate_states = 100_001 });
+    var frontier = PathFrontier{ .fifo = true, .memory = .{ .backing = a, .budget = &budget } };
+    defer frontier.deinit(a);
+    for (0..100_001) |_| {
+        var item = try initFrontierState(a, "n", null, 0, 0, 0, null, &budget);
+        errdefer item.deinit(a);
+        try frontier.push(&item);
+    }
+    var excess = try initFrontierState(a, "n", null, 0, 0, 0, null, &budget);
+    defer excess.deinit(a);
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, frontier.push(&excess));
+    try std.testing.expectEqual(@as(usize, 100_001), frontier.count());
 }
 
 test "distributed min-hop pages preserve adaptive hub paging and early targets" {
