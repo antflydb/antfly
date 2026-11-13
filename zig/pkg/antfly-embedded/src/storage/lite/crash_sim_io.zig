@@ -347,6 +347,21 @@ pub const SimIo = struct {
         return self.barriers.items.len;
     }
 
+    /// How many calls of `kind` have been observed since the current (or
+    /// most recently cleared) `IoFaultPlan` was installed -- i.e. since the
+    /// counter was last reset by `setIoFaultPlan`. Lets a caller run a
+    /// scenario once with an unreachable `at_op` (discovery), read back
+    /// exactly how many calls of `kind` that scenario alone makes, and
+    /// bound a later real sweep to that count instead of a hand-picked
+    /// constant that can overshoot into whatever the scenario's caller
+    /// does next (its own `close()`, say) once every call the scenario
+    /// itself makes has been exhausted.
+    pub fn ioFaultOpCount(self: *SimIo, kind: IoFaultKind) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.io_fault_op_counts[@backingInt(kind)];
+    }
+
     pub fn barrierAt(self: *const SimIo, sequence: u64) ?Barrier {
         for (self.barriers.items) |barrier| {
             if (barrier.sequence == sequence) return barrier;

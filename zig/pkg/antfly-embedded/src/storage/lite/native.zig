@@ -2465,31 +2465,43 @@ fn IndexReadPathType(comptime batch: bool) type {
     };
 }
 
-/// Cursor over one pinned index root. Page views and overflow scratch are
-/// reused by tree depth; each returned key remains independently owned.
-pub const DocumentIndexCursor = struct {
+/// §9.7c (`ReadView`): the raw B-tree walker, with no overlay knowledge
+/// at all -- renamed from `DocumentIndexCursor` to say so plainly. Reads
+/// *only* the physical, checkpointed page structure named by whatever
+/// `checkpoint` it is given; a key logged-but-not-yet-folded by
+/// `checkpointRedoLog` is invisible through this type by construction,
+/// not by omission. Intended callers are `checkpointRedoLog`'s own
+/// fold, vacuum, and recovery (which want exactly the physical tree, on
+/// purpose), plus `CatalogCursor`/`LiveRecordCursor`/`ReadView` here in
+/// native.zig, which wrap it with the overlay merge every other reader
+/// needs. A new caller anywhere else should go through `ReadView`
+/// instead of reaching for this directly -- still possible to do (kept
+/// `pub` so existing, already-reviewed callers keep compiling), but a
+/// deliberate, greppable code-review smell: `grep -n CheckpointedTree`
+/// should only ever turn up the handful of sites listed above.
+const CheckpointedTree = struct {
     file: *NativeFile,
     checkpoint: CheckpointSlot,
     path: IndexReadPath = .{},
     depth: usize = 0,
     key_allocator: Allocator,
 
-    pub fn init(file: *NativeFile, checkpoint: CheckpointSlot) DocumentIndexCursor {
+    pub fn init(file: *NativeFile, checkpoint: CheckpointSlot) CheckpointedTree {
         return initWithKeyAllocator(file, checkpoint, file.allocator);
     }
 
     /// Returned entries own their keys through key_allocator. Traversal scratch
     /// remains file-owned; callers must free entries with the supplied allocator.
-    pub fn initWithKeyAllocator(file: *NativeFile, checkpoint: CheckpointSlot, key_allocator: Allocator) DocumentIndexCursor {
+    pub fn initWithKeyAllocator(file: *NativeFile, checkpoint: CheckpointSlot, key_allocator: Allocator) CheckpointedTree {
         return .{ .file = file, .checkpoint = checkpoint, .key_allocator = key_allocator };
     }
 
-    pub fn deinit(self: *DocumentIndexCursor) void {
+    pub fn deinit(self: *CheckpointedTree) void {
         self.path.deinit(self.file.allocator);
         self.* = undefined;
     }
 
-    pub fn first(self: *DocumentIndexCursor) !?DocumentIndexEntry {
+    pub fn first(self: *CheckpointedTree) !?DocumentIndexEntry {
         self.clear();
         errdefer self.clear();
         if (self.checkpoint.document_index_root_page == 0) return null;
@@ -2497,7 +2509,7 @@ pub const DocumentIndexCursor = struct {
         return try self.currentEntry();
     }
 
-    pub fn last(self: *DocumentIndexCursor) !?DocumentIndexEntry {
+    pub fn last(self: *CheckpointedTree) !?DocumentIndexEntry {
         self.clear();
         errdefer self.clear();
         if (self.checkpoint.document_index_root_page == 0) return null;
@@ -2505,7 +2517,7 @@ pub const DocumentIndexCursor = struct {
         return try self.currentEntry();
     }
 
-    pub fn seekAtOrAfter(self: *DocumentIndexCursor, key: []const u8, strict: bool) !?DocumentIndexEntry {
+    pub fn seekAtOrAfter(self: *CheckpointedTree, key: []const u8, strict: bool) !?DocumentIndexEntry {
         self.clear();
         errdefer self.clear();
         var page = self.checkpoint.document_index_root_page;
@@ -2521,7 +2533,7 @@ pub const DocumentIndexCursor = struct {
         return null;
     }
 
-    pub fn seekAtOrBefore(self: *DocumentIndexCursor, key: []const u8, strict: bool) !?DocumentIndexEntry {
+    pub fn seekAtOrBefore(self: *CheckpointedTree, key: []const u8, strict: bool) !?DocumentIndexEntry {
         self.clear();
         errdefer self.clear();
         var page = self.checkpoint.document_index_root_page;
@@ -2539,7 +2551,7 @@ pub const DocumentIndexCursor = struct {
         return null;
     }
 
-    pub fn next(self: *DocumentIndexCursor) !?DocumentIndexEntry {
+    pub fn next(self: *CheckpointedTree) !?DocumentIndexEntry {
         errdefer self.clear();
         if (self.depth == 0) return null;
         const leaf = self.path.frames.items[self.depth - 1];
@@ -2562,7 +2574,7 @@ pub const DocumentIndexCursor = struct {
         return null;
     }
 
-    fn subtreePage(self: *DocumentIndexCursor, depth: usize) u64 {
+    fn subtreePage(self: *CheckpointedTree, depth: usize) u64 {
         return if (depth == 0) self.checkpoint.document_index_root_page else blk: {
             const parent = self.path.frames.items[depth - 1];
             break :blk parent.pointer(parent.position);
@@ -2571,7 +2583,7 @@ pub const DocumentIndexCursor = struct {
 
     // Advance to a sibling without opening it. Paired cursors can skip equal
     // immutable sibling references without an I/O for every leaf in the range.
-    fn nextSubtree(self: *DocumentIndexCursor, depth: usize) !u64 {
+    fn nextSubtree(self: *CheckpointedTree, depth: usize) !u64 {
         self.depth = depth;
         while (self.depth > 0) {
             const parent = self.path.frames.items[self.depth - 1];
@@ -2585,7 +2597,7 @@ pub const DocumentIndexCursor = struct {
         return 0;
     }
 
-    pub fn prev(self: *DocumentIndexCursor) !?DocumentIndexEntry {
+    pub fn prev(self: *CheckpointedTree) !?DocumentIndexEntry {
         errdefer self.clear();
         if (self.depth == 0) return null;
         const leaf = self.path.frames.items[self.depth - 1];
@@ -2608,13 +2620,13 @@ pub const DocumentIndexCursor = struct {
         return null;
     }
 
-    fn push(self: *DocumentIndexCursor, page: u64) !*IndexReadFrame {
+    fn push(self: *CheckpointedTree, page: u64) !*IndexReadFrame {
         const frame = try self.path.load(self.file, self.checkpoint, self.depth, page);
         self.depth += 1;
         return frame;
     }
 
-    fn descendExtreme(self: *DocumentIndexCursor, root: u64, first_key: bool) !void {
+    fn descendExtreme(self: *CheckpointedTree, root: u64, first_key: bool) !void {
         var page = root;
         while (page != 0) {
             const frame = try self.push(page);
@@ -2623,7 +2635,7 @@ pub const DocumentIndexCursor = struct {
         }
     }
 
-    fn currentEntry(self: *DocumentIndexCursor) !?DocumentIndexEntry {
+    fn currentEntry(self: *CheckpointedTree) !?DocumentIndexEntry {
         if (self.depth == 0) return null;
         const frame = self.path.frames.items[self.depth - 1];
         if (frame.kind != .leaf or frame.position >= frame.entries().len) return null;
@@ -2633,7 +2645,7 @@ pub const DocumentIndexCursor = struct {
         };
     }
 
-    fn clear(self: *DocumentIndexCursor) void {
+    fn clear(self: *CheckpointedTree) void {
         self.depth = 0;
     }
 };
@@ -3094,7 +3106,7 @@ fn recordRunAhead(references: []const u64, order: ?[]const usize, start: usize) 
 /// commits may continue concurrently.
 pub const CatalogCursor = struct {
     records: RecordPageReader = .{},
-    index: DocumentIndexCursor,
+    index: CheckpointedTree,
     prefix: []const u8,
     started: bool = false,
     done: bool = false,
@@ -3130,6 +3142,16 @@ pub const CatalogCursor = struct {
         const key = (try self.next()) orelse return null;
         defer file.allocator.free(key.key);
         const value = if (key.page_id == 0) blk: {
+            // `next()` only ever returns a `page_id == 0` key once its own
+            // resolve of this exact key, at this exact checkpoint,
+            // already succeeded (§9.7c: a phantom resolve there is
+            // treated as absent and never surfaced as a key at all) --
+            // this second resolve, moments later with nothing able to
+            // have changed in between, is expected to agree. A `null`
+            // here would mean that invariant broke, not a legitimately
+            // absent key, so this stays a hard error rather than quietly
+            // skipping (which `nextRecordAlloc`'s own one-key-at-a-time
+            // contract has no loop to do safely).
             const entry = (try file.redoOverlayEntry(self.overlay_root.?, self.index.checkpoint, key.key)) orelse return error.InvalidNativeRedoRecord;
             defer file.allocator.free(entry.value);
             break :blk try file.catalogEntryValueAtCheckpointAlloc(allocator, entry, self.index.checkpoint);
@@ -3182,8 +3204,30 @@ pub const CatalogCursor = struct {
                     self.pending_tree = candidate;
                     continue;
                 }
-                const entry = (try file.redoOverlayEntry(self.overlay_root.?, self.index.checkpoint, key)) orelse return error.InvalidNativeRedoRecord;
-                defer file.allocator.free(entry.value);
+                // §9.7c (ReadView): resolve before deciding whether to
+                // consume `candidate` -- the overlay enumerates every key
+                // with *any* version currently in the live map, regardless
+                // of this cursor's own pinned checkpoint, so a cursor
+                // pinned to an older, already-superseded checkpoint can
+                // enumerate a key whose entire chain postdates it (a
+                // brand-new key created only after this pin's own
+                // snapshot was taken). `resolveAlloc` then correctly
+                // returns `null` -- "nothing at or before this
+                // checkpoint" -- which must be treated exactly like the
+                // real tree never having had this key diverted away from
+                // it at this checkpoint (continue to the tree's own
+                // candidate, if any, on the next iteration), not as
+                // corruption; and if `candidate` happens to tie with this
+                // phantom key, it must stay buffered rather than being
+                // freed as if the overlay had genuinely superseded it
+                // (same bug class as `MergedCursor.advance`'s own fix).
+                const entry = try file.redoOverlayEntry(self.overlay_root.?, self.index.checkpoint, key);
+                _ = self.overlay.takeFront();
+                if (entry == null) {
+                    self.pending_tree = candidate;
+                    continue;
+                }
+                defer file.allocator.free(entry.?.value);
                 const tied = tree_key != null and std.mem.eql(u8, tree_key.?, key);
                 if (tied) {
                     var owned = candidate.?;
@@ -3191,8 +3235,7 @@ pub const CatalogCursor = struct {
                 } else {
                     self.pending_tree = candidate;
                 }
-                _ = self.overlay.takeFront();
-                if (entry.is_delete) continue;
+                if (entry.?.is_delete) continue;
                 return .{ .key = try file.allocator.dupe(u8, key), .page_id = 0 };
             }
             const owned = candidate orelse break;
@@ -3711,7 +3754,7 @@ const HistoryIndexCoverage = struct {
     fn initIndex(self: *HistoryIndexCoverage, file: *NativeFile, checkpoint: CheckpointSlot, root: u64, cancel: ?*const maintenance.CancelToken) !void {
         var indexed = checkpoint;
         indexed.document_index_root_page = root;
-        var cursor = DocumentIndexCursor.init(file, indexed);
+        var cursor = CheckpointedTree.init(file, indexed);
         defer cursor.deinit();
         var current = try cursor.first();
         while (current) |entry| {
@@ -5796,6 +5839,401 @@ const HeaderFingerprintCache = struct {
     }
 };
 
+/// §9.7c: the one read primitive for a redo-log-capable `NativeFile`. A
+/// pinned pair -- checkpoint `C` (the physical B-tree root this view's
+/// tree-side reads are pinned to) and overlay read mark `M` (the
+/// logical commit sequence this view's overlay-side reads are pinned
+/// to) -- captured together, at the same moment, because under redo
+/// mode they are not always the same number (`NativeFile.committedSequence`'s
+/// own doc comment): an ordinary commit can advance `M` without
+/// `C`'s own physical root pages moving at all, until the next
+/// `checkpointRedoLog`.
+///
+/// This exists to stop the overlay-blind-read bug class found three
+/// separate times on three separate call sites while flipping the
+/// redo-log default (`docstore.Cursor`'s own three-way merge,
+/// `getDocumentsAtCheckpointWithState`'s batch pre-pass, and
+/// `readBackingPages`'s read-ahead window -- see this struct's own
+/// design-doc section for the full account) and a fourth found
+/// building this type itself (`OverlayScanState.initForPrefix`'s old
+/// "must equal the live checkpoint exactly" gate silently emptying the
+/// overlay for every `ReadView`-shaped caller reached through a
+/// `ReadGeneration`'s separately-opened file, including the
+/// dense/sparse/graph/full-text native-catalog seed in
+/// `native_catalog_sink.zig` and the index virtual-filesystem's
+/// directory listing in `index_storage.zig` -- fixed by deleting that
+/// gate, since per-key resolution was already checkpoint-independent;
+/// see that function's own doc comment).
+///
+/// `open`/`openAt` pin with exactly the two calls
+/// `Store.pinInitializedReadGeneration` already makes, in the same
+/// order: the overlay mark `M` first (`redo.shared.pin`), then the
+/// checkpoint `C` (`inode_lock.pinReader`); `release` unpins in
+/// reverse. A `ReadView` constructed via `borrowed` instead describes
+/// an already-pinned generation (a `Txn`'s own `ReadPin`, held for the
+/// whole transaction) and never pins or unpins on its own -- `release`
+/// on one of these is a no-op, matching `ReadGeneration`'s existing,
+/// separate, longer-lived pin lifecycle. Both constructor families
+/// resolve the exact same read methods below the exact same way.
+pub const ReadView = struct {
+    file: *NativeFile,
+    checkpoint: CheckpointSlot, // C: physical tree-root pointers
+    mark: u64, // M: overlay resolution ceiling (logical commit sequence)
+    owns_pin: bool = false,
+
+    /// Pins the current generation: `C` is `file`'s own active
+    /// checkpoint, `M` is its own committed (logical) sequence,
+    /// captured together. For the live writer's own handle these two
+    /// numbers already move in lockstep (`NativeFile.committedSequence`'s
+    /// doc comment); captured as two separate fields regardless, so a
+    /// future caller that opens this on a handle where they genuinely
+    /// diverge gets the correct answer without this type changing.
+    pub fn open(file: *NativeFile, io: std.Io) !ReadView {
+        return openAt(file, io, file.activeCheckpoint());
+    }
+
+    /// Pins an explicit checkpoint: either an older, already-
+    /// checkpointed generation (`C == M == checkpoint.commit_sequence`
+    /// trivially, nothing logged against it is still only in the
+    /// overlay), or the live writer's own freshly observed checkpoint
+    /// passed in by a caller that tracks it externally (`docstore.zig`'s
+    /// `ReadGeneration.checkpoint`, kept current by
+    /// `Store.observeReadCheckpoint` on every publish even though
+    /// `file` itself -- a separately-opened `ReadGeneration.file` --
+    /// never processes a commit itself and so never advances its own
+    /// `activeCheckpoint()`/`committedSequence()`).
+    pub fn openAt(file: *NativeFile, io: std.Io, checkpoint: CheckpointSlot) !ReadView {
+        var view: ReadView = .{ .file = file, .checkpoint = checkpoint, .mark = file.readMark(checkpoint), .owns_pin = false };
+        if (file.redo) |*redo| try redo.shared.pin(std.heap.page_allocator, io, view.mark);
+        errdefer if (file.redo) |*redo| redo.shared.unpin(io, view.mark);
+        if (file.inode_lock_ref.load(.acquire)) |entry| {
+            try inode_lock.pinReader(entry, io, .{ .data = checkpoint.commit_sequence, .metadata = checkpoint.commit_sequence });
+        }
+        view.owns_pin = true;
+        return view;
+    }
+
+    /// A view over a generation already pinned by some longer-lived
+    /// mechanism (today: `docstore.zig`'s `ReadPin`/`ReadGeneration`,
+    /// held for a whole `Txn`'s lifetime). `release` is a no-op; the
+    /// caller's own pin lifecycle remains authoritative. Every read
+    /// method below behaves identically regardless of which
+    /// constructor produced this view.
+    pub fn borrowed(file: *NativeFile, checkpoint: CheckpointSlot) ReadView {
+        return .{ .file = file, .checkpoint = checkpoint, .mark = file.readMark(checkpoint), .owns_pin = false };
+    }
+
+    /// Unpins, in reverse of `open`/`openAt`'s own order. A no-op for a
+    /// `borrowed` view. Idempotent: safe to call more than once, or on
+    /// a view that never owned a pin.
+    pub fn release(self: *ReadView, io: std.Io) void {
+        if (!self.owns_pin) return;
+        self.owns_pin = false;
+        if (self.file.inode_lock_ref.load(.acquire)) |entry| {
+            inode_lock.unpinReader(entry, io, .{ .data = self.checkpoint.commit_sequence, .metadata = self.checkpoint.commit_sequence });
+        }
+        if (self.file.redo) |*redo| redo.shared.unpin(io, self.mark);
+    }
+
+    pub fn getDocumentAlloc(self: *const ReadView, allocator: Allocator, key: []const u8) !?[]u8 {
+        return self.file.getDocumentAtCheckpointAlloc(allocator, self.checkpoint, key);
+    }
+
+    pub fn documentReference(self: *const ReadView, key: []const u8) !?u64 {
+        return self.file.documentReferenceAtCheckpoint(self.checkpoint, key);
+    }
+
+    pub fn documentFingerprint(self: *const ReadView, key: []const u8) !?[32]u8 {
+        return self.file.documentFingerprintAtCheckpoint(self.checkpoint, key);
+    }
+
+    pub fn getDocumentsAlloc(self: *const ReadView, allocator: Allocator, keys: []const []const u8, values: []?[]const u8) !void {
+        return self.file.getDocumentsAtCheckpointAlloc(allocator, self.checkpoint, keys, values);
+    }
+
+    pub fn getDocumentsWithState(self: *const ReadView, allocator: Allocator, temporary: Allocator, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, state: *DocumentBatchReadState) !void {
+        return self.file.getDocumentsAtCheckpointWithState(allocator, temporary, self.checkpoint, keys, buffers, values, state);
+    }
+
+    pub fn openIndexValue(self: *const ReadView, allocator: Allocator, key: []const u8) !NativeFile.IndexValue {
+        return self.file.openIndexValue(allocator, key, self.checkpoint);
+    }
+
+    pub fn readIndexValueInto(self: *const ReadView, value: NativeFile.IndexValue, offset: u64, out: []u8) !void {
+        return self.file.readIndexValueInto(value, offset, out, self.checkpoint);
+    }
+
+    pub fn checksumIndexValue(self: *const ReadView, value: NativeFile.IndexValue, offset: u64, length: u64) !u32 {
+        return self.file.checksumIndexValue(value, offset, length, self.checkpoint);
+    }
+
+    pub fn readAuthenticatedIndexValue(self: *const ReadView, value: NativeFile.IndexValue, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
+        return self.file.readAuthenticatedIndexValue(value, offset, length, within, out, expected, self.checkpoint);
+    }
+
+    pub fn copyIndexValueTo(self: *const ReadView, value: NativeFile.IndexValue, destination: std.Io.File) !void {
+        return self.file.copyIndexValueTo(value, destination, self.checkpoint);
+    }
+
+    /// A prefix/range cursor over the metadata catalog root, overlay
+    /// merged exactly like every other `ReadView` read (`catalogCursor`'s
+    /// `OverlayScanState.initForPrefix`, gate-free since the fix above).
+    pub fn openMetadataCursor(self: *const ReadView, prefix: []const u8) !CatalogCursor {
+        return self.file.metadataCatalogCursor(self.checkpoint, prefix);
+    }
+
+    /// Like `openMetadataCursor`, over the index catalog root (full-text/
+    /// dense/sparse/graph native-catalog records, artifact leases,
+    /// virtual-filesystem directory entries).
+    pub fn openIndexCursor(self: *const ReadView, prefix: []const u8) !CatalogCursor {
+        return self.file.indexCatalogCursor(self.checkpoint, prefix);
+    }
+
+    /// Like `openIndexCursor`, restricted to `prefix`'s immediate
+    /// children (one path segment deep) -- the virtual-filesystem
+    /// directory-listing shape.
+    pub fn openIndexDirectoryCursor(self: *const ReadView, prefix: []const u8) !CatalogCursor {
+        return self.file.indexCatalogDirectoryCursor(self.checkpoint, prefix);
+    }
+
+    /// A two-way (checkpointed tree, redo-log overlay) merged cursor
+    /// over the document root, scoped to `prefix`. The only way to walk
+    /// the document root other than the fully-resolved
+    /// `getDocumentAlloc`/`getDocumentsAlloc` family -- `MergedCursor`
+    /// hides `CheckpointedTree` (non-`pub`) behind this one constructor,
+    /// per §9.7c's "the raw tree becomes a distinct type, reachable
+    /// only through `ReadView`." `docstore.Cursor` layers its own
+    /// transaction's `pending_tree` on top of this (design doc: "pending
+    /// writes of the transaction itself layer on top, in docstore").
+    pub fn openMergedDocumentCursor(self: *const ReadView, key_allocator: Allocator, prefix: []const u8) !MergedCursor {
+        return .{
+            .tree = CheckpointedTree.initWithKeyAllocator(self.file, self.checkpoint, key_allocator),
+            .overlay = try NativeFile.OverlayScanState.initForPrefixUnchecked(key_allocator, self.file, .documents, prefix),
+            .mark = self.mark,
+        };
+    }
+};
+
+/// §9.7c (ReadView): the two-way (checkpointed tree, redo-log overlay)
+/// merge-join every document-root scan needs -- extracted, not
+/// reinvented, from `docstore.Cursor`'s own original three-way merge
+/// (`pending_tree` over this over the real B-tree): the comparison,
+/// tie-breaking (a tie always favors the overlay, the newer state),
+/// and lookahead-buffering rules here are exactly the ones that merge
+/// already used for its own "redo" vs "disk" half, just relocated so
+/// `CheckpointedTree` no longer needs to be `pub`. `docstore.Cursor`
+/// now holds one of these instead of a `CheckpointedTree` plus an
+/// `OverlayScanState`, and compares its own `pending_tree` candidate
+/// against whatever this type returns.
+pub const MergedCursor = struct {
+    pub const Direction = enum { forward, backward };
+
+    tree: CheckpointedTree,
+    overlay: NativeFile.OverlayScanState,
+    mark: u64,
+    /// The tree's own already-fetched candidate, held here whenever the
+    /// overlay's candidate won a comparison without a tie: `tree`'s own
+    /// position has already advanced past it, so losing track of it
+    /// here would silently skip it forever, not just defer it to the
+    /// next call. `null` means either nothing is buffered yet, or the
+    /// last `advance` call fully consumed (returned, or matched a tie
+    /// against) whatever it held.
+    tree_lookahead: ?DocumentIndexEntry = null,
+    /// Index into `overlay.keys` of the overlay's own current
+    /// candidate, `null` once exhausted in the current direction.
+    overlay_index: ?usize = null,
+
+    pub const Entry = union(enum) {
+        disk: DocumentIndexEntry,
+        overlay: struct { key: []const u8, entry: CatalogEntry },
+
+        pub fn key(self: Entry) []const u8 {
+            return switch (self) {
+                .disk => |d| d.key,
+                .overlay => |o| o.key,
+            };
+        }
+
+        /// Frees whichever side owns allocated memory: `disk`'s own
+        /// key (`DocumentIndexEntry.deinit`'s own contract) or
+        /// `overlay`'s resolved entry value (the owned copy
+        /// `SharedRedoOverlay.resolveAlloc` returns, via
+        /// `redoOverlayEntryAt`). `overlay`'s own `key` is borrowed
+        /// from `MergedCursor.overlay`'s own keys array and must never
+        /// be freed here.
+        pub fn deinit(self: *Entry, allocator: Allocator) void {
+            switch (self.*) {
+                .disk => |*d| d.deinit(allocator),
+                .overlay => |*o| allocator.free(o.entry.value),
+            }
+        }
+    };
+
+    pub fn deinit(self: *MergedCursor) void {
+        self.clearTreeLookahead();
+        self.overlay.deinit();
+        self.tree.deinit();
+        self.* = undefined;
+    }
+
+    fn clearTreeLookahead(self: *MergedCursor) void {
+        if (self.tree_lookahead) |*entry| entry.deinit(self.tree.file.allocator);
+        self.tree_lookahead = null;
+    }
+
+    fn fetchTree(self: *MergedCursor, direction: Direction) !?DocumentIndexEntry {
+        if (self.tree_lookahead) |entry| {
+            self.tree_lookahead = null;
+            return entry;
+        }
+        return switch (direction) {
+            .forward => try self.tree.next(),
+            .backward => try self.tree.prev(),
+        };
+    }
+
+    pub fn first(self: *MergedCursor) !?Entry {
+        self.clearTreeLookahead();
+        self.tree_lookahead = try self.tree.first();
+        self.overlay_index = if (self.overlay.keys.len > 0) 0 else null;
+        return self.advance(.forward);
+    }
+
+    pub fn last(self: *MergedCursor) !?Entry {
+        self.clearTreeLookahead();
+        self.tree_lookahead = try self.tree.last();
+        self.overlay_index = if (self.overlay.keys.len > 0) self.overlay.keys.len - 1 else null;
+        return self.advance(.backward);
+    }
+
+    pub fn seekAtOrAfter(self: *MergedCursor, key: []const u8, strict: bool) !?Entry {
+        self.clearTreeLookahead();
+        self.tree_lookahead = try self.tree.seekAtOrAfter(key, strict);
+        const idx = self.overlay.indexAtOrAfter(key, strict);
+        self.overlay_index = if (idx < self.overlay.keys.len) idx else null;
+        return self.advance(.forward);
+    }
+
+    pub fn seekAtOrBefore(self: *MergedCursor, key: []const u8, strict: bool) !?Entry {
+        self.clearTreeLookahead();
+        self.tree_lookahead = try self.tree.seekAtOrBefore(key, strict);
+        const count = self.overlay.countAtOrBefore(key, strict);
+        self.overlay_index = if (count > 0) count - 1 else null;
+        return self.advance(.backward);
+    }
+
+    /// `continued`: true to pick up where the last `next`/`advance`
+    /// call left off (reusing a buffered tree lookahead instead of a
+    /// fresh seek) -- false (a direction change) forces `seekAtOrAfter`
+    /// from `current_key` instead, mirroring `docstore.Cursor`'s own
+    /// `last_direction`-gated choice between `takeBufferedDisk()` and a
+    /// fresh seek.
+    pub fn next(self: *MergedCursor, current_key: []const u8, continued: bool) !?Entry {
+        if (!continued) {
+            self.clearTreeLookahead();
+            self.tree_lookahead = try self.tree.seekAtOrAfter(current_key, true);
+        }
+        const idx = self.overlay.indexAtOrAfter(current_key, true);
+        self.overlay_index = if (idx < self.overlay.keys.len) idx else null;
+        return self.advance(.forward);
+    }
+
+    pub fn prev(self: *MergedCursor, current_key: []const u8, continued: bool) !?Entry {
+        if (!continued) {
+            self.clearTreeLookahead();
+            self.tree_lookahead = try self.tree.seekAtOrBefore(current_key, true);
+        }
+        const count = self.overlay.countAtOrBefore(current_key, true);
+        self.overlay_index = if (count > 0) count - 1 else null;
+        return self.advance(.backward);
+    }
+
+    /// Advances past a tombstoned overlay winner on its own (the
+    /// overlay already proves that key dead; nothing left for the
+    /// caller to check there). A `.disk` winner is returned exactly as
+    /// the tree gave it, unresolved -- the caller decides liveness
+    /// (`RecordPageReader.documentValueAlloc`/`documentValueLen`/
+    /// `documentIsLive`, the keys-only/length-only short-circuits
+    /// `MergedCursor` deliberately knows nothing about) and, if it
+    /// turns out dead, calls `advance` again directly to continue past
+    /// it -- `tree_lookahead` is already `null` at that point (a
+    /// `.disk` return always clears it), so the next call fetches
+    /// fresh, exactly like finding a live one would have.
+    pub fn advance(self: *MergedCursor, direction: Direction) !?Entry {
+        var disk = try self.fetchTree(direction);
+        errdefer if (disk) |*d| d.deinit(self.tree.file.allocator);
+        while (true) {
+            const overlay_key: ?[]const u8 = if (self.overlay_index) |idx| self.overlay.keys[idx] else null;
+            const Source = enum { overlay, disk };
+            var winner: ?Source = null;
+            var winner_key: []const u8 = undefined;
+            if (overlay_key) |k| {
+                winner = .overlay;
+                winner_key = k;
+            }
+            if (disk) |d| {
+                const better = if (winner != null) switch (direction) {
+                    .forward => std.mem.order(u8, d.key, winner_key) == .lt,
+                    .backward => std.mem.order(u8, d.key, winner_key) == .gt,
+                } else true;
+                if (better) {
+                    winner = .disk;
+                    winner_key = d.key;
+                }
+            }
+            const chosen = winner orelse return null;
+
+            // A tie always sets `chosen = .overlay` (the `better`
+            // check above requires a strict order for disk to win), so
+            // `chosen == .disk` here implies `overlay_key` is either
+            // `null` or strictly past `winner_key` -- nothing to
+            // consume on the overlay side.
+            if (chosen == .disk) {
+                self.tree_lookahead = null;
+                return .{ .disk = disk.? };
+            }
+
+            // `chosen == .overlay`: advance the overlay's own position
+            // past this key regardless of what it resolves to below --
+            // visited either way.
+            self.overlay_index = switch (direction) {
+                .forward => if (self.overlay_index.? + 1 < self.overlay.keys.len) self.overlay_index.? + 1 else null,
+                .backward => if (self.overlay_index.? > 0) self.overlay_index.? - 1 else null,
+            };
+            // `overlay.keys` enumerates every key with *any* version
+            // currently in the live map, regardless of this cursor's
+            // own `mark` -- correct and necessary for the *current*
+            // generation (every version predates "now" by definition),
+            // but a `ReadView` pinned to an older, already-superseded
+            // mark can enumerate a key whose entire chain postdates it
+            // (e.g. a brand-new key created only after this pin's own
+            // snapshot was taken). `resolveAlloc` then correctly
+            // returns `null` -- "nothing at or before this mark" --
+            // which must be treated exactly like the real tree never
+            // having had this key diverted away from it at this mark:
+            // resolved *before* deciding whether to consume a tied
+            // `disk` candidate below, so a phantom overlay entry never
+            // wrongly discards a disk candidate that is, in fact, the
+            // correct answer for this view.
+            const entry = try self.tree.file.redoOverlayEntryAt(.documents, self.mark, winner_key);
+            if (disk != null and std.mem.eql(u8, disk.?.key, winner_key) and entry != null) {
+                var consumed = disk.?;
+                consumed.deinit(self.tree.file.allocator);
+                disk = try self.fetchTree(direction);
+            }
+            if (entry == null) continue; // phantom: disk (if tied) stays live for the next iteration.
+            if (entry.?.is_delete) {
+                self.tree.file.allocator.free(entry.?.value);
+                continue;
+            }
+            // Whatever disk candidate remains (possibly null) must
+            // survive to the next call.
+            self.tree_lookahead = disk;
+            return .{ .overlay = .{ .key = winner_key, .entry = entry.? } };
+        }
+    }
+};
+
 pub const NativeFile = struct {
     allocator: Allocator,
     /// The default constructors own this Threaded runtime. Borrowed-I/O
@@ -6102,6 +6540,17 @@ pub const NativeFile = struct {
     test_value_read_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_cancel_on_read: if (builtin.is_test) ?*maintenance.CancelToken else void = if (builtin.is_test) null else {},
     test_page_reads: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    /// §9.3a: `readBackingPages`'s overlay consult (below) returns a fresh,
+    /// transient `dupe` for each physical page that is still staged in the
+    /// redo log overlay (not yet folded by a checkpoint) -- correct, but
+    /// unlike a page already folded onto disk, it is never cached, so it
+    /// costs one allocation on *every* read of that page, not just the
+    /// first. Counted separately so a test asserting "a retry over an
+    /// unchanged read allocates nothing new" can account for this
+    /// legitimate, bounded cost instead of either ignoring it or wrongly
+    /// treating it as a regression (see the "retry after page cache
+    /// eviction" test in docstore.zig).
+    test_redo_page_overlay_hits: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_index_view_hits: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_index_comparisons: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_page_writes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
@@ -6654,6 +7103,33 @@ pub const NativeFile = struct {
         }
         for (staged_pages) |p| {
             try self.file.writePositionalAll(io, p.bytes, p.page_id * @as(u64, self.header.page_size));
+        }
+        // §9.7c (ReadView): `self.header.checkpoints[active].page_count`
+        // still reflects the *last already-published* checkpoint here --
+        // the commit that triggered this fold (log-full, mid-`publishCheckpoint`)
+        // may itself have allocated fresh pages past that (a large
+        // external value's own extent tree, via that commit's own
+        // `TransactionWrites.pages`, seeded from `page_count` as it stood
+        // *before* this fold ever ran) whose `next`/`checkpoint` was never
+        // published, since the log-full branch runs before that
+        // publication step. Without this, `validateDocumentMutation`/
+        // `validateCatalogMutation`'s own bounds check
+        // (`external_value_root_page >= self.activeCheckpoint().page_count`)
+        // sees a reference to one of the pages just flushed above as
+        // out-of-range and fails with `error.InvalidNativeValueChain` --
+        // and, independent of that check, a fresh `PageAllocator` this
+        // fold's own `transactionWrites()` is about to construct (seeded
+        // from the same stale `page_count`) would start handing out page
+        // ids that collide with the ones just flushed. Advance it to
+        // cover every flushed page before anything below references or
+        // allocates past it.
+        if (staged_pages.len != 0) {
+            var max_staged_page: u64 = 0;
+            for (staged_pages) |p| max_staged_page = @max(max_staged_page, p.page_id);
+            const required = max_staged_page + 1;
+            if (required > self.header.checkpoints[self.header.active_checkpoint].page_count) {
+                self.header.checkpoints[self.header.active_checkpoint].page_count = required;
+            }
         }
         // §9 (redo + indexed reclamation): every page just flushed was
         // allocated and written by an earlier *diverting* commit
@@ -8804,10 +9280,53 @@ pub const NativeFile = struct {
     }
 
     pub fn retirementNeedsServiceWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !bool {
+        return self.retirementNeedsServiceCoreWithCancel(cancel, true);
+    }
+
+    /// §9 (redo retirement signal): the same check, but never considering
+    /// redo-overlay debt -- used only by `Store.startMaintenanceAssumeLocked`
+    /// (docstore.zig). That caller's job is deciding whether to spin up a
+    /// *background* maintenance thread, a code path that, under redo, has
+    /// never run for a retirement reason before now (redo debt alone used
+    /// to make this whole function always return false): doing so for the
+    /// first time surfaced a pre-existing concurrency bug in the
+    /// background maintenance loop's interaction with a live redo commit
+    /// (reproduced independently of every other change in this patch --
+    /// see the crash-sweep/close+reopen regressions this gated on), which
+    /// overlaps the write-serialization race already being fixed on
+    /// `perf/lwa-writer-race`. Every other caller of
+    /// `retirementNeedsServiceWithCancel` -- explicit test assertions,
+    /// `Store.maintainOnceWithCancel`'s own foreground-driven service
+    /// call, `reclaimRetirementPressure`'s admission check -- is a
+    /// direct, synchronous call the caller already controls the timing
+    /// of, not a decision to launch a new concurrent task, so none of
+    /// them need this exclusion. Revisit once the writer-race fix lands:
+    /// this split can likely be removed then.
+    pub fn retirementNeedsServiceLedgerOnlyWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken) !bool {
+        return self.retirementNeedsServiceCoreWithCancel(cancel, false);
+    }
+
+    fn retirementNeedsServiceCoreWithCancel(self: *NativeFile, cancel: ?*const maintenance.CancelToken, consider_redo_debt: bool) !bool {
         if (cancel) |token| try token.check();
         if (!self.header.indexed_reclamation or self.read_only) return false;
         const state = try self.loadLedgerWithCancel(self.activeCheckpoint(), cancel);
         if (state.checkpointDue() or self.budgetedCheckpointDue(state)) return true;
+        // §9 (redo retirement signal): under the redo log, a superseded
+        // overlay version's chain (an old external-value chain included)
+        // is retirement debt the on-disk ledger above cannot see -- only
+        // `checkpointRedoLog`'s next fold discovers and retires it. "The
+        // overlay has anything at all" was tried and rejected (it fires
+        // for a plain, never-overwritten bulk insert, which supersedes
+        // nothing); `pendingRetirementVersions` only counts versions a
+        // *later* write in this same uncheckpointed window has actually
+        // superseded, so a key touched exactly once since the last
+        // checkpoint contributes zero. Unconditional like the two checks
+        // above: there is no epoch/reader-fence question to ask yet (the
+        // real `Retirement` item this debt will become does not exist
+        // until the fold runs), so this can only ever be a useful next
+        // step, never a wrong one -- except for `consider_redo_debt ==
+        // false`'s own caller, see that parameter's doc comment above.
+        if (consider_redo_debt and self.redoCheckpointWouldRetire()) return true;
         const excess_promotions = state.metadata_heap.count() > 2;
         if (state.data_pending == 0 and state.chains_heap.count() == 0 and !excess_promotions) return false;
         if (excess_promotions) {
@@ -8835,6 +9354,17 @@ pub const NativeFile = struct {
         // and avoid a checkpoint-per-service loop.
         const snapshot_bytes = allocator_v4.snapshotPages(self.maxPagePayloadBytes(), state.counts.items.len, state.pending.count()) *| self.maxPagePayloadBytes();
         return state.root.delta_bytes >= 2 *| snapshot_bytes;
+    }
+
+    /// §9 (redo retirement signal): true when the overlay holds at least
+    /// one version a fold would discover is garbage (see
+    /// `SharedRedoOverlay.pending_retirement_versions`'s own doc comment).
+    /// Read-only and O(1): a lock, a load, nothing allocated -- safe to
+    /// call from `retirementNeedsServiceWithCancel` on every maintenance
+    /// check.
+    fn redoCheckpointWouldRetire(self: *NativeFile) bool {
+        const redo = self.redo orelse return false;
+        return redo.shared.pendingRetirementVersions(self.runtimeIo()) != 0;
     }
 
     fn advanceAllocatorCheckpoint(self: *NativeFile, pages: *PageAllocator, budget: usize) !void {
@@ -8902,6 +9432,52 @@ pub const NativeFile = struct {
     fn reclaimPagesImpl(self: *NativeFile, budget: usize, cancel: ?*const maintenance.CancelToken, require_reuse_proof: bool, durable: bool) !usize {
         if (!self.header.indexed_reclamation or self.read_only) return 0;
         if (cancel) |token| try token.check();
+        // §9 (redo retirement signal): a page-shaped write (an external
+        // value chain) a diverting commit staged is real, physical
+        // content the on-disk free map does not know about yet -- that
+        // commit never touched the ledger at all (`checkpointRedoLog`'s
+        // own "page-shaped exception" doc comment). Building a
+        // `PageAllocator` from that stale free map below, as this
+        // function's own ledger-only retirement is about to do, risks
+        // allocating a page id a still-live staged chain already
+        // occupies -- found by reproducing it: running this function's
+        // existing ledger body on a redo file with a staged chain
+        // corrupts that chain, surfacing later as `check()`'s
+        // `unexpected_page_kind`. Only `checkpointRedoLog`'s own fold
+        // (via `redo_fold_retain_pending`) reconciles the ledger with
+        // that physical growth, so this function must not touch the
+        // ledger while any page-shaped write is still staged, unless it
+        // folds first.
+        if (self.redo) |*redo| {
+            const io = self.runtimeIo();
+            if (!redo.shared.pagesEmpty(io)) {
+                // Folding is worth its own real, physical (and, outside
+                // `no_sync`, syncing) commit only when capacity pressure
+                // is the reason this function is running at all -- the
+                // same `budgetedCheckpointDue` gate (a real
+                // `max_file_bytes` reserve). An unbudgeted caller (e.g.
+                // a plain `Store.maintainOnce` ride-along with no
+                // storage limit configured) must stay exactly as cheap
+                // and sync-free as the ledger-only path already is --
+                // see the "ride-along passes force no sync" test, which
+                // has no budget and must not pay for a fold it does not
+                // need, and correctly does nothing here instead (the
+                // debt it asserted via `retirementNeedsService` is real
+                // but not yet safe nor urgent enough to act on without
+                // one): `checkpointRedoLog`'s own commit is always
+                // fully durable (never a ride-along -- see that
+                // function's own doc comment), so running it
+                // unconditionally here would force a sync on every
+                // ride-along pass regardless of `durable`.
+                if (self.reserve_retirement_capacity and self.max_file_bytes != null) {
+                    self.checkpointRedoLog() catch {};
+                }
+                // Whether or not folding ran (skipped above, or
+                // attempted and failed), the ledger body below remains
+                // unsafe while anything is still staged.
+                if (!redo.shared.pagesEmpty(io)) return 0;
+            }
+        }
         const previous_cancel = self.allocator_cancel_token;
         self.allocator_cancel_token = cancel;
         defer self.allocator_cancel_token = previous_cancel;
@@ -8966,6 +9542,25 @@ pub const NativeFile = struct {
         // No cancellation checks after checkpoint publication begins: preserve
         // the usual uncertain-outcome fencing across the durability boundary.
         try self.commitTransactionWithDurability(durable, null);
+        // §9 (redo + reclamation): `redo.checkpointing = true` above sent
+        // this commit through the same real, physical-slot-write branch
+        // of `publishCheckpoint` that `checkpointRedoLog`'s own build
+        // commit uses (neither one appends to the log), so this commit's
+        // sequence was consumed without ever being logged. Unlike
+        // `checkpointRedoLog`, this commit folds no logical overlay --
+        // it is purely a free-map/ledger write -- so the log's own bytes
+        // are untouched and must stay exactly as they are (still correct,
+        // still needed for a future fold): no zeroing, no `old_tail`
+        // bookkeeping, just resyncing the sequence-continuity counters
+        // the next ordinary commit's own `redo.appendRecord` call checks.
+        // Left undone, that next commit fails with the far less specific
+        // `error.OutcomeUnknown` (via `error.SequenceOutOfOrder`), on a
+        // commit that is otherwise perfectly fine.
+        if (self.redo) |*redo| {
+            const new_sequence = self.activeCheckpoint().commit_sequence;
+            redo.durable_sequence = new_sequence;
+            redo.writer.last_sequence = new_sequence;
+        }
         return count;
     }
 
@@ -9262,13 +9857,73 @@ pub const NativeFile = struct {
         // path's own callers run outside any live transaction a redo-log
         // commit could have staged into this overlay.
         if (self.redo) |*redo| {
-            if (out.len == self.header.page_size and offset % self.header.page_size == 0) {
-                const page_id = offset / self.header.page_size;
-                if (try redo.shared.readPageAlloc(self.allocator, self.runtimeIo(), page_id)) |bytes| {
-                    defer self.allocator.free(bytes);
-                    @memcpy(out, bytes);
+            const page_size = self.header.page_size;
+            if (offset % page_size == 0 and out.len % page_size == 0 and out.len != 0) {
+                const page_count = out.len / page_size;
+                if (page_count == 1) {
+                    const page_id = offset / page_size;
+                    if (try redo.shared.readPageAlloc(self.allocator, self.runtimeIo(), page_id)) |bytes| {
+                        defer self.allocator.free(bytes);
+                        if (builtin.is_test) _ = self.test_redo_page_overlay_hits.fetchAdd(1, .monotonic);
+                        @memcpy(out, bytes);
+                        return;
+                    }
+                } else if (!redo.shared.pagesEmpty(self.runtimeIo())) {
+                    // `RecordReadWindow`'s own multi-page read-ahead
+                    // window, never a single page-id-keyed lookup: any
+                    // page in this span -- not just the first -- may be
+                    // redo-log-only with no correct physical copy yet,
+                    // same as the single-page case above. A single bulk
+                    // `readBackingPagesUncached` call below would skip
+                    // the overlay check entirely for every page past the
+                    // first, reading right past the physical end of file
+                    // for one the file was never extended to cover --
+                    // observed as `EndOfStream` in
+                    // `getDocumentsAtCheckpointWithState`'s own batch-read
+                    // path, immediately after a `putDocumentBatch` whose
+                    // writes this same commit diverted into the redo log.
+                    //
+                    // Redo is now the default, so this window is the
+                    // common case on the hot batch-read path benchmarked
+                    // against SQLite: serving it one page at a time
+                    // unconditionally (an earlier version of this fix)
+                    // would turn every such read-ahead window into N
+                    // physical preads instead of one, even when nothing
+                    // in it is actually diverted -- the overwhelmingly
+                    // common case once a fold has run. Instead: walk the
+                    // span once, copying each overlay hit directly and
+                    // coalescing every maximal run of consecutive
+                    // non-overlay pages into a single physical read --
+                    // so a window with zero diverted pages among them
+                    // still costs exactly one pread, same as legacy, and
+                    // only a window that actually straddles a diverted
+                    // page pays for more than one. `pagesEmpty` above
+                    // (one cheap, non-allocating check) skips this walk
+                    // entirely once nothing is staged anywhere, which is
+                    // true for the whole process between folds.
+                    const first_page = offset / page_size;
+                    var i: usize = 0;
+                    while (i < page_count) {
+                        const page_id = first_page + i;
+                        if (try redo.shared.readPageAlloc(self.allocator, self.runtimeIo(), page_id)) |bytes| {
+                            defer self.allocator.free(bytes);
+                            if (builtin.is_test) _ = self.test_redo_page_overlay_hits.fetchAdd(1, .monotonic);
+                            @memcpy(out[i * page_size ..][0..page_size], bytes);
+                            i += 1;
+                            continue;
+                        }
+                        var run: usize = 1;
+                        while (i + run < page_count and !redo.shared.hasPage(self.runtimeIo(), first_page + i + run)) run += 1;
+                        try self.readBackingPagesUncached(out[i * page_size ..][0 .. run * page_size], offset + i * page_size);
+                        i += run;
+                    }
                     return;
                 }
+                // Either a single page already handled above and not
+                // found in the overlay, or a multi-page window with
+                // nothing staged anywhere: fall through to the one bulk
+                // uncached read below, exactly as before this function
+                // knew about multi-page windows at all.
             }
         }
         if (self.allocator_proof_window) |window| if (try window.read(out, offset)) return;
@@ -9473,7 +10128,7 @@ pub const NativeFile = struct {
         defer records.deinit(self.allocator);
         var indexed = checkpoint;
         indexed.document_index_root_page = index;
-        var cursor = DocumentIndexCursor.init(self, indexed);
+        var cursor = CheckpointedTree.init(self, indexed);
         defer cursor.deinit();
         var current = try cursor.first();
         while (current) |entry| {
@@ -10307,7 +10962,7 @@ pub const NativeFile = struct {
         const overlay_root: TransactionWrites.Root = if (root == .metadata) .metadata else .index;
         var overlay = try OverlayScanState.initForPrefix(self.allocator, self, overlay_root, checkpoint, prefix);
         errdefer overlay.deinit();
-        return .{ .index = DocumentIndexCursor.init(self, indexed), .prefix = prefix, .overlay_root = overlay_root, .overlay = overlay };
+        return .{ .index = CheckpointedTree.init(self, indexed), .prefix = prefix, .overlay_root = overlay_root, .overlay = overlay };
     }
 
     fn snapshotCatalogRecordsFromRootAlloc(self: *NativeFile, allocator: Allocator, root: CatalogRoot) ![]OwnedCatalogRecord {
@@ -10446,7 +11101,7 @@ pub const NativeFile = struct {
     /// Borrow record metadata from the checkpoint's ordered index. Values stay
     /// on disk; returned slices remain valid until the next call to next().
     const LiveRecordCursor = struct {
-        index: DocumentIndexCursor,
+        index: CheckpointedTree,
         kind: PageKind,
         started: bool = false,
         records: RecordPageReader = .{},
@@ -10481,7 +11136,7 @@ pub const NativeFile = struct {
             };
             var overlay = try OverlayScanState.initForPrefix(file.allocator, file, overlay_root, checkpoint, "");
             errdefer overlay.deinit();
-            return .{ .index = DocumentIndexCursor.init(file, checkpoint), .kind = kind, .overlay_root = overlay_root, .overlay = overlay };
+            return .{ .index = CheckpointedTree.init(file, checkpoint), .kind = kind, .overlay_root = overlay_root, .overlay = overlay };
         }
 
         pub fn deinit(self: *LiveRecordCursor) void {
@@ -10515,7 +11170,34 @@ pub const NativeFile = struct {
                 const take_overlay = overlay_key != null and (tree_key == null or std.mem.order(u8, overlay_key.?, tree_key.?) != .gt);
                 if (take_overlay) {
                     const key = overlay_key.?;
-                    const entry = (try file.redoOverlayEntry(self.overlay_root, self.index.checkpoint, key)) orelse return error.InvalidNativeRedoRecord;
+                    // §9.7c (ReadView): resolve before deciding whether
+                    // `candidate` is actually superseded -- the overlay
+                    // enumerates every key with *any* version currently
+                    // in the live map, regardless of this cursor's own
+                    // pinned checkpoint, so a cursor pinned to an older,
+                    // already-superseded checkpoint can enumerate a key
+                    // whose entire chain postdates it. `resolveAlloc`
+                    // then correctly returns `null` -- "nothing at or
+                    // before this checkpoint" -- which must be treated
+                    // like the real tree never having had this key
+                    // diverted away from it at this checkpoint (re-stash
+                    // `candidate`, exactly as the non-tied branch below
+                    // already does, and continue to find the next real
+                    // candidate), not as corruption; `candidate` must
+                    // never be freed here, only in the genuinely-tied
+                    // case (same bug class as `MergedCursor.advance`'s
+                    // own fix, and the mirror image of this function's
+                    // own leak fix -- that fix made the error path free
+                    // `candidate` instead of leaking it; this one makes
+                    // the error path not exist at all, re-stashing
+                    // `candidate` instead, same as every other "not
+                    // actually superseded" path in this loop).
+                    const entry = try file.redoOverlayEntry(self.overlay_root, self.index.checkpoint, key);
+                    _ = self.overlay.takeFront();
+                    if (entry == null) {
+                        self.pending_tree = candidate;
+                        continue;
+                    }
                     const tied = tree_key != null and std.mem.eql(u8, tree_key.?, key);
                     if (tied) {
                         var owned = candidate.?;
@@ -10523,12 +11205,11 @@ pub const NativeFile = struct {
                     } else {
                         self.pending_tree = candidate;
                     }
-                    _ = self.overlay.takeFront();
-                    if (entry.is_delete) {
-                        file.allocator.free(entry.value);
+                    if (entry.?.is_delete) {
+                        file.allocator.free(entry.?.value);
                         continue;
                     }
-                    self.overlay_value = entry.value;
+                    self.overlay_value = entry.?.value;
                     return entry;
                 }
 
@@ -10654,7 +11335,7 @@ pub const NativeFile = struct {
             errdefer deinitNamespaceDirectory(allocator, &directory);
             var indexed = checkpoint;
             indexed.document_index_root_page = roots.index;
-            var cursor = DocumentIndexCursor.init(self, indexed);
+            var cursor = CheckpointedTree.init(self, indexed);
             defer cursor.deinit();
             var reader = RecordPageReader{};
             defer reader.deinit(allocator);
@@ -11166,6 +11847,28 @@ pub const NativeFile = struct {
     }
 
     fn putIndexedDocumentBatch(self: *NativeFile, mutations: []const DocumentMutation) !void {
+        // Regression: a bare commit here (self.transaction_pages == null,
+        // the only branch that reaches publishBareCommit below) builds its
+        // real pages directly through this indexed-reclamation path --
+        // never through flushTransactionWrites's redo diversion -- so it
+        // never stages anything into redo.logical_pending/pending/shared.
+        // publishCheckpoint's own preemptive "would this record overflow
+        // the log" check (redo.pendingRecordLen() > redo.writer.remaining())
+        // is therefore always comparing against this commit's own (empty)
+        // staged bytes, never against how full the log already is from
+        // *prior* commits -- and its "page-shaped only" fallback branch,
+        // finding nothing of this commit's own to flush, is a complete
+        // no-op. publishBareCommit's own maybeAutoCheckpointRedoLog call
+        // runs too late to help: only *after* publishCheckpoint has
+        // already tried (and, once the log is genuinely full, failed) to
+        // append this commit's own ride-along marker record
+        // (error.LogFull, surfacing as error.OutcomeUnknown). Must run
+        // here, before `previous` is captured below: checkpointRedoLog
+        // advances the real checkpoint's own commit_sequence, so running
+        // it any later -- once `next.commit_sequence = previous
+        // .commit_sequence + 1` is fixed relative to a `previous` this
+        // call would make stale -- would corrupt that sequencing instead.
+        if (self.transaction_pages == null) try self.maybeAutoCheckpointRedoLog();
         const previous = self.activeCheckpoint();
         var local: PageAllocator = undefined;
         if (self.transaction_pages == null) local = try self.pageAllocatorFromFreeMap(previous);
@@ -11382,9 +12085,42 @@ pub const NativeFile = struct {
 
     /// Resolve the pinned document once; nearby requested fields share one
     /// extent read and independent spans reuse the same page reader.
+    /// §9.7c (ReadView): resolves `ranges` against an overlay entry's own
+    /// value directly, instead of a real page -- the overlay-side half
+    /// `readDocumentRangesAlloc`/`readDocumentRangesBatchAlloc` were
+    /// missing entirely (unlike `getDocumentAtCheckpointAlloc`, they went
+    /// straight to the raw tree with no overlay check at all, so a key
+    /// logged-but-not-yet-folded by `checkpointRedoLog` always resolved
+    /// as not found here even though a plain `get()` on the same handle
+    /// found it immediately). Likely root cause of full-text crash-sweep
+    /// failures that survived the `Cursor`/`getDocumentsAtCheckpointWithState`
+    /// fixes: full-text indexing reads a document's body in ranges,
+    /// through exactly this path. Caller owns `entry.value` already.
+    fn readDocumentRangesFromOverlayEntry(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, entry: CatalogEntry, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
+        if (entry.is_delete) return error.NotFound;
+        const size = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+        const Context = struct {
+            file: *NativeFile,
+            a: Allocator,
+            checkpoint: CheckpointSlot,
+            root: u64,
+            size: usize,
+            inline_value: []const u8,
+            pub fn read(ctx: @This(), begin: usize, len: usize) ![]const u8 {
+                if (ctx.root == 0) return ctx.a.dupe(u8, ctx.inline_value[begin..][0..len]);
+                return ctx.file.readValuePagesRangeAlloc(ctx.a, ctx.root, ctx.size, begin, len, ctx.checkpoint);
+            }
+        };
+        return @import("../value_ranges.zig").read(size, ranges, output, Context{ .file = self, .a = allocator, .checkpoint = checkpoint, .root = entry.external_value_root_page, .size = size, .inline_value = entry.value });
+    }
+
     pub fn readDocumentRangesAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, key: []const u8, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
         if (ranges.len != output.len or ranges.len > @import("../value_ranges.zig").maximum_ranges) return error.InvalidBatch;
         if (ranges.len == 0) return;
+        if (try self.redoOverlayEntry(.documents, checkpoint, key)) |entry| {
+            defer self.allocator.free(entry.value);
+            return self.readDocumentRangesFromOverlayEntry(allocator, checkpoint, entry, ranges, output);
+        }
         const page = (try self.lookupDocumentIndexPage(checkpoint, key)) orelse return error.NotFound;
         return self.readDocumentRangesAtPage(allocator, checkpoint, key, page, ranges, output);
     }
@@ -11397,13 +12133,29 @@ pub const NativeFile = struct {
             keys[i] = request.key;
             if (i != 0 and std.mem.order(u8, keys[i - 1], keys[i]) == .gt) return error.InvalidBatch;
         }
+        // Same overlay-blind gap as the single-key path above: resolve
+        // each request against the overlay first; only requests genuinely
+        // absent from it go through the batched tree walk below.
+        var remaining: [64]@import("../value_ranges.zig").Request = undefined;
+        var remaining_count: usize = 0;
+        for (requests) |request| {
+            if (try self.redoOverlayEntry(.documents, checkpoint, request.key)) |entry| {
+                defer self.allocator.free(entry.value);
+                try self.readDocumentRangesFromOverlayEntry(allocator, checkpoint, entry, request.ranges, request.output);
+                continue;
+            }
+            remaining[remaining_count] = request;
+            remaining_count += 1;
+        }
+        if (remaining_count == 0) return;
         const temporary = @import("antfly_platform").allocator.reclaimingScratch(allocator);
         var state: DocumentBatchReadState = .{};
         state.prepare(self);
         defer state.deinit();
-        const references = try self.resolveBatchReferences(temporary, checkpoint, keys[0..requests.len], "", &state.path);
+        for (remaining[0..remaining_count], 0..) |request, i| keys[i] = request.key;
+        const references = try self.resolveBatchReferences(temporary, checkpoint, keys[0..remaining_count], "", &state.path);
         defer temporary.free(references);
-        for (requests, references) |request, page| {
+        for (remaining[0..remaining_count], references) |request, page| {
             if (page == 0) return error.NotFound;
             try self.readDocumentRangesAtPage(allocator, checkpoint, request.key, page, request.ranges, request.output);
         }
@@ -11442,6 +12194,16 @@ pub const NativeFile = struct {
 
     /// Extents and inline slices are resolved against the caller's checkpoint.
     pub fn readDocumentRangeAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, key: []const u8, offset: u64, length: usize) ![]u8 {
+        // §9.7c (ReadView): see `readDocumentRangesAlloc`'s own comment --
+        // same overlay-blind gap, same fix.
+        if (try self.redoOverlayEntry(.documents, checkpoint, key)) |entry| {
+            defer self.allocator.free(entry.value);
+            if (entry.is_delete) return error.NotFound;
+            const size = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+            if (offset > size or length > size - offset) return error.EndOfStream;
+            if (entry.external_value_root_page != 0) return self.readValuePagesRangeAlloc(allocator, entry.external_value_root_page, size, @intCast(offset), length, checkpoint);
+            return allocator.dupe(u8, entry.value[@intCast(offset)..][0..length]);
+        }
         const page_id = (try self.lookupDocumentIndexPage(checkpoint, key)) orelse return error.NotFound;
         var reader: ValuePageReader = undefined;
         reader.init();
@@ -11460,6 +12222,20 @@ pub const NativeFile = struct {
     /// rejected before loading external pages, and no transaction read cache
     /// retains a copy. Only the initialized prefix of out is returned.
     pub fn readDocumentInto(self: *NativeFile, checkpoint: CheckpointSlot, key: []const u8, out: []u8) ![]const u8 {
+        // §9.7c (ReadView): see `readDocumentRangesAlloc`'s own comment --
+        // same overlay-blind gap, same fix.
+        if (try self.redoOverlayEntry(.documents, checkpoint, key)) |entry| {
+            defer self.allocator.free(entry.value);
+            if (entry.is_delete) return error.NotFound;
+            const length = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+            if (length > out.len) return error.BufferTooSmall;
+            if (entry.external_value_root_page != 0) {
+                try self.readValuePagesRangeInto(entry.external_value_root_page, length, 0, out[0..length], checkpoint);
+            } else {
+                @memcpy(out[0..length], entry.value);
+            }
+            return out[0..length];
+        }
         const page_id = (try self.lookupDocumentIndexPage(checkpoint, key)) orelse return error.NotFound;
         var reader: ValuePageReader = undefined;
         reader.init();
@@ -11495,7 +12271,14 @@ pub const NativeFile = struct {
         return self.getDocumentsAtCheckpointWithState(allocator, temporary, checkpoint, keys, buffers, values, &state);
     }
 
-    /// Reuse bounded native working storage independently of the result arena.
+    /// Reuse bounded native working storage independently of the result
+    /// arena. §9.7c (ReadView): `readBatchAtCheckpoint` now runs its own
+    /// overlay pre-pass internally (shared with every score-batch read
+    /// too), so this is a thin wrapper again -- the per-site pre-pass
+    /// that used to live here (resolving each key's overlay entry
+    /// directly, only sending genuinely-absent keys through the real
+    /// batch/tree path) has moved down into the one place every batch
+    /// read goes through.
     pub fn getDocumentsAtCheckpointWithState(self: *NativeFile, allocator: Allocator, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, state: *DocumentBatchReadState) !void {
         return self.readBatchAtCheckpoint(allocator, temporary, checkpoint, keys, buffers, values, @as(?ScoreSink, null), state, null, false);
     }
@@ -11562,10 +12345,15 @@ pub const NativeFile = struct {
         }
         defer state.resolved = retained;
         const identity = ReadIdentity{ .canonical = canonical_identity, .namespace = namespace };
-        if (checkpoint.document_index_root_page == 0) {
-            for (0..read_keys.len) |i| sink.write(sink.context, i, null);
-            return;
-        }
+        // §9.7c (ReadView): this used to short-circuit straight to "not
+        // found" for every key whenever the physical tree was empty,
+        // without ever consulting the overlay -- wrong whenever a
+        // graph-metric score document was logged but not yet folded by
+        // checkpointRedoLog (the tree can be legitimately empty while
+        // the overlay already holds every score this call is for).
+        // `readBatchAtCheckpoint` below now has its own overlay-aware
+        // version of this same empty-tree case, so there is no need for
+        // a second one here; always delegate to it.
         // Owned physical keys and decoded values survive scope detach. A hit
         // needs no namespace reconstruction, record reader, or temporary arena.
         if (state.binding) |binding| if (state.resolved) |resolved| {
@@ -11580,6 +12368,25 @@ pub const NativeFile = struct {
             }
         };
         return self.readBatchAtCheckpoint(temporary, temporary, checkpoint, read_keys, null, &.{}, @as(?CompleteScoreSink, sink), state, identity, true);
+    }
+
+    /// §9.7c (ReadView): decode an overlay entry's score the same way
+    /// `readBatchRecord`'s own `wants_score` branch decodes a real page's
+    /// -- a fixed 8-byte `f64`, inline or through one external-value-chain
+    /// read. `null` for a tombstone (consistent with `readBatchRecord`'s
+    /// own `entry.is_delete` handling); any other mismatched length is
+    /// the same `error.InvalidGraphMetricScore` a real page's own
+    /// corruption would raise.
+    fn scoreFromCatalogEntry(self: *NativeFile, checkpoint: CheckpointSlot, entry: CatalogEntry) !?f64 {
+        if (entry.is_delete) return null;
+        const length = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+        if (length != 8) return error.InvalidGraphMetricScore;
+        var raw: [8]u8 = undefined;
+        const score_bytes = if (entry.external_value_root_page != 0) blk: {
+            try self.readValuePagesRangeInto(entry.external_value_root_page, 8, 0, &raw, checkpoint);
+            break :blk &raw;
+        } else entry.value;
+        return try decodeScore(score_bytes);
     }
 
     // Keep record and external-score reads inside the same recovery boundary.
@@ -11627,8 +12434,88 @@ pub const NativeFile = struct {
             if (buffers == null) for (values) |value| if (value) |bytes| allocator.free(bytes);
             @memset(values, null);
         }
+        // §9.7c (ReadView): the one overlay-resolution step every batch
+        // read this function serves shares -- plain value gets
+        // (`getDocumentsAtCheckpointWithState`) and every score-batch
+        // variant (`visitScoresAtCheckpointWithState` and siblings)
+        // alike. Previously only the value path had its own, separate
+        // pre-pass (`getDocumentsAtCheckpointWithState`'s own wrapper,
+        // now folded in here and removed there); every score-reading
+        // caller went straight to the raw tree walk below with no
+        // overlay knowledge at all, so a graph-metric score document
+        // logged but not yet folded by `checkpointRedoLog` was
+        // invisible to a score-batch read even though a plain `get()`
+        // on the same key found it immediately.
+        //
+        // A key found here is fully resolved and delivered now, then
+        // `skip[i]` keeps the tree walk/caching logic below from ever
+        // touching it again -- including `resolveBatchReferences`'
+        // own (now simply wasted, not wrong) tree lookup for it. This
+        // does mean a batch that touches overlay content can never
+        // reach `decoded_ready = true` for the score cache (`captured`
+        // can never reach `keys.len` while any key is skipped) -- a
+        // bounded performance cost, not a correctness one: the cache's
+        // own checkpoint-keyed `matches`/`matchesPrepared` check already
+        // means a cached, fully-decoded batch can never silently reflect
+        // a stale overlay state, since `checkpoint.commit_sequence`
+        // advances on every commit, including one that only diverts
+        // into the overlay (`NativeFile.committedSequence`'s own doc
+        // comment).
+        var skip: []bool = &.{};
+        defer temporary.free(skip);
+        // Cheap, allocation-free out: an empty documents-root overlay
+        // (the common case away from a live redo-log write window --
+        // nothing uncheckpointed at all) means nothing below could ever
+        // match, so skip the per-key lookups and the `skip` array
+        // itself entirely. Matters beyond a pure optimization: several
+        // memory-budget/OOM-injection tests assert an exact allocation
+        // count for this function on a file that happens to have
+        // `use_redo_log` on but nothing ever diverted into the overlay
+        // during the assertion in question -- this keeps this function
+        // allocation-for-allocation identical to before this fix
+        // whenever there is genuinely nothing for it to find.
+        if (self.redo != null and keys.len != 0 and
+            self.redo.?.shared.count(self.runtimeIo(), @backingInt(TransactionWrites.Root.documents)) != 0)
+        {
+            skip = try temporary.alloc(bool, keys.len);
+            @memset(skip, false);
+            for (keys, 0..) |key, i| {
+                const full_key = if (namespace.len == 0) key else blk: {
+                    const buf = try temporary.alloc(u8, namespace.len + key.len);
+                    @memcpy(buf[0..namespace.len], namespace);
+                    @memcpy(buf[namespace.len..], key);
+                    break :blk buf;
+                };
+                defer if (namespace.len != 0) temporary.free(full_key);
+                const entry = (try self.redoOverlayEntry(.documents, checkpoint, full_key)) orelse continue;
+                defer self.allocator.free(entry.value);
+                skip[i] = true;
+                if (comptime score_reads) {
+                    const score = try self.scoreFromCatalogEntry(checkpoint, entry);
+                    if (score) |s| {
+                        deliverBatchScore(scores, i, s);
+                    } else if (complete and scores != null) deliverBatchScore(scores, i, null);
+                } else if (entry.is_delete) {
+                    // values[i] already null from the @memset above.
+                } else if (buffers) |out| {
+                    const length = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+                    if (length > out[i].len) return error.BufferTooSmall;
+                    if (entry.external_value_root_page != 0) {
+                        try self.readValuePagesRangeInto(entry.external_value_root_page, length, 0, out[i][0..length], checkpoint);
+                    } else @memcpy(out[i][0..length], entry.value);
+                    values[i] = out[i][0..length];
+                } else {
+                    values[i] = if (entry.external_value_root_page != 0)
+                        try self.readValuePagesAtCheckpointAlloc(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint)
+                    else
+                        try allocator.dupe(u8, entry.value);
+                }
+            }
+        }
         if (keys.len == 0 or checkpoint.document_index_root_page == 0) {
-            if (complete and scores != null) for (0..keys.len) |i| deliverBatchScore(scores, i, null);
+            if (complete and scores != null) for (0..keys.len) |i| {
+                if (skip.len == 0 or !skip[i]) deliverBatchScore(scores, i, null);
+            };
             return;
         }
         const use_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
@@ -11706,6 +12593,13 @@ pub const NativeFile = struct {
         var position: usize = 0;
         while (position < keys.len) {
             const i = if (order) |positions| positions[position] else position;
+            if (skip.len != 0 and skip[i]) {
+                // Already fully resolved and delivered from the overlay
+                // above; deliberately never touches `capture`/`captured`
+                // (see this function's own overlay-pre-pass comment).
+                position += 1;
+                continue;
+            }
             const reference = references[i];
             if (reference == 0) {
                 if (capture) {
@@ -11842,7 +12736,7 @@ pub const NativeFile = struct {
     /// so an index entry alone is not proof that a live document exists.
     pub fn hasLiveDocumentOutsidePrefix(self: *NativeFile, checkpoint: CheckpointSlot, excluded_prefix: []const u8) !bool {
         if (excluded_prefix.len == 0) return false;
-        var cursor = DocumentIndexCursor.init(self, checkpoint);
+        var cursor = CheckpointedTree.init(self, checkpoint);
         defer cursor.deinit();
         var records = RecordPageReader{};
         defer records.deinit(self.allocator);
@@ -11909,7 +12803,7 @@ pub const NativeFile = struct {
         }
         var references = std.ArrayListUnmanaged(u64).empty;
         defer references.deinit(self.allocator);
-        var cursor = DocumentIndexCursor.initWithKeyAllocator(self, checkpoint, allocator);
+        var cursor = CheckpointedTree.initWithKeyAllocator(self, checkpoint, allocator);
         defer cursor.deinit();
         // §9.3a revised: merge the redo-log logical_overlay's own
         // uncheckpointed document mutations into this scan, in key order,
@@ -14635,8 +15529,51 @@ pub const NativeFile = struct {
     /// `self.allocator.free(entry.value)` once done with it, exactly like
     /// any other `...Alloc` function in this file.
     pub fn redoOverlayEntry(self: *NativeFile, root: TransactionWrites.Root, checkpoint: CheckpointSlot, key: []const u8) !?CatalogEntry {
+        return self.redoOverlayEntryAt(root, self.readMark(checkpoint), key);
+    }
+
+    /// §9.7c (ReadView): the overlay read mark M corresponding to
+    /// `checkpoint` (C) -- the *logical* commit sequence to resolve the
+    /// overlay at, which is not always C's own `commit_sequence` number.
+    /// Under redo mode, an ordinary commit advances the logical sequence
+    /// (`committedSequence`) without moving the physical checkpoint slot
+    /// at all until the next `checkpointRedoLog` -- so for the *current*
+    /// generation, C trails M, and resolving the overlay at C's own
+    /// number (as every caller of `redoOverlayEntry` effectively did
+    /// before this existed) incorrectly treats every version newer than
+    /// the last real checkpoint as if it postdated this read, when it
+    /// is, in fact, exactly what this read is supposed to see. For an
+    /// older, already-checkpointed generation, C's own number already
+    /// equals the logical sequence that was current at the moment that
+    /// checkpoint published (publishing *is* the moment the two numbers
+    /// last coincided), so no correction is needed there -- `checkpoint
+    /// .commit_sequence == activeCheckpoint().commit_sequence` is
+    /// exactly the dividing line between the two cases.
+    ///
+    /// Found via `getDocumentsAtCheckpointWithState`'s batch read (and,
+    /// before that, `docstore.Cursor`'s own overlay branch) silently
+    /// treating a just-committed, not-yet-checkpointed document as
+    /// though it postdated the read: both called `redoOverlayEntry`
+    /// with `checkpoint.commit_sequence` directly, which stayed stuck at
+    /// an old, pre-redo value for the entire life of the current
+    /// generation. Centralizing the correction here, rather than
+    /// recomputing it at each call site, is the §9.7c ReadView design's
+    /// whole point: every reader is pinned to a (C, M) pair captured
+    /// together, not forced to derive M from C itself on every read.
+    pub fn readMark(self: *const NativeFile, checkpoint: CheckpointSlot) u64 {
+        if (checkpoint.commit_sequence == self.activeCheckpoint().commit_sequence) return self.committedSequence();
+        return checkpoint.commit_sequence;
+    }
+
+    /// `redoOverlayEntry`, but resolving at an explicit mark `M` instead
+    /// of deriving one from a `CheckpointSlot` -- the primitive
+    /// `ReadView`'s own read methods call directly, already holding the
+    /// correct `M` for their pinned (C, M) pair; `redoOverlayEntry`
+    /// itself is now a thin wrapper computing `M` via `readMark` for
+    /// callers that have only a `CheckpointSlot` in hand.
+    pub fn redoOverlayEntryAt(self: *NativeFile, root: TransactionWrites.Root, mark: u64, key: []const u8) !?CatalogEntry {
         const redo = self.redo orelse return null;
-        const resolved = (try redo.shared.resolveAlloc(self.allocator, self.runtimeIo(), @backingInt(root), key, checkpoint.commit_sequence)) orelse return null;
+        const resolved = (try redo.shared.resolveAlloc(self.allocator, self.runtimeIo(), @backingInt(root), key, mark)) orelse return null;
         return .{
             .previous_page = 0,
             .key = key,
@@ -14689,34 +15626,42 @@ pub const NativeFile = struct {
         index: usize = 0,
         allocator: Allocator,
 
-        /// Empty (not an error) for a non-redo file, or for a checkpoint
-        /// other than the current one: a deliberately pinned, older
-        /// snapshot must never see mutations the overlay only reflects
-        /// for the *current* generation.
+        /// §9.7c (`ReadView`): this used to refuse (return empty) for any
+        /// `checkpoint` other than `file.activeCheckpoint()` exactly --
+        /// a guard meant to stop a deliberately pinned, older snapshot
+        /// from seeing mutations the overlay only reflects for the
+        /// *current* generation. In practice it fired for a case that
+        /// guard was never meant to catch: `catalogCursor`'s own callers
+        /// (`metadataCatalogCursor`/`indexCatalogCursor`/
+        /// `indexCatalogDirectoryCursor`) are reached from a `ReadGeneration`'s
+        /// separately-opened `generation.file` with the *tracked* checkpoint
+        /// (`Txn.checkpoint`, kept current by `Store.observeReadCheckpoint`)
+        /// passed in -- `checkpoint.commit_sequence` is genuinely current,
+        /// but `generation.file.activeCheckpoint()` is frozen at that
+        /// instance's own open time (it never processes commits itself),
+        /// so the two numbers mismatch on every call after the first
+        /// commit, and this returned empty every time: the exact
+        /// overlay-blind-scan bug class §9.7c describes, just one more
+        /// occurrence of it, reached through `index_storage.zig`'s
+        /// directory listing and `native_catalog_sink.zig`'s
+        /// `loadAllAlloc` (the dense/sparse/graph/full-text native-
+        /// catalog seed) rather than through `docstore.Cursor`.
+        ///
+        /// Per-key value resolution (`redoOverlayEntry`/`resolveAlloc`)
+        /// is already correctly version-pinned regardless of which
+        /// checkpoint number is passed -- the same function an ordinary
+        /// point `get()` uses, with no such gate at all -- so dropping
+        /// this precondition does not weaken correctness for a
+        /// genuinely stale pin, only widens *enumeration* to match what
+        /// point-read resolution already does. Still returns empty for
+        /// a non-redo file. Now the same function as
+        /// `initForPrefixUnchecked` (kept as a thin alias for existing
+        /// callers) -- there is exactly one enumeration behavior.
         pub fn initForPrefix(allocator: Allocator, file: *NativeFile, root: TransactionWrites.Root, checkpoint: CheckpointSlot, prefix: []const u8) !OverlayScanState {
-            const empty: OverlayScanState = .{ .allocator = allocator };
-            const redo = file.redo orelse return empty;
-            if (checkpoint.commit_sequence != file.activeCheckpoint().commit_sequence) return empty;
-            const keys = try redo.shared.keysWithPrefixAlloc(allocator, file.runtimeIo(), @backingInt(root), prefix);
-            return .{ .keys = keys, .allocator = allocator };
+            _ = checkpoint;
+            return initForPrefixUnchecked(allocator, file, root, prefix);
         }
 
-        /// Like `initForPrefix`, but without that "must equal the
-        /// currently active (physical) checkpoint" precondition -- for a
-        /// caller (`docstore.zig`'s `Cursor`) whose own checkpoint value
-        /// (`Txn.checkpoint`, from `ReadGeneration.checkpoint`) is not
-        /// comparable to `file.activeCheckpoint()` in the first place: it
-        /// can be a different `NativeFile` instance's (`generation.file`,
-        /// a separately-opened, read-only handle) view, kept current via
-        /// `Store.observeReadCheckpoint` rather than by sharing
-        /// `activeCheckpoint()`'s own in-memory state directly. Per-key
-        /// value resolution (`redoOverlayEntry`/`resolveAlloc`) is already
-        /// correctly version-pinned regardless of which checkpoint number
-        /// is passed -- the same function an ordinary point `get()` uses,
-        /// with no such gate at all -- so omitting this precondition here
-        /// does not weaken correctness for a genuinely stale pin, only
-        /// widens *enumeration* to match what point-read resolution
-        /// already does. Still returns empty for a non-redo file.
         pub fn initForPrefixUnchecked(allocator: Allocator, file: *NativeFile, root: TransactionWrites.Root, prefix: []const u8) !OverlayScanState {
             const redo = file.redo orelse return .{ .allocator = allocator };
             const keys = try redo.shared.keysWithPrefixAlloc(allocator, file.runtimeIo(), @backingInt(root), prefix);
@@ -15872,12 +16817,14 @@ pub const NativeFile = struct {
             self.header = durable;
             self.durable_header = null;
         }
+        var redo_fell_back_to_slot = false;
         if (self.redo != null and !self.redo.?.checkpointing) {
             const redo = &self.redo.?;
             // A log-full condition must be decided before anything is
             // appended, never discovered as a failed, partial append
             // (`error.LogFull`, surfacing as the far less specific
             // `error.OutcomeUnknown` below).
+            var try_redo_log = true;
             if (redo.pendingRecordLen() > redo.writer.remaining()) {
                 if (redo.logical_pending.items.len != 0) {
                     // This commit diverted logical mutations, already
@@ -15900,7 +16847,14 @@ pub const NativeFile = struct {
                     // `redo.writer` are untouched by a failed checkpoint
                     // attempt, so the log stays intact and the caller
                     // sees a clean, pre-decision error, never a torn
-                    // append.
+                    // append. This commit's own durability comes from
+                    // `checkpointRedoLog`'s own real, physical publish
+                    // (a genuine slot write + sync), regardless of
+                    // whether that call could also reclaim log *bytes*
+                    // (`pinned_below`, that function's own doc comment)
+                    // -- unlike the page-shaped branch below, nothing
+                    // here still needs the log to fit anything
+                    // afterward.
                     try self.checkpointRedoLog();
                     redo.logical_pending.clearRetainingCapacity();
                     redo.pending.clearRetainingCapacity();
@@ -15927,65 +16881,117 @@ pub const NativeFile = struct {
                     try self.file.writePositionalAll(self.runtimeIo(), p.bytes, p.page_id * @as(u64, self.header.page_size));
                 }
                 redo.pending.clearRetainingCapacity();
+                // §9 (redo log full under a reader pin): this commit's
+                // own page-shaped content is already flushed above and
+                // `pending` is now empty, so `pendingRecordLen()` is
+                // down to the bare minimum -- the record's own framing
+                // plus one fixed-size `CompactCheckpoint`, the tracking
+                // entry every commit through this branch still appends
+                // unconditionally below. That minimum can still exceed
+                // `remaining()` if a live reader pin has kept every
+                // `checkpointRedoLog` call (this commit's own
+                // proactive one, or any earlier one) from ever
+                // physically reclaiming log bytes
+                // (`checkpointRedoLog`'s own `pinned_below` branch) --
+                // no amount of further page-shaped flushing shrinks
+                // this minimum, since there is nothing left to flush.
+                // Checked again here, after clearing, rather than
+                // trusting the first check above (which measured this
+                // commit's full, pre-flush record): falling through to
+                // `redo.appendRecord` regardless would surface the
+                // log's own `error.LogFull` as the far less specific,
+                // and wrong, `error.OutcomeUnknown` -- wrong because
+                // nothing about this commit is actually uncertain, it
+                // simply has nowhere to log its own tracking entry.
+                try_redo_log = redo.pendingRecordLen() <= redo.writer.remaining();
             }
-            // §9.1/§9.3: the on-disk checkpoint slot is untouched here --
-            // it still names the last real checkpoint (build step (d) is
-            // the only thing that ever advances it for a redo-log file).
-            // This commit's durability comes entirely from appending
-            // `pending` (everything `flushTransactionWrites` diverted
-            // above) to the log and syncing it -- the commit's one fsync,
-            // same durability boundary as the v8/v9 path's slot write +
-            // `syncIfRequired`, just covering the log instead.
-            //
-            // Not replicated here: `checkpoint_publication_uncertain`/
-            // `uncertain_checkpoint`/`uncertain_slot` and
-            // `reconcilePublicationUncertainty`. Those exist to let a
-            // *live* handle recover from a failed slot write without a
-            // full reopen, specific to the two-physical-slot model; a
-            // redo-log file's recovery path (`recoverRedoLog`) already
-            // tolerates a torn or absent tail on the *next* open, which is
-            // this design's answer to the same failure instead. A failed
-            // sync (not append -- that can no longer fail with `LogFull`
-            // here, per the preemptive check above) still reports
-            // `OutcomeUnknown`, so callers (`Store`'s reconciliation)
-            // treat this commit exactly as uncertain as the v8/v9 path
-            // would.
-            self.publication_in_flight = true;
-            defer self.publication_in_flight = false;
-            (blk: {
-                if (comptime builtin.is_test) if (self.test_fail_checkpoint_publication) |err| {
-                    self.test_fail_checkpoint_publication = null;
-                    break :blk err;
+            if (try_redo_log) {
+                // §9.1/§9.3: the on-disk checkpoint slot is untouched here --
+                // it still names the last real checkpoint (build step (d) is
+                // the only thing that ever advances it for a redo-log file).
+                // This commit's durability comes entirely from appending
+                // `pending` (everything `flushTransactionWrites` diverted
+                // above) to the log and syncing it -- the commit's one fsync,
+                // same durability boundary as the v8/v9 path's slot write +
+                // `syncIfRequired`, just covering the log instead.
+                //
+                // Not replicated here: `checkpoint_publication_uncertain`/
+                // `uncertain_checkpoint`/`uncertain_slot` and
+                // `reconcilePublicationUncertainty`. Those exist to let a
+                // *live* handle recover from a failed slot write without a
+                // full reopen, specific to the two-physical-slot model; a
+                // redo-log file's recovery path (`recoverRedoLog`) already
+                // tolerates a torn or absent tail on the *next* open, which is
+                // this design's answer to the same failure instead. A failed
+                // sync (not append -- that can no longer fail with `LogFull`
+                // here, per the preemptive checks above) still reports
+                // `OutcomeUnknown`, so callers (`Store`'s reconciliation)
+                // treat this commit exactly as uncertain as the v8/v9 path
+                // would.
+                self.publication_in_flight = true;
+                defer self.publication_in_flight = false;
+                (blk: {
+                    if (comptime builtin.is_test) if (self.test_fail_checkpoint_publication) |err| {
+                        self.test_fail_checkpoint_publication = null;
+                        break :blk err;
+                    };
+                    redo.appendRecord(self.allocator, checkpoint.commit_sequence, CompactCheckpoint.fromCheckpointSlot(checkpoint)) catch |err| break :blk err;
+                    redo.writer.sync() catch |err| break :blk err;
+                    break :blk {};
+                }) catch {
+                    return error.OutcomeUnknown;
                 };
-                redo.appendRecord(self.allocator, checkpoint.commit_sequence, CompactCheckpoint.fromCheckpointSlot(checkpoint)) catch |err| break :blk err;
-                redo.writer.sync() catch |err| break :blk err;
-                break :blk {};
-            }) catch {
-                return error.OutcomeUnknown;
-            };
-            redo.durable_sequence = checkpoint.commit_sequence;
-            // §9.3b: publish right after the append this process just
-            // made durable, never before -- ride-along/deferred appends
-            // elsewhere are unsynced and must never be visible to a
-            // cross-process reader until a `durable=true` commit's own
-            // sync (the one that just returned, above) covers them.
-            // `redo.checkpoint_sequence` is untouched by an ordinary
-            // commit (only `checkpointRedoLog` advances it), so this
-            // publishes the same baseline a cross-process reader already
-            // has whenever nothing has been checkpointed since it last
-            // refreshed.
-            self.publishRedoLogState();
-            self.header.checkpoints[self.header.active_checkpoint] = checkpoint;
-            wal_trace.recordCommit();
-            self.last_synced_header = self.header;
-            if (self.ledger) |state| {
-                self.retirement_activity_bytes +|= state.released_data_pages *| self.header.page_size;
-                self.retirement_activity_bytes +|= state.retired_inline_bytes;
-                state.released_data_pages = 0;
-                state.retired_inline_bytes = 0;
+                // §9.7c (ReadView): `redo.writer.sync()` above is this
+                // commit's own durability barrier, exactly like
+                // `syncIfRequired`'s call below is for a non-redo file --
+                // but it calls through `redo_log.Writer.sync` directly,
+                // never through `syncIfRequired` itself, so it never used
+                // to bump this counter. Several tests across both redo
+                // and legacy modes assert an exact `test_sync_calls`
+                // delta per durable commit; without this, a redo-log
+                // file's own foreground writes always read back as zero
+                // syncs, with no way to distinguish "no sync happened"
+                // from "a sync happened, through a path this counter
+                // doesn't know about."
+                if (builtin.is_test) _ = self.test_sync_calls.fetchAdd(1, .monotonic);
+                redo.durable_sequence = checkpoint.commit_sequence;
+                // §9.3b: publish right after the append this process just
+                // made durable, never before -- ride-along/deferred appends
+                // elsewhere are unsynced and must never be visible to a
+                // cross-process reader until a `durable=true` commit's own
+                // sync (the one that just returned, above) covers them.
+                // `redo.checkpoint_sequence` is untouched by an ordinary
+                // commit (only `checkpointRedoLog` advances it), so this
+                // publishes the same baseline a cross-process reader already
+                // has whenever nothing has been checkpointed since it last
+                // refreshed.
+                self.publishRedoLogState();
+                self.header.checkpoints[self.header.active_checkpoint] = checkpoint;
+                wal_trace.recordCommit();
+                self.last_synced_header = self.header;
+                if (self.ledger) |state| {
+                    self.retirement_activity_bytes +|= state.released_data_pages *| self.header.page_size;
+                    self.retirement_activity_bytes +|= state.retired_inline_bytes;
+                    state.released_data_pages = 0;
+                    state.retired_inline_bytes = 0;
+                }
+                self.publishCommittedSequenceToInode();
+                return;
             }
-            self.publishCommittedSequenceToInode();
-            return;
+            // §9 (redo log full under a reader pin): even the minimal
+            // tracking entry does not fit, and nothing here can make it
+            // fit -- the log stays exactly this full until the pin
+            // releases. This commit's own content is already real,
+            // physical pages (flushed just above); fall through to the
+            // ordinary, non-redo checkpoint-slot write below instead of
+            // trying to log anyway. That slot write is itself a
+            // complete, self-sufficient durability record for this
+            // commit -- it needs nothing further from the log -- so
+            // writes keep working for exactly as long as a pinned
+            // reader keeps the log from reclaiming space, rather than
+            // surfacing a commit that never took effect as
+            // `error.OutcomeUnknown`.
+            redo_fell_back_to_slot = true;
         }
         const next_slot: u8 = if (self.header.active_checkpoint == 0) 1 else 0;
 
@@ -16055,6 +17061,42 @@ pub const NativeFile = struct {
             self.retirement_activity_bytes +|= state.retired_inline_bytes;
             state.released_data_pages = 0;
             state.retired_inline_bytes = 0;
+        }
+        // §9 (redo log full under a reader pin): this slot write is the
+        // one taken above in place of the ordinary redo-log append,
+        // when even that append's own minimal tracking entry could not
+        // fit. `committedSequence`'s own contract reads
+        // `redo.durable_sequence` exclusively for a redo-log file (its
+        // own doc comment) -- this write just made `checkpoint` durable
+        // exactly as thoroughly as a log append would have, so that
+        // contract must reflect it too. Deliberately not also
+        // `publishRedoLogState`: that call's own `durable_offset` is
+        // the log's physical tail, unmoved here (nothing was appended),
+        // so publishing an advanced `durable_sequence` paired with that
+        // unmoved offset would tell a cross-process reader there is a
+        // log record at a position where none exists -- an invariant
+        // that function's own callers rely on, not merely a staleness
+        // question its own doc comment excuses. Such a reader catches
+        // up the ordinary way instead, through this now-durable
+        // checkpoint slot on its own next reopen or refresh.
+        if (redo_fell_back_to_slot) {
+            self.redo.?.durable_sequence = checkpoint.commit_sequence;
+            // This commit's sequence was consumed without ever being
+            // appended to the log (the slot write above is its only
+            // durability record). `redo.writer.last_sequence` still
+            // reflects the last sequence actually logged, so the *next*
+            // commit that does take the ordinary redo-log-append branch
+            // would otherwise fail `Writer.append`'s own continuity
+            // check (`error.SequenceOutOfOrder`): it would try to append
+            // `last_logged + 1`, which is now stale by however many
+            // commits fell back to this slot-write path in between.
+            // Advance just the sequence counter, not `tail` -- no bytes
+            // were written to the log region by this commit, so the
+            // writer's physical append position must not move. This is
+            // the same gap `checkpointRedoLog`'s own `pinned_below`
+            // branch closes via `Writer.initAt` when it, too, consumes a
+            // sequence without logging it.
+            self.redo.?.writer.last_sequence = checkpoint.commit_sequence;
         }
         self.publishCommittedSequenceToInode();
     }
@@ -22315,7 +23357,7 @@ test "lite native bulk index frontier preserves mixed keys and exact page counts
         // Decoding a cursor's long keys has its own path-sized memory bound;
         // the cap above isolates the builder and its counting mode.
         budget.limit = std.math.maxInt(usize);
-        var cursor = DocumentIndexCursor.init(&file, .{ .page_count = next, .document_index_root_page = root });
+        var cursor = CheckpointedTree.init(&file, .{ .page_count = next, .document_index_root_page = root });
         defer cursor.deinit();
         var entry = try cursor.first();
         var seen: usize = 0;
@@ -23205,7 +24247,7 @@ test "lite document deletes prune the active index and preserve pinned roots" {
         for (batch) |*m| m.* = .{ .key = m.key, .is_delete = true };
         // Exercise partial-leaf rebalancing and removal of whole subtrees.
         try file.putDocumentBatch(batch[0..1000]);
-        var current = DocumentIndexCursor.init(&file, file.activeCheckpoint());
+        var current = CheckpointedTree.init(&file, file.activeCheckpoint());
         defer current.deinit();
         var first = (try current.first()).?;
         defer first.deinit(a);
@@ -23216,7 +24258,7 @@ test "lite document deletes prune the active index and preserve pinned roots" {
         const reads = file.test_page_reads.load(.monotonic);
         try std.testing.expect(!try file.hasLiveDocumentOutsidePrefix(file.activeCheckpoint(), "\x02db/"));
         try std.testing.expectEqual(reads, file.test_page_reads.load(.monotonic));
-        var old = DocumentIndexCursor.init(&file, pinned);
+        var old = CheckpointedTree.init(&file, pinned);
         defer old.deinit();
         var entry = try old.first();
         var count: usize = 0;
@@ -23321,7 +24363,7 @@ test "lite document index coverage accepts legacy tombstones and rejects missing
     var file = try NativeFile.open(a, path, false);
     defer file.close();
     try std.testing.expect((try file.check()).valid);
-    var cursor = DocumentIndexCursor.init(&file, file.activeCheckpoint());
+    var cursor = CheckpointedTree.init(&file, file.activeCheckpoint());
     defer cursor.deinit();
     var indexed = (try cursor.first()).?;
     defer indexed.deinit(a);
@@ -23359,7 +24401,7 @@ test "lite lazy overflow cursor bounds seeks scans and allocation failures" {
     }
     try file.putDocumentBatch(batch);
     const pinned = file.activeCheckpoint();
-    var cursor = DocumentIndexCursor.init(&file, pinned);
+    var cursor = CheckpointedTree.init(&file, pinned);
     defer cursor.deinit();
     const baseline = budget.live;
     budget.limit = baseline;
@@ -24247,7 +25289,7 @@ test "lite index views bound batch and cursor allocations and reuse seek buffers
         }
     }
     const cursor_before = counter.alloc_index;
-    var cursor = DocumentIndexCursor.init(&file, cp);
+    var cursor = CheckpointedTree.init(&file, cp);
     defer cursor.deinit();
     var current = try cursor.first();
     var seen: usize = 0;
@@ -24353,10 +25395,10 @@ test "lite index views preserve packed and unpacked overflow reads through OOM a
             var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
             file.allocator = failing.allocator();
             defer file.allocator = a;
-            var cursor = DocumentIndexCursor.init(&file, pinned);
+            var cursor = CheckpointedTree.init(&file, pinned);
             defer cursor.deinit();
             const Attempt = struct {
-                fn run(c: *DocumentIndexCursor, query: []const u8) !void {
+                fn run(c: *CheckpointedTree, query: []const u8) !void {
                     var first = (try c.first()).?;
                     defer first.deinit(c.file.allocator);
                     var last = (try c.last()).?;
@@ -24669,7 +25711,7 @@ test "lite sorted editor releases ownership on every allocation failure" {
             var checkpoint = f.activeCheckpoint();
             checkpoint.document_index_root_page = index;
             checkpoint.page_count = pages.next_page_id;
-            var cursor = DocumentIndexCursor.init(f, checkpoint);
+            var cursor = CheckpointedTree.init(f, checkpoint);
             defer cursor.deinit();
             var current = try cursor.first();
             var ordinal: usize = 0;
@@ -28065,6 +29107,155 @@ test "lite redo log commit stages pages without a physical pwrite and recovers a
     try std.testing.expectEqualStrings("two", beta);
 }
 
+// The regression this guards against: `readBackingPages`'s redo-overlay
+// lookup only ever checked a single, exact `page_size`-wide read, so a
+// multi-page read-ahead window (`RecordReadWindow`, which `readBatchRecord`
+// requests via `recordRunAhead` for a sorted batch of keys whose document
+// index pages happen to be physically adjacent -- here, one batch, one
+// commit) skipped the overlay check entirely for every page past the
+// first and fell straight through to a raw physical read. Under a redo
+// log, those pages were diverted into the log instead of pwritten at
+// all, so that raw read ran past the physical end of file --
+// `error.EndOfStream` -- exactly the failure
+// `getDocumentsAtCheckpointWithState`'s own batch-read path hit in
+// "lite scoped native batch state reuses all working allocations",
+// "lite pooled graph reads reuse scratch across fresh queries and
+// isolate scopes", and "lite prepared review multiple columns retain
+// combined decoded reuse" under the redo-log default, immediately after
+// their own first `putDocumentBatch`/batch-read pair -- reproduced here
+// directly against the lower-level reader/window pair those tests only
+// exercise indirectly through `Store`.
+test "lite redo log multi-page read-ahead window checks the overlay for every page, not just the first" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-window-overlay.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer file.close();
+
+    var payload: [2000]u8 = undefined;
+    @memset(&payload, 'v');
+    var keys: [64][8]u8 = undefined;
+    var docs: [64]DocumentMutation = undefined;
+    for (&docs, &keys, 0..) |*doc, *key, i| {
+        const text = try std.fmt.bufPrint(key, "{d:0>8}", .{i});
+        doc.* = .{ .key = text, .value = &payload };
+    }
+    // One commit, diverted entirely into the redo log -- the whole point
+    // of `createWithRedoLog`; none of these document pages was ever
+    // pwritten to their physical location in the file. Same key count
+    // and payload size as "lite cold record windows coalesce only
+    // proven runs and authenticate every page" (the non-redo sibling
+    // this test mirrors), which already proves this shape lays out a
+    // physically adjacent run of document pages.
+    try file.putDocumentBatch(&docs);
+    const checkpoint = file.activeCheckpoint();
+
+    var refs: [64]u64 = undefined;
+    for (&refs, docs) |*ref, doc| ref.* = (try file.lookupDocumentIndexPage(checkpoint, doc.key)).?;
+
+    // One batch, inserted in key order: the whole run of document index
+    // pages is physically adjacent, so the very first lookup below asks
+    // for more than one page in a single window, not sixteen separate
+    // one-page lookups.
+    const ahead = recordRunAhead(&refs, null, 0);
+    try std.testing.expect(ahead > 1);
+
+    var reader = RecordPageReader{};
+    defer reader.deinit(a);
+    var window = RecordReadWindow{};
+    defer window.deinit(a);
+    for (refs, 0..) |ref, i| {
+        const entry = try decodeDocumentEntry(try reader.readWithWindow(true, &window, &file, a, checkpoint, ref, .document, if (i == 0) ahead else 1));
+        try std.testing.expectEqualStrings(docs[i].key, entry.key);
+        try std.testing.expectEqualSlices(u8, &payload, entry.value);
+    }
+
+    // Fold: every page above is now physical, and -- no pin held --
+    // `maybeClearPages` drops the overlay's own page cache to empty.
+    try file.checkpointRedoLog();
+    try std.testing.expect(file.redo.?.shared.pagesEmpty(std.testing.io));
+
+    // Re-stage three of the now-physical pages -- first, middle, and
+    // last of those touched by this run -- with a verbatim copy of
+    // their own physical bytes: a page genuinely back in the overlay
+    // (simulating a second diverting commit against the same page
+    // ids), without fabricating new content that would need its own,
+    // separately computed checksum. Several of the 64 documents above
+    // share a physical page (2000-byte payloads, several per page), so
+    // `physicalPage(refs[32])` is not necessarily `physicalPage(refs[0])
+    // + 32` -- only that this run touches a contiguous span of pages
+    // from `first_page` to `last_page` inclusive.
+    const first_page = physicalPage(refs[0]);
+    const last_page = physicalPage(refs[63]);
+    const span_pages: usize = @intCast(last_page - first_page + 1);
+    try std.testing.expect(span_pages >= 5);
+    const mid_page = first_page + span_pages / 2;
+    try std.testing.expect(mid_page > first_page and mid_page < last_page);
+    for ([_]u64{ first_page, mid_page, last_page }) |page_id| {
+        const buf = try a.alloc(u8, file.header.page_size);
+        defer a.free(buf);
+        try file.readBackingPagesUncached(buf, page_id * file.header.page_size);
+        const owned = try std.heap.page_allocator.dupe(u8, buf);
+        try file.redo.?.shared.appendPage(std.heap.page_allocator, std.testing.io, page_id, owned);
+    }
+    try std.testing.expect(!file.redo.?.shared.pagesEmpty(std.testing.io));
+
+    // Exercise `readBackingPages` itself directly, with one call
+    // spanning the whole run -- bypassing `RecordPageReader`/
+    // `RecordReadWindow`'s own bounded read-ahead (capped well below
+    // this span's page count, and sensitive to this process's page
+    // cache) so the read-count assertion below measures exactly the
+    // coalescing logic this fix adds, not an unrelated higher-level
+    // caching decision.
+    const span_bytes = try a.alloc(u8, span_pages * file.header.page_size);
+    defer a.free(span_bytes);
+    const before_calls = file.test_backing_read_calls.load(.monotonic);
+    try file.readBackingPages(span_bytes, first_page * file.header.page_size);
+    const reads = file.test_backing_read_calls.load(.monotonic) - before_calls;
+    // Two maximal non-overlay runs (before and after the staged middle
+    // page), each coalesced into one physical read; the three staged
+    // pages never reach a physical read at all -- not `span_pages`
+    // single-page reads (the earlier, correctness-only fix this
+    // replaces) and not one bulk read spanning everything (which would
+    // silently skip the overlay for the staged pages).
+    try std.testing.expectEqual(@as(u64, 2), reads);
+
+    // Each of the three re-staged pages' own bytes within `span_bytes`
+    // must match what was independently staged (and, by construction,
+    // what was already physically there) -- confirms the coalescing
+    // loop placed every page at its correct relative offset in the
+    // output buffer, not just the right total read count.
+    for ([_]u64{ first_page, mid_page, last_page }) |page_id| {
+        const rel: usize = @intCast((page_id - first_page) * file.header.page_size);
+        const page_bytes = try file.redo.?.shared.readPageAlloc(a, std.testing.io, page_id);
+        defer if (page_bytes) |bytes| a.free(bytes);
+        try std.testing.expect(page_bytes != null);
+        try std.testing.expectEqualSlices(u8, page_bytes.?, span_bytes[rel..][0..file.header.page_size]);
+    }
+
+    // Broader correctness check: every one of the 64 documents still
+    // decodes correctly through the ordinary `RecordPageReader` path
+    // (cache cleared so this pass, like the direct call above, actually
+    // reaches the overlay/physical split rather than a stale cache
+    // entry), confirming the re-staged overlay pages did not corrupt
+    // anything this run's own earlier, already-passing assertions
+    // covered.
+    file.page_cache.clear(a);
+    file.page_cache_enabled.store(false, .monotonic);
+    reader.deinit(a);
+    reader = RecordPageReader{};
+    window.deinit(a);
+    window = RecordReadWindow{};
+    for (refs, 0..) |ref, i| {
+        const entry = try decodeDocumentEntry(try reader.readWithWindow(true, &window, &file, a, checkpoint, ref, .document, if (i == 0) ahead else 1));
+        try std.testing.expectEqualStrings(docs[i].key, entry.key);
+        try std.testing.expectEqualSlices(u8, &payload, entry.value);
+    }
+}
+
 test "lite redo log ride-along commit is lost on a crash before its sync; the durable commit survives" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -28953,6 +30144,296 @@ test "lite redo log catalog cursor merges the overlay across put, overwrite, del
     try assertScan(&file, a, &.{ "k/alpha", "k/beta", "k/delta" }, &.{ "one", "two-updated", "four" });
 }
 
+test "lite ReadView: get, batch get, and a catalog range scan across put, overwrite, delete, a checkpoint, and a reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "readview-basic.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+
+    // alpha/beta/gamma documents and k/alpha..k/gamma catalog records
+    // land only in the redo-log overlay -- no checkpoint yet.
+    try file.beginTransaction();
+    try file.putDocument("alpha", "one");
+    try file.putCatalogRecord("k/alpha", "one");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("beta", "two");
+    try file.putCatalogRecord("k/beta", "two");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("gamma", "three");
+    try file.putCatalogRecord("k/gamma", "three");
+    try file.commitTransaction();
+
+    const checkScan = struct {
+        fn run(view: *const ReadView, alloc: Allocator, expected_keys: []const []const u8, expected_values: []const []const u8) !void {
+            var cursor = try view.openMetadataCursor("k/");
+            defer cursor.deinit();
+            var i: usize = 0;
+            while (try cursor.nextRecordAlloc(alloc)) |record| {
+                defer {
+                    alloc.free(record.key);
+                    alloc.free(record.value);
+                }
+                try std.testing.expect(i < expected_keys.len);
+                try std.testing.expectEqualStrings(expected_keys[i], record.key);
+                try std.testing.expectEqualStrings(expected_values[i], record.value);
+                i += 1;
+            }
+            try std.testing.expectEqual(expected_keys.len, i);
+        }
+    }.run;
+
+    {
+        var view = try ReadView.open(&file, std.testing.io);
+        defer view.release(std.testing.io);
+
+        const alpha = (try view.getDocumentAlloc(a, "alpha")).?;
+        defer a.free(alpha);
+        try std.testing.expectEqualStrings("one", alpha);
+
+        var values: [3]?[]const u8 = .{ null, null, null };
+        try view.getDocumentsAlloc(a, &.{ "alpha", "beta", "gamma" }, &values);
+        defer for (values) |v| if (v) |owned| a.free(owned);
+        try std.testing.expectEqualStrings("one", values[0].?);
+        try std.testing.expectEqualStrings("two", values[1].?);
+        try std.testing.expectEqualStrings("three", values[2].?);
+
+        try checkScan(&view, a, &.{ "k/alpha", "k/beta", "k/gamma" }, &.{ "one", "two", "three" });
+    }
+
+    // Checkpoint: everything above moves into the real tree. A fresh
+    // ReadView must see exactly the same results, now page-sourced
+    // instead of overlay-sourced.
+    try file.checkpointRedoLog();
+    {
+        var view = try ReadView.open(&file, std.testing.io);
+        defer view.release(std.testing.io);
+        try checkScan(&view, a, &.{ "k/alpha", "k/beta", "k/gamma" }, &.{ "one", "two", "three" });
+    }
+
+    // Overwrite beta and delete gamma (both now overlay-only mutations
+    // shadowing tree-resident keys); insert delta (overlay-only, brand
+    // new). Exercises the same put/overwrite/delete/checkpoint-boundary
+    // shape as the plain scan tests above, but through ReadView's own
+    // get/batch-get/cursor methods instead of calling NativeFile
+    // directly.
+    try file.beginTransaction();
+    try file.putDocument("beta", "two-updated");
+    try file.putCatalogRecord("k/beta", "two-updated");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.deleteDocument("gamma");
+    try file.deleteCatalogRecord("k/gamma");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("delta", "four");
+    try file.putCatalogRecord("k/delta", "four");
+    try file.commitTransaction();
+
+    {
+        var view = try ReadView.open(&file, std.testing.io);
+        defer view.release(std.testing.io);
+
+        var values: [4]?[]const u8 = .{ null, null, null, null };
+        try view.getDocumentsAlloc(a, &.{ "alpha", "beta", "delta", "gamma" }, &values);
+        defer for (values) |v| if (v) |owned| a.free(owned);
+        try std.testing.expectEqualStrings("one", values[0].?);
+        try std.testing.expectEqualStrings("two-updated", values[1].?);
+        try std.testing.expectEqualStrings("four", values[2].?);
+        try std.testing.expectEqual(@as(?[]const u8, null), values[3]);
+
+        try checkScan(&view, a, &.{ "k/alpha", "k/beta", "k/delta" }, &.{ "one", "two-updated", "four" });
+    }
+
+    file.close();
+
+    // Reopen: recovery must replay the uncheckpointed log into the
+    // shared overlay before any ReadView can pin it (§9.5/§9.7c), so a
+    // fresh ReadView.open on the reopened handle sees exactly the same
+    // post-overwrite/delete/insert state a crash-free process would,
+    // with no explicit replay call from this test.
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    {
+        var view = try ReadView.open(&reopened, std.testing.io);
+        defer view.release(std.testing.io);
+
+        var values: [4]?[]const u8 = .{ null, null, null, null };
+        try view.getDocumentsAlloc(a, &.{ "alpha", "beta", "delta", "gamma" }, &values);
+        defer for (values) |v| if (v) |owned| a.free(owned);
+        try std.testing.expectEqualStrings("one", values[0].?);
+        try std.testing.expectEqualStrings("two-updated", values[1].?);
+        try std.testing.expectEqualStrings("four", values[2].?);
+        try std.testing.expectEqual(@as(?[]const u8, null), values[3]);
+
+        try checkScan(&view, a, &.{ "k/alpha", "k/beta", "k/delta" }, &.{ "one", "two-updated", "four" });
+    }
+}
+
+test "lite redo log score-batch read sees a graph-metric score document logged before any checkpoint" {
+    // §9.7c (ReadView): visitScoresAtCheckpointWithState (and its
+    // siblings -- readDecodedScoresAtCheckpointWithState,
+    // visitCompleteScoresAtCheckpointWithState, the prepared/canonical
+    // variants) used to call readBatchAtCheckpoint with no overlay
+    // knowledge at all: a graph-metric score document logged but not
+    // yet folded by checkpointRedoLog was invisible to a score-batch
+    // read even though a plain get() on the same key found it
+    // immediately. Confirms the fix directly, through the real public
+    // entry point a graph query uses.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-score-batch.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer file.close();
+
+    const scoreBytes = struct {
+        fn run(value: f64) [8]u8 {
+            var out: [8]u8 = undefined;
+            std.mem.writeInt(u64, &out, @bitCast(value), .little);
+            return out;
+        }
+    }.run;
+    const alpha_v1 = scoreBytes(3);
+    const beta_v1 = scoreBytes(5);
+    const gamma_v1 = scoreBytes(7);
+
+    // alpha/beta/gamma land through the redo overlay -- no checkpoint yet.
+    try file.beginTransaction();
+    try file.putDocument("alpha", &alpha_v1);
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("beta", &beta_v1);
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("gamma", &gamma_v1);
+    try file.commitTransaction();
+
+    var state: DocumentBatchReadState = .{};
+    defer state.deinit();
+    var scores: [3]?f64 = undefined;
+    try file.getScoresAtCheckpointWithState(a, file.activeCheckpoint(), &.{ "alpha", "beta", "gamma" }, &scores, &state);
+    try std.testing.expectEqualSlices(?f64, &.{ 3, 5, 7 }, &scores);
+
+    // Checkpoint: the scores move into the real tree. A score-batch
+    // read must see exactly the same results, now page-sourced instead
+    // of overlay-sourced.
+    try file.checkpointRedoLog();
+    try file.getScoresAtCheckpointWithState(a, file.activeCheckpoint(), &.{ "alpha", "beta", "gamma" }, &scores, &state);
+    try std.testing.expectEqualSlices(?f64, &.{ 3, 5, 7 }, &scores);
+
+    // Overwrite beta and delete gamma (both now overlay-only mutations
+    // shadowing tree-resident keys); insert delta (overlay-only, brand
+    // new, sorts between beta and gamma).
+    const beta_v2 = scoreBytes(11);
+    try file.beginTransaction();
+    try file.putDocument("beta", &beta_v2);
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.deleteDocument("gamma");
+    try file.commitTransaction();
+    const delta_v1 = scoreBytes(13);
+    try file.beginTransaction();
+    try file.putDocument("delta", &delta_v1);
+    try file.commitTransaction();
+
+    var scores4: [4]?f64 = undefined;
+    try file.getScoresAtCheckpointWithState(a, file.activeCheckpoint(), &.{ "alpha", "beta", "delta", "gamma" }, &scores4, &state);
+    try std.testing.expectEqualSlices(?f64, &.{ 3, 11, 13, null }, &scores4);
+
+    // The complete-sink variant (used by prepared/canonical score
+    // reads) must agree.
+    var decoded: [4]f64 = undefined;
+    try file.readDecodedScoresAtCheckpointWithState(a, file.activeCheckpoint(), &.{ "alpha", "beta", "delta", "gamma" }, &decoded, &state);
+    try std.testing.expectEqual(@as(f64, 3), decoded[0]);
+    try std.testing.expectEqual(@as(f64, 11), decoded[1]);
+    try std.testing.expectEqual(@as(f64, 13), decoded[2]);
+    try std.testing.expect(std.math.isNan(decoded[3]));
+}
+
+test "lite redo log catalog cursor pinned to an older mark skips a key created only after it, instead of erroring" {
+    // §9.7c (ReadView): OverlayScanState's gate-free enumeration (per
+    // the earlier fix in this branch) means a cursor pinned to an
+    // older, already-superseded checkpoint can enumerate a key whose
+    // entire version chain postdates that pin -- a brand-new key
+    // created only after the pin's own snapshot was taken.
+    // `redoOverlayEntry` correctly resolves nothing for it ("nothing
+    // at or before this checkpoint"); `CatalogCursor.next` used to
+    // treat that as corruption (`error.InvalidNativeRedoRecord`)
+    // rather than "absent for this view". Exercises the fix directly
+    // through `ReadView.openAt`/`openMetadataCursor`, the same seam a
+    // genuinely pinned reader (an older `ReadGeneration`, or a vacuum
+    // snapshot opened before a concurrent write lands) would use.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-catalog-pinned-mark.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer file.close();
+
+    try file.beginTransaction();
+    try file.putCatalogRecord("k/alpha", "one");
+    try file.commitTransaction();
+
+    // Pin a view right here, before the next write -- its own mark is
+    // fixed at the sequence "k/alpha" alone committed at.
+    var old_view = try ReadView.openAt(&file, std.testing.io, file.activeCheckpoint());
+    defer old_view.release(std.testing.io);
+
+    // A brand-new key under the same prefix, created only after
+    // old_view's own pin -- old_view must never see it.
+    try file.beginTransaction();
+    try file.putCatalogRecord("k/beta", "two");
+    try file.commitTransaction();
+
+    {
+        var cursor = try old_view.openMetadataCursor("k/");
+        defer cursor.deinit();
+        var i: usize = 0;
+        while (try cursor.nextRecordAlloc(a)) |record| {
+            defer {
+                a.free(record.key);
+                a.free(record.value);
+            }
+            try std.testing.expectEqual(@as(usize, 0), i);
+            try std.testing.expectEqualStrings("k/alpha", record.key);
+            try std.testing.expectEqualStrings("one", record.value);
+            i += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), i);
+    }
+
+    // A fresh, current-generation view sees both.
+    {
+        var view = try ReadView.open(&file, std.testing.io);
+        defer view.release(std.testing.io);
+        var cursor = try view.openMetadataCursor("k/");
+        defer cursor.deinit();
+        var i: usize = 0;
+        const expected_keys = [_][]const u8{ "k/alpha", "k/beta" };
+        const expected_values = [_][]const u8{ "one", "two" };
+        while (try cursor.nextRecordAlloc(a)) |record| {
+            defer {
+                a.free(record.key);
+                a.free(record.value);
+            }
+            try std.testing.expect(i < expected_keys.len);
+            try std.testing.expectEqualStrings(expected_keys[i], record.key);
+            try std.testing.expectEqualStrings(expected_values[i], record.value);
+            i += 1;
+        }
+        try std.testing.expectEqual(expected_keys.len, i);
+    }
+}
+
 test "lite redo log vacuum captures uncheckpointed overlay and demotes the file rather than corrupting it" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -29124,6 +30605,93 @@ test "lite redo log versioned overlay lets a pinned older checkpoint see its own
     const v2_after_checkpoint = (try file.getDocumentAlloc(a, "k")).?;
     defer a.free(v2_after_checkpoint);
     try std.testing.expectEqualStrings("v2", v2_after_checkpoint);
+}
+
+// The retention half of the ReadView model this design is working
+// toward (docs/design/lite-performance/lite-single-commit-write-path.md
+// §9.3a/§9.6a): a reader pinned at a checkpoint must still read exactly
+// what existed as of its own pin, even after a *later* commit supersedes
+// it, a checkpoint folds the overlay, and a maintenance reclaim pass
+// runs -- the same guarantee `SharedRedoOverlay.maybeClearPages`'s own
+// doc comment already states ("the conservative, always-safe choice is
+// to keep every staged page as long as *any* pin is live") and
+// `Store.pinInitializedReadGeneration` already wires up (the overlay pin
+// plus the general reader-pin registry, both registered here directly
+// against `NativeFile`/`inode_lock.Entry` without the full `Store`
+// wrapper). Exercises both halves of that existing machinery together
+// with the multi-page read-ahead fix above, against a value large
+// enough to span several pages of external value chain -- precisely the
+// "page reference, not an inline value, that a later checkpoint
+// reclaimed or moved" shape the three originally-reported EndOfStream
+// failures' own root-cause investigation considered and ruled out as
+// the cause *for those three tests specifically* (no fold or reclaim
+// ever ran in them), but that this design's longer-term correctness
+// still depends on holding regardless.
+test "lite redo log a pin survives checkpoint and reclaim: a superseded multi-page external value stays readable" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-pin-survives-reclaim.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 256 * 1024);
+    defer file.close();
+
+    // Several pages of external value chain, written raw by the
+    // diverting commit -- never through the ordinary copy-on-write
+    // ledger (`RedoCommitState`'s own doc comment) -- and, crucially,
+    // never checkpointed before the pin below is taken.
+    const large = try a.alloc(u8, 20 * 1024);
+    defer a.free(large);
+    @memset(large, 'A');
+
+    try file.beginTransaction();
+    try file.putDocument("doc", large);
+    try file.commitTransaction();
+    const checkpoint_at_large = file.activeCheckpoint();
+
+    // Pin a reader at this checkpoint: the same two registrations
+    // `Store.pinInitializedReadGeneration` makes for a real
+    // `ReadGeneration` -- the overlay pin (protects the diverted
+    // chain's own raw pages, `SharedRedoOverlay.pages`) and the general
+    // reader-pin registry (protects the allocator's own page-reuse
+    // frontier, `reuseFrontier`) -- made directly here since this test
+    // has no `Store` to make them through.
+    const entry = file.inode_lock_ref.load(.acquire).?;
+    if (file.redo) |*redo| try redo.shared.pin(std.heap.page_allocator, std.testing.io, checkpoint_at_large.commit_sequence);
+    try inode_lock.pinReader(entry, std.testing.io, .{ .data = checkpoint_at_large.commit_sequence, .metadata = checkpoint_at_large.commit_sequence });
+    defer {
+        inode_lock.unpinReader(entry, std.testing.io, .{ .data = checkpoint_at_large.commit_sequence, .metadata = checkpoint_at_large.commit_sequence });
+        if (file.redo) |*redo| redo.shared.unpin(std.testing.io, checkpoint_at_large.commit_sequence);
+    }
+
+    // Supersede the same key with a small value, then fold: the pinned
+    // checkpoint's own large value is now logically dead from the
+    // *current* generation's point of view -- exactly the shape a later
+    // checkpoint's reclaim must not free out from under the pin.
+    try file.beginTransaction();
+    try file.putDocument("doc", "small");
+    try file.commitTransaction();
+    try file.checkpointRedoLog();
+
+    // The fold's own overlay cleanup must have respected the live pin
+    // (a no-op whenever any pin exists), and a maintenance reclaim pass
+    // must not have freed or reused the superseded chain's pages either.
+    if (file.redo) |*redo| redo.shared.maybeClearPages(std.heap.page_allocator, std.testing.io);
+    _ = try file.reclaimPagesForMaintenanceWithCancel(1024, null, true);
+
+    // The live, current checkpoint sees the overwrite.
+    const current = (try file.getDocumentAlloc(a, "doc")).?;
+    defer a.free(current);
+    try std.testing.expectEqualStrings("small", current);
+
+    // The pinned, older checkpoint still reads back the full original
+    // value, byte for byte -- not `EndOfStream` (pages reclaimed or
+    // never folded), not a wrong/truncated value (pages reused for
+    // something else).
+    const pinned_value = (try file.getDocumentAtCheckpointAlloc(a, checkpoint_at_large, "doc")).?;
+    defer a.free(pinned_value);
+    try std.testing.expectEqualSlices(u8, large, pinned_value);
 }
 
 // §9 (redo + indexed reclamation): `checkpointRedoLog`'s real build folds

@@ -2550,7 +2550,12 @@ pub const Store = struct {
             self.file.activeCheckpoint().page_count *| self.file.header.page_size >= self.maintenance_policy.options.minimum_reclaim_bytes;
         if (!cheap_already_due) {
             const retirement_check_started = if (@import("builtin").is_test) std.Io.Clock.awake.now(self.file.runtime()).nanoseconds else 0;
-            const retirement = self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false;
+            // §9 (redo retirement signal): ledger-only here on purpose --
+            // see `retirementNeedsServiceLedgerOnlyWithCancel`'s own doc
+            // comment. Starting the background `maintenanceLoop` is the
+            // one caller of this check that isn't a direct, synchronous
+            // call the caller already controls the timing of.
+            const retirement = self.file.retirementNeedsServiceLedgerOnlyWithCancel(&self.maintenance_cancel) catch false;
             if (@import("builtin").is_test) {
                 const elapsed: u64 = @intCast(@max(0, std.Io.Clock.awake.now(self.file.runtime()).nanoseconds - retirement_check_started));
                 _ = self.test_retirement_check_count.fetchAdd(1, .release);
@@ -5090,7 +5095,8 @@ pub const Txn = struct {
             const value = self.pending.items[pendingNode(node).ordinal].value orelse return error.NotFound;
             return allocator.dupe(u8, value);
         }
-        return (try (try self.readFile()).getDocumentAtCheckpointAlloc(allocator, self.checkpoint, lookup_key)) orelse error.NotFound;
+        const view = try self.readView();
+        return (try view.getDocumentAlloc(allocator, lookup_key)) orelse error.NotFound;
     }
 
     pub fn getInto(self: *Txn, key: []const u8, out: []u8) ![]const u8 {
@@ -5494,7 +5500,8 @@ pub const Txn = struct {
             const temporary = (try self.batchScratch()).allocator();
             const alloc = if (buffers == null) self.resultAllocator() else self.scratch.allocator();
             if (unique_count == keys.len and self.parent.prefix.len == 0 and self.parent.pending_count == 0) {
-                return (try self.parent.readFile()).getDocumentsAtCheckpointWithState(alloc, temporary, self.parent.checkpoint, keys, buffers, values, try self.nativeState());
+                const view = try self.parent.readView();
+                return view.getDocumentsWithState(alloc, temporary, keys, buffers, values, try self.nativeState());
             }
             const pending_keys = try temporary.alloc([]const u8, unique_count);
             const positions = try temporary.alloc(usize, unique_count);
@@ -5525,7 +5532,8 @@ pub const Txn = struct {
                 i = end;
             }
             if (count == 0) return;
-            try (try self.parent.readFile()).getDocumentsAtCheckpointWithState(alloc, temporary, self.parent.checkpoint, pending_keys[0..count], if (pending_buffers) |out| out[0..count] else null, loaded[0..count], try self.nativeState());
+            const view = try self.parent.readView();
+            try view.getDocumentsWithState(alloc, temporary, pending_keys[0..count], if (pending_buffers) |out| out[0..count] else null, loaded[0..count], try self.nativeState());
             for (loaded[0..count], positions[0..count]) |value, position| {
                 var end = position + 1;
                 while (end < keys.len and std.mem.eql(u8, keys[position], keys[end])) : (end += 1) {}
@@ -5599,14 +5607,16 @@ pub const Txn = struct {
         if (!self.read_only or self.pending_count != 0) return error.InvalidArgument;
         const lookup_key = try self.prefixedKey(key);
         defer if (self.prefix.len > 0) self.allocator.free(lookup_key);
-        return (try self.readFile()).documentReferenceAtCheckpoint(self.checkpoint, lookup_key);
+        const view = try self.readView();
+        return view.documentReference(lookup_key);
     }
 
     pub fn valueFingerprint(self: *Txn, key: []const u8) !?[32]u8 {
         if (!self.read_only or self.pending_count != 0) return error.InvalidArgument;
         const lookup_key = try self.prefixedKey(key);
         defer if (self.prefix.len > 0) self.allocator.free(lookup_key);
-        return (try self.readFile()).documentFingerprintAtCheckpoint(self.checkpoint, lookup_key);
+        const view = try self.readView();
+        return view.documentFingerprint(lookup_key);
     }
 
     pub fn get(self: *Txn, key: []const u8) ![]const u8 {
@@ -5623,7 +5633,8 @@ pub const Txn = struct {
             const owned_key = try self.allocator.dupe(u8, lookup_key);
             errdefer self.allocator.free(owned_key);
             try self.snapshot_reads.ensureUnusedCapacity(self.allocator, 1);
-            const loaded = try (try self.readFile()).getDocumentAtCheckpointAlloc(self.allocator, self.checkpoint, lookup_key);
+            const view = try self.readView();
+            const loaded = try view.getDocumentAlloc(self.allocator, lookup_key);
             self.snapshot_reads.putAssumeCapacity(owned_key, loaded);
             break :blk loaded;
         };
@@ -5672,7 +5683,8 @@ pub const Txn = struct {
         try self.snapshot_reads.ensureUnusedCapacity(alloc, std.math.cast(u32, misses.items.len) orelse return error.RecordTooLarge);
         const loaded = try alloc.alloc(?[]const u8, misses.items.len);
         defer alloc.free(loaded);
-        try (try self.readFile()).getDocumentsAtCheckpointAlloc(alloc, self.checkpoint, misses.items, loaded);
+        const view = try self.readView();
+        try view.getDocumentsAlloc(alloc, misses.items, loaded);
         for (misses.items, loaded, positions.items) |*key, value, position| {
             self.snapshot_reads.putAssumeCapacity(key.*, value);
             key.* = "";
@@ -5846,10 +5858,10 @@ pub const Txn = struct {
     }
 
     pub fn openCursor(self: *Txn) !Cursor {
-        return .{
-            .txn = self,
-            .index_cursor = native.DocumentIndexCursor.init(try self.readFile(), self.checkpoint),
-        };
+        // §9.7c (ReadView): `Cursor.merged` opens lazily, on first move
+        // (mirrors the old `redo_overlay` field's own laziness; see
+        // `Cursor.ensureMerged`'s doc comment) -- nothing more to do here.
+        return .{ .txn = self };
     }
 
     pub fn openKeyCursor(self: *Txn) !KeyCursor {
@@ -5887,23 +5899,28 @@ pub const Txn = struct {
     }
 
     pub fn openIndexValue(self: *Txn, allocator: Allocator, key: []const u8) !native.NativeFile.IndexValue {
-        return (try self.readFile()).openIndexValue(allocator, key, self.checkpoint);
+        const view = try self.readView();
+        return view.openIndexValue(allocator, key);
     }
 
     pub fn readIndexValueInto(self: *Txn, value: native.NativeFile.IndexValue, offset: u64, out: []u8) !void {
-        return (try self.readFile()).readIndexValueInto(value, offset, out, self.checkpoint);
+        const view = try self.readView();
+        return view.readIndexValueInto(value, offset, out);
     }
 
     pub fn checksumIndexValue(self: *Txn, value: native.NativeFile.IndexValue, offset: u64, length: u64) !u32 {
-        return (try self.readFile()).checksumIndexValue(value, offset, length, self.checkpoint);
+        const view = try self.readView();
+        return view.checksumIndexValue(value, offset, length);
     }
 
     pub fn readAuthenticatedIndexValue(self: *Txn, value: native.NativeFile.IndexValue, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
-        return (try self.readFile()).readAuthenticatedIndexValue(value, offset, length, within, out, expected, self.checkpoint);
+        const view = try self.readView();
+        return view.readAuthenticatedIndexValue(value, offset, length, within, out, expected);
     }
 
     pub fn copyIndexValueTo(self: *Txn, value: native.NativeFile.IndexValue, destination: std.Io.File) !void {
-        return (try self.readFile()).copyIndexValueTo(value, destination, self.checkpoint);
+        const view = try self.readView();
+        return view.copyIndexValueTo(value, destination);
     }
 
     /// The pinned descriptor is authoritative even after inode adoption.
@@ -5911,6 +5928,19 @@ pub const Txn = struct {
         if (self.read_generation) |generation| return &generation.file;
         const store = self.store orelse return error.InvalidTransactionState;
         return &store.file;
+    }
+
+    /// §9.7c: this transaction's one read primitive, borrowed from its
+    /// own already-held pin (`self.read_pin`/`self.read_generation`,
+    /// held for the whole transaction) -- `release` on the result is
+    /// therefore a no-op; this `Txn`'s own pin lifecycle
+    /// (`pinInitializedReadGeneration`/`releaseReadGeneration`) remains
+    /// authoritative. Every point get, batch get, and index-value read
+    /// below goes through this instead of calling `NativeFile`
+    /// directly, so there is exactly one place that resolves `self.
+    /// checkpoint` against the redo-log overlay.
+    pub fn readView(self: *Txn) !native.ReadView {
+        return native.ReadView.borrowed(try self.readFile(), self.checkpoint);
     }
 
     fn releaseGenerationReadLock(self: *Txn) void {
@@ -5984,31 +6014,42 @@ pub const KeyCursor = struct {
 pub const Cursor = struct {
     const Direction = enum { forward, backward };
 
+    fn mergedDirection(direction: Direction) native.MergedCursor.Direction {
+        return switch (direction) {
+            .forward => .forward,
+            .backward => .backward,
+        };
+    }
+
     txn: *Txn,
-    index_cursor: native.DocumentIndexCursor,
     records: native.RecordPageReader = .{},
     load_values: bool = true,
     current_key: ?[]u8 = null,
     upper_bound: ?[]const u8 = null,
     owned_value: ?[]u8 = null,
-    disk_candidate: ?native.DocumentIndexEntry = null,
     last_direction: ?Direction = null,
-    /// A sorted snapshot of the redo-log overlay's own uncheckpointed
-    /// mutations, scoped to `self.txn.prefix`, lazily materialized on
-    /// this cursor's first move and cached for its whole lifetime (the
-    /// txn's checkpoint -- and so the overlay content a *current*-
-    /// generation snapshot like this one sees -- never changes mid-
-    /// cursor). Layered as `pending_tree` over this over the real
-    /// B-tree (`resolveMerged`'s own doc comment): every `docstore.Cursor`
-    /// consumer (`Txn.openCursor`/`openKeyCursor`, and so every SQL range
-    /// read, posting-list walk, replay-journal/derived-index catch-up
-    /// scan, reclamation and pooling scan that goes through it) used to
-    /// see only the real, checkpointed pages here -- exactly the gap
-    /// behind "crash sweep: full text synchronous visibility"'s redo-
-    /// mode-only `CrashConsistencyFullTextNotRebuilt` failures, found to
-    /// be a whole bug *class* (every range/prefix iterator over
-    /// `NativeFile`, not one call site) rather than a single occurrence.
-    redo_overlay: ?native.NativeFile.OverlayScanState = null,
+    /// §9.7c (ReadView): the checkpointed-tree-and-redo-overlay merge,
+    /// lazily opened on this cursor's first move and cached for its
+    /// whole lifetime (the txn's checkpoint -- and so the overlay
+    /// content a *current*-generation snapshot like this one sees --
+    /// never changes mid-cursor). `resolveMerged`'s own doc comment:
+    /// `pending_tree` (this transaction's own in-flight writes) layers
+    /// on top of whatever this returns. Every `docstore.Cursor` consumer
+    /// (`Txn.openCursor`/`openKeyCursor`, and so every SQL range read,
+    /// posting-list walk, replay-journal/derived-index catch-up scan,
+    /// reclamation and pooling scan that goes through it) used to see
+    /// only the real, checkpointed pages here before this existed --
+    /// exactly the gap behind "crash sweep: full text synchronous
+    /// visibility"'s redo-mode-only `CrashConsistencyFullTextNotRebuilt`
+    /// failures, found to be a whole bug *class* (every range/prefix
+    /// iterator over `NativeFile`, not one call site) rather than a
+    /// single occurrence.
+    merged: ?native.MergedCursor = null,
+    /// The merged cursor's own already-fetched candidate, held here
+    /// whenever `pending_tree` won a comparison without a tie: `merged`'s
+    /// own position has already advanced past it, so losing track of it
+    /// here would silently skip it forever, not just defer it.
+    merged_candidate: ?native.MergedCursor.Entry = null,
     // WS5: a third mode alongside full/keys-only. Set by `setLengthOnly`.
     // `readValue` then asks the native layer for the document's real
     // logical size (one bounded page read; never the external value's own
@@ -6037,176 +6078,127 @@ pub const Cursor = struct {
 
     pub fn close(self: *Cursor) void {
         self.records.deinit(self.txn.allocator);
-        self.index_cursor.deinit();
-        if (self.disk_candidate) |*candidate| candidate.deinit(self.txn.allocator);
+        if (self.merged_candidate) |*candidate| candidate.deinit(self.txn.allocator);
         if (self.current_key) |key| self.txn.allocator.free(key);
         if (self.owned_value) |value| self.txn.allocator.free(value);
-        if (self.redo_overlay) |*overlay| overlay.deinit();
+        if (self.merged) |*merged| merged.deinit();
         self.current_key = null;
         self.owned_value = null;
-        self.disk_candidate = null;
-        self.redo_overlay = null;
+        self.merged_candidate = null;
+        self.merged = null;
     }
 
-    /// Lazily materializes and caches `redo_overlay` -- see that field's
-    /// own doc comment for why this is safe to do once and reuse for
-    /// every move this cursor makes afterward.
-    fn ensureRedoOverlay(self: *Cursor) !*native.NativeFile.OverlayScanState {
-        if (self.redo_overlay == null) {
-            const file = try self.txn.readFile();
-            // `initForPrefixUnchecked`, not `initForPrefix`: `self.txn.checkpoint`
-            // (`ReadGeneration.checkpoint`) is not comparable to `file.activeCheckpoint()`
-            // the way `initForPrefix`'s own gate requires -- see that
-            // function's own doc comment.
-            self.redo_overlay = try native.NativeFile.OverlayScanState.initForPrefixUnchecked(self.txn.allocator, file, .documents, self.txn.prefix);
+    /// Lazily opens and caches `merged` -- see that field's own doc
+    /// comment for why this is safe to do once and reuse for every
+    /// move this cursor makes afterward.
+    fn ensureMerged(self: *Cursor) !*native.MergedCursor {
+        if (self.merged == null) {
+            const view = try self.txn.readView();
+            self.merged = try view.openMergedDocumentCursor(self.txn.allocator, self.txn.prefix);
         }
-        return &self.redo_overlay.?;
+        return &self.merged.?;
     }
 
     pub fn first(self: *Cursor) !backend_adapter.Entry {
-        self.clearBufferedDisk();
-        const overlay = try self.ensureRedoOverlay();
-        const disk = if (self.txn.prefix.len == 0)
-            try self.index_cursor.first()
+        self.clearBufferedMerged();
+        const merged = try self.ensureMerged();
+        const result = if (self.txn.prefix.len == 0)
+            try merged.first()
         else
-            try self.index_cursor.seekAtOrAfter(self.txn.prefix, false);
-        return try self.resolveMerged(disk, self.overlayAtOrAfter(self.txn.prefix, false), if (overlay.keys.len > 0) 0 else null, .forward);
+            try merged.seekAtOrAfter(self.txn.prefix, false);
+        return try self.resolveMerged(result, self.overlayAtOrAfter(self.txn.prefix, false), .forward);
     }
 
     pub fn last(self: *Cursor) !backend_adapter.Entry {
-        self.clearBufferedDisk();
-        const overlay = try self.ensureRedoOverlay();
+        self.clearBufferedMerged();
+        const merged = try self.ensureMerged();
         if (self.upper_bound) |upper_bound| {
             const upper = try self.txn.prefixedKey(upper_bound);
             defer if (self.txn.prefix.len > 0) self.txn.allocator.free(upper);
-            const count = overlay.countAtOrBefore(upper, true);
-            return try self.resolveMerged(
-                try self.index_cursor.seekAtOrBefore(upper, true),
-                self.overlayAtOrBefore(upper, true),
-                if (count > 0) count - 1 else null,
-                .backward,
-            );
+            return try self.resolveMerged(try merged.seekAtOrBefore(upper, true), self.overlayAtOrBefore(upper, true), .backward);
         }
         if (self.txn.prefix.len == 0) {
-            return try self.resolveMerged(
-                try self.index_cursor.last(),
-                self.txn.pending_tree.getMax(),
-                if (overlay.keys.len > 0) overlay.keys.len - 1 else null,
-                .backward,
-            );
+            return try self.resolveMerged(try merged.last(), self.txn.pending_tree.getMax(), .backward);
         } else {
             const upper = try self.namespaceUpperBound();
             defer self.txn.allocator.free(upper);
-            const count = overlay.countAtOrBefore(upper, true);
-            return try self.resolveMerged(
-                try self.index_cursor.seekAtOrBefore(upper, true),
-                self.overlayAtOrBefore(upper, true),
-                if (count > 0) count - 1 else null,
-                .backward,
-            );
+            return try self.resolveMerged(try merged.seekAtOrBefore(upper, true), self.overlayAtOrBefore(upper, true), .backward);
         }
     }
 
     pub fn next(self: *Cursor) !backend_adapter.Entry {
         const current = self.current_key orelse return error.NotFound;
-        const overlay = try self.ensureRedoOverlay();
-        const disk = if (self.last_direction == .forward)
-            self.takeBufferedDisk() orelse try self.index_cursor.next()
-        else blk: {
-            self.clearBufferedDisk();
-            break :blk try self.index_cursor.seekAtOrAfter(current, true);
-        };
-        const idx = overlay.indexAtOrAfter(current, true);
-        return try self.resolveMerged(disk, self.overlayAtOrAfter(current, true), if (idx < overlay.keys.len) idx else null, .forward);
+        const merged = try self.ensureMerged();
+        const result = if (self.last_direction == .forward)
+            self.takeBufferedMerged() orelse try merged.next(current, true)
+        else
+            try merged.next(current, false);
+        return try self.resolveMerged(result, self.overlayAtOrAfter(current, true), .forward);
     }
 
     pub fn prev(self: *Cursor) !backend_adapter.Entry {
         const current = self.current_key orelse return error.NotFound;
-        const overlay = try self.ensureRedoOverlay();
-        const disk = if (self.last_direction == .backward)
-            self.takeBufferedDisk() orelse try self.index_cursor.prev()
-        else blk: {
-            self.clearBufferedDisk();
-            break :blk try self.index_cursor.seekAtOrBefore(current, true);
-        };
-        const count = overlay.countAtOrBefore(current, true);
-        return try self.resolveMerged(disk, self.overlayAtOrBefore(current, true), if (count > 0) count - 1 else null, .backward);
+        const merged = try self.ensureMerged();
+        const result = if (self.last_direction == .backward)
+            self.takeBufferedMerged() orelse try merged.prev(current, true)
+        else
+            try merged.prev(current, false);
+        return try self.resolveMerged(result, self.overlayAtOrBefore(current, true), .backward);
     }
 
     pub fn seekAtOrAfter(self: *Cursor, key: []const u8) !backend_adapter.Entry {
         const lookup_key = try self.txn.prefixedKey(key);
         defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
-        self.clearBufferedDisk();
-        const overlay = try self.ensureRedoOverlay();
-        const idx = overlay.indexAtOrAfter(lookup_key, false);
-        return try self.resolveMerged(
-            try self.index_cursor.seekAtOrAfter(lookup_key, false),
-            self.overlayAtOrAfter(lookup_key, false),
-            if (idx < overlay.keys.len) idx else null,
-            .forward,
-        );
+        self.clearBufferedMerged();
+        const merged = try self.ensureMerged();
+        return try self.resolveMerged(try merged.seekAtOrAfter(lookup_key, false), self.overlayAtOrAfter(lookup_key, false), .forward);
     }
 
     pub fn seekAtOrBefore(self: *Cursor, key: []const u8) !backend_adapter.Entry {
         const lookup_key = try self.txn.prefixedKey(key);
         defer if (self.txn.prefix.len > 0) self.txn.allocator.free(lookup_key);
-        self.clearBufferedDisk();
-        const overlay = try self.ensureRedoOverlay();
+        self.clearBufferedMerged();
+        const merged = try self.ensureMerged();
         if (self.upper_bound) |upper_bound| {
             const upper = try self.txn.prefixedKey(upper_bound);
             defer if (self.txn.prefix.len > 0) self.txn.allocator.free(upper);
             if (std.mem.order(u8, lookup_key, upper) != .lt) {
-                const count = overlay.countAtOrBefore(upper, true);
-                return try self.resolveMerged(
-                    try self.index_cursor.seekAtOrBefore(upper, true),
-                    self.overlayAtOrBefore(upper, true),
-                    if (count > 0) count - 1 else null,
-                    .backward,
-                );
+                return try self.resolveMerged(try merged.seekAtOrBefore(upper, true), self.overlayAtOrBefore(upper, true), .backward);
             }
         }
-        const count = overlay.countAtOrBefore(lookup_key, false);
-        return try self.resolveMerged(
-            try self.index_cursor.seekAtOrBefore(lookup_key, false),
-            self.overlayAtOrBefore(lookup_key, false),
-            if (count > 0) count - 1 else null,
-            .backward,
-        );
+        return try self.resolveMerged(try merged.seekAtOrBefore(lookup_key, false), self.overlayAtOrBefore(lookup_key, false), .backward);
     }
 
     pub fn setUpperBound(self: *Cursor, upper: ?[]const u8) void {
-        self.clearBufferedDisk();
+        self.clearBufferedMerged();
         self.last_direction = null;
         self.upper_bound = upper;
     }
 
-    /// Three-way merge: `pending_tree` (this transaction's own in-flight,
-    /// uncommitted writes) over the redo-log overlay (committed, not yet
-    /// checkpointed) over the real B-tree (`index_cursor`). A key tie
-    /// always favors the higher-priority source, and every lower-
-    /// priority source whose own candidate shares the winning key is
-    /// consumed (advanced past) in the same step -- a shadowed overlay
-    /// or disk entry, including a real page a redo-log tombstone
-    /// deletes, must never be visited again.
+    /// Two-way merge: `pending_tree` (this transaction's own in-flight,
+    /// uncommitted writes) over whatever `merged` returns (itself
+    /// already the redo-log overlay over the real B-tree -- see
+    /// `native.MergedCursor`'s own doc comment). A key tie always
+    /// favors `pending_tree`, and `merged`'s own candidate is consumed
+    /// (advanced past) in the same step whenever it shares the winning
+    /// key but did not itself win.
     fn resolveMerged(
         self: *Cursor,
-        initial_disk: ?native.DocumentIndexEntry,
+        initial_merged: ?native.MergedCursor.Entry,
         initial_pending_index: ?*PendingTree.Node,
-        initial_redo_index: ?usize,
         direction: Direction,
     ) !backend_adapter.Entry {
         const file = try self.txn.readFile();
-        var disk = initial_disk;
-        errdefer if (disk) |*candidate| candidate.deinit(self.txn.allocator);
+        var merged_entry = initial_merged;
+        errdefer if (merged_entry) |*entry| entry.deinit(self.txn.allocator);
         var pending_index = initial_pending_index;
-        var redo_index = initial_redo_index;
 
         while (true) {
-            if (disk) |candidate| {
-                if (!self.keyInRange(candidate.key)) {
-                    var out_of_range = candidate;
+            if (merged_entry) |entry| {
+                if (!self.keyInRange(entry.key())) {
+                    var out_of_range = entry;
                     out_of_range.deinit(self.txn.allocator);
-                    disk = null;
+                    merged_entry = null;
                 }
             }
             const pending_candidate = if (pending_index) |index| blk: {
@@ -6217,40 +6209,23 @@ pub const Cursor = struct {
                 }
                 break :blk candidate;
             } else null;
-            const redo_key: ?[]const u8 = if (redo_index) |idx| blk: {
-                const k = self.redo_overlay.?.keys[idx];
-                if (!self.keyInRange(k)) {
-                    redo_index = null;
-                    break :blk null;
-                }
-                break :blk k;
-            } else null;
 
-            const Source = enum { pending, redo, disk };
+            const Source = enum { pending, merged };
             var winner: ?Source = null;
             var winner_key: []const u8 = undefined;
             if (pending_candidate) |p| {
                 winner = .pending;
                 winner_key = p.key;
             }
-            if (redo_key) |k| {
+            if (merged_entry) |entry| {
+                const k = entry.key();
                 const better = if (winner != null) switch (direction) {
                     .forward => std.mem.order(u8, k, winner_key) == .lt,
                     .backward => std.mem.order(u8, k, winner_key) == .gt,
                 } else true;
                 if (better) {
-                    winner = .redo;
+                    winner = .merged;
                     winner_key = k;
-                }
-            }
-            if (disk) |d| {
-                const better = if (winner != null) switch (direction) {
-                    .forward => std.mem.order(u8, d.key, winner_key) == .lt,
-                    .backward => std.mem.order(u8, d.key, winner_key) == .gt,
-                } else true;
-                if (better) {
-                    winner = .disk;
-                    winner_key = d.key;
                 }
             }
             const chosen = winner orelse return error.NotFound;
@@ -6258,61 +6233,48 @@ pub const Cursor = struct {
             if (pending_candidate != null and std.mem.eql(u8, pending_candidate.?.key, winner_key)) {
                 pending_index = self.advanceOverlayIndex(pending_index.?, direction);
             }
-            if (redo_key != null and std.mem.eql(u8, redo_key.?, winner_key)) {
-                redo_index = self.advanceRedoIndex(redo_index.?, direction);
-            }
-            if (disk != null and std.mem.eql(u8, disk.?.key, winner_key) and chosen != .disk) {
-                var consumed = disk.?;
+            if (merged_entry != null and std.mem.eql(u8, merged_entry.?.key(), winner_key) and chosen != .merged) {
+                var consumed = merged_entry.?;
                 consumed.deinit(self.txn.allocator);
-                disk = null;
-                disk = try self.advanceDisk(direction);
+                merged_entry = try (try self.ensureMerged()).advance(mergedDirection(direction));
             }
 
             switch (chosen) {
                 .pending => {
                     const pending = pending_candidate.?;
                     const value = pending.value orelse continue;
-                    const buffered_disk = disk;
-                    disk = null;
-                    return try self.installPending(pending.key, value, buffered_disk, direction);
+                    const buffered_merged = merged_entry;
+                    merged_entry = null;
+                    return try self.installPending(pending.key, value, buffered_merged, direction);
                 },
-                .redo => {
-                    const entry = (try file.redoOverlayEntry(.documents, self.txn.checkpoint, winner_key)) orelse return error.InvalidNativeRedoRecord;
-                    defer self.txn.allocator.free(entry.value);
-                    if (entry.is_delete) continue;
-                    const resolved_value = if (entry.external_value_root_page != 0)
-                        try file.readValuePagesAtCheckpointAlloc(self.txn.allocator, entry.external_value_root_page, entry.external_value_len, self.txn.checkpoint)
-                    else
-                        entry.value;
-                    defer if (entry.external_value_root_page != 0) self.txn.allocator.free(resolved_value);
-                    const buffered_disk = disk;
-                    disk = null;
-                    return try self.installPending(winner_key, resolved_value, buffered_disk, direction);
-                },
-                .disk => {
-                    const indexed = disk.?;
-                    disk = null;
-                    const value = self.readValue(file, indexed) catch |err| {
+                .merged => switch (merged_entry.?) {
+                    .overlay => |overlay| {
+                        const entry = overlay.entry;
+                        defer self.txn.allocator.free(entry.value);
+                        merged_entry = null;
+                        const resolved_value = if (entry.external_value_root_page != 0)
+                            try file.readValuePagesAtCheckpointAlloc(self.txn.allocator, entry.external_value_root_page, entry.external_value_len, self.txn.checkpoint)
+                        else
+                            entry.value;
+                        defer if (entry.external_value_root_page != 0) self.txn.allocator.free(resolved_value);
+                        return try self.installPending(overlay.key, resolved_value, null, direction);
+                    },
+                    .disk => |indexed| {
+                        merged_entry = null;
+                        const value = self.readValue(file, indexed) catch |err| {
+                            var consumed = indexed;
+                            consumed.deinit(self.txn.allocator);
+                            return err;
+                        };
+                        if (value) |owned_value| return self.installDisk(indexed, owned_value, direction);
                         var consumed = indexed;
                         consumed.deinit(self.txn.allocator);
-                        return err;
-                    };
-                    if (value) |owned_value| return self.installDisk(indexed, owned_value, direction);
-                    var consumed = indexed;
-                    consumed.deinit(self.txn.allocator);
-                    disk = try self.advanceDisk(direction);
-                    continue;
+                        merged_entry = try (try self.ensureMerged()).advance(mergedDirection(direction));
+                        continue;
+                    },
                 },
             }
         }
-    }
-
-    fn advanceRedoIndex(self: *Cursor, index: usize, direction: Direction) ?usize {
-        const overlay = &self.redo_overlay.?;
-        return switch (direction) {
-            .forward => if (index + 1 < overlay.keys.len) index + 1 else null,
-            .backward => if (index > 0) index - 1 else null,
-        };
     }
 
     fn readValue(self: *Cursor, file: *native.NativeFile, indexed: native.DocumentIndexEntry) !?[]u8 {
@@ -6360,13 +6322,6 @@ pub const Cursor = struct {
         };
     }
 
-    fn advanceDisk(self: *Cursor, direction: Direction) !?native.DocumentIndexEntry {
-        return switch (direction) {
-            .forward => try self.index_cursor.next(),
-            .backward => try self.index_cursor.prev(),
-        };
-    }
-
     fn keyInRange(self: *const Cursor, full_key: []const u8) bool {
         if (!std.mem.startsWith(u8, full_key, self.txn.prefix)) return false;
         if (self.upper_bound) |upper| {
@@ -6379,11 +6334,11 @@ pub const Cursor = struct {
         self: *Cursor,
         full_key: []const u8,
         value: []const u8,
-        buffered_disk: ?native.DocumentIndexEntry,
+        buffered_merged: ?native.MergedCursor.Entry,
         direction: Direction,
     ) !backend_adapter.Entry {
-        var disk = buffered_disk;
-        errdefer if (disk) |*candidate| candidate.deinit(self.txn.allocator);
+        var merged_entry = buffered_merged;
+        errdefer if (merged_entry) |*entry| entry.deinit(self.txn.allocator);
         // Overlay values are already in memory: no page read is needed to
         // know their length, unlike the disk path in `readValue`.
         if (self.length_only) self.last_value_len = value.len;
@@ -6394,8 +6349,8 @@ pub const Cursor = struct {
         self.clearCurrent();
         self.current_key = owned_key;
         self.owned_value = owned_value;
-        self.disk_candidate = disk;
-        disk = null;
+        self.merged_candidate = merged_entry;
+        merged_entry = null;
         self.last_direction = direction;
         return .{ .key = owned_key[self.txn.prefix.len..], .value = owned_value };
     }
@@ -6415,14 +6370,14 @@ pub const Cursor = struct {
         self.owned_value = null;
     }
 
-    fn clearBufferedDisk(self: *Cursor) void {
-        if (self.disk_candidate) |*candidate| candidate.deinit(self.txn.allocator);
-        self.disk_candidate = null;
+    fn clearBufferedMerged(self: *Cursor) void {
+        if (self.merged_candidate) |*candidate| candidate.deinit(self.txn.allocator);
+        self.merged_candidate = null;
     }
 
-    fn takeBufferedDisk(self: *Cursor) ?native.DocumentIndexEntry {
-        const candidate = self.disk_candidate;
-        self.disk_candidate = null;
+    fn takeBufferedMerged(self: *Cursor) ?native.MergedCursor.Entry {
+        const candidate = self.merged_candidate;
+        self.merged_candidate = null;
         return candidate;
     }
 
@@ -12942,8 +12897,26 @@ test "lite prepared cached scores retry after page cache eviction" {
     try std.testing.expect(!scope.discard_workspace);
     for (scores) |score| try std.testing.expectEqual(@as(?f64, 3), score);
     const before = counter.alloc_calls;
+    // Under the redo log (the default), the 512 document records this
+    // test wrote via `putDocumentBatch` were diverted into the log and
+    // never folded by a checkpoint (nothing here ever calls
+    // `checkpointRedoLog`/`maintainOnce`), so the handful of physical
+    // pages holding them are still served from the in-memory overlay on
+    // every read, not from a stable on-disk copy -- `readBackingPages`'
+    // own §9.3a doc comment. Unlike a page a checkpoint has already
+    // folded, an overlay-served page is never cached, so a repeat read
+    // of it allocates a fresh, transient `dupe` every time
+    // (`test_redo_page_overlay_hits`), even though every other part of
+    // this retry is a full cache hit. This is a legacy-only physical
+    // detail, not a redo-mode inefficiency: the overlay must be
+    // consulted on every read for correctness (it can change between
+    // calls in a live system), so the right invariant under redo is
+    // "zero allocations beyond the ones the still-staged pages this
+    // retry touches legitimately cost," not "zero allocations."
+    const overlay_hits_before = file.test_redo_page_overlay_hits.load(.monotonic);
     try scope.getManySortedScores(&keys, &scores);
-    try std.testing.expectEqual(before, counter.alloc_calls);
+    const overlay_hit_allocs = file.test_redo_page_overlay_hits.load(.monotonic) - overlay_hits_before;
+    try std.testing.expectEqual(before + overlay_hit_allocs, counter.alloc_calls);
 }
 
 test "lite prepared point versus batch scope measurement" {

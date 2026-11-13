@@ -2360,20 +2360,19 @@ test "lite full text synchronous visibility is searchable immediately after an u
         defer tmp.cleanup();
         const path = try testAflitePath(allocator, tmp);
         defer allocator.free(path);
-        var lite_backend = try backend.Handle.createWithOptions(allocator, path, .{ .exclusive = true, .io = std.testing.io, .use_redo_log = false });
-        errdefer lite_backend.deinit();
-        const identity = connection.identityOpenOptions(true);
-        var db_opts = db_mod.OpenOptions{
-            .open_mode = .writer,
-            .identity_namespace = identity.identity_namespace,
-            .prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace,
-        };
-        try lite_backend.configureDbOpenOptions(&db_opts);
-        var db = try db_mod.DB.open(allocator, path, db_opts);
-        errdefer db.close();
-        try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
-        try db.runUntilIdle();
-        var handle = DbHandle{ .backend = lite_backend, .db = db };
+        // Opening through `openLegacyDbWithIo` (not inlined here) is the
+        // point, not incidental: an `errdefer lite_backend.deinit()` /
+        // `errdefer db.close()` pair declared in *this* function would stay
+        // armed for the rest of the loop body below, including past the
+        // point where `handle = .{ .backend = lite_backend, .db = db }`
+        // copies their values and `defer handle.close()` becomes the real
+        // owner -- any later failure (`batch`/`assertSearchable`) would
+        // then double-close both `db` and `lite_backend` on top of
+        // `handle`'s own close. `openLegacyDbWithIo`'s errdefers are scoped
+        // to its own body, which returns before any of that can happen
+        // (see its doc comment, and `ioFaultThenDoubleCloseScenarioLegacy`
+        // below for the shape this avoids).
+        var handle = try openLegacyDbWithIo(allocator, path, std.testing.io);
         defer handle.close();
         try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
         try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
@@ -2412,6 +2411,43 @@ test "lite dense vector full index visibility is readable immediately after an u
         const read = (try handle.db.get(allocator, "dv-doc")) orelse return error.TestExpectedDocumentFound;
         defer allocator.free(read);
         try std.testing.expect(std.mem.indexOf(u8, read, "dv-doc-marker") != null);
+    }
+}
+
+// Regression for the §9.7c ReadView design doc section: a document plus
+// its full-text entry, written without ever calling checkpointRedoLog,
+// must be found by derived catch-up through the real catch-up API
+// (sync_level: .full_text's own wait path) both on the live handle that
+// wrote it and, independently, on a fresh handle after a clean close and
+// reopen -- exercising "recovery replays into the overlay before any
+// reader starts" (§9.5/recoverRedoLog) feeding into the exact same
+// catch-up path the live-handle half of this test already covers.
+test "lite derived catch-up sees a document and its full-text entry written without a checkpoint, before and after a crash and reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    // Before: write on a live handle, no checkpoint, assert immediately.
+    {
+        var handle = try openDbWithIo(allocator, path, std.testing.io, true);
+        defer handle.close();
+        try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+        try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+        try assertSearchable(&handle, allocator, "body_text", "body", "ft-doc", "needle");
+    }
+
+    // After: a fresh handle, opened from scratch. recoverRedoLog must
+    // have replayed the above into the shared overlay before this handle
+    // is usable at all; the first thing this does with it is run the
+    // exact same catch-up path again (via assertSearchable's own
+    // runUntilIdle/forceCompactTextIndexes retry loop), on a derived
+    // index this new handle has never touched before.
+    {
+        var handle = try openDbWithIo(allocator, path, std.testing.io, false);
+        defer handle.close();
+        try assertSearchable(&handle, allocator, "body_text", "body", "ft-doc", "needle");
     }
 }
 
@@ -2744,12 +2780,43 @@ test "crash sweep: full text sync visibility discovery is not flaky under the sh
 // depend on knowing exactly which op a real disk hiccup happens to land
 // on -- matching this file's own `exhaustive` crash sweep's philosophy,
 // applied to I/O faults instead of crashes.
+/// Runs the "seed, then ft-doc" scenario the sweep below drives, once, with
+/// an unreachable `at_op` (`maxInt`) armed for `kind` so the fault never
+/// fires, then reads back exactly how many `kind` calls the `ft-doc` write
+/// alone made (via `SimIo.ioFaultOpCount`, which counts from the moment
+/// `setIoFaultPlan` installs the plan). This discovery pass is what lets
+/// the real sweep below bound `at_op` to calls the write itself makes,
+/// instead of a hand-picked constant that can overshoot past the write
+/// into whatever its caller does next.
+fn discoverFaultOpCount(allocator: Allocator, kind: sim_io.IoFaultKind) !u64 {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    const sim = try sim_io.SimIo.init(allocator, std.testing.io);
+    defer sim.deinit();
+
+    var handle = try openDbWithIo(allocator, path, sim.io(), true);
+    errdefer handle.close();
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+    try handle.db.runUntilIdle();
+
+    sim.setIoFaultPlan(.{ .at_op = std.math.maxInt(u64), .kind = kind, .err = error.InputOutput });
+    try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+    const count = sim.ioFaultOpCount(kind);
+    sim.setIoFaultPlan(null);
+    handle.close();
+    return count;
+}
+
 test "crash sweep: full text recovers from one transient io fault with no crash" {
     const allocator = std.testing.allocator;
     const kinds = [_]sim_io.IoFaultKind{ .write, .sync, .create };
     for (kinds) |kind| {
+        const op_count = try discoverFaultOpCount(allocator, kind);
         var at_op: u64 = 0;
-        while (at_op < 12) : (at_op += 1) {
+        while (at_op < op_count) : (at_op += 1) {
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try testAflitePath(allocator, tmp);
@@ -2767,6 +2834,20 @@ test "crash sweep: full text recovers from one transient io fault with no crash"
             var handle = try openDbWithIo(allocator, path, sim.io(), true);
             errdefer handle.close();
             try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+            // The seed write's `sync_level = .write` returns as soon as the
+            // write itself is durable, *not* once `body_text`'s background
+            // catch-up has indexed it -- that indexing keeps running
+            // concurrently via `io.concurrent(...)` afterwards. Drain it
+            // before arming the fault (same reasoning as `openDbWithIo`'s
+            // own drain after `open`/`addIndex`, just above): without this,
+            // `at_op` counts whichever call happens to be in flight when the
+            // plan is installed, which can be the seed's own still-running
+            // catch-up rather than the `ft-doc` write this test is actually
+            // targeting -- the fault then lands on unrelated setup work
+            // instead of the operation under test, and the one real,
+            // one-shot fault's effect surfaces somewhere this test never
+            // retries.
+            try handle.db.runUntilIdle();
 
             sim.setIoFaultPlan(.{
                 .at_op = at_op,
@@ -2778,9 +2859,21 @@ test "crash sweep: full text recovers from one transient io fault with no crash"
                 // (`IoFaultPlan.repeat` defaults to false): an ordinary
                 // application retry of the exact same write must now land
                 // cleanly, proving (a) the transient error surfaced as
-                // something retryable rather than wedging the owner.
+                // something retryable rather than wedging the owner. Give
+                // the owner's own handling of the failed attempt one
+                // `runUntilIdle` turn to settle first, instead of racing
+                // it with an immediate retry.
+                handle.db.runUntilIdle() catch {};
                 try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
             };
+            // `at_op < op_count` guarantees the fault fired (and, being
+            // one-shot, already cleared itself) somewhere within the
+            // `ft-doc` write's own calls above -- but disarm explicitly
+            // anyway, defense in depth: a leftover armed plan must never
+            // reach `close()`'s own best-effort, unretried syncs
+            // (`core.syncStore`, the index status snapshot), which this
+            // test has no retry path for at all.
+            sim.setIoFaultPlan(null);
             handle.close();
 
             // Reopen with a plain, unwrapped `std.Io` -- no `SimIo`, no
@@ -2797,6 +2890,130 @@ test "crash sweep: full text recovers from one transient io fault with no crash"
             };
         }
     }
+}
+
+// Deterministic regression test for a use-after-free this file's own
+// io-fault sweep above found by accident: `backend.Handle.deinit` (and
+// `bridge.ContainerStorage.deinit`, which it can reach) ended every call
+// with `self.* = undefined` and had no guard against running twice. A
+// caller that explicitly closes a handle mid-scope while an
+// `errdefer`/`defer` registered earlier in that same scope is still armed
+// -- exactly `DbHandle`'s own shape just above, and an easy one for any
+// caller to fall into -- invokes `deinit` a second time the instant
+// anything *later* in that scope returns an error. The second call read
+// `self.engine` and every other field out of memory the first call had
+// already poisoned, so the switch in `deinit` could (and did) take the
+// wrong branch entirely: observed as a segmentation fault inside
+// `bridge.zig`'s hashmap iterator, reached through the
+// `.bridge_lsm_container` arm despite the handle actually being
+// `.native_single_file` the whole time. Fixed by a `closed` flag checked
+// before anything else in `deinit`, set only after `self.* = undefined`.
+//
+// Reproduces the exact shape deterministically -- one transient fault
+// during a write, an explicit `close()`, then a *manufactured* error
+// propagated out of the scope -- rather than depending on some later,
+// unrelated call (the full sweep above relies on `assertSearchable`) to
+// happen to fail on whichever (kind, at_op) combination this file's own
+// evolution leaves exercising the bug.
+fn ioFaultThenDoubleCloseScenario(allocator: Allocator, path: []const u8, sim: *sim_io.SimIo) !void {
+    var handle = try openDbWithIo(allocator, path, sim.io(), true);
+    errdefer handle.close();
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+
+    sim.setIoFaultPlan(.{ .at_op = 0, .kind = .write, .err = error.InputOutput });
+    handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text }) catch {
+        try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+    };
+
+    // Matches the crash's exact lifecycle: an explicit close while the
+    // `errdefer` above is still armed...
+    handle.close();
+    // ...then an error, from anything at all, propagated out of this
+    // scope -- deterministically forcing that still-armed `errdefer` to
+    // run `handle.close()` a second time on the now-closed handle. Before
+    // the `closed` guard, this alone -- no actual second failure required
+    // -- was enough to segfault.
+    return error.DeliberateDoubleCloseTrigger;
+}
+
+test "backend handle survives a transient io fault followed by a double close" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    const sim = try sim_io.SimIo.init(allocator, std.testing.io);
+    defer sim.deinit();
+
+    // The scenario always returns `error.DeliberateDoubleCloseTrigger` by
+    // construction (see above): what this test actually checks is that
+    // reaching it -- and so the double `deinit` -- does not crash or
+    // corrupt memory. Any other error means the scenario itself broke
+    // before it got there.
+    try std.testing.expectError(error.DeliberateDoubleCloseTrigger, ioFaultThenDoubleCloseScenario(allocator, path, sim));
+}
+
+// Same shape, under `use_redo_log: false` (legacy) -- the control. Must
+// also pass: `Handle.deinit`'s missing re-entry guard is a plain lifecycle
+// bug in `backend.zig`, with nothing in its own crash path touching
+// `self.redo` or anything else redo-specific, so nothing about this
+// scenario should depend on which storage mode created the handle.
+//
+// Opening is factored into its own function, exactly like `openDbWithIo`,
+// rather than inlined into the scenario below: an `errdefer db.close()`
+// declared before `db`'s value is moved into a `DbHandle` stays armed for
+// the rest of whatever function it was declared in, and this scenario
+// deliberately returns an error at the end to trigger the handle's own
+// stale errdefer (see `ioFaultThenDoubleCloseScenario` above) -- which
+// would, in the same breath, also re-trigger *this* one on the
+// independent, still-"open" `db` copy it was declared against, double
+// freeing `DB`'s own internals instead of (or in addition to) the
+// `backend.Handle` bug this test exists to cover. `openDbWithIo`'s own
+// identical-looking `errdefer db.close()` never hits this because nothing
+// after it in that function can fail.
+fn openLegacyDbWithIo(allocator: Allocator, path: []const u8, io: std.Io) !DbHandle {
+    var lite_backend = try backend.Handle.createWithOptions(allocator, path, .{ .exclusive = true, .io = io, .use_redo_log = false });
+    errdefer lite_backend.deinit();
+    const identity = connection.identityOpenOptions(true);
+    var db_opts = db_mod.OpenOptions{
+        .open_mode = .writer,
+        .identity_namespace = identity.identity_namespace,
+        .prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace,
+    };
+    try lite_backend.configureDbOpenOptions(&db_opts);
+    var db = try db_mod.DB.open(allocator, path, db_opts);
+    errdefer db.close();
+    try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+    try db.runUntilIdle();
+    return .{ .backend = lite_backend, .db = db };
+}
+
+fn ioFaultThenDoubleCloseScenarioLegacy(allocator: Allocator, path: []const u8, sim: *sim_io.SimIo) !void {
+    var handle = try openLegacyDbWithIo(allocator, path, sim.io());
+    errdefer handle.close();
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+
+    sim.setIoFaultPlan(.{ .at_op = 0, .kind = .write, .err = error.InputOutput });
+    handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text }) catch {
+        try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+    };
+
+    handle.close();
+    return error.DeliberateDoubleCloseTrigger;
+}
+
+test "backend handle survives a transient io fault followed by a double close LEGACY control" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    const sim = try sim_io.SimIo.init(allocator, std.testing.io);
+    defer sim.deinit();
+
+    try std.testing.expectError(error.DeliberateDoubleCloseTrigger, ioFaultThenDoubleCloseScenarioLegacy(allocator, path, sim));
 }
 
 // Deterministic regression test for a second instance of the same bug class,
