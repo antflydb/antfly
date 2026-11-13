@@ -11612,9 +11612,42 @@ pub const NativeFile = struct {
 
     /// Resolve the pinned document once; nearby requested fields share one
     /// extent read and independent spans reuse the same page reader.
+    /// §9.7c (ReadView): resolves `ranges` against an overlay entry's own
+    /// value directly, instead of a real page -- the overlay-side half
+    /// `readDocumentRangesAlloc`/`readDocumentRangesBatchAlloc` were
+    /// missing entirely (unlike `getDocumentAtCheckpointAlloc`, they went
+    /// straight to the raw tree with no overlay check at all, so a key
+    /// logged-but-not-yet-folded by `checkpointRedoLog` always resolved
+    /// as not found here even though a plain `get()` on the same handle
+    /// found it immediately). Likely root cause of full-text crash-sweep
+    /// failures that survived the `Cursor`/`getDocumentsAtCheckpointWithState`
+    /// fixes: full-text indexing reads a document's body in ranges,
+    /// through exactly this path. Caller owns `entry.value` already.
+    fn readDocumentRangesFromOverlayEntry(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, entry: CatalogEntry, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
+        if (entry.is_delete) return error.NotFound;
+        const size = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+        const Context = struct {
+            file: *NativeFile,
+            a: Allocator,
+            checkpoint: CheckpointSlot,
+            root: u64,
+            size: usize,
+            inline_value: []const u8,
+            pub fn read(ctx: @This(), begin: usize, len: usize) ![]const u8 {
+                if (ctx.root == 0) return ctx.a.dupe(u8, ctx.inline_value[begin..][0..len]);
+                return ctx.file.readValuePagesRangeAlloc(ctx.a, ctx.root, ctx.size, begin, len, ctx.checkpoint);
+            }
+        };
+        return @import("../value_ranges.zig").read(size, ranges, output, Context{ .file = self, .a = allocator, .checkpoint = checkpoint, .root = entry.external_value_root_page, .size = size, .inline_value = entry.value });
+    }
+
     pub fn readDocumentRangesAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, key: []const u8, ranges: []const @import("../value_ranges.zig").Range, output: [][]const u8) !void {
         if (ranges.len != output.len or ranges.len > @import("../value_ranges.zig").maximum_ranges) return error.InvalidBatch;
         if (ranges.len == 0) return;
+        if (try self.redoOverlayEntry(.documents, checkpoint, key)) |entry| {
+            defer self.allocator.free(entry.value);
+            return self.readDocumentRangesFromOverlayEntry(allocator, checkpoint, entry, ranges, output);
+        }
         const page = (try self.lookupDocumentIndexPage(checkpoint, key)) orelse return error.NotFound;
         return self.readDocumentRangesAtPage(allocator, checkpoint, key, page, ranges, output);
     }
@@ -11627,13 +11660,29 @@ pub const NativeFile = struct {
             keys[i] = request.key;
             if (i != 0 and std.mem.order(u8, keys[i - 1], keys[i]) == .gt) return error.InvalidBatch;
         }
+        // Same overlay-blind gap as the single-key path above: resolve
+        // each request against the overlay first; only requests genuinely
+        // absent from it go through the batched tree walk below.
+        var remaining: [64]@import("../value_ranges.zig").Request = undefined;
+        var remaining_count: usize = 0;
+        for (requests) |request| {
+            if (try self.redoOverlayEntry(.documents, checkpoint, request.key)) |entry| {
+                defer self.allocator.free(entry.value);
+                try self.readDocumentRangesFromOverlayEntry(allocator, checkpoint, entry, request.ranges, request.output);
+                continue;
+            }
+            remaining[remaining_count] = request;
+            remaining_count += 1;
+        }
+        if (remaining_count == 0) return;
         const temporary = @import("antfly_platform").allocator.reclaimingScratch(allocator);
         var state: DocumentBatchReadState = .{};
         state.prepare(self);
         defer state.deinit();
-        const references = try self.resolveBatchReferences(temporary, checkpoint, keys[0..requests.len], "", &state.path);
+        for (remaining[0..remaining_count], 0..) |request, i| keys[i] = request.key;
+        const references = try self.resolveBatchReferences(temporary, checkpoint, keys[0..remaining_count], "", &state.path);
         defer temporary.free(references);
-        for (requests, references) |request, page| {
+        for (remaining[0..remaining_count], references) |request, page| {
             if (page == 0) return error.NotFound;
             try self.readDocumentRangesAtPage(allocator, checkpoint, request.key, page, request.ranges, request.output);
         }
@@ -11672,6 +11721,16 @@ pub const NativeFile = struct {
 
     /// Extents and inline slices are resolved against the caller's checkpoint.
     pub fn readDocumentRangeAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, key: []const u8, offset: u64, length: usize) ![]u8 {
+        // §9.7c (ReadView): see `readDocumentRangesAlloc`'s own comment --
+        // same overlay-blind gap, same fix.
+        if (try self.redoOverlayEntry(.documents, checkpoint, key)) |entry| {
+            defer self.allocator.free(entry.value);
+            if (entry.is_delete) return error.NotFound;
+            const size = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+            if (offset > size or length > size - offset) return error.EndOfStream;
+            if (entry.external_value_root_page != 0) return self.readValuePagesRangeAlloc(allocator, entry.external_value_root_page, size, @intCast(offset), length, checkpoint);
+            return allocator.dupe(u8, entry.value[@intCast(offset)..][0..length]);
+        }
         const page_id = (try self.lookupDocumentIndexPage(checkpoint, key)) orelse return error.NotFound;
         var reader: ValuePageReader = undefined;
         reader.init();
@@ -11690,6 +11749,20 @@ pub const NativeFile = struct {
     /// rejected before loading external pages, and no transaction read cache
     /// retains a copy. Only the initialized prefix of out is returned.
     pub fn readDocumentInto(self: *NativeFile, checkpoint: CheckpointSlot, key: []const u8, out: []u8) ![]const u8 {
+        // §9.7c (ReadView): see `readDocumentRangesAlloc`'s own comment --
+        // same overlay-blind gap, same fix.
+        if (try self.redoOverlayEntry(.documents, checkpoint, key)) |entry| {
+            defer self.allocator.free(entry.value);
+            if (entry.is_delete) return error.NotFound;
+            const length = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+            if (length > out.len) return error.BufferTooSmall;
+            if (entry.external_value_root_page != 0) {
+                try self.readValuePagesRangeInto(entry.external_value_root_page, length, 0, out[0..length], checkpoint);
+            } else {
+                @memcpy(out[0..length], entry.value);
+            }
+            return out[0..length];
+        }
         const page_id = (try self.lookupDocumentIndexPage(checkpoint, key)) orelse return error.NotFound;
         var reader: ValuePageReader = undefined;
         reader.init();
