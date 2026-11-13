@@ -3701,6 +3701,11 @@ const CanonicalEdgeBatch = struct {
                     .index_name = @constCast(reader.index_name),
                     .key = @constCast(entry.readKeys(group)[0]),
                     .keys = @constCast(entry.readKeys(group)),
+                    // Preserve an incomplete key's physical cursor just as in
+                    // parallel prefetch for path streams. Complete-key
+                    // traversal readers retain their existing EOF policy.
+                    // Discarding a path prefix forces a charged rescan.
+                    .allow_partial_keys = self.path_prefetch,
                     .edge_types = @constCast(params.edge_types),
                     .direction = params.direction,
                     .tensor_access_path = prepared.path,
@@ -20803,6 +20808,42 @@ test "distributed min-hop pages preserve frontier capacity accounting and raised
     defer excess.deinit(a);
     try std.testing.expectError(error.GraphWorkBudgetExceeded, frontier.push(&excess));
     try std.testing.expectEqual(@as(usize, 100_001), frontier.count());
+}
+
+test "distributed min-hop pages preserve serial prefetch cursors under an exact scan budget" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .lsm_memory });
+    defer graph.close();
+    try graph.addEdge("root", "a-hub", "FRIEND", 1, 0, 0, "");
+    try graph.addEdge("root", "b-peer", "FRIEND", 1, 0, 0, "");
+    try graph.addEdge("b-peer", "terminal", "FRIEND", 1, 0, 0, "");
+    var names: [2048][16]u8 = undefined;
+    var writes: [2048]graph_mod.BatchWrite = undefined;
+    for (&names, 0..) |*name, i| writes[i] = .{ .source = "a-hub", .target = try std.fmt.bufPrint(name, "n:{d:0>4}", .{i}), .edge_type = "FRIEND" };
+    for (0..8) |chunk| try graph.batchApply(writes[chunk * 256 ..][0..256], &.{});
+    const catalog = H.FakeCatalog.iface();
+    const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+    const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+    // Exercise both local ownership and wire decoding. With one shard and no
+    // fanout IO, the two-node frontier necessarily uses serial prefetch. Its
+    // scan allowance is smaller than the hub, so success requires resuming
+    // that prefix rather than discarding it and restarting the adjacency.
+    for ([_]bool{ false, true }) |wire| {
+        var state = H.State{ .graph = &graph, .wire = wire };
+        var admission = GraphNodeAdmissionContext.init(a, catalog, H.FakeWorker.iface(&state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+        defer admission.deinit();
+        const query = db_mod.types.NamedGraphQuery{ .name = "path", .query = .{ .query_type = .shortest_path, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{"root"} }, .target_nodes = .{ .keys = &.{"missing"} }, .params = .{ .max_depth = 2, .edge_types = &.{"FRIEND"} } } };
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{ .max_explored_edges = writes.len + 3 });
+        var result = try findDistributedShortestPath(a, catalog, H.FakeWorker.iface(&state), "docs", req, .{ .alloc = a, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget, null, null, null);
+        defer if (result) |*path| path.deinit(a);
+        try std.testing.expect(result == null);
+        try std.testing.expect(state.largest_batch == 2);
+        try std.testing.expect(state.continuations > 0);
+        try std.testing.expectEqual(@as(usize, 0), budget.remaining_physical_edges);
+        try std.testing.expectEqual(@as(usize, 0), budget.remaining_edges);
+        try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    }
 }
 
 test "distributed min-hop pages preserve adaptive hub paging and early targets" {
