@@ -28,22 +28,36 @@ from pathlib import Path
 import platform
 import selectors
 import shutil
-import signal
 import subprocess
 import sys
 import time
 import uuid
-from bench_bulk_pipeline import validate_source, validate_truth, write_report
+from bench_bulk_pipeline import (
+    CancellationScope,
+    OwnedProcess,
+    check_cancellation,
+    gcs_probe_environment,
+    sha256_stream,
+    terminate_group as terminate_group,
+    validate_source,
+    validate_truth,
+    write_report,
+)
 
 
 def command(argv, **kwargs):
-    kwargs.setdefault("timeout", 60)
-    return subprocess.run(argv, check=True, capture_output=True, **kwargs)
+    timeout = kwargs.pop("timeout", 60)
+    with OwnedProcess() as owner:
+        owner.start(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+        stdout, stderr = owner.communicate(timeout)
+        result = subprocess.CompletedProcess(argv, owner.returncode, stdout, stderr)
+        result.check_returncode()
+        return result
 
 
 def digest(path):
     with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        return sha256_stream(stream)
 
 
 def freeze_inputs(output, binary, recall, *, reopen_from=None):
@@ -117,41 +131,6 @@ def check_object(value, expected):
         raise ValueError("remote source differs from hash-verified input")
 
 
-def terminate_group(process):
-    # A group can outlive its leader. Calling poll()/wait() first must not
-    # disable cleanup of descendants that still own pipes or network transfers.
-    if getattr(process, "_antfly_group_drained", False):
-        return
-    # Reap an already-exited leader, but still signal its surviving group.
-    # Darwin can report EPERM for a group containing only that zombie leader.
-    process.poll()
-
-    def signal_group(value):
-        for attempt in range(2):
-            try:
-                os.killpg(process.pid, value)
-                return
-            except ProcessLookupError:
-                return
-            except PermissionError:
-                # The leader may have exited between poll and killpg. Reap
-                # that zombie and retry; genuine permission failures surface.
-                if attempt or process.poll() is None:
-                    raise
-
-    signal_group(signal.SIGTERM)
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        pass
-    finally:
-        # The leader can exit before descendants that ignore SIGTERM. Drain
-        # the owned group even when waiting for its leader already succeeded.
-        signal_group(signal.SIGKILL)
-        process.wait()
-        process._antfly_group_drained = True
-
-
 def upload(bucket, prefix, name, path, expected, framed, log_path, *, timeout=1800):
     # Never retain another raw corpus just to remove the filesystem envelope.
     argv = [
@@ -167,53 +146,49 @@ def upload(bucket, prefix, name, path, expected, framed, log_path, *, timeout=18
         if framed:
             stream.seek(84)
         hashed = hashlib.sha256()
-        process = subprocess.Popen(
-            argv,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=upload_log,
-            start_new_session=True,
-        )
-        deadline = time.monotonic() + timeout
-        try:
-            os.set_blocking(process.stdin.fileno(), False)
-            with selectors.DefaultSelector() as ready:
-                ready.register(process.stdin, selectors.EVENT_WRITE)
-                while chunk := stream.read(8 * 1024 * 1024):
-                    hashed.update(chunk)
-                    pending = memoryview(chunk)
-                    while pending:
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0 or not ready.select(remaining):
-                            raise subprocess.TimeoutExpired(argv, timeout)
-                        try:
-                            written = os.write(process.stdin.fileno(), pending)
-                        except BlockingIOError:
-                            continue
-                        pending = pending[written:]
-            process.stdin.close()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(argv, timeout)
-            process.wait(timeout=remaining)
-            if process.returncode:
-                raise RuntimeError("source upload failed")
-            if hashed.hexdigest() != expected["sha256"]:
-                raise ValueError("source changed during upload")
-        finally:
-            if not process.stdin.closed:
+        with OwnedProcess() as owner:
+            process = owner.start(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=upload_log,
+            )
+            deadline = time.monotonic() + timeout
+            try:
+                os.set_blocking(process.stdin.fileno(), False)
+                with selectors.DefaultSelector() as ready:
+                    ready.register(process.stdin, selectors.EVENT_WRITE)
+                    while chunk := stream.read(8 * 1024 * 1024):
+                        hashed.update(chunk)
+                        pending = memoryview(chunk)
+                        while pending:
+                            remaining = deadline - time.monotonic()
+                            check_cancellation()
+                            if remaining <= 0:
+                                raise subprocess.TimeoutExpired(argv, timeout)
+                            if not ready.select(min(0.2, remaining)):
+                                continue
+                            try:
+                                written = os.write(process.stdin.fileno(), pending)
+                            except BlockingIOError:
+                                continue
+                            pending = pending[written:]
                 process.stdin.close()
-            terminate_group(process)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                process.wait(timeout=remaining)
+                if process.returncode:
+                    raise RuntimeError("source upload failed")
+                if hashed.hexdigest() != expected["sha256"]:
+                    raise ValueError("source changed during upload")
+            finally:
+                if not process.stdin.closed:
+                    process.stdin.close()
+                # OwnedProcess drains the group after the stream closes.
 
 
-def termination_signal(signum, _frame):
-    # Raising preserves the upload/worker finally blocks; the default SIGTERM
-    # action would abandon children deliberately placed in a separate session.
-    raise SystemExit(128 + signum)
-
-
-def main():
-    signal.signal(signal.SIGTERM, termination_signal)
+def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--binary", type=Path, required=True)
     p.add_argument("--source", type=Path, required=True)
@@ -247,8 +222,13 @@ def main():
     if not 60 <= args.timeout <= 10800:
         p.error("timeout must be between one minute and three hours")
     args.output = args.output.resolve()
+    return args
+
+
+def run(args, report, cancellation):
+    cancellation.check()
+    gcs_probe_environment("adc")
     if not args.frozen_inputs:
-        args.output.mkdir(parents=True, exist_ok=False)
         inputs = freeze_inputs(
             args.output,
             args.binary.resolve(),
@@ -257,8 +237,7 @@ def main():
         )
         # Re-exec the copied controller too: its code, late validator imports,
         # executable and recall payloads must all match the recorded hashes.
-        os.execv(
-            sys.executable,
+        cancellation.exec(
             [
                 sys.executable,
                 "-B",
@@ -269,10 +248,10 @@ def main():
         )
     inputs = args.output / "inputs"
     if Path(__file__).resolve() != inputs / "gcs_bulk_local.py":
-        p.error("frozen-inputs is reserved for the owned controller snapshot")
+        raise ValueError("frozen-inputs is reserved for the owned controller snapshot")
     frozen_hashes = verify_inputs(inputs)
     if bool(args.reopen_from) != ("reopen/catalog.json" in frozen_hashes):
-        p.error("frozen reopen inputs do not match the requested case")
+        raise ValueError("frozen reopen inputs do not match the requested case")
     args.binary = inputs / "probe"
     source = args.source.resolve()
     recall = inputs / "recall"
@@ -366,7 +345,7 @@ def main():
     (args.output / "case.json").chmod(0o400)
     case_hash = digest(args.output / "case.json")
     worker = Path(__file__).with_name("gcs_bulk_worker.py")
-    report = dict(
+    report.update(
         version=1,
         qualified=False,
         execution="local machine against remote GCS; WAN affects timings",
@@ -398,31 +377,35 @@ def main():
         ).hexdigest(),
         case=case,
     )
+    report["status"] = "running"
+    report["phase"] = "worker"
     write_report(args.output / "local.json", report)
     start = time.monotonic()
-    with (args.output / "worker.log").open("w") as log:
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-B",
-                str(worker.resolve()),
-                str(args.output / "case.json"),
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
+    owner = OwnedProcess()
+    try:
+        with (args.output / "worker.log").open("w") as log, owner:
+            owner.start(
+                [
+                    sys.executable,
+                    "-B",
+                    str(worker.resolve()),
+                    str(args.output / "case.json"),
+                ],
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            owner.wait(timeout=args.timeout)
+    finally:
+        report["wall_seconds"] = time.monotonic() - start
+        report["load_after"] = os.getloadavg()
+        report["worker_exit_code"] = owner.returncode
+        report["worker_started"] = owner.process is not None
+        write_report(args.output / "local.json", report)
+    if owner.returncode != 0:
+        raise RuntimeError(
+            "qualification worker failed; inspect retained worker/build logs"
         )
-        try:
-            process.wait(timeout=args.timeout)
-        except BaseException:
-            terminate_group(process)
-            raise
-        finally:
-            report["wall_seconds"] = time.monotonic() - start
-            report["load_after"] = os.getloadavg()
-            report["worker_exit_code"] = process.returncode
-            write_report(args.output / "local.json", report)
+    report["phase"] = "revalidate"
     for previous, item in zip(objects, expected):
         after = metadata(args.bucket, args.source_prefix, item["name"])
         check_object(after, item)
@@ -432,13 +415,57 @@ def main():
     if digest(args.output / "case.json") != case_hash:
         raise ValueError("case descriptor changed during execution")
     result = json.loads((args.output / "case/result.json").read_text())
-    report["qualified"] = process.returncode == 0 and result["qualified"]
+    report["qualified"] = owner.returncode == 0 and result["qualified"]
+    cancellation.check()
+    report["status"] = "qualified" if report["qualified"] else "failed"
+    report["phase"] = "complete"
+    report["controller_exit_code"] = 0 if report["qualified"] else 1
     write_report(args.output / "local.json", report)
     if not report["qualified"]:
         raise RuntimeError(
             "local GCS qualification failed; inspect retained worker/build logs"
         )
     print(json.dumps(dict(qualified=True, output=str(args.output))), flush=True)
+
+
+def main():
+    with CancellationScope() as cancellation:
+        args = parse_args()
+        if not args.frozen_inputs:
+            args.output.mkdir(parents=True, exist_ok=False)
+        report = dict(
+            version=1,
+            status="preparing",
+            phase="admission",
+            qualified=False,
+            worker_started=False,
+            worker_exit_code=None,
+        )
+        started = time.monotonic()
+        try:
+            write_report(args.output / "local.json", report)
+            run(args, report, cancellation)
+        except BaseException as error:
+            report["qualified"] = False
+            report["status"] = (
+                "cancelled"
+                if cancellation.signum is not None
+                or isinstance(error, KeyboardInterrupt)
+                else "failed"
+            )
+            report["controller_error_type"] = type(error).__name__
+            report["controller_exit_code"] = (
+                128 + cancellation.signum
+                if cancellation.signum is not None
+                else error.code
+                if isinstance(error, SystemExit) and isinstance(error.code, int)
+                else 1
+            )
+            cancellation.check()
+            raise
+        finally:
+            report["controller_wall_seconds"] = time.monotonic() - started
+            write_report(args.output / "local.json", report)
 
 
 if __name__ == "__main__":

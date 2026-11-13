@@ -187,15 +187,16 @@ recorded separately from sampled child scratch.
 Both runners clear inherited bulk/probe flags before applying a case's settings.
 Local-file overrides, compact mode, resume flags and headroom experiments cannot
 silently change a GCS variant. The GCS worker records its explicit probe settings.
-SIGTERM follows the same cleanup path as timeout/interrupt, signals the owned
-worker group and reaps its leader. Cleanup also signals surviving descendants
+SIGTERM and SIGHUP follow the same cleanup path as timeout/interrupt, signal the
+owned worker group and reap its leader. Cleanup also signals surviving descendants
 when the group leader has already exited and is safe to call repeatedly.
 
 The native probe emits the actual complete Parquet inventory. Qualification
 matches file URIs, lengths and immutable revisions against the admitted objects,
 including files that emit no vectors. An explicit generation is checked directly;
-a prefix reader's metadata ETag must match the admitted alias that GCS resolves
-conditionally to that generation. The probe checks the owned expected inventory
+a prefix reader's metadata ETag must match the admitted alias and is enforced
+on the planned media GET. Planned range reads already skip metadata probes.
+The probe checks the owned expected inventory
 before beginning construction, and the worker checks the emitted inventory too.
 Unexpected vectorless files therefore fail admission even when vector count and
 recall would otherwise pass. This is probe-only admission; no publication format
@@ -219,3 +220,60 @@ contracts when both files were admitted; this isolates the inventory regression.
 The recorded report retains both observations. Final validation passed all 87
 build steps, 27 native tests (one guarded S3 skip, no failures/leaks), and all 26
 Python regressions. These synthetic checks are correctness evidence only.
+
+## Failed 1M scale attempt and follow-up
+
+The final optimized 1M attempt failed with `WriteFailed` after 3,017.935988
+seconds during identity ingestion. It produced no construction receipt or
+published index. Its controller disappeared without a final report; the worker
+retained the native failure. The original stale suite report was preserved
+before reconciling it as failed, with the queued incremental/control cases
+unstarted. This is not a qualified 1M performance result.
+
+The [investigation](GCS_BULK_FAILURE_INVESTIGATION.md) records the ambiguous
+historical error separately from a reproduced SIGHUP cleanup defect and an
+unretried conditional GCS POST path. Follow-up coverage exercises interrupted
+uploads, ambiguous commits, digest verification after conflicts, cancellation,
+deadlines and controller cleanup. Native failure records now identify the
+operation boundary, including underlying spool file errors when available.
+
+The follow-up also removes a payload-sized GCS request-body copy. An 8 MiB
+pre-transport comparison allocated 8,388,855 bytes for the owned body and 247
+for the borrowed body. This is an allocation measurement, not a new full-build
+timing. The successful 100K construction remains 299.9 seconds; another 1M
+publication/reopen/recall is required before making scale or throughput claims.
+
+The fresh-review follow-up closes launch/re-exec cancellation windows and covers
+all controller phases with terminal reporting. Native children remain in the
+worker group for escalation, and resource-aware waits preserve usage when
+available. Failed and cancelled cases retain disk-sampling checkpoints and
+last complete samples. Successful attempts require a completed final sample;
+cancelled/failed attempts skip final scanning. Shutdown persists observations
+before a bounded background join, and reports incomplete collection explicitly
+if filesystem I/O stalls. Real-GCS admission rejects ambient storage endpoint overrides;
+ADC mode also rejects nonrefreshable token overrides without logging their
+values. Provider mode and canonical endpoints are attested in the worker report.
+
+`lake-identity-publication-test` compares the existing identity chunk target with
+the largest compatible target, writes and rereads one million keys per case, and
+requires count/order/digest equality for both supported key widths. Measured
+chunk puts fall about 25%, under the same 256 KiB reader limit and an 8 MiB test
+allocator limit. The fresh bulk tracker uses its native owner's existing private
+quota; other tracker callers keep their existing target. See
+[the raw observations](bulk_identity_publication_results.json). Filesystem times
+and logical artifact puts do not establish WAN throughput or HTTP request counts.
+
+Active cases keep their frozen executable/controller/worker/validator inputs.
+Do not replace those inputs when rebuilding the workspace during a scale check.
+
+
+The timeout follow-up distinguishes socket idle timeouts from exhausted total
+request deadlines. Conditional upload replay stays bounded and authenticates an
+existing object after an ambiguous 412. Source-receipt operation timings are
+mandatory for fresh fused cases, and forbidden for resumes/reopen-only cases.
+Owner evidence separately reports the full-build, shared transport and mutable
+map budgets; these nested allocation domains must not be summed as independent
+RSS observations. Fresh bulk mutation batching starts only after stage admission.
+The generation publication fixture records metadata amplification separately from
+native construction throughput; neither that fixture nor the earlier failed 1M
+run establishes a successful large-corpus performance result.

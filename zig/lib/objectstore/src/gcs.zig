@@ -95,6 +95,21 @@ pub const Auth = union(enum) {
     }
 };
 
+/// Optional operation-owned diagnostics. No identifiers, credentials or payload
+/// values are included. The observer must outlive every synchronous request.
+pub const HttpDiagnostic = struct {
+    method: HttpMethod,
+    body_bytes: usize,
+    attempts: usize,
+    elapsed_ns: u64,
+    status: ?u16 = null,
+    failure: ?anyerror = null,
+};
+pub const DiagnosticObserver = struct {
+    ptr: ?*anyopaque = null,
+    report: *const fn (?*anyopaque, HttpDiagnostic) void,
+};
+
 pub const JsonApiConfig = struct {
     endpoint: []u8,
     upload_endpoint: []u8,
@@ -105,8 +120,9 @@ pub const JsonApiConfig = struct {
     request_timeout_ms: ?u64 = null,
     /// Absolute operation budget, including authentication and metadata probes.
     request_deadline_ns: ?u64 = null,
-    /// Borrowed transport policy for scoped content downloads.
+    /// Transport policy; request-specific replay admission never raises its limits.
     http_client_config: ?httpx.ClientConfig = null,
+    diagnostics: ?DiagnosticObserver = null,
     /// Optional borrowed application runtime. When absent, the client owns a
     /// threaded fallback for standalone library use.
     io: ?std.Io = null,
@@ -173,7 +189,12 @@ pub const TransportResponse = struct {
     }
 };
 
-const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8, ?usize, ?types.CancellationToken) anyerror!TransportResponse;
+/// Per-request transport controls, also supplied to injected transports.
+pub const TransportOptions = struct {
+    replay_safe: bool = false,
+    deadline_ns: ?u64 = null,
+};
+const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []const HeaderPair, ?[]const u8, ?[]const u8, ?usize, ?types.CancellationToken, TransportOptions) anyerror!TransportResponse;
 
 const HttpxTransport = struct {
     alloc: Allocator,
@@ -181,6 +202,7 @@ const HttpxTransport = struct {
     client: httpx.Client,
 
     deadline_ns: ?u64 = null,
+    diagnostics: ?DiagnosticObserver = null,
 
     fn init(alloc: Allocator, request_timeout_ms: ?u64, shared_io: ?std.Io) !HttpxTransport {
         return initConfigured(alloc, request_timeout_ms, shared_io, null);
@@ -234,6 +256,7 @@ const HttpxTransport = struct {
         content_type: ?[]const u8,
         max_response_size: ?usize,
         cancellation: ?types.CancellationToken,
+        options: TransportOptions,
     ) !TransportResponse {
         const self: *HttpxTransport = @ptrCast(@alignCast(ctx.?));
 
@@ -244,19 +267,48 @@ const HttpxTransport = struct {
             try request_headers.append(alloc, .{ "Content-Type", value });
         }
 
-        const control = google_auth.RequestControl{ .deadline_ns = self.deadline_ns };
+        const control = google_auth.RequestControl{ .deadline_ns = options.deadline_ns orelse self.deadline_ns };
         try control.check();
+        const Trace = struct {
+            attempts: usize = 0,
+            parent: ?httpx.AttemptObserver,
+            fn before(raw: *anyopaque, context: httpx.AttemptObserver.Context) !void {
+                const trace: *@This() = @ptrCast(@alignCast(raw));
+                if (trace.parent) |parent| try parent.before(parent.ptr, context);
+                trace.attempts += 1;
+            }
+            fn after(raw: *anyopaque, response_: ?*const httpx.Response) void {
+                const trace: *@This() = @ptrCast(@alignCast(raw));
+                if (trace.parent) |parent| parent.after(parent.ptr, response_);
+            }
+        };
+        var trace: Trace = .{ .parent = self.client.config.attempt_observer };
+        const traced = self.diagnostics != null;
+        const started = if (traced) platform.time.monotonicNs() else 0;
         var response = self.client.request(method.toHttpx(), url, .{
+            .attempt_observer = if (traced) .{ .ptr = &trace, .before = Trace.before, .after = Trace.after, .delivery = if (trace.parent) |parent| parent.delivery else null, .output_tokens = if (trace.parent) |parent| parent.output_tokens else 0 } else null,
             .headers = request_headers.items,
-            .body = body,
+            // Synchronous execution joins every attempt before returning.
+            // The caller keeps this immutable slice alive, including retries.
+            .borrowed_body = body,
+            .replay_safe = options.replay_safe,
             .timeout_ms = try control.remainingTimeoutMs(),
             .max_response_size = max_response_size,
             .cancellation = if (cancellation) |token|
                 httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn)
             else
                 null,
-        }) catch |err| return if (err == error.Cancelled) error.Canceled else err;
+        }) catch |err| {
+            if (self.diagnostics) |observer| observer.report(observer.ptr, .{ .method = method, .body_bytes = if (body) |bytes| bytes.len else 0, .attempts = trace.attempts, .elapsed_ns = platform.time.monotonicNs() - started, .failure = err });
+            return if (err == error.Cancelled) error.Canceled else err;
+        };
         defer response.deinit();
+        // A terminal HTTP status is still a successful transport result. Keep
+        // its attempts/timing before provider status mapping, including 412s
+        // that higher layers may authenticate as an ambiguous successful create.
+        if (self.diagnostics) |observer| {
+            if (response.status.code >= 300) observer.report(observer.ptr, .{ .method = method, .body_bytes = if (body) |bytes| bytes.len else 0, .attempts = trace.attempts, .elapsed_ns = platform.time.monotonicNs() - started, .status = response.status.code });
+        }
 
         var result = try transportResponseAlloc(
             alloc,
@@ -328,6 +380,7 @@ pub const JsonApiClient = struct {
         errdefer alloc.destroy(transport);
         transport.* = try HttpxTransport.initConfigured(alloc, cfg.request_timeout_ms, cfg.io, cfg.http_client_config);
         transport.deadline_ns = cfg.request_deadline_ns;
+        transport.diagnostics = cfg.diagnostics;
         return .{
             .alloc = alloc,
             .cfg = cfg,
@@ -335,6 +388,12 @@ pub const JsonApiClient = struct {
             .request_fn = HttpxTransport.request,
             .owned_httpx = transport,
         };
+    }
+
+    /// Configure only while this owned client is quiescent, before dispatch.
+    pub fn setDiagnostics(self: *JsonApiClient, observer: ?DiagnosticObserver) void {
+        self.cfg.diagnostics = observer;
+        if (self.owned_httpx) |transport| transport.diagnostics = observer;
     }
 
     pub fn initWithRequestFn(
@@ -515,7 +574,10 @@ pub const JsonApiClient = struct {
         defer headers.deinit(alloc);
         try appendConditionalHeaders(alloc, &headers, opts.if_match_etag, opts.if_none_match);
 
-        var response = try self.performWithResponseLimitAndCancellationAlloc(
+        // Replaying a create-only POST cannot replace a committed object.
+        // An ambiguous success becomes a 412 on retry; return that conflict
+        // so the content-addressed artifact caller can authenticate the winner.
+        var response = try self.performWithReplaySafetyAlloc(
             alloc,
             .POST,
             url,
@@ -524,6 +586,7 @@ pub const JsonApiClient = struct {
             opts.content_type orelse "application/octet-stream",
             metadata_response_limit,
             opts.cancellation,
+            opts.if_none_match,
         );
         defer response.deinit(alloc);
 
@@ -1054,6 +1117,21 @@ pub const JsonApiClient = struct {
         max_response_size: ?usize,
         cancellation: ?types.CancellationToken,
     ) !TransportResponse {
+        return self.performWithReplaySafetyAlloc(alloc, method, url, headers, body, content_type, max_response_size, cancellation, false);
+    }
+
+    fn performWithReplaySafetyAlloc(
+        self: *JsonApiClient,
+        alloc: Allocator,
+        method: HttpMethod,
+        url: []const u8,
+        headers: []const HeaderPair,
+        body: ?[]const u8,
+        content_type: ?[]const u8,
+        max_response_size: ?usize,
+        cancellation: ?types.CancellationToken,
+        replay_safe: bool,
+    ) !TransportResponse {
         if (cancellation) |token| try token.check();
         var merged = std.ArrayListUnmanaged(HeaderPair).empty;
         defer merged.deinit(alloc);
@@ -1083,6 +1161,7 @@ pub const JsonApiClient = struct {
             content_type,
             max_response_size,
             cancellation,
+            .{ .replay_safe = replay_safe, .deadline_ns = control.deadline_ns },
         );
     }
 
@@ -1973,7 +2052,18 @@ test "gcs file upload completes a resumable lifecycle with bounded chunks" {
     const State = struct {
         calls: usize = 0,
 
-        fn request(ctx: ?*anyopaque, request_alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, body: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+        fn request(
+            ctx: ?*anyopaque,
+            request_alloc: Allocator,
+            method: HttpMethod,
+            url: []const u8,
+            _: []const HeaderPair,
+            body: ?[]const u8,
+            _: ?[]const u8,
+            _: ?usize,
+            _: ?types.CancellationToken,
+            _: TransportOptions,
+        ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             defer self.calls += 1;
             return switch (self.calls) {
@@ -2078,6 +2168,7 @@ fn testGenerationPinnedReads(alloc: Allocator, client_alloc: Allocator) !void {
             content_type: ?[]const u8,
             max_response_size: ?usize,
             _: ?types.CancellationToken,
+            _: TransportOptions,
         ) !TransportResponse {
             _ = body;
             _ = content_type;
@@ -2222,6 +2313,7 @@ test "gcs cancellation reaches active read and write requests" {
             _: ?[]const u8,
             _: ?usize,
             cancellation: ?types.CancellationToken,
+            _: TransportOptions,
         ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             self.calls += 1;
@@ -2324,6 +2416,7 @@ test "json api client put object encodes upload url and returns etag" {
             content_type: ?[]const u8,
             _: ?usize,
             _: ?types.CancellationToken,
+            _: TransportOptions,
         ) !TransportResponse {
             try std.testing.expectEqual(HttpMethod.POST, method);
             try std.testing.expectEqualStrings("https://storage.googleapis.com/upload/storage/v1/b/bucket/o?uploadType=media&name=folder%2Fdoc.txt&ifGenerationMatch=0", url);
@@ -2369,6 +2462,7 @@ test "json api client persists informational caller SHA-256 metadata" {
             content_type: ?[]const u8,
             _: ?usize,
             _: ?types.CancellationToken,
+            _: TransportOptions,
         ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             self.calls += 1;
@@ -2422,6 +2516,7 @@ test "json api client lists objects and prefixes" {
             content_type: ?[]const u8,
             _: ?usize,
             _: ?types.CancellationToken,
+            _: TransportOptions,
         ) !TransportResponse {
             _ = headers;
             _ = body;
@@ -2472,6 +2567,7 @@ test "json api client make bucket requires project id" {
             _: ?[]const u8,
             _: ?usize,
             _: ?types.CancellationToken,
+            _: TransportOptions,
         ) !TransportResponse {
             return error.Unreachable;
         }
@@ -2508,8 +2604,10 @@ test "json api client round-trips against env-configured endpoint" {
 
     var put = try client.putObject(bucket, key, "hello-gcs", .{
         .content_type = "text/plain",
+        .if_none_match = true,
     });
     defer put.deinit(alloc);
+    try std.testing.expectError(error.PreconditionFailed, client.putObject(bucket, key, "replacement", .{ .if_none_match = true }));
 
     var meta = try client.statObject(bucket, key);
     defer meta.deinit(alloc);
@@ -2575,7 +2673,18 @@ fn expectHeader(headers: []const HeaderPair, name: []const u8, value: []const u8
 test "gcs version retention never certifies live artifact names" {
     const a = std.testing.allocator;
     const State = struct {
-        fn request(_: ?*anyopaque, _: Allocator, _: HttpMethod, _: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+        fn request(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: HttpMethod,
+            _: []const u8,
+            _: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            _: ?usize,
+            _: ?types.CancellationToken,
+            _: TransportOptions,
+        ) !TransportResponse {
             // Declining this capability must not depend on today's bucket
             // configuration: versioning can change after a certificate is made.
             return error.UnexpectedRetentionRequest;
@@ -2605,7 +2714,18 @@ test "gcs exact generation retention requires locked mode identity and provider 
     try std.testing.expect((try parseVersionRetention(a, "{\"name\":\"folder/key\",\"generation\":\"123\",\"retention\":{\"mode\":\"Unlocked\",\"retainUntilTime\":\"2030-01-01T00:00:00Z\"}}", date, "123", "folder/key")) == null);
     const State = struct {
         calls: usize = 0,
-        fn request(raw: ?*anyopaque, alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, limit: ?usize, _: ?types.CancellationToken) !TransportResponse {
+        fn request(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            method: HttpMethod,
+            url: []const u8,
+            _: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            limit: ?usize,
+            _: ?types.CancellationToken,
+            _: TransportOptions,
+        ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.calls += 1;
             try std.testing.expectEqual(HttpMethod.GET, method);
@@ -2643,7 +2763,18 @@ test "gcs upload generation ownership survives allocation failure" {
 test "gcs exact reads reject contradictory response generations with and without metadata probes" {
     const a = std.testing.allocator;
     const State = struct {
-        fn request(_: ?*anyopaque, alloc: Allocator, _: HttpMethod, url: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+        fn request(
+            _: ?*anyopaque,
+            alloc: Allocator,
+            _: HttpMethod,
+            url: []const u8,
+            _: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            _: ?usize,
+            _: ?types.CancellationToken,
+            _: TransportOptions,
+        ) !TransportResponse {
             try std.testing.expect(std.mem.indexOf(u8, url, "generation=123") != null);
             if (std.mem.indexOf(u8, url, "alt=media") == null) return .{ .status = 200, .body = try alloc.dupe(u8, "{\"name\":\"key\",\"generation\":\"123\",\"size\":\"1\"}") };
             const body = try alloc.dupe(u8, "x");
@@ -2697,7 +2828,18 @@ test "gcs version listing qualifies opaque pagination bounded responses and tran
     const a = std.testing.allocator;
     const State = struct {
         calls: usize = 0,
-        fn request(raw: ?*anyopaque, alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, limit: ?usize, cancellation: ?types.CancellationToken) !TransportResponse {
+        fn request(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            method: HttpMethod,
+            url: []const u8,
+            _: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            limit: ?usize,
+            cancellation: ?types.CancellationToken,
+            _: TransportOptions,
+        ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.calls += 1;
             try std.testing.expectEqual(HttpMethod.GET, method);
@@ -2738,7 +2880,18 @@ test "gcs revision publication and deletion use one generation conditional reque
     const a = std.testing.allocator;
     const State = struct {
         calls: usize = 0,
-        fn request(raw: ?*anyopaque, alloc: Allocator, method: HttpMethod, url: []const u8, headers: []const HeaderPair, body: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+        fn request(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            method: HttpMethod,
+            url: []const u8,
+            headers: []const HeaderPair,
+            body: ?[]const u8,
+            _: ?[]const u8,
+            _: ?usize,
+            _: ?types.CancellationToken,
+            _: TransportOptions,
+        ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.calls += 1;
             try std.testing.expectEqual(@as(usize, 0), headers.len);
@@ -2776,7 +2929,18 @@ test "gcs legacy ETag publication resolves a generation and cannot overwrite a c
     const a = std.testing.allocator;
     const State = struct {
         calls: usize = 0,
-        fn request(raw: ?*anyopaque, alloc: Allocator, method: HttpMethod, url: []const u8, headers: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+        fn request(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            method: HttpMethod,
+            url: []const u8,
+            headers: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            _: ?usize,
+            _: ?types.CancellationToken,
+            _: TransportOptions,
+        ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.calls += 1;
             try std.testing.expectEqual(@as(usize, 0), headers.len);
@@ -2803,7 +2967,18 @@ test "gcs response-only control read captures its publication generation in one 
     const a = std.testing.allocator;
     const State = struct {
         calls: usize = 0,
-        fn request(raw: ?*anyopaque, alloc: Allocator, method: HttpMethod, url: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+        fn request(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            method: HttpMethod,
+            url: []const u8,
+            _: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            _: ?usize,
+            _: ?types.CancellationToken,
+            _: TransportOptions,
+        ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.calls += 1;
             try std.testing.expectEqual(HttpMethod.GET, method);
@@ -2827,7 +3002,18 @@ test "gcs legacy media ETag is verified against a bounded captured generation be
     const a = std.testing.allocator;
     const State = struct {
         calls: usize = 0,
-        fn request(raw: ?*anyopaque, alloc: Allocator, method: HttpMethod, url: []const u8, headers: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, limit: ?usize, _: ?types.CancellationToken) !TransportResponse {
+        fn request(
+            raw: ?*anyopaque,
+            alloc: Allocator,
+            method: HttpMethod,
+            url: []const u8,
+            headers: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            limit: ?usize,
+            _: ?types.CancellationToken,
+            _: TransportOptions,
+        ) !TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.calls += 1;
             switch (self.calls) {
@@ -2883,7 +3069,18 @@ test "GCS expired operation deadline fails before transport dispatch" {
 
 test "GCS metadata replacement releases every partial allocation" {
     const Fixture = struct {
-        fn request(_: ?*anyopaque, a: Allocator, _: HttpMethod, url: []const u8, _: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+        fn request(
+            _: ?*anyopaque,
+            a: Allocator,
+            _: HttpMethod,
+            url: []const u8,
+            _: []const HeaderPair,
+            _: ?[]const u8,
+            _: ?[]const u8,
+            _: ?usize,
+            _: ?types.CancellationToken,
+            _: TransportOptions,
+        ) !TransportResponse {
             if (std.mem.indexOf(u8, url, "alt=media") != null)
                 return transportResponseAlloc(a, 200, "x", "http-etag", "new/type", null);
             return transportResponseAlloc(a, 200, "{\"name\":\"doc\",\"bucket\":\"bucket\",\"etag\":\"json-etag\",\"generation\":\"42\",\"size\":\"1\",\"contentType\":\"old/type\"}", null, "application/json", null);
@@ -2904,4 +3101,115 @@ test "GCS metadata replacement releases every partial allocation" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "gcs conditional media creates retry ambiguous responses without widening ordinary POST safety" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const metadata = "{\"name\":\"object\",\"generation\":\"42\",\"size\":\"7\"}";
+    const Case = struct {
+        create_only: bool = true,
+        first_status: u16 = 200,
+        disconnect: bool = false,
+        truncate: bool = false,
+        second_status: u16 = 201,
+        retries: u32 = 3,
+        expected: ?anyerror = null,
+        attempts: usize = 2,
+        timeout_ms: u64 = 3000,
+        retry_delay_ms: u64 = 1,
+        cancel_after_first: bool = false,
+    };
+    for ([_]Case{
+        .{ .disconnect = true },
+        .{ .truncate = true, .second_status = 412, .expected = error.PreconditionFailed },
+        .{ .create_only = false, .truncate = true, .expected = error.UnexpectedEof, .attempts = 1 },
+        .{ .first_status = 503 },
+        .{ .first_status = 403, .expected = error.AccessDenied, .attempts = 1 },
+        .{ .first_status = 503, .retries = 0, .expected = error.RemoteUnavailable, .attempts = 1 },
+        .{ .first_status = 503, .second_status = 503, .retries = 1, .expected = error.RemoteUnavailable },
+        .{ .first_status = 503, .timeout_ms = 1000, .retry_delay_ms = 10000, .expected = error.Timeout, .attempts = 1 },
+        .{ .first_status = 503, .cancel_after_first = true, .retry_delay_ms = 1000, .expected = error.Canceled, .attempts = 1 },
+    }) |case| {
+        var canceled: std.atomic.Value(bool) = .init(false);
+        const Check = struct {
+            var cancel: ?*std.atomic.Value(bool) = null;
+            fn request(info: httpx.testing_mod.RequestInfo) !void {
+                try std.testing.expectEqualStrings("payload", info.body);
+                try std.testing.expect(std.mem.indexOf(u8, info.query, "uploadType=media") != null);
+                if (cancel) |signal| signal.store(true, .release);
+            }
+            fn createOnly(info: httpx.testing_mod.RequestInfo) !void {
+                try std.testing.expectEqualStrings("uploadType=media&name=object&ifGenerationMatch=0", info.query);
+                try request(info);
+            }
+        };
+        Check.cancel = if (case.cancel_after_first) &canceled else null;
+        var server = try httpx.testing_mod.TestServer.start(a, io, &.{
+            .{ .method = .POST, .path = "/upload/storage/v1/b/bucket/o", .max_uses = 1, .assert_request = if (case.create_only) Check.createOnly else Check.request, .respond = .{ .status = case.first_status, .body = metadata, .truncate_body_at = if (case.truncate) 2 else null, .disconnect_before_response = case.disconnect } },
+            .{ .method = .POST, .path = "/upload/storage/v1/b/bucket/o", .assert_request = if (case.create_only) Check.createOnly else Check.request, .respond = .{ .status = case.second_status, .body = metadata } },
+        });
+        defer server.deinit();
+        const Task = struct {
+            fn serve(ts: *httpx.testing_mod.TestServer, attempts: usize) std.Io.Cancelable!void {
+                for (0..attempts) |_| ts.handleOne() catch return;
+            }
+        };
+        var group: std.Io.Group = .init;
+        try group.concurrent(io, Task.serve, .{ &server, case.attempts });
+        defer group.cancel(io);
+        var json_client = try JsonApiClient.init(a, .{
+            .endpoint = try std.fmt.allocPrint(a, "{s}/storage/v1", .{server.baseUrl()}),
+            .upload_endpoint = try std.fmt.allocPrint(a, "{s}/upload/storage/v1", .{server.baseUrl()}),
+            .io = io,
+            .request_timeout_ms = case.timeout_ms,
+            .http_client_config = .{ .keep_alive = false, .retry_policy = .{ .max_retries = case.retries, .initial_delay_ms = case.retry_delay_ms } },
+        });
+        var client = json_client.client();
+        defer client.deinit();
+        const result = client.putObject("bucket", "object", "payload", .{ .if_none_match = case.create_only, .cancellation = types.CancellationToken.fromAtomic(&canceled) });
+        if (case.expected) |err| {
+            try std.testing.expectError(err, result);
+        } else {
+            var value = try result;
+            defer value.deinit(a);
+            try std.testing.expectEqualStrings("42", value.version_id.?);
+        }
+        // A deadline can fire before the server accepts the first connection.
+        // Join by cancellation on error rather than wait forever for a request
+        // that the client is no longer obliged to send.
+        if (case.expected != null) group.cancel(io) else try group.await(io);
+        try std.testing.expectEqual(case.attempts, server.route_hits[0] + server.route_hits[1]);
+    }
+}
+
+test "gcs synchronous uploads borrow immutable bodies instead of copying corpus bytes" {
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 8 * 1024 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'v');
+    const Check = struct {
+        expected: []const u8,
+        borrowed: bool = false,
+        fn intercept(req: *httpx.Request, ptr: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.borrowed = !req.body_owned and req.body.?.ptr == self.expected.ptr;
+            return error.AllocationMeasured;
+        }
+    };
+    var counted = std.testing.FailingAllocator.init(a, .{});
+    var transport = try HttpxTransport.init(counted.allocator(), null, std.testing.io);
+    defer transport.deinit();
+    var check: Check = .{ .expected = payload };
+    try transport.client.addInterceptor(.{ .context = &check, .request_fn = Check.intercept });
+    const before_owned = counted.allocated_bytes;
+    try std.testing.expectError(error.AllocationMeasured, transport.client.request(.POST, "http://127.0.0.1/upload", .{ .body = payload }));
+    const owned_bytes = counted.allocated_bytes - before_owned;
+    try std.testing.expect(!check.borrowed);
+    const before_borrowed = counted.allocated_bytes;
+    try std.testing.expectError(error.AllocationMeasured, HttpxTransport.request(&transport, counted.allocator(), .POST, "http://127.0.0.1/upload", &.{}, payload, null, metadata_response_limit, null, .{ .replay_safe = true }));
+    const borrowed_bytes = counted.allocated_bytes - before_borrowed;
+    try std.testing.expect(check.borrowed);
+    try std.testing.expect(owned_bytes >= borrowed_bytes + payload.len);
+    std.debug.print("gcs upload allocation: body_bytes={} owned_allocated={} borrowed_allocated={}\n", .{ payload.len, owned_bytes, borrowed_bytes });
 }
