@@ -317,7 +317,8 @@ TASK_NAME_BY_DIR = {
     "extractors": "extract",
 }
 
-LISTING_BOOTSTRAP = {
+DEFAULT_E2E_MODELS = {
+    "generators": GENERATOR_MODELS[0],
     "embedders": EMBEDDER_MODELS[0],
     "rerankers": RERANKER_MODELS[0],
     "classifiers": CLASSIFIER_MODELS[0],
@@ -336,7 +337,6 @@ GENERATOR_ENV_VARS = (
 READER_ENV_VARS = (
     "ANTFLY_INFERENCE_FLORENCE_MODEL",
     "ANTFLY_INFERENCE_TROCR_MODEL",
-    "ANTFLY_INFERENCE_DONUT_MODEL",
     "ANTFLY_INFERENCE_MULTISTAGE_READER_MODEL",
     "ANTFLY_INFERENCE_PADDLEOCR_MODEL",
     "ANTFLY_INFERENCE_SURYA_READER_MODEL",
@@ -1046,21 +1046,51 @@ def _env_model_specs() -> list[ModelSpec]:
     return specs
 
 
-def bootstrap_models_for_listing(listing: dict) -> bool:
+def prefetch_test_models(items: list[tuple[str, str | None]]) -> None:
+    """Provision only the selected tests' default families, before server start.
+
+    Catalog discovery must never pull weights. Explicit requests retain their
+    single-model missing-model retry, including optional secondary models.
+    """
     if not inference_download_enabled():
-        return False
-
-    env_specs = _env_model_specs()
-    explicit_keys = {(spec.task, spec.request_name.lower()) for spec in env_specs}
-    planned: list[ModelSpec] = []
-    for category, spec in LISTING_BOOTSTRAP.items():
-        if listing.get(category):
-            continue
-        planned.append(spec)
-
-    planned.extend(env_specs)
-
-    changed = False
+        return
+    families = {
+        "test_chat.py": {"generators"},
+        "test_generate.py": {"generators"},
+        "test_openai_compat.py": {"generators"},
+        "test_classify.py": {"classifiers"},
+        "test_extract.py": {"extractors"},
+        "test_embed.py": {"embedders"},
+        "test_sparse_embed.py": {"embedders"},
+        "test_rerank.py": {"rerankers"},
+        "test_read.py": {"readers"},
+        "test_dictate.py": {"transcribers"},
+        "test_transcribe.py": {"transcribers"},
+        "test_transcription_sessions.py": {"transcribers"},
+        "test_models.py": {"embedders", "classifiers", "extractors", "readers"},
+    }
+    tasks: set[str] = set()
+    for file, affinity in items:
+        if affinity == "generator":
+            tasks.add("generators")
+        elif affinity == "reader":
+            tasks.add("readers")
+        elif affinity == "eviction":
+            tasks.add("embedders")
+        else:
+            tasks.update(families.get(file, ()))
+    explicit = [spec for spec in _env_model_specs() if spec.task in tasks]
+    explicit_keys = {(spec.task, spec.request_name.lower()) for spec in explicit}
+    planned = [
+        spec
+        for task, spec in DEFAULT_E2E_MODELS.items()
+        if task in tasks
+        and not (
+            task == "generators"
+            and os.environ.get("ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL")
+        )
+    ]
+    planned.extend(explicit)
     seen: set[tuple[str, str]] = set()
     for spec in planned:
         key = (spec.task, spec.request_name.lower())
@@ -1069,11 +1099,7 @@ def bootstrap_models_for_listing(listing: dict) -> bool:
         seen.add(key)
         if spec.large and key not in explicit_keys and not run_large_model_tests():
             continue
-        if model_available(spec):
-            continue
         ensure_model(spec)
-        changed = True
-    return changed
 
 
 def prefetch_curated_models() -> None:

@@ -115,10 +115,6 @@ def _normalize_text(value: str) -> str:
     return " ".join(value.split()).lower()
 
 
-def _donut_docvqa_prompt(question: str) -> str:
-    return f"<s_docvqa><s_question>{question}</s_question><s_answer>"
-
-
 def _assert_text_contains_any(observed_text: str, env_name: str) -> None:
     expected = _env_csv(env_name)
     if not expected:
@@ -133,9 +129,7 @@ def _assert_known_model_output(
     normalized_model = model.strip().lower()
     normalized_text = _normalize_text(observed_text)
 
-    if fixture_present and normalized_model == "xenova/donut-base-finetuned-cord-v2":
-        assert normalized_text == "box"
-    elif fixture_present and normalized_model == "xenova/pix2struct-docvqa-base":
+    if fixture_present and normalized_model == "xenova/pix2struct-docvqa-base":
         assert "text box" in normalized_text
 
 
@@ -354,44 +348,6 @@ def test_read_recovers_after_forced_run_admission_denials():
         )
     finally:
         server.stop()
-
-
-@pytest.mark.multimodal
-def test_read_donut_model_exposes_optional_fields(api):
-    """Donut-family readers should round-trip through the richer result shape."""
-    model = os.environ.get("ANTFLY_INFERENCE_DONUT_MODEL") or _find_reader_model(
-        api, "donut"
-    )
-    if not model:
-        pytest.skip("No Donut reader model is available")
-
-    fixture = load_go_sample_page_fixture()
-    if fixture is not None:
-        image, _phrases = fixture
-    else:
-        image = TINY_PNG_URI
-    prompt = (
-        _donut_docvqa_prompt("What is the document type?") if fixture else "<s_cord-v2>"
-    )
-
-    resp = api.read(images=[image], model=model, prompt=prompt)
-    results = resp["data"]
-    assert len(results) == 1
-    _assert_read_result_shape(results[0])
-    assert isinstance(results[0]["text"], str)
-    assert results[0]["text"].strip()
-    _assert_known_model_output(model, results[0]["text"], fixture is not None)
-    _assert_text_contains_any(
-        results[0]["text"], "ANTFLY_INFERENCE_DONUT_EXPECT_TEXT_ANY"
-    )
-
-    # Donut readers may emit structured fields on some inputs; when present they must
-    # use the flattened object shape expected by the Go API.
-    if "fields" in results[0]:
-        assert isinstance(results[0]["fields"], dict)
-        _assert_fields_include_any(
-            results[0]["fields"], "ANTFLY_INFERENCE_DONUT_EXPECT_FIELDS_ANY"
-        )
 
 
 @pytest.mark.multimodal
