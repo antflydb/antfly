@@ -15730,7 +15730,6 @@ pub const NativeFile = struct {
         // call's own check-and-consume still sees the true value it needs.
         defer self.claimed_active_writer = false;
         const previous = self.transaction_header orelse return error.InvalidTransactionState;
-        defer self.debugExitCommitSpan();
         // A deferred (non-durable) commit never calls publishCheckpoint or
         // tryBuildCommitManifest below -- it only stages `next` into
         // self.header and returns, with no durability barrier at all. Its
@@ -15754,6 +15753,21 @@ pub const NativeFile = struct {
         }
         self.header = previous;
         self.transaction_header = null;
+        // Registered only from here on, not right after confirming
+        // `previous` above: a failure in `flushTransactionWrites`/
+        // `sealAllocatorCheckpoint` (both fallible, both run before this
+        // point) leaves `transaction_header` still set, so the caller's own
+        // `errdefer self.abortTransaction()` is what actually closes this
+        // span -- and `abortTransaction` runs its own `debugExitCommitSpan`
+        // exactly once for that. Deferring this call unconditionally right
+        // after confirming `previous`, as an earlier version of this guard
+        // did, double-decremented `commit_span_depth` on that exact
+        // failure path (this function's own defer firing on the error
+        // return, then `abortTransaction`'s firing again right after) --
+        // caught by its own `std.debug.assert(previous > 0)` panicking,
+        // live, under `checkpointRedoLog`'s injected-fault crash-sweep
+        // coverage.
+        defer self.debugExitCommitSpan();
         errdefer {
             if (!self.checkpoint_publication_uncertain) {
                 self.discardTransactionTail();
