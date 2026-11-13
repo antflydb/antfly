@@ -16,12 +16,23 @@ struct PreparedModelSetup: Sendable {
   let runtime: ManagedRuntime
   private let managedAppleSupport: @MainActor () -> Bool
   var canUseManagedAppleSpeech: Bool { managedAppleSupport() }
-  private var runtimeModeTask: Task<Void, Never>?
+  private(set) var runtimeModeTask: Task<Void, Never>?
   private(set) var modelSetupTask: Task<Void, Never>?
   @Published private(set) var modelSetup = ModelSetupState.idle
   var settingUpModel: Bool { modelSetup.isRunning }
   @Published private(set) var hasPendingSetupCommit = false
-  var settingsLocked: Bool { working || hasPendingSetupCommit }
+  @Published private(set) var savingSettings = false
+  @Published private(set) var exporting = false
+  var isBusy: Bool { working || savingSettings }
+  var settingsLocked: Bool { isBusy || hasPendingSetupCommit }
+  var canCancelModelSetup: Bool { settingUpModel && !savingSettings }
+  private var settingsWriteOwner: UUID?
+  private(set) var settingsTask: Task<Void, Never>?
+  private(set) var settingsCommitTask: Task<String?, Error>?
+  private(set) var settingsCleanupTask: Task<Void, Never>?
+  private(set) var exportTask: Task<Void, Never>?
+  private let settingsWriter: AtomicFileWriter
+  private let exportWriter: AtomicFileWriter
   private var pendingSetupCommit: (prepared: PreparedModelSetup, baseline: Configuration)?
   private var setupCleanupResolution = CleanupResolution.requireCompatible
   private var setupProcessingResolution = ProcessingResolution.requireCompatible
@@ -51,6 +62,10 @@ struct PreparedModelSetup: Sendable {
     }
   }
   private var verifiedSpeech: SpeechSelection?
+  var engineReadinessMessage: String {
+    engineReadiness.message(
+      for: config.usesManagedRuntime ? .onThisMac : .externalServer(config.server))
+  }
   var engineReadiness: SpeechReadiness {
     if config.usesManagedRuntime && !runtime.ready { return .unavailable(runtime.status) }
     switch discoveryState {
@@ -178,6 +193,8 @@ struct PreparedModelSetup: Sendable {
     },
     clientFactory: (@Sendable (Configuration) throws -> AntflyClient)? = nil,
     managedAppleSupport: (@MainActor () -> Bool)? = nil,
+    settingsWriter: AtomicFileWriter? = nil,
+    exportWriter: AtomicFileWriter? = nil,
     shortcutManager: (any ShortcutManaging)? = nil,
     originalPaster: (
       @MainActor (String, @escaping @MainActor () throws -> Void) async throws -> Void
@@ -211,6 +228,8 @@ struct PreparedModelSetup: Sendable {
       ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
       .appendingPathComponent("AntflyDictation")
     self.directory = directory
+    self.settingsWriter = settingsWriter ?? AtomicFileWriter(ownedDirectory: directory)
+    self.exportWriter = exportWriter ?? AtomicFileWriter(ownedDirectory: directory)
     let managedRuntime = ManagedRuntime(directory: directory)
     runtime = managedRuntime
     self.managedAppleSupport = managedAppleSupport ?? { managedRuntime.supportsAppleSpeech }
@@ -326,6 +345,12 @@ struct PreparedModelSetup: Sendable {
       if config.usesManagedRuntime { runtime.start() }
       refreshModels()
     }
+    settingsCleanupTask = Task { [weak self, writer = self.settingsWriter] in
+      do { try await writer.recoverAbandonedWrites() } catch {
+        guard let self, !terminating else { return }
+        message = "Could not clean abandoned settings writes: " + error.localizedDescription
+      }
+    }
   }
   private func client(_ snapshot: Configuration? = nil, token suppliedToken: String? = nil) throws
     -> AntflyClient
@@ -354,7 +379,9 @@ struct PreparedModelSetup: Sendable {
     shortcutStatus = "Shortcut active: " + shortcut.label
   }
   func refreshShortcutAccess() {
-    guard state == .idle, !hasPendingSetupCommit, !capturingShortcut else { return }
+    guard state == .idle, !savingSettings, !hasPendingSetupCommit, !capturingShortcut else {
+      return
+    }
     if shortcutSetupPending {
       if keyboardAccess() { completeShortcutSetup() }
       return
@@ -394,50 +421,110 @@ struct PreparedModelSetup: Sendable {
     settingsOpener("com.apple.Keyboard-Settings.extension")
   }
   private func completeShortcutSetup() {
-    guard shortcutSetupPending, keyboardAccess() else { return }
-    let previous = registered
-    do {
-      if let settingsLoadError { throw DictationError.invalid(settingsLoadError) }
-      // Apply only the shortcut, preserving saved preferences and credentials.
-      let previousData =
-        FileManager.default.fileExists(atPath: settingsFile.path)
-        ? try Data(contentsOf: settingsFile) : nil
-      var saved = try previousData.map { try Configuration.decode($0) } ?? Configuration()
-      let shortcut = try config.effectiveShortcut.validated()
-      saved.effectiveShortcut = shortcut
-      let bytes = try JSONEncoder().encode(saved.validated())
-      if registered != shortcut || hotkey?.isAvailable == false { try hotkey?.register(shortcut) }
-      do { try write(bytes, to: settingsFile) } catch {
-        do {
-          if let previous { try hotkey?.register(previous) } else { hotkey?.unregister() }
-        } catch {
-          hotkey?.unregister()
-          registered = nil
+    guard shortcutSetupPending, keyboardAccess(), !isBusy else { return }
+    let chosen = config.effectiveShortcut
+    startSettingsTask { [self] owner in
+      do {
+        if let settingsLoadError { throw DictationError.invalid(settingsLoadError) }
+        await settingsCleanupTask?.value
+        var saved =
+          try await settingsWriter.readConfigurationIfPresent(at: settingsFile) ?? Configuration()
+        guard shortcutSetupPending else { return }
+        let previous = registered
+        let shortcut = try chosen.validated()
+        saved.effectiveShortcut = shortcut
+        let bytes = try JSONEncoder().encode(saved.validated())
+        if !terminating && (registered != shortcut || hotkey?.isAvailable == false) {
+          try hotkey?.register(shortcut)
         }
-        // AtomicSettingsFile leaves the destination unchanged on failure.
-        throw error
+        do { try await settingsWriter.write(bytes, to: settingsFile) } catch {
+          if !terminating {
+            do {
+              if let previous { try hotkey?.register(previous) } else { hotkey?.unregister() }
+            } catch {
+              hotkey?.unregister()
+              registered = nil
+            }
+          }
+          throw error
+        }
+        savedConfiguration = saved
+        config.effectiveShortcut = shortcut
+        updateSettingsDirtyState()
+        registered = shortcut
+        shortcutSetupPending = false
+        if terminating { hotkey?.unregister() }
+        if let hotkey, !hotkey.isAvailable, !terminating {
+          shortcutStatus =
+            "Shortcut saved but not active. Enable Accessibility access, then set up the shortcut again."
+          shortcutSetupStatus = shortcutStatus
+        } else {
+          shortcutStatus = "Shortcut saved: " + shortcut.label
+          shortcutSetupStatus = "\(shortcut.label) is enabled and saved."
+        }
+        message = shortcutSetupStatus
+      } catch {
+        shortcutSetupPending = false
+        shortcutSetupStatus = "Could not set up shortcut: " + error.localizedDescription
+        message = shortcutSetupStatus
       }
-      savedConfiguration = saved
-      config.effectiveShortcut = shortcut
-      updateSettingsDirtyState()
-      registered = shortcut
-      shortcutStatus = "Shortcut active: " + shortcut.label
-      shortcutSetupPending = false
-      shortcutSetupStatus =
-        "\(shortcut.label) is enabled and saved. \(config.toggle ? "Press" : "Hold") \(shortcut.label) to dictate."
-      message = shortcutSetupStatus
-    } catch {
-      shortcutSetupPending = false
-      shortcutSetupStatus = "Could not set up shortcut: " + error.localizedDescription
-      message = shortcutSetupStatus
+      _ = owner  // Reservation spans registration, durable write, and outcome application.
     }
   }
-
-  private func write(_ data: Data, to url: URL) throws {
-    try AtomicSettingsFile.write(data, to: url)
+  private func reserveSettingsWrite() throws -> UUID {
+    guard settingsWriteOwner == nil else {
+      throw DictationError.invalid("A settings save is already in progress.")
+    }
+    let owner = UUID()
+    settingsWriteOwner = owner
+    savingSettings = true
+    return owner
   }
-  private func persistSettings(_ proposed: Configuration? = nil) throws -> String? {
-    let candidate = try (proposed ?? config).validated()
+  private func releaseSettingsWrite(_ owner: UUID) {
+    guard settingsWriteOwner == owner else { return }
+    settingsWriteOwner = nil
+    savingSettings = false
+  }
+  private func startSettingsTask(
+    allowPending: Bool = false,
+    action: @escaping @MainActor (UUID) async throws -> Void
+  ) {
+    guard !terminating, !isBusy, state == .idle, !capturingShortcut,
+      allowPending || !hasPendingSetupCommit
+    else { return }
+    do {
+      let owner = try reserveSettingsWrite()
+      settingsTask = Task { [self] in
+        defer {
+          releaseSettingsWrite(owner)
+          settingsTask = nil
+        }
+        do { try await action(owner) } catch { message = error.localizedDescription }
+      }
+    } catch { message = error.localizedDescription }
+  }
+  private func persistSettings(_ proposed: Configuration? = nil, reservation: UUID? = nil)
+    async throws -> String?
+  {
+    guard !terminating || reservation != nil else { throw CancellationError() }
+    if reservation == nil { try Task.checkCancellation() }
+    let owner = try reservation ?? reserveSettingsWrite()
+    guard settingsWriteOwner == owner else {
+      throw DictationError.invalid("The settings write reservation expired.")
+    }
+    let candidate = proposed ?? config
+    let task = Task { [self] in try await applySettingsCommit(candidate) }
+    settingsCommitTask = task
+    defer {
+      settingsCommitTask = nil
+      if reservation == nil { releaseSettingsWrite(owner) }
+    }
+    // This owned task is not canceled mid-write: its disk outcome must be applied.
+    return try await task.value
+  }
+  private func applySettingsCommit(_ proposed: Configuration) async throws -> String? {
+    await settingsCleanupTask?.value
+    let candidate = try proposed.validated()
     let recoveringSettings = settingsLoadError != nil
     var recoveredHistory: [HistoryEntry]?
     if recoveringSettings, candidate.retainHistory,
@@ -455,8 +542,10 @@ struct PreparedModelSetup: Sendable {
       credentialEdited = false
     }
     // Publish to disk before activating the candidate or applying retention changes.
-    try write(JSONEncoder().encode(candidate), to: settingsFile)
+    try await settingsWriter.write(JSONEncoder().encode(candidate), to: settingsFile)
+    let previousManagedMode = config.usesManagedRuntime
     config = candidate
+    if previousManagedMode != candidate.usesManagedRuntime && !terminating { runtimeModeChanged() }
     savedConfiguration = candidate
     updateSettingsDirtyState()
     if let recoveredHistory {
@@ -464,9 +553,11 @@ struct PreparedModelSetup: Sendable {
       historyRevision += 1
     }
     var applicationWarning: String?
-    do { try registerShortcut() } catch {
-      applicationWarning = error.localizedDescription
-      shortcutStatus = error.localizedDescription
+    if !terminating {
+      do { try registerShortcut() } catch {
+        applicationWarning = error.localizedDescription
+        shortcutStatus = error.localizedDescription
+      }
     }
     settingsLoadError = nil
     if !config.retainHistory || !appliedHistoryRetention { historyEpoch = UUID() }
@@ -514,11 +605,9 @@ struct PreparedModelSetup: Sendable {
     return applicationWarning
   }
   func save() {
-    guard !terminating, !hasPendingSetupCommit else { return }
-    perform {
-      let issue = try self.persistSettings()
-      self.message =
-        "Settings saved locally." + (issue.map { " Needs attention: " + $0 } ?? "")
+    startSettingsTask { [self] owner in
+      let issue = try await persistSettings(reservation: owner)
+      message = "Settings saved locally." + (issue.map { " Needs attention: " + $0 } ?? "")
     }
   }
   private func perform(_ body: () throws -> Void) {
@@ -545,7 +634,7 @@ struct PreparedModelSetup: Sendable {
     }
   }
   func shortcut(down: Bool) {
-    guard !working, !capturingShortcut else { return }
+    guard !isBusy, !capturingShortcut else { return }
     var next = state
     let toggle = recordingConfig?.toggle ?? config.toggle
     let transition = down ? next.press(toggle: toggle) : next.release(toggle: toggle)
@@ -553,7 +642,7 @@ struct PreparedModelSetup: Sendable {
     if next == .recording { start() } else if next == .processing { finish() }
   }
   func start() {
-    guard !terminating, state == .idle, !working, !capturingShortcut else { return }
+    guard !terminating, state == .idle, !isBusy, !capturingShortcut else { return }
     do {
       if let settingsLoadError { throw DictationError.invalid(settingsLoadError) }
       var snapshot = try config.validated()
@@ -946,7 +1035,7 @@ struct PreparedModelSetup: Sendable {
     }
   }
   func retryCleanup() {
-    guard state == .idle, !working, canRecoverRaw else { return }
+    guard state == .idle, !isBusy, canRecoverRaw else { return }
     do {
       var snapshot = try config.validated()
       let preset =
@@ -1021,7 +1110,7 @@ struct PreparedModelSetup: Sendable {
           config.selectAvailableManagedTranscriber(
             from: catalog, supportsApple: canUseManagedAppleSpeech)
         }
-        if report { message = engineReadiness.message }
+        if report { message = engineReadinessMessage }
       } catch {
         guard let self, discoveryGeneration == revision, !Task.isCancelled else { return }
         models = []
@@ -1032,7 +1121,14 @@ struct PreparedModelSetup: Sendable {
       }
     }
   }
+  func selectConnectionMode(_ mode: ConnectionMode) {
+    guard state == .idle, !settingsLocked, !historyWorking, !terminating else { return }
+    let previous = config.usesManagedRuntime
+    config.connectionMode = mode
+    if previous != config.usesManagedRuntime { runtimeModeChanged() }
+  }
   func runtimeModeChanged() {
+    guard !terminating else { return }
     let previous = runtimeModeTask
     previous?.cancel()
     invalidateDiscovery()
@@ -1088,8 +1184,7 @@ struct PreparedModelSetup: Sendable {
           throw DictationError.invalid("Invalid prepared setup result.")
         }
         pendingSetupCommit = (prepared, baseline)
-        hasPendingSetupCommit = true
-        commitPreparedSetup()
+        await commitPreparedSetup()
       } catch let conflict as ManagedCleanupConflict {
         modelSetup = .blocked(operation, conflict)
       } catch let conflict as ManagedProcessingConflict {
@@ -1103,34 +1198,45 @@ struct PreparedModelSetup: Sendable {
       message = modelSetup.message
     }
   }
-  private func commitPreparedSetup() {
+  private func commitPreparedSetup(reservation: UUID? = nil) async {
     guard let pending = pendingSetupCommit else { return }
     guard config == pending.baseline else {
+      hasPendingSetupCommit = true
       modelSetup = .installedNotSaved(
         pending.prepared.result,
         "Settings changed during setup. Discard the pending selection to keep those edits, then choose the engine again."
       )
       return
     }
+    modelSetup = .running(
+      pending.prepared.result.operation, "Saving the installed speech engine selection…")
+    message = modelSetup.message
     do {
-      let warning = try persistSettings(pending.prepared.configuration)
+      let warning = try await persistSettings(
+        pending.prepared.configuration, reservation: reservation)
       var result = pending.prepared.result
       result.warning = warning
       pendingSetupCommit = nil
       hasPendingSetupCommit = false
       modelSetup = .ready(result)
+    } catch is CancellationError {
+      pendingSetupCommit = nil
+      hasPendingSetupCommit = false
+      modelSetup = .installedNotSelected(pending.prepared.result)
     } catch {
+      hasPendingSetupCommit = true
       modelSetup = .installedNotSaved(pending.prepared.result, error.localizedDescription)
     }
   }
   func savePendingSetup() {
-    guard !working, !terminating, state == .idle, !capturingShortcut else { return }
-    commitPreparedSetup()
-    message = modelSetup.message
-    if !hasPendingSetupCommit { refreshModels() }
+    startSettingsTask(allowPending: true) { [self] owner in
+      await commitPreparedSetup(reservation: owner)
+      message = modelSetup.message
+      if !hasPendingSetupCommit { refreshModels() }
+    }
   }
   func discardPendingSetup() {
-    guard !working, !terminating, state == .idle, let pending = pendingSetupCommit else { return }
+    guard !isBusy, !terminating, state == .idle, let pending = pendingSetupCommit else { return }
     pendingSetupCommit = nil
     hasPendingSetupCommit = false
     modelSetup = .installedNotSelected(pending.prepared.result)
@@ -1141,6 +1247,7 @@ struct PreparedModelSetup: Sendable {
     message = stage
   }
   func cancelModelSetup() {
+    guard !savingSettings else { return }
     modelSetupTask?.cancel()
     runtime.cancelDownload()
   }
@@ -1187,7 +1294,7 @@ struct PreparedModelSetup: Sendable {
     setupCleanupResolution = resolution
     setupProcessingResolution = processing
     runModelSetup(operation) {
-      try await self.runtime.waitUntilReady()
+      try await self.runtime.ensureReady()
       let data = try await self.client().models()
       let catalog = try JSONDecoder().decode(ModelCatalog.self, from: Data(data.utf8))
       // Check every processor before starting downloads; user choices remain intact on failure.
@@ -1303,15 +1410,19 @@ struct PreparedModelSetup: Sendable {
     await discoveryTask?.value
     hotkey?.unregister()
     cancel()
+    runtimeModeTask?.cancel()
+    await runtimeModeTask?.value
+    cancelModelSetup()
+    await modelSetupTask?.value
+    await settingsTask?.value
+    _ = try? await settingsCommitTask?.value
+    await settingsCleanupTask?.value
+    await exportTask?.value
     await clipboardRestoration()
     historyDeletionTask?.cancel()
     await historyDeletionTask?.value
     await historyPersistenceTask?.value
     await audioArchiveTask?.value
-    runtimeModeTask?.cancel()
-    await runtimeModeTask?.value
-    cancelModelSetup()
-    await modelSetupTask?.value
     await runtime.stop()
   }
   /// Sparkle may fail or the user may cancel after local work has drained.
@@ -1325,7 +1436,7 @@ struct PreparedModelSetup: Sendable {
     message = "Update canceled or failed. The current app is ready to use."
   }
   func retry() {
-    guard state == .idle, !working, let recording = retryRecording, let original = retryPreset
+    guard state == .idle, !isBusy, let recording = retryRecording, let original = retryPreset
     else {
       message = "No failed recording retained in memory."
       return
@@ -1354,7 +1465,7 @@ struct PreparedModelSetup: Sendable {
     NSPasteboard.general.setString(text, forType: .string)
   }
   func run(_ action: @escaping @MainActor () async throws -> Void) {
-    guard !working, state == .idle else { return }
+    guard !isBusy, state == .idle else { return }
     do { _ = try config.validated() } catch {
       message = error.localizedDescription
       return
@@ -1375,7 +1486,7 @@ struct PreparedModelSetup: Sendable {
   func publish() {
     guard !hasPendingSetupCommit else { return }
     run {
-      _ = try self.persistSettings()
+      _ = try await self.persistSettings()
       try await self.client().saveSettings(self.config)
       self.message = "Settings snapshot published to Antfly."
     }
@@ -1391,9 +1502,7 @@ struct PreparedModelSetup: Sendable {
       incoming.server = current.server
       incoming.table = current.table
       incoming.profile = current.profile
-      self.config = incoming
-      if !incoming.usesManagedRuntime { self.loadCredential(for: incoming.server) }
-      _ = try self.persistSettings()
+      _ = try await self.persistSettings(incoming)
       self.message = "Settings replaced from Antfly."
     }
   }
@@ -1739,33 +1848,49 @@ struct PreparedModelSetup: Sendable {
       try FileManager.default.removeItem(at: file)
     }
   }
+  func exportSnapshot(_ data: Data, to file: URL) {
+    guard !exporting, !terminating else { return }
+    exporting = true
+    exportTask = Task { [self] in
+      defer {
+        exporting = false
+        exportTask = nil
+      }
+      do {
+        try await exportWriter.write(data, to: file)
+        if !terminating { message = "Export saved." }
+      } catch { if !terminating { message = error.localizedDescription } }
+    }
+  }
   func exportSettings() {
+    guard !exporting, !terminating else { return }
     let panel = NSSavePanel()
     panel.nameFieldStringValue = "antfly-dictation.json"
     if panel.runModal() == .OK, let url = panel.url {
-      perform { try self.write(JSONEncoder().encode(self.config.validated()), to: url) }
+      perform { self.exportSnapshot(try JSONEncoder().encode(self.config.validated()), to: url) }
+    }
+  }
+  func importConfiguration(from file: URL) {
+    startSettingsTask { [self] owner in
+      let imported = try await settingsWriter.readConfiguration(at: file)
+      // Imported settings never carry credentials. Select the destination's
+      // saved credential even if the previous origin had an unsaved token edit.
+      if !imported.usesManagedRuntime { loadCredential(for: imported.server) }
+      _ = try await persistSettings(imported, reservation: owner)
+      message = "Settings imported."
     }
   }
   func importSettings() {
-    guard !hasPendingSetupCommit else { return }
+    guard !settingsLocked, !terminating else { return }
     let panel = NSOpenPanel()
     panel.allowsMultipleSelection = false
     panel.canChooseDirectories = false
-    if panel.runModal() == .OK, let url = panel.url {
-      perform {
-        let imported = try Configuration.decode(Data(contentsOf: url))
-        self.config = imported
-        if !imported.usesManagedRuntime { self.loadCredential(for: imported.server) }
-        _ = try self.persistSettings()
-        self.message = "Settings imported."
-      }
-    }
+    if panel.runModal() == .OK, let url = panel.url { importConfiguration(from: url) }
   }
   func exportResult() {
+    guard !exporting, !terminating else { return }
     let panel = NSSavePanel()
     panel.nameFieldStringValue = "transcript.txt"
-    if panel.runModal() == .OK, let url = panel.url {
-      perform { try self.write(Data(self.result.utf8), to: url) }
-    }
+    if panel.runModal() == .OK, let url = panel.url { exportSnapshot(Data(result.utf8), to: url) }
   }
 }

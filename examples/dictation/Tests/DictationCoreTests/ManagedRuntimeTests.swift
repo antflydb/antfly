@@ -143,7 +143,8 @@ private func localCatalog(error: String? = nil) throws -> ModelCatalog {
   #expect(config.presets == previous)
 }
 
-@MainActor @Test func savingManagedSettingsDoesNotReadOrOverwriteExternalCredentials() throws {
+@MainActor @Test func savingManagedSettingsDoesNotReadOrOverwriteExternalCredentials() async throws
+{
   let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
   defer { try? FileManager.default.removeItem(at: root) }
   let store = Store(
@@ -156,6 +157,7 @@ private func localCatalog(error: String? = nil) throws -> ModelCatalog {
   store.config.connectionMode = .managed
   store.config.server = "not a server"
   store.save()
+  await store.settingsTask?.value
   let saved = try Configuration.decode(
     Data(contentsOf: root.appendingPathComponent("settings.json")))
   #expect(saved.usesManagedRuntime && saved.server == "not a server")
@@ -181,5 +183,26 @@ private func localCatalog(error: String? = nil) throws -> ModelCatalog {
     try await runtime.waitUntilReady(timeout: .seconds(3))
     Issue.record("Missing engine became ready")
   } catch { #expect(error.localizedDescription.contains("Bundled Antfly is missing")) }
+  await runtime.stop()
+}
+
+@MainActor @Test func setupRetryStartsAnEngineAfterAStoppedStartupFailure() async throws {
+  let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  defer { try? FileManager.default.removeItem(at: root) }
+  var attempts = 0
+  let runtime = ManagedRuntime(
+    directory: root, runtime: URL(fileURLWithPath: "/usr/bin/false"),
+    launcher: URL(fileURLWithPath: "/usr/bin/false"), credentialRead: { "" },
+    credentialWrite: { _ in
+      attempts += 1
+      throw DictationError.invalid("Synthetic locked Keychain")
+    })
+  for expected in 1...2 {
+    do {
+      try await runtime.ensureReady(timeout: .seconds(3))
+      Issue.record("Failed engine became ready")
+    } catch { #expect(error.localizedDescription.contains("Synthetic locked Keychain")) }
+    #expect(attempts == expected && !runtime.ready && !runtime.busy)
+  }
   await runtime.stop()
 }

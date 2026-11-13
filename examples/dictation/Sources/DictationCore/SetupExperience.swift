@@ -3,6 +3,23 @@
 
 import Foundation
 
+public enum SpeechRecoveryContext: Equatable, Sendable {
+  case onThisMac
+  case externalServer(String)
+  var serverLabel: String {
+    guard case .externalServer(let origin) = self,
+      var parts = URLComponents(string: origin),
+      ["http", "https"].contains(parts.scheme), parts.host != nil
+    else { return "the external Antfly server" }
+    parts.user = nil
+    parts.password = nil
+    parts.path = ""
+    parts.query = nil
+    parts.fragment = nil
+    return parts.string ?? "the external Antfly server"
+  }
+}
+
 public enum SpeechReadiness: Equatable, Sendable {
   case ready, checking, unverified
   case assetsNeeded(String)
@@ -15,8 +32,20 @@ public enum SpeechReadiness: Equatable, Sendable {
     case .unverified: return "Speech readiness is not verified. Check the engine or test dictation."
     case .assetsNeeded(let language):
       return
-        "Speech assets for \(language) are not installed. Install/check speech in Speech & text."
+        "Speech assets for \(language) are not installed on the processing server."
     case .unavailable(let reason): return reason
+    }
+  }
+  public func message(for context: SpeechRecoveryContext) -> String {
+    switch (self, context) {
+    case (.assetsNeeded(let language), .onThisMac):
+      return "Speech assets for " + language
+        + " are not installed on this Mac. Use Install / check speech in Settings → Speech & text."
+    case (.assetsNeeded(let language), .externalServer):
+      return "Speech assets for " + language + " are not installed on " + context.serverLabel
+        + ". Ask its administrator to install/check that language or enable download_assets on the server’s Mac."
+    case (.unavailable(let reason), .externalServer): return context.serverLabel + ": " + reason
+    default: return message
     }
   }
 }
@@ -41,7 +70,7 @@ extension DiscoveredModel {
       return .unverified
     }
     guard available else {
-      return .unavailable("Apple speech is unavailable on this Mac. Choose another speech engine.")
+      return .unavailable("Apple speech is unavailable. Choose another speech engine.")
     }
     let requested = language.isEmpty ? defaultLanguage : language
     guard let requested, let installed = native.speech_installed_locales else { return .unverified }

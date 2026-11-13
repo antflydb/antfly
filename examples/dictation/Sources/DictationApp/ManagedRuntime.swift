@@ -224,6 +224,17 @@ import Security
     busy = false
     status = "Local engine stopped."
   }
+  func ensureReady(timeout: Duration = .seconds(90)) async throws {
+    try Task.checkCancellation()
+    if !ready && !busy {
+      // A failed startup may still own a child awaiting termination. Drain it
+      // before starting a fresh attempt rather than waiting on a stopped engine.
+      await stop()
+      try Task.checkCancellation()
+      start()
+    }
+    try await waitUntilReady(timeout: timeout)
+  }
   func waitUntilReady(timeout: Duration = .seconds(90)) async throws {
     let deadline = ContinuousClock.now.advanced(by: timeout)
     while !ready {

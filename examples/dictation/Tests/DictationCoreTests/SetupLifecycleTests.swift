@@ -292,6 +292,7 @@ extension SetupLifecycleTests {
     try FileManager.default.moveItem(at: backup, to: file)
     if retrySave {
       store.savePendingSetup()
+      await store.settingsTask?.value
       #expect(store.config == candidate)
       #expect(try Configuration.decode(Data(contentsOf: file)) == candidate)
       #expect(store.modelSetup == .ready(result))
@@ -382,6 +383,7 @@ extension SetupLifecycleTests {
     store.config.dictionary = ["New user edit"]
     try FileManager.default.removeItem(at: file)
     store.savePendingSetup()
+    await store.settingsTask?.value
     #expect(store.config.dictionary == ["New user edit"])
     #expect(!FileManager.default.fileExists(atPath: file.path))
     #expect(store.hasPendingSetupCommit && store.modelSetup.message.contains("Settings changed"))

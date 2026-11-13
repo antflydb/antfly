@@ -205,3 +205,21 @@ private func speechCatalog(
   #expect(candidate.presets[0].processingStrategy == .automatic)
   #expect(candidate.presets[0].instructions == config.presets[0].instructions)
 }
+
+@Test func speechRecoveryGuidanceTargetsTheProcessingHost() {
+  let assets = SpeechReadiness.assetsNeeded("fr-FR")
+  let local = assets.message(for: .onThisMac)
+  #expect(local.contains("this Mac") && local.contains("Settings → Speech & text"))
+  let remote = assets.message(for: .externalServer("https://speech.example:8443"))
+  #expect(remote.contains("https://speech.example:8443") && remote.contains("administrator"))
+  #expect(remote.contains("download_assets") && !remote.contains("Settings →"))
+  #expect(!remote.contains("this Mac"))
+  let unavailable = SpeechReadiness.unavailable("Apple speech is unavailable.")
+    .message(for: .externalServer("https://speech.example"))
+  #expect(unavailable.contains("speech.example") && !unavailable.contains("this Mac"))
+  let sanitized = assets.message(
+    for: .externalServer("https://user:secret@speech.example/path?token=private"))
+  #expect(
+    sanitized.contains("speech.example") && !sanitized.contains("secret")
+      && !sanitized.contains("private"))
+}

@@ -35,7 +35,7 @@ struct SetupChecklist: View {
         }
         HStack {
           readiness("Speech engine", ready: store.engineReadiness.isReady)
-          Text(store.engineReadiness.message).font(.caption).lineLimit(2)
+          Text(store.engineReadinessMessage).font(.caption).lineLimit(2)
           Spacer()
           Button("Check engine") { store.checkEngine() }.disabled(
             store.working || store.discoveryState == .checking)

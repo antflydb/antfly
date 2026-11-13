@@ -82,10 +82,12 @@ struct MenuContent: View {
       HStack {
         Button(store.state == .recording ? "Finish" : "Record") {
           if store.state == .recording { store.finish() } else { store.start() }
-        }.disabled(store.state == .processing || store.working)
+        }.disabled(store.state == .processing || store.isBusy)
         Button("Cancel") {
           if store.settingUpModel { store.cancelModelSetup() } else { store.cancel() }
-        }.disabled(store.state == .idle && !store.settingUpModel)
+        }.disabled(
+          (store.state == .idle && !store.settingUpModel)
+            || (store.settingUpModel && !store.canCancelModelSetup))
         Button("Copy") { store.copy(store.result.isEmpty ? store.preview : store.result) }.disabled(
           store.result.isEmpty && store.preview.isEmpty)
       }
@@ -132,7 +134,7 @@ struct SettingsView: View {
           HStack {
             Button("Retry saving settings") { store.savePendingSetup() }
             Button("Keep previous selection") { store.discardPendingSetup() }
-          }.disabled(store.state != .idle || store.working)
+          }.disabled(store.state != .idle || store.isBusy)
           Text(
             "Resolve the pending selection before editing settings. Installed speech assets are kept either way."
           )
@@ -147,7 +149,7 @@ struct SettingsView: View {
         Spacer()
         Button(store.state == .recording ? "Finish dictation" : "Test dictation") {
           if store.state == .recording { store.finish() } else { store.start() }
-        }.disabled(store.state == .processing || store.working)
+        }.disabled(store.state == .processing || store.isBusy)
       }
       Text(store.activePresetSummary).font(.caption).foregroundStyle(.secondary)
       Text(
@@ -168,21 +170,26 @@ struct SettingsView: View {
           maxWidth: .infinity, alignment: .leading)
       }
       HStack {
+        if store.savingSettings { ProgressView().controlSize(.small) }
         Text(
-          store.hasPendingSetupCommit
-            ? "Selection not saved"
-            : store.hasUnsavedSettings ? "Unsaved changes" : "Settings saved"
+          store.savingSettings
+            ? "Saving settings…"
+            : store.hasPendingSetupCommit
+              ? "Selection not saved"
+              : store.hasUnsavedSettings ? "Unsaved changes" : "Settings saved"
         ).font(.caption)
           .foregroundStyle(.secondary)
         Button("Save settings") { store.save() }.disabled(
           store.state != .idle || store.settingsLocked || store.capturingShortcut)
         Button("Import JSON…") { store.importSettings() }.disabled(
           store.state != .idle || store.settingsLocked || store.capturingShortcut)
-        Button("Export JSON…") { store.exportSettings() }
+        Button("Export JSON…") { store.exportSettings() }.disabled(store.exporting)
         Spacer()
         Button(store.settingUpModel ? "Cancel model setup" : "Cancel recording / request") {
           if store.settingUpModel { store.cancelModelSetup() } else { store.cancel() }
-        }.disabled(store.state == .idle && !store.settingUpModel)
+        }.disabled(
+          (store.state == .idle && !store.settingUpModel)
+            || (store.settingUpModel && !store.canCancelModelSetup))
       }
     }.padding(20)
   }
@@ -200,12 +207,12 @@ struct SettingsView: View {
               "Processing location",
               selection: Binding(
                 get: { store.config.connectionMode ?? .external },
-                set: { store.config.connectionMode = $0 })
+                set: { store.selectConnectionMode($0) })
             ) {
               Text("On this Mac (bundled Antfly)").tag(ConnectionMode.managed)
               Text("External Antfly server").tag(ConnectionMode.external)
-            }.disabled(store.state != .idle || store.working || store.historyWorking)
-              .onChange(of: store.config.connectionMode) { _, _ in store.runtimeModeChanged() }
+            }.disabled(store.state != .idle || store.isBusy || store.historyWorking)
+
             if store.config.usesManagedRuntime {
               RuntimeControls(store: store, runtime: store.runtime)
             } else {
@@ -434,7 +441,7 @@ struct SettingsView: View {
       TextEditor(text: $store.result).disabled(store.state != .idle)
       HStack {
         Button("Copy") { store.copy(store.result) }
-        Button("Export text…") { store.exportResult() }
+        Button("Export text…") { store.exportResult() }.disabled(store.exporting)
         Button("Retry recording (copy only)") { store.retry() }
         if store.canRecoverRaw {
           Button("Insert original") { store.insertOriginal() }

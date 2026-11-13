@@ -611,3 +611,20 @@ speech assets remain available either way. Errors applying already-saved setting
 such as shortcut permissions, are reported as warnings rather than pretending the
 settings write failed. Setup success messages retain the language actually checked,
 so changing the selected preset cannot relabel an earlier language verification.
+
+Setup retries start a stopped managed engine before waiting for readiness. External
+Apple speech recovery identifies the server and directs its administrator to install
+language assets or enable `download_assets`; it never offers a local-only button.
+
+Durable settings and shortcut writes run on a serialized filesystem worker, with a
+visible saving state. The final commit is drained rather than canceled halfway
+through; the app applies its known disk outcome before admitting another change.
+Quitting waits for these writes and their resulting retention work. Exports use a
+separate owned worker, so slow export storage does not hold up preference writes or
+recording admission. Import selects credentials for the imported origin, and changing
+processing location reconciles the engine independently of the visible settings tab.
+
+Startup recovery only removes regular, UUID-named `.dictation-settings-*.tmp` files
+inside the app's support directory. A private directory lock coordinates cleanup
+with active writers across app instances; recovery skips a busy writer. It does not
+scan export destinations, follow symlinks, or remove unrelated files.
