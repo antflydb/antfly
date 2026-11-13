@@ -80,9 +80,9 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     // Generator-backed readers use the resident server executor, which owns
     // recurrent state, vision preparation, completion and memory admission.
-    var manifest = try @import("models/manifest.zig").loadFromDir(allocator, opts.model_dir);
-    defer manifest.deinit();
-    if (manifest.isGenerativeReader()) return runGenerativeReader(allocator, io, opts, image_data);
+    const load_start_ns = nowNs();
+    if (try usesGenerativeReadExecutor(allocator, opts.model_dir))
+        return runGenerativeReader(allocator, io, opts, image_data, load_start_ns);
 
     var session_manager = backends.SessionManager.initWithIo(allocator, io);
     session_manager.native_call_policy = .in_process;
@@ -94,7 +94,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     if (debug_cuda_session) std.log.info("read: load reader start model={s}", .{opts.model_dir});
-    const load_start_ns = nowNs();
     var reader = try readers_mod.LoadedReader.loadFromDir(
         allocator,
         opts.model_dir,
@@ -162,7 +161,15 @@ fn encodedImageMime(bytes: []const u8) ![]const u8 {
     return @import("pipelines/image.zig").mimeEssenceForEncoded(bytes) orelse error.UnsupportedImageFormat;
 }
 
-fn runGenerativeReader(allocator: std.mem.Allocator, io: std.Io, opts: Options, image_data: []const u8) !void {
+fn usesGenerativeReadExecutor(allocator: std.mem.Allocator, model_dir: []const u8) !bool {
+    // Routing needs architecture/task metadata, never vocabulary-sized tokenizer
+    // data or weight inspection. The selected executor performs full loading.
+    var manifest = try @import("models/manifest.zig").loadListingFromDir(allocator, model_dir);
+    defer manifest.deinit();
+    return manifest.isGenerativeReader();
+}
+
+fn runGenerativeReader(allocator: std.mem.Allocator, io: std.Io, opts: Options, image_data: []const u8, load_start_ns: u64) !void {
     // /read uses its selected model's cache policy. Do not silently accept an
     // encoder-decoder-only cache override which this executor cannot honor.
     if (opts.cache_dtype != null) return error.UnsupportedReaderCacheDtype;
@@ -182,9 +189,8 @@ fn runGenerativeReader(allocator: std.mem.Allocator, io: std.Io, opts: Options, 
         .metal => .metal,
         .cuda => .cuda,
     };
-    const start = nowNs();
     try node.warmModel(allocator, .{ .name = model_dir, .kind = .reader, .backend = backend });
-    const load_ns = nowNs() - start;
+    const load_ns = nowNs() - load_start_ns;
     var reader = GenerativeReader{ .node = &node, .allocator = allocator, .model_dir = model_dir };
     if (opts.measure_iters != null) {
         var bench = try runWarmBenchmark(allocator, &reader, image_data, opts, load_ns);
@@ -796,4 +802,25 @@ test "standalone reader derives MIME from encoded bytes rather than filename" {
     try std.testing.expectEqualStrings("image/jpeg", try encodedImageMime("\xff\xd8\xffrest"));
     try std.testing.expectEqualStrings("image/webp", try encodedImageMime("RIFF1234WEBPrest"));
     try std.testing.expectError(error.UnsupportedImageFormat, encodedImageMime("not an image"));
+}
+
+test "standalone reader discovery skips vocabulary-sized tokenizer files" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("models/testdata/lightonocr3/config.json") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = @import("readers/lightonocr3.zig").manifest_json });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "" });
+    const tokenizer = try allocator.alloc(u8, 2 * 1024 * 1024);
+    defer allocator.free(tokenizer);
+    @memset(tokenizer, ' ');
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+    const path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path);
+    // Full discovery cannot even read this vocabulary within the budget.
+    // Lightweight routing still succeeds and leaves validation to the loader.
+    var bounded = @import("runtime/bounded_allocator.zig").BoundedAllocator{ .backing = allocator, .limit = 128 * 1024 };
+    try std.testing.expect(try usesGenerativeReadExecutor(bounded.allocator(), path));
+    try std.testing.expect(!bounded.denied);
 }
