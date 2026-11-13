@@ -11166,6 +11166,28 @@ pub const NativeFile = struct {
     }
 
     fn putIndexedDocumentBatch(self: *NativeFile, mutations: []const DocumentMutation) !void {
+        // Regression: a bare commit here (self.transaction_pages == null,
+        // the only branch that reaches publishBareCommit below) builds its
+        // real pages directly through this indexed-reclamation path --
+        // never through flushTransactionWrites's redo diversion -- so it
+        // never stages anything into redo.logical_pending/pending/shared.
+        // publishCheckpoint's own preemptive "would this record overflow
+        // the log" check (redo.pendingRecordLen() > redo.writer.remaining())
+        // is therefore always comparing against this commit's own (empty)
+        // staged bytes, never against how full the log already is from
+        // *prior* commits -- and its "page-shaped only" fallback branch,
+        // finding nothing of this commit's own to flush, is a complete
+        // no-op. publishBareCommit's own maybeAutoCheckpointRedoLog call
+        // runs too late to help: only *after* publishCheckpoint has
+        // already tried (and, once the log is genuinely full, failed) to
+        // append this commit's own ride-along marker record
+        // (error.LogFull, surfacing as error.OutcomeUnknown). Must run
+        // here, before `previous` is captured below: checkpointRedoLog
+        // advances the real checkpoint's own commit_sequence, so running
+        // it any later -- once `next.commit_sequence = previous
+        // .commit_sequence + 1` is fixed relative to a `previous` this
+        // call would make stale -- would corrupt that sequencing instead.
+        if (self.transaction_pages == null) try self.maybeAutoCheckpointRedoLog();
         const previous = self.activeCheckpoint();
         var local: PageAllocator = undefined;
         if (self.transaction_pages == null) local = try self.pageAllocatorFromFreeMap(previous);
