@@ -2542,10 +2542,22 @@ revision), then the `ReadView` type itself on `perf/lwa-readview`:
   never discards disk's own correct answer for that view; caught by
   "lite key-only cursor preserves prefix overlay bounds and pinned
   snapshots" (a pinned read opened before a later write adds a
-  brand-new key under the same prefix). `CatalogCursor`/
-  `LiveRecordCursor`'s identical pattern is not fixed -- not currently
-  known to be reachable with a genuinely historical mark, but a
-  documented, narrower risk for a future caller that pins one.
+  brand-new key under the same prefix).
+- Done: `CatalogCursor.next`/`nextRecordAlloc` and
+  `LiveRecordCursor.next`'s identical resolveAlloc-miss-as-error
+  pattern, fixed the same way (resolve before deciding whether to
+  consume a tied tree-side candidate; re-stash it, never free it, on
+  the phantom path). Found genuinely reachable, not just theoretical:
+  "lite online vacuum publishes while group-commit mutations keep
+  landing" was already crashing on this exact path
+  (`LiveRecordCursor.next`, via `performVacuum`'s own `liveStats` call
+  on a vacuum snapshot pinned before a concurrent write landed) --
+  this fix replaces the crash with the intended skip-not-error
+  behavior (that test still fails afterward on a separate, deeper
+  vacuum/catch-up timing assertion, confirmed present with the same
+  crash before this fix too -- not caused or resolved by it). Test:
+  "lite redo log catalog cursor pinned to an older mark skips a key
+  created only after it, instead of erroring" (native.zig).
 - Not done: `ReadGeneration` has not been collapsed onto `ReadView`;
   it keeps its own pin lifecycle (`ReadPin` linked list, `references`
   counting, retirement, the kernel-level reader fence for
