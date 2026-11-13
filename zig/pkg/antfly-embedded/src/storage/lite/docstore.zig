@@ -2037,7 +2037,7 @@ pub const Store = struct {
         // allocation, retirement, and indexed reclamation defer to
         // `checkpointRedoLog`'s own batched transaction instead of
         // running on every foreground commit (`NativeFile.transactionWrites`).
-        const use_redo_log = opts.use_redo_log orelse false;
+        const use_redo_log = opts.use_redo_log orelse true;
         // §9.7a: `default_redo_log_capacity_bytes` (8 MiB) is reserved
         // eagerly, in full, the moment the file is created -- it is real
         // physical file size from byte zero, not amortized content. A
