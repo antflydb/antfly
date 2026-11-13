@@ -130,6 +130,7 @@ pub fn boundedReachabilityWithOptionsAlloc(
     defer deinitPendingMap(alloc, &results);
 
     var frontier = PendingMap.empty;
+    defer deinitPendingMap(alloc, &frontier);
     const identity = try law.identityAlloc(alloc, .provenance_semiring);
     defer alloc.free(identity);
     try mergePending(alloc, &frontier, start_node, identity, 0);
@@ -137,6 +138,7 @@ pub fn boundedReachabilityWithOptionsAlloc(
     var depth: u32 = 0;
     while (depth < max_depth) : (depth += 1) {
         var next = PendingMap.empty;
+        errdefer deinitPendingMap(alloc, &next);
         var it = frontier.iterator();
         while (it.next()) |entry| {
             const from = entry.key_ptr.*;
@@ -148,14 +150,13 @@ pub fn boundedReachabilityWithOptionsAlloc(
                 try mergePending(alloc, &results, edge.to, product, depth + 1);
                 try mergePending(alloc, &next, edge.to, product, depth + 1);
                 if (options.work_budget) |budget| {
-                    try budget.checkIntermediateStates(next.count(), work_budget_mod.default_max_intermediate_states);
+                    try budget.checkIntermediateStates(next.count(), budget.max_intermediate_states);
                 }
             }
         }
         deinitPendingMap(alloc, &frontier);
         frontier = next;
     }
-    deinitPendingMap(alloc, &frontier);
 
     var out = std.ArrayListUnmanaged(PathResult).empty;
     errdefer {
@@ -165,36 +166,30 @@ pub fn boundedReachabilityWithOptionsAlloc(
     var result_it = results.iterator();
     while (result_it.next()) |entry| {
         if (!targetNodeAllowed(options.target_nodes, entry.key_ptr.*)) continue;
-        try out.append(alloc, .{
-            .node = try alloc.dupe(u8, entry.key_ptr.*),
-            .provenance = try alloc.dupe(u8, entry.value_ptr.provenance),
-            .depth = entry.value_ptr.depth,
-        });
+        try out.ensureUnusedCapacity(alloc, 1);
+        const node = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(node);
+        const provenance = try alloc.dupe(u8, entry.value_ptr.provenance);
+        out.appendAssumeCapacity(.{ .node = node, .provenance = provenance, .depth = entry.value_ptr.depth });
     }
     std.mem.sort(PathResult, out.items, {}, lessPathResult);
     return try out.toOwnedSlice(alloc);
 }
 
 fn mergePending(alloc: Allocator, map: *PendingMap, node: []const u8, provenance: []const u8, depth: u32) !void {
-    const key = try alloc.dupe(u8, node);
-    var key_owned = true;
-    errdefer if (key_owned) alloc.free(key);
-    const gop = try map.getOrPut(alloc, key);
-    if (gop.found_existing) {
-        key_owned = false;
-        alloc.free(key);
-        const next = try tensor.mergeOneSlotValuesAlloc(alloc, .provenance_semiring, gop.value_ptr.provenance, provenance);
-        alloc.free(gop.value_ptr.provenance);
-        gop.value_ptr.provenance = next;
-        gop.value_ptr.depth = @min(gop.value_ptr.depth, depth);
+    if (map.getPtr(node)) |current| {
+        const next = try tensor.mergeOneSlotValuesAlloc(alloc, .provenance_semiring, current.provenance, provenance);
+        alloc.free(current.provenance);
+        current.provenance = next;
+        current.depth = @min(current.depth, depth);
         return;
     }
-    gop.key_ptr.* = key;
-    gop.value_ptr.* = .{
-        .provenance = try alloc.dupe(u8, provenance),
-        .depth = depth,
-    };
-    key_owned = false;
+    // Finish owned values before publishing an entry to error cleanup.
+    const key = try alloc.dupe(u8, node);
+    errdefer alloc.free(key);
+    const owned_provenance = try alloc.dupe(u8, provenance);
+    errdefer alloc.free(owned_provenance);
+    try map.putNoClobber(alloc, key, .{ .provenance = owned_provenance, .depth = depth });
 }
 
 fn deinitPendingMap(alloc: Allocator, map: *PendingMap) void {
@@ -322,4 +317,33 @@ test "bounded provenance path query can constrain reachable targets" {
     try std.testing.expectEqual(@as(usize, 2), provenance.len);
     try std.testing.expectEqualStrings("edge:ab", provenance[0]);
     try std.testing.expectEqualStrings("edge:bc", provenance[1]);
+}
+
+test "bounded provenance path query releases frontiers on configured state exhaustion" {
+    const a = std.testing.allocator;
+    const provenance = try provenanceTokenAlloc(a, &.{"edge"});
+    defer a.free(provenance);
+    const edges = [_]Edge{
+        .{ .from = "root", .to = "a", .provenance = provenance },
+        .{ .from = "root", .to = "b", .provenance = provenance },
+    };
+    var budget = work_budget_mod.WorkBudget.initWithLimits(.{ .max_intermediate_states = 1 });
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, boundedReachabilityWithOptionsAlloc(a, "root", &edges, 1, .{ .work_budget = &budget }));
+}
+
+test "bounded provenance path query owns partial maps on allocation failure" {
+    const Runner = struct {
+        fn run(a: Allocator) !void {
+            const provenance = try provenanceTokenAlloc(a, &.{"edge"});
+            defer a.free(provenance);
+            const edges = [_]Edge{
+                .{ .from = "root", .to = "a", .provenance = provenance },
+                .{ .from = "root", .to = "b", .provenance = provenance },
+                .{ .from = "a", .to = "b", .provenance = provenance },
+            };
+            const results = try boundedReachabilityAlloc(a, "root", &edges, 3);
+            defer deinitPathResults(a, results);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }

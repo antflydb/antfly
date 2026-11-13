@@ -66,6 +66,7 @@ pub const GraphExpandRequest = struct {
     topology_epoch: u64 = 0,
     ttl_now_ns: u64 = 0,
     max_scanned_rows: u32 = graph_pattern_mod.default_max_explored_edges,
+    work_limits: ?@import("../graph/work_budget.zig").Limits = null,
     /// Only non-TTL expansion may retry an older worker's wire contract.
     allow_legacy_wire_fallback: bool = false,
     /// Parsed from a request that predates physical-scan accounting.
@@ -269,6 +270,9 @@ pub const GraphEdgesRequest = struct {
     legacy_wire_request: bool = false,
     // Borrowed request-local transport/decode workspace, never serialized.
     scratch_allocator: ?std.mem.Allocator = null,
+    /// Local-only completed scan count, including failed reads. Null means a
+    /// dispatched worker's work is unknown and must not be refunded/retried.
+    physical_scan_observation: ?*?usize = null,
     timeout_ms: ?u32 = null,
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
@@ -339,6 +343,7 @@ pub const GraphExpandRequestJson = struct {
     topology_epoch: u64 = 0,
     ttl_now_ns: ?u64 = null,
     max_scanned_rows: ?u32 = null,
+    work_limits: ?@import("../graph/work_budget.zig").Limits = null,
     identity_read_generation: ?u64 = null,
     _resolved_doc_filter: ?std.json.Value = null,
     params: GraphExpandParamsJson,
@@ -634,10 +639,14 @@ pub fn parseGraphEdgesRequest(alloc: std.mem.Allocator, body: []const u8) !Graph
 // Capacity exhaustion returns a complete prefix and charges the unsuccessful
 // key's scans too; the coordinator can continue with a single-key read.
 pub fn readGraphEdgesRequest(alloc: std.mem.Allocator, index: *graph_mod.GraphIndex, req: GraphEdgesRequest, now_ns: u64) !GraphEdgesResponse {
+    var scanned: usize = 0;
+    defer if (req.physical_scan_observation) |observed| {
+        observed.* = scanned;
+    };
     try validateGraphEdgesReadLimits(req.max_edges, req.max_owned_bytes, req.max_scanned_rows);
     if (req.resume_cursor != null and (req.keys.len != 1 or !req.allow_partial_keys)) return error.InvalidQueryRequest;
     if (req.keys.len == 0) {
-        const result = try index.getEdgesByTypesBoundedWithStatsAt(alloc, req.key, req.edge_types, req.direction, req.max_edges, req.max_owned_bytes, req.max_scanned_rows, now_ns);
+        const result = try index.getEdgesByTypesBoundedWithStatsAtCounted(alloc, req.key, req.edge_types, req.direction, req.max_edges, req.max_owned_bytes, req.max_scanned_rows, now_ns, &scanned);
         return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
     }
     if (req.keys.len > 64 or !std.mem.eql(u8, req.key, req.keys[0])) return error.InvalidQueryRequest;
@@ -656,7 +665,6 @@ pub fn readGraphEdgesRequest(alloc: std.mem.Allocator, index: *graph_mod.GraphIn
     try offsets.ensureTotalCapacity(alloc, req.keys.len + 1);
     try scans.ensureTotalCapacity(alloc, req.keys.len);
     offsets.appendAssumeCapacity(0);
-    var scanned: usize = 0;
     var owned_bytes: usize = 0;
     var read_context = if (req.allow_partial_keys) try index.beginEdgeReadContextWithProof(req.direction) else try index.beginEdgeReadContext(req.direction);
     defer read_context.deinit();
@@ -672,20 +680,21 @@ pub fn readGraphEdgesRequest(alloc: std.mem.Allocator, index: *graph_mod.GraphIn
         if (req.cancellation) |token| try token.check();
         if (req.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.Timeout;
         var attempted: usize = 0;
+        // Native readers publish attempted rows even when allocation fails.
+        // Commit once on all exits, before publishing the request observation.
+        defer scanned += attempted;
         var page = if (partial_supported) read_context.getPage(alloc, key, req.edge_types, req.resume_cursor, .{
             .max_edges = req.max_edges - edges.items.len,
             .max_owned_bytes = req.max_owned_bytes - owned_bytes,
             .max_scanned_rows = req.max_scanned_rows - scanned,
         }, now_ns, &attempted) catch |err| switch (err) {
             error.GraphExploredEdgesBudgetExceeded, error.GraphExploredEdgeBytesBudgetExceeded => {
-                scanned += attempted;
                 break;
             },
             else => return err,
         } else blk: {
             const bounded = read_context.getBounded(alloc, key, req.edge_types, req.max_edges - edges.items.len, req.max_owned_bytes - owned_bytes, req.max_scanned_rows - scanned, now_ns, &attempted) catch |err| switch (err) {
                 error.GraphExploredEdgesBudgetExceeded, error.GraphExploredEdgeBytesBudgetExceeded => {
-                    scanned += attempted;
                     break;
                 },
                 else => return err,
@@ -698,21 +707,22 @@ pub fn readGraphEdgesRequest(alloc: std.mem.Allocator, index: *graph_mod.GraphIn
             break :blk graph_mod.EdgePage{ .edges = bounded.edges, .scanned_rows = bounded.scanned_rows, .owned_bytes = bounded_bytes };
         };
         defer page.deinit(alloc);
-        scanned += page.scanned_rows;
+        // Subsequent key/probe allowances need this key's charge immediately.
+        scanned += attempted;
+        attempted = 0;
         // A scan boundary may land on the last row. Preserve the bounded
         // reader's one-probe EOF proof rather than requiring another RPC with
         // a zero remaining allowance. Non-empty probes remain charged.
         if (req.resume_cursor != null and page.next_cursor != null and page.scanned_rows == req.max_scanned_rows) {
             var probe_scans: usize = 0;
+            defer scanned += probe_scans;
             var probe = read_context.getPage(alloc, key, req.edge_types, page.next_cursor, .{ .max_edges = 1, .max_owned_bytes = 1, .max_scanned_rows = 1 }, now_ns, &probe_scans) catch |err| switch (err) {
                 error.GraphExploredEdgesBudgetExceeded, error.GraphExploredEdgeBytesBudgetExceeded => blk: {
-                    scanned += probe_scans;
                     break :blk graph_mod.EdgePage{ .edges = &.{}, .byte_limit_hit = true };
                 },
                 else => return err,
             };
             defer probe.deinit(alloc);
-            scanned += probe.scanned_rows;
             if (!probe.byte_limit_hit and probe.scanned_rows == 0 and probe.next_cursor == null and probe.edges.len == 0) {
                 page.next_cursor.?.deinit(alloc);
                 page.next_cursor = null;
@@ -1023,11 +1033,13 @@ pub fn frontierItemToSearchRequest(
         },
     };
 
+    var limits = req.work_limits orelse @import("../graph/work_budget.zig").Limits{};
+    limits.max_explored_edges = @min(limits.max_explored_edges, req.max_scanned_rows);
     return .{
         .query = .{ .match_all = {} },
         .graph_queries = graph_queries,
         .graph_ttl_now_ns = req.ttl_now_ns,
-        .graph_execution_limits = .{ .max_explored_edges = req.max_scanned_rows },
+        .graph_execution_limits = limits,
         .graph_physical_scan_observation = req.physical_scan_observation,
         .limit = 0,
         .include_stored = true,
@@ -1186,6 +1198,7 @@ pub fn freeGraphMetricReads(
 pub fn parseGraphExpandRequest(alloc: std.mem.Allocator, body: []const u8) !GraphExpandRequest {
     var parsed = try std.json.parseFromSlice(GraphExpandRequestJson, alloc, body, .{});
     defer parsed.deinit();
+    if (parsed.value.work_limits) |limits| try limits.validate();
     const max_scanned_rows: u32 = parsed.value.max_scanned_rows orelse @intCast(graph_pattern_mod.default_max_explored_edges);
     if (max_scanned_rows == 0 or max_scanned_rows > graph_pattern_mod.default_max_explored_edges)
         return error.InvalidQueryRequest;
@@ -1281,6 +1294,7 @@ pub fn parseGraphExpandRequest(alloc: std.mem.Allocator, body: []const u8) !Grap
         .topology_epoch = parsed.value.topology_epoch,
         .ttl_now_ns = parsed.value.ttl_now_ns orelse 0,
         .max_scanned_rows = max_scanned_rows,
+        .work_limits = parsed.value.work_limits,
         .legacy_wire_request = parsed.value.ttl_now_ns == null and parsed.value.max_scanned_rows == null,
         .identity_read_generation = identity_read_generation,
         .resolved_doc_filter = if (parsed_filter) |filter| filter.resolved_doc_filter else null,
