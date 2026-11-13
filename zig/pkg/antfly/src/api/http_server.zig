@@ -40777,6 +40777,22 @@ test "api http graph operator limits propagate and enforce through public querie
     try graph.addEdge("a", "b", "FRIEND", 1, 0, 0, "");
     try graph.addEdge("b", "c", "FRIEND", 1, 0, 0, "");
     var bound = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    // The internal expansion contract must preserve policy across a wire
+    // round trip before the real DB creates its local execution budget.
+    for ([_]bool{ false, true }) |raised| {
+        const wire = try std.fmt.allocPrint(a,
+            \\{{"name":"expand","index_name":"graph_idx","frontier":[{{"id":0,"key":"a"}}],"params":{{"max_depth":1}},"work_limits":{{"max_explored_nodes":{d},"max_intermediate_states":200000,"max_retained_state_bytes":134217728}}}}
+        , .{if (raised) @as(usize, 200_000) else 1});
+        defer a.free(wire);
+        var decoded = try distributed_graph.parseGraphExpandRequest(a, wire);
+        defer decoded.deinit(a);
+        const response = bound.source().graphExpandGroupLocal(a, 77, "docs", decoded, .read_index);
+        if (raised) {
+            var result = (try response).?;
+            defer result.deinit(a);
+            try std.testing.expectEqual(@as(usize, 1), result.expansions.len);
+        } else try std.testing.expectError(error.GraphWorkBudgetExceeded, response);
+    }
     const Status = struct {
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };

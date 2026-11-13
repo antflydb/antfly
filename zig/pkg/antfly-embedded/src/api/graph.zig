@@ -66,6 +66,7 @@ pub const GraphExpandRequest = struct {
     topology_epoch: u64 = 0,
     ttl_now_ns: u64 = 0,
     max_scanned_rows: u32 = graph_pattern_mod.default_max_explored_edges,
+    work_limits: ?@import("../graph/work_budget.zig").Limits = null,
     /// Only non-TTL expansion may retry an older worker's wire contract.
     allow_legacy_wire_fallback: bool = false,
     /// Parsed from a request that predates physical-scan accounting.
@@ -339,6 +340,7 @@ pub const GraphExpandRequestJson = struct {
     topology_epoch: u64 = 0,
     ttl_now_ns: ?u64 = null,
     max_scanned_rows: ?u32 = null,
+    work_limits: ?@import("../graph/work_budget.zig").Limits = null,
     identity_read_generation: ?u64 = null,
     _resolved_doc_filter: ?std.json.Value = null,
     params: GraphExpandParamsJson,
@@ -1023,11 +1025,13 @@ pub fn frontierItemToSearchRequest(
         },
     };
 
+    var limits = req.work_limits orelse @import("../graph/work_budget.zig").Limits{};
+    limits.max_explored_edges = @min(limits.max_explored_edges, req.max_scanned_rows);
     return .{
         .query = .{ .match_all = {} },
         .graph_queries = graph_queries,
         .graph_ttl_now_ns = req.ttl_now_ns,
-        .graph_execution_limits = .{ .max_explored_edges = req.max_scanned_rows },
+        .graph_execution_limits = limits,
         .graph_physical_scan_observation = req.physical_scan_observation,
         .limit = 0,
         .include_stored = true,
@@ -1186,6 +1190,7 @@ pub fn freeGraphMetricReads(
 pub fn parseGraphExpandRequest(alloc: std.mem.Allocator, body: []const u8) !GraphExpandRequest {
     var parsed = try std.json.parseFromSlice(GraphExpandRequestJson, alloc, body, .{});
     defer parsed.deinit();
+    if (parsed.value.work_limits) |limits| try limits.validate();
     const max_scanned_rows: u32 = parsed.value.max_scanned_rows orelse @intCast(graph_pattern_mod.default_max_explored_edges);
     if (max_scanned_rows == 0 or max_scanned_rows > graph_pattern_mod.default_max_explored_edges)
         return error.InvalidQueryRequest;
@@ -1281,6 +1286,7 @@ pub fn parseGraphExpandRequest(alloc: std.mem.Allocator, body: []const u8) !Grap
         .topology_epoch = parsed.value.topology_epoch,
         .ttl_now_ns = parsed.value.ttl_now_ns orelse 0,
         .max_scanned_rows = max_scanned_rows,
+        .work_limits = parsed.value.work_limits,
         .legacy_wire_request = parsed.value.ttl_now_ns == null and parsed.value.max_scanned_rows == null,
         .identity_read_generation = identity_read_generation,
         .resolved_doc_filter = if (parsed_filter) |filter| filter.resolved_doc_filter else null,
