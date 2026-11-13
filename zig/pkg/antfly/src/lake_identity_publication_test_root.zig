@@ -33,7 +33,10 @@ test "external lake execution bulk identity publication batching preserves the f
     const Probe = struct {
         var chunks: std.atomic.Value(usize) = .init(0);
         var puts: std.atomic.Value(usize) = .init(0);
+        var quota: ?*anyopaque = null;
         fn put(raw: *anyopaque, alloc: A, scope: stores.UploadScope, bytes_: []const u8, token: Cancellation) !stores.ArtifactMetadata {
+            // Covers identity chunks and every paged-reference publication.
+            try std.testing.expect(alloc.ptr == quota.?);
             _ = puts.fetchAdd(1, .monotonic);
             if (std.mem.startsWith(u8, bytes_, "lake2:")) _ = chunks.fetchAdd(1, .monotonic);
             const fs: *Fs = @ptrCast(@alignCast(raw));
@@ -64,6 +67,7 @@ test "external lake execution bulk identity publication batching preserves the f
             defer plan.deinit();
             try plan.by_id.put(a, "fragment", 0);
             var budget: local.sql_memory_budget = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+            Probe.quota = budget.allocator().ptr;
             var tracker = try Tracker.init(budget.allocator(), out, &plan, &store, .none);
             defer tracker.deinit();
             tracker.chunk_target_bytes = target;
@@ -86,6 +90,7 @@ test "external lake execution bulk identity publication batching preserves the f
                 try tracker.append(ref, key);
             }
             try tracker.finish();
+            try std.testing.expect(store.allocator.ptr == a.ptr);
             const elapsed = @import("antfly_platform").time.monotonicNs() - begin;
             chunk_counts[trial] = Probe.chunks.load(.monotonic);
             put_counts[trial] = Probe.puts.load(.monotonic);

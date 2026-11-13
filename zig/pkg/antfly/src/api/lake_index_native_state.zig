@@ -613,7 +613,11 @@ pub const Tracker = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
-        var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = self.store.upload_scope.?.domain, .attempt = self.store.upload_scope.?.attempt, .artifacts = self.store, .cancellation = self.cancellation, .remaining_read_bytes = &self.directory_bytes, .remaining_write_bytes = &self.directory_bytes, .streaming = true };
+        // Keep packing and backend upload scratch in the same quota as the
+        // tracker. The borrowed capability itself remains unchanged.
+        var store = self.store.*;
+        store.allocator = self.a;
+        var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .cancellation = self.cancellation, .remaining_read_bytes = &self.directory_bytes, .remaining_write_bytes = &self.directory_bytes, .streaming = true };
         pages.admitPublication();
         const keys = try a.alloc([8]u8, references.items.len);
         const edits = try a.alloc(tree.Mutation, references.items.len);

@@ -11,6 +11,48 @@
       "rows": 1000000,
       "chunks": 489,
       "puts": 524,
+      "elapsed_ns": 598174000,
+      "allocator_peak": 519243
+    },
+    {
+      "target_bytes": 262037,
+      "key_width": 96,
+      "rows": 1000000,
+      "chunks": 367,
+      "puts": 395,
+      "elapsed_ns": 561118000,
+      "allocator_peak": 519243
+    },
+    {
+      "target_bytes": 196608,
+      "key_width": 108,
+      "rows": 1000000,
+      "chunks": 550,
+      "puts": 590,
+      "elapsed_ns": 2061811000,
+      "allocator_peak": 454327
+    },
+    {
+      "target_bytes": 262037,
+      "key_width": 108,
+      "rows": 1000000,
+      "chunks": 413,
+      "puts": 441,
+      "elapsed_ns": 650949000,
+      "allocator_peak": 552489
+    }
+  ],
+  "limitations": [
+    "Filesystem timings on a shared workstation; not a WAN or full-build speedup",
+    "Ongoing 1M GCS qualification remains on earlier frozen executable/harness inputs"
+  ],
+  "prior_results_before_reference_upload_quota_fix": [
+    {
+      "target_bytes": 196608,
+      "key_width": 96,
+      "rows": 1000000,
+      "chunks": 489,
+      "puts": 524,
       "allocator_peak": 519004,
       "elapsed_ns": 439743000
     },
@@ -42,8 +84,5 @@
       "elapsed_ns": 453108000
     }
   ],
-  "limitations": [
-    "Filesystem timings on a shared workstation; not a WAN or full-build speedup",
-    "Ongoing 1M GCS qualification remains on earlier frozen executable/harness inputs"
-  ]
+  "allocator_scope": "Tracker buffers, page-tree scratch, page packing and backend publication allocations; upload callback verifies allocator identity for every publication; shared capability unchanged"
 }

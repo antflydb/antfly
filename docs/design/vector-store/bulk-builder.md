@@ -793,6 +793,15 @@ scratch remains outside that directory total, and host free space includes
 unrelated workloads. SIGKILL cannot run finalization; the periodic checkpoint and
 external supervisor's exit record remain the available evidence.
 
+Shutdown persists the last complete observations before waiting for the sampler.
+Cancelled and failed attempts skip final collection. Successful attempts request
+one final scan in the sampling daemon, with a two-second cooperative deadline
+and a three-second join ceiling. Filesystem calls can block beyond that deadline;
+the reporting thread still persists terminal failure with
+`final_sample_complete=false` and `sampler_stopped=false`. A successful case
+requires completed final collection. Scan loops check cancellation and deadlines
+between filesystem operations. No final scan runs in the reporting thread.
+
 Real-GCS qualification rejects inherited storage endpoint overrides. ADC mode
 also rejects `GCS_BEARER_TOKEN` and `GOOGLE_OAUTH_ACCESS_TOKEN`, which otherwise
 take precedence over refreshable ADC in the native default credential resolver.
@@ -810,13 +819,18 @@ before appending. The tracker's pending buffer and publication scratch are
 charged to the native bulk owner's 256 MiB private allocator. Other tracker
 callers retain their 192 KiB target.
 
+Paged-reference publication also borrows an operation-local copy of the artifact
+store with the tracker allocator. This includes page packing and backend upload
+scratch without changing the shared capability's allocator. The publication
+fixture checks allocator identity for every identity and reference-page upload.
+
 The `lake-identity-publication-test` fixture publishes one million real keys for
 each target/key-width pair through `FsStore`, then reads every persisted chunk
 through the established paged reader and requires equal corpus count, order and
 BLAKE3 digest. For 96-byte keys, chunk puts decreased from 489 to 367 and all
-artifact puts from 524 to 395, with the same 519,004-byte tracker allocation peak.
+artifact puts from 524 to 395, with the same 519,243-byte tracker allocation peak.
 For 108-byte keys, chunk puts decreased from 550 to 413 and all puts from 590 to
-441; the measured peak increased from 454,088 to 552,250 bytes. Every fixture is
+441; the measured peak increased from 454,327 to 552,489 bytes. Every fixture is
 admitted under an 8 MiB tracker limit. These are measured artifact API counts and
 filesystem allocation observations, not measured GCS HTTP counts or a WAN/full
 build speedup. Raw observations are in

@@ -389,3 +389,84 @@ class SamplingPermissions(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertFalse(result["qualified"])
             self.assertEqual(result["error_type"], "PermissionError")
+
+
+class SamplingShutdown(unittest.TestCase):
+    def test_success_requires_a_completed_final_sample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = dict(qualified=False)
+            with worker.DiskSampler(root, report):
+                (root / "payload").write_bytes(bytes(4096))
+                report["qualified"] = True
+            result = json.loads((root / "result.json").read_text())
+            self.assertTrue(result["qualified"])
+            self.assertTrue(result["scratch_sample"]["final_sample_complete"])
+            self.assertTrue(result["scratch_sample"]["sampler_stopped"])
+            self.assertGreaterEqual(
+                result["scratch_sample"]["case_nominal_bytes"], 4096
+            )
+
+    def test_cancelled_shutdown_retains_last_sample_without_rescanning(self):
+        with tempfile.TemporaryDirectory() as directory, CancellationScope() as scope:
+            root = Path(directory)
+            report = dict(qualified=True)
+            sampler = worker.DiskSampler(root, report)
+            sampler.__enter__()
+            scope.request(signal.SIGTERM)
+            with mock.patch.object(
+                sampler, "sample", side_effect=AssertionError("rescan")
+            ):
+                with self.assertRaises(SystemExit):
+                    sampler.__exit__(None, None, None)
+            result = json.loads((root / "result.json").read_text())
+            self.assertEqual(result["status"], "cancelled")
+            self.assertFalse(result["qualified"])
+            self.assertFalse(result["scratch_sample"]["final_sample_complete"])
+            self.assertTrue(result["scratch_sample"]["sampler_stopped"])
+            self.assertIsNotNone(
+                result["scratch_sample"]["host_filesystem_min_free_bytes"]
+            )
+
+    def test_stalled_final_scan_cannot_block_terminal_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = dict(qualified=True)
+            sampler = worker.DiskSampler(root, report)
+            sampler.__enter__()
+            release = threading.Event()
+            entered = threading.Event()
+
+            def stalled():
+                entered.set()
+                provisional = json.loads((root / "result.json").read_text())
+                self.assertFalse(provisional["qualified"])
+                self.assertEqual(provisional["status"], "finalizing")
+                release.wait(10)
+
+            start = time.monotonic()
+            try:
+                with mock.patch.object(sampler, "sample", side_effect=stalled):
+                    with self.assertRaisesRegex(RuntimeError, "scratch sampler failed"):
+                        sampler.__exit__(None, None, None)
+                self.assertTrue(entered.is_set())
+                self.assertLess(time.monotonic() - start, 5)
+                result = json.loads((root / "result.json").read_text())
+                self.assertFalse(result["qualified"])
+                self.assertEqual(result["status"], "failed")
+                self.assertFalse(result["scratch_sample"]["sampler_stopped"])
+                self.assertFalse(result["scratch_sample"]["final_sample_complete"])
+            finally:
+                release.set()
+                sampler.thread.join(timeout=1)
+
+    def test_scan_checks_deadline_and_cancellation_between_entries(self):
+        with tempfile.TemporaryDirectory() as directory, CancellationScope() as scope:
+            sampler = worker.DiskSampler(Path(directory), {})
+            sampler.final_deadline = time.monotonic() - 1
+            with self.assertRaises(TimeoutError):
+                sampler.sample()
+            sampler.final_deadline = None
+            scope.request(signal.SIGTERM)
+            with self.assertRaises(InterruptedError):
+                sampler.sample()

@@ -146,6 +146,30 @@ hashes rather than assumed to use the same workspace revision.
 
 ## Remaining scale evidence
 
+The second review closed two remaining gaps: paged-reference publication now
+uses an operation-local artifact-store copy with the tracker allocator, and
+sampler shutdown saves observations before a bounded background final scan.
+Cancellation/failure skips final collection. Success requires a completed final
+sample; stalled filesystem operations produce terminal failure with explicit
+incomplete/still-running sampler fields. Regressions cover cancellation without
+rescanning, a blocked final scan, sampling deadlines, and successful final
+collection. Every publication fixture upload now asserts the quota allocator,
+including reference pages; all borrowed store fields remain unchanged.
+
+The repeated one-million-key fixtures retain the same publication counts and
+full readback equality. Including the missing upload allocations raises the
+observed tracker peaks by 239 bytes in these filesystem cases. The raw results
+preserve the preceding observations for comparison; timings remain shared-host
+filesystem observations, not full-build or WAN speedups.
+
+Second-review validation passed 49 Python regressions, all four million-key
+publication/readback cases, and native integration (28 passed, one guarded S3
+skip, no leaks). The restricted-sandbox invocation could not run the local HTTP
+ambiguous-upload fixture; both that isolated fixture and the full integration
+executable passed when rerun with loopback socket access.
+The final combined build invocation with that access passed all 99 native build
+steps, including the non-test runtime probe and publication fixture.
+
 Follow-up validation passed all 99 native build steps (including ABI integration,
 the runtime probe, and the publication/readback fixture) and 45 Python regression
 tests. A fresh frozen 1,024-row live GCS case using ADC also qualified: build,

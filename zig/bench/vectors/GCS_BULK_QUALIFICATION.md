@@ -247,7 +247,10 @@ The fresh-review follow-up closes launch/re-exec cancellation windows and covers
 all controller phases with terminal reporting. Native children remain in the
 worker group for escalation, and resource-aware waits preserve usage when
 available. Failed and cancelled cases retain disk-sampling checkpoints and
-final samples. Real-GCS admission rejects ambient storage endpoint overrides;
+last complete samples. Successful attempts require a completed final sample;
+cancelled/failed attempts skip final scanning. Shutdown persists observations
+before a bounded background join, and reports incomplete collection explicitly
+if filesystem I/O stalls. Real-GCS admission rejects ambient storage endpoint overrides;
 ADC mode also rejects nonrefreshable token overrides without logging their
 values. Provider mode and canonical endpoints are attested in the worker report.
 

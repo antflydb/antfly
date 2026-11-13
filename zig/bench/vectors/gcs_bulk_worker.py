@@ -314,6 +314,9 @@ class DiskSampler:
             host_filesystem_min_free_bytes=None,
         )
         self.thread = None
+        self.final_deadline = None
+        self.final_sample_complete = False
+        self.skip_final = False
 
     def snapshot(self):
         with self.lock:
@@ -329,15 +332,27 @@ class DiskSampler:
         if not isinstance(error, FileNotFoundError):
             raise error
 
+    def check_sample(self):
+        scope = CancellationScope.current
+        if scope is not None and scope.signum is not None:
+            raise InterruptedError("scratch sampling cancelled")
+        if self.final_deadline is not None and time.monotonic() >= self.final_deadline:
+            raise TimeoutError("scratch sampling deadline")
+
     def sample(self):
+        self.check_sample()
         total = 0
         for directory, _, names in os.walk(self.root, onerror=self.walk_error):
+            self.check_sample()
             for name in names:
+                self.check_sample()
                 try:
                     total += (Path(directory) / name).stat().st_size
                 except FileNotFoundError:
                     pass
+        self.check_sample()
         free = shutil.disk_usage(self.root).free
+        self.check_sample()
         with self.lock:
             self.peaks["case_nominal_bytes"] = max(
                 self.peaks["case_nominal_bytes"], total
@@ -349,13 +364,17 @@ class DiskSampler:
         atomic(self.root / "disk-samples.json", self.snapshot())
 
     def loop(self):
-        while not self.stop.wait(2):
-            try:
+        try:
+            while not self.stop.wait(2):
                 self.sample()
-            except Exception as error:
-                with self.lock:
-                    self.error_type = type(error).__name__
-                return
+            # Final collection stays in this daemon, never the reporting thread:
+            # a blocked filesystem call cannot delay terminal evidence forever.
+            if not self.skip_final:
+                self.sample()
+                self.final_sample_complete = True
+        except Exception as error:
+            with self.lock:
+                self.error_type = type(error).__name__
 
     def __enter__(self):
         try:
@@ -364,28 +383,51 @@ class DiskSampler:
             self.thread.start()
         except BaseException as error:
             self.error_type = type(error).__name__
+            scope = CancellationScope.current
             self.report.update(
                 qualified=False,
-                status="failed",
+                status="cancelled"
+                if scope is not None and scope.signum is not None
+                else "failed",
                 error_type=self.error_type,
-                scratch_sample=dict(self.snapshot(), sampler_stopped=True),
+                scratch_sample=dict(
+                    self.snapshot(), sampler_stopped=True, final_sample_complete=False
+                ),
             )
             atomic(self.root / "result.json", self.report)
             raise
         return self
 
     def __exit__(self, kind, error, _trace):
+        qualified = self.report.get("qualified", False)
+        scope = CancellationScope.current
+        cancelled = scope is not None and scope.signum is not None
+        self.skip_final = kind is not None or cancelled
+        self.final_deadline = time.monotonic() + 2
+        # Retain the last complete observations before waiting on filesystem I/O.
+        self.report.update(
+            qualified=False,
+            status="cancelled" if cancelled else "failed" if kind else "finalizing",
+            scratch_sample=dict(
+                self.snapshot(), final_sample_complete=False, sampler_stopped=False
+            ),
+        )
+        if kind is not None or cancelled:
+            self.report["error_type"] = (
+                kind.__name__ if kind is not None else "SystemExit"
+            )
+        atomic(self.root / "result.json", self.report)
         self.stop.set()
-        self.thread.join(timeout=5)
-        if not self.thread.is_alive():
-            try:
-                self.sample()
-            except Exception as failure:
-                self.error_type = self.error_type or type(failure).__name__
+        self.thread.join(timeout=3)
         sample = self.snapshot()
         sample["sampler_stopped"] = not self.thread.is_alive()
+        sample["final_sample_complete"] = self.final_sample_complete
         self.report["scratch_sample"] = sample
-        broken = self.error_type is not None or not sample["sampler_stopped"]
+        broken = (
+            self.error_type is not None
+            or not sample["sampler_stopped"]
+            or (not self.skip_final and not self.final_sample_complete)
+        )
         scope = CancellationScope.current
         cancelled = scope is not None and scope.signum is not None
         if kind is not None or broken or cancelled:
@@ -399,7 +441,8 @@ class DiskSampler:
                 else "ScratchSamplingFailed"
             )
         else:
-            self.report["status"] = "qualified"
+            self.report["qualified"] = qualified
+            self.report["status"] = "qualified" if qualified else "failed"
         atomic(self.root / "result.json", self.report)
         if kind is None:
             if cancelled:
