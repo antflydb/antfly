@@ -116,6 +116,19 @@ pub const Context = struct {
             fn release(_: *anyopaque, bytes: abi.OwnedBytes) callconv(.c) void {
                 std.heap.smp_allocator.free(bytes.slice());
             }
+            fn probe(raw: *anyopaque, out: *kernel_runtime_services.CachedRemoteContentSource.Revision) callconv(.c) abi.Status {
+                const facade: *const scraping.RemoteContentConfig = @ptrCast(@alignCast(raw));
+                var snapshot = facade.acquire() catch |err| return switch (err) {
+                    error.OutOfMemory => .out_of_memory,
+                    error.Timeout => .timeout,
+                    error.Canceled => .cancelled,
+                    else => .resource_temporarily_unavailable,
+                };
+                defer snapshot.deinit();
+                out.* = .{};
+                if (snapshot.revision) |revision| out.* = .{ .value = revision, .known = 1 };
+                return .ok;
+            }
             fn acquireIfChanged(raw: *anyopaque, previous: ?*const [32]u8, out: *kernel_runtime_services.CachedRemoteContentSource.Update) callconv(.c) abi.Status {
                 const facade: *const scraping.RemoteContentConfig = @ptrCast(@alignCast(raw));
                 const update = common_config.remoteContentSnapshotUpdateAlloc(std.heap.smp_allocator, facade, previous) catch |err| return switch (err) {
@@ -131,6 +144,7 @@ pub const Context = struct {
         };
         const source = kernel_runtime_services.CachedRemoteContentSource{
             .source = .{ .version = 3, .context = @ptrCast(@constCast(remote)), .acquire = Adapter.acquire, .release = Adapter.release },
+            .probe = Adapter.probe,
             .acquire_if_changed = Adapter.acquireIfChanged,
         };
         try self.ensure();

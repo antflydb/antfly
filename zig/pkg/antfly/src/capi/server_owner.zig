@@ -146,8 +146,10 @@ pub const StorageOwnerContext = struct {
     inference_lifetime: ?inference_provider.EmbeddedInferenceProviderLifetime = null,
     remote_content_source: ?kernel_runtime_services.RemoteContentSource = null,
     remote_content_acquire_if_changed: ?kernel_runtime_services.CachedRemoteContentSource.AcquireIfChanged = null,
+    remote_content_probe: ?kernel_runtime_services.CachedRemoteContentSource.Probe = null,
     remote_content_snapshot: ?*RemoteContentSnapshot = null,
     remote_content_snapshot_mutex: std.atomic.Mutex = .unlocked,
+    remote_content_build_mutex: std.atomic.Mutex = .unlocked,
     remote_content_security: ?std.json.Parsed(scraping.ContentSecurityConfig) = null,
     // An unconfigured facade denies destinations; acquisition errors propagate.
     remote_content: scraping.RemoteContentConfig = .{ .security = .{ .allowed_hosts = &.{}, .allowed_paths = &.{} } },
@@ -1030,6 +1032,10 @@ pub fn storageOwnerContextConfigureRemoteContentSource(
         @as(*const kernel_runtime_services.CachedRemoteContentSource, @ptrCast(source)).acquire_if_changed
     else
         null;
+    owner.remote_content_probe = if (source.version == 3)
+        @as(*const kernel_runtime_services.CachedRemoteContentSource, @ptrCast(source)).probe
+    else
+        null;
     owner.remote_content.security = .{ .allowed_hosts = &.{}, .allowed_paths = &.{} };
     owner.remote_content_source = source.*;
     owner.remote_content.runtime = .{ .context = owner, .acquire_fn = acquireRemoteContent };
@@ -1068,25 +1074,49 @@ fn acquireRemoteContentImpl(raw: *anyopaque) !scraping.RemoteContentConfig.Snaps
     const owner: *StorageOwnerContext = @ptrCast(@alignCast(raw));
     const source = owner.remote_content_source.?;
     if (owner.remote_content_acquire_if_changed) |acquire_if_changed| {
-        // Single-flight a new revision, including parsing. Existing leases do
-        // not take this lock and remain valid across publication/reconfiguration.
-        antfly.platform_sync.lockYielding(&owner.remote_content_snapshot_mutex);
-        defer owner.remote_content_snapshot_mutex.unlock();
-        const previous = owner.remote_content_snapshot;
+        // A probe may refresh a file-backed publisher. Never hold a consumer
+        // lock across it: other readers must be able to acquire the publisher's
+        // current publication while one request checks a slow replacement.
+        var revision: kernel_runtime_services.CachedRemoteContentSource.Revision = .{};
+        try remoteContentSourceStatus(owner.remote_content_probe.?(source.context, &revision));
+        if (revision.known > 1) return error.InvalidRemoteContentConfig;
+        if (revision.known == 1) {
+            antfly.platform_sync.lockYielding(&owner.remote_content_snapshot_mutex);
+            defer owner.remote_content_snapshot_mutex.unlock();
+            if (owner.remote_content_snapshot) |held| {
+                if (std.mem.eql(u8, &held.revision, &revision.value)) return held.acquire();
+            }
+        }
+        // Only cold or changed revisions wait for the builder. The second
+        // acquisition checks the latest publication, so a delayed probe cannot
+        // overwrite a newer cached revision with its older observation.
+        antfly.platform_sync.lockYielding(&owner.remote_content_build_mutex);
+        defer owner.remote_content_build_mutex.unlock();
+        const previous_revision: ?[32]u8 = blk: {
+            antfly.platform_sync.lockYielding(&owner.remote_content_snapshot_mutex);
+            defer owner.remote_content_snapshot_mutex.unlock();
+            break :blk if (owner.remote_content_snapshot) |held| held.revision else null;
+        };
         var update: kernel_runtime_services.CachedRemoteContentSource.Update = .{};
-        try remoteContentSourceStatus(acquire_if_changed(source.context, if (previous) |held| &held.revision else null, &update));
+        try remoteContentSourceStatus(acquire_if_changed(source.context, if (previous_revision) |*held| held else null, &update));
         if (update.bytes.ptr == null) {
             if (update.bytes.len != 0) return error.InvalidRemoteContentConfig;
-            const held = previous orelse return error.InvalidRemoteContentConfig;
+            antfly.platform_sync.lockYielding(&owner.remote_content_snapshot_mutex);
+            defer owner.remote_content_snapshot_mutex.unlock();
+            const held = owner.remote_content_snapshot orelse return error.InvalidRemoteContentConfig;
             if (!std.mem.eql(u8, &held.revision, &update.revision)) return error.InvalidRemoteContentConfig;
             return held.acquire();
         }
         defer source.release(source.context, update.bytes);
         const next = try parseRemoteContentSnapshot(source.version, update.bytes);
         next.revision = update.revision;
+        antfly.platform_sync.lockYielding(&owner.remote_content_snapshot_mutex);
+        const previous = owner.remote_content_snapshot;
         owner.remote_content_snapshot = next;
+        const lease = next.acquire();
+        owner.remote_content_snapshot_mutex.unlock();
         if (previous) |held| RemoteContentSnapshot.release(held);
-        return next.acquire();
+        return lease;
     }
     var bytes: kernel_owner_abi.OwnedBytes = .{};
     try remoteContentSourceStatus(source.acquire(source.context, &bytes));
@@ -1144,6 +1174,7 @@ pub fn storageOwnerContextConfigureRemoteContentSecurity(
     var previous = owner_context.remote_content_security;
     owner_context.remote_content_source = null;
     owner_context.remote_content_acquire_if_changed = null;
+    owner_context.remote_content_probe = null;
     if (owner_context.remote_content_snapshot) |snapshot| RemoteContentSnapshot.release(snapshot);
     owner_context.remote_content_snapshot = null;
     owner_context.remote_content.runtime = null;

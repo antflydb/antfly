@@ -8177,10 +8177,23 @@ test "storage owner remote content source caches revisions without hiding errors
         releases: std.atomic.Value(usize) = .init(0),
         failure: kernel_owner_abi.Status = .ok,
         malformed: bool = false,
+        block_probe: std.atomic.Value(bool) = .init(false),
+        probe_started: std.atomic.Value(bool) = .init(false),
+        resume_probe: std.atomic.Value(bool) = .init(false),
 
         fn acquire(_: *anyopaque, _: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
             // v3 must use the conditional callback.
             return .invalid_argument;
+        }
+        fn probe(raw: *anyopaque, out: *remote_content_services.CachedRemoteContentSource.Revision) callconv(.c) kernel_owner_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.failure != .ok) return self.failure;
+            if (self.block_probe.swap(false, .acq_rel)) {
+                self.probe_started.store(true, .release);
+                while (!self.resume_probe.load(.acquire)) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            }
+            out.* = .{ .value = @splat(self.revision.load(.acquire)), .known = 1 };
+            return .ok;
         }
         fn acquireIfChanged(raw: *anyopaque, previous: ?*const [32]u8, out: *remote_content_services.CachedRemoteContentSource.Update) callconv(.c) kernel_owner_abi.Status {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -8210,6 +8223,7 @@ test "storage owner remote content source caches revisions without hiding errors
     defer std.testing.expectEqual(kernel_owner_abi.Status.ok, storageOwnerContextDestroy(context)) catch unreachable;
     const callbacks = remote_content_services.CachedRemoteContentSource{
         .source = .{ .version = 3, .context = &source, .acquire = Source.acquire, .release = Source.release },
+        .probe = Source.probe,
         .acquire_if_changed = Source.acquireIfChanged,
     };
     try std.testing.expectEqual(kernel_owner_abi.Status.ok, server_api.storageOwnerContextConfigureRemoteContentSource(context, &callbacks.source));
@@ -8223,6 +8237,50 @@ test "storage owner remote content source caches revisions without hiding errors
     }
     try std.testing.expectEqual(@as(usize, 1), source.payloads.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), source.releases.load(.acquire));
+
+    const Acquisition = struct {
+        facade: *const server_api.scraping.RemoteContentConfig,
+        completed: std.atomic.Value(bool) = .init(false),
+        failed: bool = false,
+        fn run(self: *@This()) void {
+            defer self.completed.store(true, .release);
+            var held = self.facade.acquire() catch {
+                self.failed = true;
+                return;
+            };
+            held.deinit();
+        }
+    };
+    // Hold one publisher acquisition open, as a slow file refresh would. A
+    // second acquisition of the current revision must finish before release.
+    source.block_probe.store(true, .release);
+    var blocked = Acquisition{ .facade = facade };
+    var blocked_task = try std.testing.io.concurrent(Acquisition.run, .{&blocked});
+    defer {
+        source.resume_probe.store(true, .release);
+        blocked_task.await(std.testing.io);
+    }
+    for (0..1000) |_| {
+        if (source.probe_started.load(.acquire)) break;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(source.probe_started.load(.acquire));
+    var independent = Acquisition{ .facade = facade };
+    var independent_task = try std.testing.io.concurrent(Acquisition.run, .{&independent});
+    defer {
+        source.resume_probe.store(true, .release);
+        independent_task.await(std.testing.io);
+    }
+    for (0..1000) |_| {
+        if (independent.completed.load(.acquire)) break;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const completed_while_blocked = independent.completed.load(.acquire);
+    source.resume_probe.store(true, .release);
+    blocked_task.await(std.testing.io);
+    independent_task.await(std.testing.io);
+    try std.testing.expect(completed_while_blocked);
+    try std.testing.expect(!blocked.failed and !independent.failed);
 
     source.failure = .timeout;
     try std.testing.expectError(error.Timeout, facade.acquire());
@@ -8247,33 +8305,57 @@ test "storage owner remote content source caches revisions without hiding errors
 
     const Reader = struct {
         facade: *const server_api.scraping.RemoteContentConfig,
+        round: std.atomic.Value(usize) = .init(0),
+        completed: std.atomic.Value(usize) = .init(0),
+        stop: std.atomic.Value(bool) = .init(false),
         invalid: std.atomic.Value(bool) = .init(false),
         fn run(self: *@This()) void {
-            for (0..1000) |_| {
+            for (1..21) |round| {
+                while (self.round.load(.acquire) < round) {
+                    if (self.stop.load(.acquire)) return;
+                    std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+                }
                 var held = self.facade.acquire() catch {
                     self.invalid.store(true, .release);
-                    return;
+                    _ = self.completed.fetchAdd(1, .release);
+                    continue;
                 };
                 defer held.deinit();
                 const s3 = held.config.getS3("r2").?.secret_access_key.?;
                 const http = held.config.getHttp("github").?.headers.get("Authorization").?;
-                if (!std.mem.eql(u8, s3, http)) self.invalid.store(true, .release);
+                const expected = if (round % 2 == 1) "${secret:old}" else "${secret:new}";
+                if (!std.mem.eql(u8, s3, http) or !std.mem.eql(u8, s3, expected)) self.invalid.store(true, .release);
+                _ = self.completed.fetchAdd(1, .release);
             }
         }
     };
     var reader = Reader{ .facade = facade };
     var first = try std.testing.io.concurrent(Reader.run, .{&reader});
-    defer first.await(std.testing.io);
+    defer {
+        reader.stop.store(true, .release);
+        first.await(std.testing.io);
+    }
     var second = try std.testing.io.concurrent(Reader.run, .{&reader});
-    defer second.await(std.testing.io);
+    defer {
+        reader.stop.store(true, .release);
+        second.await(std.testing.io);
+    }
+    const payloads_before_rounds = source.payloads.load(.acquire);
     for (0..20) |i| {
         source.revision.store(@intCast(1 + i % 2), .release);
+        reader.round.store(i + 1, .release);
         var held = try facade.acquire();
         held.deinit();
+        for (0..1000) |_| {
+            if (reader.completed.load(.acquire) >= 2 * (i + 1)) break;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(2 * (i + 1), reader.completed.load(.acquire));
     }
     first.await(std.testing.io);
     second.await(std.testing.io);
     try std.testing.expect(!reader.invalid.load(.acquire));
+    try std.testing.expectEqual(payloads_before_rounds + 20, source.payloads.load(.acquire));
     try std.testing.expectEqual(source.payloads.load(.acquire), source.releases.load(.acquire));
 
     // Reconfiguration drops only the cache's reference, not outstanding leases.

@@ -61,12 +61,21 @@ pub const RemoteContentSource = extern struct {
 /// Errors must propagate even when the consumer holds an older cached value.
 pub const CachedRemoteContentSource = extern struct {
     source: RemoteContentSource,
+    /// Always consult the publisher, outside consumer locks. It must report
+    /// acquisition errors, and bind a known revision to the acquired immutable
+    /// publication. Mutable publishers report known=0 and use the full path.
+    probe: Probe,
     acquire_if_changed: AcquireIfChanged,
 
+    pub const Revision = extern struct {
+        value: [32]u8 = @splat(0),
+        known: u8 = 0,
+    };
     pub const Update = extern struct {
         revision: [32]u8 = @splat(0),
         bytes: abi.OwnedBytes = .{},
     };
+    pub const Probe = *const fn (*anyopaque, *Revision) callconv(.c) abi.Status;
     pub const AcquireIfChanged = *const fn (*anyopaque, ?*const [32]u8, *Update) callconv(.c) abi.Status;
 };
 
