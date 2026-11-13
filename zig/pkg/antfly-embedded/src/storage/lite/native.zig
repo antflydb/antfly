@@ -6649,6 +6649,16 @@ pub const NativeFile = struct {
     /// Fails the next checkpoint publication inside its uncertain window
     /// (after the flag is set, before the slot write), then disarms.
     test_fail_checkpoint_publication: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
+    /// Fails the redo log's own durability barrier (`RedoCommitState.writer
+    /// .sync()`) on the next redo-log durable commit, but only *after* that
+    /// commit's own `appendRecord` has already succeeded -- unlike
+    /// `test_fail_checkpoint_publication`, which fires before `appendRecord`
+    /// is ever reached. Exercises the gap `redo_log.Writer.rollbackTo`
+    /// closes: a record whose append succeeded but whose own sync failed
+    /// must not leave the writer's physical cursor permanently ahead of
+    /// the logical state every later commit computes its next sequence
+    /// from. Disarms itself after firing once.
+    test_fail_redo_sync: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
     /// Fails the very next `checkpointRedoLog` call outright (before it
     /// touches anything), then disarms. For exercising a caller's own
     /// error handling around that call directly -- e.g. docstore.zig's
@@ -17553,15 +17563,32 @@ pub const NativeFile = struct {
                 // would.
                 self.publication_in_flight = true;
                 defer self.publication_in_flight = false;
+                // Captured before `appendRecord` below so a `sync()`
+                // failure right after a successful append can roll the
+                // writer's own cursor back to exactly here -- see
+                // `redo_log.Writer.rollbackTo`'s own doc comment for why
+                // this matters: without it, this record's bytes are
+                // already physically indistinguishable from a durably
+                // synced one, while this function's own failure path
+                // below never advances `self.header`/`redo.durable_sequence`
+                // to match, permanently desyncing the writer's physical
+                // cursor from the logical state every later commit
+                // computes its own next sequence from.
+                const append_mark = redo.writer.mark();
                 (blk: {
                     if (comptime builtin.is_test) if (self.test_fail_checkpoint_publication) |err| {
                         self.test_fail_checkpoint_publication = null;
                         break :blk err;
                     };
                     redo.appendRecord(self.allocator, checkpoint.commit_sequence, CompactCheckpoint.fromCheckpointSlot(checkpoint)) catch |err| break :blk err;
+                    if (comptime builtin.is_test) if (self.test_fail_redo_sync) |err| {
+                        self.test_fail_redo_sync = null;
+                        break :blk err;
+                    };
                     redo.writer.sync() catch |err| break :blk err;
                     break :blk {};
                 }) catch {
+                    redo.writer.rollbackTo(append_mark);
                     return error.OutcomeUnknown;
                 };
                 // §9.7c (ReadView): `redo.writer.sync()` above is this
@@ -30493,6 +30520,142 @@ test "lite redo log publishRedoLogState never runs when the durable append itsel
     try file.commitTransaction();
     const final = region.readLogState();
     try std.testing.expect(final.durable_sequence > before.durable_sequence);
+}
+
+// Regression for a gap `test_fail_checkpoint_publication` (used just
+// above) cannot reach: that hook fires *before* `RedoCommitState
+// .appendRecord` is ever called, so it only ever exercises "the publish
+// failed before touching the log." `RedoCommitState.appendRecord` itself
+// physically writes a record's payload and header, and only *then* does
+// `publishCheckpoint`'s redo branch call `redo.writer.sync()` -- a
+// *separate* call that can fail on its own, after the append already
+// succeeded. Before `redo_log.Writer.rollbackTo` existed, a sync failure
+// there left `redo.writer`'s own cursor (`tail`/`last_sequence`)
+// permanently advanced past what `self.header`/`redo.durable_sequence`
+// rolled back to on that same failure (unchanged, per the "let a failed
+// append propagate without ever having touched the header" rule) --
+// every later commit then recomputed the exact same doomed
+// `commit_sequence` from the stale header, colliding with the writer's
+// already-advanced `last_sequence` and failing `Writer.append`'s own
+// continuity check forever (`error.SequenceOutOfOrder`, surfacing as the
+// equally far less specific `error.OutcomeUnknown`) -- reproduced
+// end-to-end via `crash sweep: dense native-catalog dimension
+// replacement delete (#1216)` at `barrier=0 when=before
+// power_loss=drop_unsynced`, where the live process never recovered on
+// its own and a subsequent cold reopen found a durably recovered record
+// referencing a page neither on disk nor rebuilt from the log.
+test "lite redo log a sync failure right after a successful append does not permanently wedge later commits" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-sync-after-append-fails.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    try file.beginTransaction();
+    try file.putDocument("alpha", "one");
+    try file.commitTransaction();
+    const tail_before = file.redo.?.writer.tail;
+    const sequence_before = file.redo.?.writer.last_sequence;
+
+    // Fail the sync, not the append: by the time this fires, `beta`'s own
+    // record is already fully, physically written into the log region.
+    file.test_fail_redo_sync = error.TestInjectedFailure;
+    try file.beginTransaction();
+    try file.putDocument("beta", "two");
+    try std.testing.expectError(error.OutcomeUnknown, file.commitTransaction());
+    try std.testing.expectEqual(@as(?anyerror, null), file.test_fail_redo_sync);
+
+    // The writer's own cursor must be rolled back to exactly where it was
+    // before the failed attempt's append -- not left pointing past
+    // `beta`'s own (physically present but never confirmed durable)
+    // record.
+    try std.testing.expectEqual(tail_before, file.redo.?.writer.tail);
+    try std.testing.expectEqual(sequence_before, file.redo.?.writer.last_sequence);
+
+    // The regression itself: a later, perfectly ordinary durable commit
+    // must succeed, not fail with `OutcomeUnknown` (`error
+    // .SequenceOutOfOrder` under the hood) forever.
+    try file.beginTransaction();
+    try file.putDocument("gamma", "three");
+    try file.commitTransaction();
+
+    const alpha = (try file.getDocumentAlloc(a, "alpha")).?;
+    defer a.free(alpha);
+    try std.testing.expectEqualStrings("one", alpha);
+    const gamma = (try file.getDocumentAlloc(a, "gamma")).?;
+    defer a.free(gamma);
+    try std.testing.expectEqualStrings("three", gamma);
+
+    // A cold reopen must also recover cleanly: whatever became of `beta`
+    // (rolled back, so absent -- one of the two outcomes an uncertain
+    // commit may resolve to), every page a recovered record references
+    // must be either on disk or rebuilt from the log -- never neither.
+    file.close();
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    const alpha_reopened = (try reopened.getDocumentAlloc(a, "alpha")).?;
+    defer a.free(alpha_reopened);
+    try std.testing.expectEqualStrings("one", alpha_reopened);
+    const gamma_reopened = (try reopened.getDocumentAlloc(a, "gamma")).?;
+    defer a.free(gamma_reopened);
+    try std.testing.expectEqualStrings("three", gamma_reopened);
+    try std.testing.expect((try reopened.getDocumentAlloc(a, "beta")) == null);
+    try std.testing.expect((try reopened.check()).valid);
+}
+
+// Same gap, bare-commit flavor: `RedoCommitState.appendRecord`'s own
+// doc comment notes a bare (non-`Txn`) diverting commit's redo record
+// carries only page-shaped content (`pending`), never a logical
+// mutation (`logical_pending` stays empty) -- so this exercises
+// `redo_log.Writer.rollbackTo` against a record whose payload is a
+// page-shaped chain rather than a document mutation, matching the #1216
+// crash sweep's own dense native-catalog write shape (`putIndexCatalogBatch`,
+// used by `.native_catalog` index storage) more directly than the
+// document-write test just above does.
+test "lite redo log a sync failure right after a successful bare (page-shaped) append does not permanently wedge later commits" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-sync-after-bare-append-fails.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    // A bare commit (no beginTransaction/commitTransaction wrapper): the
+    // same shape `putIndexCatalogBatch` uses, diverting real B-tree pages
+    // into the redo overlay with no accompanying logical mutation.
+    try file.putIndexCatalogRecord("first", "value-one");
+    const tail_before = file.redo.?.writer.tail;
+    const sequence_before = file.redo.?.writer.last_sequence;
+    try std.testing.expect(tail_before > 0);
+
+    file.test_fail_redo_sync = error.TestInjectedFailure;
+    try std.testing.expectError(error.OutcomeUnknown, file.putIndexCatalogRecord("second", "value-two"));
+    try std.testing.expectEqual(@as(?anyerror, null), file.test_fail_redo_sync);
+
+    try std.testing.expectEqual(tail_before, file.redo.?.writer.tail);
+    try std.testing.expectEqual(sequence_before, file.redo.?.writer.last_sequence);
+
+    // The regression: a later bare commit must succeed, not stay wedged.
+    try file.putIndexCatalogRecord("third", "value-three");
+
+    const first = (try file.getIndexCatalogRecordAlloc(a, "first")).?;
+    defer a.free(first);
+    try std.testing.expectEqualStrings("value-one", first);
+    const third = (try file.getIndexCatalogRecordAlloc(a, "third")).?;
+    defer a.free(third);
+    try std.testing.expectEqualStrings("value-three", third);
+
+    file.close();
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    const first_reopened = (try reopened.getIndexCatalogRecordAlloc(a, "first")).?;
+    defer a.free(first_reopened);
+    try std.testing.expectEqualStrings("value-one", first_reopened);
+    const third_reopened = (try reopened.getIndexCatalogRecordAlloc(a, "third")).?;
+    defer a.free(third_reopened);
+    try std.testing.expectEqualStrings("value-three", third_reopened);
+    try std.testing.expect((try reopened.check()).valid);
 }
 
 test "lite redo log cross-process: a forked child sees commits the parent makes after the child opens" {

@@ -216,6 +216,70 @@ pub const Writer = struct {
     pub fn sync(self: *Writer) File.SyncError!void {
         try self.file.sync(self.io);
     }
+
+    /// A saved writer position, captured before one or more `append` calls
+    /// so a caller whose own durability barrier (`sync()`) fails afterward
+    /// can undo them via `rollbackTo`. See that function's own doc comment
+    /// for why this matters.
+    pub const Mark = struct { tail: u64, last_sequence: ?u64 };
+
+    /// Captures the writer's current position.
+    pub fn mark(self: *const Writer) Mark {
+        return .{ .tail = self.tail, .last_sequence = self.last_sequence };
+    }
+
+    /// Undoes every `append` made since `m` was captured: zeroes the
+    /// *complete* byte range those appends wrote -- every rolled-back
+    /// record's payload as well as its header, not just the header -- so a
+    /// later `replay` sees `m.tail` onward as untouched (`isAllZero` on
+    /// every header it meets there -> benign `end_of_region`, never
+    /// `corrupt_record`), then resets `tail`/`last_sequence` back to `m` so
+    /// the next real `append` reuses this same byte range and sequence
+    /// number instead of leaving a gap. Zeroing only each record's own
+    /// header is not enough: a later retry that writes a *shorter* record
+    /// at `m.tail` would leave the old, longer record's own stale payload
+    /// tail sitting right after the new one's declared length -- exactly
+    /// where `replay` next expects either a valid header or untouched
+    /// zero-fill, and neither is what it would find.
+    ///
+    /// Why this is needed at all: `append` physically writes a record's
+    /// payload and header *before* the caller's own `sync()` ever runs
+    /// (§9.3's "one append, one fsync" batches many appends behind one
+    /// barrier) -- so the moment it returns, the record is already
+    /// indistinguishable, on disk, from a durably-synced one: a later
+    /// `replay` has no way to tell "written but this writer's own barrier
+    /// never confirmed it" apart from "written and confirmed," since both
+    /// look like a complete, correctly-sequenced, checksummed record.
+    /// Without rolling back here, a `sync()` failure right after a
+    /// successful `append` leaves `tail`/`last_sequence` permanently ahead
+    /// of whatever the caller's own logical state (`self.header`,
+    /// `durable_sequence`) rolls back to on that same failure -- every
+    /// later commit then computes its next `commit_sequence` from that
+    /// unrolled-back logical state, colliding with this writer's
+    /// already-advanced `last_sequence` and failing `append`'s own
+    /// continuity check forever (`error.SequenceOutOfOrder`, surfacing as
+    /// the equally far less specific `error.OutcomeUnknown`) -- a one-way
+    /// lockout exactly like the one `RedoCommitState`'s own ride-along
+    /// append-ordering fix (`native.zig`) already closed for `append`
+    /// itself failing outright. This closes the matching gap for `append`
+    /// succeeding but the barrier right after it failing.
+    pub fn rollbackTo(self: *Writer, m: Mark) void {
+        if (m.tail >= self.tail) return;
+        const zeros: [4096]u8 = @splat(0);
+        var pos = m.tail;
+        while (pos < self.tail) {
+            const chunk = @min(zeros.len, self.tail - pos);
+            // Best-effort, like every other write into this fixed,
+            // preallocated extent (§9.1): a failure here leaves some stale
+            // bytes behind, no worse off than not rolling back at all, so
+            // it must never stop `tail`/`last_sequence` from being reset
+            // below regardless.
+            self.file.writePositionalAll(self.io, zeros[0..chunk], self.base_offset + pos) catch break;
+            pos += chunk;
+        }
+        self.tail = m.tail;
+        self.last_sequence = m.last_sequence;
+    }
 };
 
 /// One decoded, checksum-and-sequence-validated record, handed to a
@@ -743,6 +807,53 @@ test "writer rejects out-of-order sequence" {
     try writer.append(5, "a");
     try testing.expectError(error.SequenceOutOfOrder, writer.append(5, "dup"));
     try testing.expectError(error.SequenceOutOfOrder, writer.append(7, "gap"));
+}
+
+test "rollbackTo undoes an append so a shorter retry at the same sequence does not leave stale payload garbage" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    var writer = Writer.init(region.file, io, 0, capacity);
+    try writer.append(1, "one");
+    try writer.sync();
+    const mark_before_long = writer.mark();
+
+    // A long record "appended" (as `RedoCommitState.appendRecord` does
+    // before its own caller's `sync()` ever runs) then rolled back, as if
+    // that `sync()` had failed.
+    try writer.append(2, "a much longer payload than the retry below");
+    writer.rollbackTo(mark_before_long);
+    try testing.expectEqual(mark_before_long.tail, writer.tail);
+    try testing.expectEqual(mark_before_long.last_sequence, writer.last_sequence);
+
+    // The retry, at the same sequence, with a *shorter* payload: without
+    // zeroing the long record's own payload tail (not just its header),
+    // the long record's leftover bytes past the short one's own declared
+    // length would sit exactly where `replay` next expects either a valid
+    // header or untouched zero-fill.
+    try writer.append(2, "short");
+    try writer.sync();
+
+    const outcome = try replay(testing.allocator, region.file, io, 0, capacity, null, null, null);
+    try testing.expectEqual(@as(u64, 2), outcome.valid_count);
+    try testing.expectEqual(@as(u64, 2), outcome.last_sequence.?);
+    try testing.expectEqual(StopReason.end_of_region, outcome.stop_reason);
+}
+
+test "rollbackTo is a no-op when nothing was appended since the mark" {
+    const io = testing.io;
+    const capacity: u64 = 4096;
+    var region = try makeTempRegion(io, capacity);
+    defer cleanupTempRegion(io, &region.file, region.path[0..region.path_len]);
+
+    var writer = Writer.init(region.file, io, 0, capacity);
+    try writer.append(1, "one");
+    const m = writer.mark();
+    writer.rollbackTo(m);
+    try testing.expectEqual(m.tail, writer.tail);
+    try testing.expectEqual(m.last_sequence, writer.last_sequence);
 }
 
 test "writer rejects a record that would overflow the region" {
