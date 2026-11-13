@@ -3163,6 +3163,8 @@ const CanonicalBatchSlot = struct {
 
 const CanonicalEdgeBatch = struct {
     const GroupKeys = struct { keys: []const []const u8, ids: []u32 };
+    const ShardChain = struct { first: usize, last: usize };
+    const LookupWork = if (@import("builtin").is_test) struct { lookups: usize = 0, shard_visits: usize = 0 } else struct {};
     const Table = struct {
         logical: []const u8,
         physical: []const u8 = "",
@@ -3171,6 +3173,7 @@ const CanonicalEdgeBatch = struct {
         keys: std.ArrayListUnmanaged([]const u8) = .empty,
         seen: std.StringHashMapUnmanaged(void) = .empty,
         groups: []u64 = &.{},
+        group_shards: std.AutoHashMapUnmanaged(u64, ShardChain) = .empty,
         incoming_resolved: bool = false,
         incoming_complete: u64 = 0,
         incoming: std.AutoHashMapUnmanaged(u64, GroupKeys) = .empty,
@@ -3193,6 +3196,7 @@ const CanonicalEdgeBatch = struct {
         pinned: bool = false,
         retired: bool = false,
         consumed_keys: u64 = 0,
+        next: ?usize = null,
         fn keyIndex(self: @This(), index: usize) usize {
             return if (self.key_ids.len != 0) self.key_ids[index] else self.key_base + index;
         }
@@ -3207,8 +3211,47 @@ const CanonicalEdgeBatch = struct {
     retired_pages: usize = 0,
     unobserved_prefetch_failure: bool = false,
     tables: std.ArrayListUnmanaged(Table) = .empty,
+    table_ids: std.StringHashMapUnmanaged(usize) = .empty,
     shards: std.ArrayListUnmanaged(Shard) = .empty,
+    lookup_work: LookupWork = .{},
     unsupported: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    fn addTable(self: *@This(), logical: []const u8) !*Table {
+        if (self.table(logical)) |entry| return entry;
+        const a = self.tracked.allocator();
+        try self.tables.ensureUnusedCapacity(a, 1);
+        try self.table_ids.putNoClobber(a, logical, self.tables.items.len);
+        self.tables.appendAssumeCapacity(.{ .logical = logical });
+        return &self.tables.items[self.tables.items.len - 1];
+    }
+    fn reserveShards(self: *@This(), table_id: usize, count: usize) !void {
+        const a = self.tracked.allocator();
+        try self.shards.ensureUnusedCapacity(a, count);
+        try self.tables.items[table_id].group_shards.ensureUnusedCapacity(a, @intCast(count));
+    }
+    fn appendShardAssumeCapacity(self: *@This(), shard: Shard) void {
+        std.debug.assert(shard.next == null);
+        const id = self.shards.items.len;
+        const group = self.tables.items[shard.table].group_shards.getOrPutAssumeCapacity(shard.group);
+        if (group.found_existing) {
+            self.shards.items[group.value_ptr.last].next = id;
+            group.value_ptr.last = id;
+        } else group.value_ptr.* = .{ .first = id, .last = id };
+        self.shards.appendAssumeCapacity(shard);
+    }
+    fn appendShard(self: *@This(), shard: Shard) !void {
+        try self.reserveShards(shard.table, 1);
+        self.appendShardAssumeCapacity(shard);
+    }
+    fn firstShard(self: *@This(), logical: []const u8, group: u64) ?usize {
+        if (comptime @import("builtin").is_test) self.lookup_work.lookups += 1;
+        const entry = self.table(logical) orelse return null;
+        return (entry.group_shards.get(group) orelse return null).first;
+    }
+    fn indexedShard(self: *@This(), id: usize) *Shard {
+        if (comptime @import("builtin").is_test) self.lookup_work.shard_visits += 1;
+        return &self.shards.items[id];
+    }
 
     fn enableReclamation(self: *@This()) void {
         const budget = self.tracked.budget orelse return;
@@ -3239,10 +3282,12 @@ const CanonicalEdgeBatch = struct {
     /// Only the descriptor prefix may need a new allocation. Pin the source
     /// during that allocation so reentrant reclamation cannot invalidate it.
     fn takePage(self: *@This(), logical: []const u8, group: u64, key: []const u8, target: *graph_work_budget.RetainedAllocator) !?GraphEdgesResponse {
-        for (self.shards.items) |*shard| {
+        var shard_cursor = self.firstShard(logical, group);
+        while (shard_cursor) |id| {
+            const shard = self.indexedShard(id);
+            shard_cursor = shard.next;
             if (shard.retired) continue;
             const source = self.tables.items[shard.table];
-            if (shard.group != group or !std.mem.eql(u8, source.logical, logical)) continue;
             var complete_scans: u32 = 0;
             for (shard.result.key_scanned_rows, 0..) |scans, i| {
                 complete_scans += scans;
@@ -3315,11 +3360,13 @@ const CanonicalEdgeBatch = struct {
                 a.free(read.ids);
             }
             entry.incoming.deinit(a);
+            entry.group_shards.deinit(a);
             entry.keys.deinit(a);
             entry.seen.deinit(a);
             a.free(entry.groups);
         }
         self.tables.clearRetainingCapacity();
+        self.table_ids.clearRetainingCapacity();
     }
     fn deinit(self: *@This()) void {
         if (self.owns_reclaimer) {
@@ -3327,15 +3374,22 @@ const CanonicalEdgeBatch = struct {
             self.tracked.budget.?.state_reclaimer = null;
         }
         self.clear();
-        const a = self.tracked.allocator();
-        self.tables.deinit(a);
-        self.shards.deinit(a);
-        self.unsupported.deinit(a);
+        self.releaseContainers();
+        self.unsupported.deinit(self.tracked.allocator());
         std.debug.assert(self.tracked.live_bytes == 0);
     }
+    fn releaseContainers(self: *@This()) void {
+        const a = self.tracked.allocator();
+        std.debug.assert(self.tables.items.len == 0 and self.shards.items.len == 0);
+        self.tables.deinit(a);
+        self.tables = .empty;
+        self.table_ids.deinit(a);
+        self.table_ids = .empty;
+        self.shards.deinit(a);
+        self.shards = .empty;
+    }
     fn table(self: *@This(), logical: []const u8) ?*Table {
-        for (self.tables.items) |*entry| if (std.mem.eql(u8, logical, entry.logical)) return entry;
-        return null;
+        return &self.tables.items[self.table_ids.get(logical) orelse return null];
     }
     fn hasKey(self: *@This(), logical: []const u8, key: []const u8) bool {
         for (self.shards.items) |*shard| {
@@ -3396,20 +3450,24 @@ const CanonicalEdgeBatch = struct {
     }
 
     fn hasPage(self: *@This(), logical: []const u8, group: u64, key: []const u8) bool {
-        for (self.shards.items) |shard| {
+        var cursor = self.firstShard(logical, group);
+        while (cursor) |id| {
+            const shard = self.indexedShard(id);
+            cursor = shard.next;
             if (shard.retired) continue;
             const source = self.tables.items[shard.table];
-            if (shard.group != group or !std.mem.eql(u8, source.logical, logical)) continue;
             for (shard.result.key_scanned_rows, 0..) |_, i| if (shard.consumed_keys & (@as(u64, 1) << @intCast(i)) == 0 and std.mem.eql(u8, source.keys.items[shard.keyIndex(i)], key)) return true;
             if (shard.result.partial_key) |i| if (std.mem.eql(u8, source.keys.items[shard.keyIndex(i)], key)) return true;
         }
         return false;
     }
     fn take(self: *@This(), alloc: std.mem.Allocator, reader: DistributedEdgeReader, logical: []const u8, group: u64, key: []const u8, edge_types: []const []const u8, direction: graph_mod.EdgeDirection, max_edges: usize, max_bytes: usize) !?GraphEdgesResponse {
-        for (self.shards.items) |*shard| {
+        var cursor = self.firstShard(logical, group);
+        while (cursor) |id| {
+            const shard = self.indexedShard(id);
+            cursor = shard.next;
             if (shard.retired) continue;
             const source = self.tables.items[shard.table];
-            if (shard.group != group or !std.mem.eql(u8, source.logical, logical)) continue;
             for (shard.result.key_scanned_rows, 0..) |*scans, i| {
                 if (shard.consumed_keys & (@as(u64, 1) << @intCast(i)) != 0 or !std.mem.eql(u8, source.keys.items[shard.keyIndex(i)], key)) continue;
                 const counted = if (scans.* == std.math.maxInt(u32)) 0 else scans.*;
@@ -3417,11 +3475,12 @@ const CanonicalEdgeBatch = struct {
                 return .{ .edges = shard.result.edges[shard.result.key_offsets[i]..shard.result.key_offsets[i + 1]], .scanned_rows = counted, .borrowed_edges = true, .physical_rows_precharged = true };
             }
         }
-        for (self.shards.items, 0..) |shard, index| {
-            if (shard.group != group) continue;
+        cursor = self.firstShard(logical, group);
+        while (cursor) |index| {
+            const shard = self.indexedShard(index);
+            cursor = shard.next;
             if (shard.retired) continue;
             const source = self.tables.items[shard.table];
-            if (!std.mem.eql(u8, source.logical, logical)) continue;
             if (shard.result.partial_key) |partial| if (std.mem.eql(u8, source.keys.items[shard.keyIndex(partial)], key))
                 return self.finishPartial(alloc, reader, index, key, edge_types, direction, max_edges, max_bytes) catch |err| return if (err == error.OutOfMemory and self.tracked.denied) error.GraphWorkBudgetExceeded else err;
         }
@@ -3453,7 +3512,7 @@ const CanonicalEdgeBatch = struct {
             if (bytes > max_bytes) return error.GraphExploredEdgeBytesBudgetExceeded;
             if (budget.remaining_physical_edges == 0) return budget.exhaust(.explored_edges, budget.max_edges);
             const a = self.tracked.allocator();
-            try self.shards.ensureUnusedCapacity(a, 1);
+            try self.reserveShards(table_index, 1);
             var cursor_bytes: usize = 0;
             inline for (.{ cursor.edge_type, cursor.adjacent_key, cursor.edge_id, cursor.owner_document }) |value| cursor_bytes = try std.math.add(usize, cursor_bytes, value.len);
             if (cursor.physical_resume_key) |value| cursor_bytes = try std.math.add(usize, cursor_bytes, value.len);
@@ -3497,17 +3556,21 @@ const CanonicalEdgeBatch = struct {
             const fragment = if (response.partial_key != null) response.partial_edges else response.edges;
             for (fragment) |edge| bytes = try std.math.add(usize, bytes, graphEdgeOwnedBytes(edge));
             try edges.appendSlice(alloc, fragment);
-            self.shards.appendAssumeCapacity(.{ .table = table_index, .group = group_id, .key_base = key_index, .result = response });
+            self.appendShardAssumeCapacity(.{ .table = table_index, .group = group_id, .key_base = key_index, .result = response });
             if (response.resume_cursor) |next| cursor = next else break;
         }
         // Fragments are retired only by clear. Mark their payloads consumed so
         // no later demand read can return an incomplete or duplicate prefix.
-        for (self.shards.items) |*shard| if (!shard.retired and shard.table == table_index and shard.group == group_id) {
+        var fragment = self.firstShard(logical, group_id);
+        while (fragment) |id| {
+            const shard = self.indexedShard(id);
+            fragment = shard.next;
+            if (shard.retired) continue;
             if (shard.result.partial_key) |partial| if (shard.keyIndex(partial) == key_index) {
                 shard.result.partial_key = null;
             };
             if (shard.key_base == key_index and shard.result.key_scanned_rows.len == 1) shard.result.key_scanned_rows[0] = std.math.maxInt(u32);
-        };
+        }
         return .{ .edges = try edges.toOwnedSlice(alloc), .scanned_rows = @intCast(scans), .borrowed_edges = true, .owns_descriptors = true, .physical_rows_precharged = true };
     }
     fn prepare(self: *@This(), reader: DistributedEdgeReader, frontier: []const FrontierState, max_depth: u32, params: graph_query_mod.QueryParams) !void {
@@ -3529,6 +3592,9 @@ const CanonicalEdgeBatch = struct {
                 (err == error.GraphWorkBudgetExceeded and budget != null and budget.?.last_exhaustion != null and budget.?.last_exhaustion.?.dimension == .retained_state_bytes);
             if (self.path_prefetch and memory_denied and !self.unobserved_prefetch_failure) {
                 self.clear();
+                // A refused speculation has no remaining page/routing proofs
+                // to preserve. Return index and slot capacity to demand reads.
+                self.releaseContainers();
                 self.tracked.denied = false;
                 budget.?.last_exhaustion = prior;
                 return;
@@ -3588,7 +3654,7 @@ const CanonicalEdgeBatch = struct {
                 cursor = end;
                 continue;
             }
-            try self.shards.ensureUnusedCapacity(a, count);
+            try self.reserveShards(table_index, count);
             const room = @min(budget.max_retained_state_bytes -| budget.retained_state_bytes, graph_memory_budget.reusableHeadroom(self.tracked.backing) orelse std.math.maxInt(usize));
             const per_memory = room / count;
             // Small or nearly exhausted budgets keep demand-driven serial
@@ -3652,7 +3718,7 @@ const CanonicalEdgeBatch = struct {
                 memory.local_budget.releaseStateBytes(live);
                 memory.tracked.detach();
                 self.tracked.live_bytes += live;
-                self.shards.appendAssumeCapacity(.{ .table = table_index, .group = memory.group_id, .result = result, .key_ids = entry.keyIds(memory.group_id) });
+                self.appendShardAssumeCapacity(.{ .table = table_index, .group = memory.group_id, .result = result, .key_ids = entry.keyIds(memory.group_id) });
                 memory.result = null;
                 memory.deinit();
                 slots[si] = null;
@@ -3673,8 +3739,7 @@ const CanonicalEdgeBatch = struct {
             const count: usize = if (std.mem.eql(u8, tagged, reader.source_table)) 1 else 2;
             for (names[0..count]) |name| {
                 if (reader.reuse_cache) |cache| if (cache.get(name, null, item) != null) continue;
-                if (self.table(name) == null) try self.tables.append(a, .{ .logical = name });
-                const entry = self.table(name).?;
+                const entry = try self.addTable(name);
                 if (item.key.len > 64 * 1024 - entry.key_bytes) continue;
                 const key_entry = try entry.seen.getOrPut(a, item.key);
                 if (key_entry.found_existing) continue;
@@ -3711,7 +3776,7 @@ const CanonicalEdgeBatch = struct {
                 // duplicate transport buffers before bounding response payloads.
                 const overhead = (entry.key_bytes + entry.keys.items[0].len) * 6 + 64 * 1024;
                 if (room < overhead + 128 * 1024) return;
-                try self.shards.ensureUnusedCapacity(a, 1);
+                try self.reserveShards(ti, 1);
                 var observed_scans: ?usize = null;
                 const request = GraphEdgesRequest{
                     .index_name = @constCast(reader.index_name),
@@ -3750,7 +3815,7 @@ const CanonicalEdgeBatch = struct {
                 try validatePrefix(result, entry.readKeys(group).len, @min(budget.remaining_physical_edges, @as(usize, request.max_scanned_rows) + 1));
                 try budget.consumePhysicalEdges(result.scanned_rows);
                 if (self.path_prefetch) self.prefetch_scans -= result.scanned_rows;
-                self.shards.appendAssumeCapacity(.{ .table = ti, .group = group, .result = result, .key_ids = entry.keyIds(group) });
+                self.appendShardAssumeCapacity(.{ .table = ti, .group = group, .result = result, .key_ids = entry.keyIds(group) });
             }
         }
     }
@@ -4394,14 +4459,17 @@ const PathEdgeStream = struct {
         {
             var incoming = GraphExpandBatches.empty;
             defer freeFrontierBatches(tracked, &incoming);
-            var cached_all = reader.prefetched != null;
-            if (reader.prefetched) |cache| for (all_groups) |group| {
-                if (!cache.hasPage(table, group, key)) {
-                    cached_all = false;
-                    break;
-                }
-            };
-            const resolved_incoming = if (reader.prefetched) |cache| cache.incomingRoute(table, 0, key) != null else false;
+            const resolved_incoming = params.direction == .in and if (reader.prefetched) |cache| cache.incomingRoute(table, 0, key) != null else false;
+            var cached_all = false;
+            if (params.direction == .in and !resolved_incoming) {
+                cached_all = reader.prefetched != null;
+                if (reader.prefetched) |cache| for (all_groups) |group| {
+                    if (!cache.hasPage(table, group, key)) {
+                        cached_all = false;
+                        break;
+                    }
+                };
+            }
             const probe_incoming = params.direction == .in and !cached_all and !resolved_incoming and
                 (reader.worker.vtable.resolve_incoming_source_groups != null or reader.worker.recordsIncomingSourceGroups());
             if (probe_incoming) appendIncomingProbeBatches(
@@ -20493,7 +20561,7 @@ test "distributed min-hop page ownership transfers cached prefixes under allocat
                 defer cache.deinit();
                 cache.enableReclamation();
                 const c = cache.tracked.allocator();
-                try cache.tables.append(c, .{ .logical = "docs" });
+                _ = try cache.addTable("docs");
                 try cache.tables.items[0].keys.appendSlice(c, &.{ "a", "b" });
                 var response = GraphEdgesResponse{ .edges = &.{}, .scanned_rows = 2 };
                 var response_owned = true;
@@ -20503,7 +20571,7 @@ test "distributed min-hop page ownership transfers cached prefixes under allocat
                 for (response.edges) |*edge| edge.* = try cloneOwnedGraphEdge(c, .{ .source = "root", .target = "node", .edge_type = "FRIEND", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "{}" });
                 response.key_offsets = try c.dupe(u32, &.{ 0, 1, 2 });
                 response.key_scanned_rows = try c.dupe(u32, &.{ 1, 1 });
-                try cache.shards.append(c, .{ .table = 0, .group = 11, .result = response });
+                try cache.appendShard(.{ .table = 0, .group = 11, .result = response });
                 response_owned = false;
                 var memory = graph_work_budget.RetainedAllocator{ .backing = a, .budget = &budget };
                 var prefix = (try cache.takePage("docs", 11, "a", &memory)).?;
@@ -20520,6 +20588,96 @@ test "distributed min-hop page ownership transfers cached prefixes under allocat
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
+test "distributed min-hop pages preserve linear indexed lookup across many shards" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    const NoReads = struct {
+        fn expand(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: GraphExpandRequest, _: raft_mod.ReadConsistency) !GraphExpandResponse {
+            return error.UnexpectedTestCall;
+        }
+        fn hydrate(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: GraphHydrateRequest, _: raft_mod.ReadConsistency) !GraphHydrateResponse {
+            return error.UnexpectedTestCall;
+        }
+        fn page(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: GraphEdgesRequest, _: raft_mod.ReadConsistency) !GraphEdgesResponse {
+            return error.UnexpectedTestCall;
+        }
+    };
+    for ([_]usize{ 32, 128, 512 }) |group_count| {
+        var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+        {
+            var cache = CanonicalEdgeBatch{ .tracked = .{ .backing = a, .budget = &budget }, .path_prefetch = true };
+            defer cache.deinit();
+            cache.enableReclamation();
+            const c = cache.tracked.allocator();
+            for ([_][]const u8{ "docs", "entities" }) |logical| {
+                const entry = try cache.addTable(logical);
+                try entry.keys.appendSlice(c, &.{ "a", "b" });
+            }
+            // Identical group IDs in different tables must remain independent.
+            // Empty adjacency is the worst case for repeated cache lookups:
+            // each page supplies EOF without spending physical-edge budget.
+            for (0..group_count) |group| for (0..2) |table_id| {
+                var response = GraphEdgesResponse{ .edges = &.{}, .scanned_rows = 0 };
+                errdefer response.deinit(c);
+                response.key_offsets = try c.dupe(u32, &.{ 0, 0, 0 });
+                response.key_scanned_rows = try c.dupe(u32, &.{ 0, 0 });
+                try cache.appendShard(.{ .table = table_id, .group = 11 + group, .result = response });
+            };
+            {
+                const entry = cache.table("docs").?;
+                const keys = try c.dupe([]const u8, &.{"a"});
+                errdefer c.free(keys);
+                const ids = try c.dupe(u32, &.{0});
+                errdefer c.free(ids);
+                try entry.incoming.put(c, 11, .{ .keys = keys, .ids = ids });
+                entry.incoming_resolved = true;
+                entry.incoming_complete = 1;
+            }
+            const catalog = H.FakeCatalog.multiIface();
+            var unused: u8 = 0;
+            const worker = Worker{ .ptr = &unused, .vtable = &.{ .execute_graph_expand = NoReads.expand, .execute_graph_hydrate = NoReads.hydrate, .execute_graph_get_edges_batch = NoReads.page } };
+            const epoch = try table_catalog.topologyEpoch(a, catalog, "docs");
+            var admission = GraphNodeAdmissionContext.init(a, catalog, worker, "docs", "graph_idx", epoch, .{ .identity_read_generation = 12345 }, null, &.{}, .{}, .read_index);
+            defer admission.deinit();
+            var routes = PathEdgeRoutes{ .memory = .{ .backing = a, .budget = &budget } };
+            defer routes.deinit();
+            const reader = DistributedEdgeReader{ .catalog = catalog, .worker = worker, .source_table = "docs", .index_name = "graph_idx", .admission = &admission, .consistency = .read_index, .physical_work_budget = &budget, .prefetched = &cache };
+            for ([_]graph_mod.EdgeDirection{ .out, .in }) |direction| {
+                const before = cache.lookup_work.lookups;
+                var stream = try PathEdgeStream.init(a, reader, &routes, "docs", "a", .{ .direction = direction });
+                defer stream.deinit();
+                try std.testing.expectEqual(before, cache.lookup_work.lookups);
+                try std.testing.expectEqual(@as(usize, if (direction == .out) 2 else 1), stream.shards.items.len);
+            }
+            cache.lookup_work = .{};
+            var memory = graph_work_budget.RetainedAllocator{ .backing = a, .budget = &budget };
+            for ([_][]const u8{ "b", "a" }) |key| for ([_][]const u8{ "entities", "docs" }) |logical| {
+                for (0..group_count) |reverse| {
+                    const group = 11 + group_count - reverse - 1;
+                    try std.testing.expect(cache.hasPage(logical, group, key));
+                    var page = (try cache.takePage(logical, group, key, &memory)).?;
+                    defer page.deinit(memory.allocator());
+                    try std.testing.expectEqual(@as(usize, 0), page.edges.len);
+                    try std.testing.expect(!cache.hasPage(logical, group, key));
+                }
+            };
+            // Three lookups per (table, key, group), each inspecting exactly
+            // one indexed response. This counts work rather than wall time.
+            try std.testing.expectEqual(12 * group_count, cache.lookup_work.lookups);
+            try std.testing.expectEqual(12 * group_count, cache.lookup_work.shard_visits);
+            try std.testing.expectEqual(@as(usize, 0), memory.live_bytes);
+            try std.testing.expectEqual(budget.max_edges, budget.remaining_physical_edges);
+            cache.clear();
+            try std.testing.expect(cache.table("docs") == null);
+            try std.testing.expect(!cache.hasPage("docs", 11, "a"));
+            _ = try cache.addTable("docs");
+            try cache.appendShard(.{ .table = 0, .group = 11, .result = .{ .edges = &.{} } });
+            try std.testing.expectEqual(@as(?usize, 0), cache.firstShard("docs", 11));
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    }
+}
+
 test "distributed min-hop pages preserve cached empty-key scan proofs" {
     const a = std.testing.allocator;
     var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
@@ -20527,11 +20685,11 @@ test "distributed min-hop pages preserve cached empty-key scan proofs" {
         var cache = CanonicalEdgeBatch{ .tracked = .{ .backing = a, .budget = &budget }, .path_prefetch = true };
         defer cache.deinit();
         const c = cache.tracked.allocator();
-        try cache.tables.append(c, .{ .logical = "docs" });
+        _ = try cache.addTable("docs");
         try cache.tables.items[0].keys.appendSlice(c, &.{ "a", "b" });
         const offsets = try c.dupe(u32, &.{ 0, 0, 0 });
         const scans = try c.dupe(u32, &.{ 10, 20 });
-        try cache.shards.append(c, .{ .table = 0, .group = 11, .result = .{ .edges = &.{}, .scanned_rows = 30, .key_offsets = offsets, .key_scanned_rows = scans } });
+        try cache.appendShard(.{ .table = 0, .group = 11, .result = .{ .edges = &.{}, .scanned_rows = 30, .key_offsets = offsets, .key_scanned_rows = scans } });
         var required = graph_work_budget.RetainedAllocator{ .backing = a, .budget = &budget };
         var first = (try cache.takePage("docs", 11, "a", &required)).?;
         defer first.deinit(required.allocator());
@@ -20571,14 +20729,14 @@ test "distributed min-hop pages preserve required reads after reclaiming peer pr
         defer cache.deinit();
         cache.enableReclamation();
         const c = cache.tracked.allocator();
-        try cache.tables.append(c, .{ .logical = "docs" });
+        _ = try cache.addTable("docs");
         const edges = try c.alloc(graph_mod.Edge, 1);
         const peer = try c.alloc(u8, 32 * 1024 * 1024);
         @memset(peer, ' ');
         peer[0] = '{';
         peer[peer.len - 1] = '}';
         edges[0] = .{ .source = "", .target = "", .edge_type = "", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = peer };
-        try cache.shards.append(c, .{ .table = 0, .group = 22, .result = .{ .edges = edges } });
+        try cache.appendShard(.{ .table = 0, .group = 22, .result = .{ .edges = edges } });
         var routes = PathEdgeRoutes{ .memory = .{ .backing = a, .budget = &budget } };
         defer routes.deinit();
         const reader = DistributedEdgeReader{ .catalog = catalog, .worker = worker, .source_table = "docs", .index_name = "graph_idx", .admission = &admission, .consistency = .read_index, .physical_work_budget = &budget, .prefetched = &cache };
