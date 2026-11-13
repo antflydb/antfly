@@ -5848,7 +5848,7 @@ pub const Txn = struct {
     pub fn openCursor(self: *Txn) !Cursor {
         return .{
             .txn = self,
-            .index_cursor = native.DocumentIndexCursor.init(try self.readFile(), self.checkpoint),
+            .index_cursor = native.CheckpointedTree.init(try self.readFile(), self.checkpoint),
         };
     }
 
@@ -5985,7 +5985,7 @@ pub const Cursor = struct {
     const Direction = enum { forward, backward };
 
     txn: *Txn,
-    index_cursor: native.DocumentIndexCursor,
+    index_cursor: native.CheckpointedTree,
     records: native.RecordPageReader = .{},
     load_values: bool = true,
     current_key: ?[]u8 = null,

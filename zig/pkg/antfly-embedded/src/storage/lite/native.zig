@@ -2465,31 +2465,43 @@ fn IndexReadPathType(comptime batch: bool) type {
     };
 }
 
-/// Cursor over one pinned index root. Page views and overflow scratch are
-/// reused by tree depth; each returned key remains independently owned.
-pub const DocumentIndexCursor = struct {
+/// §9.7c (`ReadView`): the raw B-tree walker, with no overlay knowledge
+/// at all -- renamed from `DocumentIndexCursor` to say so plainly. Reads
+/// *only* the physical, checkpointed page structure named by whatever
+/// `checkpoint` it is given; a key logged-but-not-yet-folded by
+/// `checkpointRedoLog` is invisible through this type by construction,
+/// not by omission. Intended callers are `checkpointRedoLog`'s own
+/// fold, vacuum, and recovery (which want exactly the physical tree, on
+/// purpose), plus `CatalogCursor`/`LiveRecordCursor`/`ReadView` here in
+/// native.zig, which wrap it with the overlay merge every other reader
+/// needs. A new caller anywhere else should go through `ReadView`
+/// instead of reaching for this directly -- still possible to do (kept
+/// `pub` so existing, already-reviewed callers keep compiling), but a
+/// deliberate, greppable code-review smell: `grep -n CheckpointedTree`
+/// should only ever turn up the handful of sites listed above.
+pub const CheckpointedTree = struct {
     file: *NativeFile,
     checkpoint: CheckpointSlot,
     path: IndexReadPath = .{},
     depth: usize = 0,
     key_allocator: Allocator,
 
-    pub fn init(file: *NativeFile, checkpoint: CheckpointSlot) DocumentIndexCursor {
+    pub fn init(file: *NativeFile, checkpoint: CheckpointSlot) CheckpointedTree {
         return initWithKeyAllocator(file, checkpoint, file.allocator);
     }
 
     /// Returned entries own their keys through key_allocator. Traversal scratch
     /// remains file-owned; callers must free entries with the supplied allocator.
-    pub fn initWithKeyAllocator(file: *NativeFile, checkpoint: CheckpointSlot, key_allocator: Allocator) DocumentIndexCursor {
+    pub fn initWithKeyAllocator(file: *NativeFile, checkpoint: CheckpointSlot, key_allocator: Allocator) CheckpointedTree {
         return .{ .file = file, .checkpoint = checkpoint, .key_allocator = key_allocator };
     }
 
-    pub fn deinit(self: *DocumentIndexCursor) void {
+    pub fn deinit(self: *CheckpointedTree) void {
         self.path.deinit(self.file.allocator);
         self.* = undefined;
     }
 
-    pub fn first(self: *DocumentIndexCursor) !?DocumentIndexEntry {
+    pub fn first(self: *CheckpointedTree) !?DocumentIndexEntry {
         self.clear();
         errdefer self.clear();
         if (self.checkpoint.document_index_root_page == 0) return null;
@@ -2497,7 +2509,7 @@ pub const DocumentIndexCursor = struct {
         return try self.currentEntry();
     }
 
-    pub fn last(self: *DocumentIndexCursor) !?DocumentIndexEntry {
+    pub fn last(self: *CheckpointedTree) !?DocumentIndexEntry {
         self.clear();
         errdefer self.clear();
         if (self.checkpoint.document_index_root_page == 0) return null;
@@ -2505,7 +2517,7 @@ pub const DocumentIndexCursor = struct {
         return try self.currentEntry();
     }
 
-    pub fn seekAtOrAfter(self: *DocumentIndexCursor, key: []const u8, strict: bool) !?DocumentIndexEntry {
+    pub fn seekAtOrAfter(self: *CheckpointedTree, key: []const u8, strict: bool) !?DocumentIndexEntry {
         self.clear();
         errdefer self.clear();
         var page = self.checkpoint.document_index_root_page;
@@ -2521,7 +2533,7 @@ pub const DocumentIndexCursor = struct {
         return null;
     }
 
-    pub fn seekAtOrBefore(self: *DocumentIndexCursor, key: []const u8, strict: bool) !?DocumentIndexEntry {
+    pub fn seekAtOrBefore(self: *CheckpointedTree, key: []const u8, strict: bool) !?DocumentIndexEntry {
         self.clear();
         errdefer self.clear();
         var page = self.checkpoint.document_index_root_page;
@@ -2539,7 +2551,7 @@ pub const DocumentIndexCursor = struct {
         return null;
     }
 
-    pub fn next(self: *DocumentIndexCursor) !?DocumentIndexEntry {
+    pub fn next(self: *CheckpointedTree) !?DocumentIndexEntry {
         errdefer self.clear();
         if (self.depth == 0) return null;
         const leaf = self.path.frames.items[self.depth - 1];
@@ -2562,7 +2574,7 @@ pub const DocumentIndexCursor = struct {
         return null;
     }
 
-    fn subtreePage(self: *DocumentIndexCursor, depth: usize) u64 {
+    fn subtreePage(self: *CheckpointedTree, depth: usize) u64 {
         return if (depth == 0) self.checkpoint.document_index_root_page else blk: {
             const parent = self.path.frames.items[depth - 1];
             break :blk parent.pointer(parent.position);
@@ -2571,7 +2583,7 @@ pub const DocumentIndexCursor = struct {
 
     // Advance to a sibling without opening it. Paired cursors can skip equal
     // immutable sibling references without an I/O for every leaf in the range.
-    fn nextSubtree(self: *DocumentIndexCursor, depth: usize) !u64 {
+    fn nextSubtree(self: *CheckpointedTree, depth: usize) !u64 {
         self.depth = depth;
         while (self.depth > 0) {
             const parent = self.path.frames.items[self.depth - 1];
@@ -2585,7 +2597,7 @@ pub const DocumentIndexCursor = struct {
         return 0;
     }
 
-    pub fn prev(self: *DocumentIndexCursor) !?DocumentIndexEntry {
+    pub fn prev(self: *CheckpointedTree) !?DocumentIndexEntry {
         errdefer self.clear();
         if (self.depth == 0) return null;
         const leaf = self.path.frames.items[self.depth - 1];
@@ -2608,13 +2620,13 @@ pub const DocumentIndexCursor = struct {
         return null;
     }
 
-    fn push(self: *DocumentIndexCursor, page: u64) !*IndexReadFrame {
+    fn push(self: *CheckpointedTree, page: u64) !*IndexReadFrame {
         const frame = try self.path.load(self.file, self.checkpoint, self.depth, page);
         self.depth += 1;
         return frame;
     }
 
-    fn descendExtreme(self: *DocumentIndexCursor, root: u64, first_key: bool) !void {
+    fn descendExtreme(self: *CheckpointedTree, root: u64, first_key: bool) !void {
         var page = root;
         while (page != 0) {
             const frame = try self.push(page);
@@ -2623,7 +2635,7 @@ pub const DocumentIndexCursor = struct {
         }
     }
 
-    fn currentEntry(self: *DocumentIndexCursor) !?DocumentIndexEntry {
+    fn currentEntry(self: *CheckpointedTree) !?DocumentIndexEntry {
         if (self.depth == 0) return null;
         const frame = self.path.frames.items[self.depth - 1];
         if (frame.kind != .leaf or frame.position >= frame.entries().len) return null;
@@ -2633,7 +2645,7 @@ pub const DocumentIndexCursor = struct {
         };
     }
 
-    fn clear(self: *DocumentIndexCursor) void {
+    fn clear(self: *CheckpointedTree) void {
         self.depth = 0;
     }
 };
@@ -3094,7 +3106,7 @@ fn recordRunAhead(references: []const u64, order: ?[]const usize, start: usize) 
 /// commits may continue concurrently.
 pub const CatalogCursor = struct {
     records: RecordPageReader = .{},
-    index: DocumentIndexCursor,
+    index: CheckpointedTree,
     prefix: []const u8,
     started: bool = false,
     done: bool = false,
@@ -3711,7 +3723,7 @@ const HistoryIndexCoverage = struct {
     fn initIndex(self: *HistoryIndexCoverage, file: *NativeFile, checkpoint: CheckpointSlot, root: u64, cancel: ?*const maintenance.CancelToken) !void {
         var indexed = checkpoint;
         indexed.document_index_root_page = root;
-        var cursor = DocumentIndexCursor.init(file, indexed);
+        var cursor = CheckpointedTree.init(file, indexed);
         defer cursor.deinit();
         var current = try cursor.first();
         while (current) |entry| {
@@ -5793,6 +5805,193 @@ const HeaderFingerprintCache = struct {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         self.cached = .{ .header = header, .digest = digest };
+    }
+};
+
+/// §9.7c: the one read primitive for a redo-log-capable `NativeFile`. A
+/// pinned pair -- checkpoint `C` (the physical B-tree root this view's
+/// tree-side reads are pinned to) and overlay read mark `M` (the
+/// logical commit sequence this view's overlay-side reads are pinned
+/// to) -- captured together, at the same moment, because under redo
+/// mode they are not always the same number (`NativeFile.committedSequence`'s
+/// own doc comment): an ordinary commit can advance `M` without
+/// `C`'s own physical root pages moving at all, until the next
+/// `checkpointRedoLog`.
+///
+/// This exists to stop the overlay-blind-read bug class found three
+/// separate times on three separate call sites while flipping the
+/// redo-log default (`docstore.Cursor`'s own three-way merge,
+/// `getDocumentsAtCheckpointWithState`'s batch pre-pass, and
+/// `readBackingPages`'s read-ahead window -- see this struct's own
+/// design-doc section for the full account) and a fourth found
+/// building this type itself (`OverlayScanState.initForPrefix`'s old
+/// "must equal the live checkpoint exactly" gate silently emptying the
+/// overlay for every `ReadView`-shaped caller reached through a
+/// `ReadGeneration`'s separately-opened file, including the
+/// dense/sparse/graph/full-text native-catalog seed in
+/// `native_catalog_sink.zig` and the index virtual-filesystem's
+/// directory listing in `index_storage.zig` -- fixed by deleting that
+/// gate, since per-key resolution was already checkpoint-independent;
+/// see that function's own doc comment).
+///
+/// `open`/`openAt` pin with exactly the two calls
+/// `Store.pinInitializedReadGeneration` already makes, in the same
+/// order: the overlay mark `M` first (`redo.shared.pin`), then the
+/// checkpoint `C` (`inode_lock.pinReader`); `release` unpins in
+/// reverse. A `ReadView` constructed via `borrowed` instead describes
+/// an already-pinned generation (a `Txn`'s own `ReadPin`, held for the
+/// whole transaction) and never pins or unpins on its own -- `release`
+/// on one of these is a no-op, matching `ReadGeneration`'s existing,
+/// separate, longer-lived pin lifecycle. Both constructor families
+/// resolve the exact same read methods below the exact same way.
+pub const ReadView = struct {
+    file: *NativeFile,
+    checkpoint: CheckpointSlot, // C: physical tree-root pointers
+    mark: u64, // M: overlay resolution ceiling (logical commit sequence)
+    owns_pin: bool = false,
+
+    /// Pins the current generation: `C` is `file`'s own active
+    /// checkpoint, `M` is its own committed (logical) sequence,
+    /// captured together. For the live writer's own handle these two
+    /// numbers already move in lockstep (`NativeFile.committedSequence`'s
+    /// doc comment); captured as two separate fields regardless, so a
+    /// future caller that opens this on a handle where they genuinely
+    /// diverge gets the correct answer without this type changing.
+    pub fn open(file: *NativeFile, io: std.Io) !ReadView {
+        return openAt(file, io, file.activeCheckpoint());
+    }
+
+    /// Pins an explicit checkpoint: either an older, already-
+    /// checkpointed generation (`C == M == checkpoint.commit_sequence`
+    /// trivially, nothing logged against it is still only in the
+    /// overlay), or the live writer's own freshly observed checkpoint
+    /// passed in by a caller that tracks it externally (`docstore.zig`'s
+    /// `ReadGeneration.checkpoint`, kept current by
+    /// `Store.observeReadCheckpoint` on every publish even though
+    /// `file` itself -- a separately-opened `ReadGeneration.file` --
+    /// never processes a commit itself and so never advances its own
+    /// `activeCheckpoint()`/`committedSequence()`).
+    pub fn openAt(file: *NativeFile, io: std.Io, checkpoint: CheckpointSlot) !ReadView {
+        var view: ReadView = .{ .file = file, .checkpoint = checkpoint, .mark = checkpoint.commit_sequence, .owns_pin = false };
+        if (file.redo) |*redo| try redo.shared.pin(std.heap.page_allocator, io, view.mark);
+        errdefer if (file.redo) |*redo| redo.shared.unpin(io, view.mark);
+        if (file.inode_lock_ref.load(.acquire)) |entry| {
+            try inode_lock.pinReader(entry, io, .{ .data = checkpoint.commit_sequence, .metadata = checkpoint.commit_sequence });
+        }
+        view.owns_pin = true;
+        return view;
+    }
+
+    /// A view over a generation already pinned by some longer-lived
+    /// mechanism (today: `docstore.zig`'s `ReadPin`/`ReadGeneration`,
+    /// held for a whole `Txn`'s lifetime). `release` is a no-op; the
+    /// caller's own pin lifecycle remains authoritative. Every read
+    /// method below behaves identically regardless of which
+    /// constructor produced this view.
+    pub fn borrowed(file: *NativeFile, checkpoint: CheckpointSlot) ReadView {
+        return .{ .file = file, .checkpoint = checkpoint, .mark = checkpoint.commit_sequence, .owns_pin = false };
+    }
+
+    /// Unpins, in reverse of `open`/`openAt`'s own order. A no-op for a
+    /// `borrowed` view. Idempotent: safe to call more than once, or on
+    /// a view that never owned a pin.
+    pub fn release(self: *ReadView, io: std.Io) void {
+        if (!self.owns_pin) return;
+        self.owns_pin = false;
+        if (self.file.inode_lock_ref.load(.acquire)) |entry| {
+            inode_lock.unpinReader(entry, io, .{ .data = self.checkpoint.commit_sequence, .metadata = self.checkpoint.commit_sequence });
+        }
+        if (self.file.redo) |*redo| redo.shared.unpin(io, self.mark);
+    }
+
+    pub fn getDocumentAlloc(self: *const ReadView, allocator: Allocator, key: []const u8) !?[]u8 {
+        return self.file.getDocumentAtCheckpointAlloc(allocator, self.checkpoint, key);
+    }
+
+    pub fn documentReference(self: *const ReadView, key: []const u8) !?u64 {
+        return self.file.documentReferenceAtCheckpoint(self.checkpoint, key);
+    }
+
+    pub fn documentFingerprint(self: *const ReadView, key: []const u8) !?[32]u8 {
+        return self.file.documentFingerprintAtCheckpoint(self.checkpoint, key);
+    }
+
+    pub fn getDocumentsAlloc(self: *const ReadView, allocator: Allocator, keys: []const []const u8, values: []?[]const u8) !void {
+        return self.file.getDocumentsAtCheckpointAlloc(allocator, self.checkpoint, keys, values);
+    }
+
+    pub fn getDocumentsWithState(self: *const ReadView, allocator: Allocator, temporary: Allocator, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, state: *DocumentBatchReadState) !void {
+        return self.file.getDocumentsAtCheckpointWithState(allocator, temporary, self.checkpoint, keys, buffers, values, state);
+    }
+
+    pub fn openIndexValue(self: *const ReadView, allocator: Allocator, key: []const u8) !NativeFile.IndexValue {
+        return self.file.openIndexValue(allocator, key, self.checkpoint);
+    }
+
+    pub fn readIndexValueInto(self: *const ReadView, value: NativeFile.IndexValue, offset: u64, out: []u8) !void {
+        return self.file.readIndexValueInto(value, offset, out, self.checkpoint);
+    }
+
+    pub fn checksumIndexValue(self: *const ReadView, value: NativeFile.IndexValue, offset: u64, length: u64) !u32 {
+        return self.file.checksumIndexValue(value, offset, length, self.checkpoint);
+    }
+
+    pub fn readAuthenticatedIndexValue(self: *const ReadView, value: NativeFile.IndexValue, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32) !void {
+        return self.file.readAuthenticatedIndexValue(value, offset, length, within, out, expected, self.checkpoint);
+    }
+
+    pub fn copyIndexValueTo(self: *const ReadView, value: NativeFile.IndexValue, destination: std.Io.File) !void {
+        return self.file.copyIndexValueTo(value, destination, self.checkpoint);
+    }
+
+    /// A prefix/range cursor over the metadata catalog root, overlay
+    /// merged exactly like every other `ReadView` read (`catalogCursor`'s
+    /// `OverlayScanState.initForPrefix`, gate-free since the fix above).
+    pub fn openMetadataCursor(self: *const ReadView, prefix: []const u8) !CatalogCursor {
+        return self.file.metadataCatalogCursor(self.checkpoint, prefix);
+    }
+
+    /// Like `openMetadataCursor`, over the index catalog root (full-text/
+    /// dense/sparse/graph native-catalog records, artifact leases,
+    /// virtual-filesystem directory entries).
+    pub fn openIndexCursor(self: *const ReadView, prefix: []const u8) !CatalogCursor {
+        return self.file.indexCatalogCursor(self.checkpoint, prefix);
+    }
+
+    /// Like `openIndexCursor`, restricted to `prefix`'s immediate
+    /// children (one path segment deep) -- the virtual-filesystem
+    /// directory-listing shape.
+    pub fn openIndexDirectoryCursor(self: *const ReadView, prefix: []const u8) !CatalogCursor {
+        return self.file.indexCatalogDirectoryCursor(self.checkpoint, prefix);
+    }
+
+    /// The raw document-root tree walker, with no overlay knowledge --
+    /// see `CheckpointedTree`'s own doc comment. For a caller (today:
+    /// `docstore.Cursor`) that needs direct control over the tree side
+    /// of its own merge (keys-only/length-only short-circuits that must
+    /// not materialize a full value) and already merges the overlay
+    /// itself via `openDocumentOverlayScan` below. Everyone else should
+    /// prefer `openMetadataCursor`/`openIndexCursor`/`openDocumentAlloc`-
+    /// family methods, which already merge both halves.
+    pub fn openDocumentTreeCursor(self: *const ReadView, key_allocator: Allocator) CheckpointedTree {
+        return CheckpointedTree.initWithKeyAllocator(self.file, self.checkpoint, key_allocator);
+    }
+
+    /// The document root's overlay enumeration alone (gate-free, per
+    /// `OverlayScanState.initForPrefixUnchecked`'s own doc comment) --
+    /// pairs with `openDocumentTreeCursor` for a caller building its
+    /// own merge against the raw tree directly.
+    pub fn openDocumentOverlayScan(self: *const ReadView, allocator: Allocator, prefix: []const u8) !NativeFile.OverlayScanState {
+        return NativeFile.OverlayScanState.initForPrefixUnchecked(allocator, self.file, .documents, prefix);
+    }
+
+    /// The document root's resolved overlay entry for one key, at this
+    /// view's own mark -- the same primitive `getDocumentAlloc` uses
+    /// internally, exposed directly for a caller (`docstore.Cursor`)
+    /// that needs the entry's own flags (`is_delete`, the external-value
+    /// pointer) rather than an already-materialized value.
+    pub fn documentOverlayEntry(self: *const ReadView, key: []const u8) !?CatalogEntry {
+        return self.file.redoOverlayEntry(.documents, self.checkpoint, key);
     }
 };
 
@@ -9473,7 +9672,7 @@ pub const NativeFile = struct {
         defer records.deinit(self.allocator);
         var indexed = checkpoint;
         indexed.document_index_root_page = index;
-        var cursor = DocumentIndexCursor.init(self, indexed);
+        var cursor = CheckpointedTree.init(self, indexed);
         defer cursor.deinit();
         var current = try cursor.first();
         while (current) |entry| {
@@ -10307,7 +10506,7 @@ pub const NativeFile = struct {
         const overlay_root: TransactionWrites.Root = if (root == .metadata) .metadata else .index;
         var overlay = try OverlayScanState.initForPrefix(self.allocator, self, overlay_root, checkpoint, prefix);
         errdefer overlay.deinit();
-        return .{ .index = DocumentIndexCursor.init(self, indexed), .prefix = prefix, .overlay_root = overlay_root, .overlay = overlay };
+        return .{ .index = CheckpointedTree.init(self, indexed), .prefix = prefix, .overlay_root = overlay_root, .overlay = overlay };
     }
 
     fn snapshotCatalogRecordsFromRootAlloc(self: *NativeFile, allocator: Allocator, root: CatalogRoot) ![]OwnedCatalogRecord {
@@ -10446,7 +10645,7 @@ pub const NativeFile = struct {
     /// Borrow record metadata from the checkpoint's ordered index. Values stay
     /// on disk; returned slices remain valid until the next call to next().
     const LiveRecordCursor = struct {
-        index: DocumentIndexCursor,
+        index: CheckpointedTree,
         kind: PageKind,
         started: bool = false,
         records: RecordPageReader = .{},
@@ -10481,7 +10680,7 @@ pub const NativeFile = struct {
             };
             var overlay = try OverlayScanState.initForPrefix(file.allocator, file, overlay_root, checkpoint, "");
             errdefer overlay.deinit();
-            return .{ .index = DocumentIndexCursor.init(file, checkpoint), .kind = kind, .overlay_root = overlay_root, .overlay = overlay };
+            return .{ .index = CheckpointedTree.init(file, checkpoint), .kind = kind, .overlay_root = overlay_root, .overlay = overlay };
         }
 
         pub fn deinit(self: *LiveRecordCursor) void {
@@ -10654,7 +10853,7 @@ pub const NativeFile = struct {
             errdefer deinitNamespaceDirectory(allocator, &directory);
             var indexed = checkpoint;
             indexed.document_index_root_page = roots.index;
-            var cursor = DocumentIndexCursor.init(self, indexed);
+            var cursor = CheckpointedTree.init(self, indexed);
             defer cursor.deinit();
             var reader = RecordPageReader{};
             defer reader.deinit(allocator);
@@ -11946,7 +12145,7 @@ pub const NativeFile = struct {
     /// so an index entry alone is not proof that a live document exists.
     pub fn hasLiveDocumentOutsidePrefix(self: *NativeFile, checkpoint: CheckpointSlot, excluded_prefix: []const u8) !bool {
         if (excluded_prefix.len == 0) return false;
-        var cursor = DocumentIndexCursor.init(self, checkpoint);
+        var cursor = CheckpointedTree.init(self, checkpoint);
         defer cursor.deinit();
         var records = RecordPageReader{};
         defer records.deinit(self.allocator);
@@ -12013,7 +12212,7 @@ pub const NativeFile = struct {
         }
         var references = std.ArrayListUnmanaged(u64).empty;
         defer references.deinit(self.allocator);
-        var cursor = DocumentIndexCursor.initWithKeyAllocator(self, checkpoint, allocator);
+        var cursor = CheckpointedTree.initWithKeyAllocator(self, checkpoint, allocator);
         defer cursor.deinit();
         // §9.3a revised: merge the redo-log logical_overlay's own
         // uncheckpointed document mutations into this scan, in key order,
@@ -14793,34 +14992,42 @@ pub const NativeFile = struct {
         index: usize = 0,
         allocator: Allocator,
 
-        /// Empty (not an error) for a non-redo file, or for a checkpoint
-        /// other than the current one: a deliberately pinned, older
-        /// snapshot must never see mutations the overlay only reflects
-        /// for the *current* generation.
+        /// §9.7c (`ReadView`): this used to refuse (return empty) for any
+        /// `checkpoint` other than `file.activeCheckpoint()` exactly --
+        /// a guard meant to stop a deliberately pinned, older snapshot
+        /// from seeing mutations the overlay only reflects for the
+        /// *current* generation. In practice it fired for a case that
+        /// guard was never meant to catch: `catalogCursor`'s own callers
+        /// (`metadataCatalogCursor`/`indexCatalogCursor`/
+        /// `indexCatalogDirectoryCursor`) are reached from a `ReadGeneration`'s
+        /// separately-opened `generation.file` with the *tracked* checkpoint
+        /// (`Txn.checkpoint`, kept current by `Store.observeReadCheckpoint`)
+        /// passed in -- `checkpoint.commit_sequence` is genuinely current,
+        /// but `generation.file.activeCheckpoint()` is frozen at that
+        /// instance's own open time (it never processes commits itself),
+        /// so the two numbers mismatch on every call after the first
+        /// commit, and this returned empty every time: the exact
+        /// overlay-blind-scan bug class §9.7c describes, just one more
+        /// occurrence of it, reached through `index_storage.zig`'s
+        /// directory listing and `native_catalog_sink.zig`'s
+        /// `loadAllAlloc` (the dense/sparse/graph/full-text native-
+        /// catalog seed) rather than through `docstore.Cursor`.
+        ///
+        /// Per-key value resolution (`redoOverlayEntry`/`resolveAlloc`)
+        /// is already correctly version-pinned regardless of which
+        /// checkpoint number is passed -- the same function an ordinary
+        /// point `get()` uses, with no such gate at all -- so dropping
+        /// this precondition does not weaken correctness for a
+        /// genuinely stale pin, only widens *enumeration* to match what
+        /// point-read resolution already does. Still returns empty for
+        /// a non-redo file. Now the same function as
+        /// `initForPrefixUnchecked` (kept as a thin alias for existing
+        /// callers) -- there is exactly one enumeration behavior.
         pub fn initForPrefix(allocator: Allocator, file: *NativeFile, root: TransactionWrites.Root, checkpoint: CheckpointSlot, prefix: []const u8) !OverlayScanState {
-            const empty: OverlayScanState = .{ .allocator = allocator };
-            const redo = file.redo orelse return empty;
-            if (checkpoint.commit_sequence != file.activeCheckpoint().commit_sequence) return empty;
-            const keys = try redo.shared.keysWithPrefixAlloc(allocator, file.runtimeIo(), @backingInt(root), prefix);
-            return .{ .keys = keys, .allocator = allocator };
+            _ = checkpoint;
+            return initForPrefixUnchecked(allocator, file, root, prefix);
         }
 
-        /// Like `initForPrefix`, but without that "must equal the
-        /// currently active (physical) checkpoint" precondition -- for a
-        /// caller (`docstore.zig`'s `Cursor`) whose own checkpoint value
-        /// (`Txn.checkpoint`, from `ReadGeneration.checkpoint`) is not
-        /// comparable to `file.activeCheckpoint()` in the first place: it
-        /// can be a different `NativeFile` instance's (`generation.file`,
-        /// a separately-opened, read-only handle) view, kept current via
-        /// `Store.observeReadCheckpoint` rather than by sharing
-        /// `activeCheckpoint()`'s own in-memory state directly. Per-key
-        /// value resolution (`redoOverlayEntry`/`resolveAlloc`) is already
-        /// correctly version-pinned regardless of which checkpoint number
-        /// is passed -- the same function an ordinary point `get()` uses,
-        /// with no such gate at all -- so omitting this precondition here
-        /// does not weaken correctness for a genuinely stale pin, only
-        /// widens *enumeration* to match what point-read resolution
-        /// already does. Still returns empty for a non-redo file.
         pub fn initForPrefixUnchecked(allocator: Allocator, file: *NativeFile, root: TransactionWrites.Root, prefix: []const u8) !OverlayScanState {
             const redo = file.redo orelse return .{ .allocator = allocator };
             const keys = try redo.shared.keysWithPrefixAlloc(allocator, file.runtimeIo(), @backingInt(root), prefix);
@@ -22419,7 +22626,7 @@ test "lite native bulk index frontier preserves mixed keys and exact page counts
         // Decoding a cursor's long keys has its own path-sized memory bound;
         // the cap above isolates the builder and its counting mode.
         budget.limit = std.math.maxInt(usize);
-        var cursor = DocumentIndexCursor.init(&file, .{ .page_count = next, .document_index_root_page = root });
+        var cursor = CheckpointedTree.init(&file, .{ .page_count = next, .document_index_root_page = root });
         defer cursor.deinit();
         var entry = try cursor.first();
         var seen: usize = 0;
@@ -23309,7 +23516,7 @@ test "lite document deletes prune the active index and preserve pinned roots" {
         for (batch) |*m| m.* = .{ .key = m.key, .is_delete = true };
         // Exercise partial-leaf rebalancing and removal of whole subtrees.
         try file.putDocumentBatch(batch[0..1000]);
-        var current = DocumentIndexCursor.init(&file, file.activeCheckpoint());
+        var current = CheckpointedTree.init(&file, file.activeCheckpoint());
         defer current.deinit();
         var first = (try current.first()).?;
         defer first.deinit(a);
@@ -23320,7 +23527,7 @@ test "lite document deletes prune the active index and preserve pinned roots" {
         const reads = file.test_page_reads.load(.monotonic);
         try std.testing.expect(!try file.hasLiveDocumentOutsidePrefix(file.activeCheckpoint(), "\x02db/"));
         try std.testing.expectEqual(reads, file.test_page_reads.load(.monotonic));
-        var old = DocumentIndexCursor.init(&file, pinned);
+        var old = CheckpointedTree.init(&file, pinned);
         defer old.deinit();
         var entry = try old.first();
         var count: usize = 0;
@@ -23425,7 +23632,7 @@ test "lite document index coverage accepts legacy tombstones and rejects missing
     var file = try NativeFile.open(a, path, false);
     defer file.close();
     try std.testing.expect((try file.check()).valid);
-    var cursor = DocumentIndexCursor.init(&file, file.activeCheckpoint());
+    var cursor = CheckpointedTree.init(&file, file.activeCheckpoint());
     defer cursor.deinit();
     var indexed = (try cursor.first()).?;
     defer indexed.deinit(a);
@@ -23463,7 +23670,7 @@ test "lite lazy overflow cursor bounds seeks scans and allocation failures" {
     }
     try file.putDocumentBatch(batch);
     const pinned = file.activeCheckpoint();
-    var cursor = DocumentIndexCursor.init(&file, pinned);
+    var cursor = CheckpointedTree.init(&file, pinned);
     defer cursor.deinit();
     const baseline = budget.live;
     budget.limit = baseline;
@@ -24351,7 +24558,7 @@ test "lite index views bound batch and cursor allocations and reuse seek buffers
         }
     }
     const cursor_before = counter.alloc_index;
-    var cursor = DocumentIndexCursor.init(&file, cp);
+    var cursor = CheckpointedTree.init(&file, cp);
     defer cursor.deinit();
     var current = try cursor.first();
     var seen: usize = 0;
@@ -24457,10 +24664,10 @@ test "lite index views preserve packed and unpacked overflow reads through OOM a
             var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
             file.allocator = failing.allocator();
             defer file.allocator = a;
-            var cursor = DocumentIndexCursor.init(&file, pinned);
+            var cursor = CheckpointedTree.init(&file, pinned);
             defer cursor.deinit();
             const Attempt = struct {
-                fn run(c: *DocumentIndexCursor, query: []const u8) !void {
+                fn run(c: *CheckpointedTree, query: []const u8) !void {
                     var first = (try c.first()).?;
                     defer first.deinit(c.file.allocator);
                     var last = (try c.last()).?;
@@ -24773,7 +24980,7 @@ test "lite sorted editor releases ownership on every allocation failure" {
             var checkpoint = f.activeCheckpoint();
             checkpoint.document_index_root_page = index;
             checkpoint.page_count = pages.next_page_id;
-            var cursor = DocumentIndexCursor.init(f, checkpoint);
+            var cursor = CheckpointedTree.init(f, checkpoint);
             defer cursor.deinit();
             var current = try cursor.first();
             var ordinal: usize = 0;
