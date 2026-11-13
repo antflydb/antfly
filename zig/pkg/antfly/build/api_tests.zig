@@ -1368,7 +1368,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "canonical relationship predicates",
             "projected graph endpoint routing recognizes every source form",
             "distributed graph edge reader finds fact owners outside the source endpoint shard",
-            "distributed min-hop BFS batches layers and expands cyclic vertices once",
+            "distributed min-hop paths stream bounded pages and admit each vertex once",
+            "distributed min-hop pages preserve",
+            "distributed min-hop page ownership",
             "distributed graph edges response round trips owned edges",
             "internal batch parser owns and round trips graph mutations",
             "internal batch graph endpoint cleanup command",
@@ -1405,6 +1407,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_api_graph_snapshot_tests = addFilteredTestRunArtifact(b, lib_api_graph_snapshot_tests);
     const lib_api_graph_snapshot_test_step = b.step("antfly-api-graph-snapshot-test", "Run distributed graph snapshot-vector regression tests");
     lib_api_graph_snapshot_test_step.dependOn(&run_lib_api_graph_snapshot_tests.step);
+    const shortest_path_scale_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, &.{"shortest path production reader scans 122K"}),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-shortest-path-scale-test", "Run the real-reader 10K-node shortest-path budget regression")
+        .dependOn(&addFilteredTestRunArtifact(b, shortest_path_scale_tests).step);
     const lib_api_graph_wire_runtime_filters = &.{"graph hydrate response wire flattens index identity"};
     const lib_api_graph_wire_tests = b.addTest(.{
         .root_module = antfly_test_mod,

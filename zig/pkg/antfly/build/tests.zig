@@ -1918,7 +1918,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "projected MATCH rows reserve and release retained output bytes",
         "shortest path preflights live frontier admission",
         "shortest path retained payloads use the shared request budget",
-        "min-hop BFS scans a 122K-edge synthetic social graph once",
         "consumed path state detaches its request-scoped release hook",
         "distributed bounded paths retain non-dominated cost and depth labels",
         "distributed frontier reservations precede allocation and release on deinit",
