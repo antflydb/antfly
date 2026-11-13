@@ -27,6 +27,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const context_resolution = @import("enrichment/context_resolution.zig");
+const context_sources = @import("enrichment/context_sources.zig");
+const graph_mod = @import("../../graph/graph.zig");
 
 pub fn ownTable(comptime DB: type, db: *DB, own_table_id: []const u8) context_resolution.Reader {
     const Impl = Adapter(DB);
@@ -36,6 +38,8 @@ pub fn ownTable(comptime DB: type, db: *DB, own_table_id: []const u8) context_re
         .lookup_fn = Impl.lookupOwn,
         .query_fn = Impl.queryOwn,
         .frontier_fn = Impl.frontierOwn,
+        .edges_fn = Impl.edgesOwn,
+        .search_fn = Impl.searchOwn,
     };
 }
 
@@ -59,6 +63,84 @@ pub fn Adapter(comptime DB: type) type {
             return frontier(db, alloc);
         }
 
+        fn edgesOwn(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: context_sources.GraphSpec.Direction, limit: u32) anyerror![]context_resolution.Edge {
+            const db: *DB = @ptrCast(@alignCast(ptr));
+            if (!isOwn(db, table_id)) return error.ContextSourceTableUnavailable;
+            return edges(db, alloc, graph_index, node, types, direction, limit);
+        }
+
+        fn searchOwn(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, q: context_resolution.SearchQuery) anyerror!context_resolution.Page {
+            const db: *DB = @ptrCast(@alignCast(ptr));
+            if (!isOwn(db, table_id)) return error.ContextSourceTableUnavailable;
+            return search(db, alloc, q);
+        }
+
+        /// Explicitly written edges only. Field- and artifact-derived edges
+        /// change through document writes or enrichment output, which graph
+        /// notices do not observe; live context therefore never reads them.
+        pub fn edges(db: *DB, alloc: Allocator, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: context_sources.GraphSpec.Direction, limit: u32) ![]context_resolution.Edge {
+            var out = std.ArrayListUnmanaged(context_resolution.Edge).empty;
+            errdefer {
+                for (out.items) |e| {
+                    alloc.free(e.edge_type);
+                    alloc.free(e.neighbor);
+                }
+                out.deinit(alloc);
+            }
+            const entry = db.core.index_manager.graphIndex(graph_index) orelse return error.ContextGraphUnavailable;
+            const dir: graph_mod.EdgeDirection = switch (direction) {
+                .out => .out,
+                .in => .in,
+                .both => .both,
+            };
+            var cursor: ?graph_mod.EdgeScanCursor = null;
+            defer if (cursor) |*c| c.deinit(alloc);
+            var scanned: usize = 0;
+            while (out.items.len < limit) {
+                var page = try entry.index.getEdgesByTypesPage(alloc, node, types, dir, cursor, .{ .max_edges = 256, .max_owned_bytes = 512 * 1024, .max_scanned_rows = 4096 });
+                defer graph_mod.GraphIndex.freeEdges(alloc, page.edges);
+                scanned += page.scanned_rows;
+                for (page.edges) |edge| {
+                    if (edge.artifact_derived or edge.field_derived) continue;
+                    if (out.items.len >= limit) break;
+                    const outgoing = std.mem.eql(u8, edge.source, node) and direction != .in;
+                    const neighbor = if (outgoing) edge.target else edge.source;
+                    const t = try alloc.dupe(u8, edge.edge_type);
+                    errdefer alloc.free(t);
+                    try out.append(alloc, .{ .edge_type = t, .neighbor = try alloc.dupe(u8, neighbor), .outgoing = outgoing });
+                }
+                if (cursor) |*c| c.deinit(alloc);
+                cursor = page.next_cursor;
+                page.next_cursor = null;
+                if (cursor == null) break;
+                if (scanned > 64 * 4096) return error.ContextBudgetExceeded;
+            }
+            return out.toOwnedSlice(alloc);
+        }
+
+        /// Ranked retrieval: full-text relevance (`match`) or dense k-NN.
+        pub fn search(db: *DB, alloc: Allocator, q: context_resolution.SearchQuery) !context_resolution.Page {
+            var result = if (q.vector.len != 0)
+                try db.search(alloc, .{ .index_name = q.vector_index, .dense = .{ .vector = q.vector, .k = q.k }, .limit = q.k, .include_stored = true, .include_all_fields = true })
+            else
+                try db.search(alloc, .{ .full_text = .{ .match = .{ .field = q.text_field, .text = q.text } }, .limit = q.k, .include_stored = true, .include_all_fields = true });
+            defer result.deinit();
+            var rows = std.ArrayListUnmanaged(context_resolution.Row).empty;
+            errdefer {
+                for (rows.items) |row| {
+                    alloc.free(row.key);
+                    alloc.free(row.value);
+                }
+                rows.deinit(alloc);
+            }
+            for (result.hits) |hit| {
+                const value = if (hit.stored_data) |data| try alloc.dupe(u8, data) else (try db.get(alloc, hit.id)) orelse continue;
+                errdefer alloc.free(value);
+                try rows.append(alloc, .{ .key = try alloc.dupe(u8, hit.id), .value = value });
+            }
+            return .{ .rows = try rows.toOwnedSlice(alloc), .exhausted = true };
+        }
+
         fn isOwn(db: *DB, table_id: []const u8) bool {
             if (table_id.len == 0) return true;
             return std.mem.eql(u8, table_id, db.contextSourceTableId());
@@ -69,6 +151,54 @@ pub fn Adapter(comptime DB: type) type {
         }
 
         pub fn query(db: *DB, alloc: Allocator, filter: []const u8, offset: u32, limit: u32) !context_resolution.Page {
+            return queryIndexed(db, alloc, filter, offset, limit) catch |err| switch (err) {
+                // No full-text index can serve the prefilter: fall back to an
+                // ordered table scan. Resolution bounds it by the declared
+                // candidate budget and verifies every row exactly.
+                error.UnsupportedQueryRequest => scanPage(db, alloc, offset, limit),
+                else => err,
+            };
+        }
+
+        fn scanPage(db: *DB, alloc: Allocator, offset: u32, limit: u32) !context_resolution.Page {
+            const Collect = struct {
+                alloc: Allocator,
+                rows: std.ArrayListUnmanaged(context_resolution.Row) = .empty,
+                skip: u32,
+                limit: u32,
+                more: bool = false,
+                fn visit(raw: ?*anyopaque, entry: @import("types.zig").ScanVisitEntry) anyerror!void {
+                    const c: *@This() = @ptrCast(@alignCast(raw.?));
+                    const doc = entry.document_json orelse return;
+                    if (c.skip > 0) {
+                        c.skip -= 1;
+                        return;
+                    }
+                    if (c.rows.items.len >= c.limit) {
+                        c.more = true;
+                        return error.Canceled;
+                    }
+                    const key = try c.alloc.dupe(u8, entry.id);
+                    errdefer c.alloc.free(key);
+                    try c.rows.append(c.alloc, .{ .key = key, .value = try c.alloc.dupe(u8, doc) });
+                }
+            };
+            var collect = Collect{ .alloc = alloc, .skip = offset, .limit = limit };
+            errdefer {
+                for (collect.rows.items) |row| {
+                    alloc.free(row.key);
+                    alloc.free(row.value);
+                }
+                collect.rows.deinit(alloc);
+            }
+            db.scanVisit(alloc, "", "", .{ .include_documents = true }, .{ .context = &collect, .visit = Collect.visit }) catch |err| switch (err) {
+                error.Canceled => {},
+                else => return err,
+            };
+            return .{ .rows = try collect.rows.toOwnedSlice(alloc), .exhausted = !collect.more };
+        }
+
+        fn queryIndexed(db: *DB, alloc: Allocator, filter: []const u8, offset: u32, limit: u32) !context_resolution.Page {
             var result = try db.search(alloc, .{
                 .filter_query_json = filter,
                 .limit = limit,
@@ -115,7 +245,7 @@ pub fn Registry(comptime DB: type) type {
         const Impl = Adapter(DB);
 
         pub fn reader(self: *Self) context_resolution.Reader {
-            return .{ .ptr = self, .own_table_id = self.own_table_id, .lookup_fn = lookupImpl, .query_fn = queryImpl, .frontier_fn = frontierImpl };
+            return .{ .ptr = self, .own_table_id = self.own_table_id, .lookup_fn = lookupImpl, .query_fn = queryImpl, .frontier_fn = frontierImpl, .edges_fn = edgesImpl, .search_fn = searchImpl };
         }
 
         fn target(self: *Self, table_id: []const u8) !*DB {
@@ -131,6 +261,16 @@ pub fn Registry(comptime DB: type) type {
         fn queryImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, filter: []const u8, offset: u32, limit: u32) anyerror!context_resolution.Page {
             const self: *Self = @ptrCast(@alignCast(ptr));
             return Impl.query(try self.target(table_id), alloc, filter, offset, limit);
+        }
+
+        fn edgesImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: context_sources.GraphSpec.Direction, limit: u32) anyerror![]context_resolution.Edge {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return Impl.edges(try self.target(table_id), alloc, graph_index, node, types, direction, limit);
+        }
+
+        fn searchImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8, q: context_resolution.SearchQuery) anyerror!context_resolution.Page {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return Impl.search(try self.target(table_id), alloc, q);
         }
 
         fn frontierImpl(ptr: *anyopaque, alloc: Allocator, table_id: []const u8) anyerror![]u8 {

@@ -11,10 +11,13 @@ T = TypeVar("T", bound="EnrichmentContextQueryFilterQuery")
 
 @_attrs_define
 class EnrichmentContextQueryFilterQuery:
-    """A `{"conjuncts":[...]}` of `term`/`terms` equality conjuncts (or one bare conjunct). Values are literals or typed
-    bindings `{"$source":"/json/pointer"}` from the source document (never text interpolation); at most one bound
-    `terms` set. Ranges, disjunctions, full-text, and semantic top-k are rejected at admission. Members are canonically
-    ordered by key.
+    """`{"conjuncts":[...]}` (or one bare conjunct) of: `term`/`terms` (equality, indexed subscriptions; at most one bound
+    `terms` set), `range` (`gt`/`gte`/`lt`/`lte`, numbers or strings such as ISO dates), `prefix`, `match` (filter-mode
+    full-text with `operator` and|or, evaluated with the pinned `antfly.context.simple.v1` analyzer: lowercase ASCII
+    words), and `similar` (`{vector, threshold, metric: cosine|dot, dims, model}` over a vector stored in a document
+    field; `model` names the embedding space and is part of the declaration). Values are literals or typed bindings
+    `{"$source":"/json/pointer"}` from the source document. Disjunctions, scored full-text, fuzzy/regex, and nearest-k
+    are rejected for live tracking.
 
     """
 

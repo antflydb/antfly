@@ -16077,6 +16077,37 @@ pub const IndexManager = struct {
         return try out.toOwnedSlice(alloc);
     }
 
+    /// Reject a context source that reads a table this table's resolvers
+    /// promote into from this enrichment's own output (directly or through
+    /// downstream artifacts): its rebuild would rewrite its own input.
+    fn rejectContextSourceFeedback(self: *const IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !void {
+        var parsed = enrichment_context_sources.parseStoredJson(self.alloc, cfg.context_sources_json) catch return error.InvalidEnrichmentConfig;
+        defer parsed.deinit();
+        for (parsed.sources) |source| {
+            if (source.table.len == 0) continue;
+            for (self.resolvers.items) |resolver| {
+                if (!std.mem.eql(u8, resolver.table, source.table)) continue;
+                if (self.artifactDependsOn(resolver.source_artifact, cfg.name)) return error.ContextSourceFeedbackCycle;
+            }
+        }
+    }
+
+    /// Whether `artifact` is `root` or consumes it through source chains.
+    fn artifactDependsOn(self: *const IndexManager, artifact: []const u8, root: []const u8) bool {
+        var current = artifact;
+        var hops: usize = 0;
+        while (current.len != 0 and hops <= self.enrichments.items.len) : (hops += 1) {
+            if (std.mem.eql(u8, current, root)) return true;
+            var next: []const u8 = "";
+            for (self.enrichments.items) |entry| if (std.mem.eql(u8, entry.name, current)) {
+                next = entry.source_artifact_name;
+                break;
+            };
+            current = next;
+        }
+        return false;
+    }
+
     /// Whether any admitted asset enrichment declares context sources. The
     /// commit path consults this before computing dependency notices so tables
     /// without dependents pay nothing.
@@ -26099,7 +26130,10 @@ pub const IndexManager = struct {
                     var context = try enrichment_neighbor_context.parseConfigJson(self.alloc, cfg.neighbor_context_json);
                     context.deinit(self.alloc);
                 }
-                if (cfg.context_sources_json.len > 0) try validateContextSourcesConfig(self.alloc, cfg);
+                if (cfg.context_sources_json.len > 0) {
+                    try validateContextSourcesConfig(self.alloc, cfg);
+                    try self.rejectContextSourceFeedback(cfg);
+                }
                 if (cfg.source_artifact_name.len > 0) {
                     // Asset-consumes-asset: the upstream chain must resolve
                     // to admitted assets and terminate without revisiting

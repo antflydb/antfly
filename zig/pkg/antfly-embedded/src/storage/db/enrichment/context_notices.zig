@@ -132,7 +132,9 @@ pub fn buildSourceSpecs(alloc: Allocator, own_table_id: []const u8, declared: []
                 d.dependent_table_id.len == 0 or std.mem.eql(u8, d.dependent_table_id, own_table_id)
             else
                 std.mem.eql(u8, source.table_id, own_table_id);
-            if (!targets_this) continue;
+            // Snapshot sources register no subscriptions; ranked retrieval
+            // is never invalidated by row changes.
+            if (!targets_this or !source.isLive() or source.kind == .search) continue;
             try items.append(alloc, .{
                 .dependent_table_id = d.dependent_table_id,
                 .artifact = d.artifact,
@@ -140,7 +142,7 @@ pub fn buildSourceSpecs(alloc: Allocator, own_table_id: []const u8, declared: []
                 .spec = source.specDigest(),
                 .refresh = config.refresh,
             });
-            for (source.fields) |f| try fields.append(alloc, f);
+            for (source.relevant_fields) |f| try fields.append(alloc, f);
             for (source.conjuncts) |c| try fields.append(alloc, c.field);
         }
     }
@@ -209,6 +211,11 @@ pub const Notice = struct {
     sequence: u64,
     /// Fan-out continuation cursor (subscription key) when non-empty.
     resume_after: []const u8 = "",
+    /// Residual sources: the row's relevant projection before/after the
+    /// change ("" absent, "?" unknown), evaluated against each subscriber's
+    /// parameters on the dependent side.
+    prev_row: []const u8 = "",
+    next_row: []const u8 = "",
 };
 
 pub fn encodeNoticeAlloc(alloc: Allocator, n: Notice) ![]u8 {
@@ -224,9 +231,13 @@ pub fn encodeNoticeAlloc(alloc: Allocator, n: Notice) ![]u8 {
     try ctx.appendJsonString(alloc, &out, n.source_table_id);
     try out.appendSlice(alloc, ",\"key\":");
     try ctx.appendJsonString(alloc, &out, n.key);
-    try out.print(alloc, ",\"spec\":\"{x}\",\"tuple\":\"{x}\",\"all\":{},\"change\":\"{s}\",\"refresh\":\"{s}\",\"debounce_ms\":{d},\"sequence\":{d},\"resume_after\":\"{x}\"}}", .{
+    try out.print(alloc, ",\"spec\":\"{x}\",\"tuple\":\"{x}\",\"all\":{},\"change\":\"{s}\",\"refresh\":\"{s}\",\"debounce_ms\":{d},\"sequence\":{d},\"resume_after\":\"{x}\",\"prev_row\":", .{
         &n.spec, &n.tuple, n.all, @tagName(n.change), @tagName(n.refresh.mode), n.refresh.debounce_ms, n.sequence, n.resume_after,
     });
+    try ctx.appendJsonString(alloc, &out, n.prev_row);
+    try out.appendSlice(alloc, ",\"next_row\":");
+    try ctx.appendJsonString(alloc, &out, n.next_row);
+    try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -288,6 +299,8 @@ pub fn decodeNoticeAlloc(alloc: Allocator, raw: []const u8) !DecodedNotice {
         },
         .sequence = try str.int(o, "sequence"),
         .resume_after = resume_after,
+        .prev_row = if (o.get("prev_row")) |v| (if (v == .string) v.string else "") else "",
+        .next_row = if (o.get("next_row")) |v| (if (v == .string) v.string else "") else "",
     } };
 }
 
@@ -364,27 +377,30 @@ pub fn planStageNotices(
             std.mem.eql(u8, previous_raw.?[32..], next_projection.?)) continue;
 
         for (specs.items) |binding| {
+            const residual = binding.source.hasResidual();
+            const prev_row: []const u8 = if (!residual) "" else if (previous_unknown) "?" else if (previous) |row| try ctx.projectAlloc(a, row, binding.source.relevant_fields) else "";
+            const next_row: []const u8 = if (!residual) "" else if (next) |row| try ctx.projectAlloc(a, row, binding.source.relevant_fields) else "";
             if (previous_unknown) {
                 const change_kind: ctx.ChangeKind = if (binding.source.kind == .document)
                     (if (next == null) .document_deleted else .document_changed)
                 else
                     (if (next == null) .member_removed else .member_changed);
-                if (binding.source.kind == .document) {
+                if (binding.source.kind == .document or binding.source.kind == .graph) {
                     // Document subscriptions are keyed by the row key, so the
                     // exact tuple is known even without a shadow.
                     try stage(alloc, plan, binding, own_table_id, change.key, ctx.documentTuple(binding.spec, change.key), false, change_kind, sequence, &result);
                 } else {
-                    try stage(alloc, plan, binding, own_table_id, change.key, @splat(0), true, change_kind, sequence, &result);
+                    try stageRows(alloc, plan, binding, own_table_id, change.key, @splat(0), true, change_kind, sequence, &result, prev_row, next_row);
                 }
                 continue;
             }
             var touched = try ctx.touchedTuplesAlloc(a, binding.source, change.key, previous, next);
             defer touched.deinit(a);
             if (touched.all) {
-                try stage(alloc, plan, binding, own_table_id, change.key, @splat(0), true, touched.all_change, sequence, &result);
+                try stageRows(alloc, plan, binding, own_table_id, change.key, @splat(0), true, touched.all_change, sequence, &result, prev_row, next_row);
                 continue;
             }
-            for (touched.tuples) |t| try stage(alloc, plan, binding, own_table_id, change.key, t.tuple, false, t.change, sequence, &result);
+            for (touched.tuples) |t| try stageRows(alloc, plan, binding, own_table_id, change.key, t.tuple, false, t.change, sequence, &result, prev_row, next_row);
         }
 
         if (next_projection) |projection| {
@@ -397,7 +413,13 @@ pub fn planStageNotices(
 }
 
 fn stage(alloc: Allocator, plan: *store.Plan, binding: SpecBinding, own_table_id: []const u8, key: []const u8, tuple: Digest, all: bool, change: ctx.ChangeKind, sequence: u64, result: *StageResult) !void {
+    return stageRows(alloc, plan, binding, own_table_id, key, tuple, all, change, sequence, result, "", "");
+}
+
+fn stageRows(alloc: Allocator, plan: *store.Plan, binding: SpecBinding, own_table_id: []const u8, key: []const u8, tuple: Digest, all: bool, change: ctx.ChangeKind, sequence: u64, result: *StageResult, prev_row: []const u8, next_row: []const u8) !void {
     const value = try encodeNoticeAlloc(alloc, .{
+        .prev_row = prev_row,
+        .next_row = next_row,
         .dependent_table_id = binding.dependent_table_id,
         .artifact = binding.artifact,
         .source_name = binding.source.name,
@@ -415,6 +437,44 @@ fn stage(alloc: Allocator, plan: *store.Plan, binding: SpecBinding, own_table_id
     try plan.putOwned(try alloc.dupe(u8, &okey), value);
     result.next_ordinal += 1;
     result.notices += 1;
+}
+
+pub const EdgeChange = struct {
+    graph_index: []const u8,
+    source: []const u8,
+    target: []const u8,
+    edge_type: []const u8,
+    /// Generated (artifact-derived) edges never reach live graph context.
+    artifact_derived: bool = false,
+};
+
+/// Stage adjacency notices for direct graph edge writes/deletes: the
+/// traversal through an endpoint can change, so the endpoint's graph tuple
+/// is notified in the traversal orientations each spec declares.
+pub fn planStageEdgeNotices(alloc: Allocator, plan: *store.Plan, specs: *const SourceSpecs, own_table_id: []const u8, sequence: u64, first_ordinal: u32, edges: []const EdgeChange) !StageResult {
+    var result = StageResult{ .next_ordinal = first_ordinal };
+    for (edges) |edge| {
+        if (edge.artifact_derived) continue;
+        for (specs.items) |binding| {
+            const g = binding.source.graph;
+            if (binding.source.kind != .graph or !std.mem.eql(u8, g.graph_index, edge.graph_index)) continue;
+            if (g.edge_types.len != 0) {
+                var admitted = false;
+                for (g.edge_types) |t| if (std.mem.eql(u8, t, edge.edge_type)) {
+                    admitted = true;
+                };
+                if (!admitted) continue;
+            }
+            if (g.direction != .in) try stage(alloc, plan, binding, own_table_id, edge.source, ctx.graphTuple(binding.spec, edge.source), false, .edge_changed, sequence, &result);
+            if (g.direction != .out) try stage(alloc, plan, binding, own_table_id, edge.target, ctx.graphTuple(binding.spec, edge.target), false, .edge_changed, sequence, &result);
+            // A depth>1 traversal also reads through the far endpoint.
+            if (g.depth > 1) {
+                const far = if (g.direction == .in) edge.source else edge.target;
+                try stage(alloc, plan, binding, own_table_id, far, ctx.graphTuple(binding.spec, far), false, .edge_changed, sequence, &result);
+            }
+        }
+    }
+    return result;
 }
 
 pub const BackfillResult = struct {
@@ -489,6 +549,59 @@ pub fn planApplyNotice(
     range_upper: []const u8,
     page: usize,
 ) !ApplyResult {
+    return planApplyNoticeWithSources(alloc, reader, plan, notice, now_ms, range_lower, range_upper, page, null);
+}
+
+/// Resolves a dependent's source declaration so residual notices can be
+/// evaluated against each subscriber's parameters.
+pub const SourceLookup = struct {
+    ptr: *anyopaque,
+    lookup_fn: *const fn (ptr: *anyopaque, artifact: []const u8, spec: Digest) ?*const ctx.Source,
+};
+
+const RelevanceContext = struct {
+    alloc: Allocator,
+    sources: SourceLookup,
+    notice: Notice,
+    prev: ?std.json.Value,
+    next: ?std.json.Value,
+    prev_unknown: bool,
+
+    fn relevant(p: *anyopaque, artifact: []const u8, residual: []const u8) anyerror!bool {
+        const self: *RelevanceContext = @ptrCast(@alignCast(p));
+        if (self.prev_unknown or residual.len == 0) return true;
+        const source = self.sources.lookup_fn(self.sources.ptr, artifact, self.notice.spec) orelse return true;
+        return ctx.subscriberRelevant(self.alloc, source, residual, self.notice.key, self.prev, self.next);
+    }
+};
+
+pub fn planApplyNoticeWithSources(
+    alloc: Allocator,
+    reader: store.Reader,
+    plan: *store.Plan,
+    notice: Notice,
+    now_ms: u64,
+    range_lower: []const u8,
+    range_upper: []const u8,
+    page: usize,
+    sources: ?SourceLookup,
+) !ApplyResult {
+    var rows_arena = std.heap.ArenaAllocator.init(alloc);
+    defer rows_arena.deinit();
+    var relevance_ctx: RelevanceContext = undefined;
+    var relevance: ?store.Relevance = null;
+    if (sources) |lookup| if (notice.prev_row.len != 0 or notice.next_row.len != 0) {
+        const ra = rows_arena.allocator();
+        relevance_ctx = .{
+            .alloc = alloc,
+            .sources = lookup,
+            .notice = notice,
+            .prev_unknown = std.mem.eql(u8, notice.prev_row, "?"),
+            .prev = if (notice.prev_row.len == 0 or std.mem.eql(u8, notice.prev_row, "?")) null else std.json.parseFromSliceLeaky(std.json.Value, ra, notice.prev_row, .{}) catch null,
+            .next = if (notice.next_row.len == 0) null else std.json.parseFromSliceLeaky(std.json.Value, ra, notice.next_row, .{}) catch null,
+        };
+        relevance = .{ .ptr = &relevance_ctx, .relevant_fn = RelevanceContext.relevant };
+    };
     var result = ApplyResult{};
     errdefer result.deinit(alloc);
     const background = notice.refresh.mode == .background;
@@ -502,6 +615,7 @@ pub fn planApplyNotice(
         .range_upper = range_upper,
         .resume_after = notice.resume_after,
         .max_targets = page,
+        .relevance = relevance,
     };
     var invalidated = if (notice.all)
         try store.planInvalidateSpec(alloc, reader, plan, notice.spec, options)

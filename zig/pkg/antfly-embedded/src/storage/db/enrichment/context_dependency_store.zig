@@ -337,6 +337,9 @@ pub const Freshness = enum(u8) {
     /// The last rebuild failed; the last successful artifact (if any) is
     /// retained and still not current.
     failed = 3,
+    /// Published from snapshot (ranked/unverifiable) context: retained and
+    /// usable, but never claimed current.
+    unverified = 4,
 };
 
 pub const Reason = struct {
@@ -368,6 +371,8 @@ pub const State = struct {
     reasons: []const Reason = &.{},
     /// Reasons dropped beyond `max_reasons` since the last publication.
     dropped_reasons: u32 = 0,
+    /// Wall-clock time the published inputs were read (ms since epoch).
+    validated_at_ms: u64 = 0,
 
     /// Owned decode result; free with `deinit`.
     pub fn deinit(self: *State, alloc: Allocator) void {
@@ -468,6 +473,7 @@ pub fn encodeStateAlloc(alloc: Allocator, state: State) ![]u8 {
     }
     std.mem.writeInt(u32, &n, state.dropped_reasons, .little);
     try out.appendSlice(alloc, &n);
+    try writeU64(&out, alloc, state.validated_at_ms);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -523,6 +529,7 @@ pub fn decodeStateAlloc(alloc: Allocator, raw: []const u8) Error!State {
     }
     view.reasons = reasons[0..reason_count];
     view.dropped_reasons = try c.u32_();
+    view.validated_at_ms = try c.u64_();
     if (c.pos != raw.len) return error.InvalidDependencyState;
     return view.clone(alloc);
 }
@@ -887,11 +894,14 @@ pub fn planRegister(
     try union_list.appendSlice(alloc, state.tuples);
     var changed = false;
     for (tuples) |t| {
-        if (state.hasTuple(t)) continue;
+        if (state.hasTuple(t)) {
+            try putSubscriptionValue(alloc, reader, plan, t, artifact, doc_key);
+            continue;
+        }
         try union_list.append(alloc, t);
         const key = try subscriptionKeyAlloc(alloc, t.spec, t.tuple, artifact, doc_key);
         errdefer alloc.free(key);
-        try plan.putOwned(key, try alloc.dupe(u8, ""));
+        try plan.putOwned(key, try alloc.dupe(u8, t.residual));
         changed = true;
     }
     ctx.sortUniqueTuples(&union_list);
@@ -925,7 +935,32 @@ pub const PublishInput = struct {
     /// When false the artifact bytes were reused (skip state matched); only
     /// freshness advances and no new lineage version is minted.
     new_version: bool = true,
+    /// Inputs include snapshot (ranked) sources: publish as `unverified`.
+    snapshot: bool = false,
+    /// Schedule the next snapshot rebuild at this time (0 = none).
+    refresh_due_ms: u64 = 0,
 };
+
+/// Write (or refresh) a subscription hint with its residual value. Reads the
+/// hint so an unchanged value costs no write.
+fn putSubscriptionValue(alloc: Allocator, reader: Reader, plan: *Plan, t: ctx.SubscriptionTuple, artifact: []const u8, doc_key: []const u8) !void {
+    const key = try subscriptionKeyAlloc(alloc, t.spec, t.tuple, artifact, doc_key);
+    var key_owned = true;
+    defer if (key_owned) alloc.free(key);
+    const current: ?[]const u8 = switch (plan.pending(key)) {
+        .put => |v| v,
+        .deleted => null,
+        .untouched => blk: {
+            const raw = try reader.get(alloc, key);
+            defer if (raw) |r| alloc.free(r);
+            if (raw) |r| if (std.mem.eql(u8, r, t.residual)) return;
+            break :blk null;
+        },
+    };
+    if (current) |v| if (std.mem.eql(u8, v, t.residual)) return;
+    key_owned = false;
+    try plan.putOwned(key, try alloc.dupe(u8, t.residual));
+}
 
 pub const PublishResult = struct {
     version: u64,
@@ -956,11 +991,7 @@ pub fn planPublish(alloc: Allocator, reader: Reader, plan: *Plan, doc_key: []con
     defer sorted.deinit(alloc);
     try sorted.appendSlice(alloc, input.tuples);
     ctx.sortUniqueTuples(&sorted);
-    for (sorted.items) |t| if (!state.hasTuple(t)) {
-        const key = try subscriptionKeyAlloc(alloc, t.spec, t.tuple, artifact, doc_key);
-        errdefer alloc.free(key);
-        try plan.putOwned(key, try alloc.dupe(u8, ""));
-    };
+    for (sorted.items) |t| try putSubscriptionValue(alloc, reader, plan, t, artifact, doc_key);
 
     var version = state.published_version;
     if (input.new_version or version == 0) {
@@ -990,12 +1021,14 @@ pub fn planPublish(alloc: Allocator, reader: Reader, plan: *Plan, doc_key: []con
         if (version > retain) try planDropVersion(alloc, reader, plan, doc_key, artifact, version - retain);
     }
 
+    if (input.refresh_due_ms != 0) try planQueueDebounced(plan, input.refresh_due_ms, artifact, doc_key);
     const next = State{
         .generation = state.generation,
         .published_generation = state.generation,
         .published_version = version,
-        .freshness = .current,
+        .freshness = if (input.snapshot) .unverified else .current,
         .rebuild_queued = false,
+        .validated_at_ms = @intCast(@max(input.published_at_ms, 0)),
         .input_fingerprint = input.input_fingerprint,
         .config_digest = input.capture.config_digest,
         .frontier = input.frontier,
@@ -1067,6 +1100,11 @@ pub const Invalidated = struct {
     newly_stale: bool,
 };
 
+pub const Relevance = struct {
+    ptr: *anyopaque,
+    relevant_fn: *const fn (ptr: *anyopaque, artifact: []const u8, residual: []const u8) anyerror!bool,
+};
+
 pub const InvalidateOptions = struct {
     source: []const u8,
     change: ctx.ChangeKind,
@@ -1083,6 +1121,9 @@ pub const InvalidateOptions = struct {
     /// tuple prefix.
     resume_after: []const u8 = "",
     max_targets: usize = 1024,
+    /// Per-subscriber filter over the subscription value (residual
+    /// parameters). Subscribers it rejects are not invalidated.
+    relevance: ?Relevance = null,
 };
 
 pub const InvalidatePage = struct {
@@ -1142,26 +1183,31 @@ fn planInvalidateRange(
     defer alloc.free(lower);
 
     var hints = std.ArrayListUnmanaged([]u8).empty;
+    var values = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (hints.items) |h| alloc.free(h);
         hints.deinit(alloc);
+        for (values.items) |v| alloc.free(v);
+        values.deinit(alloc);
     }
     const Collect = struct {
         alloc: Allocator,
         hints: *std.ArrayListUnmanaged([]u8),
+        values: *std.ArrayListUnmanaged([]u8),
         limit: usize,
-        fn visit(p: *anyopaque, key: []const u8, _: []const u8) anyerror!bool {
+        fn visit(p: *anyopaque, key: []const u8, value: []const u8) anyerror!bool {
             const self: *@This() = @ptrCast(@alignCast(p));
             try self.hints.append(self.alloc, try self.alloc.dupe(u8, key));
+            try self.values.append(self.alloc, try self.alloc.dupe(u8, value));
             return self.hints.items.len <= self.limit;
         }
     };
-    var collect = Collect{ .alloc = alloc, .hints = &hints, .limit = options.max_targets };
+    var collect = Collect{ .alloc = alloc, .hints = &hints, .values = &values, .limit = options.max_targets };
     try reader.scan(lower, upper, .{ .ptr = &collect, .visit_fn = Collect.visit });
     const more = hints.items.len > options.max_targets;
     const visible = if (more) hints.items[0..options.max_targets] else hints.items;
 
-    for (visible) |hint_key| {
+    for (visible, values.items[0..visible.len]) |hint_key, hint_value| {
         var hint = (try parseSubscriptionKeyAlloc(alloc, hint_key)) orelse {
             try plan.delete(hint_key);
             continue;
@@ -1177,6 +1223,7 @@ fn planInvalidateRange(
             try plan.delete(hint_key);
             continue;
         }
+        if (options.relevance) |filter| if (!try filter.relevant_fn(filter.ptr, hint.artifact, hint_value)) continue;
         const newly_stale = try applyInvalidation(alloc, plan, hint.doc_key, hint.artifact, &state, options);
         const artifact = try alloc.dupe(u8, hint.artifact);
         errdefer alloc.free(artifact);
@@ -1198,7 +1245,7 @@ pub fn planInvalidateDocument(alloc: Allocator, reader: Reader, plan: *Plan, doc
 }
 
 fn applyInvalidation(alloc: Allocator, plan: *Plan, doc_key: []const u8, artifact: []const u8, state: *State, options: InvalidateOptions) !bool {
-    const newly_stale = state.freshness == .current or state.freshness == .pending;
+    const newly_stale = state.freshness == .current or state.freshness == .pending or state.freshness == .unverified;
     var reasons = std.ArrayListUnmanaged(Reason).empty;
     defer reasons.deinit(alloc);
     try reasons.appendSlice(alloc, state.reasons);
@@ -1523,10 +1570,11 @@ pub fn freshnessJsonAlloc(alloc: Allocator, state: State) ![]u8 {
         try out.appendSlice(alloc, ",\"validated_through\":");
         try ctx.appendJsonString(alloc, &out, state.frontier);
     }
+    if (state.validated_at_ms != 0) try out.print(alloc, ",\"validated_at_ms\":{d}", .{state.validated_at_ms});
     if (state.published_generation != 0)
         try out.print(alloc, ",\"input_fingerprint\":\"sha256:{x}\"", .{&state.input_fingerprint});
     const rebuild: []const u8 = switch (state.freshness) {
-        .current => "idle",
+        .current, .unverified => "idle",
         .failed => "failed",
         else => if (state.rebuild_queued) "queued" else "manual",
     };
@@ -1929,4 +1977,40 @@ test "subscription and impact key parsing round trips escaped components" {
     try testing.expectEqual(@as(u64, 77), impact.version);
     try testing.expectEqualStrings("t\x00", impact.table_id);
     try testing.expectEqualStrings(doc, impact.doc_key);
+}
+
+test "residual subscription values filter invalidation per subscriber and snapshots publish unverified" {
+    const alloc = testing.allocator;
+    var store = MemoryStore{ .alloc = alloc };
+    defer store.deinit();
+    var plan = Plan.init(alloc);
+    defer plan.deinit();
+    const near = ctx.SubscriptionTuple{ .spec = @splat(0xaa), .tuple = @splat(1), .residual = "near" };
+    const far = ctx.SubscriptionTuple{ .spec = @splat(0xaa), .tuple = @splat(1), .residual = "far" };
+    _ = try planRegister(alloc, store.reader(), &plan, "a", "x", &.{near}, @splat(1));
+    _ = try planRegister(alloc, store.reader(), &plan, "b", "x", &.{far}, @splat(1));
+    try commit(&store, &plan);
+    const Filter = struct {
+        fn relevant(_: *anyopaque, _: []const u8, residual: []const u8) anyerror!bool {
+            return std.mem.eql(u8, residual, "near");
+        }
+    };
+    var dummy: u8 = 0;
+    var page = try planInvalidateTuple(alloc, store.reader(), &plan, near.spec, near.tuple, .{ .source = "s", .change = .member_added, .table_id = "t", .key = "k", .relevance = .{ .ptr = &dummy, .relevant_fn = Filter.relevant } });
+    defer page.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), page.targets.items.len);
+    try testing.expectEqualStrings("a", page.targets.items[0].doc_key);
+    try commit(&store, &plan);
+
+    const c = try planRegister(alloc, store.reader(), &plan, "s", "x", &.{}, @splat(2));
+    try commit(&store, &plan);
+    _ = try planPublish(alloc, store.reader(), &plan, "s", "x", .{ .capture = c, .tuples = &.{}, .input_fingerprint = @splat(3), .snapshot = true, .published_at_ms = 5000, .refresh_due_ms = 9000 });
+    try commit(&store, &plan);
+    var state = (try loadState(alloc, store.reader(), null, "s", "x")).?;
+    defer state.deinit(alloc);
+    try testing.expectEqual(Freshness.unverified, state.freshness);
+    try testing.expectEqual(@as(u64, 5000), state.validated_at_ms);
+    const due = try planDrainDebounced(alloc, store.reader(), &plan, 9000, 4);
+    defer freeTargets(alloc, due);
+    try testing.expectEqual(@as(usize, 1), due.len);
 }

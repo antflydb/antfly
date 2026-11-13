@@ -65,6 +65,10 @@ pub const Reader = struct {
     query_fn: *const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, filter_query_json: []const u8, offset: u32, limit: u32) anyerror!Page,
     /// Opaque position the subsequent reads are at least as fresh as.
     frontier_fn: ?*const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8) anyerror![]u8 = null,
+    /// Direct (non-generated) adjacency of one node, at most `limit` edges.
+    edges_fn: ?*const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, graph_index: []const u8, node: []const u8, edge_types: []const []const u8, direction: ctx.GraphSpec.Direction, limit: u32) anyerror![]Edge = null,
+    /// Ranked retrieval (full-text relevance or vector k-NN), rank order.
+    search_fn: ?*const fn (ptr: *anyopaque, alloc: Allocator, table_id: []const u8, query: SearchQuery) anyerror!Page = null,
 
     pub fn isOwn(self: Reader, table_id: []const u8) bool {
         return table_id.len == 0 or std.mem.eql(u8, table_id, self.own_table_id);
@@ -74,6 +78,28 @@ pub const Reader = struct {
     pub fn identity(self: Reader, table_id: []const u8) []const u8 {
         return if (table_id.len == 0) self.own_table_id else table_id;
     }
+};
+
+pub const Edge = struct {
+    edge_type: []u8,
+    neighbor: []u8,
+    outgoing: bool,
+};
+
+pub fn freeEdges(alloc: Allocator, edges: []Edge) void {
+    for (edges) |e| {
+        alloc.free(e.edge_type);
+        alloc.free(e.neighbor);
+    }
+    alloc.free(edges);
+}
+
+pub const SearchQuery = struct {
+    text: []const u8 = "",
+    text_field: []const u8 = "",
+    vector: []const f32 = &.{},
+    vector_index: []const u8 = "",
+    k: u32,
 };
 
 pub const Limits = struct {
@@ -92,6 +118,13 @@ pub const Resolution = struct {
     absent: []const store.ManifestInput,
     /// `{"<table_id>":"<position>",...}` sorted by table id.
     frontier: []const u8,
+    /// Exact subscription set after reading: bound tuples plus nodes and
+    /// members discovered while traversing, with residual values updated
+    /// (top-N boundaries). Register before publishing.
+    tuples: []const ctx.SubscriptionTuple,
+    /// Some consumed source is a snapshot (publish as `unverified`).
+    snapshot: bool,
+    refresh_interval_ms: u64,
 
     pub fn deinit(self: *Resolution, alloc: Allocator) void {
         self.rendered.deinit(alloc);
@@ -106,8 +139,9 @@ pub fn prefilterJsonAlloc(alloc: Allocator, bound: *const ctx.Bound) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     var pushed: usize = 0;
-    try out.appendSlice(alloc, "{\"conjuncts\":[");
+    try out.appendSlice(alloc, "{\"bool\":{\"filter\":[");
     for (bound.source.conjuncts, bound.values) |c, set| {
+        if (!c.isEquality()) continue;
         var strings: usize = 0;
         for (set) |v| {
             if (v.len > 0 and v[0] == '"') strings += 1;
@@ -116,23 +150,23 @@ pub fn prefilterJsonAlloc(alloc: Allocator, bound: *const ctx.Bound) ![]u8 {
         if (strings == 0 or strings != set.len) continue;
         if (pushed != 0) try out.append(alloc, ',');
         pushed += 1;
-        if (set.len > 1) try out.appendSlice(alloc, "{\"disjuncts\":[");
+        if (set.len > 1) try out.appendSlice(alloc, "{\"bool\":{\"should\":[");
         for (set, 0..) |v, i| {
             if (i != 0) try out.append(alloc, ',');
-            try out.appendSlice(alloc, "{\"match\":");
-            try out.appendSlice(alloc, v);
-            try out.appendSlice(alloc, ",\"field\":");
+            try out.appendSlice(alloc, "{\"match\":{\"field\":");
             try ctx.appendJsonString(alloc, &out, c.field);
-            try out.appendSlice(alloc, ",\"operator\":\"and\"}");
+            try out.appendSlice(alloc, ",\"text\":");
+            try out.appendSlice(alloc, v);
+            try out.appendSlice(alloc, "}}");
         }
-        if (set.len > 1) try out.appendSlice(alloc, "]}");
+        if (set.len > 1) try out.appendSlice(alloc, "]}}");
     }
     if (pushed == 0) {
         out.clearRetainingCapacity();
         try out.appendSlice(alloc, "{\"match_all\":{}}");
         return try out.toOwnedSlice(alloc);
     }
-    try out.appendSlice(alloc, "]}");
+    try out.appendSlice(alloc, "]}}");
     return try out.toOwnedSlice(alloc);
 }
 
@@ -148,10 +182,26 @@ pub fn resolveAlloc(alloc: Allocator, reader: Reader, bindings: *const ctx.Bindi
     var queries = std.ArrayListUnmanaged(store.ManifestQuery).empty;
     var absent = std.ArrayListUnmanaged(store.ManifestInput).empty;
     var frontiers = std.StringArrayHashMapUnmanaged([]const u8).empty;
+    var tuples = std.ArrayListUnmanaged(ctx.SubscriptionTuple).empty;
+    var snapshot = false;
+    var refresh_interval_ms: u64 = 0;
+    for (bindings.items) |*bound| {
+        if (!bound.source.isLive()) {
+            snapshot = true;
+            const interval = bound.source.refresh_interval_ms;
+            if (interval != 0 and (refresh_interval_ms == 0 or interval < refresh_interval_ms)) refresh_interval_ms = interval;
+        }
+        // Graph and ordered sources replace their own tuples after reading.
+        if (bound.source.kind == .graph or bound.source.order_by != null) continue;
+        const residual = try a.dupe(u8, bound.residual);
+        for (bound.tuples) |t| try tuples.append(a, .{ .spec = bound.spec, .tuple = t, .residual = residual });
+    }
 
     for (bindings.items, 0..) |*bound, i| {
         const source = bound.source;
-        const table_identity = reader.identity(source.table_id);
+        // Results outlive the bindings and declaration: own every string.
+        const source_name = try a.dupe(u8, source.name);
+        const table_identity = try a.dupe(u8, reader.identity(source.table_id));
         if (!frontiers.contains(table_identity)) {
             const position: []const u8 = if (reader.frontier_fn) |f| try f(reader.ptr, a, source.table_id) else "";
             try frontiers.put(a, table_identity, position);
@@ -159,9 +209,9 @@ pub fn resolveAlloc(alloc: Allocator, reader: Reader, bindings: *const ctx.Bindi
         switch (source.kind) {
             .document => {
                 resolved[i] = .{ .bound = bound, .members = &.{} };
-                const key = bound.key orelse continue;
+                const key = try a.dupe(u8, bound.key orelse continue);
                 const raw = (try reader.lookup_fn(reader.ptr, a, source.table_id, key)) orelse {
-                    try absent.append(a, .{ .source = source.name, .table_id = table_identity, .key = key, .revision = @splat(0) });
+                    try absent.append(a, .{ .source = source_name, .table_id = table_identity, .key = key, .revision = @splat(0) });
                     continue;
                 };
                 const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
@@ -169,47 +219,48 @@ pub fn resolveAlloc(alloc: Allocator, reader: Reader, bindings: *const ctx.Bindi
                 const members = try a.alloc(ctx.ConsumedInput, 1);
                 members[0] = member;
                 resolved[i] = .{ .bound = bound, .members = members, .present = true };
-                try inputs.append(a, .{ .source = source.name, .table_id = table_identity, .key = key, .revision = member.revision() });
+                try inputs.append(a, .{ .source = source_name, .table_id = table_identity, .key = key, .revision = member.revision() });
             },
             .query => {
-                var members = std.ArrayListUnmanaged(ctx.ConsumedInput).empty;
-                if (!bound.unsatisfiable) {
-                    const filter = try prefilterJsonAlloc(a, bound);
-                    const budget = @max(limits.scan_floor, source.max_documents *| limits.scan_factor);
-                    var offset: u32 = 0;
-                    var seen = std.StringHashMapUnmanaged(void).empty;
-                    while (true) {
-                        if (offset >= budget) return error.ContextBudgetExceeded;
-                        var page = try reader.query_fn(reader.ptr, alloc, source.table_id, filter, offset, limits.page_rows);
-                        defer page.deinit(alloc);
-                        for (page.rows) |row| {
-                            if (seen.contains(row.key)) continue;
-                            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, row.value, .{});
-                            if (!ctx.rowMatches(bound, parsed)) continue;
-                            const key = try a.dupe(u8, row.key);
-                            try seen.put(a, key, {});
-                            try members.append(a, .{ .key = key, .projection = try ctx.projectAlloc(a, parsed, source.fields) });
-                            if (members.items.len > source.max_documents) return error.ContextBudgetExceeded;
-                        }
-                        offset += @intCast(page.rows.len);
-                        if (page.exhausted or page.rows.len == 0) break;
-                    }
-                }
-                std.mem.sort(ctx.ConsumedInput, members.items, {}, struct {
-                    fn lt(_: void, l: ctx.ConsumedInput, r: ctx.ConsumedInput) bool {
-                        return std.mem.lessThan(u8, l.key, r.key);
-                    }
-                }.lt);
-                for (members.items) |m| try inputs.append(a, .{ .source = source.name, .table_id = table_identity, .key = m.key, .revision = m.revision() });
+                var ordered = false;
+                const members = try resolveQuery(a, alloc, reader, bound, limits, &tuples, &ordered);
+                for (members) |m| try inputs.append(a, .{ .source = source_name, .table_id = table_identity, .key = m.key, .revision = m.revision() });
                 try queries.append(a, .{
-                    .source = source.name,
+                    .source = source_name,
                     .table_id = table_identity,
                     .query_identity = bound.query_identity,
-                    .member_count = @intCast(members.items.len),
-                    .membership = store.membershipDigest(members.items),
+                    .member_count = @intCast(members.len),
+                    .membership = store.membershipDigest(members),
                     .complete = true,
                 });
-                resolved[i] = .{ .bound = bound, .members = members.items };
+                resolved[i] = .{ .bound = bound, .members = members, .ordered = ordered };
+            },
+            .graph => {
+                const members = try resolveGraph(a, alloc, reader, bound, &tuples);
+                for (members) |m| try inputs.append(a, .{ .source = source_name, .table_id = table_identity, .key = m.key, .revision = m.revision() });
+                try queries.append(a, .{
+                    .source = source_name,
+                    .table_id = table_identity,
+                    .query_identity = bound.query_identity,
+                    .member_count = @intCast(members.len),
+                    .membership = store.membershipDigest(members),
+                    .complete = true,
+                });
+                resolved[i] = .{ .bound = bound, .members = members, .ordered = true };
+            },
+            .search => {
+                const members = try resolveSearch(a, alloc, reader, bound);
+                for (members) |m| try inputs.append(a, .{ .source = source_name, .table_id = table_identity, .key = m.key, .revision = m.revision() });
+                try queries.append(a, .{
+                    .source = source_name,
+                    .table_id = table_identity,
+                    .query_identity = bound.query_identity,
+                    .member_count = @intCast(members.len),
+                    .membership = store.membershipDigest(members),
+                    // Ranked snapshot: complete for the declared k, never verified.
+                    .complete = false,
+                });
+                resolved[i] = .{ .bound = bound, .members = members, .ordered = true };
             },
         }
     }
@@ -243,7 +294,152 @@ pub fn resolveAlloc(alloc: Allocator, reader: Reader, bindings: *const ctx.Bindi
         .queries = queries.items,
         .absent = absent.items,
         .frontier = frontier.items,
+        .tuples = blk: {
+            ctx.sortUniqueTuples(&tuples);
+            break :blk tuples.items;
+        },
+        .snapshot = snapshot,
+        .refresh_interval_ms = refresh_interval_ms,
     };
+}
+
+const Candidate = struct {
+    key: []const u8,
+    row: std.json.Value,
+};
+
+/// Bounded candidate scan with exact verification. Unordered results larger
+/// than `max_documents` fail; ordered results keep the declared top-N and
+/// record its boundary in the dependent's subscription value.
+fn resolveQuery(a: Allocator, alloc: Allocator, reader: Reader, bound: *const ctx.Bound, limits: Limits, tuples: *std.ArrayListUnmanaged(ctx.SubscriptionTuple), ordered: *bool) ![]ctx.ConsumedInput {
+    const source = bound.source;
+    var matches = std.ArrayListUnmanaged(Candidate).empty;
+    if (!bound.unsatisfiable) {
+        const filter = try prefilterJsonAlloc(a, bound);
+        const budget: u32 = if (source.hasResidual()) source.max_candidates else @max(limits.scan_floor, source.max_documents *| limits.scan_factor);
+        var offset: u32 = 0;
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        while (true) {
+            if (offset >= budget) return error.ContextBudgetExceeded;
+            var page = try reader.query_fn(reader.ptr, alloc, source.table_id, filter, offset, @min(limits.page_rows, budget - offset + 1));
+            defer page.deinit(alloc);
+            for (page.rows) |row| {
+                if (seen.contains(row.key)) continue;
+                const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, row.value, .{});
+                if (!try ctx.rowMatches(a, bound, parsed)) continue;
+                const key = try a.dupe(u8, row.key);
+                try seen.put(a, key, {});
+                try matches.append(a, .{ .key = key, .row = parsed });
+                if (source.order_by == null and matches.items.len > source.max_documents) return error.ContextBudgetExceeded;
+            }
+            offset += @intCast(page.rows.len);
+            if (page.exhausted or page.rows.len == 0) break;
+        }
+    }
+    var members = std.ArrayListUnmanaged(ctx.ConsumedInput).empty;
+    if (source.order_by) |order| {
+        ordered.* = true;
+        const Sort = struct {
+            a: Allocator,
+            field: []const u8,
+            desc: bool,
+            fn lt(self: @This(), l: Candidate, r: Candidate) bool {
+                const rv = ctx.resolveFieldPath(r.row, self.field) orelse std.json.Value.null;
+                return ctx.orderCompare(self.a, ctx.resolveFieldPath(l.row, self.field), l.key, rv, r.key, self.desc) == .lt;
+            }
+        };
+        std.mem.sort(Candidate, matches.items, Sort{ .a = a, .field = order.field, .desc = order.descending }, Sort.lt);
+        const full = matches.items.len >= source.max_documents;
+        const kept = matches.items[0..@min(matches.items.len, source.max_documents)];
+        const residual = if (kept.len == 0)
+            try a.dupe(u8, bound.residual)
+        else
+            try ctx.withBoundaryAlloc(a, bound.residual, ctx.resolveFieldPath(kept[kept.len - 1].row, order.field), kept[kept.len - 1].key, full);
+        for (bound.tuples) |t| try tuples.append(a, .{ .spec = bound.spec, .tuple = t, .residual = residual });
+        for (kept) |m| try members.append(a, .{ .key = m.key, .projection = try ctx.projectAlloc(a, m.row, source.fields) });
+    } else {
+        std.mem.sort(Candidate, matches.items, {}, struct {
+            fn lt(_: void, l: Candidate, r: Candidate) bool {
+                return std.mem.lessThan(u8, l.key, r.key);
+            }
+        }.lt);
+        for (matches.items) |m| try members.append(a, .{ .key = m.key, .projection = try ctx.projectAlloc(a, m.row, source.fields) });
+    }
+    return members.items;
+}
+
+/// Bounded breadth-first traversal over direct edges. Every node whose
+/// adjacency was read subscribes to its graph tuple; every reached member
+/// subscribes to its document tuple (so its projection and creation count).
+fn resolveGraph(a: Allocator, alloc: Allocator, reader: Reader, bound: *const ctx.Bound, tuples: *std.ArrayListUnmanaged(ctx.SubscriptionTuple)) ![]ctx.ConsumedInput {
+    const source = bound.source;
+    const g = source.graph;
+    const start = bound.start orelse return &.{};
+    const edges_fn = reader.edges_fn orelse return error.ContextGraphUnavailable;
+    const Visit = struct { key: []const u8, depth: u8, edge_type: []const u8, outgoing: bool };
+    var visited = std.StringArrayHashMapUnmanaged(Visit).empty;
+    try visited.put(a, start, .{ .key = start, .depth = 0, .edge_type = "", .outgoing = true });
+    var frontier = std.ArrayListUnmanaged([]const u8).empty;
+    try frontier.append(a, start);
+    var depth: u8 = 0;
+    while (depth < g.depth and frontier.items.len != 0) : (depth += 1) {
+        var next = std.ArrayListUnmanaged([]const u8).empty;
+        std.mem.sort([]const u8, frontier.items, {}, struct {
+            fn lt(_: void, l: []const u8, r: []const u8) bool {
+                return std.mem.lessThan(u8, l, r);
+            }
+        }.lt);
+        for (frontier.items) |node| {
+            if (source.isLive()) try tuples.append(a, .{ .spec = bound.spec, .tuple = ctx.graphTuple(bound.spec, node) });
+            const edges = try edges_fn(reader.ptr, alloc, source.table_id, g.graph_index, node, g.edge_types, g.direction, g.max_fanout + 1);
+            defer freeEdges(alloc, edges);
+            if (edges.len > g.max_fanout) return error.ContextBudgetExceeded;
+            for (edges) |edge| {
+                if (visited.contains(edge.neighbor)) continue;
+                const key = try a.dupe(u8, edge.neighbor);
+                try visited.put(a, key, .{ .key = key, .depth = depth + 1, .edge_type = try a.dupe(u8, edge.edge_type), .outgoing = edge.outgoing });
+                try next.append(a, key);
+                if (visited.count() - 1 > source.max_documents) return error.ContextBudgetExceeded;
+            }
+        }
+        frontier = next;
+    }
+    var members = std.ArrayListUnmanaged(ctx.ConsumedInput).empty;
+    var order = std.ArrayListUnmanaged(Visit).empty;
+    for (visited.values()[1..]) |v| try order.append(a, v);
+    std.mem.sort(Visit, order.items, {}, struct {
+        fn lt(_: void, l: Visit, r: Visit) bool {
+            if (l.depth != r.depth) return l.depth < r.depth;
+            return std.mem.lessThan(u8, l.key, r.key);
+        }
+    }.lt);
+    for (order.items) |v| {
+        if (source.isLive()) try tuples.append(a, .{ .spec = bound.spec, .tuple = ctx.documentTuple(bound.spec, v.key) });
+        const raw = try reader.lookup_fn(reader.ptr, a, source.table_id, v.key);
+        const projection = if (raw) |doc| try ctx.projectAlloc(a, try std.json.parseFromSliceLeaky(std.json.Value, a, doc, .{}), source.fields) else "null";
+        var extra = std.ArrayListUnmanaged(u8).empty;
+        try extra.print(a, "\"depth\":{d},\"edge_type\":", .{v.depth});
+        try ctx.appendJsonString(a, &extra, v.edge_type);
+        try extra.appendSlice(a, if (v.outgoing) ",\"direction\":\"out\"" else ",\"direction\":\"in\"");
+        try members.append(a, .{ .key = v.key, .projection = projection, .extra = extra.items });
+    }
+    return members.items;
+}
+
+/// Ranked snapshot retrieval in rank order.
+fn resolveSearch(a: Allocator, alloc: Allocator, reader: Reader, bound: *const ctx.Bound) ![]ctx.ConsumedInput {
+    const source = bound.source;
+    if (bound.unsatisfiable) return &.{};
+    const search_fn = reader.search_fn orelse return error.ContextSearchUnavailable;
+    const s = source.search;
+    var page = try search_fn(reader.ptr, alloc, source.table_id, .{ .text = bound.search_text, .text_field = s.text_field, .vector = bound.query_vector, .vector_index = s.vector_index, .k = s.k });
+    defer page.deinit(alloc);
+    var members = std.ArrayListUnmanaged(ctx.ConsumedInput).empty;
+    for (page.rows[0..@min(page.rows.len, s.k)], 0..) |row, rank| {
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, row.value, .{});
+        try members.append(a, .{ .key = try a.dupe(u8, row.key), .projection = try ctx.projectAlloc(a, parsed, source.fields), .extra = try std.fmt.allocPrint(a, "\"rank\":{d}", .{rank + 1}) });
+    }
+    return members.items;
 }
 
 // ---------------------------------------------------------------------------
@@ -295,7 +491,55 @@ pub const MemoryTables = struct {
     }
 
     pub fn reader(self: *MemoryTables, own: []const u8) Reader {
-        return .{ .ptr = self, .own_table_id = own, .lookup_fn = lookup, .query_fn = query, .frontier_fn = frontier };
+        return .{ .ptr = self, .own_table_id = own, .lookup_fn = lookup, .query_fn = query, .frontier_fn = frontier, .edges_fn = edges, .search_fn = search };
+    }
+
+    /// Edges are rows of table "edges:<graph_index>" keyed "<source>|<type>|<target>".
+    fn edges(p: *anyopaque, alloc: Allocator, _: []const u8, graph_index: []const u8, node: []const u8, types: []const []const u8, direction: ctx.GraphSpec.Direction, limit: u32) anyerror![]Edge {
+        const self: *MemoryTables = @ptrCast(@alignCast(p));
+        var name_buf: [128]u8 = undefined;
+        const table = try std.fmt.bufPrint(&name_buf, "edges:{s}", .{graph_index});
+        var out = std.ArrayListUnmanaged(Edge).empty;
+        errdefer {
+            for (out.items) |e| {
+                alloc.free(e.edge_type);
+                alloc.free(e.neighbor);
+            }
+            out.deinit(alloc);
+        }
+        const rows = self.rowsFor(table) orelse return out.toOwnedSlice(alloc);
+        for (rows.items) |row| {
+            var parts = std.mem.splitScalar(u8, row.key, '|');
+            const src = parts.next().?;
+            const typ = parts.next().?;
+            const dst = parts.next().?;
+            if (types.len != 0) {
+                var ok = false;
+                for (types) |t| if (std.mem.eql(u8, t, typ)) {
+                    ok = true;
+                };
+                if (!ok) continue;
+            }
+            const out_match = direction != .in and std.mem.eql(u8, src, node);
+            const in_match = direction != .out and std.mem.eql(u8, dst, node);
+            if (!out_match and !in_match) continue;
+            if (out.items.len >= limit) break;
+            try out.append(alloc, .{ .edge_type = try alloc.dupe(u8, typ), .neighbor = try alloc.dupe(u8, if (out_match) dst else src), .outgoing = out_match });
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// Toy relevance: rows whose text field contains the query, by key.
+    fn search(p: *anyopaque, alloc: Allocator, table_id: []const u8, q: SearchQuery) anyerror!Page {
+        const self: *MemoryTables = @ptrCast(@alignCast(p));
+        var out = std.ArrayListUnmanaged(Row).empty;
+        errdefer out.deinit(alloc);
+        const rows = self.rowsFor(if (table_id.len == 0) "own" else table_id) orelse return .{ .rows = &.{}, .exhausted = true };
+        for (rows.items) |row| {
+            if (q.text.len != 0 and std.mem.indexOf(u8, row.value, q.text) == null) continue;
+            try out.append(alloc, .{ .key = try alloc.dupe(u8, row.key), .value = try alloc.dupe(u8, row.value) });
+        }
+        return .{ .rows = try out.toOwnedSlice(alloc), .exhausted = true };
     }
 
     fn rowsFor(self: *MemoryTables, table_id: []const u8) ?*std.ArrayListUnmanaged(Row) {
@@ -428,7 +672,55 @@ test "prefilter pushes down only string conjuncts" {
     const filter = try prefilterJsonAlloc(alloc, &bindings.items[0]);
     defer alloc.free(filter);
     try testing.expectEqualStrings(
-        "{\"conjuncts\":[{\"disjuncts\":[{\"match\":\"en\",\"field\":\"locale\",\"operator\":\"and\"},{\"match\":\"fr\",\"field\":\"locale\",\"operator\":\"and\"}]},{\"match\":\"o\",\"field\":\"org\",\"operator\":\"and\"}]}",
+        "{\"bool\":{\"filter\":[{\"bool\":{\"should\":[{\"match\":{\"field\":\"locale\",\"text\":\"en\"}},{\"match\":{\"field\":\"locale\",\"text\":\"fr\"}}]}},{\"match\":{\"field\":\"org\",\"text\":\"o\"}}]}}",
         filter,
     );
+}
+
+test "ordered top-N, graph traversal, and snapshot search resolve with exact subscriptions" {
+    const alloc = testing.allocator;
+    var tables = MemoryTables{ .alloc = alloc };
+    defer tables.deinit();
+    for ([_][2][]const u8{ .{ "n1", "{\"org\":\"o\",\"at\":1,\"title\":\"a\"}" }, .{ "n2", "{\"org\":\"o\",\"at\":3,\"title\":\"b solar\"}" }, .{ "n3", "{\"org\":\"o\",\"at\":2,\"title\":\"c solar\"}" }, .{ "n4", "{\"org\":\"x\",\"at\":9,\"title\":\"d\"}" } }) |r| try tables.put("own", r[0], r[1]);
+    try tables.put("edges:refs", "dep|cites|n1", "{}");
+    try tables.put("edges:refs", "n1|cites|n2", "{}");
+    try tables.put("edges:refs", "n1|mentions|n3", "{}");
+    var config = try ctx.parsePublicJson(alloc,
+        \\{"latest":{"query":{"filter_query":{"field":"org","term":{"$source":"/org"}},"order_by":{"field":"at","order":"desc"}},"fields":["title"],"max_documents":2},
+        \\ "cites":{"graph":{"graph_index":"refs","edge_types":["cites"],"depth":2},"fields":["title"],"max_documents":10},
+        \\ "solar":{"search":{"text":"solar","text_field":"title","k":5},"fields":["title"],"tracking":"snapshot"}}
+    , "");
+    defer config.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var bindings = try ctx.bindForKeyAlloc(alloc, &config, "dep", try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"org\":\"o\"}", .{}));
+    defer bindings.deinit();
+    var r = try resolveAlloc(alloc, tables.reader(""), &bindings, .{});
+    defer r.deinit(alloc);
+    try testing.expectEqualStrings(
+        "{\"cites\":{\"count\":2,\"members\":[{\"key\":\"n1\",\"depth\":1,\"edge_type\":\"cites\",\"direction\":\"out\",\"value\":{\"title\":\"a\"}},{\"key\":\"n2\",\"depth\":2,\"edge_type\":\"cites\",\"direction\":\"out\",\"value\":{\"title\":\"b solar\"}}]}," ++
+            "\"latest\":{\"count\":2,\"members\":[{\"key\":\"n2\",\"value\":{\"title\":\"b solar\"}},{\"key\":\"n3\",\"value\":{\"title\":\"c solar\"}}]}," ++
+            "\"solar\":{\"count\":2,\"members\":[{\"key\":\"n2\",\"rank\":1,\"value\":{\"title\":\"b solar\"}},{\"key\":\"n3\",\"rank\":2,\"value\":{\"title\":\"c solar\"}}],\"tracking\":\"snapshot\"}}",
+        r.rendered.json,
+    );
+    try testing.expect(r.snapshot);
+    // Graph: adjacency of dep and n1, document tuples of n1 and n2; ordered:
+    // one equality tuple carrying the recorded boundary.
+    const cites = &bindings.items[0];
+    var graph_tuples: usize = 0;
+    var boundary_recorded = false;
+    for (r.tuples) |t| {
+        if (std.mem.eql(u8, &t.spec, &cites.spec)) graph_tuples += 1;
+        if (std.mem.indexOf(u8, t.residual, "\"b\":{\"full\":true,\"k\":\"n3\"") != null) boundary_recorded = true;
+    }
+    try testing.expectEqual(@as(usize, 4), graph_tuples);
+    try testing.expect(boundary_recorded);
+    // Fan-out beyond the declared bound fails explicitly.
+    var tight = try ctx.parsePublicJson(alloc,
+        \\{"g":{"graph":{"graph_index":"refs","depth":2,"max_fanout":1},"fields":["title"]}}
+    , "");
+    defer tight.deinit();
+    var tight_bindings = try ctx.bindForKeyAlloc(alloc, &tight, "dep", try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{}", .{}));
+    defer tight_bindings.deinit();
+    try testing.expectError(error.ContextBudgetExceeded, resolveAlloc(alloc, tables.reader(""), &tight_bindings, .{}));
 }

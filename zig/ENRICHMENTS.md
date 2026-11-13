@@ -571,6 +571,52 @@ Code map (`zig/pkg/antfly-embedded/src/storage/db/`):
 - `context_dependency_db.zig`, `context_source_db_reader.zig`: DB glue.
 - `capi/context_dependencies.zig`: multi-table Lite host and C ABI.
 
+### Which queries can be tracked live
+
+A predicate is admitted for live tracking only when a single row's
+membership can be decided from that row alone, so a changed row's previous
+and next values determine exactly which dependents change:
+
+| Source | Live | Mechanism |
+| --- | --- | --- |
+| `term`, `terms` | yes | equality values form the indexed subscription tuple |
+| `range`, `prefix` | yes | residual per-row test |
+| `match` (filter mode) | yes | residual test with the pinned `antfly.context.simple.v1` analyzer (part of the source identity) |
+| `similar` (threshold) | yes | residual cosine/dot test against a vector stored in a document field; `model` names the embedding space and is part of the source identity |
+| `order_by` top-N | yes | relevant only if the row ranks at or above the recorded boundary (ties by key) |
+| `graph`, depth 1-3 | yes | adjacency tuple per visited node plus document tuple per member; only explicitly written edges are traversed |
+| scored full-text, nearest-k, hybrid, reranked | snapshot only | membership is relative to the corpus |
+
+Equality conjuncts build the tuple a dependent subscribes to. Every other
+conjunct is *residual*: the dependent's resolved parameters (range bounds,
+prefix, query tokens, query vector, top-N boundary) are stored as the value of
+its subscription row. Source tables ship the row's previous and next
+projection of the relevant fields with each notice, and the dependent side
+evaluates both against each subscriber, so a change entirely outside one
+dependent's window, below its top-N boundary, or under its similarity
+threshold invalidates nothing. Sources without equality conjuncts share one
+spec-wide tuple, which fans out to every dependent of the declaration and is
+filtered per subscriber. Residual and ordered queries scan at most
+`max_candidates` rows after equality filtering (or the whole table when no
+full-text index serves the prefilter) and fail explicitly beyond it.
+
+Graph traversal discovers its subscriptions while reading. The runtime
+registers the bound tuples, reads, registers what the traversal discovered,
+re-reads, and publishes only if both reads render identically; afterwards
+every change finds a registration and advances the fenced generation.
+Field-derived and artifact-derived edges change through document writes or
+enrichment output that adjacency notices do not observe, and generated edges
+would create producer feedback, so live context never traverses them.
+Admission also rejects a context source reading a table that this table's
+resolvers promote into from the enrichment's own output (directly or through
+downstream artifacts).
+
+`tracking: snapshot` sources (required for `search`, optional for any other
+kind) register no subscriptions. Their dependents publish with freshness
+`unverified` and `validated_at_ms`, rebuild on `refresh_interval` through the
+due-ordered refresh queue or manually, and keep full lineage, so audit and
+impact analysis still work.
+
 ### Indexed invalidation
 
 A dependent subscribes to the digests of its bound predicate tuples
@@ -654,7 +700,7 @@ not a decision explanation.
 
 | Runtime | Context sources |
 | --- | --- |
-| Embedded single DB | own-table document and query sources |
+| Embedded single DB | own-table document, query (all live predicates, top-N), graph, and snapshot sources |
 | Embedded Lite (multi-table) | cross-table sources, `lite:<id>` identities, persisted inbound topology, C ABI inspection/impact/refresh |
 | Ordered (replicated serverless) publication | rejected explicitly at runtime |
 | Distributed server tables | rejected explicitly at admission |
@@ -674,6 +720,12 @@ not a decision explanation.
   table's context) and graph selectors (#1635).
 - Fan-out benchmarks (invalidation latency, rebuild latency, producer calls,
   subscription storage, bulk-update work).
+- Similarity over enrichment-generated embeddings (today `similar` reads
+  vectors stored in document fields) and live traversal of generated edges;
+  both need the upstream artifact's freshness as an input plus cycle checks.
+- Range-aware subscription indexes: residual predicates without equality
+  conjuncts currently fan out to every dependent of the declaration and are
+  filtered per subscriber.
 
 ## Full-Text Routing From Enrichments
 

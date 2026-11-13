@@ -2684,6 +2684,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 sequence,
                 effective_req.writes,
                 effective_req.deletes,
+                effective_req.graph_writes,
+                effective_req.graph_deletes,
                 &write_buffers.store_writes,
                 &owned_child_range_outbox_keys,
                 &owned_child_range_outbox_values,

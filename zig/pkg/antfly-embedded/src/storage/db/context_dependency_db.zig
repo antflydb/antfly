@@ -103,6 +103,8 @@ pub fn stageForBatch(
     sequence: u64,
     writes: []const types.BatchWrite,
     deletes: []const []const u8,
+    graph_writes: []const types.GraphEdgeWrite,
+    graph_deletes: []const types.GraphEdgeDelete,
     store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
     owned_keys: *std.ArrayListUnmanaged([]u8),
     owned_values: *std.ArrayListUnmanaged([]u8),
@@ -110,7 +112,7 @@ pub fn stageForBatch(
     owned_delete_keys: *std.ArrayListUnmanaged([]u8),
 ) !void {
     if (!manager.hasContextDependents()) return;
-    if (writes.len == 0 and deletes.len == 0) return;
+    if (writes.len == 0 and deletes.len == 0 and graph_writes.len == 0 and graph_deletes.len == 0) return;
     const declared = try manager.contextDeclarationsAlloc(alloc);
     defer alloc.free(declared);
     var specs = try notices.buildSourceSpecs(alloc, manager.context_table_id, declared);
@@ -128,7 +130,11 @@ pub fn stageForBatch(
         for (writes) |w| if (isUserDocumentKey(w.key)) try changes.append(alloc, .{ .key = w.key, .next = w.value });
         for (deletes) |k| if (isUserDocumentKey(k)) try changes.append(alloc, .{ .key = k, .next = null });
         const complete = try shadowsComplete(alloc, reader, specs.fields_digest);
-        _ = try notices.planStageNotices(alloc, reader, &plan, &specs, manager.context_table_id, sequence, 0, changes.items, complete);
+        const staged = try notices.planStageNotices(alloc, reader, &plan, &specs, manager.context_table_id, sequence, 0, changes.items, complete);
+        var edges = std.ArrayListUnmanaged(notices.EdgeChange).empty;
+        defer edges.deinit(alloc);
+        inline for (.{ graph_writes, graph_deletes }) |list| for (list) |e| try edges.append(alloc, .{ .graph_index = e.index_name, .source = e.source, .target = e.target, .edge_type = e.edge_type });
+        _ = try notices.planStageEdgeNotices(alloc, &plan, &specs, manager.context_table_id, sequence, staged.next_ordinal, edges.items);
     }
     // A deleted dependent retires its live subscriptions and lineage.
     if (manager.hasAssetContextSources()) {
@@ -223,6 +229,40 @@ fn appendRef(alloc: Allocator, refs: *std.ArrayListUnmanaged(enrichment_types.Ge
     try refs.append(alloc, ref);
 }
 
+/// Parses dependents' declarations once per apply call to evaluate residual
+/// notices against each subscriber's parameters.
+fn SourceCache(comptime Manager: type) type {
+    return struct {
+        alloc: Allocator,
+        manager: Manager,
+        configs: std.StringHashMapUnmanaged(ctx.Config) = .empty,
+
+        fn deinit(self: *@This()) void {
+            var it = self.configs.valueIterator();
+            while (it.next()) |c| c.deinit();
+            self.configs.deinit(self.alloc);
+        }
+
+        fn sources(self: *@This()) notices.SourceLookup {
+            return .{ .ptr = self, .lookup_fn = lookupFn };
+        }
+
+        fn lookupFn(p: *anyopaque, artifact: []const u8, spec: ctx.Digest) ?*const ctx.Source {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            if (self.configs.getPtr(artifact)) |c| return c.findSpec(spec);
+            const entry = self.manager.getEnrichment(.asset, artifact) orelse return null;
+            if (entry.context_sources_json.len == 0) return null;
+            const config = ctx.parseStoredJson(self.alloc, entry.context_sources_json) catch return null;
+            self.configs.put(self.alloc, entry.name, config) catch {
+                var c = config;
+                c.deinit();
+                return null;
+            };
+            return self.configs.getPtr(artifact).?.findSpec(spec);
+        }
+    };
+}
+
 /// Apply encoded notices against this DB's subscriptions in one batch and
 /// return the rebuilds to journal. Remaining fan-out is re-staged in this
 /// DB's outbox as a continuation (bounded work per call).
@@ -250,10 +290,12 @@ pub fn applyNotices(
         refs.deinit(alloc);
     }
     var summary = ApplySummary{};
+    var lookup = SourceCache(@TypeOf(manager)){ .alloc = alloc, .manager = manager };
+    defer lookup.deinit();
     for (encoded, 0..) |raw, i| {
         var decoded = try notices.decodeNoticeAlloc(alloc, raw);
         defer decoded.deinit();
-        var applied = try notices.planApplyNotice(alloc, reader, &plan, decoded.notice, now_ms, range_lower, range_upper, notices.default_fanout_page);
+        var applied = try notices.planApplyNoticeWithSources(alloc, reader, &plan, decoded.notice, now_ms, range_lower, range_upper, notices.default_fanout_page, lookup.sources());
         defer applied.deinit(alloc);
         summary.invalidated += applied.rebuild.items.len + applied.debounced + applied.stale_only;
         summary.debounced += applied.debounced;

@@ -17816,7 +17816,7 @@ fn captureContextSources(
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
     const config_digest = config.digest();
-    var bindings = enrichment_context_sources.bindAlloc(alloc, &config, parsed.value) catch |err| switch (err) {
+    var bindings = enrichment_context_sources.bindForKeyAlloc(alloc, &config, request.doc_key, parsed.value) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.ContextBudgetExceeded, error.InvalidContextBinding => {
             try recordContextFailure(runtime, request, artifact_name, null, &.{}, config_digest, @errorName(err));
@@ -17826,24 +17826,65 @@ fn captureContextSources(
         else => return err,
     };
     defer bindings.deinit();
-    const tuples = try bindings.allTuplesAlloc(alloc);
-    var tuples_owned = true;
-    defer if (tuples_owned) alloc.free(tuples);
-    const capture = try registerContextDependencies(runtime, request.doc_key, artifact_name, tuples, config_digest);
+    var tuples = try bindings.allTuplesAlloc(alloc);
+    defer alloc.free(tuples);
+    var capture = try registerContextDependencies(runtime, request.doc_key, artifact_name, tuples, config_digest);
     const reader = runtime.config.context_source_reader orelse return error.ContextSourceTableUnavailable;
-    var resolution = context_resolution.resolveAlloc(alloc, reader, &bindings, .{}) catch |err| switch (err) {
-        error.ContextBudgetExceeded, error.RequiredContextMissing, error.InvalidContextBinding => {
-            try recordContextFailure(runtime, request, artifact_name, capture, tuples, config_digest, @errorName(err));
-            try recordIsolatedRequestErrorNamed(runtime, window, request, @errorName(err), scope.attemptNumber(runtime));
-            return null;
-        },
-        else => return err,
-    };
-    errdefer resolution.deinit(alloc);
-    const publish = try alloc.create(ContextPublish);
-    publish.* = .{ .resolution = resolution, .capture = capture, .tuples = tuples };
-    tuples_owned = false;
-    return publish;
+    // Traversal discovers subscriptions only while reading (graph nodes and
+    // members, top-N boundaries). Register what was discovered, then re-read
+    // and require an identical result: any change between the first read
+    // and that registration is visible to the validating read, and any later
+    // change finds the registration and advances the fenced generation.
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        var resolution = context_resolution.resolveAlloc(alloc, reader, &bindings, .{}) catch |err| switch (err) {
+            error.ContextBudgetExceeded, error.RequiredContextMissing, error.InvalidContextBinding, error.ContextGraphUnavailable, error.ContextSearchUnavailable => {
+                try recordContextFailure(runtime, request, artifact_name, capture, tuples, config_digest, @errorName(err));
+                try recordIsolatedRequestErrorNamed(runtime, window, request, @errorName(err), scope.attemptNumber(runtime));
+                return null;
+            },
+            else => return err,
+        };
+        var resolution_owned = true;
+        defer if (resolution_owned) resolution.deinit(alloc);
+        if (!contextTuplesCovered(tuples, resolution.tuples)) {
+            if (attempt >= 3) return error.ContextSourceUnstable;
+            const merged = try mergeContextTuplesAlloc(alloc, tuples, resolution.tuples);
+            alloc.free(tuples);
+            tuples = merged;
+            capture = try registerContextDependencies(runtime, request.doc_key, artifact_name, tuples, config_digest);
+            var validation = context_resolution.resolveAlloc(alloc, reader, &bindings, .{}) catch |err| switch (err) {
+                error.ContextBudgetExceeded, error.RequiredContextMissing, error.InvalidContextBinding => continue,
+                else => return err,
+            };
+            defer validation.deinit(alloc);
+            if (!std.mem.eql(u8, &validation.rendered.fingerprint, &resolution.rendered.fingerprint)) continue;
+        }
+        const publish = try alloc.create(ContextPublish);
+        errdefer alloc.destroy(publish);
+        const final_tuples = try alloc.dupe(enrichment_context_sources.SubscriptionTuple, resolution.tuples);
+        publish.* = .{ .resolution = resolution, .capture = capture, .tuples = final_tuples };
+        resolution_owned = false;
+        return publish;
+    }
+}
+
+fn contextTuplesCovered(registered: []const enrichment_context_sources.SubscriptionTuple, needed: []const enrichment_context_sources.SubscriptionTuple) bool {
+    outer: for (needed) |n| {
+        for (registered) |r| if (r.eql(n)) continue :outer;
+        return false;
+    }
+    return true;
+}
+
+fn mergeContextTuplesAlloc(alloc: Allocator, a: []const enrichment_context_sources.SubscriptionTuple, b: []const enrichment_context_sources.SubscriptionTuple) ![]enrichment_context_sources.SubscriptionTuple {
+    var list = std.ArrayListUnmanaged(enrichment_context_sources.SubscriptionTuple).empty;
+    errdefer list.deinit(alloc);
+    // Registration-time values are the permissive (pre-boundary) residuals.
+    try list.appendSlice(alloc, a);
+    try list.appendSlice(alloc, b);
+    enrichment_context_sources.sortUniqueTuples(&list);
+    return list.toOwnedSlice(alloc);
 }
 
 /// Plan against, and commit through, a fenced runtime write batch.
@@ -17924,6 +17965,8 @@ fn applyContextPublishTxn(runtime: *EnrichmentRuntime, batch: anytype, doc_key: 
         .queries = resolution.queries,
         .absent = resolution.absent,
         .new_version = dependency.new_version,
+        .snapshot = resolution.snapshot,
+        .refresh_due_ms = if (resolution.refresh_interval_ms == 0) 0 else @as(u64, @intCast(@divTrunc(runtime.clock.nowRealtimeNs(), std.time.ns_per_ms))) +| resolution.refresh_interval_ms,
     }) catch |err| switch (err) {
         error.DependencyGenerationSuperseded => return error.EnrichmentSourceChanged,
         else => return err,

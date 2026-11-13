@@ -153669,6 +153669,7 @@ test "db context sources invalidate and rebuild dependents on consumed input cha
     // Both retained versions consumed org:1 (different revisions).
     var impact = try db.contextImpact(alloc, "", "org:1", null, "", 16);
     defer impact.deinit(alloc);
+
     try std.testing.expectEqual(@as(usize, 2), impact.rows.items.len);
     const v1 = (try db.contextDependencyManifest(alloc, "doc:a", "summary", 1)).?;
     defer alloc.free(v1);
@@ -153696,4 +153697,98 @@ test "db context sources invalidate and rebuild dependents on consumed input cha
     try db.batch(.{ .deletes = &.{"doc:b"}, .sync_level = .write });
     try std.testing.expect((try db.contextDependencyState(alloc, "doc:b", "summary")) == null);
     try std.testing.expect((try db.contextDependencyManifest(alloc, "doc:b", "summary", 1)) == null);
+}
+
+fn contextSourcesTestFreshness(db: *DB, alloc: Allocator, doc: []const u8) !context_dependency_store.Freshness {
+    var state = (try db.contextDependencyState(alloc, doc, "summary")).?;
+    defer state.deinit(alloc);
+    return state.freshness;
+}
+
+test "db context sources track residual ranges per subscriber and direct graph adjacency" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("context-sources-residual-graph");
+    defer tmp.cleanup();
+    var producer = GateAssetProducer{};
+    producer.allowAll();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "refs", .kind = .graph, .config_json = "{}" });
+    const declaration = try contextSourcesTestDeclarationAlloc(alloc,
+        \\{"recent":{"query":{"filter_query":{"conjuncts":[{"field":"org","term":{"$source":"/org"}},{"field":"at","range":{"gte":{"$source":"/since"}}}]}},"fields":["title"],"max_documents":10},
+        \\ "cites":{"graph":{"graph_index":"refs","edge_types":["cites"],"depth":1},"fields":["title"],"max_documents":10}}
+    );
+    defer alloc.free(declaration);
+    try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .context_sources_json = declaration });
+    var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
+    try db.initOptionalEnrichmentRuntime(&config);
+    _ = try db.advanceContextShadowBackfill(64);
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "n:1", .value = "{\"org\":\"o1\",\"at\":20,\"title\":\"fresh\"}" },
+        .{ .key = "n:2", .value = "{\"org\":\"o1\",\"at\":5,\"title\":\"old\"}" },
+        .{ .key = "doc:a", .value = "{\"body\":\"hello\",\"org\":\"o1\",\"since\":10}" },
+    }, .sync_level = .write });
+    try contextSourcesTestCatchUp(&db);
+    try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    const baseline = producer.successful_requests.load(.acquire);
+
+    // Same tuple, relevant field changed, but outside this subscriber's
+    // window before and after: no invalidation.
+    try db.batch(.{ .writes = &.{.{ .key = "n:2", .value = "{\"org\":\"o1\",\"at\":6,\"title\":\"old\"}" }}, .sync_level = .write });
+    try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    // Entering the window invalidates.
+    try db.batch(.{ .writes = &.{.{ .key = "n:2", .value = "{\"org\":\"o1\",\"at\":15,\"title\":\"old\"}" }}, .sync_level = .write });
+    try std.testing.expectEqual(context_dependency_store.Freshness.stale, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    try contextSourcesTestCatchUp(&db);
+    try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    try std.testing.expect(producer.successful_requests.load(.acquire) > baseline);
+
+    // A direct edge from the dependent invalidates through its adjacency.
+    try db.batch(.{ .graph_writes = &.{.{ .index_name = "refs", .source = "doc:a", .target = "n:1", .edge_type = "cites" }}, .sync_level = .write });
+    {
+        var state = (try db.contextDependencyState(alloc, "doc:a", "summary")).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(context_dependency_store.Freshness.stale, state.freshness);
+        try std.testing.expectEqual(@import("enrichment/context_sources.zig").ChangeKind.edge_changed, state.reasons[0].change);
+    }
+    try contextSourcesTestCatchUp(&db);
+    try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    // The reached neighbor's projected field now matters too.
+    try db.batch(.{ .writes = &.{.{ .key = "n:1", .value = "{\"org\":\"o2\",\"at\":1,\"title\":\"renamed\"}" }}, .sync_level = .write });
+    try std.testing.expectEqual(context_dependency_store.Freshness.stale, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+    // An edge of an unrelated type changes nothing.
+    try contextSourcesTestCatchUp(&db);
+    try db.batch(.{ .graph_writes = &.{.{ .index_name = "refs", .source = "doc:a", .target = "n:2", .edge_type = "mentions" }}, .sync_level = .write });
+    try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+}
+
+test "db context sources publish snapshot context as unverified with scheduled refresh" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("context-sources-snapshot");
+    defer tmp.cleanup();
+    var producer = GateAssetProducer{};
+    producer.allowAll();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const declaration = try contextSourcesTestDeclarationAlloc(alloc,
+        \\{"peers":{"query":{"filter_query":{"field":"org","term":{"$source":"/org"}},"order_by":{"field":"at","order":"desc"}},"fields":["title"],"max_documents":1,"tracking":"snapshot","refresh_interval":"1h"}}
+    );
+    defer alloc.free(declaration);
+    try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .context_sources_json = declaration });
+    var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
+    try db.initOptionalEnrichmentRuntime(&config);
+    try db.batch(.{ .writes = &.{
+        .{ .key = "p:1", .value = "{\"org\":\"o\",\"at\":1,\"title\":\"x\"}" },
+        .{ .key = "doc:a", .value = "{\"body\":\"hello\",\"org\":\"o\"}" },
+    }, .sync_level = .write });
+    try contextSourcesTestCatchUp(&db);
+    var state = (try db.contextDependencyState(alloc, "doc:a", "summary")).?;
+    defer state.deinit(alloc);
+    try std.testing.expectEqual(context_dependency_store.Freshness.unverified, state.freshness);
+    try std.testing.expect(state.validated_at_ms != 0);
+    try std.testing.expectEqual(@as(usize, 0), state.tuples.len);
+    // Snapshot sources are never invalidated by row changes.
+    try db.batch(.{ .writes = &.{.{ .key = "p:2", .value = "{\"org\":\"o\",\"at\":9,\"title\":\"y\"}" }}, .sync_level = .write });
+    try std.testing.expectEqual(context_dependency_store.Freshness.unverified, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
 }
