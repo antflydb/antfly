@@ -7062,6 +7062,33 @@ pub const NativeFile = struct {
         for (staged_pages) |p| {
             try self.file.writePositionalAll(io, p.bytes, p.page_id * @as(u64, self.header.page_size));
         }
+        // §9.7c (ReadView): `self.header.checkpoints[active].page_count`
+        // still reflects the *last already-published* checkpoint here --
+        // the commit that triggered this fold (log-full, mid-`publishCheckpoint`)
+        // may itself have allocated fresh pages past that (a large
+        // external value's own extent tree, via that commit's own
+        // `TransactionWrites.pages`, seeded from `page_count` as it stood
+        // *before* this fold ever ran) whose `next`/`checkpoint` was never
+        // published, since the log-full branch runs before that
+        // publication step. Without this, `validateDocumentMutation`/
+        // `validateCatalogMutation`'s own bounds check
+        // (`external_value_root_page >= self.activeCheckpoint().page_count`)
+        // sees a reference to one of the pages just flushed above as
+        // out-of-range and fails with `error.InvalidNativeValueChain` --
+        // and, independent of that check, a fresh `PageAllocator` this
+        // fold's own `transactionWrites()` is about to construct (seeded
+        // from the same stale `page_count`) would start handing out page
+        // ids that collide with the ones just flushed. Advance it to
+        // cover every flushed page before anything below references or
+        // allocates past it.
+        if (staged_pages.len != 0) {
+            var max_staged_page: u64 = 0;
+            for (staged_pages) |p| max_staged_page = @max(max_staged_page, p.page_id);
+            const required = max_staged_page + 1;
+            if (required > self.header.checkpoints[self.header.active_checkpoint].page_count) {
+                self.header.checkpoints[self.header.active_checkpoint].page_count = required;
+            }
+        }
         // §9 (redo + indexed reclamation): every page just flushed was
         // allocated and written by an earlier *diverting* commit
         // (`pageAllocatorForDivertingCommit`'s own doc comment -- "the
