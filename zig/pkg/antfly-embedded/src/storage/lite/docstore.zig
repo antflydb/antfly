@@ -6054,7 +6054,11 @@ pub const Cursor = struct {
     fn ensureRedoOverlay(self: *Cursor) !*native.NativeFile.OverlayScanState {
         if (self.redo_overlay == null) {
             const file = try self.txn.readFile();
-            self.redo_overlay = try native.NativeFile.OverlayScanState.initForPrefix(self.txn.allocator, file, .documents, self.txn.checkpoint, self.txn.prefix);
+            // `initForPrefixUnchecked`, not `initForPrefix`: `self.txn.checkpoint`
+            // (`ReadGeneration.checkpoint`) is not comparable to `file.activeCheckpoint()`
+            // the way `initForPrefix`'s own gate requires -- see that
+            // function's own doc comment.
+            self.redo_overlay = try native.NativeFile.OverlayScanState.initForPrefixUnchecked(self.txn.allocator, file, .documents, self.txn.prefix);
         }
         return &self.redo_overlay.?;
     }
@@ -9989,6 +9993,136 @@ test "lite packed document cursors read each physical bundle once per scan" {
     try std.testing.expectEqualStrings("key-00001000", (try cursor.seekAtOrAfter("key-00001000")).key);
     try std.testing.expectEqualStrings("key-00000999", (try cursor.prev()).key);
     try std.testing.expectEqualStrings("key-00001000", (try cursor.next()).key);
+}
+
+// Regression: `Txn.openCursor()`'s `Cursor` used to merge only
+// `pending_tree` (a write transaction's own in-flight, uncommitted
+// writes), never `NativeFile`'s redo-log overlay -- a commit logged but
+// not yet folded by `checkpointRedoLog` was invisible to every cursor
+// scan, even though it was visible to an ordinary point `get()`. Exercises
+// the fixed three-way merge (`pending_tree` over the overlay over the
+// B-tree) directly at the `docstore.Cursor` level: puts, an overwrite and
+// a delete all land in the overlay (no checkpoint in between for most of
+// them), straddling a checkpoint boundary partway through, scanned both
+// forward and backward.
+test "lite docstore cursor merges the redo overlay across put, overwrite, delete and a checkpoint boundary" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "cursor-redo-overlay.aflite");
+    defer alloc.free(path);
+    var store = try Store.createWithOptions(alloc, path, .{ .use_redo_log = true, .io = std.testing.io, .reclamation = .{ .page_reuse = false } });
+    defer store.close();
+
+    // alpha/beta/gamma land through the redo overlay -- no checkpoint yet.
+    {
+        var write = try store.beginWrite();
+        try write.put("alpha", "one");
+        try write.commit();
+    }
+    {
+        var write = try store.beginWrite();
+        try write.put("beta", "two");
+        try write.commit();
+    }
+    {
+        var write = try store.beginWrite();
+        try write.put("gamma", "three");
+        try write.commit();
+    }
+
+    const Expect = struct { key: []const u8, value: []const u8 };
+    const checkCursorSees = struct {
+        fn run(s: *Store, expected: []const Expect) !void {
+            std.debug.assert(expected.len > 0);
+            var read = try s.beginRead();
+            defer read.abort();
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            var i: usize = 0;
+            var entry = try cursor.first();
+            while (true) {
+                try std.testing.expect(i < expected.len);
+                try std.testing.expectEqualStrings(expected[i].key, entry.key);
+                try std.testing.expectEqualStrings(expected[i].value, entry.value);
+                i += 1;
+                entry = cursor.next() catch break;
+            }
+            try std.testing.expectEqual(expected.len, i);
+            // Same contract, walked backward from `last()`.
+            var j = expected.len;
+            var back = try cursor.last();
+            while (true) {
+                j -= 1;
+                try std.testing.expectEqualStrings(expected[j].key, back.key);
+                try std.testing.expectEqualStrings(expected[j].value, back.value);
+                if (j == 0) break;
+                back = try cursor.prev();
+            }
+            try std.testing.expectError(error.NotFound, cursor.prev());
+        }
+    }.run;
+
+    try checkCursorSees(&store, &.{
+        .{ .key = "alpha", .value = "one" },
+        .{ .key = "beta", .value = "two" },
+        .{ .key = "gamma", .value = "three" },
+    });
+
+    // Checkpoint: alpha/beta/gamma move into the real tree. The cursor
+    // must see exactly the same results, now page-sourced instead of
+    // overlay-sourced.
+    try store.file.checkpointRedoLog();
+    try checkCursorSees(&store, &.{
+        .{ .key = "alpha", .value = "one" },
+        .{ .key = "beta", .value = "two" },
+        .{ .key = "gamma", .value = "three" },
+    });
+
+    // Overwrite beta and delete gamma (both now overlay-only mutations
+    // shadowing tree-resident keys -- gamma's tombstone must hide its
+    // real page entirely); insert delta (overlay-only, brand new, sorts
+    // between beta and gamma).
+    {
+        var write = try store.beginWrite();
+        try write.put("beta", "two-updated");
+        try write.commit();
+    }
+    {
+        var write = try store.beginWrite();
+        try write.delete("gamma");
+        try write.commit();
+    }
+    {
+        var write = try store.beginWrite();
+        try write.put("delta", "four");
+        try write.commit();
+    }
+
+    try checkCursorSees(&store, &.{
+        .{ .key = "alpha", .value = "one" },
+        .{ .key = "beta", .value = "two-updated" },
+        .{ .key = "delta", .value = "four" },
+    });
+
+    // seekAtOrAfter/seekAtOrBefore must resolve correctly too, including
+    // landing exactly on an overlay-only key and stepping past a
+    // tombstoned one without ever surfacing it.
+    {
+        var read = try store.beginRead();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        try std.testing.expectEqualStrings("delta", (try cursor.seekAtOrAfter("beta-zzz")).key);
+        // "At or before" is inclusive: "delta" itself is live, so it wins.
+        try std.testing.expectEqualStrings("delta", (try cursor.seekAtOrBefore("delta")).key);
+        // "gamma" itself is a tombstone (hidden, never surfaced) -- the
+        // largest live key at or before it is "delta", not "beta": the
+        // tombstone must not make the search fall back past a live key
+        // that sorts between the deleted one and the next real candidate.
+        try std.testing.expectEqualStrings("delta", (try cursor.seekAtOrBefore("gamma")).key);
+        try std.testing.expectEqualStrings("four", (try cursor.seekAtOrBefore("gamma")).value);
+    }
 }
 
 test "lite maintenance snapshots release shared cache accounting on cancellation and publication" {

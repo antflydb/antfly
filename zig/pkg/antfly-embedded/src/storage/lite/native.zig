@@ -14625,6 +14625,28 @@ pub const NativeFile = struct {
             return .{ .keys = keys, .allocator = allocator };
         }
 
+        /// Like `initForPrefix`, but without that "must equal the
+        /// currently active (physical) checkpoint" precondition -- for a
+        /// caller (`docstore.zig`'s `Cursor`) whose own checkpoint value
+        /// (`Txn.checkpoint`, from `ReadGeneration.checkpoint`) is not
+        /// comparable to `file.activeCheckpoint()` in the first place: it
+        /// can be a different `NativeFile` instance's (`generation.file`,
+        /// a separately-opened, read-only handle) view, kept current via
+        /// `Store.observeReadCheckpoint` rather than by sharing
+        /// `activeCheckpoint()`'s own in-memory state directly. Per-key
+        /// value resolution (`redoOverlayEntry`/`resolveAlloc`) is already
+        /// correctly version-pinned regardless of which checkpoint number
+        /// is passed -- the same function an ordinary point `get()` uses,
+        /// with no such gate at all -- so omitting this precondition here
+        /// does not weaken correctness for a genuinely stale pin, only
+        /// widens *enumeration* to match what point-read resolution
+        /// already does. Still returns empty for a non-redo file.
+        pub fn initForPrefixUnchecked(allocator: Allocator, file: *NativeFile, root: TransactionWrites.Root, prefix: []const u8) !OverlayScanState {
+            const redo = file.redo orelse return .{ .allocator = allocator };
+            const keys = try redo.shared.keysWithPrefixAlloc(allocator, file.runtimeIo(), @backingInt(root), prefix);
+            return .{ .keys = keys, .allocator = allocator };
+        }
+
         pub fn deinit(self: *OverlayScanState) void {
             for (self.keys) |k| self.allocator.free(k);
             self.allocator.free(self.keys);
