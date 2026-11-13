@@ -9264,14 +9264,15 @@ pub const NativeFile = struct {
         if (self.redo) |*redo| {
             const page_size = self.header.page_size;
             if (offset % page_size == 0 and out.len % page_size == 0 and out.len != 0) {
-                if (out.len == page_size) {
+                const page_count = out.len / page_size;
+                if (page_count == 1) {
                     const page_id = offset / page_size;
                     if (try redo.shared.readPageAlloc(self.allocator, self.runtimeIo(), page_id)) |bytes| {
                         defer self.allocator.free(bytes);
                         @memcpy(out, bytes);
                         return;
                     }
-                } else {
+                } else if (!redo.shared.pagesEmpty(self.runtimeIo())) {
                     // `RecordReadWindow`'s own multi-page read-ahead
                     // window, never a single page-id-keyed lookup: any
                     // page in this span -- not just the first -- may be
@@ -9279,27 +9280,53 @@ pub const NativeFile = struct {
                     // same as the single-page case above. A single bulk
                     // `readBackingPagesUncached` call below would skip
                     // the overlay check entirely for every page past the
-                    // first (this branch only runs when `out.len` is
-                    // more than one page), reading right past the
-                    // physical end of file for one the file was never
-                    // extended to cover -- observed as `EndOfStream` in
+                    // first, reading right past the physical end of file
+                    // for one the file was never extended to cover --
+                    // observed as `EndOfStream` in
                     // `getDocumentsAtCheckpointWithState`'s own batch-read
                     // path, immediately after a `putDocumentBatch` whose
                     // writes this same commit diverted into the redo log.
-                    // Serve this span one page at a time instead: each
-                    // recursive call re-enters this same function, so
-                    // every page still gets its own overlay check. The
-                    // window's whole point is fewer syscalls on the
-                    // common, nothing-diverted path; this trades that
-                    // for correctness only while `self.redo` is active,
-                    // never on the legacy path these tests already cover.
-                    const page_count = out.len / page_size;
+                    //
+                    // Redo is now the default, so this window is the
+                    // common case on the hot batch-read path benchmarked
+                    // against SQLite: serving it one page at a time
+                    // unconditionally (an earlier version of this fix)
+                    // would turn every such read-ahead window into N
+                    // physical preads instead of one, even when nothing
+                    // in it is actually diverted -- the overwhelmingly
+                    // common case once a fold has run. Instead: walk the
+                    // span once, copying each overlay hit directly and
+                    // coalescing every maximal run of consecutive
+                    // non-overlay pages into a single physical read --
+                    // so a window with zero diverted pages among them
+                    // still costs exactly one pread, same as legacy, and
+                    // only a window that actually straddles a diverted
+                    // page pays for more than one. `pagesEmpty` above
+                    // (one cheap, non-allocating check) skips this walk
+                    // entirely once nothing is staged anywhere, which is
+                    // true for the whole process between folds.
+                    const first_page = offset / page_size;
                     var i: usize = 0;
-                    while (i < page_count) : (i += 1) {
-                        try self.readBackingPages(out[i * page_size ..][0..page_size], offset + i * page_size);
+                    while (i < page_count) {
+                        const page_id = first_page + i;
+                        if (try redo.shared.readPageAlloc(self.allocator, self.runtimeIo(), page_id)) |bytes| {
+                            defer self.allocator.free(bytes);
+                            @memcpy(out[i * page_size ..][0..page_size], bytes);
+                            i += 1;
+                            continue;
+                        }
+                        var run: usize = 1;
+                        while (i + run < page_count and !redo.shared.hasPage(self.runtimeIo(), first_page + i + run)) run += 1;
+                        try self.readBackingPagesUncached(out[i * page_size ..][0 .. run * page_size], offset + i * page_size);
+                        i += run;
                     }
                     return;
                 }
+                // Either a single page already handled above and not
+                // found in the overlay, or a multi-page window with
+                // nothing staged anywhere: fall through to the one bulk
+                // uncached read below, exactly as before this function
+                // knew about multi-page windows at all.
             }
         }
         if (self.allocator_proof_window) |window| if (try window.read(out, offset)) return;
@@ -28178,6 +28205,88 @@ test "lite redo log multi-page read-ahead window checks the overlay for every pa
     defer reader.deinit(a);
     var window = RecordReadWindow{};
     defer window.deinit(a);
+    for (refs, 0..) |ref, i| {
+        const entry = try decodeDocumentEntry(try reader.readWithWindow(true, &window, &file, a, checkpoint, ref, .document, if (i == 0) ahead else 1));
+        try std.testing.expectEqualStrings(docs[i].key, entry.key);
+        try std.testing.expectEqualSlices(u8, &payload, entry.value);
+    }
+
+    // Fold: every page above is now physical, and -- no pin held --
+    // `maybeClearPages` drops the overlay's own page cache to empty.
+    try file.checkpointRedoLog();
+    try std.testing.expect(file.redo.?.shared.pagesEmpty(std.testing.io));
+
+    // Re-stage three of the now-physical pages -- first, middle, and
+    // last of those touched by this run -- with a verbatim copy of
+    // their own physical bytes: a page genuinely back in the overlay
+    // (simulating a second diverting commit against the same page
+    // ids), without fabricating new content that would need its own,
+    // separately computed checksum. Several of the 64 documents above
+    // share a physical page (2000-byte payloads, several per page), so
+    // `physicalPage(refs[32])` is not necessarily `physicalPage(refs[0])
+    // + 32` -- only that this run touches a contiguous span of pages
+    // from `first_page` to `last_page` inclusive.
+    const first_page = physicalPage(refs[0]);
+    const last_page = physicalPage(refs[63]);
+    const span_pages: usize = @intCast(last_page - first_page + 1);
+    try std.testing.expect(span_pages >= 5);
+    const mid_page = first_page + span_pages / 2;
+    try std.testing.expect(mid_page > first_page and mid_page < last_page);
+    for ([_]u64{ first_page, mid_page, last_page }) |page_id| {
+        const buf = try a.alloc(u8, file.header.page_size);
+        defer a.free(buf);
+        try file.readBackingPagesUncached(buf, page_id * file.header.page_size);
+        const owned = try std.heap.page_allocator.dupe(u8, buf);
+        try file.redo.?.shared.appendPage(std.heap.page_allocator, std.testing.io, page_id, owned);
+    }
+    try std.testing.expect(!file.redo.?.shared.pagesEmpty(std.testing.io));
+
+    // Exercise `readBackingPages` itself directly, with one call
+    // spanning the whole run -- bypassing `RecordPageReader`/
+    // `RecordReadWindow`'s own bounded read-ahead (capped well below
+    // this span's page count, and sensitive to this process's page
+    // cache) so the read-count assertion below measures exactly the
+    // coalescing logic this fix adds, not an unrelated higher-level
+    // caching decision.
+    const span_bytes = try a.alloc(u8, span_pages * file.header.page_size);
+    defer a.free(span_bytes);
+    const before_calls = file.test_backing_read_calls.load(.monotonic);
+    try file.readBackingPages(span_bytes, first_page * file.header.page_size);
+    const reads = file.test_backing_read_calls.load(.monotonic) - before_calls;
+    // Two maximal non-overlay runs (before and after the staged middle
+    // page), each coalesced into one physical read; the three staged
+    // pages never reach a physical read at all -- not `span_pages`
+    // single-page reads (the earlier, correctness-only fix this
+    // replaces) and not one bulk read spanning everything (which would
+    // silently skip the overlay for the staged pages).
+    try std.testing.expectEqual(@as(u64, 2), reads);
+
+    // Each of the three re-staged pages' own bytes within `span_bytes`
+    // must match what was independently staged (and, by construction,
+    // what was already physically there) -- confirms the coalescing
+    // loop placed every page at its correct relative offset in the
+    // output buffer, not just the right total read count.
+    for ([_]u64{ first_page, mid_page, last_page }) |page_id| {
+        const rel: usize = @intCast((page_id - first_page) * file.header.page_size);
+        const page_bytes = try file.redo.?.shared.readPageAlloc(a, std.testing.io, page_id);
+        defer if (page_bytes) |bytes| a.free(bytes);
+        try std.testing.expect(page_bytes != null);
+        try std.testing.expectEqualSlices(u8, page_bytes.?, span_bytes[rel..][0..file.header.page_size]);
+    }
+
+    // Broader correctness check: every one of the 64 documents still
+    // decodes correctly through the ordinary `RecordPageReader` path
+    // (cache cleared so this pass, like the direct call above, actually
+    // reaches the overlay/physical split rather than a stale cache
+    // entry), confirming the re-staged overlay pages did not corrupt
+    // anything this run's own earlier, already-passing assertions
+    // covered.
+    file.page_cache.clear(a);
+    file.page_cache_enabled.store(false, .monotonic);
+    reader.deinit(a);
+    reader = RecordPageReader{};
+    window.deinit(a);
+    window = RecordReadWindow{};
     for (refs, 0..) |ref, i| {
         const entry = try decodeDocumentEntry(try reader.readWithWindow(true, &window, &file, a, checkpoint, ref, .document, if (i == 0) ahead else 1));
         try std.testing.expectEqualStrings(docs[i].key, entry.key);

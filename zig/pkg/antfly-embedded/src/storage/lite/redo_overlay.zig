@@ -157,6 +157,33 @@ pub const SharedRedoOverlay = struct {
         return try allocator.dupe(u8, bytes);
     }
 
+    /// Cheap, non-allocating presence check for a multi-page read-ahead
+    /// window deciding where to split a physical read: true if `page_id`
+    /// has a staged raw page right now. Never copies -- unlike
+    /// `readPageAlloc`, this exists purely so a caller walking a window
+    /// to find the boundary of a run of consecutive non-overlay pages
+    /// can check many page ids without paying for a copy it would
+    /// immediately discard for every page that turns out not to be
+    /// staged.
+    pub fn hasPage(self: *SharedRedoOverlay, io: std.Io, page_id: u64) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.pages.contains(page_id);
+    }
+
+    /// True when nothing is staged at all right now -- the common case
+    /// once every diverted page has been folded or flushed. Lets a
+    /// multi-page window skip a per-page overlay check entirely when
+    /// there is provably nothing to find anywhere, preserving the
+    /// single-pread cost a read-ahead window exists for in the first
+    /// place (the point of the window at all, on the legacy -- non-redo
+    /// -- path, and on a redo path once nothing is left diverted).
+    pub fn pagesEmpty(self: *SharedRedoOverlay, io: std.Io) bool {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.pages.count() == 0;
+    }
+
     /// One staged page, fully owned, returned by `takeAllPagesAlloc`.
     pub const OwnedPage = struct {
         page_id: u64,
