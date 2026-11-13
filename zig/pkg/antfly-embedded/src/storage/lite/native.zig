@@ -5796,6 +5796,26 @@ const HeaderFingerprintCache = struct {
     }
 };
 
+/// Debug-only overlap backstop for `beginTransaction`/`commitTransactionWithDurability`/
+/// `abortTransaction` (lite-writer-race investigation, docs/design/lite-performance/
+/// lite-single-commit-write-path.md §8/§9). See `NativeFile.commit_span_depth`'s
+/// own doc comment for what this catches and why it is scoped wider than
+/// `transaction_header != null`. Off in release builds, like
+/// `publication_mutex_owner_tracking` in docstore.zig, which this mirrors.
+///
+/// Deliberately *not* identity-based (no thread id, no owner field):  an
+/// earlier version of this guard keyed the sanctioned-reentry exception off
+/// "is the current thread already the holder", which this codebase's own
+/// `std.Io.Threaded` runtime can defeat -- a logical task is not 1:1 with an
+/// OS thread under its scheduler (one worker thread can run two unrelated
+/// tasks back to back, and `std.Thread.getCurrentId()` cannot tell them
+/// apart), so a thread-identity check can quietly treat a second, unrelated
+/// caller as "the same caller, reentering" and skip the very overlap it
+/// exists to catch. A plain depth counter, deepened only by the few call
+/// sites that *know* they are nested (see `commit_span_nested_allowance`),
+/// has no such gap: it never has to guess who is calling.
+const debug_commit_span_tracking = std.debug.runtime_safety;
+
 pub const NativeFile = struct {
     allocator: Allocator,
     /// The default constructors own this Threaded runtime. Borrowed-I/O
@@ -5872,6 +5892,58 @@ pub const NativeFile = struct {
     header: Header,
     header_fingerprint_cache: HeaderFingerprintCache = .{},
     transaction_header: ?Header = null,
+    /// Debug-only overlap backstop: an atomic count of how many
+    /// `beginTransaction` calls on this instance are currently open
+    /// (incremented in `debugEnterCommitSpan`, decremented in
+    /// `debugExitCommitSpan`) -- deliberately wider than
+    /// `transaction_header != null`, which `commitTransactionWithDurability`
+    /// clears early (right after `flushTransactionWrites`, well before
+    /// `publishCheckpoint`/the durability barrier) so that a *different*
+    /// `NativeFile`'s own `beginTransaction` can overlap *this* commit's
+    /// still-in-flight publish under WS2 pipelining (see `docstore.zig`'s
+    /// `lockStore`/`lockStoreExclusive`/`commit_in_sync`). A non-nested
+    /// `beginTransaction` reaching this same instance while the count is
+    /// already non-zero is always a caller-side serialization failure (the
+    /// writer lease or group-commit queue failed to exclude a second
+    /// commit on this exact file), never a legitimate overlap -- WS2
+    /// pipelining only ever overlaps two *different* `NativeFile`
+    /// instances' spans, not two on the same one.
+    ///
+    /// The three sanctioned same-call-stack reentries -- `checkpointRedoLog`
+    /// opening its own nested transaction from inside
+    /// `commitTransactionWithDurability`'s deferred-publication branch or
+    /// `publishCheckpoint`'s own redo branch, and
+    /// `commitTransactionWithDurability`'s own tail call into
+    /// `maybeAutoCheckpointRedoLog` (which can also reach `checkpointRedoLog`)
+    /// -- are each wrapped at their call site with
+    /// `commit_span_nested_allowance`, not detected here by inference. An
+    /// earlier version of this guard tried to infer "is this call nested"
+    /// from thread identity (same OS thread as the current holder = assume
+    /// reentry) or from `redo.checkpointing` (the codebase's own "this call
+    /// stack is building a real checkpoint" signal); both were wrong.
+    /// Thread identity is wrong because this codebase's own `std.Io.Threaded`
+    /// runtime does not guarantee one logical task per OS thread -- a
+    /// worker thread can run two unrelated tasks back to back, so
+    /// "same thread id" does not mean "same call stack", and a second,
+    /// genuinely unrelated caller can be misread as a reentrant one.
+    /// `redo.checkpointing` is wrong because it is `true` for *both* the
+    /// genuinely nested call sites above *and* a wholly standalone one
+    /// (`docstore.zig`'s `maybeCheckpointRedoLogOnIdleTurn`, which calls
+    /// `checkpointRedoLog` fresh, under its own `lockStoreExclusive`, with
+    /// no outer transaction open at all) -- so keying off it silently
+    /// passed the exact overlap this guard exists to catch. Explicit,
+    /// call-site-driven signaling has no such gap: it never has to guess.
+    commit_span_depth: if (debug_commit_span_tracking) std.atomic.Value(usize) else void = if (debug_commit_span_tracking) .init(0) else {},
+    /// Set (incremented before, decremented after, always paired) by a call
+    /// site that is *itself* already inside an open commit span and is
+    /// about to make a synchronous, same-call-stack nested call that will
+    /// re-enter `beginTransaction` on this exact instance -- see
+    /// `commit_span_depth`'s own doc comment for the three sites. Plain
+    /// (non-atomic): by construction, only the call stack that already
+    /// holds the span can ever reach one of these sites, so there is never
+    /// concurrent access to this field to guard against -- that is the
+    /// whole difference between this and `commit_span_depth`.
+    commit_span_nested_allowance: if (debug_commit_span_tracking) usize else void = if (debug_commit_span_tracking) 0 else {},
     // Lease-only metadata transactions may append without proving free-page
     // reuse. General mutations still validate before any physical reuse.
     artifact_lease_transaction: bool = false,
@@ -6598,6 +6670,31 @@ pub const NativeFile = struct {
     /// instead of resetting over it, so `replay`'s superseded handling
     /// must (and does) tolerate a superseded run followed by genuinely
     /// new records, not just a superseded run with nothing after it.
+    /// Calls `checkpointRedoLog` from a call site that is itself already
+    /// inside an open `beginTransaction`..`commitTransactionWithDurability`/
+    /// `publishCheckpoint` span on this instance -- see
+    /// `commit_span_nested_allowance`'s own doc comment. `checkpointRedoLog`
+    /// opens its *own* nested transaction (`beginTransaction`/
+    /// `commitTransactionWithDurability`) on the same `*NativeFile`, which
+    /// `debugEnterCommitSpan` would otherwise read as a second, overlapping
+    /// caller and panic on; this brackets that nested call so the guard
+    /// knows it is sanctioned. Every production call site that reaches
+    /// `checkpointRedoLog` from inside an already-open span (the two
+    /// log-full branches in `commitTransactionWithDurability`/
+    /// `publishCheckpoint`, and `maybeAutoCheckpointRedoLogNested`) goes
+    /// through this wrapper, never `checkpointRedoLog` directly -- the
+    /// standalone callers (`docstore.zig`'s `maybeCheckpointRedoLogOnIdleTurn`,
+    /// `maintainOnceWithCancel`-adjacent reclaim, tests) call
+    /// `checkpointRedoLog` directly instead, with no outer span open to
+    /// bracket.
+    fn checkpointRedoLogNested(self: *NativeFile) anyerror!void {
+        if (debug_commit_span_tracking) self.commit_span_nested_allowance += 1;
+        defer if (debug_commit_span_tracking) {
+            self.commit_span_nested_allowance -= 1;
+        };
+        try self.checkpointRedoLog();
+    }
+
     pub fn checkpointRedoLog(self: *NativeFile) anyerror!void {
         if (comptime builtin.is_test) if (self.test_fail_checkpoint_redo_log) |err| {
             self.test_fail_checkpoint_redo_log = null;
@@ -15287,6 +15384,40 @@ pub const NativeFile = struct {
         self.notifyPublication();
     }
 
+    /// Debug-only: see `commit_span_depth`'s own doc comment. Panics
+    /// immediately if a non-nested `beginTransaction` reaches this same
+    /// instance while another span is still open -- the first-overlapping-
+    /// begin backstop the lite-writer-race investigation asked for, wider
+    /// than `assertActiveWriter` (which only compares *different*
+    /// `NativeFile` pointers sharing one inode, so it can never catch two
+    /// callers racing this exact instance). The three sanctioned
+    /// same-call-stack reentries bracket their own nested call with
+    /// `commit_span_nested_allowance` first, so they deepen the count here
+    /// without panicking; everything else that finds the count already
+    /// non-zero is a genuine second caller.
+    fn debugEnterCommitSpan(self: *NativeFile) void {
+        if (!debug_commit_span_tracking) return;
+        const previous = self.commit_span_depth.fetchAdd(1, .acq_rel);
+        if (previous != 0 and self.commit_span_nested_allowance == 0) {
+            std.debug.panic(
+                "lite: NativeFile.beginTransaction overlapped an already-open commit span on the same instance (path={s} depth_before={d}) -- two commits racing one NativeFile; this is always a caller-side serialization bug (the writer lease or group-commit queue failed to exclude a second commit on this exact file), never legitimate WS2 pipelining, which only ever overlaps two *different* NativeFile instances",
+                .{ self.path, previous },
+            );
+        }
+    }
+
+    /// Debug-only counterpart to `debugEnterCommitSpan`, called via `defer`
+    /// from `commitTransactionWithDurability`/`abortTransaction` once each
+    /// has confirmed it owns an actually-open transaction (`previous =
+    /// self.transaction_header orelse return ...` already succeeded) --
+    /// never before that check, so a call that finds nothing to commit/abort
+    /// never touches a guard it did not set.
+    fn debugExitCommitSpan(self: *NativeFile) void {
+        if (!debug_commit_span_tracking) return;
+        const previous = self.commit_span_depth.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+    }
+
     /// The caller serializes writers and checkpoint acquisition throughout a
     /// transaction. Intermediate roots are private; existing pinned readers
     /// continue reading immutable pages from their own checkpoint.
@@ -15299,6 +15430,7 @@ pub const NativeFile = struct {
         // failing (or an inconsistent latch) falls through to the refusal.
         if (self.checkpoint_publication_uncertain) try self.reconcilePublicationUncertainty();
         try self.refreshIfWriterBaseStale();
+        self.debugEnterCommitSpan();
         if (self.lease_managed) {
             if (self.inode_lock_ref.load(.acquire)) |entry| inode_lock.claimActiveWriter(entry, @intFromPtr(self));
             self.claimed_active_writer = true;
@@ -15454,6 +15586,7 @@ pub const NativeFile = struct {
         defer self.claimed_active_writer = false;
         self.invalidateLedger();
         const previous = self.transaction_header orelse return;
+        defer self.debugExitCommitSpan();
         if (self.transaction_writes) |writes| writes.deinit(self.allocator);
         self.transaction_writes = null;
         self.header = previous;
@@ -15583,6 +15716,7 @@ pub const NativeFile = struct {
         // call's own check-and-consume still sees the true value it needs.
         defer self.claimed_active_writer = false;
         const previous = self.transaction_header orelse return error.InvalidTransactionState;
+        defer self.debugExitCommitSpan();
         // A deferred (non-durable) commit never calls publishCheckpoint or
         // tryBuildCommitManifest below -- it only stages `next` into
         // self.header and returns, with no durability barrier at all. Its
@@ -15666,7 +15800,7 @@ pub const NativeFile = struct {
                             // this would leave them staged forever,
                             // growing unboundedly across every later
                             // commit.
-                            try self.checkpointRedoLog();
+                            try self.checkpointRedoLogNested();
                             redo.logical_pending.clearRetainingCapacity();
                             redo.pending.clearRetainingCapacity();
                             return;
@@ -15731,7 +15865,7 @@ pub const NativeFile = struct {
             // before its slot write, same as any non-redo commit.
             if (!manifest_prepared and (self.redo == null or self.redo.?.checkpointing)) try self.syncIfRequired(hooks);
             try self.publishCheckpoint(next, manifest_prepared, hooks);
-            try self.maybeAutoCheckpointRedoLog();
+            try self.maybeAutoCheckpointRedoLogNested();
         } else try self.sync();
     }
 
@@ -15773,6 +15907,21 @@ pub const NativeFile = struct {
     /// `std.log.warn`, rate-limited to the first failure and every
     /// power-of-two one after that, so a budget stuck at capacity does
     /// not spam a line per commit.
+    /// Calls `maybeAutoCheckpointRedoLog` from `commitTransactionWithDurability`'s
+    /// own tail, reached right after this same call's own `publishCheckpoint`
+    /// already succeeded -- the span this `*NativeFile` instance's
+    /// `beginTransaction` opened is still held (the function has not
+    /// returned yet), so `maybeAutoCheckpointRedoLog`'s own possible
+    /// `checkpointRedoLog` call is a nested reentry, same reasoning as
+    /// `checkpointRedoLogNested`.
+    fn maybeAutoCheckpointRedoLogNested(self: *NativeFile) anyerror!void {
+        if (debug_commit_span_tracking) self.commit_span_nested_allowance += 1;
+        defer if (debug_commit_span_tracking) {
+            self.commit_span_nested_allowance -= 1;
+        };
+        try self.maybeAutoCheckpointRedoLog();
+    }
+
     fn maybeAutoCheckpointRedoLog(self: *NativeFile) anyerror!void {
         const redo: *RedoCommitState = if (self.redo) |*r| r else return;
         if (redo.checkpointing) return;
@@ -16041,6 +16190,68 @@ pub const NativeFile = struct {
         var redo_fell_back_to_slot = false;
         if (self.redo != null and !self.redo.?.checkpointing) {
             const redo = &self.redo.?;
+            // Writer-race investigation (docs/design/lite-performance/
+            // lite-single-commit-write-path.md §8/§9): `proposed`/`checkpoint`
+            // can already be the writer's own last-appended record, not a
+            // new one to log. This happens whenever a commit whose own
+            // `apply` staged nothing new (`commitTransactionWithDurability`'s
+            // `changed == false`) still needs to flush a *pending*
+            // `durable_header` -- a deferred (`durable = false`) ride-along
+            // commit earlier in this same chain already called
+            // `redo.appendRecord` for this exact `commit_sequence` (writing
+            // the bytes, never syncing them), and the "nothing changed"
+            // branch above (`NativeFile.sync`'s `if (self.durable_header)
+            // |_| try self.publishCheckpoint(self.activeCheckpoint(), ...)`
+            // fallback) reaches here purely to make that already-written
+            // record durable, not to add a new one. Calling
+            // `redo.appendRecord` again for the same `commit_sequence` would
+            // violate the writer's own `commit_sequence == last_sequence + 1`
+            // continuity check (`error.SequenceOutOfOrder`, surfacing as the
+            // far less specific `error.OutcomeUnknown`) -- not because two
+            // commits ever raced each other on this `NativeFile` (the debug
+            // backstop added alongside this fix, `beginTransaction`'s
+            // `debugEnterCommitSpan`, proves they did not: this reproduces
+            // single-threaded, deterministically, on every run), but because
+            // this call is a legitimate *republish* of an already-logged
+            // sequence, which only the v8/v9 slot-write path is idempotent
+            // under -- rewriting the same checkpoint slot and re-syncing is
+            // harmless there, which is exactly why `use_redo_log = false`
+            // never surfaces this: it just republishes the identical slot
+            // and never consults a continuity counter at all. Detected by
+            // comparing against the writer's own already-appended tail
+            // (`last_sequence`), not `redo.durable_sequence` (which only
+            // tracks what is *synced*, not what is merely *appended* --
+            // this call may be the very thing that syncs it for the first
+            // time).
+            if (redo.writer.last_sequence) |already_appended| {
+                if (checkpoint.commit_sequence <= already_appended) {
+                    self.publication_in_flight = true;
+                    defer self.publication_in_flight = false;
+                    (blk: {
+                        if (comptime builtin.is_test) if (self.test_fail_checkpoint_publication) |err| {
+                            self.test_fail_checkpoint_publication = null;
+                            break :blk err;
+                        };
+                        redo.writer.sync() catch |err| break :blk err;
+                        break :blk {};
+                    }) catch {
+                        return error.OutcomeUnknown;
+                    };
+                    if (checkpoint.commit_sequence > redo.durable_sequence) redo.durable_sequence = checkpoint.commit_sequence;
+                    self.publishRedoLogState();
+                    self.header.checkpoints[self.header.active_checkpoint] = checkpoint;
+                    wal_trace.recordCommit();
+                    self.last_synced_header = self.header;
+                    if (self.ledger) |state| {
+                        self.retirement_activity_bytes +|= state.released_data_pages *| self.header.page_size;
+                        self.retirement_activity_bytes +|= state.retired_inline_bytes;
+                        state.released_data_pages = 0;
+                        state.retired_inline_bytes = 0;
+                    }
+                    self.publishCommittedSequenceToInode();
+                    return;
+                }
+            }
             // A log-full condition must be decided before anything is
             // appended, never discovered as a failed, partial append
             // (`error.LogFull`, surfacing as the far less specific
@@ -16076,7 +16287,7 @@ pub const NativeFile = struct {
                     // -- unlike the page-shaped branch below, nothing
                     // here still needs the log to fit anything
                     // afterward.
-                    try self.checkpointRedoLog();
+                    try self.checkpointRedoLogNested();
                     redo.logical_pending.clearRetainingCapacity();
                     redo.pending.clearRetainingCapacity();
                     return;
