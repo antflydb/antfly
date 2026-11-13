@@ -3844,6 +3844,23 @@ const PageAllocator = struct {
     next_free_index: usize = 0,
     next_page_id: u64,
     batch: ?PageWriteBatch = null,
+    // §9 (redo + indexed reclamation): true only for
+    // `pageAllocatorForDivertingCommit`'s own allocator -- the one
+    // "page-shaped exception" a diverting transactional commit still
+    // makes (external value chains, per `RedoCommitState`'s own doc
+    // comment). `PageWriteBatch.flushCount` reads this (propagated
+    // through `writePage`'s lazy batch init, and threaded explicitly into
+    // every `ExtentAppender`/`CatalogAppendState` batch literal built from
+    // this allocator) to decide whether a page it is about to flush
+    // should divert into the redo log instead of a real pwrite. A bare
+    // commit's own allocator (`pageAllocatorFromFreeMap`) leaves this
+    // `false`, so its document/catalog/index/free-map pages always write
+    // for real regardless of `self.file.redo` -- matching
+    // `putIndexedDocumentBatch`'s and `publishBareCommit`'s own doc
+    // comments ("a bare commit never diverts"), which `flushCount`'s
+    // earlier, allocator-blind `file.redo != null` check silently broke
+    // once `use_redo_log` became the default.
+    diverting: bool = false,
     pack_records: bool = false,
     record_buffer: [65536]u8 = undefined,
     record_used: usize = 0,
@@ -3935,7 +3952,7 @@ const PageAllocator = struct {
             },
             else => {},
         };
-        if (self.batch == null) self.batch = .{ .file = self.file };
+        if (self.batch == null) self.batch = .{ .file = self.file, .diverting = self.diverting };
         try self.batch.?.appendPage(page, kind, payload);
     }
 
@@ -5505,6 +5522,15 @@ const PageWriteBatch = struct {
     const max_pages = capacity / 4096;
     file: *NativeFile,
     options: WriteOptions = .{},
+    // See `PageAllocator.diverting`'s own doc comment: propagated from the
+    // allocator that owns this batch (`PageAllocator.writePage`'s lazy
+    // init, or threaded explicitly into a standalone `ExtentAppender`/
+    // `CatalogAppendState` batch literal built from that allocator).
+    // `false` by default, so a batch built with no allocator in the
+    // picture at all (a bare commit's ledger/free-map pages via
+    // `writeLedgerPage`, a checkpoint-slot write, a disposable vacuum/copy
+    // workspace file) never diverts regardless of `file.redo`.
+    diverting: bool = false,
     buffer: [capacity]u8 = undefined,
     page_ids: [max_pages]u64 = undefined,
     used: usize = 0,
@@ -5568,7 +5594,7 @@ const PageWriteBatch = struct {
         while (start < count) {
             var end = start + 1;
             while (end < count and self.page_ids[end] - self.page_ids[end - 1] == 1) : (end += 1) {}
-            if (file.redo != null and !file.redo.?.checkpointing) {
+            if (self.diverting and file.redo != null and !file.redo.?.checkpointing) {
                 // §9.3/§9.1: diverted into the redo log's in-memory staging
                 // instead of a physical pwrite -- no manifest bookkeeping
                 // either (meaningless under redo-log commit; see
@@ -5576,6 +5602,25 @@ const PageWriteBatch = struct {
                 // for this file). Run-coalescing above exists only to
                 // batch *syscalls*; staging bytes in memory has no such
                 // benefit, so each page in the run is staged individually.
+                // `self.diverting` (propagated from the owning
+                // `PageAllocator`, see its own doc comment) scopes this to
+                // the one legitimate page-shaped exception -- an external
+                // value chain staged through `pageAllocatorForDivertingCommit`
+                // during an ordinary (non-fold) transactional commit. A
+                // bare commit's own pages (`pageAllocatorFromFreeMap`,
+                // `diverting = false`) always take the real-pwrite branch
+                // below, matching `putIndexedDocumentBatch`'s and
+                // `publishBareCommit`'s own doc comments ("a bare commit
+                // never diverts") -- `file.redo != null` alone used to be
+                // this check's only condition, which silently broke that
+                // invariant for every bare commit once `use_redo_log`
+                // became the default (every page it wrote, not just
+                // page-shaped external values, got staged here instead of
+                // written, leaving `checkpoint.page_count` running ahead
+                // of bytes that were never actually on disk until the next
+                // `checkpointRedoLog` fold -- confirmed via a direct repro:
+                // a bare `putDocument`'s own `document_root_page` offset
+                // read back as past-EOF).
                 // Only page-shaped writes (external value chains) reach
                 // this at all now -- see `RedoCommitState`'s own doc
                 // comment -- since `flushTransactionWrites` diverts the
@@ -10300,7 +10345,7 @@ pub const NativeFile = struct {
         defer if (!self.stagingTransaction()) local_pages.deinit();
         errdefer if (!self.stagingTransaction()) self.resetBareCommitManifestWindow();
         const pages = if (self.stagingTransaction()) &(try self.transactionWrites()).pages else &local_pages;
-        var builder = ExtentAppender{ .file = self, .pages = pages, .tail = undefined, .batch = .{ .file = self, .options = options } };
+        var builder = ExtentAppender{ .file = self, .pages = pages, .tail = undefined, .batch = .{ .file = self, .options = options, .diverting = pages.diverting } };
         defer builder.deinit();
         const chunk_size = self.maxValuePagePayloadBytes();
         const read_size = buffer.len / chunk_size * chunk_size;
@@ -14759,7 +14804,7 @@ pub const NativeFile = struct {
     /// Neither initial writes nor vacuum need an array of every leaf reference.
     fn writeValueTree(self: *NativeFile, pages: *PageAllocator, value: []const u8, options: WriteOptions) !ExtentRef {
         if (value.len == 0) return error.InvalidNativeValueChain;
-        var builder = ExtentAppender{ .file = self, .pages = pages, .tail = undefined, .batch = .{ .file = self, .options = options } };
+        var builder = ExtentAppender{ .file = self, .pages = pages, .tail = undefined, .batch = .{ .file = self, .options = options, .diverting = pages.diverting } };
         defer builder.deinit();
         var offset: usize = 0;
         while (offset < value.len) {
@@ -14816,7 +14861,7 @@ pub const NativeFile = struct {
         }
 
         fn init(file: *NativeFile, pages: *PageAllocator, root: ExtentRef) !ExtentAppender {
-            var result = ExtentAppender{ .file = file, .pages = pages, .tail = root, .batch = .{ .file = file } };
+            var result = ExtentAppender{ .file = file, .pages = pages, .tail = root, .batch = .{ .file = file, .diverting = pages.diverting } };
             errdefer result.deinit();
             var checkpoint = file.activeCheckpoint();
             checkpoint.page_count = pages.next_page_id;
@@ -14916,7 +14961,7 @@ pub const NativeFile = struct {
             const self = try file.allocator.create(CatalogAppendState);
             errdefer file.allocator.destroy(self);
             self.* = .{
-                .builder = .{ .file = file, .pages = pages, .tail = undefined, .batch = .{ .file = file } },
+                .builder = .{ .file = file, .pages = pages, .tail = undefined, .batch = .{ .file = file, .diverting = pages.diverting } },
                 .tail = try file.allocator.alloc(u8, file.maxValuePagePayloadBytes()),
                 .len = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len,
             };
@@ -15197,6 +15242,7 @@ pub const NativeFile = struct {
             .file = self,
             .free_pages = try self.allocator.alloc(u64, 0),
             .append_only = true,
+            .diverting = true,
             .next_page_id = self.manifestSafeNextPageId(checkpoint.page_count),
         };
     }
