@@ -11530,7 +11530,31 @@ pub const Node = struct {
     }
 
     fn recognizePcmFromPath(self: *Node, allocator: std.mem.Allocator, model_path: []const u8, request: transcribing_api.Request, pcm: audio_mod.PcmAudio, control: InferenceExecutionControl, max_working_bytes: usize, expected_revision: ?[64]u8, diarization_options: speaker_embedding_mod.DiarizeOptions) !long_transcription.Result {
-        var whisper = WhisperRuntime{ .node = self, .allocator = allocator, .model_path = try allocator.dupe(u8, model_path) };
+        const Admission = struct {
+            fn acquire(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
+                const node: *Node = @ptrCast(@alignCast(raw));
+                return node.admitDocumentHost(bytes);
+            }
+        };
+        // The document allocator bounds source/metadata/output, not Whisper's
+        // transient encoder/decoder tensors. Keep that workspace separately
+        // charged to the same process resource manager and release it before
+        // returning the compact transcript to the document owner.
+        var workspace = @import("../backends/admitted_allocator.zig").AdmittedAllocator{
+            .backing = std.heap.smp_allocator,
+            .admission_context = self,
+            .admit = Admission.acquire,
+            .trim_on_free = true,
+        };
+        defer workspace.deinit();
+        return self.recognizePcmInWorkspace(workspace.allocator(), allocator, model_path, request, pcm, control, max_working_bytes, expected_revision, diarization_options) catch |err| {
+            if (err == error.OutOfMemory) if (workspace.admission_error) |failure| return failure;
+            return err;
+        };
+    }
+
+    fn recognizePcmInWorkspace(self: *Node, work: std.mem.Allocator, output: std.mem.Allocator, model_path: []const u8, request: transcribing_api.Request, pcm: audio_mod.PcmAudio, control: InferenceExecutionControl, max_working_bytes: usize, expected_revision: ?[64]u8, diarization_options: speaker_embedding_mod.DiarizeOptions) !long_transcription.Result {
+        var whisper = WhisperRuntime{ .node = self, .allocator = work, .model_path = try work.dupe(u8, model_path) };
         defer whisper.deinit();
         var stage: WhisperRuntimeStage = .manifest;
         try self.loadWhisperRuntime(&whisper, null, 0, control, &stage);
@@ -11547,13 +11571,13 @@ pub const Node = struct {
         // one Whisper window are cut at pauses and decoded window by window,
         // so an in-process enrichment gets the whole recording, not its first
         // 30 seconds.
-        var result = try long_transcription.transcribeLong(allocator, &pipeline, pcm.samples, pcm.sample_rate, .{ .control = control });
-        errdefer result.deinit();
+        var result = try long_transcription.transcribeLong(work, &pipeline, pcm.samples, pcm.sample_rate, .{ .control = control });
+        defer result.deinit();
         if (request.diarization orelse false) {
             try control.update(.executing, 0, 0);
-            try self.assignTranscriptSpeakers(allocator, &result, pcm.samples, pcm.sample_rate, control, diarization_options);
+            try self.assignTranscriptSpeakers(work, &result, pcm.samples, pcm.sample_rate, control, diarization_options);
         }
-        return result;
+        return result.clone(output);
     }
 
     /// Where the default speaker-embedding model lives once pulled: the
@@ -43716,8 +43740,7 @@ fn normalizeReadPrompt(prompt: ?[]const u8) ?[]const u8 {
 }
 
 fn isGenerativeReadModel(manifest: *const manifest_mod.ModelManifest) bool {
-    return (manifest.isLightOnOcr3() and manifest.hasTask("read")) or (manifest.model_type == .generator and
-        manifest.isQwen3VlGgufBundle() and !manifest.isQwen3VlReranker());
+    return manifest.isGenerativeReader();
 }
 
 fn resolveGenerativeReadPrompt(manifest: *const manifest_mod.ModelManifest, prompt: ?[]const u8) ![]const u8 {
