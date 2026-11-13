@@ -146,6 +146,17 @@ hashes rather than assumed to use the same workspace revision.
 
 ## Remaining scale evidence
 
+The frozen 1M follow-up completed unsuccessfully on 2026-11-13 at 00:37 UTC.
+Its earlier executable (`ac42c5b1dec42aec2d16346f3e2fd3a596cafe29ef3b433495d7554174cb4352`)
+reported native `Timeout` after 4,172.744 seconds. Failure-phase evidence includes
+1,459.085 seconds in identity, 134.718 seconds across 377 bulk-tee calls, and
+2,712.105 seconds in bulk receipt. No successful publication or reopen followed.
+These phase times are not necessarily additive. The retained output is
+`followup-1m-20261112T232725Z/optimized` under the local GCS benchmark results.
+This run predates the latest quota/sampling fixes and does not qualify them or
+establish a throughput improvement. The specific timed-out operation still needs
+isolation; the failure record alone does not establish its cause.
+
 The second review closed two remaining gaps: paged-reference publication now
 uses an operation-local artifact-store copy with the tracker allocator, and
 sampler shutdown saves observations before a bounded background final scan.
