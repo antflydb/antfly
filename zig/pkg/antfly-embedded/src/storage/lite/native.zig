@@ -17437,6 +17437,20 @@ pub const NativeFile = struct {
                             self.test_fail_checkpoint_publication = null;
                             break :blk err;
                         };
+                        // WS2: release the store mutex for exactly the
+                        // fsync syscall, same protocol `syncIfRequired`
+                        // already uses for the v8/v9 slot path -- see that
+                        // function's own comment. Nothing appends to
+                        // `redo.writer` here (this branch republishes an
+                        // already-appended sequence), so there is nothing
+                        // left to serialize against besides the fsync
+                        // itself; `commit_in_sync` still fences every other
+                        // `NativeFile` mutation (a new transaction, an
+                        // allocate/reclaim, another checkpoint publish) out
+                        // for this window, exactly as it does for the
+                        // non-redo path.
+                        if (hooks) |h| h.release(h.context);
+                        defer if (hooks) |h| h.reacquire(h.context);
                         redo.writer.sync() catch |err| break :blk err;
                         break :blk {};
                     }) catch {
@@ -17573,6 +17587,29 @@ pub const NativeFile = struct {
                         break :blk err;
                     };
                     redo.appendRecord(self.allocator, checkpoint.commit_sequence, CompactCheckpoint.fromCheckpointSlot(checkpoint)) catch |err| break :blk err;
+                    // WS2 (lite-single-commit-write-path.md §9.3/§3.2a):
+                    // append under the lock (above; `redo_log.Writer` is
+                    // "not safe for concurrent use from more than one
+                    // caller," so the append itself needs full exclusion),
+                    // then release the store mutex for exactly the fsync
+                    // syscall and reacquire before touching anything else --
+                    // the same protocol `syncIfRequired` already uses for
+                    // the v8/v9 slot path. Without this, every stage
+                    // serialized behind every fsync: the legacy path lets
+                    // the *next* group's own `Txn` stage (and, at 8+
+                    // concurrent writers, start its own commit) while this
+                    // group's fsync is still running (`commit_in_sync`
+                    // fences `NativeFile` mutation, not staging); this redo
+                    // path held the lock across `redo.writer.sync()` too,
+                    // so a new `Txn.openWrite`'s `lockStore` spun for the
+                    // syscall's entire duration -- confirmed live as a
+                    // multi-hour livelock in "a new Txn opens and stages
+                    // while a group's fsync is in flight" at 8 concurrent
+                    // writers, and a throughput regression (no group-commit
+                    // fsync sharing) even below livelock-triggering
+                    // concurrency.
+                    if (hooks) |h| h.release(h.context);
+                    defer if (hooks) |h| h.reacquire(h.context);
                     redo.writer.sync() catch |err| break :blk err;
                     break :blk {};
                 }) catch {
@@ -17591,7 +17628,15 @@ pub const NativeFile = struct {
                 // from "a sync happened, through a path this counter
                 // doesn't know about."
                 if (builtin.is_test) _ = self.test_sync_calls.fetchAdd(1, .monotonic);
-                redo.durable_sequence = checkpoint.commit_sequence;
+                // Monotonic, not a bare assignment: the store mutex was
+                // released for the `sync()` call just above, so -- in
+                // principle, if some future caller is ever added that can
+                // reach this same `redo.writer`/`redo.durable_sequence`
+                // under `lockStoreExclusive` without going through this
+                // exact append-then-sync sequence -- a reacquire here must
+                // never retreat `durable_sequence` backward. Matches the
+                // republish branch above, which already uses this form.
+                if (checkpoint.commit_sequence > redo.durable_sequence) redo.durable_sequence = checkpoint.commit_sequence;
                 // §9.3b: publish right after the append this process just
                 // made durable, never before -- ride-along/deferred appends
                 // elsewhere are unsynced and must never be visible to a
