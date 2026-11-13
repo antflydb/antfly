@@ -58,6 +58,7 @@
     a {
       color: #205f49;
     }
+    audio { display: block; width: 100%; margin: 1rem 0; }
     #status {
       min-height: 2rem;
       margin-top: 1rem;
@@ -65,7 +66,7 @@
   </style>
   <h1>Grepstein</h1>
   <p>
-    Search public records. Follow page evidence and explore extracted
+    Search PDFs and audio transcripts. Follow page and timestamp evidence and explore extracted
     relationships.
   </p>
   <small
@@ -73,6 +74,7 @@
     in a record does not establish wrongdoing.</small
   >
   <form id="search">
+    <select id="collection" aria-label="Record collection"><option value="all">All records</option></select>
     <input
       id="query"
       aria-label="Search records"

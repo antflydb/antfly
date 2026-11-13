@@ -15,11 +15,35 @@
 
 const status = document.querySelector("#status"),
   results = document.querySelector("#results");
+const collectionPicker = document.querySelector("#collection");
 let request;
+fetch("/api/collections").then(async response => {
+  if (!response.ok) throw Error("Collections unavailable");
+  const collections = await response.json();
+  for (const collection of collections) {
+    const option = document.createElement("option");
+    option.value = collection.id;
+    option.textContent = collection.label;
+    collectionPicker.append(option);
+  }
+}).catch(error => { status.textContent = error.message; });
+
+function unitEvidence(match) {
+  return match.hierarchy?.ancestors?.unit?.document || {};
+}
+function timestamp(evidence, field) {
+  const value = evidence.provenance?.[field] ?? evidence["provenance." + field];
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value / 1000 : null;
+}
+function timeLabel(seconds) {
+  const whole = Math.floor(seconds);
+  return Math.floor(whole / 60) + ":" + String(whole % 60).padStart(2, "0");
+}
 document.querySelector("#search").onsubmit = async (e) => {
   e.preventDefault();
   if (request) request.abort();
-  request = new AbortController();
+  const current = new AbortController();
+  request = current;
   status.textContent = "Searching…";
   results.replaceChildren();
   try {
@@ -28,11 +52,13 @@ document.querySelector("#search").onsubmit = async (e) => {
         new URLSearchParams({
           q: document.querySelector("#query").value,
           mode: document.querySelector("#mode").value,
+          collection: collectionPicker.value,
         }),
-      { signal: request.signal },
+      { signal: current.signal },
     );
     if (!response.ok) throw Error(await response.text());
     let data = await response.json();
+    if (request !== current) return;
     let groups = data.responses || [data];
     let total = 0;
     for (let group of groups) {
@@ -44,35 +70,66 @@ document.querySelector("#search").onsubmit = async (e) => {
         title.textContent =
           hit._source?.title || hit.source?.title || hit._id || hit.id;
         card.append(title);
+        const collection = group.collection || { id: "pdf", profile: "pdf", label: "PDF records" };
+        const mediaURL = "/original?" + new URLSearchParams({ id: hit._id || hit.id, collection: collection.id });
+        const audioProfile = collection.profile === "transcription";
+        const kind = document.createElement("small");
+        kind.textContent = collection.label;
+        card.append(kind, document.createElement("br"));
         let link = document.createElement("a");
-        link.textContent = "Open original PDF";
-        link.href = "/pdf?" + new URLSearchParams({ id: hit._id || hit.id });
+        link.textContent = audioProfile ? "Open original audio" : collection.profile === "images" ? "Open original image" : "Open original PDF";
+        link.href = mediaURL;
         link.target = "_blank";
         link.rel = "noopener";
         card.append(link);
         let source = hit._source || hit.source || {};
         let matches = hit.hierarchy?.matches || hit.hierarchy?.chunks || [];
-        let first = matches[0]?.hierarchy?.ancestors?.unit?.document;
+        let first = matches[0] ? unitEvidence(matches[0]) : {};
         let page =
           first?.provenance?.page_number || first?.["provenance.page_number"];
-        if (!page && source.metadata?.page_number) {
+        if (!audioProfile && !page && source.metadata?.page_number) {
           link.href += "#page=" + source.metadata.page_number;
           link.textContent += " · page " + source.metadata.page_number;
         }
-        if (page) {
+        if (!audioProfile && page) {
           page += Math.max(1, source.metadata?.page_start || 1) - 1;
           link.href += "#page=" + page;
           link.textContent += " · page " + page;
         }
+        let player;
+        if (audioProfile) {
+          player = document.createElement("audio");
+          player.controls = true;
+          player.preload = "none";
+          player.src = mediaURL;
+          player.setAttribute("aria-label", "Original audio for " + title.textContent);
+          card.append(player);
+          const firstTime = timestamp(first, "start_ms");
+          if (firstTime !== null) link.href += "#t=" + firstTime;
+        }
         for (let match of matches) {
           let p = document.createElement("p");
           p.textContent = (match._source || match.source || {}).text || "";
+          if (audioProfile) {
+            const evidence = unitEvidence(match), start = timestamp(evidence, "start_ms"), end = timestamp(evidence, "end_ms");
+            if (start !== null) {
+              const seek = document.createElement("button");
+              seek.type = "button";
+              seek.textContent = "Play " + timeLabel(start) + (end !== null && end >= start ? "–" + timeLabel(end) : "");
+              seek.onclick = () => {
+                const play = () => { player.currentTime = start; player.play().catch(() => { status.textContent = "Use the audio controls to start playback."; }); };
+                if (player.readyState >= 1) play();
+                else { player.onloadedmetadata = () => { player.onloadedmetadata = null; play(); }; player.load(); }
+              };
+              card.append(seek);
+            }
+          }
           card.append(p);
         }
         let evidence = document.createElement("details"),
           summary = document.createElement("summary"),
           pre = document.createElement("pre");
-        summary.textContent = "Source and page evidence";
+        summary.textContent = audioProfile ? "Source and timestamp evidence" : "Source and page evidence";
         pre.textContent = JSON.stringify(hit, null, 2);
         evidence.append(summary, pre);
         card.append(evidence);
@@ -95,7 +152,7 @@ document.querySelector("#search").onsubmit = async (e) => {
       total +
       " results. Semantic and graph modes require their enrichment stages to finish.";
   } catch (error) {
-    if (error.name !== "AbortError") status.textContent = error.message;
+    if (request === current && error.name !== "AbortError") status.textContent = error.message;
   }
 };
 

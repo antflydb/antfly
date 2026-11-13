@@ -42,14 +42,28 @@ var explorerJS string
 func exploreCmd(args []string) error {
 	f := flag.NewFlagSet("explore", flag.ContinueOnError)
 	endpoint := f.String("url", DefaultAntflyURL, "Antfly API")
-	table := f.String("table", "grepstein_corpus", "Corpus table")
+	table := f.String("table", "grepstein_corpus", "PDF corpus table")
+	collections := f.String("collections", os.Getenv("GREPSTEIN_COLLECTIONS"), "JSON array of named table/profile collections")
 	listen := f.String("listen", ":"+envDefault("PORT", "3000"), "Listen address")
 	if err := f.Parse(args); err != nil {
 		return err
 	}
 	// The hosted process uses a table-scoped read key. It never exposes that key
 	// or accepts arbitrary API paths, query bodies, or mutation operations.
-	handler := explorerHandler(strings.TrimRight(*endpoint, "/")+"/tables/"+url.PathEscape(*table), &http.Client{Timeout: 45 * time.Second})
+	configured, err := parseExplorerCollections(*endpoint, *table, *collections)
+	if err != nil {
+		return err
+	}
+	bucket := os.Getenv("GREPSTEIN_BUCKET")
+	storageClient := gcsReadClient
+	if bucket != "" {
+		storage, err := gcsReadClient(context.Background())
+		if err != nil {
+			return fmt.Errorf("initialize original storage: %w", err)
+		}
+		storageClient = func(context.Context) (*http.Client, error) { return storage, nil }
+	}
+	handler := explorerCollectionsHandler(configured, &http.Client{Timeout: 45 * time.Second}, bucket, storageClient)
 	fmt.Printf("Grepstein explorer listening on %s\n", *listen)
 	return (&http.Server{Addr: *listen, Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: time.Minute}).ListenAndServe()
 }
@@ -65,6 +79,9 @@ func explorerHandler(tableURL string, client *http.Client) http.Handler {
 	return explorerHandlerWithStorage(tableURL, client, os.Getenv("GREPSTEIN_BUCKET"), gcsReadClient)
 }
 func explorerHandlerWithStorage(tableURL string, client *http.Client, bucket string, storageClient func(context.Context) (*http.Client, error)) http.Handler {
+	return boundExplorerRequests(explorerCollectionHandler(tableURL, "pdf", client, bucket, storageClient), 4)
+}
+func explorerCollectionHandler(tableURL, profile string, client *http.Client, bucket string, storageClient func(context.Context) (*http.Client, error)) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /explorer.js", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
@@ -88,7 +105,7 @@ func explorerHandlerWithStorage(tableURL string, client *http.Client, bucket str
 			http.Error(w, "Enter a query of at most 2048 bytes", 400)
 			return
 		}
-		payload, err := explorerQuery(q, mode)
+		payload, err := explorerProfileQuery(q, mode, profile)
 		if err != nil {
 			http.Error(w, err.Error(), 400)
 			return
@@ -110,7 +127,7 @@ func explorerHandlerWithStorage(tableURL string, client *http.Client, bucket str
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(raw)
 	})
-	mux.HandleFunc("GET /pdf", func(w http.ResponseWriter, r *http.Request) {
+	original := func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		if id == "" || len(id) > 1024 {
 			http.Error(w, "Invalid document", 400)
@@ -131,7 +148,8 @@ func explorerHandlerWithStorage(tableURL string, client *http.Client, bucket str
 		}
 		original, _ := doc["original_url"].(string)
 		u, err := url.Parse(original)
-		if err != nil || !validOriginalLocator(u, bucket) {
+		contentType := profileOriginalContentType(u, bucket, profile)
+		if err != nil || contentType == "" {
 			http.Error(w, "Source unavailable", 404)
 			return
 		}
@@ -140,26 +158,34 @@ func explorerHandlerWithStorage(tableURL string, client *http.Client, bucket str
 			http.Error(w, "Storage unavailable", 502)
 			return
 		}
-		storage.Timeout = time.Minute
+		// The injected transport/token source is shared; only this request's
+		// client timeout is copied, without racing another range request.
+		boundedStorage := *storage
+		boundedStorage.Timeout = time.Minute
 		query := url.Values{"alt": {"media"}}
 		if u.Scheme == "gs" {
 			query.Set("generation", u.Query().Get("generation"))
 		}
-		req, err := http.NewRequestWithContext(r.Context(), "GET", "https://storage.googleapis.com/storage/v1/b/"+url.PathEscape(bucket)+"/o/"+url.PathEscape(strings.TrimPrefix(u.Path, "/"))+"?"+query.Encode(), nil)
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, "https://storage.googleapis.com/storage/v1/b/"+url.PathEscape(bucket)+"/o/"+url.PathEscape(strings.TrimPrefix(u.Path, "/"))+"?"+query.Encode(), nil)
 		if err != nil {
 			http.Error(w, "Source unavailable", 502)
 			return
 		}
+		req.Header.Set("Accept-Encoding", "identity")
 		if value := r.Header.Get("Range"); value != "" {
+			if !singleMediaRange.MatchString(value) {
+				http.Error(w, "Invalid byte range", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
 			req.Header.Set("Range", value)
 		}
-		response, err := storage.Do(req)
+		response, err := boundedStorage.Do(req)
 		if err != nil {
 			http.Error(w, "Source unavailable", 502)
 			return
 		}
 		defer response.Body.Close()
-		if response.StatusCode != 200 && response.StatusCode != 206 {
+		if response.StatusCode != 200 && response.StatusCode != 206 && response.StatusCode != 416 {
 			http.Error(w, "Source unavailable", 502)
 			return
 		}
@@ -168,13 +194,17 @@ func explorerHandlerWithStorage(tableURL string, client *http.Client, bucket str
 				w.Header().Set(key, value)
 			}
 		}
-		w.Header().Set("Content-Type", "application/pdf")
+		w.Header().Set("Content-Type", contentType)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "private, max-age=300")
 		w.WriteHeader(response.StatusCode)
-		io.Copy(w, response.Body)
-	})
-	return boundExplorerRequests(mux, 4)
+		if r.Method != http.MethodHead && response.StatusCode != 416 {
+			io.Copy(w, response.Body)
+		}
+	}
+	mux.HandleFunc("GET /original", original)
+	mux.HandleFunc("GET /pdf", original)
+	return mux
 }
 
 // Bound work at the exposed HTTP boundary, including direct API and PDF calls.
@@ -182,7 +212,7 @@ func explorerHandlerWithStorage(tableURL string, client *http.Client, bucket str
 func boundExplorerRequests(next http.Handler, limit int) http.Handler {
 	active := make(chan struct{}, limit)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/api/") && r.URL.Path != "/pdf" {
+		if !strings.HasPrefix(r.URL.Path, "/api/") && r.URL.Path != "/pdf" && r.URL.Path != "/original" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -201,6 +231,9 @@ func boundExplorerRequests(next http.Handler, limit int) http.Handler {
 }
 
 func explorerQuery(q, mode string) (map[string]any, error) {
+	return explorerProfileQuery(q, mode, "pdf")
+}
+func explorerProfileQuery(q, mode, profile string) (map[string]any, error) {
 	payload := map[string]any{"limit": 20, "fields": []string{"title", "original_url", "metadata"}}
 	switch mode {
 	case "", "text":
@@ -218,7 +251,7 @@ func explorerQuery(q, mode string) (map[string]any, error) {
 	default:
 		return nil, fmt.Errorf("Unknown search mode")
 	}
-	payload["hierarchy"] = map[string]any{"group_by": map[string]any{"level": "source", "matches": map[string]any{"limit": 3, "fields": []string{"text"}}}, "ancestors": map[string]any{"unit": map[string]any{"fields": []string{"provenance.page_number"}}}}
+	payload["hierarchy"] = map[string]any{"group_by": map[string]any{"level": "source", "matches": map[string]any{"limit": 3, "fields": []string{"text"}}}, "ancestors": map[string]any{"unit": map[string]any{"fields": explorerProvenanceFields(profile)}}}
 	return payload, nil
 }
 
@@ -228,20 +261,47 @@ func gcsReadClient(ctx context.Context) (*http.Client, error) {
 	return google.DefaultClient(ctx, "https://www.googleapis.com/auth/devstorage.read_only")
 }
 
-// Only immutable original PDFs in the configured private bucket can be served.
-// Page fragments are citations and never become part of the storage request.
+// Original locators are content-addressed objects in the configured bucket.
+// A collection's profile determines its allowed media; URLs never choose it.
+var originalObjectPath = regexp.MustCompile(`^/objects/sha256/[a-f0-9]{64}\.([a-z0-9]+)$`)
+var singleMediaRange = regexp.MustCompile(`^bytes=(?:[0-9]+-[0-9]*|-[0-9]+)$`)
+
+var explorerMediaTypes = map[string]map[string]string{
+	"pdf":           {"pdf": "application/pdf"},
+	"transcription": {"wav": "audio/wav", "mp3": "audio/mpeg", "m4a": "audio/mp4", "ogg": "audio/ogg", "opus": "audio/ogg", "aac": "audio/aac", "aif": "audio/aiff", "aiff": "audio/aiff", "caf": "audio/x-caf", "flac": "audio/flac"},
+	"images":        {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"},
+}
+
 func validOriginalLocator(u *url.URL, bucket string) bool {
-	if u == nil || bucket == "" || u.Host != bucket || u.User != nil || !regexp.MustCompile(`^/objects/sha256/[a-f0-9]{64}\.pdf$`).MatchString(u.Path) {
-		return false
+	return profileOriginalContentType(u, bucket, "pdf") != ""
+}
+func profileOriginalContentType(u *url.URL, bucket, profile string) string {
+	if u == nil || bucket == "" || u.Host != bucket || u.User != nil {
+		return ""
+	}
+	match := originalObjectPath.FindStringSubmatch(u.Path)
+	if len(match) != 2 {
+		return ""
+	}
+
+	mime := explorerMediaTypes[profile][match[1]]
+	if mime == "" {
+		return ""
 	}
 	if u.Scheme == "s3" {
-		return u.RawQuery == "" && !u.ForceQuery
+		if u.RawQuery == "" && !u.ForceQuery {
+			return mime
+		}
+		return ""
 	}
 	if u.Scheme != "gs" {
-		return false
+		return ""
 	}
 	q, err := url.ParseQuery(u.RawQuery)
-	return err == nil && len(q) == 1 && len(q["generation"]) == 1 && validGCSGeneration(q.Get("generation")) && u.RawQuery == "generation="+q.Get("generation")
+	if err != nil || len(q) != 1 || len(q["generation"]) != 1 || !validGCSGeneration(q.Get("generation")) || u.RawQuery != "generation="+q.Get("generation") {
+		return ""
+	}
+	return mime
 }
 func validGCSGeneration(value string) bool {
 	if value == "" || value[0] == '0' {
