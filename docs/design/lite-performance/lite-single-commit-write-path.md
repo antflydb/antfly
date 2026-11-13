@@ -2500,20 +2500,75 @@ revision), then the `ReadView` type itself on `perf/lwa-readview`:
   exact same bug class as `docstore.Cursor`'s original one, just not
   yet found there. Per-key resolution was already checkpoint-
   independent; only enumeration needed widening.
-- Not done: `docstore.Cursor`'s three-way merge still does its own
-  disk/overlay comparison loop (now against `ReadView.
-  openDocumentTreeCursor`/`openDocumentOverlayScan`/
-  `documentOverlayEntry`/`readValueChainAlloc` instead of constructing
-  `CheckpointedTree`/`OverlayScanState`/`redoOverlayEntry` directly, but
-  the comparison/consumption logic itself did not move into a
-  `native.zig`-side `MergedCursor`). Building that abstraction --
-  genuinely hiding `CheckpointedTree`, and supporting `Cursor`'s keys-
-  only/length-only short-circuits against its own disk-side candidate
-  without materializing a full value -- is the next step toward fully
-  collapsing this into one primitive. `ReadGeneration` itself also has
-  not been collapsed onto `ReadView`; it keeps its own pin lifecycle,
-  with `Txn.readView()` building a `borrowed` `ReadView` over it per
-  call.
+- Done: `readBatchAtCheckpoint` runs one overlay pre-pass internally,
+  shared by every batch read it serves -- plain value gets
+  (`getDocumentsAtCheckpointWithState`, now a thin delegate) and every
+  score-batch variant (`visitScoresAtCheckpointWithState`,
+  `readDecodedScoresAtCheckpointWithState`,
+  `visitCompleteScoresAtCheckpointWithState`,
+  `visitPreparedScoresAtCheckpointWithState`/`visitOwnedScoresAtCheckpointWithState`)
+  alike. The score-reading family had no overlay knowledge at all
+  before this (a graph-metric score document logged but not yet
+  folded by `checkpointRedoLog` was invisible to a score-batch read
+  even though a plain `get()` on the same key found it immediately);
+  `visitCanonicalScores`'s own separate empty-tree-only shortcut
+  (which bypassed `readBatchAtCheckpoint` entirely) is removed for the
+  same reason. Gated on the documents-root overlay actually being
+  non-empty (`SharedRedoOverlay.count`), confirmed necessary against a
+  real regression: several memory-budget/OOM-injection tests assert
+  an exact allocation count for this function and broke without the
+  gate, on a file that had `use_redo_log` on but nothing ever
+  diverted into the overlay during the assertion in question.
+- Done: `native.MergedCursor` -- the two-way (checkpointed tree,
+  redo-log overlay) comparison/tie-breaking/lookahead-buffering loop
+  extracted (not reinvented) from `docstore.Cursor`'s own original
+  three-way merge's "redo vs disk" half, behind the single constructor
+  `ReadView.openMergedDocumentCursor`. `CheckpointedTree` is now
+  genuinely non-`pub` -- `docstore.Cursor` holds a `MergedCursor`
+  instead (its own keys-only/length-only short-circuits still apply to
+  `MergedCursor.Entry.disk`'s raw, unresolved `DocumentIndexEntry`
+  exactly as before), and `Cursor.resolveMerged` is now a true two-way
+  merge (`pending_tree` vs whatever `MergedCursor` returns). Building
+  this surfaced a real bug in the process: `MergedCursor.advance`'s
+  overlay branch treated a `resolveAlloc` miss as corruption
+  (`error.InvalidNativeRedoRecord`), the same (equally wrong) pattern
+  `CatalogCursor.next`/`nextRecordAlloc` and `LiveRecordCursor.next`
+  still have -- correct only when every overlay-enumerated key's
+  version chain predates the view's own mark, which fails for a
+  `ReadView` pinned to an older snapshot when the overlay (gate-free
+  since the fix above) enumerates a key created only after that
+  snapshot. Fixed by resolving the overlay candidate *before* decoding
+  whether to consume a tied disk candidate, so a phantom overlay entry
+  never discards disk's own correct answer for that view; caught by
+  "lite key-only cursor preserves prefix overlay bounds and pinned
+  snapshots" (a pinned read opened before a later write adds a
+  brand-new key under the same prefix). `CatalogCursor`/
+  `LiveRecordCursor`'s identical pattern is not fixed -- not currently
+  known to be reachable with a genuinely historical mark, but a
+  documented, narrower risk for a future caller that pins one.
+- Not done: `ReadGeneration` has not been collapsed onto `ReadView`;
+  it keeps its own pin lifecycle (`ReadPin` linked list, `references`
+  counting, retirement, the kernel-level reader fence for
+  `externally_locked` stores, and the `reader_frontier` atomic
+  `Store.reuseFrontier` reads as a fast path), with `Txn.readView()`
+  building a `borrowed` `ReadView` over it per call. Assessed, not
+  attempted: each individual pin *could* become its own
+  `ReadView.openAt` (the underlying `SharedRedoOverlay.pin`/
+  `inode_lock.pinReader` registries are already multisets, not
+  reference counts, so one entry per `Txn` is already how they behave
+  today), but `Store`'s own `read_mutex`-protected "oldest live pin"
+  bookkeeping, generation retirement (swapping the underlying file
+  after e.g. a vacuum while old readers finish), and the kernel-fence
+  machinery are `Store`-level concerns with no `ReadView`-shaped
+  equivalent -- collapsing them would mean removing `Store.
+  read_generation`/`ReadPin`/`pinInitializedReadGeneration`/
+  `releaseReadGeneration`/`retireReadGeneration` outright and
+  rerouting every call site (`openReadWithPrefix`, `openWriteWithPrefix`,
+  `openWriteYieldingWithPrefix`, `observeReadCheckpoint`, ...) plus
+  reworking `reuseFrontier` to drop `reader_frontier`'s own fast path
+  in favor of `inode_lock.minimumReaderSequence` alone -- a store-wide
+  architectural change, not a cheap one. Left as the next step, not
+  attempted this pass.
 - Not done: the reclaim agent's planned redo on/off differential oracle
   against the `ReadView` API.
 - Tests added: "lite derived catch-up sees a document..." (earlier
@@ -2531,7 +2586,12 @@ revision), then the `ReadView` type itself on `perf/lwa-readview`:
   currently fails on its first call for an unrelated, separately-owned
   write-path bug (a `LogFull`/`OutcomeUnknown` case in index creation's
   own `deleteTree`, traced but not fixed by this branch -- see the
-  `perf/lwa-readview` report).
+  `perf/lwa-readview` report); "lite redo log score-batch read sees a
+  graph-metric score document logged before any checkpoint"
+  (`native.zig`) -- put/overwrite/delete/insert across a checkpoint
+  boundary, through `getScoresAtCheckpointWithState` and
+  `readDecodedScoresAtCheckpointWithState`, confirming the
+  `readBatchAtCheckpoint` overlay pre-pass fix above directly.
 
 ### 9.8 Gates (from step (c) on)
 
