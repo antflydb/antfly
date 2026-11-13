@@ -28,12 +28,213 @@ import math
 import os
 import platform
 import re
+import signal
 import sys
 import subprocess
 import struct
 import time
 from pathlib import Path
 from statistics import median
+
+
+class CancellationScope:
+    """Record signals; interrupt only at ownership-safe polling boundaries."""
+
+    current = None
+
+    def __init__(self):
+        self.signum = None
+        self.signals = [signal.SIGTERM, signal.SIGINT]
+        if hasattr(signal, "SIGHUP"):
+            self.signals.append(signal.SIGHUP)
+
+    def request(self, signum, _frame=None):
+        if self.signum is None:
+            self.signum = signum
+
+    def check(self):
+        if self.signum is not None:
+            raise SystemExit(128 + self.signum)
+
+    def __enter__(self):
+        self.previous = CancellationScope.current
+        self.handlers = {sig: signal.signal(sig, self.request) for sig in self.signals}
+        # A controller re-exec hands pending signals across exec while blocked.
+        # Install handlers before releasing those signals in the frozen image.
+        self.mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, self.signals)
+        CancellationScope.current = self
+        return self
+
+    def __exit__(self, *_):
+        CancellationScope.current = self.previous
+        signal.pthread_sigmask(signal.SIG_SETMASK, self.mask)
+        for sig, handler in self.handlers.items():
+            signal.signal(sig, handler)
+
+    def exec(self, argv):
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, self.signals)
+        try:
+            self.check()
+            os.execv(argv[0], argv)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def check_cancellation():
+    if CancellationScope.current is not None:
+        CancellationScope.current.check()
+
+
+def terminate_group(process):
+    if getattr(process, "_antfly_group_drained", False):
+        return
+    process.poll()
+
+    def send(value):
+        for attempt in range(2):
+            try:
+                os.killpg(process.pid, value)
+                return
+            except ProcessLookupError:
+                return
+            except PermissionError:
+                if attempt or process.poll() is None:
+                    raise
+
+    send(signal.SIGTERM)
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        send(signal.SIGKILL)
+        process.wait(timeout=10)
+        process._antfly_group_drained = True
+
+
+class OwnedProcess:
+    """Establish cleanup before spawning, including resource-aware native waits."""
+
+    def __init__(self, *, collect_usage=False):
+        self.process = None
+        self.usage = None
+        self.collect_usage = collect_usage
+        self.cleaning = False
+
+    def __enter__(self):
+        return self
+
+    def start(self, argv, **kwargs):
+        check_cancellation()
+        kwargs.setdefault("start_new_session", True)
+        kwargs.setdefault("stdin", subprocess.DEVNULL)
+        self.owns_group = kwargs["start_new_session"]
+        self.argv = argv
+        self.process = subprocess.Popen(argv, **kwargs)
+        # Signal handlers only record intent, so ownership is established even
+        # when a signal arrives inside Popen before it returns the child.
+        check_cancellation()
+        return self
+
+    @property
+    def pid(self):
+        return self.process.pid
+
+    @property
+    def returncode(self):
+        return self.process.returncode if self.process is not None else None
+
+    def poll(self):
+        if self.process is None or self.returncode is not None:
+            return self.returncode
+        if not self.collect_usage:
+            return self.process.poll()
+        pid, status, usage = os.wait4(self.pid, os.WNOHANG)
+        if pid:
+            self.usage = usage
+            self.process.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+
+    def wait(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if not self.cleaning:
+                check_cancellation()
+            code = self.poll()
+            if code is not None:
+                return code
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self.argv, timeout)
+            time.sleep(0.02)
+
+    def communicate(self, timeout):
+        deadline = time.monotonic() + timeout
+        while True:
+            check_cancellation()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(self.argv, timeout)
+            try:
+                return self.process.communicate(timeout=min(0.2, remaining))
+            except subprocess.TimeoutExpired:
+                pass
+
+    def __getattr__(self, name):
+        return getattr(self.process, name)
+
+    def __exit__(self, *_):
+        if self.process is None:
+            return
+        self.cleaning = True
+        try:
+            if self.owns_group:
+                terminate_group(self)
+            elif self.poll() is None:
+                # A native child stays in the worker's group. The controller's
+                # escalation therefore also reaches it if worker cleanup stalls.
+                self.process.terminate()
+                try:
+                    self.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.wait(timeout=10)
+        finally:
+            for stream in (
+                self.process.stdin,
+                self.process.stdout,
+                self.process.stderr,
+            ):
+                if stream is not None:
+                    stream.close()
+
+
+def sha256_stream(stream):
+    digest = hashlib.sha256()
+    buffer = bytearray(1024 * 1024)
+    view = memoryview(buffer)
+    while True:
+        check_cancellation()
+        count = stream.readinto(buffer)
+        check_cancellation()
+        if not count:
+            break
+        digest.update(view[:count])
+    return digest.hexdigest()
+
+
+def gcs_probe_environment(auth="adc"):
+    """Real GCS qualification has explicit endpoints and refreshable ADC."""
+    env = probe_environment()
+    forbidden = ["GCS_JSON_API_ENDPOINT", "GCS_JSON_API_UPLOAD_ENDPOINT"]
+    if auth == "adc":
+        forbidden += ["GCS_BEARER_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN"]
+    inherited = sorted(key for key in forbidden if env.get(key))
+    if inherited:
+        # Values can contain credentials; report names only.
+        raise ValueError(
+            "GCS qualification rejects inherited overrides: " + ", ".join(inherited)
+        )
+    return env
 
 
 def validate_truth(path, manifest, dims):
@@ -51,7 +252,7 @@ def validate_truth(path, manifest, dims):
     ):
         payload = path / name
         with payload.open("rb") as stream:
-            actual = hashlib.file_digest(stream, "sha256").hexdigest()
+            actual = sha256_stream(stream)
         if payload.stat().st_size != size or actual != manifest["outputs"][name]:
             raise ValueError(f"ground-truth payload mismatch: {payload}")
 
@@ -137,7 +338,7 @@ def validate_recall(records, truth):
 def validate_source(source, truth):
     if source.is_file():
         with source.open("rb") as stream:
-            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            digest = sha256_stream(stream)
         if digest != truth["source_sha256"]:
             raise ValueError("ground truth is not bound to this Parquet source")
         return dict(bytes=source.stat().st_size, sha256=digest, fixture=None)
@@ -171,7 +372,7 @@ def validate_source(source, truth):
             if (
                 stream.read(84) != expected_header
                 or payload.stat().st_size != item["bytes"] + 84
-                or hashlib.file_digest(stream, "sha256").hexdigest() != item["sha256"]
+                or sha256_stream(stream) != item["sha256"]
             ):
                 raise ValueError(f"framed Parquet payload mismatch: {payload}")
     return dict(bytes=sum(f["bytes"] for f in files), sha256=None, fixture=fixture)
@@ -248,10 +449,7 @@ def main():
         order = configs if trial % 2 == 0 else list(reversed(configs))
         for name, fused, compact, prebind in order:
             with executable.open("rb") as stream:
-                if (
-                    hashlib.file_digest(stream, "sha256").hexdigest()
-                    != report["executable_sha256"]
-                ):
+                if sha256_stream(stream) != report["executable_sha256"]:
                     raise ValueError("benchmark executable changed after preflight")
             validate_truth(args.recall, truth_manifest, args.dims)
             env = dict(
@@ -321,10 +519,7 @@ def main():
             write_report(args.output, report)
             try:
                 with executable.open("rb") as stream:
-                    if (
-                        hashlib.file_digest(stream, "sha256").hexdigest()
-                        != report["executable_sha256"]
-                    ):
+                    if sha256_stream(stream) != report["executable_sha256"]:
                         raise ValueError(
                             "benchmark executable changed during execution"
                         )

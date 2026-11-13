@@ -189,7 +189,13 @@ with open(sys.argv[1],'ab',buffering=0) as out:
     def test_sighup_cancels_the_real_snapshotted_controller_and_worker_group(self):
         self.check_controller_cancellation(signal.SIGHUP)
 
-    def check_controller_cancellation(self, signum):
+    def test_signal_during_worker_launch_is_owned_and_reported(self):
+        self.check_controller_cancellation(signal.SIGTERM, when="launch")
+
+    def test_pending_hangup_survives_frozen_controller_exec(self):
+        self.check_controller_cancellation(signal.SIGHUP, when="exec")
+
+    def check_controller_cancellation(self, signum, *, when="running"):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             pulse = root / "pulse"
@@ -246,6 +252,38 @@ with open(sys.argv[1],'ab',buffering=0) as out:
                 ANTFLY_LAKE_BULK_REOPEN_ONLY="1",
                 ANTFLY_LAKE_PROBE_HEADROOM="unknown",
             )
+            for key in (
+                "GCS_BEARER_TOKEN",
+                "GOOGLE_OAUTH_ACCESS_TOKEN",
+                "GCS_JSON_API_ENDPOINT",
+                "GCS_JSON_API_UPLOAD_ENDPOINT",
+            ):
+                env.pop(key, None)
+            if when != "running":
+                injection = root / "inject"
+                injection.mkdir()
+                worker_pid = root / "worker.pid"
+                (injection / "sitecustomize.py").write_text(
+                    "import os,signal,subprocess\nfrom pathlib import Path\n"
+                    + "original=subprocess.Popen\ndef spawn(argv,*args,**kwargs):\n p=original(argv,*args,**kwargs)\n"
+                    + " if any(str(a).endswith('gcs_bulk_worker.py') for a in argv):\n  Path(os.environ['INJECT_WORKER_PID']).write_text(str(p.pid))\n"
+                    + (
+                        "  os.kill(os.getpid(),int(os.environ['INJECT_SIGNAL']))\n"
+                        if when == "launch"
+                        else ""
+                    )
+                    + " return p\nsubprocess.Popen=spawn\n"
+                    + (
+                        "original_exec=os.execv\ndef execute(path,argv):\n os.kill(os.getpid(),int(os.environ['INJECT_SIGNAL']))\n original_exec(path,argv)\nos.execv=execute\n"
+                        if when == "exec"
+                        else ""
+                    )
+                )
+                env.update(
+                    PYTHONPATH=str(injection),
+                    INJECT_SIGNAL=str(int(signum)),
+                    INJECT_WORKER_PID=str(worker_pid),
+                )
             output = root / "case"
             with (root / "controller.log").open("w") as log:
                 process = subprocess.Popen(
@@ -274,37 +312,56 @@ with open(sys.argv[1],'ab',buffering=0) as out:
                     stderr=subprocess.STDOUT,
                 )
                 try:
-                    deadline = time.monotonic() + 10
-                    while (
-                        not pulse.exists()
-                        and process.poll() is None
-                        and time.monotonic() < deadline
-                    ):
-                        time.sleep(0.02)
-                    self.assertTrue(
-                        pulse.exists(), (root / "controller.log").read_text()
-                    )
-                    actual_env = json.loads(environment.read_text())
-                    self.assertEqual(actual_env["ANTFLY_LAKE_BULK_COMPACT"], "0")
-                    for key in (
-                        "ANTFLY_LAKE_BULK_PARQUET_FILE",
-                        "ANTFLY_LAKE_BULK_REOPEN_ONLY",
-                        "ANTFLY_LAKE_PROBE_HEADROOM",
-                    ):
-                        self.assertNotIn(key, actual_env)
-                    process.send_signal(signum)
+                    if when == "running":
+                        deadline = time.monotonic() + 10
+                        while (
+                            not pulse.exists()
+                            and process.poll() is None
+                            and time.monotonic() < deadline
+                        ):
+                            time.sleep(0.02)
+                        self.assertTrue(
+                            pulse.exists(), (root / "controller.log").read_text()
+                        )
+                        actual_env = json.loads(environment.read_text())
+                        self.assertEqual(actual_env["ANTFLY_LAKE_BULK_COMPACT"], "0")
+                        for key in (
+                            "ANTFLY_LAKE_BULK_PARQUET_FILE",
+                            "ANTFLY_LAKE_BULK_REOPEN_ONLY",
+                            "ANTFLY_LAKE_PROBE_HEADROOM",
+                        ):
+                            self.assertNotIn(key, actual_env)
+                        process.send_signal(signum)
                     self.assertEqual(process.wait(timeout=15), 128 + signum)
-                    time.sleep(0.1)
-                    before = pulse.stat().st_size
-                    time.sleep(0.1)
-                    self.assertEqual(before, pulse.stat().st_size)
+                    if when == "running":
+                        time.sleep(0.1)
+                        before = pulse.stat().st_size
+                        time.sleep(0.1)
+                        self.assertEqual(before, pulse.stat().st_size)
                     report = json.loads((output / "local.json").read_text())
                     self.assertFalse(report["qualified"])
                     self.assertEqual(report["status"], "cancelled")
                     self.assertEqual(report["controller_exit_code"], 128 + signum)
-                    self.assertGreater(report["wall_seconds"], 0)
-                    self.assertNotEqual(report["worker_exit_code"], 0)
+                    if when != "exec":
+                        self.assertGreater(report["wall_seconds"], 0)
+                        self.assertNotEqual(report["worker_exit_code"], 0)
+                        self.assertTrue(report["worker_started"])
+                    else:
+                        self.assertFalse(report["worker_started"])
+                    if when == "launch":
+                        with self.assertRaises(ProcessLookupError):
+                            os.killpg(int(worker_pid.read_text()), 0)
                     self.assertTrue((output / "inputs/manifest.json").exists())
+                    if when == "running":
+                        child_report = json.loads(
+                            (output / "case/result.json").read_text()
+                        )
+                        self.assertFalse(child_report["qualified"])
+                        self.assertEqual(child_report["status"], "cancelled")
+                        self.assertTrue(
+                            child_report["scratch_sample"]["sampler_stopped"]
+                        )
+                        self.assertTrue((output / "case/disk-samples.json").exists())
                 finally:
                     controller.terminate_group(process)
                     if pidfile.exists():

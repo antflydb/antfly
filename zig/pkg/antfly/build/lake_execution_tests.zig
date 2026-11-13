@@ -21,6 +21,11 @@ const Imports = @import("../../../build_support/antfly/imports.zig").AntflyRootI
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, imports: Imports, vopr: *std.Build.Module, lmdb_engine: *std.Build.Module) void {
     const source_imports = sourceImports(b, imports);
     const test_imports = @import("../../../build_support/antfly/test_support.zig").Imports{ .runtime = source_imports, .vopr = vopr, .lmdb_engine = lmdb_engine };
+    const identity_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/lake_identity_publication_test_root.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, identity_module, false, true);
+    const identity_tests = b.addTest(.{ .root_module = identity_module, .filters = &.{"external lake execution bulk identity publication"} });
+    imports.build_info.linkTest(identity_tests.root_module);
+    b.step("lake-identity-publication-test", "Measure bounded identity chunks and verify the complete stored corpus").dependOn(&b.addRunArtifact(identity_tests).step);
     const provider = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/lake_execution_provider_probe_root.zig"), .target = target, .optimize = optimize, .pic = true });
     test_imports.configure(b, provider, false, true);
     // This fixture owns source implementations rather than production storage

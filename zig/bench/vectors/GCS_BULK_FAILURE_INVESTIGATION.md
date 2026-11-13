@@ -106,7 +106,54 @@ local ADC: conditional create, conflict preservation, pinned range reads,
 generation CAS and conditional deletion of the created test object. No cloud
 worker or infrastructure was created.
 
+## Fresh review follow-up
+
+The first hangup fix still allowed a signal between worker creation and entry
+to its cleanup `try`. An isolated real-controller reproduction started the native
+child, injected SIGHUP before `Popen` returned, and observed a surviving worker
+with status still running and no worker exit/elapsed fields. A separate injected
+post-worker metadata failure left status `worker_finished` and exit zero without
+a controller error. The historical failed 1M result also confirmed that failure
+paths omitted the disk sampler's in-memory minimum-free-space observations.
+
+The controller/worker now use signal-recording cancellation scopes and process
+owners established before child creation. Re-exec preserves pending signals;
+cleanup ignores repeated cancellation until children are drained and reaped.
+Native children remain in the worker group for controller escalation. One outer
+reporting boundary handles admission, worker and post-validation failures.
+Disk samples are periodically checkpointed and finalized on failure/cancellation,
+with explicit sampling errors and unavailable resource measurements.
+
+ADC qualification rejects inherited static bearer tokens and alternate GCS
+endpoints before execution, reports names rather than values, and records its
+admitted provider mode/endpoints. Explicit ADC files remain supported. Tests cover
+signals during launch and exec, repeated signals during cleanup, process creation
+failure, post-worker source validation, cancellation while hashing, disk sampling
+failure and cancellation after successful native completion.
+
+The measured publication optimization retains the 256 KiB reader cap: a fresh
+bulk owner selects a 262,037-byte target and admits the tracker in its existing
+private quota. Full one-million-key write/readback fixtures reduced chunk puts
+489→367 (96-byte keys) and 550→413 (108-byte keys). A 1 MiB candidate failed
+reader validation and was rejected. See the raw
+[publication observations](bulk_identity_publication_results.json); these are
+artifact API counts, not full-build throughput measurements.
+
+The ongoing GCS 1M run is frozen to the earlier executable/harness snapshot.
+Edits in this follow-up do not change that running build's inputs. Any subsequent
+reopen has its own executable and harness hashes and must be identified by those
+hashes rather than assumed to use the same workspace revision.
+
 ## Remaining scale evidence
+
+Follow-up validation passed all 99 native build steps (including ABI integration,
+the runtime probe, and the publication/readback fixture) and 45 Python regression
+tests. A fresh frozen 1,024-row live GCS case using ADC also qualified: build,
+reopen/recall, unchanged source generation and frozen input hashes, and finalized
+scratch sampling all passed. Its executable SHA-256 was
+`7d367deb1eb7f30c7eabe3a700ecd08a27b58e20f2d2197ce97c813d7e932594`.
+The 28.73-second worker wall time is a small correctness check, not a scale or
+performance qualification.
 
 The historical failure's exact root cause remains unknown. A new qualification
 must retain the operation diagnostics rather than treating the retry fix as

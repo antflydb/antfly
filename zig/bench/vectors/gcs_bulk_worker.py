@@ -28,6 +28,9 @@ import threading
 import shutil
 
 
+from bench_bulk_pipeline import CancellationScope, OwnedProcess, gcs_probe_environment
+
+
 def atomic(path, value):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n")
@@ -298,11 +301,119 @@ def validate_evidence(cfg, row, receipt=None):
             raise RuntimeError("preassigned parents were rewritten")
 
 
-def main():
+class DiskSampler:
+    """Checkpoint scratch evidence independently of successful qualification."""
+
+    def __init__(self, root, report):
+        self.root, self.report = root, report
+        self.stop = threading.Event()
+        self.lock = threading.Lock()
+        self.error_type = None
+        self.peaks = dict(
+            case_nominal_bytes=0,
+            host_filesystem_min_free_bytes=None,
+        )
+        self.thread = None
+
+    def snapshot(self):
+        with self.lock:
+            return dict(
+                self.peaks,
+                error_type=self.error_type,
+                interval_seconds=2,
+                scope="case directory nominal lengths only; host free-space includes unrelated work, native /tmp scratch not attributed",
+            )
+
+    @staticmethod
+    def walk_error(error):
+        if not isinstance(error, FileNotFoundError):
+            raise error
+
+    def sample(self):
+        total = 0
+        for directory, _, names in os.walk(self.root, onerror=self.walk_error):
+            for name in names:
+                try:
+                    total += (Path(directory) / name).stat().st_size
+                except FileNotFoundError:
+                    pass
+        free = shutil.disk_usage(self.root).free
+        with self.lock:
+            self.peaks["case_nominal_bytes"] = max(
+                self.peaks["case_nominal_bytes"], total
+            )
+            previous = self.peaks["host_filesystem_min_free_bytes"]
+            self.peaks["host_filesystem_min_free_bytes"] = (
+                free if previous is None else min(previous, free)
+            )
+        atomic(self.root / "disk-samples.json", self.snapshot())
+
+    def loop(self):
+        while not self.stop.wait(2):
+            try:
+                self.sample()
+            except Exception as error:
+                with self.lock:
+                    self.error_type = type(error).__name__
+                return
+
+    def __enter__(self):
+        try:
+            self.sample()
+            self.thread = threading.Thread(target=self.loop, daemon=True)
+            self.thread.start()
+        except BaseException as error:
+            self.error_type = type(error).__name__
+            self.report.update(
+                qualified=False,
+                status="failed",
+                error_type=self.error_type,
+                scratch_sample=dict(self.snapshot(), sampler_stopped=True),
+            )
+            atomic(self.root / "result.json", self.report)
+            raise
+        return self
+
+    def __exit__(self, kind, error, _trace):
+        self.stop.set()
+        self.thread.join(timeout=5)
+        if not self.thread.is_alive():
+            try:
+                self.sample()
+            except Exception as failure:
+                self.error_type = self.error_type or type(failure).__name__
+        sample = self.snapshot()
+        sample["sampler_stopped"] = not self.thread.is_alive()
+        self.report["scratch_sample"] = sample
+        broken = self.error_type is not None or not sample["sampler_stopped"]
+        scope = CancellationScope.current
+        cancelled = scope is not None and scope.signum is not None
+        if kind is not None or broken or cancelled:
+            self.report["qualified"] = False
+            self.report["status"] = "cancelled" if cancelled else "failed"
+            self.report["error_type"] = (
+                kind.__name__
+                if kind is not None
+                else "SystemExit"
+                if cancelled
+                else "ScratchSamplingFailed"
+            )
+        else:
+            self.report["status"] = "qualified"
+        atomic(self.root / "result.json", self.report)
+        if kind is None:
+            if cancelled:
+                scope.check()
+            if broken:
+                raise RuntimeError("scratch sampler failed")
+
+
+def run():
     cfg = json.loads(Path(sys.argv[1]).read_text())
     token = "" if cfg.get("auth") == "adc" else sys.stdin.readline(65537).strip()
     if cfg.get("auth") != "adc" and (not token or len(token) > 65536):
         raise ValueError("expected bounded credential on stdin")
+    native_env = gcs_probe_environment(cfg.get("auth", "bearer"))
     root = Path(cfg["work"])
     root.mkdir(exist_ok=False)
     os.chdir(root)
@@ -355,10 +466,8 @@ def main():
     inventory_hash = hashlib.sha256(
         Path("expected-inventory.json").read_bytes()
     ).hexdigest()
-    from bench_bulk_pipeline import probe_environment
-
     env = dict(
-        probe_environment(),
+        native_env,
         BULK_GCS_BEARER=token,
         ANTFLY_LAKE_BULK_CONFIG=str(root / "config.json"),
         ANTFLY_LAKE_BULK_EXPECTED_INVENTORY=str(root / "expected-inventory.json"),
@@ -386,126 +495,120 @@ def main():
         native_config_sha256=config_hash,
         expected_inventory_sha256=inventory_hash,
         qualified=False,
+        provider_environment=dict(
+            credential_mode=cfg.get("auth", "bearer"),
+            storage_endpoint="https://storage.googleapis.com/storage/v1",
+            upload_endpoint="https://storage.googleapis.com/upload/storage/v1",
+        ),
         attempts=[],
         network_scope="Linux process network namespace interfaces, including control traffic; unavailable on macOS; not object-store payload bytes",
     )
     atomic(root / "result.json", report)
-    stop = threading.Event()
-    peaks = {
-        "case_nominal_bytes": 0,
-        "host_filesystem_min_free_bytes": shutil.disk_usage(root).free,
-    }
-
-    def sample_disk():
-        while not stop.is_set():
-            total = 0
-            for base in (root,):
-                for directory, _, names in os.walk(base):
-                    for name in names:
-                        try:
-                            total += (Path(directory) / name).stat().st_size
-                        except FileNotFoundError:
-                            pass
-            peaks["case_nominal_bytes"] = max(peaks["case_nominal_bytes"], total)
-            peaks["host_filesystem_min_free_bytes"] = min(
-                peaks["host_filesystem_min_free_bytes"], shutil.disk_usage(root).free
-            )
-            stop.wait(2)
-
-    sampler = threading.Thread(target=sample_disk, daemon=True)
-    sampler.start()
-    retained_receipt = None
-    for stage in (
-        ["reopen"]
-        if cfg.get("reopen_catalog")
-        else ["interrupt", "resume"]
-        if cfg.get("interrupt")
-        else ["build"]
-    ):
-        if stage == "interrupt":
-            env["ANTFLY_LAKE_BULK_INTERRUPT"] = str(cfg["interrupt"])
-            env.pop("ANTFLY_LAKE_BULK_RECALL_DIR", None)
-        if stage == "resume":
-            env.pop("ANTFLY_LAKE_BULK_INTERRUPT", None)
-            env["ANTFLY_LAKE_BULK_RESUME"] = "1"
-            env["ANTFLY_LAKE_BULK_RECALL_DIR"] = cfg["recall"]
-        before, start = network(), time.monotonic_ns()
-        with (root / (stage + ".log")).open("w") as log:
-            child = subprocess.Popen(
-                [cfg["binary"]], env=env, stdout=log, stderr=subprocess.STDOUT
-            )
-            try:
-                _, status, usage = os.wait4(child.pid, 0)
-                child.returncode = os.waitstatus_to_exitcode(status)
-            finally:
-                if child.returncode is None:
-                    child.kill()
-                    child.wait()
-        row = dict(
-            stage=stage,
-            exit_code=child.returncode,
-            wall_ns=time.monotonic_ns() - start,
-            user_seconds=usage.ru_utime,
-            system_seconds=usage.ru_stime,
-            peak_rss_bytes=usage.ru_maxrss * (1 if sys.platform == "darwin" else 1024),
-            pod_network_bytes=network() - before if before is not None else None,
-            probe_environment={
-                key: value
-                for key, value in env.items()
-                if key.startswith(("ANTFLY_LAKE_BULK_", "ANTFLY_LAKE_PROBE_"))
-            },
-        )
-        report["attempts"].append(row)
-        atomic(root / "result.json", report)
-        if hashlib.sha256(Path("config.json").read_bytes()).hexdigest() != config_hash:
-            raise RuntimeError("native configuration changed during execution")
-        if (
-            hashlib.sha256(Path("expected-inventory.json").read_bytes()).hexdigest()
-            != inventory_hash
+    with DiskSampler(root, report):
+        retained_receipt = None
+        for stage in (
+            ["reopen"]
+            if cfg.get("reopen_catalog")
+            else ["interrupt", "resume"]
+            if cfg.get("interrupt")
+            else ["build"]
         ):
-            raise RuntimeError("expected inventory changed during execution")
-        text = (root / (stage + ".log")).read_text()
-        if token and token in text:
-            raise RuntimeError("credential appeared in child log")
-        row["records"] = parse_records(text)
-        atomic(root / "result.json", report)
-        validate_inventory(cfg, row["records"])
-        if stage == "interrupt":
-            catalog = json.loads((root / "catalog.json").read_text())
-            retained_receipt = validate_interruption(cfg, row, text, catalog)
-            row["retained_receipt"] = retained_receipt
-            row["retained_catalog_sha256"] = hashlib.sha256(
-                (root / "catalog.json").read_bytes()
-            ).hexdigest()
-            continue
-        match = re.search(
-            r"^PARQUET_BULK algorithm=\w+ vectors=(\d+) dims=768 total_ns=(\d+) reopened_hits=10 checkpoints=(\d+) logical_identity=true$",
-            text,
-            re.M,
-        )
-        if child.returncode or not match or int(match[1]) != cfg["rows"]:
-            raise RuntimeError("build/reopen verification failed")
-        row["native_ns"] = int(match[2])
-        row["checkpoints"] = int(match[3])
-        from bench_bulk_pipeline import validate_recall
+            if stage == "interrupt":
+                env["ANTFLY_LAKE_BULK_INTERRUPT"] = str(cfg["interrupt"])
+                env.pop("ANTFLY_LAKE_BULK_RECALL_DIR", None)
+            if stage == "resume":
+                env.pop("ANTFLY_LAKE_BULK_INTERRUPT", None)
+                env["ANTFLY_LAKE_BULK_RESUME"] = "1"
+                env["ANTFLY_LAKE_BULK_RECALL_DIR"] = cfg["recall"]
+            before, start = network(), time.monotonic_ns()
+            owner = OwnedProcess(collect_usage=True)
+            try:
+                with (root / (stage + ".log")).open("w") as log, owner:
+                    owner.start(
+                        [cfg["binary"]],
+                        env=env,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=False,
+                    )
+                    owner.wait()
+            finally:
+                usage = owner.usage
+                row = dict(
+                    stage=stage,
+                    exit_code=owner.returncode,
+                    wall_ns=time.monotonic_ns() - start,
+                    resource_usage_available=usage is not None,
+                    user_seconds=usage.ru_utime if usage is not None else None,
+                    system_seconds=usage.ru_stime if usage is not None else None,
+                    peak_rss_bytes=usage.ru_maxrss
+                    * (1 if sys.platform == "darwin" else 1024)
+                    if usage is not None
+                    else None,
+                    pod_network_bytes=network() - before
+                    if before is not None
+                    else None,
+                    probe_environment={
+                        key: value
+                        for key, value in env.items()
+                        if key.startswith(("ANTFLY_LAKE_BULK_", "ANTFLY_LAKE_PROBE_"))
+                    },
+                )
+                report["attempts"].append(row)
+                atomic(root / "result.json", report)
+            if (
+                hashlib.sha256(Path("config.json").read_bytes()).hexdigest()
+                != config_hash
+            ):
+                raise RuntimeError("native configuration changed during execution")
+            if (
+                hashlib.sha256(Path("expected-inventory.json").read_bytes()).hexdigest()
+                != inventory_hash
+            ):
+                raise RuntimeError("expected inventory changed during execution")
+            text = (root / (stage + ".log")).read_text()
+            if token and token in text:
+                raise RuntimeError("credential appeared in child log")
+            row["records"] = parse_records(text)
+            atomic(root / "result.json", report)
+            validate_inventory(cfg, row["records"])
+            if stage == "interrupt":
+                catalog = json.loads((root / "catalog.json").read_text())
+                retained_receipt = validate_interruption(cfg, row, text, catalog)
+                row["retained_receipt"] = retained_receipt
+                row["retained_catalog_sha256"] = hashlib.sha256(
+                    (root / "catalog.json").read_bytes()
+                ).hexdigest()
+                continue
+            match = re.search(
+                r"^PARQUET_BULK algorithm=\w+ vectors=(\d+) dims=768 total_ns=(\d+) reopened_hits=10 checkpoints=(\d+) logical_identity=true$",
+                text,
+                re.M,
+            )
+            if owner.returncode or not match or int(match[1]) != cfg["rows"]:
+                raise RuntimeError("build/reopen verification failed")
+            row["native_ns"] = int(match[2])
+            row["checkpoints"] = int(match[3])
+            from bench_bulk_pipeline import validate_recall
 
-        truth = json.loads((Path(cfg["recall"]) / "prepare.json").read_text())
-        validate_recall(row["records"].get("PARQUET_BULK_RECALL", []), truth)
+            truth = json.loads((Path(cfg["recall"]) / "prepare.json").read_text())
+            validate_recall(row["records"].get("PARQUET_BULK_RECALL", []), truth)
 
-        validate_evidence(cfg, row, retained_receipt if stage == "resume" else None)
-        if cfg.get("reopen_catalog"):
-            row["build_timing_available"] = False
+            validate_evidence(cfg, row, retained_receipt if stage == "resume" else None)
+            if cfg.get("reopen_catalog"):
+                row["build_timing_available"] = False
 
-    stop.set()
-    sampler.join()
-    report["scratch_sample"] = dict(
-        peaks,
-        interval_seconds=2,
-        scope="case directory nominal lengths only; host free-space includes unrelated work, native /tmp scratch not attributed",
-    )
-    report["qualified"] = True
-    atomic(root / "result.json", report)
+        report["qualified"] = True
     print(json.dumps(dict(qualified=True, case=cfg["case"])), flush=True)
+
+
+def main():
+    with CancellationScope() as cancellation:
+        try:
+            run()
+        except BaseException:
+            cancellation.check()
+            raise
 
 
 if __name__ == "__main__":

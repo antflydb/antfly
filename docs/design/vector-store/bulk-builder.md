@@ -764,3 +764,66 @@ assumed extra HEAD is not a performance opportunity on that path. Further
 upload batching, range coalescing or concurrency changes need attributed phase
 and request measurements plus a successful publication/reopen/recall check
 before another paired performance comparison.
+
+### Qualification process ownership
+
+The controller and worker install one cancellation scope before starting work.
+SIGTERM, SIGHUP and SIGINT record the first stop request; handlers do not raise
+inside process creation or teardown. Every helper command, upload and native
+child acquires an owner before `Popen`. Cancellable waits poll that scope, while
+teardown drains and reaps the owned process without a second signal interrupting
+cleanup. Frozen-controller re-exec blocks these signals across exec and installs
+handlers before unblocking them in the new image, preserving pending requests.
+
+The controller owns the worker's process group. Native children remain in that
+group, so controller escalation still reaches them if worker cleanup stalls.
+The worker additionally owns and reaps its native child with `wait4`, preserving
+CPU/RSS observations when available. Failed process creation is explicitly
+distinguished from a started child; missing resource usage is unavailable rather
+than zero. Source hashing checks cancellation between reads of a reused 1 MiB
+buffer. Upload writes and captured helper output also have cancellable waits.
+
+One reporting boundary covers admission, worker execution and post-build source
+and input verification. Any exception leaves a terminal failed/cancelled report,
+including post-build verification after worker exit zero. Disk sampling writes
+an independent checkpoint every two seconds and finalizes on success, failure or
+catchable cancellation. Reports retain minimum host free space, case-directory
+nominal lengths, sampling errors and whether its thread stopped. Native `/tmp`
+scratch remains outside that directory total, and host free space includes
+unrelated workloads. SIGKILL cannot run finalization; the periodic checkpoint and
+external supervisor's exit record remain the available evidence.
+
+Real-GCS qualification rejects inherited storage endpoint overrides. ADC mode
+also rejects `GCS_BEARER_TOKEN` and `GOOGLE_OAUTH_ACCESS_TOKEN`, which otherwise
+take precedence over refreshable ADC in the native default credential resolver.
+Rejections list names only. Explicit ADC-file selection and ordinary proxy
+settings remain supported. The worker records its admitted credential mode and
+canonical storage/upload endpoints without copying credentials into evidence.
+
+### Bounded identity publication chunks
+
+Fresh fused bulk construction uses a 262,037-byte identity chunk target. The
+last append can add a 108-byte key, keeping every payload within the existing
+256 KiB reader limit. Both 96-byte parent keys and 108-byte enrichment keys retain
+their existing paged-reference representation. Oversized targets are rejected
+before appending. The tracker's pending buffer and publication scratch are
+charged to the native bulk owner's 256 MiB private allocator. Other tracker
+callers retain their 192 KiB target.
+
+The `lake-identity-publication-test` fixture publishes one million real keys for
+each target/key-width pair through `FsStore`, then reads every persisted chunk
+through the established paged reader and requires equal corpus count, order and
+BLAKE3 digest. For 96-byte keys, chunk puts decreased from 489 to 367 and all
+artifact puts from 524 to 395, with the same 519,004-byte tracker allocation peak.
+For 108-byte keys, chunk puts decreased from 550 to 413 and all puts from 590 to
+441; the measured peak increased from 454,088 to 552,250 bytes. Every fixture is
+admitted under an 8 MiB tracker limit. These are measured artifact API counts and
+filesystem allocation observations, not measured GCS HTTP counts or a WAN/full
+build speedup. Raw observations are in
+[`bulk_identity_publication_results.json`](../../../zig/bench/vectors/bulk_identity_publication_results.json).
+
+A proposed 1 MiB identity chunk failed existing reader validation and was not
+enabled. Raising the shared SST chunk size would change persisted-file offset
+interpretation and is not part of this optimization. Additional asynchronous
+publication queues need separate latency, ordering, cancellation and scheduler
+admission evidence before adoption.

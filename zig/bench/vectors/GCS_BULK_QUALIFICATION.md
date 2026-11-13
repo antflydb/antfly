@@ -242,3 +242,23 @@ pre-transport comparison allocated 8,388,855 bytes for the owned body and 247
 for the borrowed body. This is an allocation measurement, not a new full-build
 timing. The successful 100K construction remains 299.9 seconds; another 1M
 publication/reopen/recall is required before making scale or throughput claims.
+
+The fresh-review follow-up closes launch/re-exec cancellation windows and covers
+all controller phases with terminal reporting. Native children remain in the
+worker group for escalation, and resource-aware waits preserve usage when
+available. Failed and cancelled cases retain disk-sampling checkpoints and
+final samples. Real-GCS admission rejects ambient storage endpoint overrides;
+ADC mode also rejects nonrefreshable token overrides without logging their
+values. Provider mode and canonical endpoints are attested in the worker report.
+
+`lake-identity-publication-test` compares the existing identity chunk target with
+the largest compatible target, writes and rereads one million keys per case, and
+requires count/order/digest equality for both supported key widths. Measured
+chunk puts fall about 25%, under the same 256 KiB reader limit and an 8 MiB test
+allocator limit. The fresh bulk tracker uses its native owner's existing private
+quota; other tracker callers keep their existing target. See
+[the raw observations](bulk_identity_publication_results.json). Filesystem times
+and logical artifact puts do not establish WAN throughput or HTTP request counts.
+
+Active cases keep their frozen executable/controller/worker/validator inputs.
+Do not replace those inputs when rebuilding the workspace during a scale check.

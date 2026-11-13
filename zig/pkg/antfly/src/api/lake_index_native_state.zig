@@ -514,6 +514,9 @@ pub const Plan = struct {
         return !self.isChanged(ordinal) and std.mem.eql(u8, &file.digest, &(self.stateAt(ordinal) catch return false).digest);
     }
 };
+// Identity references use the existing native directory reader's chunk cap.
+// Leave room for the widest key so the last append never exceeds that cap.
+pub const bulk_identity_chunk_target_bytes = @import("lake_index_native_files.zig").chunk_bytes - 108 + 1;
 pub const Tracker = struct {
     plan: *Plan,
     a: A,
@@ -522,6 +525,8 @@ pub const Tracker = struct {
     cancellation: Cancellation,
     refs: std.AutoHashMapUnmanaged(usize, std.ArrayList(artifacts.ChunkRef)) = .empty,
     pending: std.ArrayList(u8) = .empty,
+    /// Callers admit this target plus one fixed-width key in their allocator.
+    chunk_target_bytes: usize = 96 * 2048,
     active: ?usize = null,
     output_bytes: u64 = 256 * 1024 * 1024,
     cumulative_bytes: ?*u64 = null,
@@ -545,6 +550,7 @@ pub const Tracker = struct {
     }
     fn appendFile(self: *Tracker, file: usize, key: []const u8) !void {
         if ((key.len != 96 and key.len != 108) or !std.mem.startsWith(u8, key, "lake2:")) return error.InvalidNativeLakeFileState;
+        if (self.chunk_target_bytes == 0 or self.chunk_target_bytes > bulk_identity_chunk_target_bytes) return error.InvalidArgument;
         const state = try self.plan.mutable(file);
         if (state.count == 0) state.key_width = @intCast(key.len);
         if (state.key_width != key.len) return error.InvalidNativeLakeFileState;
@@ -552,7 +558,7 @@ pub const Tracker = struct {
         self.active = file;
         try self.pending.appendSlice(self.a, key);
         state.count += 1;
-        if (self.pending.items.len >= 96 * 2048) try self.flush();
+        if (self.pending.items.len >= self.chunk_target_bytes) try self.flush();
     }
     fn keepChunk(self: *Tracker, file_index: usize, reference: artifacts.ChunkRef, width: u16) !void {
         try self.flush();

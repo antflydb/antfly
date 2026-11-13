@@ -115,7 +115,10 @@ pub const Stage = struct {
         // The source phase uses exactly the serving binding, including its native
         // implementation epoch. No generated vector or expression bypasses it.
         self.binding.index_config_hash = try std.fmt.allocPrint(ca, "native-dense-checkpoint-v2:{s}", .{self.binding.index_config_hash});
-        self.tracker = try state.Tracker.init(a, ca, &self.plan, store, token);
+        self.tracker = try state.Tracker.init(self.budget.allocator(), ca, &self.plan, store, token);
+        // Use the reader-compatible maximum only for this fresh bulk owner.
+        // Pending bytes and publication scratch share the native 256 MiB quota.
+        self.tracker.chunk_target_bytes = state.bulk_identity_chunk_target_bytes;
         errdefer self.tracker.deinit();
         self.tracker.output_bytes = allowance;
         self.tracker.directory_bytes = allowance;
