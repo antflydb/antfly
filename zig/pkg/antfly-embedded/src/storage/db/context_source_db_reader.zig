@@ -167,15 +167,15 @@ pub fn Adapter(comptime DB: type) type {
             defer parsed.deinit();
             const search_value = parsed.value.object.get("search") orelse return error.InvalidContextBinding;
             const scan_value = parsed.value.object.get("scan") orelse .null;
-            const search = try std.json.Stringify.valueAlloc(alloc, search_value, .{});
-            defer alloc.free(search);
+            const search_filter = try std.json.Stringify.valueAlloc(alloc, search_value, .{});
+            defer alloc.free(search_filter);
             const scan_filter: []u8 = if (scan_value == .null) try alloc.dupe(u8, "") else try std.json.Stringify.valueAlloc(alloc, scan_value, .{});
             defer alloc.free(scan_filter);
             // Range-only predicates: the storage-evaluated scan filter is the
             // range-aware path (columnar block pruning on relational tables).
-            const has_text_pushdown = std.mem.indexOf(u8, search, "\"match\"") != null;
+            const has_text_pushdown = std.mem.indexOf(u8, search_filter, "\"match\"") != null;
             if (!has_text_pushdown and scan_filter.len != 0) return scanPage(db, alloc, scan_filter, offset, limit);
-            return queryIndexed(db, alloc, search, offset, limit) catch |err| switch (err) {
+            return queryIndexed(db, alloc, search_filter, offset, limit) catch |err| switch (err) {
                 // No full-text index can serve the prefilter: fall back to a
                 // filtered table scan. Resolution bounds it by the declared
                 // candidate budget and verifies every row exactly.
