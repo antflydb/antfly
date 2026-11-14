@@ -333,7 +333,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "public api split integration uses distributed global text stats for bm25 and significant_terms",
         "public api multi-node integration routes CRUD from a non-host node",
     };
-    const public_api_integration_runtime_filters = selectTestFilters(b, &public_api_integration_filters);
+    // An explicit compile filter already selects one small closure. Preserve
+    // the legacy single-owner focused path instead of compiling/running it in
+    // both shards. Runtime-only filters use the fixed buckets and union audit.
+    const focused_public_api_compile = selectTestFilters(b, &.{}).len != 0;
+    const public_api_integration_runtime_filters: []const []const u8 = &public_api_integration_filters;
     const public_api_integration = @import("linked_tests.zig").add(b, .{
         .name = "public-api-integration",
         .root_module = antfly_test_mod,
@@ -370,12 +374,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         public_api_parity_tests,
         public_api_parity_runtime_filters,
     );
-    run_public_api_parity_tests.step.dependOn(&run_public_api_integration.step);
-    run_public_api_parity_aggregate_tests.step.dependOn(&run_public_api_integration.step);
+    if (!focused_public_api_compile)
+        run_public_api_parity_aggregate_tests.step.dependOn(&run_public_api_integration.step);
     run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
     run_public_api_parity_aggregate_tests.step.dependOn(&openapi_root_check.step);
     const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
-    public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
+    if (focused_public_api_compile) {
+        public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
+    } else {
+        @import("../../../build_support/antfly/test_support.zig").addOwnerTestRuns(b, public_api_parity_test_step, &.{
+            .{ .artifact = public_api_parity_tests, .filters = &public_api_parity_default_filters },
+            .{ .artifact = public_api_integration.executable, .filters = &public_api_integration_filters },
+        }, &.{});
+        public_api_parity_test_step.dependOn(&openapi_root_check.step);
+    }
 
     const lib_api_auth_default_filters = [_][]const u8{
         "trusted principal table operations",
@@ -1736,7 +1748,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const evaluation_graph_step = b.step("inference-evaluation-graph-test", "Verify final-ranked graph starts in public and cross-range queries");
-    const evaluation_public_graph = b.addRunArtifact(public_api_integration.executable);
+    const evaluation_public_graph = b.addRunArtifact(if (focused_public_api_compile) public_api_parity_tests else public_api_integration.executable);
     evaluation_public_graph.addArgs(&.{ "--test-filter", "public api integration supports hybrid query pruner and reranker" });
     const evaluation_distributed_graph = b.addRunArtifact(write_implementation_tests);
     evaluation_distributed_graph.addArgs(&.{ "--test-filter", "hosted cross-range graph start set follows final reranking" });

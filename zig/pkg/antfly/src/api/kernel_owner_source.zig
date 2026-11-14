@@ -4028,7 +4028,11 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn exactApplyDescriptor(entry: *const Entry, descriptor: descriptor_contract.Descriptor) bool {
-        const restore_matches = restoreBindingMatches(entry.restore, descriptor.restore, false);
+        return descriptorMatches(entry, descriptor, false);
+    }
+
+    fn descriptorMatches(entry: *const Entry, descriptor: descriptor_contract.Descriptor, inherit_admitted_restore: bool) bool {
+        const restore_matches = restoreBindingMatches(entry.restore, descriptor.restore, inherit_admitted_restore);
         return entry.generation == descriptor.lsm_root_generation and
             entry.identity.eql(descriptor.identity) and
             restore_matches and
@@ -4170,7 +4174,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                     if (entry.group_id == group_id and std.mem.eql(u8, entry.table_name, table_name) and
                         !entry.retired and !entry.closing and !entry.opened_for_historical_apply and
                         (!controls.prepare_graph_indexes or entry.graph_replay_indexes_prepared) and
-                        exactApplyDescriptor(entry, descriptor)) break true;
+                        descriptorMatches(entry, descriptor, true)) break true;
                 } else false;
                 if (!unchanged) return error.StorageKernelOwnerStaleDescriptor;
             } else {
@@ -7799,11 +7803,13 @@ test "owner descriptor catalog watermark fences index-only regressions across ow
     // Only the index catalog changed. Both schema and physical root remain
     // equal, so the schema-version safeguard cannot detect this delayed DDL.
     controls.catalog_observation.?.revision = 41;
-    {
+    for ([_]bool{ false, true }) |restored| {
+        entry.restore = if (restored) .{ .backup_id = "backup", .location = "file:///backup", .snapshot_path = "snapshot", .artifact_sha256 = "digest" } else null;
         var lease = try source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, .shared, .resident, controls);
         defer lease.deinit();
         try std.testing.expectEqual(@as(u64, 42), source.catalog_observations.get(1).?.revision);
     }
+    entry.restore = null;
     descriptor.indexes_json = "{\"model_a\":{}}";
     for ([_]Source.LeaseAdmission{ .shared, .exclusive, .exclusive_if_idle }) |admission| {
         try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, controls));
