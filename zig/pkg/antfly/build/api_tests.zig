@@ -321,6 +321,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http invalid filter query response names the offending node",
         "api http unsupported filter query response names the offending node",
         "api http server drop table observes metadata absence before local cleanup",
+    };
+    // Native integration fixtures instantiate a complete cluster. Keep that
+    // code-generation working set separate from the transport/SQL contracts;
+    // the former combined object exceeded CI's entire 20 GiB compiler budget.
+    const public_api_integration_filters = [_][]const u8{
         "public api smoke integration creates table inserts and queries documents",
         "public api integration supports hybrid query pruner and reranker",
         "provisioned table write source routes batch writes across ranges",
@@ -328,6 +333,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "public api split integration uses distributed global text stats for bm25 and significant_terms",
         "public api multi-node integration routes CRUD from a non-host node",
     };
+    // An explicit compile filter already selects one small closure. Preserve
+    // the legacy single-owner focused path instead of compiling/running it in
+    // both shards. Runtime-only filters use the fixed buckets and union audit.
+    const focused_public_api_compile = selectTestFilters(b, &.{}).len != 0;
+    const public_api_integration_runtime_filters: []const []const u8 = &public_api_integration_filters;
+    const public_api_integration = @import("linked_tests.zig").add(b, .{
+        .name = "public-api-integration",
+        .root_module = antfly_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_integration_runtime_filters),
+        .max_rss = 0,
+    });
+    const run_public_api_integration = addFilteredTestRunArtifactWithRuntimeFilters(b, public_api_integration.executable, public_api_integration_runtime_filters);
     const public_api_parity_runtime_filters = selectTestFilters(b, &public_api_parity_default_filters);
     const public_api_parity = @import("linked_tests.zig").add(b, .{
         .name = "public-api-parity",
@@ -344,6 +361,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
     });
     const public_api_parity_tests = public_api_parity.executable;
+    const public_api_compile_step = b.step("public-api-parity-compile", "Compile public API contract and integration owners without running fixtures");
+    public_api_compile_step.dependOn(&public_api_parity_tests.step);
+    public_api_compile_step.dependOn(&public_api_integration.executable.step);
     const run_public_api_parity_tests = addFilteredTestRunArtifactWithRuntimeFilters(
         b,
         public_api_parity_tests,
@@ -354,10 +374,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         public_api_parity_tests,
         public_api_parity_runtime_filters,
     );
+    if (!focused_public_api_compile)
+        run_public_api_parity_aggregate_tests.step.dependOn(&run_public_api_integration.step);
     run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
     run_public_api_parity_aggregate_tests.step.dependOn(&openapi_root_check.step);
     const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
-    public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
+    if (focused_public_api_compile) {
+        public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
+    } else {
+        @import("../../../build_support/antfly/test_support.zig").addOwnerTestRuns(b, public_api_parity_test_step, &.{
+            .{ .artifact = public_api_parity_tests, .filters = &public_api_parity_default_filters },
+            .{ .artifact = public_api_integration.executable, .filters = &public_api_integration_filters },
+        }, &.{});
+        public_api_parity_test_step.dependOn(&openapi_root_check.step);
+    }
 
     const lib_api_auth_default_filters = [_][]const u8{
         "trusted principal table operations",
@@ -1721,7 +1751,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const evaluation_graph_step = b.step("inference-evaluation-graph-test", "Verify final-ranked graph starts in public and cross-range queries");
-    const evaluation_public_graph = b.addRunArtifact(public_api_parity_tests);
+    const evaluation_public_graph = b.addRunArtifact(if (focused_public_api_compile) public_api_parity_tests else public_api_integration.executable);
     evaluation_public_graph.addArgs(&.{ "--test-filter", "public api integration supports hybrid query pruner and reranker" });
     const evaluation_distributed_graph = b.addRunArtifact(write_implementation_tests);
     evaluation_distributed_graph.addArgs(&.{ "--test-filter", "hosted cross-range graph start set follows final reranking" });
@@ -2566,7 +2596,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
         .hosted_recovery_tests = hosted_recovery_tests,
         .hosted_recovery_step = hosted_recovery_step,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ public_api_parity_tests, lib_api_auth_tests, cypher_cohort_tests.executable, api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_recovery_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_recovery_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_recovery_tests }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ public_api_parity_tests, public_api_integration.executable, lib_api_auth_tests, cypher_cohort_tests.executable, api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_recovery_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_recovery_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_recovery_tests }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,

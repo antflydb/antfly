@@ -6129,6 +6129,14 @@ pub const MetadataService = struct {
         _ = try self.raft.stepTransitions();
     }
 
+    pub fn localMetadataLeadershipTerm(self: *MetadataService) ?u64 {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const leadership_status = self.raft.host.host.raftStatus(self.metadata_group_id) orelse return null;
+        if (leadership_status.soft.role != .leader or leadership_status.soft.leader_id == null or leadership_status.soft.leader_id.? != leadership_status.id) return null;
+        return leadership_status.hard.current_term;
+    }
+
     fn isLocalMetadataLeader(self: *MetadataService) bool {
         self.lockRuntime();
         defer self.unlockRuntime();
@@ -8575,17 +8583,20 @@ pub const MetadataService = struct {
 
     fn ensureReconcileLeaseLocked(self: *MetadataService) !bool {
         const now_ms = self.reconcile_lease.nowMs();
-        const is_local_leader = self.isLocalMetadataLeader();
+        const term = self.localMetadataLeadershipTerm();
+        const is_local_leader = term != null;
         const projected = self.getCachedProjectedReconcileLease(now_ms, is_local_leader) catch |err| switch (err) {
             error.MissingMetadataStore => null,
             else => return err,
         };
         const has_lease = self.reconcile_lease.observe(is_local_leader, projected, now_ms);
-        if (self.reconcile_lease.shouldRenew(is_local_leader, projected, now_ms)) {
-            self.upsertReconcileLease(self.reconcile_lease.desiredRecord(now_ms)) catch |err| {
+        if (self.reconcile_lease.shouldProposeRenewal(term, projected, now_ms)) {
+            const desired = self.reconcile_lease.desiredRecord(now_ms);
+            self.upsertReconcileLease(desired) catch |err| {
                 self.reconcile_lease.noteAcquireFailure();
                 return err;
             };
+            self.reconcile_lease.noteRenewalProposed(term.?, desired);
         }
         return has_lease;
     }
@@ -13449,17 +13460,20 @@ pub const MetadataHttpService = struct {
 
     fn ensureReconcileLeaseLocked(self: *MetadataHttpService) !bool {
         const now_ms = self.reconcile_lease.nowMs();
-        const is_local_leader = self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id);
+        const term = self.localMetadataLeadershipTerm();
+        const is_local_leader = term != null;
         const projected = self.getCachedProjectedReconcileLease(now_ms, is_local_leader) catch |err| switch (err) {
             error.MissingMetadataStore => null,
             else => return err,
         };
         const has_lease = self.reconcile_lease.observe(is_local_leader, projected, now_ms);
-        if (self.reconcile_lease.shouldRenew(is_local_leader, projected, now_ms)) {
-            self.upsertReconcileLease(self.reconcile_lease.desiredRecord(now_ms)) catch |err| {
+        if (self.reconcile_lease.shouldProposeRenewal(term, projected, now_ms)) {
+            const desired = self.reconcile_lease.desiredRecord(now_ms);
+            self.upsertReconcileLease(desired) catch |err| {
                 self.reconcile_lease.noteAcquireFailure();
                 return err;
             };
+            self.reconcile_lease.noteRenewalProposed(term.?, desired);
         }
         return has_lease;
     }
@@ -15132,10 +15146,9 @@ fn ensureCdcWorkPermit(service: anytype) !void {
         service.reconcile_lease.config.lease_ttl_ms *| std.time.ns_per_ms,
     );
     const deadline_ns = platform_time.monotonicNs() +| renew_timeout_ns;
-    var proposed_expires_at_ms: u64 = 0;
     while (platform_time.monotonicNs() < deadline_ns) {
         if (service.cdc_shutdown.load(.acquire)) return error.CdcWorkShuttingDown;
-        if (!cdcLocalMetadataLeader(service)) return error.CdcWorkLeaseLost;
+        const term = service.localMetadataLeadershipTerm() orelse return error.CdcWorkLeaseLost;
 
         const now_ms = service.reconcile_lease.nowMs();
         const projected = try service.getProjectedReconcileLease();
@@ -15160,12 +15173,12 @@ fn ensureCdcWorkPermit(service: anytype) !void {
         }
 
         const desired = service.reconcile_lease.desiredRecord(now_ms);
-        if (desired.expires_at_ms > proposed_expires_at_ms) {
+        if (service.reconcile_lease.shouldProposeRenewal(term, projected, now_ms)) {
             service.upsertReconcileLease(desired) catch |err| {
                 service.reconcile_lease.noteAcquireFailure();
                 return err;
             };
-            proposed_expires_at_ms = desired.expires_at_ms;
+            service.reconcile_lease.noteRenewalProposed(term, desired);
         }
         try advanceCdcLeaseRaft(service);
         platform_clock.Clock.real().sleepMs(1);

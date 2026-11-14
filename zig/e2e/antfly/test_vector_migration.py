@@ -85,13 +85,17 @@ def seed(api, table):
             ready_when=lambda value: ready_index_status(value, until="complete"),
             timeout_s=90,
         ), api.get_index(table, index)
-        assert nearest(api, table, index, vector) == ["a", "b"], {
-            "index": api.get_index(table, index),
-            "query": api.query_table(
-                table, {"embeddings": {index: vector}, "indexes": [index], "limit": 2}
-            ),
-            "logs": api.debug_logs(),
-        }
+        assert nearest(api, table, index, vector) == ["a", "b"], json.dumps(
+            {
+                "index": api.get_index(table, index),
+                "query": api.query_table(
+                    table,
+                    {"embeddings": {index: vector}, "indexes": [index], "limit": 2},
+                ),
+                "logs": api.debug_logs(),
+            },
+            indent=2,
+        )
 
 
 def nearest(api, table, index, vector):
