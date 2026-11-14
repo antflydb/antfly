@@ -3984,7 +3984,31 @@ fn runSustainedFullIndexRideAlongUnderCrash(allocator: Allocator, path: []const 
     });
     defer index_manager.setBenchmarkTextMergePolicyOverride(null);
 
-    for (ride_along_steps) |step| {
+    // `inline for`, not a regular `for`: `ride_along_steps` is comptime-known
+    // and every field this loop reads off `step` (key/before/after) is a
+    // comptime string literal, but the loop body is still ordinary runtime
+    // code (db writes, retirement, asserts) executed once per unrolled copy
+    // -- `inline for` only changes how the *source* is lowered, not when
+    // anything runs. A plain `for` here was a real, confirmed bug: `&.{...}`
+    // for `Checkpoint.expectations` is evaluated as a block-scoped temporary
+    // whose storage is the loop body's own stack slot, reused by every
+    // iteration of an ordinary (non-inline) `for` loop -- so every
+    // `checkpoints.append` call's `expectations` slice ended up aliasing the
+    // *same* address, and by the time a crashed run's invariant checker
+    // read `checkpoints.items` back, every entry showed the last iteration's
+    // own key/value instead of its own (confirmed directly: a debug dump of
+    // `checkpoints[0..2]` during a failing run showed all three aliased to
+    // the third write's own key, not the first and second writes' real
+    // ones). This made `checkCheckpointsViaDb` demand the *wrong* key's
+    // value from the acknowledged set, misreporting a perfectly durable
+    // write as `CrashConsistencyAcknowledgedWriteLost` -- a false positive
+    // in the harness, not a storage durability bug: nothing was actually
+    // lost. `inline for` unrolls the loop at compile time (the same idiom
+    // this file already uses for `concurrent_steps`/`retirement_docs`
+    // immediately above), giving each iteration's `&.{...}` its own,
+    // distinct, comptime-promoted storage -- no aliasing, no allocator
+    // needed to own it.
+    inline for (ride_along_steps) |step| {
         const json = try std.fmt.allocPrint(allocator, "{{\"body\":\"{s} churn alpha beta gamma\"}}", .{step.after});
         defer allocator.free(json);
         try checkpoints.append(allocator, .{
@@ -4043,6 +4067,44 @@ test "crash sweep: sustained full_index writes survive a crash during ride-along
     }, .{});
     defer report.deinit();
     try reportFailures(&report);
+}
+
+// Regression for the `CrashConsistencyAcknowledgedWriteLost` false positive
+// in "crash sweep: sustained full_index writes survive a crash during
+// ride-along merge and retirement": a plain (non-`inline`) `for` loop
+// building `Checkpoint.expectations` via `&.{...}` reused the same loop-body
+// stack slot on every iteration, so by the time a crashed run's checker read
+// `checkpoints.items` back, every entry had silently aliased the *last*
+// iteration's own key/value -- not a storage durability bug at all (nothing
+// was ever actually lost), but the harness itself misreporting an entirely
+// different, perfectly durable write as missing. This exercises the root
+// cause directly and fast, without any crash simulation: run the scenario's
+// own write loop to completion against a plain passthrough `Io`, then assert
+// every recorded checkpoint's key/after matches its own step in
+// `ride_along_steps`, in order -- aliasing would collapse every entry to the
+// last step's own key/value, which this catches immediately.
+test "crash sweep: sustained full_index ride-along checkpoints are not aliased across loop iterations" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    var checkpoints = std.ArrayListUnmanaged(Checkpoint).empty;
+    defer checkpoints.deinit(allocator);
+    try runSustainedFullIndexRideAlongUnderCrash(allocator, path, std.testing.io, &checkpoints);
+
+    try std.testing.expectEqual(ride_along_steps.len, checkpoints.items.len);
+    for (checkpoints.items, ride_along_steps) |cp, want| {
+        try std.testing.expectEqual(@as(usize, 1), cp.expectations.len);
+        try std.testing.expectEqualStrings(want.key, cp.expectations[0].key);
+        try std.testing.expectEqualStrings(want.after, cp.expectations[0].after.?);
+        if (want.before) |before| {
+            try std.testing.expectEqualStrings(before, cp.expectations[0].before.?);
+        } else {
+            try std.testing.expect(cp.expectations[0].before == null);
+        }
+    }
 }
 
 // Deliberately no `.exhaustive` variant: this scenario's own writes already
