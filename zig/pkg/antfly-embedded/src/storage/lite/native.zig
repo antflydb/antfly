@@ -13449,14 +13449,57 @@ pub const NativeFile = struct {
     /// checkpoint's reader pin and the same file incarnation. It names the
     /// document record, not an index leaf that unrelated writes can replace.
     /// External value bytes need not be read to qualify unchanged metadata.
+    ///
+    /// §9.7c (ReadView)/redo overlay: a key committed-but-not-yet-folded by
+    /// `checkpointRedoLog` has no physical document-index page at all yet --
+    /// `lookupDocumentIndexPage` alone always reported such a key as absent,
+    /// even though a plain `get()` on the same handle found it immediately
+    /// (the same overlay-blind-read bug class as `Cursor`'s original merge
+    /// and `getDocumentsAtCheckpointWithState`'s pre-pass; see that section's
+    /// own "found three times" note -- this caller was a fourth, found via
+    /// `PublicationCatalog.verify`'s `valueIdentity`/`valueFingerprint` never
+    /// detecting an overlay-only change). Checked first, same as
+    /// `getDocumentAtCheckpointAlloc`. An overlay-resident version has no
+    /// physical page to name, so it is named by its own redo sequence
+    /// instead, with the high bit set (this file's own `packed_record_flag`
+    /// convention) so it can never collide with a real, unpacked page id --
+    /// still stable and comparable for exactly as long as the caller holds
+    /// the pin this checkpoint/mark pair was captured under.
     pub fn documentReferenceAtCheckpoint(self: *NativeFile, checkpoint: CheckpointSlot, key: []const u8) !?u64 {
+        if (self.redo) |*redo| {
+            if (try redo.shared.resolveAlloc(self.allocator, self.runtimeIo(), @backingInt(TransactionWrites.Root.documents), key, self.readMark(checkpoint))) |resolved| {
+                defer self.allocator.free(resolved.value);
+                if (resolved.is_delete) return null;
+                return packed_record_flag | resolved.sequence;
+            }
+        }
         return self.lookupDocumentIndexPage(checkpoint, key);
     }
 
     /// Logical content identity survives physical page reuse. New metadata
     /// records carry the digest in their checksummed record, avoiding payload
     /// hydration; older records use the same digest computed on demand.
+    ///
+    /// §9.7c/redo overlay: checked first, same as `getDocumentAtCheckpointAlloc`
+    /// and for the same reason as `documentReferenceAtCheckpoint` just above --
+    /// an uncheckpointed overlay version previously resolved as "unchanged"
+    /// here no matter what it actually held, because this function only ever
+    /// consulted the real, on-disk tree. The overlay's own `CatalogEntry`
+    /// carries no pre-computed digest (unlike an on-disk `DocumentEntry`), so
+    /// an overlay hit always hashes its value/external bytes on demand.
     pub fn documentFingerprintAtCheckpoint(self: *NativeFile, checkpoint: CheckpointSlot, key: []const u8) !?[32]u8 {
+        if (try self.redoOverlayEntry(.documents, checkpoint, key)) |entry| {
+            defer self.allocator.free(entry.value);
+            if (entry.is_delete) return null;
+            const bytes = if (entry.external_value_root_page != 0)
+                try self.readValuePagesAtCheckpointAlloc(self.allocator, entry.external_value_root_page, entry.external_value_len, checkpoint)
+            else
+                null;
+            defer if (bytes) |owned| self.allocator.free(owned);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(bytes orelse entry.value, &digest, .{});
+            return digest;
+        }
         const page = (try self.lookupDocumentIndexPage(checkpoint, key)) orelse return null;
         var reader: ValuePageReader = undefined;
         reader.init();
@@ -19705,6 +19748,31 @@ pub const NativeFile = struct {
             // (`redo_folded_through`) stays truthful for `self`'s own
             // later folds.
             try self.attachFreshRedoState(io, self.header.redo_log_offset, self.header.redo_log_capacity, self.activeCheckpoint().commit_sequence, self.activeCheckpoint().redo_folded_through);
+            // `attachFreshRedoState`'s own `Writer.init` call above always
+            // resumes at `tail = 0`, correct only for the "nothing to
+            // replay yet" case its doc comment promises (a vacuum's
+            // `prepared`, never itself redo-attached). A caller that hands
+            // this a `prepared` written to directly under redo (the
+            // backup/restore-import path, not vacuum -- the exact case
+            // the comment above this block already acknowledges can leave
+            // `commit_sequence`/`redo_folded_through` genuinely different)
+            // has real, valid records already sitting in the log region
+            // between `redo_folded_through` and `commit_sequence`.
+            // `prepared.redo` -- left completely untouched above, since
+            // only `self.redo` is reset -- still holds `prepared`'s own
+            // writer at its true on-disk tail/last_sequence. Resuming at
+            // `tail = 0` instead would make this generation's very next
+            // diverted commit physically overwrite the start of that
+            // still-valid region, corrupting a reopen's replay
+            // (`recoverRedoLog`'s `NativeRedoLogCorrupt`) even though
+            // nothing had actually gone wrong on disk. `prepared.redo.
+            // writer.file` already names the post-rename fd -- the same
+            // value this function's own swap moved into `self.file` --
+            // so only the position fields need to carry over.
+            if (prepared.redo) |prepared_redo| {
+                self.redo.?.writer.tail = prepared_redo.writer.tail;
+                self.redo.?.writer.last_sequence = prepared_redo.writer.last_sequence;
+            }
         } else {
             self.manifest_commits_enabled = true;
         }
