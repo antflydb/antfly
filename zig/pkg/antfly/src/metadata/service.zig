@@ -3271,9 +3271,8 @@ fn requirePrivacyStoreAdmission(service: anytype, record: metadata_table_manager
 
 fn requireIndexAliasStoreAdmission(service: anytype, record: metadata_table_manager.StoreRecord) !void {
     if (!record.live or !metadata_table_manager.storeServesTableData(record.role) or metadata_table_manager.indexAliasesProtocolSupported(record.reporter_incarnation, record.artifact_sources_protocol_version)) return;
-    const tables = try service.listProjectedTables(service.alloc);
-    defer service.freeProjectedTables(service.alloc, tables);
-    for (tables) |table| if (metadata_topology_protocol.usesIndexAliases(table.indexes_json)) return error.IndexAliasProtocolUpgradeRequired;
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    if (try store.hasIndexAliases(service.metadata_group_id)) return error.IndexAliasProtocolUpgradeRequired;
 }
 
 fn validateDenseNativeStoreAdmission(
@@ -23843,4 +23842,37 @@ test "selected owner readiness transition index cancels while observations are l
     try std.testing.expectError(error.Canceled, lockReadinessTransitions(&mutex, .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = Cancel.canceled } }));
     try std.testing.expectEqual(@as(usize, 3), cancellation.calls);
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, lockReadinessTransitions(&mutex, .{ .deadline_ns = 0 }));
+}
+
+test "index alias legacy store admission uses only the durable presence lookup" {
+    const Store = struct {
+        present: bool = false,
+        reads: usize = 0,
+        pub fn hasIndexAliases(self: *@This(), group: u64) !bool {
+            try std.testing.expectEqual(@as(u64, 21), group);
+            self.reads += 1;
+            return self.present;
+        }
+    };
+    const Service = struct {
+        metadata_group_id: u64 = 21,
+        store: Store = .{},
+        pub fn projectedStore(self: *@This()) ?*Store {
+            return &self.store;
+        }
+    };
+    var service: Service = .{};
+    var record: metadata_table_manager.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .artifact_sources_protocol_version = 2 };
+    try requireIndexAliasStoreAdmission(&service, record);
+    service.store.present = true;
+    try std.testing.expectError(error.IndexAliasProtocolUpgradeRequired, requireIndexAliasStoreAdmission(&service, record));
+    record.artifact_sources_protocol_version = 3;
+    try requireIndexAliasStoreAdmission(&service, record);
+    record.artifact_sources_protocol_version = 2;
+    record.live = false;
+    try requireIndexAliasStoreAdmission(&service, record);
+    record.live = true;
+    record.role = "metadata";
+    try requireIndexAliasStoreAdmission(&service, record);
+    try std.testing.expectEqual(@as(usize, 2), service.store.reads);
 }

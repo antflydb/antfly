@@ -436,6 +436,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-store-observer-test", "Run store report admission, fencing, and ownership regressions").dependOn(&b.addRunArtifact(store_observer_tests).step);
 
+    // Committed alias tests use the metadata persistence owner, including its
+    // kernel-owned WAL; the lean coordinator target has no such provider.
+    const alias_raft_tests = b.addTest(.{
+        .name = "index-alias-raft-tests",
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{"metadata alias"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-index-alias-raft-test", "Verify committed alias rejection and durable store-admission indexes")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, alias_raft_tests, &.{"metadata alias"}).step);
     const system_catalog_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "system catalog", "catalog rename", "catalog names", "metadata raft apply store projects backup restore bootstrap source in placement intents" },

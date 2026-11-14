@@ -715,14 +715,17 @@ pub const MutableState = struct {
         next_id: u64,
         pub fn finish(self: *Change, state: *MutableState, committed: bool) void {
             if (!committed) {
-                for (self.inserted.items) |r| if (state.take(r.kind, r.id)) |removed| freeResource(state.alloc, removed);
+                for (self.inserted.items) |r| _ = state.take(r.kind, r.id);
                 for (self.previous.items) |r| state.put(r);
                 state.value.revision = self.revision;
                 state.value.next_id = self.next_id;
             }
             state.index.pruneEmptyParents(state.alloc, self.previous.items);
             state.index.pruneEmptyParents(state.alloc, self.inserted.items);
-            if (committed) for (self.previous.items) |r| freeResource(state.alloc, r);
+            // Reverse-index cleanup borrows binding arrays from both sides.
+            // Release the discarded side only after every prune has completed.
+            const discarded = if (committed) self.previous.items else self.inserted.items;
+            for (discarded) |r| freeResource(state.alloc, r);
             self.previous.deinit(state.alloc);
             self.inserted.deinit(state.alloc);
             self.* = undefined;

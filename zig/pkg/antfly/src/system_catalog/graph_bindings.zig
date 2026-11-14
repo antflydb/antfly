@@ -233,9 +233,30 @@ test "index alias graph admission rejects converged physical mappings and indexe
             change.finish(&owned, false);
             try std.testing.expectEqual(@as(usize, 1), owned.index.graphsForTable(42).len);
             try std.testing.expectEqual(@as(usize, 0), owned.index.graphsForTable(43).len);
+            try std.testing.expect(!owned.index.graph_users.contains(43));
         }
     };
     try std.testing.checkAllAllocationFailures(a, AllocationProbe.run, .{record});
+    const Poison = struct {
+        backing: std.mem.Allocator,
+        fn allocate(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backing.rawAlloc(len, alignment, ra);
+        }
+        fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn free(_: *anyopaque, bytes: []u8, _: std.mem.Alignment, _: usize) void {
+            @memset(bytes, 0xa5);
+        }
+    };
+    var quarantine = std.heap.ArenaAllocator.init(a);
+    defer quarantine.deinit();
+    var poison: Poison = .{ .backing = quarantine.allocator() };
+    try AllocationProbe.run(.{ .ptr = &poison, .vtable = &.{ .alloc = Poison.allocate, .resize = Poison.resize, .remap = Poison.remap, .free = Poison.free } }, record);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const before = "{\"g1\":{\"type\":\"graph\"},\"g2\":{\"type\":\"graph\"},\"_index_aliases\":{\"left\":{\"index\":\"g1\"},\"right\":{\"index\":\"g2\"}}}";
