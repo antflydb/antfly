@@ -2229,6 +2229,21 @@ fixed. `use_redo_log` now defaults to `true` for newly-created files
 (`docstore.zig`'s `Store.createWithOptions`); every intermediate layer
 listed above still just threads the `?bool` through unchanged.
 
+**Second update (§9.7f's recommendation, implemented):** that default
+is no longer size-independent. `createWithOptions` now defaults
+`use_redo_log` to `false` (legacy) instead of `true` when the caller
+configures `reclamation.max_storage_bytes` below
+`native.NativeFile.use_redo_log_min_budget_bytes` (4 MiB) -- 8x the
+unscaled `default_redo_log_capacity_bytes` (512 KiB) -- and leaves
+`use_redo_log` unset. No budget at all (`max_storage_bytes == 0`) still
+always defaults to `true`, and an explicit `use_redo_log` (`true` or
+`false`) always wins over the default regardless of budget. This is a
+creation-time-only decision: `OpenOptions` has no `use_redo_log` field,
+so reopening an existing file never changes the mode it was created
+with. See §9.7f below for the numbers behind the 4 MiB floor and for
+why a small-budget default of `true` was the wrong choice to begin
+with.
+
 ### 9.7b A self-deadlock in the idle-turn checkpoint error path
 
 With redo as the default, a crash-sweep run appeared to hang at
@@ -2947,34 +2962,53 @@ fraction of a small budget: 25% at and above a 256 KiB budget (where
 128 KiB budget and beyond as the budget shrinks further while the
 floor stays fixed.
 
-Recommendation (not implemented here -- see below for why): default
-`use_redo_log` to `false` when the caller configures `max_storage_bytes`
-below a floor of **4 MiB** (8x the unscaled 512 KiB default), unless
-the caller explicitly passes `use_redo_log = true`. At a 4 MiB budget
-the scaled reservation is `max(4 MiB / 4, 64 KiB) = 1 MiB` (25% of
-budget) -- already the steady-state ratio every larger bounded budget
-also pays, so a 4 MiB floor caps the *worst case* at that same 25%
-instead of letting the 64 KiB absolute floor dominate smaller budgets
-disproportionately. Leave the unbounded (`max_storage_bytes == 0`)
-default's flat 512 KiB reservation unchanged: a real unbounded
-production store is not meaningfully harmed by it, the artifacts found
-here are specific to deliberately tiny test workloads, and those are
-now accounted for directly (`fixed_overhead`) rather than by shrinking
-the reservation itself. A more thorough fix for the unbounded case --
-growing the reservation from a small floor as the file's real data
-grows, instead of reserving the maximum eagerly -- is a larger,
-separate change (§9.4's own checkpointer would need to drive the
-growth) and is left for whoever picks this up next.
+**Implemented (perf/lwa-small-budget-policy):** `docstore.Store
+.createWithOptions` defaults `use_redo_log` to `false` when the caller
+configures `reclamation.max_storage_bytes` below a floor of **4 MiB**
+(`native.NativeFile.use_redo_log_min_budget_bytes`, 8x the unscaled 512
+KiB `default_redo_log_capacity_bytes`), unless the caller explicitly
+passes `use_redo_log` (`true` or `false`, either way). At a 4 MiB
+budget the scaled reservation is `max(4 MiB / 4, 64 KiB) = 1 MiB` (25%
+of budget) -- already the steady-state ratio every larger bounded
+budget also pays, so the 4 MiB floor caps the *worst case* at that same
+25% instead of letting the 64 KiB absolute floor dominate smaller
+budgets disproportionately. The unbounded (`max_storage_bytes == 0`)
+default's flat 512 KiB reservation is unchanged and still defaults to
+`true`: a real unbounded production store is not meaningfully harmed by
+it, the artifacts found here are specific to deliberately tiny test
+workloads, and those are now accounted for directly (`fixed_overhead`,
+Bug 3 above) rather than by shrinking the reservation itself. The
+decision is creation-time only -- `OpenOptions` has no `use_redo_log`
+field, so reopening an existing file never changes the mode it was
+created with, independent of whatever budget the reopen itself passes.
+A more thorough fix for the unbounded case -- growing the reservation
+from a small floor as the file's real data grows, instead of reserving
+the maximum eagerly -- is still a larger, separate change (§9.4's own
+checkpointer would need to drive the growth) and is left for whoever
+picks this up next.
 
-Not changed in this pass: `use_redo_log` is threaded through every
-layer listed in §9.7a and defaults to `true` globally once
-`page_reuse`/`indexed_reclamation` allow it; making that default
-budget-dependent would change behavior for every other caller in the
-codebase that relies on the current, size-independent default,
-including tests outside this investigation's own scope. That is
-exactly the kind of wide-blast-radius change worth a dedicated pass
-(with its own full-suite verification), not a decision folded into a
-budget-admission bugfix.
+Every other `use_redo_log`-threading layer (`backend.zig`'s
+`Handle.createWithOptions`, the capi/`db.zig` open-options seam,
+vacuum's prepared-generation and restore/staging-workspace callers)
+still just threads the already-resolved `?bool` through unchanged, as
+§9.7a originally described; the budget-dependent default is decided in
+exactly the one place, `docstore.Store.createWithOptions`, so a staged
+or prepared-generation store created from a workspace's own (often
+smaller) budget picks up the same policy automatically rather than
+needing a second copy of it. The earlier concern about blast radius
+(below) is why this landed as its own dedicated, budget-scoped pass
+with its own full-suite verification rather than folded into the
+budget-admission bugfix above: every test that creates a store with a
+small `max_storage_bytes` and no explicit `use_redo_log` was audited
+individually, and the handful of dual-mode/redo-named tests whose
+coverage would otherwise have silently narrowed to legacy at their
+existing small budgets were pinned to `use_redo_log = true` explicitly
+to keep it.
+
+Not changed in this pass: `use_redo_log` still defaults to `true`
+globally once `page_reuse`/`indexed_reclamation` allow it, for every
+caller at or above the 4 MiB floor (including the common/production
+case of no budget at all) -- only the small-budget default moved.
 
 ### 9.8 Gates (from step (c) on)
 
