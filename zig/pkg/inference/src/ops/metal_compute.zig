@@ -1163,6 +1163,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         max_position_embeddings: usize,
         norm_eps_bits: u32,
         layers_hash: u64,
+        packed_qkv_cache_bytes: ?usize,
+        attention_scratch_bytes: ?usize,
     };
 
     const DeepSeekV4CacheKey = struct {
@@ -33498,6 +33500,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .max_position_embeddings = request.max_position_embeddings,
             .norm_eps_bits = @bitCast(request.norm_eps),
             .layers_hash = debertaEncoderFramePlanLayerHash(request.layers),
+            .packed_qkv_cache_bytes = request.packed_qkv_cache_bytes,
+            .attention_scratch_bytes = request.attention_scratch_bytes,
         };
     }
 
@@ -33536,6 +33540,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (request.batch == 0 or request.seq_len == 0 or request.hidden_size == 0 or request.intermediate_size == 0) return false;
         if (request.num_attention_heads == 0 or request.hidden_size % request.num_attention_heads != 0) return false;
         if (request.position_buckets == 0 or request.max_position_embeddings == 0) return false;
+
+        if (request.packed_qkv_cache_bytes) |packed_bytes| {
+            const attention_bytes = request.attention_scratch_bytes orelse return false;
+            try metal_runtime.configureDebertaCacheLimits(self.provider_impl.raw_decode_runtime, packed_bytes, attention_bytes);
+        } else if (request.attention_scratch_bytes != null) return false;
 
         const plan_key = debertaEncoderFramePlanKey(request);
         if (self.hasReusableDebertaEncoderFramePlan(plan_key)) {

@@ -50,7 +50,9 @@ pub fn create(ctx: Context) Suite {
         // 20,025,544,704 bytes with cold caches; reserve 24 GiB in that mode.
         // The focused native CPU ReleaseFast suite peaked at 10,032,644,096
         // bytes. Its old 9 GiB declaration rejected a successful compilation.
-        .max_rss = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) @as(usize, if (ctx.optimize == .safe) 24 else 16) * 1024 * 1024 * 1024 else if (native_cpu and ctx.optimize == .debug) 12_672 * 1024 * 1024 else @as(usize, if (native_cpu) 11 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else 9) * 1024 * 1024 * 1024,
+        // Native macOS Metal GLiNER Decide serving (Zig 0.17, ReleaseFast)
+        // peaked at 15,153,954,816 bytes; 16 GiB keeps measured headroom.
+        .max_rss = if (b.graph.host.result.os.tag == .linux and b.graph.host.result.cpu.arch == .aarch64 and ctx.target.result.os.tag == .linux and ctx.target.result.cpu.arch == .aarch64 and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt) @as(usize, if (ctx.optimize == .safe) 24 else 16) * 1024 * 1024 * 1024 else if (native_cpu and ctx.optimize == .debug) 12_672 * 1024 * 1024 else @as(usize, if (native_cpu) 11 else if (ctx.backend.enable_cuda) 24 else if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 16 else 9) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/inference.zig"),
             .target = ctx.target,

@@ -12605,7 +12605,9 @@ pub const Node = struct {
             options.classification_batch_items = gliner_decide_qualification.cuda_batch_items;
             options.max_sequences_per_item = 1;
         } else if (backend == .metal and qualified_variant == .decide_deberta) {
-            options.classification_batch_items = gliner_decide_qualification.metal_batch_items;
+            const policy = gliner_decide_qualification.metalExecutionPolicy(qualified_identity.?) orelse return error.UnsupportedGlinerDecisionArtifact;
+            options.classification_batch_items = policy.batch_items;
+            options.classification_batch_tokens = policy.padded_batch_tokens;
         }
         const requested_sequence = if (qualified_variant == .decide_1b) (try gliner_decide_qualification.requestLimits(qualified_identity.?)).?.sequence_tokens else options.processor.max_sequence_tokens;
         const max_sequence = span_v2_executor.sequenceTokenCeiling(config, requested_sequence, backend == .cuda);
@@ -30756,10 +30758,10 @@ fn resolvedInferenceExecutorContract(
         std.mem.eql(u8, resolved_task, "extract") and
         manifest.gliner_classification_head == .label_marker_mlp and manifest.gliner_span_encoder_family == .deberta)
     {
-        // Metal preserves the existing public request cardinality and chunks
-        // physical forwards at eight rows. CUDA's qualified request cap is
-        // independently eight. Boundary discovery stays conservative because
-        // its long-document profiles still require one input per request.
+        // Unloaded-model discovery keeps its conservative eight-row preference.
+        // Authenticated Metal sessions choose physical groups using their
+        // padded-token policy without changing public request cardinality.
+        // CUDA's qualified request cap remains independently eight.
         implementation = .{
             .mode = .native,
             .preferred_items = if (metal_decide_batch) gliner_decide_qualification.metal_batch_items else gliner_decide_qualification.cuda_batch_items,

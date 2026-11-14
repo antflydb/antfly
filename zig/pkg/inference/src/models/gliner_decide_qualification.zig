@@ -190,6 +190,41 @@ pub const cuda_batch_items: usize = 8;
 const legacy_cuda_limits = RequestLimits{ .request_items = cuda_batch_items, .prepared_sequences = cuda_batch_items, .sequence_tokens = 512 };
 pub const metal_batch_items: usize = 8;
 
+/// Execution tuning for the exact dense DeBERTa Decide artifact. These are
+/// internal physical-forward limits; the public request envelope is unchanged.
+pub const MetalExecutionPolicy = struct {
+    batch_items: usize = 8,
+    padded_batch_tokens: usize = 1000,
+    reuse_batch_padding: bool = true,
+    packed_qkv_cache_bytes: usize = 512 * 1024 * 1024,
+    attention_scratch_bytes: usize = 32 * 1024 * 1024,
+};
+
+pub fn metalExecutionPolicy(identity: Identity) ?MetalExecutionPolicy {
+    return if (isLegacyDecide(identity)) .{} else null;
+}
+
+/// Conservative admission hint, never an execution or qualification grant.
+/// The loader still authenticates the complete consumed identity before
+/// installing the policy. Unknown weights may only be over-reserved here.
+pub fn metalPolicySidecarHint(config: ?Digest, encoder: ?Digest) bool {
+    return digestMatches(config orelse return false, legacy_config) and
+        digestMatches(encoder orelse return false, legacy_encoder_config);
+}
+
+test "GLiNER Decide Metal policy binds the dense artifact and keeps admission conservative" {
+    var identity = legacyIdentity();
+    const policy = metalExecutionPolicy(identity).?;
+    try std.testing.expectEqual(@as(usize, 8), policy.batch_items);
+    try std.testing.expectEqual(@as(usize, 1000), policy.padded_batch_tokens);
+    try std.testing.expect(metalPolicySidecarHint(identity.sidecars.config, identity.sidecars.encoder_config));
+    identity.weight.sha256[0] = if (identity.weight.sha256[0] == '0') '1' else '0';
+    try std.testing.expect(metalExecutionPolicy(identity) == null);
+    try std.testing.expect(metalPolicySidecarHint(identity.sidecars.config, identity.sidecars.encoder_config));
+    try std.testing.expect(!metalPolicySidecarHint(null, identity.sidecars.encoder_config));
+    try std.testing.expect(metalExecutionPolicy(pinned_fp32_identity) == null);
+}
+
 /// The two immutable precision variants share the measured request geometry.
 /// Their numerical and serving evidence remain independently captured.
 pub fn requestLimits(identity: Identity) !?RequestLimits {
@@ -237,6 +272,8 @@ fn legacyIdentity() Identity {
         },
     };
 }
+
+pub const pinned_legacy_fp32_identity = legacyIdentity();
 
 test "GLiNER Decide qualification binds exact loaded legacy identity" {
     var identity = legacyIdentity();
