@@ -1860,6 +1860,9 @@ typedef struct termite_metal_decode_runtime {
     id<MTLBuffer> rms_norm_weight_buffers[TERMITE_METAL_RMS_NORM_SLOT_CAPACITY];
     size_t rms_norm_hidden_sizes[TERMITE_METAL_RMS_NORM_SLOT_CAPACITY];
     uint8_t rms_norm_slot_prepared[TERMITE_METAL_RMS_NORM_SLOT_CAPACITY];
+    bool deberta_cache_limits_configured;
+    size_t deberta_packed_qkv_cache_max_bytes;
+    size_t deberta_attention_scratch_max_bytes;
     id<MTLBuffer> linear_weight_buffers[TERMITE_METAL_LINEAR_SLOT_CAPACITY];
     id<MTLBuffer> linear_bias_buffers[TERMITE_METAL_LINEAR_SLOT_CAPACITY];
     // Shared all-zero bias buffers by element count. A slot prepared with an
@@ -17956,7 +17959,9 @@ static bool termite_metal_size_add(size_t a, size_t b, size_t *out) {
     return true;
 }
 
-static size_t termite_metal_dense_qkv_pack_cache_max_bytes(void) {
+static size_t termite_metal_dense_qkv_pack_cache_max_bytes(const termite_metal_decode_runtime *runtime) {
+    if (runtime != NULL && runtime->deberta_cache_limits_configured)
+        return runtime->deberta_packed_qkv_cache_max_bytes;
     const char *value = getenv("TERMITE_METAL_DENSE_QKV_PACK_CACHE_MAX_MB");
     if (value == NULL || value[0] == '\0') {
         return (size_t)TERMITE_METAL_DENSE_QKV_PACK_CACHE_DEFAULT_MAX_MB * 1024u * 1024u;
@@ -17970,7 +17975,9 @@ static size_t termite_metal_dense_qkv_pack_cache_max_bytes(void) {
     return (size_t)mb * 1024u * 1024u;
 }
 
-static size_t termite_metal_deberta_mps_attention_scratch_max_bytes(void) {
+static size_t termite_metal_deberta_mps_attention_scratch_max_bytes(const termite_metal_decode_runtime *runtime) {
+    if (runtime != NULL && runtime->deberta_cache_limits_configured)
+        return runtime->deberta_attention_scratch_max_bytes;
     if (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_DEBERTA_MPS_ATTENTION"))) return 0;
     const uint64_t max_mb = termite_metal_env_bounded_u64(
         "TERMITE_METAL_DEBERTA_MPS_ATTENTION_MAX_MB",
@@ -17979,6 +17986,26 @@ static size_t termite_metal_deberta_mps_attention_scratch_max_bytes(void) {
         (uint64_t)(SIZE_MAX / (1024u * 1024u))
     );
     return (size_t)max_mb * 1024u * 1024u;
+}
+
+int termite_metal_decode_runtime_configure_deberta_cache_limits(
+    termite_metal_decode_runtime *runtime, size_t packed_bytes, size_t attention_bytes
+) {
+    if (runtime == NULL || packed_bytes == 0 ||
+        runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -1;
+    runtime->deberta_packed_qkv_cache_max_bytes = packed_bytes;
+    runtime->deberta_attention_scratch_max_bytes = attention_bytes;
+    runtime->deberta_cache_limits_configured = true;
+    return 0;
+}
+
+int termite_metal_decode_runtime_deberta_cache_limits(
+    termite_metal_decode_runtime *runtime, size_t *packed_bytes, size_t *attention_bytes
+) {
+    if (runtime == NULL || packed_bytes == NULL || attention_bytes == NULL) return -1;
+    *packed_bytes = termite_metal_dense_qkv_pack_cache_max_bytes(runtime);
+    *attention_bytes = termite_metal_deberta_mps_attention_scratch_max_bytes(runtime);
+    return 0;
 }
 
 static bool termite_metal_buffer_range_valid(id<MTLBuffer> buffer, size_t offset, size_t byte_count) {
@@ -20196,7 +20223,7 @@ static int termite_metal_decode_runtime_ensure_dense_qkv_packed_weight(
     size_t projected_cache_bytes = 0;
     if (!termite_metal_size_add(packed_bytes, packed_bias_bytes, &requested_bytes) ||
         !termite_metal_size_add(cached_bytes, requested_bytes, &projected_cache_bytes) ||
-        projected_cache_bytes > termite_metal_dense_qkv_pack_cache_max_bytes()) return -4;
+        projected_cache_bytes > termite_metal_dense_qkv_pack_cache_max_bytes(runtime)) return -4;
     id<MTLBuffer> packed = antfly_observe_metal_buffer([runtime->device newBufferWithLength:packed_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
     id<MTLBuffer> packed_bias = antfly_observe_metal_buffer([runtime->device newBufferWithLength:packed_bias_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
     if (packed == nil || packed_bias == nil) return -2;
@@ -54654,7 +54681,7 @@ int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
         // host reference. The legacy `_tg` kernel stays opt-in for debugging.
         const BOOL force_scalar = getenv("TERMITE_METAL_FORCE_DEBERTA_SCALAR") != NULL;
         const BOOL force_tg = getenv("TERMITE_METAL_FORCE_DEBERTA_TG") != NULL;
-        const size_t mps_attention_scratch_max_bytes = termite_metal_deberta_mps_attention_scratch_max_bytes();
+        const size_t mps_attention_scratch_max_bytes = termite_metal_deberta_mps_attention_scratch_max_bytes(runtime);
         const BOOL mps_attention_requested =
             mps_attention_scratch_max_bytes != 0 &&
             !force_scalar && !force_tg &&

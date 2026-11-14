@@ -7994,7 +7994,9 @@ pub const Node = struct {
         const control = self.bindExecutionControl(items[0].control.io, .{ .ptr = &group, .check_fn = executor_microbatch.ExecutionControl.check });
         var longest: usize = 0;
         for (items) |item| longest = @max(longest, item.payloadAs(DecideClassifyTicket).sample.input_ids.len);
-        var budget = gliner_microbatch.classificationBudget(first.limits, first.config, longest, items.len) catch |err| {
+        const variant = try gliner_decide_qualification.require(try session_factory.getGlinerDecisionIdentity(first.model.session));
+        const workspace_bytes: usize = if (variant == .decide_deberta or variant == .decide_deberta_q8) gliner_specialty.cuda_matmul_workspace_bytes else 0;
+        var budget = gliner_microbatch.classificationBudget(first.limits, first.config, longest, items.len, workspace_bytes) catch |err| {
             if (err == error.MemoryBudgetExceeded) return error.ClassificationMicrobatchCapacity;
             return err;
         };
@@ -12735,8 +12737,10 @@ pub const Node = struct {
         if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
             options.classification_batch_items = gliner_decide_qualification.cuda_batch_items;
             options.max_sequences_per_item = 1;
-        } else if (backend == .metal and qualified_variant == .decide_deberta) {
-            options.classification_batch_items = gliner_decide_qualification.metal_batch_items;
+        } else if (backend == .metal and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
+            const policy = gliner_decide_qualification.metalExecutionPolicy(qualified_identity.?) orelse return error.UnsupportedGlinerDecisionArtifact;
+            options.classification_batch_items = policy.batch_items;
+            options.classification_batch_tokens = policy.padded_batch_tokens;
         }
         const requested_sequence = if (qualified_variant == .decide_1b) (try gliner_decide_qualification.requestLimits(qualified_identity.?)).?.sequence_tokens else options.processor.max_sequence_tokens;
         const max_sequence = span_v2_executor.sequenceTokenCeiling(config, requested_sequence, backend == .cuda);
@@ -12821,7 +12825,11 @@ pub const Node = struct {
             else if (span_geometry) |geometry|
                 try span_v2_executor.spanExtractionDeviceScratchUpperBound(config, geometry)
             else
-                try std.math.mul(usize, try span_v2_executor.deviceScratchUpperBound(config, longest), span_v2_executor.classificationBatchItems(request, &request_plan, options));
+                try std.math.add(
+                    usize,
+                    try std.math.mul(usize, try span_v2_executor.deviceScratchUpperBound(config, longest), span_v2_executor.classificationBatchItems(request, &request_plan, options)),
+                    if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) gliner_specialty.cuda_matmul_workspace_bytes else 0,
+                );
             const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
                 self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(if (gpu) .gpu else .cpu)),
                 self.config.generation_budget_overrides.scratch_limit_bytes,
@@ -30889,14 +30897,14 @@ fn resolvedInferenceExecutorContract(
         std.mem.eql(u8, resolved_task, "extract") and
         manifest.gliner_classification_head == .label_marker_mlp and manifest.gliner_span_encoder_family == .deberta)
     {
-        // Metal preserves the existing public request cardinality and chunks
-        // physical forwards at eight rows. CUDA's qualified request cap is
-        // independently eight. Boundary discovery stays conservative because
-        // its long-document profiles still require one input per request.
+        // Unloaded-model discovery keeps its conservative eight-row preference.
+        // Authenticated Metal sessions choose physical groups using their
+        // padded-token policy without changing public request cardinality.
+        // Both pinned CUDA artifacts compose eight-row forwards, up to 32 inputs.
         implementation = .{
             .mode = .native,
             .preferred_items = if (metal_decide_batch) gliner_decide_qualification.metal_batch_items else gliner_decide_qualification.cuda_batch_items,
-            .max_items = if (metal_decide_batch) resolvedTaskMaxItems(resolved_task) else gliner_decide_qualification.cuda_batch_items,
+            .max_items = if (metal_decide_batch) resolvedTaskMaxItems(resolved_task) else gliner_decide_qualification.cuda_request_items,
             .per_item_failures = false,
         };
     }
