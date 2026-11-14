@@ -1884,6 +1884,17 @@ test "lite allocator v4 owner pins readers and reuses pages with shrinking disab
     defer if (newer_open) newer.abort();
     old.abort();
     old_open = false;
+    // perf/lwa-reuse-loss: "doc"'s 120 overwrites above are all still only
+    // logical (redo.shared.maps), never folded -- no explicit checkpoint
+    // and no capacity pressure ran in between. `maintainOnce`'s own
+    // ledger-only retirement body now correctly defers to an unbudgeted,
+    // unfolded store (same posture as a staged page) rather than risking
+    // a `commit_sequence` advance past content the real tree does not
+    // have yet, so it alone no longer makes retirement progress here --
+    // an explicit fold first is what actually unblocks it, exactly like
+    // a real capacity-pressure caller gets for free via `checkpointRedoLog`'s
+    // own budgeted-fold branch.
+    try store.checkpointRedoLog();
     for (0..200) |_| try store.maintainOnce(false);
     try std.testing.expectEqualStrings("new", try newer.get("doc"));
     try std.testing.expect((try store.reclamationStatus()).retired_objects_serviced > 0);
