@@ -192,6 +192,14 @@ deadline so subsequent runs can retain the server's timeout identity rather than
 race it with the client socket timeout. No host cache flush or GPU workload
 interruption was performed.
 
+The same full raster with LightOn 4B, eight performance cores, automatic scratch
+and a 600 s execution budget returned structured retryable HTTP 504
+`INFERENCE_TIMEOUT` (peak PSS 9.49 GiB). The response grace preserved that error
+identity and the worker exited cleanly. This also failed full-page qualification;
+the successful 4B tiny fixture must not be used to advertise dense-page CPU
+throughput. Raw receipts and the exact executable were retained locally; no
+Grepstein document contents are checked into the repository.
+
 ## Adoption
 
 The native `/read` service owns PDF rendering, OCR and long-audio transcription.
