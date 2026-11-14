@@ -35,6 +35,11 @@ batch's allocator and lease. Merely installing a dispatcher does not imply a
 batch was executed. Queue metadata trims unused growth capacity before admission
 of the physical batch. After encoding, surviving outputs retain their respective
 allocation/batch credits while unused encoder workspace is released before decoding.
+Serial credit is bound to the actual callee for the duration of that call and
+restores the prior preparation binding afterward. Distinct encoder/decoder
+sessions must not execute through each other's permit. KV outputs, accelerator
+execution and foreign ledgers retain separate execution/output leases; only
+their small tensor container transfers into the request allocator.
 Document leaves preserve the complete execution control, including the logical
 request permit. Top-level direct document read/extract operations acquire that
 permit before source processing, including operations satisfied by native text.

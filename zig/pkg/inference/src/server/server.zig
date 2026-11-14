@@ -52594,6 +52594,8 @@ test "native media Node dispatcher transfers serial credit and releases physical
     const Session = backends_mod.Session;
     const Fake = struct {
         batched: bool,
+        kv: bool = false,
+        factor: f32 = 1,
         fn info(_: *anyopaque) []const Info {
             return &.{.{ .name = "values", .dtype = .f32, .shape = &.{ -1, 1 } }};
         }
@@ -52601,17 +52603,26 @@ test "native media Node dispatcher transfers serial credit and releases physical
             const self: *@This() = @ptrCast(@alignCast(raw));
             return self.batched;
         }
+        fn outputInfo(raw: *anyopaque) []const Info {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.kv) &.{.{ .name = "present.0.decoder.key", .dtype = .f32, .shape = &.{ -1, 1 } }} else info(raw);
+        }
+        fn geometry(raw: *anyopaque, _: @import("../backends/session.zig").ShapeInputs, _: usize) !?@import("../backends/session.zig").RunGeometry {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.kv) .{ .sequence = 1, .output_bytes = 20, .output_kv_bytes = 20 } else null;
+        }
         fn backend(_: *anyopaque) backends_mod.BackendType {
             return .native;
         }
         fn close(_: *anyopaque) void {}
-        fn run(_: *anyopaque, inputs: []const Tensor, alloc: std.mem.Allocator) ![]Tensor {
+        fn run(raw: *anyopaque, inputs: []const Tensor, alloc: std.mem.Allocator) ![]Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
             const scratch = try alloc.alloc(u8, 128 * 1024);
             defer alloc.free(scratch);
             @memset(scratch, 42);
             const out = try alloc.alloc(Tensor, 1);
             errdefer alloc.free(out);
-            out[0] = try Tensor.initFloat32(alloc, "values", &.{ 1, 1 }, inputs[0].asFloat32());
+            out[0] = try Tensor.initFloat32(alloc, if (self.kv) "present.0.decoder.key" else "values", &.{ 1, 1 }, &.{inputs[0].asFloat32()[0] * self.factor});
             return out;
         }
         fn controlled(raw: *anyopaque, inputs: []const Tensor, alloc: std.mem.Allocator, control: InferenceExecutionControl) ![]Tensor {
@@ -52621,18 +52632,23 @@ test "native media Node dispatcher transfers serial credit and releases physical
     };
     var node = try Node.init(a, .{});
     defer node.deinit();
-    for ([_]bool{ false, true }) |batched| {
-        var fake = Fake{ .batched = batched };
+    for (0..3) |mode| {
+        var encoder = Fake{ .batched = false };
+        var fake = Fake{ .batched = mode == 1, .kv = mode == 2, .factor = 2 };
         var controller = runtime.tier.memory.AdmissionController{};
         var gate: std.atomic.Mutex = .unlocked;
-        const session = Session{ .ptr = &fake, .vtable = &.{ .run = Fake.run, .runWithControl = Fake.controlled, .inputInfo = Fake.info, .outputInfo = Fake.info, .backend = Fake.backend, .close = Fake.close, .independentBatchRows = Fake.independent }, .execution_gate = &gate, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .scratch_limit_bytes = 192 * 1024 }, .static_workspace_bytes = 128 * 1024, .check_live_memory = false } };
-        var workspace = @import("../backends/admitted_allocator.zig").AdmittedAllocator{ .backing = a, .session = session, .trim_on_free = true };
+        const session = Session{ .ptr = &fake, .vtable = &.{ .run = Fake.run, .runWithControl = Fake.controlled, .inputInfo = Fake.info, .outputInfo = Fake.outputInfo, .runGeometry = Fake.geometry, .backend = Fake.backend, .close = Fake.close, .independentBatchRows = Fake.independent }, .execution_gate = &gate, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .scratch_limit_bytes = 192 * 1024 }, .static_workspace_bytes = 128 * 1024, .check_live_memory = false } };
+        var encoder_session = session;
+        encoder_session.ptr = &encoder;
+        var workspace = @import("../backends/admitted_allocator.zig").AdmittedAllocator{ .backing = a, .session = encoder_session, .trim_on_free = true };
         defer workspace.deinit();
         var input = try Tensor.initFloat32(a, "values", &.{ 1, 1 }, &.{7});
         defer input.deinit();
         const dispatch = node.tensorBatchDispatch(.transcribe);
         const outputs = try dispatch.run(workspace.allocator(), session, null, &gate, &.{input}, .{ .io = std.testing.io });
-        try std.testing.expectEqualSlices(f32, &.{7}, outputs[0].asFloat32());
+        try std.testing.expectEqualSlices(f32, &.{14}, outputs[0].asFloat32());
+        try std.testing.expect(workspace.session.?.ptr == @as(*anyopaque, @ptrCast(&encoder)));
+        try std.testing.expectEqual(mode == 2, controller.snapshot().host_kv_bytes > 0);
         // The output remains alive, but not the encoder's 128 KiB peak.
         try std.testing.expect(controller.snapshot().host_scratch_bytes < 4096);
         for (outputs) |*tensor| tensor.deinit();

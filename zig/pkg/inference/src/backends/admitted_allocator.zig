@@ -73,6 +73,19 @@ pub const AdmittedAllocator = struct {
         self.admission_context = null;
     }
 
+    /// Only plain CPU scratch can share this allocation ledger. KV outputs,
+    /// foreign domains and custom rollback ledgers retain execution ownership.
+    pub fn canBorrowRun(self: *const @This(), session: sessions.Session, request: sessions.RunRequest) !bool {
+        const admission = session.run_admission orelse return false;
+        if (admission.backend_class != .cpu or self.admit != null or self.rollback_admission != null or self.prepaid_host_bytes != 0) return false;
+        var reservation = self.reservations;
+        while (reservation) |node| : (reservation = node.next) {
+            const lease = node.lease orelse return false;
+            if (lease.controller != admission.controller or lease.retain_backend_class != .cpu) return false;
+        }
+        return (try admission.estimateRequest(request, session.outputInfo())).host_kv_bytes == 0;
+    }
+
     pub fn allocationOverhead(alignment: std.mem.Alignment) usize {
         return std.mem.alignForward(usize, @sizeOf(Header), alignment.toByteUnits());
     }
