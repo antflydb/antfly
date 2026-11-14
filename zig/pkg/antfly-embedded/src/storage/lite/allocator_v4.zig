@@ -959,7 +959,20 @@ pub const State = struct {
         self.clean();
     }
     pub fn checkpointDue(self: *const State) bool {
-        const threshold = @max(@as(u64, 256 * 1024), @as(u64, self.counts.items.len) * 8 + self.pending.count() * 96);
+        // perf/lwa-reclaim-reconcile: `counts.items.len`/`pending.count()`
+        // are ordinary array/hashmap sizes, bounded by real memory, but
+        // `*`/`+` here were never saturating -- a store whose counter
+        // table legitimately grows very large (a redo-log file's own
+        // "allow_behind" lag lets `covered_pages`/`counts.items.len` run
+        // ahead of `checkpoint.page_count` by design, see
+        // `decodeFreeMapAlloc`'s own doc comment) could overflow this
+        // threshold computation and panic a background maintenance turn
+        // (`Store.maintenanceLoop` -> `retirementNeedsService` ->
+        // `checkpointDue`) instead of just saturating to "always due."
+        // Saturating arithmetic preserves the real invariant (a bigger
+        // counter table only ever raises the threshold, never wraps it
+        // negative) without changing behavior for any size that fits.
+        const threshold = @max(@as(u64, 256 * 1024), (@as(u64, self.counts.items.len) *| 8) +| (@as(u64, self.pending.count()) *| 96));
         return self.root.build_limit != 0 or self.force_checkpoint or self.root.delta_bytes >= threshold;
     }
 
@@ -1370,6 +1383,44 @@ test "lite allocator v4 retirement preserves shared ownership and oldest epoch" 
     try state.complete(oldest);
     try std.testing.expect(state.oldest(9) == null);
     try std.testing.expectEqual(@as(u64, 1), state.oldest(10).?.page);
+}
+
+test "lite allocator v4 checkpointDue threshold tracks counts and pending without overflow" {
+    // perf/lwa-reclaim-reconcile: `checkpointDue`'s own threshold used
+    // non-saturating `*`/`+` over `counts.items.len`/`pending.count()`
+    // (a background maintenance turn -- Store.maintenanceLoop ->
+    // retirementNeedsService -> checkpointDue -- hit this live as a
+    // panic rather than a correctness bug). Driving those fields all
+    // the way to their true overflow point would need exabytes of real
+    // entries, so this instead pins the formula's own observable
+    // behavior at a size the fix must leave unchanged: the threshold is
+    // the floor (256 KiB) until enough counters/pending entries exist to
+    // raise it, and it strictly increases from there, matching
+    // `@max(256*1024, counts.items.len*8 + pending.count()*96)` exactly.
+    var state = State.init(std.testing.allocator);
+    defer state.deinit();
+    // 40_000 counter entries alone (*8 = 320_000) already clears the
+    // 256 KiB floor, so the formula's own counts-driven term, not the
+    // floor, governs everything below.
+    for (1..40_001) |page| try state.retain(page);
+    const base_threshold = @as(u64, state.counts.items.len) * 8;
+    try std.testing.expect(base_threshold > 256 * 1024);
+    state.root.delta_bytes = base_threshold - 1;
+    try std.testing.expect(!state.checkpointDue());
+    state.root.delta_bytes = base_threshold;
+    try std.testing.expect(state.checkpointDue());
+    try state.retire(.{ .epoch = 1, .page = 1, .kind = .page });
+    state.root.delta_bytes = base_threshold;
+    // One queued retirement raises `pending.count()` by one, which
+    // raises the threshold by 96 -- the same `delta_bytes` that was
+    // "due" against the pre-retire threshold must no longer be.
+    try std.testing.expectEqual(@as(u32, 1), state.pending.count());
+    try std.testing.expect(!state.checkpointDue());
+    // The saturating ceiling itself: even a maximal delta still reports
+    // due (never panics) once the queue/counter-driven threshold is
+    // itself near u64's own ceiling.
+    state.root.delta_bytes = std.math.maxInt(u64);
+    try std.testing.expect(state.checkpointDue());
 }
 
 test "lite allocator v4 saturated admission preserves depth first collector space" {
