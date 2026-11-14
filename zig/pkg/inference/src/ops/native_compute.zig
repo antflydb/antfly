@@ -4004,14 +4004,25 @@ fn convertTensorRowsToF32(
 }
 
 fn shouldBorrowEmbeddingTensor(name: []const u8) bool {
-    return std.mem.eql(u8, name, "model.embed_tokens.weight") or
+    return std.mem.eql(u8, name, "embed_tokens.weight") or
+        std.mem.eql(u8, name, "model.embed_tokens.weight") or
         std.mem.eql(u8, name, "language_model.embed_tokens.weight") or
         std.mem.eql(u8, name, "vision_tower.patch_embedder.position_embedding_table") or
         std.mem.eql(u8, name, "wte.weight");
 }
 
+fn decoderLocalWeightName(self: *const NativeCompute, name: []const u8) []const u8 {
+    const prefix = self.decoder_weight_prefix;
+    var local = name;
+    if (prefix.len != 0 and local.len > prefix.len and std.mem.startsWith(u8, local, prefix) and local[prefix.len] == '.')
+        local = local[prefix.len + 1 ..];
+    if (std.mem.startsWith(u8, local, "model.")) local = local["model.".len..];
+    return local;
+}
+
 fn shouldBorrowTypedWeightTensor(self: *const NativeCompute, name: []const u8, tensor: *const tensor_mod.Tensor) bool {
-    if (shouldBorrowEmbeddingTensor(name)) return true;
+    const local = decoderLocalWeightName(self, name);
+    if (shouldBorrowEmbeddingTensor(local)) return true;
     if (self.cache_embeddinggemma2_bf16_weights and !native.useBlas() and
         embeddinggemma2_weight_cache.nativeClass(name) != null and tensor.shape.len == 2 and
         tensor.shape[0] >= 64 and tensor.shape[1] >= 64 and
@@ -4020,23 +4031,23 @@ fn shouldBorrowTypedWeightTensor(self: *const NativeCompute, name: []const u8, t
         (tensor.dtype == .f16 or tensor.dtype == .bf16)) return true;
     if (!self.borrow_bf16_linear_weights) return false;
     if (tensor.dtype != .bf16 or tensor.shape.len != 2) return false;
-    if (std.mem.eql(u8, name, "lm_head.weight") or std.mem.eql(u8, name, "cls.output.weight")) return true;
-    if (!std.mem.startsWith(u8, name, "model.layers.")) return false;
+    if (std.mem.eql(u8, local, "lm_head.weight") or std.mem.eql(u8, local, "cls.output.weight")) return true;
+    if (!std.mem.startsWith(u8, local, "layers.")) return false;
     // Projection matrices share the typed, bounded conversion kernel across
     // full-attention and recurrent decoders. Conv/norm/state tensors retain
     // their dense representation; borrowing every rank-two tensor is unsafe.
-    return std.mem.endsWith(u8, name, ".linear_attn.in_proj_qkv.weight") or
-        std.mem.endsWith(u8, name, ".linear_attn.in_proj_z.weight") or
-        std.mem.endsWith(u8, name, ".linear_attn.in_proj_b.weight") or
-        std.mem.endsWith(u8, name, ".linear_attn.in_proj_a.weight") or
-        std.mem.endsWith(u8, name, ".linear_attn.out_proj.weight") or
-        std.mem.endsWith(u8, name, ".self_attn.q_proj.weight") or
-        std.mem.endsWith(u8, name, ".self_attn.k_proj.weight") or
-        std.mem.endsWith(u8, name, ".self_attn.v_proj.weight") or
-        std.mem.endsWith(u8, name, ".self_attn.o_proj.weight") or
-        std.mem.endsWith(u8, name, ".mlp.gate_proj.weight") or
-        std.mem.endsWith(u8, name, ".mlp.up_proj.weight") or
-        std.mem.endsWith(u8, name, ".mlp.down_proj.weight");
+    return std.mem.endsWith(u8, local, ".linear_attn.in_proj_qkv.weight") or
+        std.mem.endsWith(u8, local, ".linear_attn.in_proj_z.weight") or
+        std.mem.endsWith(u8, local, ".linear_attn.in_proj_b.weight") or
+        std.mem.endsWith(u8, local, ".linear_attn.in_proj_a.weight") or
+        std.mem.endsWith(u8, local, ".linear_attn.out_proj.weight") or
+        std.mem.endsWith(u8, local, ".self_attn.q_proj.weight") or
+        std.mem.endsWith(u8, local, ".self_attn.k_proj.weight") or
+        std.mem.endsWith(u8, local, ".self_attn.v_proj.weight") or
+        std.mem.endsWith(u8, local, ".self_attn.o_proj.weight") or
+        std.mem.endsWith(u8, local, ".mlp.gate_proj.weight") or
+        std.mem.endsWith(u8, local, ".mlp.up_proj.weight") or
+        std.mem.endsWith(u8, local, ".mlp.down_proj.weight");
 }
 
 const WeightF32View = struct {
@@ -4299,6 +4310,9 @@ pub const NativeCompute = struct {
     /// Opt in only for qualified model families whose projection consumers
     /// accept typed weights. Other native/PJRT callers keep their load policy.
     borrow_bf16_linear_weights: bool = false,
+    /// Borrowed from the model configuration. Safetensors multimodal decoders
+    /// can retain this namespace while ordinary/stripped backbones do not.
+    decoder_weight_prefix: []const u8 = "",
     /// Borrow every resident 2-D f16/bf16 weight for typed GEMM. Only for
     /// sessions whose 2-D weights are consumed exclusively by linear ops
     /// (native Moondream reads its embedding table on the host).
@@ -54511,39 +54525,50 @@ test "embeddinggemma2 video host borrows avoid copies and writable views reject 
 
 test "native recurrent decoder projections use bounded BF16 workspace without dense weight copies" {
     const a = std.testing.allocator;
-    const shape = [_]i64{ 2, 3 };
-    var bytes: [12]u8 = undefined;
-    for (0..6) |i| std.mem.writeInt(u16, bytes[i * 2 ..][0..2], 0x3f80, .little);
-    const names = [_][]const u8{
-        "model.layers.0.linear_attn.in_proj_qkv.weight",
-        "model.layers.0.linear_attn.in_proj_z.weight",
-        "model.layers.0.linear_attn.in_proj_b.weight",
-        "model.layers.0.linear_attn.in_proj_a.weight",
-        "model.layers.0.linear_attn.out_proj.weight",
-        "lm_head.weight",
-    };
-    var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
-    defer store.resident_weights.deinit(a);
-    for (names) |name| try store.resident_weights.put(a, name, .{ .tensor = .{ .data = &bytes, .shape = &shape, .dtype = .bf16, .name = name, .allocator = a, .owns_data = false, .owns_shape = false } });
-    var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 1024, .scratch_limit_bytes = 128 });
-    var compute = NativeCompute.init(a, &store, &budget);
-    compute.borrow_bf16_linear_weights = true;
-    defer compute.deinit();
-    var values = [_]f32{ 1, 2, 3 };
-    const input = try compute.makeBuf(&values, false);
-    defer freeTensor(&compute, input);
-    for (names) |name| {
-        const weight = try getWeight(&compute, name);
-        defer freeTensor(&compute, weight);
-        try std.testing.expectEqual(@as(usize, 0), toBuf(weight).data.len);
-        const output = try linearNoBiasOp(&compute, input, weight, 1, 3, 2);
-        defer freeTensor(&compute, output);
-        try std.testing.expectEqualSlices(f32, &.{ 6, 6 }, getData(output));
-        try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+    for ([_][]const u8{ "", "model", "model.language_model", "language_model.model" }) |prefix| {
+        const shape = [_]i64{ 2, 3 };
+        var bytes: [12]u8 = undefined;
+        for (0..6) |i| std.mem.writeInt(u16, bytes[i * 2 ..][0..2], 0x3f80, .little);
+        const roles = [_][]const u8{
+            "layers.0.linear_attn.in_proj_qkv.weight",
+            "layers.0.linear_attn.in_proj_z.weight",
+            "layers.0.linear_attn.in_proj_b.weight",
+            "layers.0.linear_attn.in_proj_a.weight",
+            "layers.0.linear_attn.out_proj.weight",
+            "lm_head.weight",
+            "embed_tokens.weight",
+        };
+        var names: [roles.len][]const u8 = undefined;
+        var initialized: usize = 0;
+        defer for (names[0..initialized]) |name| a.free(name);
+        for (roles, &names) |role, *name| {
+            name.* = if (prefix.len == 0) try a.dupe(u8, role) else try std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, role });
+            initialized += 1;
+        }
+        var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+        defer store.resident_weights.deinit(a);
+        for (names) |name| try store.resident_weights.put(a, name, .{ .tensor = .{ .data = &bytes, .shape = &shape, .dtype = .bf16, .name = name, .allocator = a, .owns_data = false, .owns_shape = false } });
+        var budget = run_memory.RunBudget.init(.{ .host_limit_bytes = 1024, .scratch_limit_bytes = 128 });
+        var compute = NativeCompute.init(a, &store, &budget);
+        compute.borrow_bf16_linear_weights = true;
+        compute.decoder_weight_prefix = prefix;
+        defer compute.deinit();
+        var values = [_]f32{ 1, 2, 3 };
+        const input = try compute.makeBuf(&values, false);
+        defer freeTensor(&compute, input);
+        for (names) |name| {
+            const weight = try getWeight(&compute, name);
+            defer freeTensor(&compute, weight);
+            try std.testing.expectEqual(@as(usize, 0), toBuf(weight).data.len);
+            const output = try linearNoBiasOp(&compute, input, weight, 1, 3, 2);
+            defer freeTensor(&compute, output);
+            try std.testing.expectEqualSlices(f32, &.{ 6, 6 }, getData(output));
+            try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+        }
+        const source = &store.resident_weights.getPtr(names[0]).?.tensor;
+        try std.testing.expect(!shouldBorrowTypedWeightTensor(&compute, "layers.0.linear_attn.conv1d.weight", source));
+        try std.testing.expect(!shouldBorrowTypedWeightTensor(&compute, "layers.0.linear_attn.norm.weight", source));
     }
-    const source = &store.resident_weights.getPtr(names[0]).?.tensor;
-    try std.testing.expect(!shouldBorrowTypedWeightTensor(&compute, "model.layers.0.linear_attn.conv1d.weight", source));
-    try std.testing.expect(!shouldBorrowTypedWeightTensor(&compute, "model.layers.0.linear_attn.norm.weight", source));
 }
 
 test "native mapped F32 matrix consumers advise only their borrowed operand" {
