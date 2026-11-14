@@ -233,6 +233,44 @@ the successful 4B tiny fixture must not be used to advertise dense-page CPU
 throughput. Raw receipts and the exact executable were retained locally; no
 Grepstein document contents are checked into the repository.
 
+### Follow-up validation receipt
+
+The admission, preparation and scratch-reuse fixes at
+`e06fc8ccbdc560e3c623e21045316003300dda1e` repeated all four CPU smoke cases on
+Spark. Sources were verified per file against the built source copy; executable
+SHA-256 was `ba29b905448328e5f39b55c56b4ef4765a1f331bc2630636a19321ec398fa36f`.
+The same OpenBLAS library and four performance cores 5–8 were used, with a
+32 GiB process limit, automatic 6 GiB scratch, one logical request and prompt
+caching disabled. This was a shared host with uncontrolled page cache.
+
+| Model | Startup through first complete read | Warm read | Sampled peak PSS |
+| --- | ---: | ---: | ---: |
+| LightOnOCR-3-4B | 60.138 s | 44.636 s | 9.721 GiB |
+| LightOnOCR-3-0.8B | 12.130 s | 7.819 s | 2.154 GiB |
+| Whisper-small | 8.419 s | 6.454 s | 1.077 GiB |
+| Whisper-large-v3 | 46.131 s | 36.418 s | 6.796 GiB |
+
+These use the tiny image and short speech fixtures described above. Every model
+passed known-answer checks, deadline cancellation and a subsequent recovery
+read; each pinned installation's asset manifest remained unchanged after
+execution. These results do not establish a speedup or full-page throughput.
+The raw report is retained as `review-e06-smoke/report.json` alongside its
+source manifest and executable.
+
+The subsequent session-binding correction at `e342ea10e6` was verified locally:
+the real Node dispatcher regression covers distinct encoder/decoder sessions,
+fused execution and KV output lifetime under a tight scratch cap. The focused
+suite passed 343 tests, with 16 skipped. Nine qualification-tool tests and nine
+BLAS-disabled compute tests passed; the production inference host ABI test
+also passed on the core-fix source. No GPU execution is claimed by these checks.
+
+A separate exploratory 90 s run of the dense 1051×1400 page used the earlier
+core-fix snapshot, rather than the executable above. It returned the correct
+`INFERENCE_TIMEOUT` identity and logged 38.192 s of multimodal preparation,
+18.320 s of prefill and 33.850 s of decode, with 65 tokens observed before the
+deadline. This validates the failure diagnostics but is not complete-page
+qualification. Dense-page CPU fallback remains unqualified.
+
 ## Adoption
 
 The native `/read` service owns PDF rendering, OCR and long-audio transcription.
