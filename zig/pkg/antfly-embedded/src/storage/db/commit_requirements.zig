@@ -16,7 +16,6 @@
 //! Stable admission classification, shared by preparation and capability checks.
 //! This module performs no IO and never depends on a visibility wait level.
 const std = @import("std");
-const enrichment = @import("enrichment/enrichment_types.zig");
 
 pub const Eligibility = enum {
     eligible,
@@ -27,7 +26,7 @@ pub const Eligibility = enum {
     grouped_source,
 };
 
-pub fn directEligibility(request: enrichment.GeneratedEnrichmentRequest) Eligibility {
+pub fn directEligibility(request: anytype) Eligibility {
     for ([_][]const u8{ request.artifact_name, request.embedding_name, request.upstream_artifact_name }) |name| {
         if (std.mem.startsWith(u8, name, "_privacy_")) return .protected_producer;
     }
@@ -69,8 +68,23 @@ pub fn validateOutputBounds(writes: anytype, deletes: []const []const u8) !void 
     }
 }
 
+// The policy consumes values, not the enrichment runtime or its import graph.
+// Keep standalone contract fixtures local to this module.
+const TestRequest = struct {
+    artifact_name: []const u8 = "",
+    embedding_name: []const u8 = "",
+    upstream_artifact_name: []const u8 = "",
+    group_source_json: []const u8 = "",
+    group_artifact_name: []const u8 = "",
+    requires_committed_graph: bool = false,
+    neighbor_context_json: []const u8 = "",
+    prior_context_json: []const u8 = "",
+    input_kind: enum { document, inline_chunks, materialized_chunks } = .document,
+    embedding_input: enum { text, pdf_page_images } = .text,
+};
+
 test "commit requirements direct admission excludes committed and artifact dependencies" {
-    var request: enrichment.GeneratedEnrichmentRequest = .{ .kind = .dense_embedding, .index_name = "semantic", .doc_key = "doc", .source_field = "body" };
+    var request = TestRequest{};
     try std.testing.expectEqual(Eligibility.eligible, directEligibility(request));
     request.upstream_artifact_name = "extracted";
     try std.testing.expectEqual(Eligibility.artifact_source, directEligibility(request));
@@ -90,10 +104,10 @@ test "commit requirements direct admission excludes committed and artifact depen
 
 test "commit requirements catalog capability includes grouped-only and empty catalogs" {
     const Group = struct { entries: []const u8 };
-    const Plan = struct { generated_templates: []const enrichment.GeneratedEnrichmentRequest = &.{}, group_sources: ?Group = null };
+    const Plan = struct { generated_templates: []const TestRequest = &.{}, group_sources: ?Group = null };
     try std.testing.expect(catalogSupported(Plan{}));
     try std.testing.expect(!catalogSupported(Plan{ .group_sources = .{ .entries = &.{1} } }));
-    const excluded: enrichment.GeneratedEnrichmentRequest = .{ .kind = .dense_embedding, .index_name = "semantic", .doc_key = "", .source_field = "body", .upstream_artifact_name = "extraction" };
+    const excluded: TestRequest = .{ .upstream_artifact_name = "extraction" };
     try std.testing.expect(!catalogSupported(Plan{ .generated_templates = &.{excluded} }));
     var eligible = excluded;
     eligible.upstream_artifact_name = "";
