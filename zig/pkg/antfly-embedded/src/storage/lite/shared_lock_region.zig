@@ -918,7 +918,7 @@ pub const Region = struct {
             // but fails validation (or belongs to a different data file,
             // per the inode check above): prove no live process is
             // relying on it before even considering a rebuild.
-            try ensureNoLivePeer(raw_fd, &existing_raw, size);
+            try ensureNoLivePeer(io, fd_entry, &existing_raw, size);
         }
         if (need_init) {
             // Per-slot overhead: the reader slot itself, the ticket
@@ -1004,7 +1004,30 @@ pub const Region = struct {
     /// `existing_raw` is the (unvalidated -- that's the whole point)
     /// header this file already had. Succeeds only if every liveness
     /// byte it plausibly could have had is provably free.
-    fn ensureNoLivePeer(fd: std.posix.fd_t, existing_raw: *const [header_bytes]u8, actual_file_bytes: u64) RegionError!void {
+    ///
+    /// `fd_entry` (not just the raw fd) matters here for exactly the
+    /// reason `isSlotDead` already takes one: `fcntl(F_SETLK)` byte-range
+    /// locks are scoped to a *process*, not to a specific `Region` handle
+    /// or claim, so a slot THIS process already claimed through some
+    /// *other*, still-live `Region` handle sharing this same fd (an
+    /// in-process peer, not a foreign/dead one) would otherwise look
+    /// exactly like a free byte to a raw `fcntlTryLock` probe --
+    /// re-locking your own process's lock trivially "succeeds". Probing
+    /// it anyway, then immediately `fcntlUnlock`-ing it as "just a
+    /// probe", would release that other handle's *real* liveness lock
+    /// out from under it, and this function would wrongly report "no
+    /// live peer" the instant before `openSized` truncates and rebuilds
+    /// the very file that handle's own mapping is still backed by --
+    /// exactly the bus error this guard exists to prevent (confirmed
+    /// live: `Store.performVacuum`'s read snapshot/maintenance-worker
+    /// pairing hits this every time a generation swap's `inode_lock.
+    /// rebind` reopens a region whose sidecar still has another,
+    /// genuinely live, same-process reader's slot on it). Every index
+    /// already in `fd_entry.claimed_slots` is therefore treated as proof
+    /// of a live peer *without ever touching its byte range* -- the same
+    /// "mine" guard `isSlotDead` already applies per-slot, just run
+    /// across the whole claimed range before any probe, not after.
+    fn ensureNoLivePeer(io: Io, fd_entry: *FdEntry, existing_raw: *const [header_bytes]u8, actual_file_bytes: u64) RegionError!void {
         const h: *const Header = @ptrCast(@alignCast(existing_raw));
         const claimed_max_readers = h.max_readers;
         // A sane cap well above anything `openSized` would ever actually
@@ -1023,8 +1046,15 @@ pub const Region = struct {
             // no range left to prove safe. Refuse rather than guess.
             return RegionError.RegionCorrupt;
         }
+        const fd = fd_entry.fd;
         var i: u32 = 0;
         while (i < claimed_max_readers) : (i += 1) {
+            fd_registry_mutex.lockUncancelable(io);
+            const mine = for (fd_entry.claimed_slots.items) |claimed| {
+                if (claimed == i) break true;
+            } else false;
+            fd_registry_mutex.unlock(io);
+            if (mine) return RegionError.RegionCorrupt;
             const offset = livenessByteOffset(claimed_max_readers, i);
             if (!fcntlTryLock(fd, offset, std.c.F.WRLCK)) return RegionError.RegionCorrupt;
             // Just a probe, not a claim: release immediately so this
@@ -2731,13 +2761,16 @@ test "shared lock region rejects a corrupt header and reinitializes when no live
 
 // §8.4's corruption-safety rule, case 2: a corrupt header with a *live*
 // peer must refuse rather than silently wipe state a still-running
-// process is relying on. The "live peer" has to be a genuinely separate
-// OS process, not a second in-process `Region` handle: `fcntl` byte-
-// range locks are scoped per *process*, not per fd, so two handles this
-// same process opened would never conflict with each other regardless of
-// whether a real peer would -- this is exactly why `probeDead`/
-// `isSlotDead` need their own self-slot guard elsewhere in this file,
-// and the same reasoning rules out a single-process version of this test.
+// process is relying on. This test's "live peer" is a genuinely separate
+// OS process; "shared lock region refuses a corrupt header instead of
+// rebuilding under a live in-process peer" below covers the other live-
+// peer shape -- a second `Region` handle in *this* process -- which
+// needs its own, differently-synchronized test rather than a variant of
+// this one: `fcntl` byte-range locks are scoped per *process*, not per
+// fd, so a raw `fcntlTryLock` probe of a slot this same process already
+// holds (via that other handle) trivially "succeeds", which is a
+// different failure shape than a real foreign process actually holding
+// the lock (this test's own case).
 test "shared lock region refuses a corrupt header instead of rebuilding under a live peer" {
     if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -2833,12 +2866,13 @@ test "shared lock region rebuilds a sidecar whose db_inode no longer matches the
     rebuilt.releaseWriter();
 }
 
-// The inode cross-check's own "live peer" half, mirroring the
-// checksum-corruption test above it exactly (same reasoning for why the
-// live peer must be a genuinely separate process, not a second
-// in-process handle): a db_inode mismatch with a real separate process
-// still holding its liveness slot on the current sidecar must refuse to
-// rebuild, not silently wipe state that process is relying on.
+// The inode cross-check's own "live peer" half: a db_inode mismatch with
+// a real separate process still holding its liveness slot on the
+// current sidecar must refuse to rebuild, not silently wipe state that
+// process is relying on. "shared lock region refuses a db_inode mismatch
+// instead of rebuilding under a live in-process peer" below covers the
+// other live-peer shape this same check must also refuse under -- a
+// second `Region` handle in *this* process.
 test "shared lock region refuses a db_inode mismatch instead of rebuilding under a live peer" {
     if (builtin.os.tag == .windows or builtin.single_threaded) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -2889,6 +2923,106 @@ test "shared lock region refuses a db_inode mismatch instead of rebuilding under
 
     _ = std.c.kill(child_pid, std.c.SIG.KILL);
     _ = try reapBounded(child_pid, 2000);
+}
+
+// Regression (bus error): `ensureNoLivePeer` used a raw `fcntlTryLock`
+// then `fcntlUnlock` probe on every liveness byte with no check for
+// whether *this process* already held it through some other, still-live
+// `Region` handle sharing the same fd (`FdEntry`, keyed by the sidecar's
+// own inode in `acquireProcessFd`'s registry). `fcntl` byte-range locks
+// are scoped per process, not per handle or claim, so re-locking a byte
+// range this process already holds trivially "succeeds" -- the probe
+// wrongly concluded the holder was dead, the matching `fcntlUnlock`
+// released that other handle's *real* liveness lock, and `openSized`
+// then truncated and rebuilt the sidecar (`setLength(0)` then back up)
+// while that handle's `mmap` mapping was still live on it. The next
+// ordinary, correct `close()` of that first handle touched its now-
+// invalidated mapping and crashed with a bus error.
+//
+// This is exactly the shape `Store.performVacuum` hits in production:
+// its own full-read snapshot ("source") opens a `Region` against the
+// pre-vacuum generation and keeps it open across the whole vacuum, while
+// `NativeFile.replaceWithPreparedGeneration`'s `inode_lock.rebind` lazily
+// reopens a region for the newly-live (just-renamed) generation against
+// the very same sidecar path -- whose on-disk header still names the
+// *previous* generation's `db_inode`. Reproduced via
+// `storage.lite.docstore`'s "lite reclamation automatic worker bounds
+// sustained overwrite history": a sustained foreground writer plus the
+// automatic maintenance worker's own vacuum cycles, intermittently (the
+// bug needs the worker's `ensureRegion` reopen to land while the
+// snapshot reader's slot is still live), hence this deterministic,
+// single-process reproduction instead of relying on that timing.
+//
+// Unlike the two fork-based tests above, the live peer here is a second
+// `Region` handle in *this* process (`io.concurrent`, this file's own
+// convention for a real OS thread backed by `std.Io` -- never raw
+// `std.Thread`), not a separate OS process: the bug is specifically
+// about same-process, same-fd self-conflict, which a forked child can
+// never exercise (a different process's `fcntl` locks always correctly
+// conflict with this one's).
+test "shared lock region refuses a db_inode mismatch instead of rebuilding under a live in-process peer" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(io, &buf);
+    const db_path = try std.fmt.allocPrint(a, "{s}/region-inode-check-inprocess.aflite", .{buf[0..dir_len]});
+    defer a.free(db_path);
+
+    {
+        const f = try Io.Dir.cwd().createFile(io, db_path, .{});
+        f.close(io);
+    }
+
+    const Peer = struct {
+        db_path: []const u8,
+        ready: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        // The genuinely separate "live peer" *handle*: opens the region
+        // against the data file as it exists right now (claiming its own
+        // liveness slot and the writer word, mirroring the fork-based
+        // test's own peer shape) and parks -- on its own `io.concurrent`
+        // task, not the test's main flow of control -- until told to let
+        // go.
+        fn run(self: *@This(), peer_io: Io) !void {
+            var region = try Region.open(std.testing.allocator, peer_io, self.db_path);
+            _ = region.tryAcquireWriter(1);
+            self.ready.store(true, .release);
+            while (!self.release.load(.acquire)) peer_io.sleep(.fromMilliseconds(1), .awake) catch {};
+            region.releaseWriter();
+            region.close();
+        }
+    };
+    var peer: Peer = .{ .db_path = db_path };
+    var task = try io.concurrent(Peer.run, .{ &peer, io });
+    defer {
+        peer.release.store(true, .release);
+        task.await(io) catch {};
+    }
+
+    const ready_deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+    while (!peer.ready.load(.acquire)) {
+        if (Io.Clock.awake.now(io).nanoseconds > ready_deadline.nanoseconds) return error.Timeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+
+    // Replace the data file at the same path, exactly as the "no live
+    // peer" and fork-based cases do, but this time with a real, live
+    // `Region` handle in *this* process (not a separate OS process)
+    // still holding its liveness slot on the sidecar the old data file's
+    // inode was recorded into.
+    try Io.Dir.cwd().deleteFile(io, db_path);
+    {
+        const f = try Io.Dir.cwd().createFile(io, db_path, .{});
+        f.close(io);
+    }
+
+    // Before the fix, this call wrongly succeeded -- rebuilding the
+    // sidecar under the peer's still-live mapping -- instead of refusing.
+    try std.testing.expectError(RegionError.RegionCorrupt, Region.open(a, io, db_path));
 }
 
 // A symlink alias and its target must converge on the exact same
