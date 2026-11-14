@@ -53175,3 +53175,80 @@ test "reader direct prompt preparation includes metadata and pinned model in rej
         try std.testing.expectEqual(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, preparation.admission_error.?);
     }
 }
+
+test "reader direct generation entry point preserves pinned residency and cleans up planning rejection" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data =
+        \\{"model_type":"llama","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"intermediate_size":8,"vocab_size":8192,"max_position_embeddings":1048576}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"generator\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data =
+        \\{"model":{"type":"WordPiece","vocab":{"[UNK]":0,"x":1},"unk_token":"[UNK]","continuing_subword_prefix":"##"},"pre_tokenizer":{"type":"Whitespace"}}
+    });
+    // Only prompt planning runs: a real native session imports this embedding
+    // table, but no forward requiring the other decoder weights may execute.
+    const header = "{\"model.embed_tokens.weight\":{\"dtype\":\"F32\",\"shape\":[8192,4],\"data_offsets\":[0,131072]}}";
+    const header_len = std.mem.alignForward(usize, header.len, 8);
+    const checkpoint = try a.alloc(u8, 8 + header_len + 131072);
+    defer a.free(checkpoint);
+    @memset(checkpoint, 0);
+    std.mem.writeInt(u64, checkpoint[0..8], header_len, .little);
+    @memset(checkpoint[8..][0..header_len], ' ');
+    @memcpy(checkpoint[8..][0..header.len], header);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = checkpoint });
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    node.session_manager.preferred_backends = &.{.native};
+    node.session_manager.native_call_policy = .in_process;
+    node.model_manager.session_manager.preferred_backends = &.{.native};
+    node.model_manager.session_manager.native_call_policy = .in_process;
+    var handle = try node.model_manager.acquireFromDirWithControl(path, .{ .io = io });
+    defer handle.release();
+    const model = handle.get();
+    try std.testing.expect(model.manifest.model_type == .generator);
+    const domain = node.model_manager.resource_domain.?;
+    const resident = (try model.session.run_admission.?.requiredResidency().total()).hostTotalBytes();
+    try std.testing.expect(resident >= 128 * 1024);
+    const content = try a.alloc(u8, 16 * 1024);
+    defer a.free(content);
+    @memset(content, 'x');
+    const messages = [_]generation.Message{.{ .role = "user", .content = content }};
+    for ([_]bool{ false, true }) |contended| {
+        const cap = resident + if (contended) @as(usize, 256 * 1024) else @as(usize, 32 * 1024);
+        domain.admission_limits = .{ .host_limit_bytes = cap, .scratch_limit_bytes = cap };
+        model.session.run_admission.?.limits = domain.admission_limits;
+        const baseline = domain.admission.snapshot().hostTotalBytes();
+        var peer = try domain.admission.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = if (contended) cap - baseline - 32 * 1024 else 0 }, false);
+        defer peer.release();
+        const before = domain.admission.snapshot();
+        const slots_before = model.generation_admission.snapshot();
+        try std.testing.expectError(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, node.generateMessagesDirectPrepared(
+            a,
+            path,
+            &messages,
+            1,
+            try Node.directGeneratePreflightForMessages(&messages),
+            1,
+            null,
+            true,
+            null,
+            false,
+            null,
+            null,
+            null,
+            .{ .io = io },
+        ));
+        try std.testing.expectEqualDeep(before, domain.admission.snapshot());
+        const slots_after = model.generation_admission.snapshot();
+        // Prove rejection occurred after model acquisition and execution-slot
+        // admission, rather than during preliminary manifest inspection.
+        try std.testing.expectEqual(slots_before.started + 1, slots_after.started);
+        try std.testing.expectEqual(@as(usize, 0), slots_after.active);
+        try std.testing.expectEqual(@as(usize, 1), model.active_handles);
+    }
+}
