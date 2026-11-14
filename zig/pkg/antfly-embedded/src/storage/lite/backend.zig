@@ -1596,7 +1596,28 @@ test "lite backend deferred opens leave derived replay to their external owner" 
     // still publishes it, with ordinary allocator validation before reuse.
     try db.runUntilIdle();
     try std.testing.expect(try db.core.loadAppliedSequence(a, "body_text") >= target);
-    try std.testing.expect(handle.native_docstore.?.file.free_pages_verified);
+    // `free_pages_verified` only flips on a real (non-diverting) redo-log
+    // checkpoint fold -- the catch-up write just applied above is an
+    // ordinary diverting commit under the redo log's default, which never
+    // touches the ledger (see `pageAllocatorForDivertingCommit`'s own doc
+    // comment). The only thing that folds it here is the store's
+    // background ride-along idle-flush timer (`docstore.zig`'s
+    // `rideAlongFlushLoop`/`maybeCheckpointRedoLogOnIdleTurn`), started
+    // eagerly for any redo-log file regardless of
+    // `start_index_workers`/`start_optional_runtime_workers` (both false
+    // above) -- `runUntilIdle()` itself never forces a fold for a write
+    // this small (nowhere near the log's own 25%-remaining backpressure
+    // bound), so asserting `free_pages_verified` immediately after one
+    // `runUntilIdle()` call races that independent ~50ms timer: it failed
+    // under light system load, where this test's own thread reliably
+    // reached the assertion before the timer's first tick. Poll for it
+    // instead, the same bounded busy-wait idiom `waitForGateStartedForTest`
+    // (docstore.zig) already uses for an independent-thread condition.
+    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    while (!handle.native_docstore.?.file.free_pages_verified) {
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
+        @import("antfly_platform").time.yieldNow();
+    }
 }
 
 test "lite backend native engine can back db primary documents" {

@@ -5595,42 +5595,90 @@ const PageWriteBatch = struct {
             var end = start + 1;
             while (end < count and self.page_ids[end] - self.page_ids[end - 1] == 1) : (end += 1) {}
             if (self.diverting and file.redo != null and !file.redo.?.checkpointing) {
-                // §9.3/§9.1: diverted into the redo log's in-memory staging
-                // instead of a physical pwrite -- no manifest bookkeeping
-                // either (meaningless under redo-log commit; see
-                // `NativeFile.manifest_commits_enabled`, already `false`
-                // for this file). Run-coalescing above exists only to
-                // batch *syscalls*; staging bytes in memory has no such
-                // benefit, so each page in the run is staged individually.
                 // `self.diverting` (propagated from the owning
-                // `PageAllocator`, see its own doc comment) scopes this to
-                // the one legitimate page-shaped exception -- an external
-                // value chain staged through `pageAllocatorForDivertingCommit`
-                // during an ordinary (non-fold) transactional commit. A
-                // bare commit's own pages (`pageAllocatorFromFreeMap`,
-                // `diverting = false`) always take the real-pwrite branch
-                // below, matching `putIndexedDocumentBatch`'s and
-                // `publishBareCommit`'s own doc comments ("a bare commit
-                // never diverts") -- `file.redo != null` alone used to be
-                // this check's only condition, which silently broke that
-                // invariant for every bare commit once `use_redo_log`
-                // became the default (every page it wrote, not just
-                // page-shaped external values, got staged here instead of
-                // written, leaving `checkpoint.page_count` running ahead
-                // of bytes that were never actually on disk until the next
-                // `checkpointRedoLog` fold -- confirmed via a direct repro:
-                // a bare `putDocument`'s own `document_root_page` offset
-                // read back as past-EOF).
+                // `PageAllocator`, see its own doc comment) scopes this
+                // branch to the one legitimate page-shaped exception -- an
+                // external value chain staged through
+                // `pageAllocatorForDivertingCommit` during an ordinary
+                // (non-fold) transactional commit. A bare commit's own
+                // pages (`pageAllocatorFromFreeMap`, `diverting = false`)
+                // always take the real-pwrite branch below, matching
+                // `putIndexedDocumentBatch`'s and `publishBareCommit`'s own
+                // doc comments ("a bare commit never diverts") --
+                // `file.redo != null` alone used to be this check's only
+                // condition, which silently broke that invariant for every
+                // bare commit once `use_redo_log` became the default.
                 // Only page-shaped writes (external value chains) reach
-                // this at all now -- see `RedoCommitState`'s own doc
-                // comment -- since `flushTransactionWrites` diverts the
-                // B-tree roots logically, before any page is ever built.
-                const redo = &file.redo.?;
-                for (self.page_ids[start..end], start..end) |page_id, i| {
-                    redo.appendPending(file.allocator, file.runtimeIo(), page_id, self.buffer[i * size ..][0..size]) catch |zig017_err| {
+                // this at all -- see `RedoCommitState`'s own doc comment --
+                // since `flushTransactionWrites` diverts the B-tree roots
+                // logically, before any page is ever built.
+                //
+                // §9 (heap-bound writes): staging every page through
+                // `redo.appendPending` instead of writing it -- buffering a
+                // full copy in `redo.pending` (tracked) and another in the
+                // overlay (untracked, via `std.heap.page_allocator`) until
+                // this commit's own eventual `appendRecord`/overflow check,
+                // which only ever runs once, at the end of the whole
+                // commit -- makes peak memory proportional to a single
+                // external value chain's own size. For a *catalog* value
+                // (`file.direct_value_pages`, see its own doc comment:
+                // `writeCatalogValue`, `CatalogAppendState`,
+                // `putIndexCatalogRecordFromFile`), that is unbounded by
+                // the caller's own private-flush chunking (which only
+                // bounds the staged catalog *mutation*, never the
+                // page-shaped bytes underneath it), so these pages are
+                // written for real, immediately, exactly like the
+                // non-diverting branch below (same run-coalesced write,
+                // same test instrumentation) -- always safe: each is a
+                // fresh, append-only id (`pageAllocatorForDivertingCommit`'s
+                // own doc comment) that nothing can reference until this
+                // same commit's logical mutation durably publishes, so a
+                // torn or orphaned page here on an abort or a crash is
+                // exactly as harmless as the one a bare, non-diverting
+                // commit already risks the same way. No separate durable
+                // copy belongs in the redo log for it either, matching
+                // `commitTransactionWithDurability`'s and
+                // `publishCheckpoint`'s own "page-shaped only" fallback,
+                // which already writes these pages directly rather than
+                // ever embedding them in a log record. No manifest
+                // bookkeeping, unlike the non-diverting branch below --
+                // meaningless under a redo-log commit; see
+                // `NativeFile.manifest_commits_enabled`, already `false`
+                // for this file.
+                //
+                // A document's own value chain (`file.direct_value_pages ==
+                // false`) keeps staging through `redo.appendPending`
+                // exactly as before: one document write is one external
+                // value, written once, with no comparable unbounded
+                // private-flush accumulation to begin with, and other
+                // tests already depend on the current page_count-runs-ahead-
+                // of-physical-size behavior for a still-diverting
+                // document write (`check()`'s own redo-aware tolerance,
+                // vacuum/cross-process recovery).
+                if (file.direct_value_pages) {
+                    if (builtin.is_test) {
+                        if (file.test_page_write_fail_after) |remaining| {
+                            if (remaining == 0) return zig017_failure: {
+                                zig017_return_error = error.TestPageWriteFailure;
+                                break :zig017_failure error.TestPageWriteFailure;
+                            };
+                            file.test_page_write_fail_after = remaining - 1;
+                        }
+                        _ = file.test_page_write_calls.fetchAdd(1, .monotonic);
+                        _ = file.test_page_writes.fetchAdd(@intCast(end - start), .monotonic);
+                    }
+                    file.file.writePositionalAll(file.runtimeIo(), self.buffer[start * size .. end * size], self.page_ids[start] * @as(u64, size)) catch |zig017_err| {
                         zig017_return_error = zig017_err;
                         return zig017_err;
                     };
+                } else {
+                    const redo = &file.redo.?;
+                    for (self.page_ids[start..end], start..end) |page_id, i| {
+                        redo.appendPending(file.allocator, file.runtimeIo(), page_id, self.buffer[i * size ..][0..size]) catch |zig017_err| {
+                            zig017_return_error = zig017_err;
+                            return zig017_err;
+                        };
+                    }
                 }
             } else {
                 if (builtin.is_test) {
@@ -6528,6 +6576,34 @@ pub const NativeFile = struct {
     /// (`enableRedoLog`) or opened from one (`recoverRedoLog`). See
     /// `RedoCommitState`'s own doc comment.
     redo: ?RedoCommitState = null,
+    /// Scopes `PageWriteBatch.flushCount`'s page-shaped diverting exception
+    /// (an external value chain staged through `pageAllocatorForDivertingCommit`
+    /// during an ordinary transactional commit -- `RedoCommitState`'s own
+    /// doc comment) to catalog value writes specifically, never document
+    /// ones. Set transiently, for the duration of the synchronous call,
+    /// by every catalog-exclusive value-writing entry point
+    /// (`writeCatalogValue`, `CatalogAppendState.append`/`finish`,
+    /// `putIndexCatalogRecordFromFile`) -- never by `writeDocumentValue` or
+    /// anything document-shaped, which keep staging through
+    /// `redo.appendPending` (buffered until this commit's own
+    /// `appendRecord`/overflow check) exactly as before. A catalog value's
+    /// own private-flush chunking (`CatalogDeleteBatch`, the 64-key subtree
+    /// delete batches) only bounds the staged *mutation*, never a single
+    /// large external value underneath one of its puts, so without this a
+    /// big atomic import's own page-shaped bytes would buffer in full
+    /// (`redo.pending`, plus the overlay's own untracked copy) regardless
+    /// of how many small commits the caller's own code paths it through --
+    /// unbounded by the caller's own chunking. Writing these pages for
+    /// real, immediately, is always safe (see `flushCount`'s own doc
+    /// comment on this), and a document's own value chain has no
+    /// comparable unbounded-accumulation path to begin with (one document
+    /// write is one external value, written once, not staged incrementally
+    /// across many private flushes the way a catalog append is) --
+    /// changing its behavior too would only risk the redo-log-core
+    /// invariants other tests (`check()`'s own redo-aware tolerance for
+    /// page_count running ahead of physical size, vacuum/cross-process
+    /// recovery) already depend on, for no corresponding benefit.
+    direct_value_pages: bool = false,
     durable_header: ?Header = null,
     last_synced_header: ?Header = null,
     change_capture: ?*ChangeCapture = null,
@@ -6673,6 +6749,19 @@ pub const NativeFile = struct {
 
     test_page_write_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_page_write_fail_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
+    /// `test_page_write_fail_after`'s own counterpart for a catalog
+    /// mutation that diverts purely logically (no page-shaped content at
+    /// all -- a small put/delete under the redo log's default diversion,
+    /// `flushTransactionWrites`'s own diverting branch). A fault-injection
+    /// test written against the legacy B-tree rebuild could rely on
+    /// `test_page_write_fail_after` firing partway through a batch of real
+    /// page writes; under full logical diversion that batch may never
+    /// touch a real page at all, so this counts/fails on logical mutations
+    /// instead. Checked in `flushTransactionWrites`'s diverting loop, once
+    /// per mutation.
+    test_logical_write_fail_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
+    /// `test_page_writes`'s own counterpart for `test_logical_write_fail_after`.
+    test_logical_mutations: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     /// Counts durability barriers (`syncIfRequired`'s underlying `file.sync`
     /// calls), independent of filesystem speed. Used to assert syncs/commit.
     test_sync_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
@@ -8830,7 +8919,16 @@ pub const NativeFile = struct {
                     std.mem.eql(u8, root[160..192], &try state.incrementalFingerprint());
             }
             if (rebased and authenticated) {
-                if (state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
+                // §9.7d: on a redo-log file, a diverting commit's own
+                // page-shaped exception (an external value chain) can
+                // advance `checkpoint.page_count` without the ledger ever
+                // rebuilding to match -- the same lag `decodeFreeMapAlloc`
+                // and the sibling full-ledger-load check just below both
+                // already tolerate via `allow_behind`. This rebase
+                // fast-path compared the two unconditionally and flagged
+                // every such (legitimate) lag as `InvalidNativeAllocator`.
+                const allow_behind = self.header.redo_log_capacity != 0;
+                if (if (allow_behind) state.root.covered_pages > checkpoint.page_count else state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
                 self.allocator_ledger_rebased = true;
                 self.allocator_work.journal_rebases +|= 1;
                 self.allocator_work.journal_rebase_ns +|= @intCast(@max(0, started.durationTo(std.Io.Clock.awake.now(self.runtime())).nanoseconds));
@@ -8842,7 +8940,13 @@ pub const NativeFile = struct {
         if (checkpoint.free_map_root_page != 0) {
             const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
             defer self.allocator.free(payload);
-            if ((try allocator_v4.State.decodeRoot(payload)).covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
+            // §9.7d: same `allow_behind` lag as the rebase fast-path above
+            // and `decodeFreeMapAlloc` -- a redo-log file's diverting
+            // page-shaped exception can leave `checkpoint.page_count`
+            // legitimately ahead of what the ledger root itself covers.
+            const covered_pages = (try allocator_v4.State.decodeRoot(payload)).covered_pages;
+            const allow_behind = self.header.redo_log_capacity != 0;
+            if (if (allow_behind) covered_pages > checkpoint.page_count else covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
         }
         const started = std.Io.Clock.awake.now(self.runtime());
         self.allocator_work.full_loads +|= 1;
@@ -10389,6 +10493,8 @@ pub const NativeFile = struct {
         defer builder.deinit();
         const chunk_size = self.maxValuePagePayloadBytes();
         const read_size = buffer.len / chunk_size * chunk_size;
+        self.direct_value_pages = true;
+        defer self.direct_value_pages = false;
         var offset: usize = 0;
         while (offset < len) {
             const n = @min(read_size, len - offset);
@@ -14093,10 +14199,29 @@ pub const NativeFile = struct {
                     if (cancel) |token| try token.check();
                     const key = keys[position];
                     if (root == 0 and std.mem.startsWith(u8, key, artifact_lease_key_prefix)) continue;
-                    const page = if (root == 2) try self.lookupDocumentIndexPage(checkpoint, key) else try self.lookupCatalogPage(checkpoint, if (root == 0) .metadata else .index, key);
+                    const root_kind: TransactionWrites.Root = switch (root) {
+                        0 => .metadata,
+                        1 => .index,
+                        else => .documents,
+                    };
                     const old_size = try destination.liveRecordSize(root, key);
                     var record: ?CatalogEntry = null;
-                    if (page) |id| {
+                    // §9.3a/§9.7c: a key captured while this source snapshot
+                    // was live may be committed but not yet checkpointed --
+                    // present only in the redo-log overlay, never in the
+                    // physical tree `lookupDocumentIndexPage`/
+                    // `lookupCatalogPage` walk below. Check the overlay
+                    // first, exactly like `getDocumentAtCheckpointAlloc`,
+                    // or an online vacuum silently drops every write that
+                    // landed after the last checkpoint but before this
+                    // catch-up round copied it (`entry.value` is owned by
+                    // `self.allocator` per `redoOverlayEntry`'s own doc
+                    // comment and must be freed once `copied` is built).
+                    const overlay_entry = try self.redoOverlayEntry(root_kind, checkpoint, key);
+                    defer if (overlay_entry) |entry| self.allocator.free(entry.value);
+                    if (overlay_entry) |entry| {
+                        if (!entry.is_delete) record = entry;
+                    } else if (if (root == 2) try self.lookupDocumentIndexPage(checkpoint, key) else try self.lookupCatalogPage(checkpoint, if (root == 0) .metadata else .index, key)) |id| {
                         const payload = try reader.read(self, self.allocator, checkpoint, id, if (root == 2) .document else .catalog);
                         if (root == 2) {
                             const doc = try decodeDocumentEntry(payload);
@@ -14487,6 +14612,26 @@ pub const NativeFile = struct {
             // can never be mistaken for a later, now-truncated-away
             // generation's stale copied bytes.
             var snapshot_checkpoint = checkpoint;
+            // §9.3/§9.3a: under redo, `self.activeCheckpoint().commit_sequence`
+            // is not the real physical checkpoint on disk -- `stageMutation`'s
+            // own "track private changes" bump (its own doc comment)
+            // advances it on every ordinary, overlay-only commit so
+            // in-process callers can tell versions apart, while the real
+            // on-disk slot (and the physical tree this raw byte copy above
+            // just reproduced) stays at the last real `checkpointRedoLog`
+            // fold's sequence. Stamping the bumped value into the
+            // snapshot's own slot told a reopening `recoverRedoLog`
+            // "every record through this sequence is already in the
+            // tree," which is false under redo: every log record at or
+            // below that sequence is then treated as superseded and never
+            // replayed into the overlay, silently losing every write that
+            // only ever lived in the log (confirmed live: a reopened
+            // snapshot resolved a secret's "head" pointer back to
+            // revision 0 even though the live file it was copied from
+            // resolved it correctly). Use the real physical sequence
+            // instead, the same one `publishRedoLogState`/
+            // `checkpointRedoLog` already treat as authoritative.
+            if (self.redo) |redo| snapshot_checkpoint.commit_sequence = redo.checkpoint_sequence;
             snapshot_checkpoint.presynced = true;
             snapshot_checkpoint.manifest_page = 0;
             snapshot_checkpoint.manifest_crc = 0;
@@ -14856,6 +15001,8 @@ pub const NativeFile = struct {
     }
 
     fn writeCatalogValue(self: *NativeFile, pages: *PageAllocator, value: []const u8, options: WriteOptions) !u64 {
+        self.direct_value_pages = true;
+        defer self.direct_value_pages = false;
         return (try self.writeValueTree(pages, value, options)).page;
     }
 
@@ -15030,6 +15177,8 @@ pub const NativeFile = struct {
         }
 
         fn append(self: *CatalogAppendState, suffix: []const u8) !void {
+            self.builder.file.direct_value_pages = true;
+            defer self.builder.file.direct_value_pages = false;
             const len = try std.math.add(usize, self.len, suffix.len);
             if (len > std.math.maxInt(u32)) return error.RecordTooLarge;
             const capacity = self.builder.file.maxValuePagePayloadBytes();
@@ -15048,6 +15197,8 @@ pub const NativeFile = struct {
         }
 
         fn finish(self: *CatalogAppendState) !ExtentRef {
+            self.builder.file.direct_value_pages = true;
+            defer self.builder.file.direct_value_pages = false;
             if (self.used != 0) {
                 try self.builder.pushValue(self.tail[0..self.used]);
                 self.used = 0;
@@ -16382,7 +16533,16 @@ pub const NativeFile = struct {
                 }
             }.less);
             if (diverting) {
-                for (batch.items) |m| try self.redo.?.appendLogicalMutation(self.allocator, self.runtimeIo(), @intCast(root), m, pending_sequence);
+                for (batch.items) |m| {
+                    if (builtin.is_test) {
+                        if (self.test_logical_write_fail_after) |remaining| {
+                            if (remaining == 0) return error.TestPageWriteFailure;
+                            self.test_logical_write_fail_after = remaining - 1;
+                        }
+                        _ = self.test_logical_mutations.fetchAdd(1, .monotonic);
+                    }
+                    try self.redo.?.appendLogicalMutation(self.allocator, self.runtimeIo(), @intCast(root), m, pending_sequence);
+                }
                 diverted_anything = true;
             } else if (root == @backingInt(TransactionWrites.Root.documents)) {
                 const docs = try self.allocator.alloc(DocumentMutation, batch.items.len);
@@ -16430,7 +16590,41 @@ pub const NativeFile = struct {
                     // Only a page that is neither already counted nor one
                     // of the ledger's own structural pages is a real,
                     // previously-unretained continuation page.
-                    if (state.count(page_id) == 0 and !state.isSelfDescribingPage(page_id)) try state.retain(page_id);
+                    //
+                    // A page-shaped exception is not always a single
+                    // external-value continuation page: a diverting
+                    // commit's own `pack_records` path (`PageAllocator
+                    // .writeRecord`) can also flush a shared
+                    // `record_bundle` page here (`flushRecords`, called
+                    // from `takeAllPagesAlloc`'s own drain), bundling
+                    // several packed document/catalog records that each
+                    // need their own retain -- never touched by
+                    // `retainRecord` while diverting, same as a plain
+                    // continuation page. A single blind `retain()` left
+                    // every bundled record but the first invisible to the
+                    // ledger (count stuck at 1 regardless of how many
+                    // packed records the page actually holds), so a later
+                    // `release()` on just one of them freed the whole
+                    // page while the others were still live --
+                    // reproduced by "lite replay cleanup commits bounded
+                    // chunks isolates namespaces and retries" as
+                    // `validateIndexedOwnership`'s own reachability walk
+                    // expecting many more references than the ledger had.
+                    if (state.count(page_id) == 0 and !state.isSelfDescribingPage(page_id)) {
+                        const raw = try self.readPhysicalPageAlloc(self.allocator, page_id, self.activeCheckpoint());
+                        defer self.allocator.free(raw);
+                        if (raw.len > page_header_size and raw[4] == @backingInt(PageKind.record_bundle)) {
+                            const bundle_payload = try decodePagePayload(raw, .record_bundle);
+                            var offset: usize = 0;
+                            while (offset < bundle_payload.len) {
+                                const record = try packedRecordAtOffset(bundle_payload, offset);
+                                try state.retain(page_id);
+                                offset += 4 + record.bytes.len;
+                            }
+                        } else {
+                            try state.retain(page_id);
+                        }
+                    }
                 }
             }
         }
@@ -17038,6 +17232,17 @@ pub const NativeFile = struct {
             // durability barrier. Readers on this handle see the new roots;
             // reopening after a crash sees the previous complete checkpoint.
             if (changed) {
+                // Whether this commit's own deferred, non-durable append
+                // below can still go ahead -- `false` only in the one edge
+                // case handled after this block: even the page-shaped
+                // flush below could not free enough room for the minimal
+                // tracking entry (a live reader pin blocking every
+                // `checkpointRedoLog` reclaim attempt, same edge case
+                // `publishCheckpoint`'s own "page-shaped only" branch
+                // documents). Declared before the `if (self.redo)` below
+                // so the no-redo case (this stays `true`, unused) and the
+                // redo case agree on one flag the code after both reads.
+                var try_ride_along_append = true;
                 if (self.redo) |*redo| {
                     // Same preemptive check as `publishCheckpoint`'s own
                     // redo branch (see that comment for the full
@@ -17096,52 +17301,79 @@ pub const NativeFile = struct {
                         }
                         redo.shared.removePages(std.heap.page_allocator, self.runtimeIo(), pages);
                         redo.pending.clearRetainingCapacity();
+                        // §9 (redo log full under a reader pin): mirrors
+                        // `publishCheckpoint`'s own re-check after the
+                        // identical page-shaped flush -- this commit's own
+                        // page-shaped content is already flushed above, so
+                        // `pendingRecordLen()` is down to the bare tracking
+                        // minimum, which can still exceed `remaining()` if
+                        // a live reader pin has kept every
+                        // `checkpointRedoLog` call from ever physically
+                        // reclaiming log bytes. Falling through to
+                        // `redo.appendRecord` regardless -- what this used
+                        // to do -- would surface the log's own
+                        // `error.LogFull` directly, uncaught, on a commit
+                        // that is not actually uncertain, merely out of
+                        // room to log its own non-durable tracking entry.
+                        try_ride_along_append = redo.pendingRecordLen() <= redo.writer.remaining();
                     }
                 }
-                const was_durable_header_null = self.durable_header == null;
-                if (self.durable_header == null) self.durable_header = previous;
-                // §9.3: a ride-along redo-log commit still appends -- just
-                // like a ride-along copy-on-write commit still physically
-                // writes its pages today (`PageWriteBatch.flushCount`
-                // already ran, diverted, inside `flushTransactionWrites`
-                // above) -- but never syncs. The next commit whose own
-                // `durable` promotes a shared group covers it, exactly as
-                // §3.2a already describes for pages.
-                //
-                // Append (when a redo log backs this file) *before*
-                // publishing `next` into `self.header`, and let a failed
-                // append propagate without ever having touched the header.
-                // The reverse order (publish `self.header` first, append
-                // second -- what this used to do) left `self.header`'s
-                // `commit_sequence` permanently ahead of `redo.writer
-                // .last_sequence` the moment an append failed for any
-                // reason (`error.LogFull`, a transient I/O fault, ...):
-                // nothing here or in `commitTransactionWithDurability`'s
-                // own `errdefer` ever rolled the header back, so every
-                // later commit on this same file instance computed its own
-                // next sequence from the now-wrongly-advanced header --
-                // and could then never equal `redo.writer.last_sequence +
-                // 1` again. One ordinary transient append failure turned
-                // into a one-way ratchet: every subsequent commit,
-                // foreground or background, permanently failed with
-                // `error.SequenceOutOfOrder` (surfacing as the far less
-                // specific `error.OutcomeUnknown`), not a retryable,
-                // one-off error a caller's own retry could ever clear.
-                // Reproduced by "crash sweep: graph add-index mid-scenario"
-                // (gr_idx's/body_text's own background ride-along catch-up
-                // commits), independent of any crash or injected fault --
-                // the uncrashed discovery pass alone could hit it.
-                if (self.redo) |*redo| {
-                    try redo.appendRecord(self.allocator, next.commit_sequence, CompactCheckpoint.fromCheckpointSlot(next));
+                if (try_ride_along_append) {
+                    const was_durable_header_null = self.durable_header == null;
+                    if (self.durable_header == null) self.durable_header = previous;
+                    // §9.3: a ride-along redo-log commit still appends -- just
+                    // like a ride-along copy-on-write commit still physically
+                    // writes its pages today (`PageWriteBatch.flushCount`
+                    // already ran, diverted, inside `flushTransactionWrites`
+                    // above) -- but never syncs. The next commit whose own
+                    // `durable` promotes a shared group covers it, exactly as
+                    // §3.2a already describes for pages.
+                    //
+                    // Append (when a redo log backs this file) *before*
+                    // publishing `next` into `self.header`, and let a failed
+                    // append propagate without ever having touched the header.
+                    // The reverse order (publish `self.header` first, append
+                    // second -- what this used to do) left `self.header`'s
+                    // `commit_sequence` permanently ahead of `redo.writer
+                    // .last_sequence` the moment an append failed for any
+                    // reason (`error.LogFull`, a transient I/O fault, ...):
+                    // nothing here or in `commitTransactionWithDurability`'s
+                    // own `errdefer` ever rolled the header back, so every
+                    // later commit on this same file instance computed its own
+                    // next sequence from the now-wrongly-advanced header --
+                    // and could then never equal `redo.writer.last_sequence +
+                    // 1` again. One ordinary transient append failure turned
+                    // into a one-way ratchet: every subsequent commit,
+                    // foreground or background, permanently failed with
+                    // `error.SequenceOutOfOrder` (surfacing as the far less
+                    // specific `error.OutcomeUnknown`), not a retryable,
+                    // one-off error a caller's own retry could ever clear.
+                    // Reproduced by "crash sweep: graph add-index mid-scenario"
+                    // (gr_idx's/body_text's own background ride-along catch-up
+                    // commits), independent of any crash or injected fault --
+                    // the uncrashed discovery pass alone could hit it.
+                    if (self.redo) |*redo| {
+                        try redo.appendRecord(self.allocator, next.commit_sequence, CompactCheckpoint.fromCheckpointSlot(next));
+                    }
+                    self.header.checkpoints[self.header.active_checkpoint] = next;
+                    recoveryDebugLog("ride-along commit (non-durable) commit_sequence={d} captured_durable_header={} durable_header_commit_sequence={d}", .{
+                        next.commit_sequence,
+                        was_durable_header_null,
+                        self.durable_header.?.checkpoints[self.durable_header.?.active_checkpoint].commit_sequence,
+                    });
+                    return;
                 }
-                self.header.checkpoints[self.header.active_checkpoint] = next;
-                recoveryDebugLog("ride-along commit (non-durable) commit_sequence={d} captured_durable_header={} durable_header_commit_sequence={d}", .{
-                    next.commit_sequence,
-                    was_durable_header_null,
-                    self.durable_header.?.checkpoints[self.durable_header.?.active_checkpoint].commit_sequence,
-                });
-            }
-            return;
+                // §9: even the minimal tracking entry has nowhere to go
+                // (a live reader pin blocking every reclaim attempt) --
+                // rather than fail this commit outright with the log's own
+                // `error.LogFull`, fall through past this whole
+                // `deferred_publication` block to the ordinary durable
+                // path below (`publishCheckpoint`'s own ReadView-aware,
+                // already-protected fallback), paying this one commit's
+                // own sync instead of losing the write. `next`/`changed`
+                // are untouched above, so that path sees exactly the same
+                // state a non-deferred caller's commit would have.
+            } else return;
         }
         if (changed) {
             recoveryDebugLog("durable commit commit_sequence={d} durable_header_was_set={}", .{ next.commit_sequence, self.durable_header != null });
@@ -31161,6 +31393,83 @@ test "lite redo log checkpoints automatically once the log nears its capacity" {
     }
 }
 
+test "lite redo log ride-along commits never fail as OutcomeUnknown when a pinned reader blocks reclaim" {
+    // §9 invariant: a full redo log must never fail a commit as
+    // OutcomeUnknown. `checkpointRedoLog`'s fold moves the logical
+    // overlay into real pages, but a live cross-process reader pin on an
+    // older sequence still blocks the log's own *byte* reclaim
+    // (`pinned_below`, `publishCheckpoint`'s own doc comment, and "lite
+    // redo log checkpointer defers log reclaim while a cross-process
+    // reader is pinned behind it" above) -- folding keeps working, but
+    // `remaining()` never recovers, so ordinary durable commits alone can
+    // still drive the log to genuinely, persistently full. Every commit
+    // below keeps its own logical_pending non-empty (an ordinary document
+    // write always diverts its own root mutation), so each one takes the
+    // already-protected "fold, then skip the append entirely" branch
+    // (ed767ba951) -- this exercises that path repeatedly, continuously,
+    // under both the durable and the ride-along (non-durable) commit
+    // shapes, with reclaim permanently blocked, rather than the narrower
+    // "logical_pending empty, page-shaped flush alone still doesn't fit"
+    // edge case `commitTransactionWithDurability`'s own ride-along branch
+    // handles with its matching re-check (added alongside this test,
+    // mirroring `publishCheckpoint`'s sibling branch) -- that edge case
+    // needs a ride-along commit with nothing of its own to divert (only
+    // flushing an earlier commit's pending durable_header), which this
+    // test does not construct. Before that re-check existed, a ride-along
+    // commit could fall through to `redo.appendRecord` unconditionally
+    // once its own page-shaped flush ran, surfacing the log's own
+    // `error.LogFull` directly instead of making room.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-pinned-log-full.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 16 * 1024);
+    defer file.close();
+    try file.beginTransaction();
+    try file.putDocument("seed", "seed-value");
+    try file.commitTransaction();
+
+    var reader = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    defer reader.close();
+    try reader.refreshCrossProcessRedoOverlay(); // pins behind "seed", blocking all later byte reclaim.
+
+    var value_buf: [512]u8 = undefined;
+    @memset(&value_buf, 'v');
+    var key_buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 400) : (i += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{i});
+        try file.beginTransaction();
+        try file.putDocument(key, &value_buf);
+        // Alternate durable (pays its own sync, folds opportunistically
+        // at the 25%-remaining backstop, but the fold cannot reclaim any
+        // log bytes while `reader` stays pinned) and ride-along (no
+        // backstop of its own) commits -- both must keep succeeding once
+        // the log is genuinely, persistently full.
+        try file.commitTransactionWithDurability(i % 2 == 0, null);
+    }
+    try file.beginTransaction();
+    try file.putDocument("final", "final-value");
+    try file.commitTransaction();
+
+    try std.testing.expect((try file.check()).valid);
+    const seed = (try file.getDocumentAlloc(a, "seed")).?;
+    defer a.free(seed);
+    try std.testing.expectEqualStrings("seed-value", seed);
+    i = 0;
+    while (i < 400) : (i += 1) {
+        const key = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{i});
+        const got = (try file.getDocumentAlloc(a, key)).?;
+        defer a.free(got);
+        try std.testing.expectEqualStrings(&value_buf, got);
+    }
+    const final = (try file.getDocumentAlloc(a, "final")).?;
+    defer a.free(final);
+    try std.testing.expectEqualStrings("final-value", final);
+}
+
 test "lite redo log document scan merges the overlay across put, overwrite, delete and a checkpoint boundary" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -31623,7 +31932,7 @@ test "lite redo log catalog cursor pinned to an older mark skips a key created o
     }
 }
 
-test "lite redo log vacuum captures uncheckpointed overlay and demotes the file rather than corrupting it" {
+test "lite redo log vacuum captures uncheckpointed overlay and keeps the file a redo-log file" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -31631,6 +31940,7 @@ test "lite redo log vacuum captures uncheckpointed overlay and demotes the file 
     defer a.free(path);
 
     var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    const original_redo_log_capacity = file.header.redo_log_capacity;
 
     try file.beginTransaction();
     try file.putDocument("doc:live", "small");
@@ -31650,16 +31960,17 @@ test "lite redo log vacuum captures uncheckpointed overlay and demotes the file 
     const vacuumed = try file.vacuum();
     _ = vacuumed;
 
-    // §9.4a: `prepareVacuum`'s compacted file never reserves a redo-log
-    // region, so a live handle's stale `redo.writer` (still pointing at
-    // the *old* file's fd/offsets after the swap) must not survive --
-    // otherwise the next commit would divert into a log region that
-    // does not exist in the new file, corrupting whatever bytes happen
-    // to sit at that offset instead. Confirm the demotion is complete
-    // and consistent, not just that nothing crashed.
-    try std.testing.expect(file.redo == null);
-    try std.testing.expectEqual(@as(u64, 0), file.header.redo_log_capacity);
-    try std.testing.expect(file.manifest_commits_enabled);
+    // §9 (vacuum redo-log retention, 0de1ef453d): vacuum used to always
+    // rebuild a plain, non-redo compacted image, permanently reverting a
+    // redo-log store to the legacy manifest-commit path the moment
+    // maintenance first ran. `prepareVacuum`/`replaceWithPreparedGeneration`
+    // now reserve a log region of the same capacity the source file
+    // already had and attach fresh redo state to it once the swap
+    // settles, so the vacuumed generation comes out as a redo-log file
+    // too -- confirm that directly, not a demotion.
+    try std.testing.expect(file.redo != null);
+    try std.testing.expectEqual(original_redo_log_capacity, file.header.redo_log_capacity);
+    try std.testing.expect(!file.manifest_commits_enabled);
 
     // The vacuum's own copy loop (`LiveRecordCursor`/`OverlayScanState`)
     // must have already merged that uncheckpointed overlay into the
@@ -31670,25 +31981,28 @@ test "lite redo log vacuum captures uncheckpointed overlay and demotes the file 
     try std.testing.expectEqualStrings("small", live);
     try std.testing.expectEqual(@as(?[]u8, null), try file.getDocumentAlloc(a, "doc:gone"));
 
-    // A plain commit on the now-demoted (non-redo) file must work
-    // through the ordinary copy-on-write path, not the diversion logic.
+    // A plain commit on the still-redo-log file must work through the
+    // ordinary diversion path, not fall back to manifest commits, and
+    // must not corrupt anything.
     try file.beginTransaction();
     try file.putDocument("doc:after", "fresh");
     try file.commitTransaction();
     const after = (try file.getDocumentAlloc(a, "doc:after")).?;
     defer a.free(after);
     try std.testing.expectEqualStrings("fresh", after);
+    try std.testing.expect((try file.check()).valid);
 
     file.close();
     var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
     defer reopened.close();
-    try std.testing.expect(reopened.redo == null);
+    try std.testing.expect(reopened.redo != null);
     const live_reopened = (try reopened.getDocumentAlloc(a, "doc:live")).?;
     defer a.free(live_reopened);
     try std.testing.expectEqualStrings("small", live_reopened);
     const after_reopened = (try reopened.getDocumentAlloc(a, "doc:after")).?;
     defer a.free(after_reopened);
     try std.testing.expectEqualStrings("fresh", after_reopened);
+    try std.testing.expect((try reopened.check()).valid);
 }
 
 test "lite redo log openIndexValue (artifact lease resolution) sees an uncheckpointed overlay entry" {

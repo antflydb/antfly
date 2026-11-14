@@ -1866,6 +1866,23 @@ pub const Store = struct {
     ride_along_pending_count: usize = 0,
     ride_along_pending_bytes: usize = 0,
     ride_along_last_enqueue_ns: i96 = 0,
+    /// §9: last time *any* mutation (ride-along or not) was enqueued on
+    /// this store, updated unconditionally by `enqueueRequest` -- unlike
+    /// `ride_along_last_enqueue_ns` above, which only ever moves for a
+    /// ride-along member. `maybeCheckpointRedoLogOnIdleTurn`'s own "idle"
+    /// trigger needs this broader signal: an ordinary (non-ride-along)
+    /// foreground write never touches `ride_along_last_enqueue_ns` at
+    /// all, so gating the opportunistic fold on that field alone would
+    /// treat a store under continuous foreground-only write load as
+    /// permanently idle. Guarded by `commit_mutex`, same as the
+    /// `ride_along_*` fields above.
+    last_mutation_enqueue_ns: i96 = 0,
+    /// §9: last time `maybeCheckpointRedoLogOnIdleTurn` actually ran a
+    /// fold (attempted or not -- see that function's own comment), so its
+    /// own idle debounce also covers "since the last fold", not just
+    /// "since the last commit". Guarded by `lockStoreExclusive`, same as
+    /// every other field that function reads/writes.
+    last_redo_fold_ns: i96 = 0,
     /// Count of currently-queued, not-yet-drained members with
     /// `ride_along = false` -- i.e. every member with no backstop of its
     /// own. A ride-along member left queued when a leader stops early
@@ -3084,7 +3101,19 @@ pub const Store = struct {
         var source = blk: {
             if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
             defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
-            lockStore(self);
+            // Exclusive, not plain lockStore: `captureFullReadSnapshot`
+            // compares `self.header` against a fresh reopen of the same
+            // path and refuses (`EnrichmentWaitCanceled`) on any
+            // disagreement. A foreground group's `syncIfRequired` writes
+            // its durability barrier before releasing `self.mutex` for the
+            // sync itself (`commit_in_sync`), so a plain `lockStore` here
+            // could land inside that released window, see the new bytes
+            // already on disk, and spuriously refuse the very first
+            // snapshot a vacuum ever takes against a live, concurrently
+            // written file -- the same race `applyResidualVacuumChanges`'s
+            // own `takeResidualVacuumChangesAssumeLocked` already guards
+            // against with `lockStoreExclusive`, just not yet here.
+            lockStoreExclusive(self);
             defer self.mutex.unlock();
             if (cancel) |token| try token.check();
             if (self.generation_workspace_active or self.file.change_capture != null or (self.maintenance_running and !automatic)) {
@@ -3609,10 +3638,12 @@ pub const Store = struct {
         // WS1's reuse-frontier hook -- to lead on its behalf.
         const become_leader = !self.commit_draining and !ride_along;
         if (become_leader) self.commit_draining = true;
+        const now_ns = std.Io.Clock.awake.now(io).nanoseconds;
+        self.last_mutation_enqueue_ns = now_ns;
         if (ride_along) {
             self.ride_along_pending_count +|= 1;
             self.ride_along_pending_bytes +|= plan.estimated_bytes;
-            self.ride_along_last_enqueue_ns = std.Io.Clock.awake.now(io).nanoseconds;
+            self.ride_along_last_enqueue_ns = now_ns;
         } else {
             self.non_ride_along_pending_count +|= 1;
         }
@@ -3890,27 +3921,44 @@ pub const Store = struct {
         const io = self.file.runtime();
         var overlay_entries: u64 = 0;
         for (0..3) |root_idx| overlay_entries += redo.shared.count(io, @intCast(root_idx));
-        // Idle: this call only happens on `rideAlongFlushLoop`'s own
-        // periodic wake, which already implies nothing more pressing woke
-        // it sooner -- any non-empty overlay reaching this point has had at
-        // least one full `ride_along_idle_ns` tick with no other reason to
-        // run, so it is cheap to clear opportunistically rather than
-        // leaving it to grow (and the next reopen's replay to cover)
-        // indefinitely.
-        const has_overlay_work = overlay_entries != 0 or redo.shared.pagesCount(io) != 0;
+        // Idle (§9: background checkpoints run when idle, or when the log
+        // is more than 50% full): this call runs on every one of
+        // `rideAlongFlushLoop`'s wakes, not only the full periodic
+        // `ride_along_idle_ns` ones -- the loop's own `ride_along_wake` can
+        // also be `.set()` early, for an unrelated reason (a ride-along
+        // byte threshold, `forceDrainDurable`, ...), and this function used
+        // to treat every one of those wakes as proof of idleness too,
+        // folding the whole log whenever the overlay merely happened to be
+        // non-empty. For any live workload the overlay is essentially never
+        // perfectly empty between wakes, so that fired far more often than
+        // the batched design intends -- confirmed live via WS4-for-dense/
+        // WS4-for-graph's own commit-count regression. Idle now means what
+        // the ride-along branch above already means by it: nothing
+        // enqueued for a full `ride_along_idle_ns`, checked against
+        // `last_mutation_enqueue_ns` (every enqueue, not just a ride-along
+        // one -- see that field's own doc comment) -- and debounced against
+        // `last_redo_fold_ns` too, so a fold's own settling on one wake
+        // doesn't immediately re-trigger on the very next, early-woken one.
+        const now = std.Io.Clock.awake.now(io).nanoseconds;
+        const last_activity_ns = @max(self.last_mutation_enqueue_ns, self.last_redo_fold_ns);
+        const idle_long_enough = now -| last_activity_ns >= @as(i96, @intCast(self.ride_along_idle_ns));
+        const has_overlay_work = idle_long_enough and (overlay_entries != 0 or redo.shared.pagesCount(io) != 0);
         // Threshold: byte usage past the halfway point, well before the
         // emergency 25%-remaining backpressure (`maybeAutoCheckpointRedoLog`)
-        // would ever fire. Checked independently of `has_overlay_work`: a
-        // commit's own external-value pages count against the log's *byte*
-        // capacity, a different axis than the logical_overlay *entry*
-        // count above, so this catches a byte-heavy-but-entry-light backlog
-        // the entry count alone would not flag.
+        // would ever fire. Checked independently of `has_overlay_work` (and
+        // of idleness -- real capacity pressure folds immediately, exactly
+        // as before this change): a commit's own external-value pages
+        // count against the log's *byte* capacity, a different axis than
+        // the logical_overlay *entry* count above, so this catches a
+        // byte-heavy-but-entry-light backlog the entry count alone would
+        // not flag.
         const threshold_due = redo.writer.remaining() < redo.writer.capacity / 2;
         if (!has_overlay_work and !threshold_due) return;
         // AssumeLocked: this whole function runs under `lockStoreExclusive`
         // above, which locks the same `self.mutex` `recordMaintenanceError`
         // itself would try to lock -- see that function's own comment.
         self.file.checkpointRedoLog() catch |err| self.recordMaintenanceErrorAssumeLocked(err);
+        self.last_redo_fold_ns = now;
     }
 
     /// Enqueue `plan` and return a ticket resolved once its group is durable.
@@ -7403,6 +7451,18 @@ test "lite artifact leases defer allocator proof until an authored write" {
     errdefer write.abort();
     try write.put("doc", "authored");
     try write.commit();
+    // §9 (redo + indexed reclamation): an ordinary foreground commit on a
+    // redo-log file diverts into the log (`transactionWrites`'s own
+    // `diverting` check) and never builds a real copy-on-write page for
+    // its logical roots, so it takes `pageAllocatorForDivertingCommit`,
+    // which skips the free-map load/verify entirely -- only
+    // `checkpointRedoLog`'s own undiverted transaction reaches
+    // `pageAllocatorFromFreeMapWithProof` and can complete the proof.
+    // The authored write above still only defers the proof one step
+    // further (to the next real fold), not all the way to never; this is
+    // the new place "an authored write" actually resolves to under redo.
+    try std.testing.expect(!store.file.free_pages_verified);
+    try store.checkpointRedoLog();
     try std.testing.expect(store.file.free_pages_verified);
     try std.testing.expect((try store.file.check()).valid);
 }
@@ -9878,10 +9938,30 @@ test "lite online vacuum catches foreground commits while its copy is blocked" {
     var vtable = std.Options.debug_io.vtable.*;
     vtable.fileSync = Gate.sync;
     const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
-    const storage_limit = 128 * 4096;
+    // §9.7a (vacuum redo-log retention, 0de1ef453d): redo-log is on by
+    // default now, and both the live file *and* a vacuum's own prepared/
+    // compacted image reserve a log region (scaled from this same
+    // `max_storage_bytes`) as real file bytes -- the compacted image's
+    // own copy of that reservation comes out of its workspace byte limit
+    // (`assessment_bytes` here, via `Store.performVacuum`'s `workspace`
+    // -> `source.vacuum_workspace_limit` -> `prepared.max_file_bytes`).
+    // 128 pages/16 pages were tuned pre-redo, when neither needed any
+    // extra room, and started failing admission
+    // (`LiteStorageBudgetExceeded`) before the test ever reached the
+    // foreground-commit race it exists to exercise. `page_reuse = false`
+    // (this test never needed indexed reclamation) keeps the live file's
+    // own admission math to just that log reservation plus this test's
+    // own tiny content, instead of also owing indexed reclamation's own
+    // fixed-size retirement reserve and ledger-rebuild cost on every
+    // commit and every synchronous 25%-remaining redo-log checkpoint --
+    // both sized independently of how little data this test ever writes,
+    // and both large enough on their own to blow through a budget this
+    // tight.
+    const storage_limit = 512 * 4096;
     var store = try Store.createWithOptions(alloc, path, .{ .io = io, .reclamation = .{
         .enabled = false,
-        .assessment_bytes = 16 * 4096,
+        .page_reuse = false,
+        .assessment_bytes = 160 * 4096,
         .max_storage_bytes = storage_limit,
     } });
     defer store.close();
@@ -9906,14 +9986,28 @@ test "lite online vacuum catches foreground commits while its copy is blocked" {
     // A paused rewrite reserves capacity before its first publication. A
     // large foreground mutation must leave that workspace available and
     // preserve the committed roots when admission rejects its tail pages.
-    const reservation = (try store.reclamationStatus()).temporary_bytes;
+    const status_before_oversized = try store.reclamationStatus();
+    const reservation = status_before_oversized.temporary_bytes;
     try std.testing.expect(reservation > 0);
-    const oversized: [128 * 4096]u8 = @splat('x');
+    // Sized off the budget actually remaining right now (storage_limit
+    // minus this file's current bytes minus the vacuum's own workspace
+    // reservation), not a fixed constant: just enough over that headroom
+    // to overflow it, rather than a value many times the whole budget --
+    // a page-by-page write that fails partway through still writes every
+    // page up to the one that trips the budget check, so a value sized
+    // off the *whole* budget pays for (and the rejected commit's
+    // savepoint rollback then discards) far more partial work than a
+    // value sized to just barely overflow the real headroom.
+    const headroom = storage_limit -| status_before_oversized.current_file_bytes -| reservation;
+    const oversized = try alloc.alloc(u8, headroom + 4096);
+    defer alloc.free(oversized);
+    @memset(oversized, 'x');
     write = try store.beginWrite();
-    try write.put("oversized", &oversized);
+    try write.put("oversized", oversized);
     try std.testing.expectError(error.LiteStorageBudgetExceeded, write.commit());
     write.abort();
-    try std.testing.expect((try store.reclamationStatus()).current_file_bytes <= storage_limit - reservation);
+    const status_after_abort = try store.reclamationStatus();
+    try std.testing.expect(status_after_abort.current_file_bytes <= storage_limit - reservation);
     try std.testing.expectError(error.FileBusy, store.vacuum());
     write = try store.beginWrite();
     try write.put("doc", "during copy");
@@ -10509,7 +10603,23 @@ test "WS5 serviceRetirement retires every lane in exactly one native commit" {
     // advance by 2 instead of 1. Suppressing the background loop keeps the
     // measurement deterministic without weakening what is actually being
     // asserted: serviceRetirement itself commits exactly once.
+    //
+    // Under a redo-log file, `maintenance_start_suppressed` alone is not
+    // enough: `ensureRideAlongFlushStarted`'s `rideAlongFlushLoop` is a
+    // separate background mechanism (started unconditionally for any
+    // redo-log file on its first commit, §9.4b) that also wakes on
+    // `ride_along_idle_ns` and opportunistically folds the redo log via
+    // `maybeCheckpointRedoLogOnIdleTurn` -- a second, independent real
+    // commit this test never asked for, racing the explicit
+    // `serviceRetirement` call below exactly the way the comment above
+    // already describes for the other loop. Disabling it the same way
+    // "lite ride-along ticket resolves within the idle window even if
+    // the idle-flush task never starts" does keeps `serviceRetirement`'s
+    // own ride-along commit the only one that ever runs: its ticket still
+    // resolves via `Ticket.waitSequence`'s own bounded wait-then-drive
+    // fallback, never the idle-flush task.
     store.maintenance_start_suppressed = true;
+    store.ride_along_flush_unavailable.store(true, .release);
     defer store.close();
 
     const payload = try change_journal_mod.encodeRecord(a, .{
@@ -10713,6 +10823,12 @@ test "WS5 retirement keeps deletes and credit release atomic across a mid-turn f
     defer a.free(path);
     var store = try Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
     store.maintenance_start_suppressed = true;
+    // See "WS5 serviceRetirement retires every lane in exactly one native
+    // commit"'s own comment: under a redo-log file, the idle-flush task
+    // (`rideAlongFlushLoop`/`maybeCheckpointRedoLogOnIdleTurn`) is a second
+    // background committer `maintenance_start_suppressed` does not cover,
+    // and this test's own exact commit_sequence deltas need it disabled too.
+    store.ride_along_flush_unavailable.store(true, .release);
     defer store.close();
     store.file.page_cache_enabled.store(false, .monotonic);
 
