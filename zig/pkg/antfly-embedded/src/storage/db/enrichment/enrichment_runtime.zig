@@ -18292,7 +18292,7 @@ fn indexDocumentProducerRequired(a: Allocator, item: AssetProducerBatchItem) !bo
     if (item.producer_type == .extractor) {
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
-        if (try asset_producer_mod.extractionDocuments(arena.allocator(), item.asRequest()) == null) return false;
+        if (try asset_producer_mod.extractionDocumentInput(arena.allocator(), item.asRequest()) == null) return false;
     }
     const provider = parsed.value.object.get("provider") orelse return item.producer_type == .extractor;
     return provider == .string and std.mem.eql(u8, provider.string, "antfly");

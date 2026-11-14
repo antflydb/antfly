@@ -67,22 +67,105 @@ pub fn supportsScalarTextProjection(kind: ProducerType, content_type: []const u8
     };
 }
 
-// Returned values belong to the caller's invocation arena.
-pub fn extractionDocuments(a: Allocator, request: Request) !?std.json.Value {
+/// A borrowed routing decision. Classification retains neither payload strings
+/// nor JSON values; only the scanner's nesting stack requires scratch memory.
+pub const ExtractionDocumentInput = union(enum) {
+    documents_json: []const u8,
+    locator: struct { url: []const u8, mime: []const u8 },
+
+    /// Materialize only after invocation admission, when document execution
+    /// actually needs the descriptor. URI bytes remain borrowed until encoding.
+    pub fn materialize(self: @This(), a: Allocator) !std.json.Value {
+        switch (self) {
+            .documents_json => |raw| return std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .parse_numbers = false }),
+            .locator => |source| {
+                var object: std.json.Value = .{ .object = .empty };
+                try object.object.put(a, "id", .{ .string = "source" });
+                try object.object.put(a, "url", .{ .string = source.url });
+                try object.object.put(a, "media_type", .{ .string = source.mime });
+                var documents: std.json.Value = .{ .array = .init(a) };
+                try documents.array.append(object);
+                return documents;
+            },
+        }
+    }
+};
+
+pub fn extractionDocumentInput(a: Allocator, request: Request) !?ExtractionDocumentInput {
     const input = std.mem.trim(u8, request.source_text, " \t\r\n");
-    const raw = request.source_parts_json orelse input;
+    const raw = std.mem.trim(u8, request.source_parts_json orelse input, " \t\r\n");
     if (std.mem.startsWith(u8, raw, "{")) {
-        const source = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .parse_numbers = false }) catch |err| switch (err) {
+        const documents = scanExtractionDocuments(a, raw) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => return null, // Text may start with an ordinary literal '{'.
+            else => return null, // Ordinary text may start with a literal '{'.
         };
-        if (source == .object) if (source.object.get("documents")) |documents| return documents;
+        if (documents) |value| return .{ .documents_json = value };
     }
-    if (documentSourceMediaType(input, request.content_type)) |mime| {
-        const encoded = try std.json.Stringify.valueAlloc(a, [_]@import("antfly_readers").DocumentSource{.{ .id = "source", .url = input, .media_type = mime }}, .{});
-        return try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{});
-    }
+    if (documentSourceMediaType(input, request.content_type)) |mime|
+        return .{ .locator = .{ .url = input, .mime = mime } };
     return null;
+}
+
+fn scanExtractionDocuments(a: Allocator, raw: []const u8) !?[]const u8 {
+    var scanner = std.json.Scanner.initCompleteInput(a, raw);
+    defer scanner.deinit();
+    if (try scanner.next() != .object_begin) return error.SyntaxError;
+    var documents: ?[]const u8 = null;
+    while (try scanner.peekNextTokenType() != .object_end) {
+        const selected = try nextExtractionDocumentKey(&scanner);
+        const kind = try scanner.peekNextTokenType();
+        switch (kind) {
+            .object_end, .array_end, .end_of_document => return error.SyntaxError,
+            else => {},
+        }
+        const start = scanner.cursor;
+        try scanner.skipValue();
+        if (selected) {
+            if (documents != null) return error.SyntaxError;
+            documents = raw[start..scanner.cursor];
+        }
+    }
+    _ = try scanner.next();
+    if (try scanner.next() != .end_of_document) return error.SyntaxError;
+    return documents;
+}
+
+// Compare decoded key fragments without allocating even for huge or escaped
+// unknown keys. The scanner still validates every discarded value's syntax.
+fn nextExtractionDocumentKey(scanner: *std.json.Scanner) !bool {
+    const name = "documents";
+    var matched = true;
+    var length: usize = 0;
+    while (true) {
+        const token = try scanner.next();
+        var escaped: [4]u8 = undefined;
+        const bytes: []const u8 = switch (token) {
+            .string, .partial_string => |value| value,
+            .partial_string_escaped_1 => |value| blk: {
+                @memcpy(escaped[0..1], &value);
+                break :blk escaped[0..1];
+            },
+            .partial_string_escaped_2 => |value| blk: {
+                @memcpy(escaped[0..2], &value);
+                break :blk escaped[0..2];
+            },
+            .partial_string_escaped_3 => |value| blk: {
+                @memcpy(escaped[0..3], &value);
+                break :blk escaped[0..3];
+            },
+            .partial_string_escaped_4 => |value| blk: {
+                @memcpy(escaped[0..4], &value);
+                break :blk escaped[0..4];
+            },
+            else => return error.SyntaxError,
+        };
+        if (matched) {
+            if (bytes.len > name.len - length or !std.mem.eql(u8, bytes, name[length..][0..bytes.len])) {
+                matched = false;
+            } else length += bytes.len;
+        }
+        if (token == .string) return matched and length == name.len;
+    }
 }
 
 pub fn documentSourceMediaType(url: []const u8, supplied: []const u8) ?[]const u8 {

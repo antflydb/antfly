@@ -1514,10 +1514,13 @@ pub const Runtime = struct {
     }
 
     fn batchModeWithContext(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request, context: asset_producer.InvocationContext) !inference_work.BatchMode {
-        if (context.document_checkpoints != null and try requestsUseDocumentCheckpoints(alloc, requests)) return .none;
         var cancellation: RuntimeInvocationCancellation = undefined;
         var scoped = invocationRuntime(ptr, context, &cancellation);
         try scoped.execution.check(platform.time.monotonicNs());
+        if (scoped.document_checkpoints != null and try requestsUseDocumentCheckpoints(alloc, requests)) {
+            try scoped.execution.check(platform.time.monotonicNs());
+            return .none;
+        }
         const mode = try batchMode(&scoped, alloc, requests);
         try scoped.execution.check(platform.time.monotonicNs());
         return mode;
@@ -3709,10 +3712,9 @@ pub const Runtime = struct {
         // A checkpoint factory is a capability of the storage owner, not a
         // request to turn ordinary text extraction into a document RPC. Text
         // already commits through the artifact publication/retry protocol.
-        const documents = (try extractionDocuments(scratch, request)) orelse return null;
-        const content = try extractionContentJsonAlloc(a, request.source_text, request.source_parts_json);
-        defer a.free(content);
-        const initial = try extracting.requestJsonAlloc(a, cfg, .{ .inputs = &.{.{ .content_json = content }}, .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null, .schema_json = cfg.schema_json, .options_json = cfg.options_json });
+        const selected = (try extractionDocumentInput(scratch, request)) orelse return null;
+        const documents = try selected.materialize(scratch);
+        const initial = try extracting.requestJsonAlloc(a, cfg, .{ .inputs = &.{}, .schema_version = if (cfg.schema_version_explicit) cfg.schema_version else null, .schema_json = cfg.schema_json, .options_json = cfg.options_json });
         defer a.free(initial);
         var body = try std.json.parseFromSliceLeaky(std.json.Value, scratch, initial, .{ .parse_numbers = false });
         if (documents != .array or documents.array.items.len != 1) return error.InvalidDocumentSource;
@@ -9319,7 +9321,7 @@ fn documentExecuteUrl(a: Allocator, endpoint: []const u8, extract: bool) ![]u8 {
     return std.fmt.allocPrint(a, "{s}/ai/v1/{s}/execute", .{ root, if (extract) "extract" else "read" });
 }
 
-const extractionDocuments = asset_producer.extractionDocuments;
+const extractionDocumentInput = asset_producer.extractionDocumentInput;
 const documentSourceMediaType = asset_producer.documentSourceMediaType;
 
 fn requestsUseDocumentCheckpoints(a: Allocator, requests: []const asset_producer.Request) !bool {
@@ -9330,11 +9332,85 @@ fn requestsUseDocumentCheckpoints(a: Allocator, requests: []const asset_producer
         .extractor => {
             if (try generated_extractor.isGenerated(arena.allocator(), request.config_json) or
                 try @import("privacy/document.zig").isManaged(arena.allocator(), request.config_json)) continue;
-            if (request.media.len == 0 and try extractionDocuments(arena.allocator(), request) != null) return true;
+            if (request.media.len == 0 and try extractionDocumentInput(arena.allocator(), request) != null) return true;
         },
         else => {},
     };
     return false;
+}
+
+test "index document checkpoint producer classification borrows wide JSON and URI inputs" {
+    const a = std.testing.allocator;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(a);
+    try raw.appendSlice(a, "{\"payload\":[");
+    for (0..100_000) |_| try raw.appendSlice(a, "0,");
+    try raw.appendSlice(a, "0],\"nested\":{\"documents\":[]}}");
+    var bytes: [1024]u8 = undefined;
+    var scratch = std.heap.FixedBufferAllocator.init(&bytes);
+    var request: asset_producer.Request = .{ .producer_type = .extractor, .config_json = "{}", .source_text = raw.items };
+    try std.testing.expect(try extractionDocumentInput(scratch.allocator(), request) == null);
+    try std.testing.expect(scratch.end_index < bytes.len);
+    // Find a decoded top-level key after a wide discarded subtree, while
+    // retaining exactly its borrowed value rather than the surrounding DOM.
+    raw.shrinkRetainingCapacity(raw.items.len - 1);
+    try raw.appendSlice(a, ",\"docu\\u006dents\":[{\"id\":\"p\",\"url\":\"https://example.test/p.pdf\"}]}");
+    request.source_text = raw.items;
+    scratch.reset();
+    const selected = (try extractionDocumentInput(scratch.allocator(), request)).?;
+    try std.testing.expectEqualStrings("[{\"id\":\"p\",\"url\":\"https://example.test/p.pdf\"}]", selected.documents_json);
+    try std.testing.expect(@intFromPtr(selected.documents_json.ptr) >= @intFromPtr(raw.items.ptr));
+    for ([_][]const u8{ "{literal", "{\"documents\":[]} trailing", "{\"documents\":[],\"documents\":[]}" }) |invalid| {
+        request.source_text = invalid;
+        scratch.reset();
+        try std.testing.expect(try extractionDocumentInput(scratch.allocator(), request) == null);
+    }
+    // A large data URI needs no serialized descriptor just to select routing.
+    raw.clearRetainingCapacity();
+    try raw.appendSlice(a, "data:application/pdf;base64,");
+    try raw.appendNTimes(a, 'A', 2 * 1024 * 1024);
+    request.source_text = raw.items;
+    scratch.reset();
+    const uri = (try extractionDocumentInput(scratch.allocator(), request)).?.locator;
+    try std.testing.expectEqual(raw.items.ptr, uri.url.ptr);
+    try std.testing.expectEqualStrings("application/pdf", uri.mime);
+}
+
+test "index document checkpoint producer memory planning preserves text budgets and reserves document transport" {
+    const checkpoint = @import("storage/db/enrichment/document_checkpoints.zig");
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var backend = checkpoint.TestBackend.init(a);
+    defer backend.deinit();
+    var owner = checkpoint.Owner{ .allocator = a, .backend = backend.backend(), .binding = .{ .document = "doc", .producer = "extract", .source_key = "doc", .source_digest = @splat(1), .producer_digest = @splat(2) }, .io = io };
+    defer owner.drain();
+    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .GET, .path = "/ai/v1/models", .respond = .{ .status = 404, .body = "{}" } }});
+    defer server.deinit();
+    var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer http.deinit();
+    var runtime = Runtime.initWithOptions(a, &http, .{ .inference_api_url = server.baseUrl() });
+    defer runtime.deinit();
+    const ordinary = runtime.producer();
+    const scoped = ordinary.withInvocationContext(.{ .io = io, .document_checkpoints = owner.factory() });
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(a);
+    try raw.appendSlice(a, "{\"values\":[");
+    for (0..100_000) |_| try raw.appendSlice(a, "0,");
+    try raw.appendSlice(a, "0]}");
+    var request: asset_producer.Request = .{ .producer_type = .extractor, .config_json = "{\"provider\":\"antfly\",\"model\":\"fixture\"}", .source_text = raw.items };
+    const text = try ordinary.invocationMemoryForRequests(a, &.{request});
+    const text_scoped = try scoped.invocationMemoryForRequests(a, &.{request});
+    try std.testing.expectEqual(text.fixed_bytes, text_scoped.fixed_bytes);
+    try std.testing.expectEqual(text.allocator_limit_bytes, text_scoped.allocator_limit_bytes);
+    request.source_text = "https://example.test/document.pdf";
+    const uri = try ordinary.invocationMemoryForRequests(a, &.{request});
+    const document = try scoped.invocationMemoryForRequests(a, &.{request});
+    try std.testing.expectEqual(uri.fixed_bytes + 128 * 1024 * 1024, document.fixed_bytes);
+    // An expired caller must not scan input or enter capability discovery.
+    const canceled = ordinary.withInvocationContext(.{ .io = io, .deadline_ns = 1, .document_checkpoints = owner.factory() });
+    try std.testing.expectError(error.Timeout, canceled.batchMode(a, &.{request}));
 }
 
 test "index document checkpoint producer keeps text extraction on the ordinary provider" {
