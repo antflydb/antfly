@@ -669,8 +669,10 @@ phrase offsets and any provider speaker evidence. `--artifact chunks` selects
 native semantic chunks; timing follows the phrases they overlap. Existing
 `enrich --stage semantic` and `enrich --stage graph` commands target those same
 chunk artifacts in either table. Inference, graph materialization and provider
-admission remain native operations. The current web explorer/original-delivery
-endpoint remains PDF-specific; use native queries and grep for this audio pilot.
+admission remain native operations. The hosted explorer can bind both tables as explicit collections, search them
+with bounded native queries, and deliver generation-pinned originals through its
+read-only proxy. Audio results include playback and timestamp links; PDF page
+citations are unchanged.
 
 To search both profiles on the same instance, combine the two generated table
 bindings (the PDF alias is `grepstein`; transcription uses its table name):
@@ -815,3 +817,32 @@ offsets are parsed as decimal seconds/nanoseconds with integer arithmetic and
 rounded to milliseconds. Constructor and result ownership is established before
 fallible field allocation; failed requests release partial segments, words,
 speakers and text, including when an invocation reaches its allocator ceiling.
+
+### Hosted PDF and audio collections
+
+Configure only the tables the explorer may read; the server key must have matching
+read grants. Keep the audio profile separate from accepted PDF extraction:
+
+```sh
+GREPSTEIN_COLLECTIONS='[{"id":"pdf","label":"PDF records","table":"grepstein_corpus_rc11","profile":"pdf"},{"id":"audio","label":"Audio recordings","table":"grepstein_transcripts","profile":"transcription"}]' \
+  ./grepstein explore --url "$ANTFLY_URL"
+```
+
+The selector supports one collection or all configured collections. Combined
+search keeps each collection's ranking and provenance distinct, bounds results
+to twenty sources total, and cancels sibling requests on an upstream failure.
+The browser cannot choose arbitrary tables, query bodies or native API paths.
+There are at most four collections and four active explorer requests per process.
+
+Audio playback uses the authenticated original proxy with single byte ranges and
+HEAD support. Media type, bucket, content-addressed object name and generation
+are checked against the collection profile. The Antfly key never reaches GCS or
+the browser; the hosted service uses its own bucket-scoped identity. The speech
+model remains on shared inference, with no instance-local model pool. A browser
+that cannot decode an original format can still open/download the original.
+
+Raw Archive.org WARC collections may require authenticated access. An unrestricted
+release ZIP is a separate source: a bounded audio selection must retain its
+archive URL, strong ETag, member names/CRC32 and per-file SHA-256. Selected-member
+checks do not establish the full archive checksum or current official hosting.
+Record that distinction, and never treat a 403/interstitial as document bytes.
