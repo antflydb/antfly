@@ -88,7 +88,13 @@ for the final pixel tensor and codec scratch. Flattened-patch readers admit
 source decoding and patch preparation. Multi-stage decoding, regional crops,
 detection/layout resizing and CTC preprocessing use the existing allocation-based
 preparation scope, retaining only live pixels when execution starts. Each phase
-returns unused capacity before acquiring model execution resources. Admission
+returns unused capacity before acquiring model execution resources.
+
+Codec scratch is allocated lazily: solid-color, nearest and bilinear paths
+reserve no slab when they need no scratch. Sizing forecasts are advisory; denied
+headroom falls back to actual allocation demand. Capacity is reused across batch
+waves, with growth bounded by the aggregate physical cap. Speculative admission
+failures are discarded after a successful fallback. Admission
 failure precedes the backing allocation and retains its policy/pressure identity.
 
 Prepared model inputs borrow the allocation owner's proven payload range and

@@ -37,6 +37,7 @@ const session_mod = @import("../backends/session.zig");
 const ops = @import("../ops/ops.zig");
 const tokenizer_mod = @import("inference_tokenizer");
 const image = @import("image.zig");
+const admission_memory = @import("../runtime/tier/memory.zig");
 const antfly_image = @import("antfly_image");
 
 const CT = ops.CT;
@@ -174,15 +175,23 @@ pub const ReadingPipeline = struct {
     }
 
     fn preprocessEncodedBatchInto(self: *ReadingPipeline, pixels: []f32, images: []const []const u8, parent: *const @import("preprocessing_memory.zig").Scope) !void {
-        var scratch = PreprocessScratchAdmission{ .allocator = self.allocator, .session = self.vision_encoder, .parent = parent };
+        var capture = admission_memory.AdmissionFailure.Capture.init(if (self.vision_encoder.run_admission) |admission| admission.failure else null);
+        var scratch = PreprocessScratchAdmission{ .allocator = self.allocator, .session = self.vision_encoder.withAdmissionFailure(capture.sink()), .parent = parent };
         defer scratch.deinit();
-        try image.preprocessBatchIntoBounded(pixels, images, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample, self.preprocessOptions(&scratch));
+        image.preprocessBatchIntoBounded(pixels, images, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample, self.preprocessOptions(&scratch)) catch |err| {
+            capture.publish(err);
+            return err;
+        };
     }
 
     fn preprocessRasterBatchInto(self: *ReadingPipeline, pixels: []f32, rasters: []const antfly_image.BorrowedRasterAttachment, parent: *const @import("preprocessing_memory.zig").Scope) !void {
-        var scratch = PreprocessScratchAdmission{ .allocator = self.allocator, .session = self.vision_encoder, .parent = parent };
+        var capture = admission_memory.AdmissionFailure.Capture.init(if (self.vision_encoder.run_admission) |admission| admission.failure else null);
+        var scratch = PreprocessScratchAdmission{ .allocator = self.allocator, .session = self.vision_encoder.withAdmissionFailure(capture.sink()), .parent = parent };
         defer scratch.deinit();
-        try image.preprocessBorrowedRasterBatchIntoWithOptions(self.allocator, pixels, rasters, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample, self.preprocessOptions(&scratch));
+        image.preprocessBorrowedRasterBatchIntoWithOptions(self.allocator, pixels, rasters, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample, self.preprocessOptions(&scratch)) catch |err| {
+            capture.publish(err);
+            return err;
+        };
     }
 
     fn readBoundedNativeImage(self: *ReadingPipeline, bytes: []const u8) !ReadResult {
@@ -1178,9 +1187,13 @@ pub const ReadingPipeline = struct {
         defer work.free(pixels);
         try preparation.trim();
         {
-            var scratch = PreprocessScratchAdmission{ .allocator = allocator, .session = self.vision_encoder, .parent = &preparation };
+            var capture = admission_memory.AdmissionFailure.Capture.init(if (self.vision_encoder.run_admission) |admission| admission.failure else null);
+            var scratch = PreprocessScratchAdmission{ .allocator = allocator, .session = self.vision_encoder.withAdmissionFailure(capture.sink()), .parent = &preparation };
             defer scratch.deinit();
-            try image.preprocessDecodedWithResampleIntoBounded(allocator, img, pixels, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample, self.preprocessOptions(&scratch));
+            image.preprocessDecodedWithResampleIntoBounded(allocator, img, pixels, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample, self.preprocessOptions(&scratch)) catch |err| {
+                capture.publish(err);
+                return err;
+            };
         }
         return self.readPixelValues(pixels, &preparation);
     }
@@ -3513,4 +3526,33 @@ test "reading codec growth includes pixels and earlier slab capacity in feasibil
         try PreprocessScratchAdmission.growOpaque(&scratch, 0, 16 * 1024);
         try std.testing.expectError(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, PreprocessScratchAdmission.growOpaque(&scratch, 16 * 1024, if (contended) 40 * 1024 else 24 * 1024));
     }
+}
+
+test "reading codec forecast fallback clears speculative policy diagnostics" {
+    const Scope = @import("preprocessing_memory.zig").Scope;
+    var controller = admission_memory.AdmissionController{};
+    var failure = admission_memory.AdmissionFailure{};
+    const session = backends.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{ .host_limit_bytes = 32 * 1024, .scratch_limit_bytes = 32 * 1024 },
+        .static_workspace_bytes = 0,
+        .check_live_memory = false,
+        .failure = &failure,
+    } };
+    var pipeline = ReadingPipeline.init(std.testing.allocator, session, undefined, undefined, .{ .image_size = 8, .resample = .pillow_bicubic }, null);
+    var parent = Scope.child(std.testing.allocator, session, null);
+    defer parent.deinit();
+    const a = try parent.allocator();
+    const pixels = try a.alloc(f32, 3 * 8 * 8);
+    defer a.free(pixels);
+    try parent.trim();
+    // The 64 KiB forecast fails, but actual codec demand fits with the pixels.
+    try pipeline.preprocessEncodedBatchInto(pixels, &.{@import("antfly_documents").fixtures.get("one-pixel.png")}, &parent);
+    try std.testing.expect(failure.snapshot() == null);
+    var rgba = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255 };
+    try pipeline.preprocessRasterBatchInto(pixels, &.{.{ .bytes = &rgba, .width = 2, .height = 2, .stride_bytes = 8 }}, &parent);
+    try std.testing.expect(failure.snapshot() == null);
+    // Only the parent pixels remain after codec permits are retired.
+    try std.testing.expectEqual(try parent.ownedHostBytesFor(session), controller.snapshot().hostTotalBytes());
 }
