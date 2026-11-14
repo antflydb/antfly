@@ -402,6 +402,7 @@ test "commit requirements serverless prepared batch commits source outputs and d
     try client.makeBucket("db");
     var indexed = try wal_mod.IndexedObjectStore.init(a, client, "db", "prepared");
     defer indexed.deinit();
+    indexed.catalog_fences_enabled = true;
     var wal = indexed.walStore();
     var service = Service.init(a, &wal, undefined);
     var initial = try service.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 1, .mutations = &.{.{ .kind = .upsert, .doc_id = "victim", .body = "{}" }} });

@@ -152,7 +152,7 @@ artifacts, deletes, metadata and replay have an 8 MiB / 16,384-row physical budg
 Provider result contracts and incremental output accounting stop oversized work.
 Transaction preparation additionally reserves a conservative bound for commit
 metadata, index effects, read guards, retained-source output and existing artifact
-retirement before voting yes;
+retirement before voting yes, including old secondary-index tuples on updates;
 that bound can reject a request below the final physical limit. Prepared primary
 intents fence background artifact publication, so the retirement footprint cannot
 expand after reservation. Workers defer that conflict without terminal failure.
@@ -164,10 +164,13 @@ revisions. It references each immutable catalog definition instead of repeating
 provider configuration for every document. Binary artifact values round-trip
 without UTF-8 conversion. Capture has no primary side effects. Receivers validate
 the complete eligible producer set and its physical output scopes without model
-calls. Native owner ABI 94, storage engine ABI 40 and media compute ABI 5
+calls. Native owner ABI 94, storage engine ABI 41 and media compute ABI 5
 fence the added interfaces. Request deadlines and cancellation cross the native
 owner and extraction boundaries into request-owned provider calls. Acceptance
-shares one immutable source image and digest across producers for each document.
+shares one immutable source image and digest across producers for each document,
+and validates its source/TTL bytes once inside the commit. Sparse revision
+discovery uses the same controlled provider boundary as foreground inference;
+legacy synchronous discovery is rejected when request controls are present.
 
 Raft leaders prepare before acquiring routed admission or the proposal lock.
 The all-member durable protocol-30 barrier precedes prepared-effect entries;
@@ -180,7 +183,8 @@ inference or second mutation. Certificate retirement has bounded epoch/root and
 current-record scans, with exact-record checks protecting concurrent renewal.
 
 Distributed prepare persists the frozen packet with its intent vote and reserves
-its retained-source cost. Its request digest rejects identity collisions; retries
+its retained-source cost. Its request digest binds range guards and document-version semantics as well as
+mutations, predicates and integrity commands, rejecting identity collisions; retries
 of an accepted participant reuse the durable packet. A non-gated prepare cannot
 replace or extend that sealed vote. Commit and abort retire the packet atomically
 with intent resolution. Restart and phase two consume recorded effects without
@@ -193,10 +197,21 @@ and its direct pipeline outputs, preserving logical source-byte accounting. One
 conditional atomic WAL batch admits all writes and deletes against the captured
 namespace cut and catalog epoch, with an operation receipt for exact replay and
 collision checks. WAL HEAD format 8 and private mutation kind 6 publish a durable
-catalog-change intent before metadata changes. Pending intents block fresh gated
+catalog-change intent before metadata changes. Catalog intents use the same
+8 MiB payload limit as batch admission, with a separate recovery allowance for
+the complete encoded record/descriptor and decoded-record overhead. Pending intents block fresh gated
 admission and recover on the next catalog read; per-record epochs make delayed
 recovery harmless. Clearing the intent and admitting prepared sources use HEAD
 CAS, so catalog changes during inference cannot admit stale effects.
+Catalog fencing is explicitly activated with `--wal-catalog-fences true` (or
+`ANTFLY_SERVERLESS_WAL_CATALOG_FENCES=true`) alongside `--indexed-wal true`.
+The immutable WAL layout-v3 marker is created only at a pristine/migrated prefix;
+existing layout-v1/v2 prefixes reject activation rather than upgrading on a DDL
+request. Move WAL and catalog state together during a quiesced cutover, remove
+old readers and metadata writers, and configure every new opener for fencing.
+Old binaries reject the new marker before serving the prefix. Ordinary DDL on
+unactivated prefixes keeps its legacy behavior; direct gates fail closed there.
+
 It is limited to 1,024 mutations and 8 MiB including framing. Legacy backends
 without atomic source/catalog fencing reject before inference or source admission.
 Each document uses a 64 MiB scratch allocation quota; remaining output limits are
@@ -208,7 +223,8 @@ publication locks. Media/model-source stages requiring artifact context remain
 asynchronous. Prepared completion markers bind the canonical producer catalog;
 configuration changes reopen their pending facts and prevent fingerprint reuse
 from skipping the replacement work. Available model revisions are recorded and
-revalidated before admission.
+revalidated before admission. Cancellations and deadline expiry remain control
+outcomes even when a model adapter wraps its transport error.
 
 Direct extraction materializes its own units and navigation. Its terminal
 failures reject admission even without a consuming index. Artifact-source children

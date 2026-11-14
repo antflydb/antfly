@@ -233,6 +233,9 @@ pub const SparseEnricher = struct {
         var scoped = self.*;
         scoped.alloc = quota.allocator();
         const prepared = scoped.prepareDirectBodyBounded(body, policy, exclude_model_sources) catch |err| {
+            // Model adapters may classify transport errors. Request control
+            // remains authoritative even when inference wrapped its failure.
+            if (self.execution_context) |context| try context.check();
             if (quota.limit_exceeded) return error.CommitRequirementTooLarge;
             return err;
         };
@@ -838,6 +841,17 @@ fn preserveOtherEnrichmentOutputsAlloc(a: Allocator, original: []const u8, produ
     return std.json.Stringify.valueAlloc(a, after.value, .{});
 }
 
+fn isExecutionControlError(err: anyerror) bool {
+    return switch (err) {
+        error.Canceled, error.Cancelled, error.Timeout, error.DeadlineExceeded => true,
+        else => false,
+    };
+}
+
+fn modelFailure(err: anyerror, classified: anyerror) anyerror {
+    return if (isExecutionControlError(err) or err == error.OutOfMemory) err else classified;
+}
+
 fn buildDerivedSparseBodyAlloc(
     self: *SparseEnricher,
     body: []const u8,
@@ -874,7 +888,7 @@ fn buildDerivedSparseBodyAlloc(
             .prefer_model => {
                 if (self.sparse_embedder) |embedder| {
                     const embedding_name = self.sparse_embedding_name orelse return EnrichmentError.MissingSparseEmbeddingName;
-                    const sparse = embedder.embedSparse(alloc, embedding_name, projection.text) catch null;
+                    const sparse = embedder.embedSparse(alloc, embedding_name, projection.text) catch |err| if (isExecutionControlError(err) or err == error.OutOfMemory) return err else null;
                     if (sparse) |value| {
                         var owned_sparse = value;
                         defer owned_sparse.deinit(alloc);
@@ -901,7 +915,7 @@ fn buildDerivedSparseBodyAlloc(
             .require_model => {
                 const embedder = self.sparse_embedder orelse return EnrichmentError.RequiredSparseModelUnavailable;
                 const embedding_name = self.sparse_embedding_name orelse return EnrichmentError.MissingSparseEmbeddingName;
-                var sparse = embedder.embedSparse(alloc, embedding_name, projection.text) catch return EnrichmentError.SparseEmbeddingModelFailed;
+                var sparse = embedder.embedSparse(alloc, embedding_name, projection.text) catch |err| return modelFailure(err, EnrichmentError.SparseEmbeddingModelFailed);
                 defer sparse.deinit(alloc);
                 used_model = true;
                 try appendJSONString(alloc, &out, ",\"sparse_embedding\":{");
@@ -1764,7 +1778,7 @@ fn buildDenseEmbeddingAlloc(
         .prefer_model => {
             if (self.chunk_embedder) |embedder| {
                 const embedding_name = self.chunk_embedding_name orelse return EnrichmentError.MissingChunkEmbeddingName;
-                const model_result = embedder.embedDense(alloc, embedding_name, text, @intCast(dims)) catch null;
+                const model_result = embedder.embedDense(alloc, embedding_name, text, @intCast(dims)) catch |err| if (isExecutionControlError(err) or err == error.OutOfMemory) return err else null;
                 if (model_result) |result| {
                     return .{ .embedding = result, .used_model = true, .used_fallback = false };
                 }
@@ -1783,7 +1797,7 @@ fn buildDenseEmbeddingAlloc(
         .require_model => {
             const embedder = self.chunk_embedder orelse return EnrichmentError.RequiredChunkEmbeddingModelUnavailable;
             const embedding_name = self.chunk_embedding_name orelse return EnrichmentError.MissingChunkEmbeddingName;
-            const result = embedder.embedDense(alloc, embedding_name, text, @intCast(dims)) catch return EnrichmentError.ChunkEmbeddingModelFailed;
+            const result = embedder.embedDense(alloc, embedding_name, text, @intCast(dims)) catch |err| return modelFailure(err, EnrichmentError.ChunkEmbeddingModelFailed);
             return .{ .embedding = result, .used_model = true, .used_fallback = false };
         },
     }
@@ -4704,4 +4718,29 @@ test "commit requirements serverless rejects predictable vector amplification be
     enricher.chunk_embedding_dims = 8192;
     enricher.direct_output_limit = 1024;
     try std.testing.expectError(error.CommitRequirementTooLarge, enricher.prepareDirectBody("{\"text\":\"some source words\"}", .{ .chunk_embeddings_enabled = true, .chunk_embeddings_model_preference = .require_model }, false));
+}
+
+test "commit requirements serverless model cancellation survives error classification" {
+    const Probe = struct {
+        canceled: std.atomic.Value(bool) = .init(false),
+        fn embed(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !embedder_mod.SparseEmbedding {
+            return error.UnexpectedLegacyInference;
+        }
+        fn controlled(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8, context: @import("antfly_inference_execution_context").RequestContext) !embedder_mod.SparseEmbedding {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            self.canceled.store(true, .release);
+            return error.ProviderTransportFailure;
+        }
+    };
+    var probe = Probe{};
+    const context: @import("antfly_inference_execution_context").RequestContext = .{ .io = std.testing.io, .deadline_ns = null, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&probe.canceled) };
+    var enricher = SparseEnricher.init(std.testing.allocator, undefined, undefined, undefined, undefined);
+    defer enricher.deinit();
+    enricher.execution_context = context;
+    try enricher.setSparseEmbedder((embedder_mod.SparseEmbedder{ .ptr = &probe, .sparse_embed_fn = Probe.embed, .sparse_embed_with_context_fn = Probe.controlled }).withRequestContext(context), "model");
+    try std.testing.expectError(error.Cancelled, enricher.prepareDirectBody("{\"text\":\"must cancel during inference\"}", .{ .enrichment_enabled = true, .lexical_sparse_model_preference = .require_model }, false));
+    probe.canceled.store(false, .release);
+    enricher.execution_context = .{ .io = std.testing.io, .deadline_ns = 0 };
+    try std.testing.expectError(error.Timeout, enricher.prepareDirectBody("{\"text\":\"expired\"}", .{ .enrichment_enabled = true }, false));
 }

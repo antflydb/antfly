@@ -188,15 +188,15 @@ pub fn read(a: std.mem.Allocator, txn: anytype, root: u128, document: []const u8
     return .{ .arena = arena, .root = root, .requirement = requirement, .observation = observation, .document = try owned.dupe(u8, document), .receipt_key = key, .receipt = try owned.dupe(u8, raw) };
 }
 
-const SourceImage = struct { bytes: []const u8, digest: [32]u8, ttl: []const u8 };
-fn internSource(a: std.mem.Allocator, images: *std.StringHashMapUnmanaged(SourceImage), document: []const u8, source: []const u8, ttl: []const u8) !SourceImage {
+const SourceImage = struct { bytes: []const u8, digest: [32]u8, ttl: []const u8, index: ?usize = null };
+fn internSource(a: std.mem.Allocator, images: *std.StringHashMapUnmanaged(SourceImage), document: []const u8, source: []const u8, ttl: []const u8) !*SourceImage {
     const entry = try images.getOrPut(a, document);
     if (!entry.found_existing) {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
         entry.value_ptr.* = .{ .bytes = try a.dupe(u8, source), .digest = digest, .ttl = try a.dupe(u8, ttl) };
     }
-    return entry.value_ptr.*;
+    return entry.value_ptr;
 }
 
 pub const Prepared = struct {
@@ -204,9 +204,11 @@ pub const Prepared = struct {
     root: u128,
     sequence: u64,
     records: []Record,
+    documents: []Document,
     budget: @import("commit_requirements.zig").OutputBudget = .{},
     other: ?commit_hooks.Participant,
-    const Record = struct { requirement: [32]u8, command: publication.Command, primary: []const u8, source_bytes: []const u8, ttl: []const u8 };
+    const Record = struct { requirement: [32]u8, command: publication.Command, document_index: usize };
+    const Document = struct { primary: []const u8, bytes: []const u8, ttl_key: []const u8, ttl: []const u8 };
     pub fn deinit(self: *@This()) void {
         self.arena.deinit();
         self.* = undefined;
@@ -217,6 +219,7 @@ pub const Prepared = struct {
         errdefer arena.deinit();
         const owned = arena.allocator();
         var records = std.ArrayList(Record).empty;
+        var documents = std.ArrayList(Document).empty;
         var txn = try store.beginReadTxn();
         defer txn.abort();
         if (try publication.authority(&txn)) |authority| {
@@ -259,6 +262,10 @@ pub const Prepared = struct {
                 const ttl_bytes = if (final.get(ttl_key)) |bytes| bytes else txn.get(ttl_key) catch return error.EnrichmentSourceChanged;
                 const timestamp = @import("../ttl.zig").writeVersion(ttl_bytes) orelse return error.InvalidBatchRequest;
                 const image = try internSource(owned, &images, request.doc_key, source, ttl_bytes);
+                if (image.index == null) {
+                    image.index = documents.items.len;
+                    try documents.append(owned, .{ .primary = primary, .bytes = image.bytes, .ttl_key = ttl_key, .ttl = image.ttl });
+                }
                 const source_digest = image.digest;
                 const source_record = try owned.create(publication.Source);
                 source_record.* = .{ .document_key = request.doc_key, .content_digest = source_digest, .timestamp = timestamp, .input_position = null };
@@ -270,7 +277,7 @@ pub const Prepared = struct {
                     }
                 }.less);
                 const is_index = request.kind == .dense_embedding or request.kind == .sparse_embedding;
-                try records.append(owned, .{ .requirement = binding.requirement.id, .primary = primary, .source_bytes = image.bytes, .ttl = image.ttl, .command = .{
+                try records.append(owned, .{ .requirement = binding.requirement.id, .document_index = image.index.?, .command = .{
                     .execution_identity = revision,
                     .namespace = authority.namespace,
                     .authority_epoch = authority.epoch,
@@ -285,7 +292,7 @@ pub const Prepared = struct {
                 } });
             }
         }
-        return .{ .arena = arena, .root = root, .sequence = sequence, .records = try records.toOwnedSlice(owned), .other = other };
+        return .{ .arena = arena, .root = root, .sequence = sequence, .records = try records.toOwnedSlice(owned), .documents = try documents.toOwnedSlice(owned), .other = other };
     }
 
     pub fn participant(self: *@This()) commit_hooks.Participant {
@@ -306,16 +313,24 @@ pub const Prepared = struct {
         const self: *Prepared = @ptrCast(@alignCast(ptr));
         if (self.other) |other| other.observe(other.ptr, key, value);
     }
+    fn validateDocuments(self: *Prepared, view: commit_hooks.View) !void {
+        for (self.documents) |document| {
+            if (!std.mem.eql(u8, try view.get(document.primary), document.bytes) or
+                !std.mem.eql(u8, try view.get(document.ttl_key), document.ttl)) return error.EnrichmentSourceChanged;
+        }
+    }
+
     fn stage(ptr: *anyopaque, view: commit_hooks.View, encoded: []const u8) !void {
         const self: *Prepared = @ptrCast(@alignCast(ptr));
         if (self.other) |other| try other.stage(other.ptr, view, encoded);
         const position = try publication.Position.decode(encoded);
         const a = self.arena.allocator();
+        // Source images are interned by document. Compare the complete bytes
+        // once per document, irrespective of producer count, inside the writer.
+        try self.validateDocuments(view);
         for (self.records) |record| {
-            if (!std.mem.eql(u8, try view.get(record.primary), record.source_bytes)) return error.EnrichmentSourceChanged;
+            std.debug.assert(record.document_index < self.documents.len);
             const source = &@constCast(record.command.sources)[0];
-            const ttl_key = try keys.ttlKeyAlloc(a, source.document_key);
-            if (!std.mem.eql(u8, try view.get(ttl_key), record.ttl)) return error.EnrichmentSourceChanged;
             source.input_position = try publication.inputRevision(view, record.command.namespace, source.document_key);
             var command = record.command;
             command.publication_digest = command.digest();
@@ -387,4 +402,36 @@ test "commit requirements acceptance interns one source image across producer sc
         try std.testing.expectEqual(first.ttl.ptr, next.ttl.ptr);
         try std.testing.expectEqual(first.digest, next.digest);
     }
+}
+
+test "commit requirements acceptance validates source bytes once per document" {
+    const Probe = struct {
+        gets: usize = 0,
+        fn get(raw: *anyopaque, key: []const u8) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.gets += 1;
+            return if (std.mem.eql(u8, key, "source")) "large source image" else "timestamp";
+        }
+        fn put(_: *anyopaque, _: []const u8, _: []const u8) !void {
+            return error.UnexpectedMutation;
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var prepared: Prepared = .{
+        .arena = arena,
+        .root = 1,
+        .sequence = 1,
+        .records = try arena.allocator().alloc(Prepared.Record, 1000),
+        .documents = try arena.allocator().dupe(Prepared.Document, &.{.{ .primary = "source", .bytes = "large source image", .ttl_key = "ttl", .ttl = "timestamp" }}),
+        .other = null,
+    };
+    // Transfer the arena only after populating it; allocator calls mutate state.
+    prepared.arena = arena;
+    defer prepared.deinit();
+    var probe = Probe{};
+    const view: commit_hooks.View = .{ .ptr = &probe, .get_fn = Probe.get, .put_fn = Probe.put };
+    try prepared.validateDocuments(view);
+    try std.testing.expectEqual(@as(usize, 2), probe.gets);
+    prepared.documents[0].bytes = "wrong source";
+    try std.testing.expectError(error.EnrichmentSourceChanged, prepared.validateDocuments(view));
 }

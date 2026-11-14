@@ -13455,6 +13455,9 @@ pub const DataServer = struct {
                 // Raft proposal lock. Receiver-owned source/catalog fences are
                 // rechecked atomically at ordered apply on every replica.
                 if (req.commit_requires == .direct_enrichments and req.prepared_enrichments_json == null) {
+                    // Protocol 30 includes revision-v1 document semantics. Bind
+                    // that admitted scheme before sealing the retry digest.
+                    if (batchMutatesDocuments(req)) req.document_version_scheme = .revision_v1;
                     const activation = protocol_activation_entry.?;
                     if (activation.protocol_version.load(.acquire) < minimum_protocol_version and
                         protocol_preflight.activatable_version < minimum_protocol_version and

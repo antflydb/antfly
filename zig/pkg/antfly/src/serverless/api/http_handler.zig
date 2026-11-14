@@ -6000,6 +6000,7 @@ pub const HttpHandler = struct {
                 error.UnsupportedCommitRequirement => return error.UnsupportedCommitRequirement,
                 error.CommitRequirementTooLarge, error.InvalidDocumentBody, error.InvalidDocumentMutation => return error.InvalidBatchRequest,
                 error.Canceled, error.Cancelled => return error.Canceled,
+                error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
                 else => return error.Unavailable,
             };
         } else null;

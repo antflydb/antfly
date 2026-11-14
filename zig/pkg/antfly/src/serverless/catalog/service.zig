@@ -5967,6 +5967,7 @@ fn testDirectCatalogRecovery(comptime object_backed: bool) !void {
     try client.makeBucket("db");
     var indexed = try wal_mod.IndexedObjectStore.init(a, client, "db", "catalog-recovery");
     defer indexed.deinit();
+    indexed.catalog_fences_enabled = true;
     var wal = indexed.walStore();
     var service: CatalogService = .{ .alloc = a, .artifacts = undefined, .manifests = undefined, .progress = undefined, .wal = &wal, .builder = undefined, .store = &metadata };
     const update: catalog_types.CatalogUpdate = .{ .definition = .{ .table = "docs", .schema = "", .read_schema = "", .indexes = "{\"old\":{}}" } };
@@ -5992,4 +5993,28 @@ fn testDirectCatalogRecovery(comptime object_backed: bool) !void {
     try metadata.applyCatalogUpdate("docs", policy_fence.fence.epoch, .{ .policy = .{ .chunk_preview_enabled = true } });
     try std.testing.expect(!(try metadata.getPolicy("docs")).chunk_preview_enabled);
     try std.testing.expectError(error.CatalogFenceRequired, metadata.setPolicy("docs", .{}));
+}
+
+test "commit requirements ordinary catalog changes preserve an unactivated WAL" {
+    const a = std.testing.allocator;
+    var root_buf: [256]u8 = undefined;
+    const root = tmpPath(&root_buf, "legacy-catalog-compatibility");
+    defer cleanupTmp(root);
+    var fs = try @import("fs_store.zig").FsStore.init(a, std.mem.span(root));
+    var metadata = fs.catalogStore();
+    defer metadata.deinit();
+    try std.testing.expect(try metadata.ensureTable("docs", "docs", 1, .{}, "", "", "{}"));
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var backing = try @import("../wal/object_store.zig").ObjectStore.initWithClient(a, client, "db", "legacy-catalog");
+    defer backing.deinit();
+    try backing.enableIndexed(.{});
+    var wal = backing.walStore();
+    var service: CatalogService = .{ .alloc = a, .artifacts = undefined, .manifests = undefined, .progress = undefined, .wal = &wal, .builder = undefined, .store = &metadata };
+    try std.testing.expect(try service.setTableDefinition("docs", "", "", "{\"new\":{}}"));
+    _ = try service.setPolicy("docs", .{ .chunk_preview_enabled = true });
+    try std.testing.expectEqual(@as(u64, 0), try wal.latestLsn("docs"));
+    try std.testing.expectError(error.AtomicCatalogAdmissionUnsupported, service.directCatalogFence("docs"));
 }

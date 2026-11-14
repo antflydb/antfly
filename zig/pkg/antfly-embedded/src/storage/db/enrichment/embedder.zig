@@ -800,13 +800,24 @@ pub const SparseEmbedder = struct {
     deinit_fn: ?SparseEmbedDeinitFn = null,
     set_cancellation_fn: ?EmbedSetCancellationFn = null,
     set_progress_fn: ?EmbedSetProgressFn = null,
+    cache_revision_with_context_fn: ?*const fn (*anyopaque, Allocator, []const u8, RequestContext) anyerror!?[32]u8 = null,
     cache_revision_fn: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!?[32]u8 = null,
     recovery_identity_fn: ?EmbedRecoveryIdentityFn = null,
     foreground_bounded: bool = false,
 
     /// The provider generation behind this name, when it can report one.
     pub fn captureRevision(self: SparseEmbedder, a: Allocator, name: []const u8) !?[32]u8 {
-        if (self.request_context) |context| try context.check();
+        if (self.request_context) |context| {
+            try context.check();
+            if (self.cache_revision_with_context_fn) |resolve| {
+                const revision = try resolve(self.ptr, a, name, context);
+                try context.check();
+                return revision;
+            }
+            // A provider with no revision contract has nothing to discover.
+            if (self.cache_revision_fn != null) return error.UncancellableInferenceProvider;
+            return null;
+        }
         const resolve = self.cache_revision_fn orelse return null;
         const revision = try resolve(self.ptr, a, name);
         if (self.request_context) |context| try context.check();
@@ -1909,4 +1920,30 @@ test "dense grouped parts fence revisions and consume the captured lease" {
             try std.testing.expectEqual(planned, state.planned);
         }
     }
+}
+
+test "commit requirements sparse revision discovery carries control and rejects legacy resolvers" {
+    const Probe = struct {
+        seen: bool = false,
+        fn embed(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8) !SparseEmbedding {
+            return error.UnexpectedInference;
+        }
+        fn legacy(_: *anyopaque, _: Allocator, _: []const u8) !?[32]u8 {
+            return error.UnexpectedLegacyDiscovery;
+        }
+        fn controlled(ptr: *anyopaque, _: Allocator, _: []const u8, context: RequestContext) !?[32]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.check();
+            try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), context.deadline_ns);
+            self.seen = true;
+            return @as([32]u8, @splat(7));
+        }
+    };
+    var probe = Probe{};
+    const context: RequestContext = .{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64) };
+    var provider = SparseEmbedder{ .ptr = &probe, .sparse_embed_fn = Probe.embed, .cache_revision_fn = Probe.legacy, .cache_revision_with_context_fn = Probe.controlled };
+    try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(7))), try provider.withRequestContext(context).captureRevision(std.testing.allocator, "model"));
+    try std.testing.expect(probe.seen);
+    provider.cache_revision_with_context_fn = null;
+    try std.testing.expectError(error.UncancellableInferenceProvider, provider.withRequestContext(context).captureRevision(std.testing.allocator, "model"));
 }

@@ -25841,6 +25841,8 @@ pub const DB = struct {
             .row_policy_principal_proof = req.row_policy_principal_proof,
             .row_policy_database = req.row_policy_database,
             .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
+            .range_guards = req.range_guards,
+            .document_version_scheme = req.document_version_scheme,
             .commit_requires = req.commit_requires,
             .writes = @ptrCast(req.writes),
             .deletes = req.deletes,
@@ -26504,8 +26506,16 @@ pub const DB = struct {
         var cursor = try read.openPhysicalCursorAdapter();
         defer cursor.close();
         for (intents) |intent| {
-            if (intent.value != null or isMetadataKey(intent.key)) continue;
-            const prefix = try internal_keys.documentExactPrefixAlloc(alloc, intent.key);
+            if (isMetadataKey(intent.key)) continue;
+            const document_prefix = try internal_keys.documentExactPrefixAlloc(alloc, intent.key);
+            defer alloc.free(document_prefix);
+            // Updates retire old secondary keys too. Scan only reverse-index
+            // ownership for updates; generated artifact retirement is already
+            // captured in the immutable packet. Deletes retire the whole row.
+            const prefix = if (intent.value != null)
+                try std.mem.concat(alloc, u8, &.{ document_prefix, &.{internal_keys.relational_index_reverse_kind} })
+            else
+                try alloc.dupe(u8, document_prefix);
             defer alloc.free(prefix);
             var entry = try cursor.seekAtOrAfter(prefix);
             while (entry) |record| : (entry = try cursor.next()) {
@@ -26513,6 +26523,10 @@ pub const DB = struct {
                 // Includes retirement stamps, revision clocks, provenance and
                 // replay references, including replacement/delete metadata.
                 try budget.reserve(2048 + 12 * record.key.len, 12);
+                // Reverse values carry the old tuple used to reconstruct the
+                // forward tombstone. Its size is independent of the new row.
+                if (internal_keys.isRelationalIndexReverseKey(record.key))
+                    try budget.reserve(2048 + 4 * record.value.len, 8);
                 if (internal_keys.isStoredSourceRowKey(record.key)) {
                     for (0..indexes) |_| try budget.reserve(1024 + 4 * record.value.len + 8 * record.key.len, 8);
                 }
@@ -154420,4 +154434,50 @@ test "db commit requirements capture borrows an authenticated policy lease witho
     try db.batchInternal(.{ .commit_requires = .direct_enrichments, .row_policy_principal_proof = "already verified before Raft proposal", .row_policy_database = "main", .row_policy_admitted_at_seconds = 1 }, null, .{ .preparation_capture = &capture, .wait_for_sync_level = false, .row_policy_principal = &principal, .row_policy_lease = &lease });
     try std.testing.expect(capture.json != null);
     try lease.checkAt(1000);
+}
+
+test "db commit requirements reserves old reverse index tuples on updates" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-update-retirement");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .commit_requires = .none });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const tuple = try owned.alloc(u8, 24 * 1024);
+    @memset(tuple, 'x');
+    const writes = try owned.alloc(docstore_mod.KVPair, 100);
+    for (writes, 0..) |*write, ordinal| {
+        var key = std.ArrayList(u8).empty;
+        try relational_index_records.appendReverseKey(owned, &key, .{ .generation = 1, .slot = @intCast(ordinal) }, "doc");
+        var value = std.ArrayList(u8).empty;
+        try relational_index_records.appendReverseValue(owned, &value, key.items, tuple);
+        write.* = .{ .key = key.items, .value = value.items };
+    }
+    try db.core.store.putBatch(writes, &.{});
+    const transaction = try db.beginTransaction(100);
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.writeTransaction(transaction, .{ .writes = &.{.{ .key = "doc", .value = "{\"small\":true}" }}, .commit_requires = .direct_enrichments }));
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .commit_requires = .none });
+    try db.abortTransaction(transaction, 200);
+}
+
+test "db commit requirements sealed retries reject changed range guards and version semantics" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-sealed-guards");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    const transaction = try db.beginTransaction(100);
+    const request: types.TransactionIntentRequest = .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .commit_requires = .direct_enrichments };
+    try db.writeTransaction(transaction, request);
+    var changed = request;
+    changed.range_guards = &.{.{ .bucket = 1, .generation = 999 }};
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(transaction, changed));
+    changed = request;
+    changed.document_version_scheme = .legacy;
+    try std.testing.expectError(error.VersionConflict, db.writeTransaction(transaction, changed));
+    try db.writeTransaction(transaction, request);
+    try db.abortTransaction(transaction, 200);
 }
