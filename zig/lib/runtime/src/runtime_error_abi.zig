@@ -1106,6 +1106,10 @@ pub const Detail = enum(c_int) {
     reembed_budget_exceeded,
     reembed_setup_retry,
     unsupported_node_filter_query,
+    process_fd_quota_exceeded,
+    system_fd_quota_exceeded,
+    storage_descriptor_pressure,
+    input_output,
 };
 
 pub const Status = extern struct {
@@ -1759,6 +1763,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.MetricStale => status(.retryable, .metric_stale),
         error.StorageReadTemporarilyUnavailable => status(.retryable, .storage_read_temporarily_unavailable),
         error.PersistentDescriptorAdmissionExhausted => status(.retryable, .persistent_descriptor_admission_exhausted),
+        error.ProcessFdQuotaExceeded => status(.retryable, .process_fd_quota_exceeded),
+        error.SystemFdQuotaExceeded => status(.retryable, .system_fd_quota_exceeded),
+        error.StorageDescriptorPressure => status(.retryable, .storage_descriptor_pressure),
+        error.InputOutput => status(.internal, .input_output),
         error.ResourceRequestTooLarge => status(.invalid_argument, .resource_request_too_large),
         error.ResourceTemporarilyUnavailable => status(.retryable, .resource_temporarily_unavailable),
         error.ConcurrencyUnavailable => status(.retryable, .concurrency_unavailable),
@@ -2903,6 +2911,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .ha_read_wait_for_apply => "HAReadWaitForApply",
         .ha_read_wait_for_metadata => "HAReadWaitForMetadata",
         .persistent_descriptor_admission_exhausted => "PersistentDescriptorAdmissionExhausted",
+        .process_fd_quota_exceeded => "ProcessFdQuotaExceeded",
+        .system_fd_quota_exceeded => "SystemFdQuotaExceeded",
+        .storage_descriptor_pressure => "StorageDescriptorPressure",
+        .input_output => "InputOutput",
         .invalid_graph_edges => "InvalidGraphEdges",
         .invalid_table_index_metadata => "InvalidTableIndexMetadata",
         .transaction_begin_failed => "TransactionBeginFailed",
@@ -3806,4 +3818,18 @@ test "unsupported graph node filter survives the runtime boundary as a client er
     try std.testing.expectEqual(@backingInt(Code.invalid_argument), wire.code);
     try std.testing.expectEqual(error.UnsupportedNodeFilterQuery, errorFromStatus(wire));
     try std.testing.expect(errorHasStableDetail(error.UnsupportedNodeFilterQuery));
+}
+
+test "descriptor exhaustion retains retryable public runtime identity" {
+    inline for (.{ error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.StorageDescriptorPressure }) |err| {
+        const value = statusFromError(err);
+        try std.testing.expectEqual(@backingInt(Code.retryable), value.code);
+        try std.testing.expectEqual(err, errorFromStatus(value));
+    }
+}
+
+test "positional IO errors preserve identity without becoming retryable pressure" {
+    const value = statusFromError(error.InputOutput);
+    try std.testing.expectEqual(@backingInt(Code.internal), value.code);
+    try std.testing.expectEqual(error.InputOutput, errorFromStatus(value));
 }

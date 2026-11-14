@@ -1296,6 +1296,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "public table batch handler preserves ambiguous write outcomes",
             "public table batch handler maps HA write gate errors",
             "public table batch handler returns concise dense repair backpressure",
+            "public table batch handler returns actionable descriptor pressure",
             "public table api carries borrowed cancellation into batch execution",
             "public create index exposes retryable storage descriptor exhaustion",
             "public create index exposes unsupported deployment capability",

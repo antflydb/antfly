@@ -23,6 +23,8 @@ make build && ./antfly standalone
 docker run -p 127.0.0.1:8080:8080 ghcr.io/antflydb/antfly:latest standalone --host 0.0.0.0
 ```
 
+For production, [configure and verify the process open-file limit](docs/operations/open-file-limits.md) (recommended: 65,536; supported minimum: 256).
+
 These quickstarts run without authentication and are intended for local development. Keep Docker ports bound to loopback. Before allowing remote access, [enable authentication and provision a unique admin password](docs/reference/auth.md#secure-deployment), then configure TLS at a reverse proxy.
 
 That gives you the [Antfarm dashboard](ts/apps/antfarm) at `http://localhost:8080` — playgrounds for search, RAG, knowledge graphs, embeddings, reranking, and more.

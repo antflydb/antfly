@@ -5372,6 +5372,8 @@ pub fn runFromIterator(
         return;
     }
 
+    try preflightOpenFileLimit();
+
     var termination_signals = antfly.common.runtime_lifecycle.ProcessSignalScope.install();
     defer termination_signals.deinit();
     var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
@@ -6924,6 +6926,29 @@ fn publicHttpConnectionLimitForFdSoftLimit(fd_soft_limit: u64) u32 {
     // operator shell retain the rest even when the deployment lowers RLIMIT.
     const proportional_limit = @max(@as(u64, 1), fd_soft_limit / 4);
     return @intCast(@min(proportional_limit, public_http_connection_ceiling));
+}
+
+fn validateOpenFileSoftLimit(soft_limit: u64) !void {
+    if (soft_limit < 256) return error.OpenFileLimitTooLow;
+}
+
+fn preflightOpenFileLimit() !void {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return;
+    const limit = try std.posix.getrlimit(.NOFILE);
+    const soft: u64 = @intCast(limit.cur);
+    validateOpenFileSoftLimit(soft) catch |err| {
+        std.log.err("RLIMIT_NOFILE soft limit {d} is below the supported minimum 256; configure at least 65536 for production", .{soft});
+        return err;
+    };
+    if (soft < 65536) std.log.warn("RLIMIT_NOFILE soft limit is {d}; production deployments should configure at least 65536 (minimum supported: 256)", .{soft});
+}
+
+test "standalone open file preflight supports constrained deployments and rejects unsafe limits" {
+    try std.testing.expectError(error.OpenFileLimitTooLow, validateOpenFileSoftLimit(255));
+    try validateOpenFileSoftLimit(256);
+    try validateOpenFileSoftLimit(1024);
+    try validateOpenFileSoftLimit(65536);
+    try validateOpenFileSoftLimit(std.math.maxInt(u64));
 }
 
 fn configuredPublicHttpConnectionLimit() u32 {
