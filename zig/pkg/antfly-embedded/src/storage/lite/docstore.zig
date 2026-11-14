@@ -272,6 +272,23 @@ test "lite reclamation completed does not discard a reassessment request made wh
     const size = (try store.file.file.stat(store.file.runtime())).size;
     try std.testing.expect(store.maintenance_policy.due(size));
 
+    // Fresh garbage for a genuine second rewrite opportunity: the first
+    // vacuum already fully compacted everything reclaimable at the time
+    // the request arrived, so `due() == true` alone proves the request
+    // survived, but a second `maintainOnce` finding nothing left to
+    // reclaim would correctly skip the rewrite regardless -- not a sign
+    // the request was lost. New debt makes the "did it actually act, not
+    // just report due" check meaningful too.
+    for (0..64) |i| {
+        var key: [32]u8 = undefined;
+        try store.file.putDocument(try std.fmt.bufPrint(&key, "fresh-{d}", .{i}), &value);
+    }
+    for (0..64) |i| {
+        var key: [32]u8 = undefined;
+        try store.file.deleteDocument(try std.fmt.bufPrint(&key, "fresh-{d}", .{i}));
+    }
+    _ = try store.file.reclaimPages(8192);
+
     // And a second `maintainOnce`, with nothing else changed, must actually
     // act on that -- not merely report `due()` true while doing nothing.
     try store.maintainOnce(true);
