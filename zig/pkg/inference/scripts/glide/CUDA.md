@@ -132,15 +132,29 @@ Wrap each arm with `measure_process.py --out <prefix> -- <command>`. It saves
 the child log and samples process RSS/PSS and per-process NVML GPU memory every
 20 ms, separating startup and inference. These are sampled process peaks;
 Torch allocator peaks are additional metrics, not substitutes for NVML.
-The sampler follows the child PID across physical GPUs independently of
-`CUDA_VISIBLE_DEVICES`, sums simultaneous usage across devices, and records
-observed device UUIDs and names. Missing or unavailable process GPU memory
-fails the measurement rather than publishing a zero-byte GPU peak. Attribution
-regressions run without NVIDIA hardware or optional monitoring packages:
+The sampler follows the child process tree across physical GPUs independently
+of `CUDA_VISIBLE_DEVICES`, sums simultaneous usage across devices, and records
+observed device UUIDs and names. Each phase records its total samples and valid
+GPU samples; an unobserved GPU peak is `null`, never a measured zero. A valid
+measurement requires a load marker and a positive inference-phase GPU sample.
+Startup GPU observations cannot validate an unobserved inference phase.
+
+Receipts include `passed`, the child's `exit_code`, and `measurement_error` on
+monitoring failures. The wrapper exits nonzero if either the child or measurement
+fails. Sampling uses a 20 ms target cadence; `sample_times_s` and
+`sampling_actual_interval_s` record the actual cadence, including monitoring
+cost. Physical device discovery happens once, with one NVML process query per
+device per sample. The output pump uses bounded nonblocking reads, and process
+group cleanup terminates workers even if the direct child exits first or a
+worker ignores SIGTERM. Generated output draining and shutdown have deadlines.
+
+Attribution and process-lifecycle regressions run without NVIDIA hardware or
+optional monitoring packages:
 
 ```sh
 python3 -m unittest discover -s zig/pkg/inference/scripts/glide -p test_measure_process.py -v
 ```
+
 Run fresh processes in alternating order for repeated lifecycles, with no
 other GPU work or concurrent builds during final measurements.
 

@@ -437,14 +437,15 @@ const Forward = struct {
             defer cb.free(all_rows);
             break :blk try self.gatherReadout(all_rows, hidden_size);
         };
-        const attn_res = blk: {
-            // Register cleanup before the fallible residual gather, and release
-            // both inputs before allocating the feed-forward activations.
-            defer cb.free(mixed);
-            const residual = if (prune) try self.gatherReadout(hidden, hidden_size) else hidden;
-            defer if (residual != hidden) cb.free(residual);
-            break :blk try cb.add(mixed, residual);
+        const Gather = struct {
+            forward: *Forward,
+            width: usize,
+
+            pub fn call(gather: @This(), input: CT) !CT {
+                return gather.forward.gatherReadout(input, gather.width);
+            }
         };
+        const attn_res = try @import("glide_residual.zig").add(cb, mixed, hidden, prune, Gather{ .forward = self, .width = hidden_size });
         defer cb.free(attn_res);
 
         const ffn_in = try self.layerNorm(attn_res, layer, "post_attention_layernorm.weight");
