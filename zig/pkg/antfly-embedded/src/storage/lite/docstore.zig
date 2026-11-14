@@ -1036,6 +1036,66 @@ test "startMaintenanceAssumeLocked skips the ledger-rebase check once the cheap 
     }
 }
 
+// Regression: 085e219bff switched `startMaintenanceAssumeLocked` from
+// `retirementNeedsServiceLedgerOnlyWithCancel` to the full, redo-aware
+// `retirementNeedsServiceWithCancel`, reasoning that upgrading this
+// function's own lock to `lockStoreExclusive` had already closed the race
+// that originally justified staying ledger-only here
+// (`retirementNeedsServiceLedgerOnlyWithCancel`'s own doc comment). It
+// closed a *different* race -- this read's own TOCTOU against a live
+// commit's briefly released sync window (`commit_in_sync != 0`) -- not the
+// one that comment actually describes: starting the background
+// `maintenanceLoop` is the one caller of this check that is not a direct,
+// synchronous call the caller already controls the timing of, so a loop
+// started "for a retirement reason under redo" can race a still-in-flight
+// redo commit via the loop's own later work, not via this read. That
+// background/live-redo-commit race is still undiagnosed (see this file's
+// design doc, §9.7d). Reverting to the full signal here reliably exposed
+// it again as deterministic `EndOfStream`/`OutcomeUnknown` crash-sweep
+// failures, including on the sweep's own uncrashed run (`crash sweep:
+// dense native-catalog dimension replacement delete (#1216)` and its
+// admit-and-delete sibling, `crash sweep exhaustive: full text synchronous
+// visibility`, `crash sweep: full text with non-durable commit`).
+//
+// This test pins the signal split itself (the part that is actually
+// fixed), not the deeper background-loop race (still open): with a redo
+// log but no ledger-level retirement debt at all (no checkpoint fold has
+// ever run, so nothing has ever been durably retired), overwriting the
+// same key enough times to supersede a redo-overlay version must make the
+// full signal see "needs service" while the ledger-only signal
+// `startMaintenanceAssumeLocked` now uses again must not -- and
+// `maintenance_started` must stay false, proving the background loop
+// never starts for that redo-only reason.
+test "startMaintenanceAssumeLocked stays on the ledger-only retirement signal under redo" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "startmaintenance-ledger-only-under-redo.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{
+        .io = std.testing.io,
+        .no_sync = true,
+        .use_redo_log = true,
+        .reclamation = .{ .enabled = false, .page_reuse = true },
+    });
+    defer store.close();
+    try std.testing.expect(store.file.header.indexed_reclamation);
+
+    // Overwrite the same key enough times to supersede at least one
+    // redo-overlay version. No checkpoint fold ever runs here (nothing
+    // forces one), so no real ledger retirement debt is ever created --
+    // only redo-overlay debt.
+    for (0..4) |i| {
+        var write = try store.beginWrite();
+        try write.put("doc", if (i % 2 == 0) "a" else "b");
+        try write.commit();
+    }
+
+    try std.testing.expect(try store.file.retirementNeedsServiceWithCancel(null));
+    try std.testing.expect(!(try store.file.retirementNeedsServiceLedgerOnlyWithCancel(null)));
+    try std.testing.expect(!store.maintenance_started.load(.acquire));
+}
+
 test "lite reclamation capacity reserve sustains bounded overwrites" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2848,16 +2908,41 @@ pub const Store = struct {
             self.file.activeCheckpoint().page_count *| self.file.header.page_size >= self.maintenance_policy.options.minimum_reclaim_bytes;
         if (!cheap_already_due) {
             const retirement_check_started = if (@import("builtin").is_test) std.Io.Clock.awake.now(self.file.runtime()).nanoseconds else 0;
-            // §9 (redo retirement signal): the full, redo-aware signal.
-            // This used to call `retirementNeedsServiceLedgerOnlyWithCancel`
-            // to avoid starting the background `maintenanceLoop` for a
-            // redo-debt-only reason, because doing so exposed a background/
-            // foreground writer-ownership race (see `maintainOnceWithCancel`'s
-            // retirement/reclaim block and `lockStoreExclusive`'s own doc
-            // comment on `releaseWriterSlot`'s opportunistic maintenance
-            // kick). That race is fixed; every caller of this check now
-            // shares the same signal.
-            const retirement = self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false;
+            // §9 (redo retirement signal), ledger-only, on purpose -- do
+            // not "upgrade" this to the full, redo-aware
+            // `retirementNeedsServiceWithCancel` again. An earlier pass
+            // (085e219bff) switched this to the full signal, reasoning
+            // that upgrading `startMaintenance`'s own lock to
+            // `lockStoreExclusive` had closed the race that originally
+            // justified staying ledger-only here. It closed a *different*
+            // race (this read's own TOCTOU against a live commit's brief
+            // released sync window, `commit_in_sync != 0`) -- it did not
+            // close the one this comment is actually about: starting the
+            // background `maintenanceLoop` is the one caller of this check
+            // that is not a direct, synchronous call the caller already
+            // controls the timing of, so a loop started "for a retirement
+            // reason under redo" races a still-in-flight redo commit via
+            // the background loop's own later work, not via this read.
+            // That background/live-redo-commit race is undiagnosed and
+            // unfixed (see this file's design doc, §9.7d's "second,
+            // independent regression found and contained, not fixed").
+            // Switching back to the full signal here reliably reproduces
+            // it: deterministic `EndOfStream`/`OutcomeUnknown` crash-sweep
+            // failures, including on the sweep's own uncrashed run
+            // (`crash sweep: dense native-catalog dimension replacement
+            // delete (#1216)` and its admit-and-delete sibling, `crash
+            // sweep exhaustive: full text synchronous visibility`, `...full
+            // text with non-durable commit`) -- see "lite maintenance
+            // retirement-signal background-loop race predates the redo
+            // retirement signal" below for a plain, non-sweep repro.
+            // Every other caller of this check is a direct/synchronous
+            // caller that already controls its own timing
+            // (`maintainOnceWithCancel`'s own foreground-driven service
+            // call, `reclaimRetirementPressure`'s admission check, every
+            // explicit test assertion) and keeps the full signal
+            // unchanged; only this one, background-loop-starting caller
+            // stays on the ledger-only signal.
+            const retirement = self.file.retirementNeedsServiceLedgerOnlyWithCancel(&self.maintenance_cancel) catch false;
             if (@import("builtin").is_test) {
                 const elapsed: u64 = @intCast(@max(0, std.Io.Clock.awake.now(self.file.runtime()).nanoseconds - retirement_check_started));
                 _ = self.test_retirement_check_count.fetchAdd(1, .release);
