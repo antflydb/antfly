@@ -30,6 +30,7 @@ pub const Stats = struct {
     enabled: bool = false,
     owner_node_id: u64 = 0,
     expires_at_ms: u64 = 0,
+
     held_by_local: bool = false,
     acquisition_count: u64 = 0,
     acquire_failures: u64 = 0,
@@ -47,6 +48,9 @@ pub const State = struct {
     last_acquired_ms: u64 = 0,
     owner_node_id: u64 = 0,
     expires_at_ms: u64 = 0,
+    // Process-local proposal debt is shared by reconciliation and CDC. It is
+    // never authority: only an applied unexpired lease admits work.
+    pending_renewal: ?struct { term: u64, expires_at_ms: u64 } = null,
 
     pub fn init(local_node_id: u64, config: Config) State {
         return .{
@@ -72,6 +76,26 @@ pub const State = struct {
             .owner_node_id = self.local_node_id,
             .expires_at_ms = now_ms + self.config.lease_ttl_ms,
         };
+    }
+
+    pub fn shouldProposeRenewal(self: *State, leadership_term: ?u64, record: ?ReconcileLeaseRecord, now_ms: u64) bool {
+        const term = leadership_term orelse {
+            self.pending_renewal = null;
+            return false;
+        };
+        if (self.pending_renewal) |pending| {
+            const acknowledged = if (record) |current|
+                current.owner_node_id == self.local_node_id and current.expires_at_ms >= pending.expires_at_ms
+            else
+                false;
+            if (pending.term == term and !acknowledged and pending.expires_at_ms > now_ms) return false;
+            self.pending_renewal = null;
+        }
+        return self.shouldRenew(true, record, now_ms);
+    }
+
+    pub fn noteRenewalProposed(self: *State, term: u64, record: ReconcileLeaseRecord) void {
+        self.pending_renewal = .{ .term = term, .expires_at_ms = record.expires_at_ms };
     }
 
     pub fn observe(self: *State, is_local_leader: bool, record: ?ReconcileLeaseRecord, now_ms: u64) bool {
@@ -125,6 +149,37 @@ pub const State = struct {
         };
     }
 };
+
+test "reconcile lease coalesces pending renewals across polling and leadership changes" {
+    const std = @import("std");
+    var state = State.init(7, .{ .lease_ttl_ms = 5_000 });
+    try std.testing.expect(state.shouldProposeRenewal(1, null, 0));
+    state.noteRenewalProposed(1, state.desiredRecord(0));
+    for (1..3_000) |now| {
+        try std.testing.expect(state.shouldRenew(true, null, now));
+        try std.testing.expect(!state.shouldProposeRenewal(1, null, now));
+    }
+    // Proposal debt never grants execution authority.
+    try std.testing.expect(!state.observe(true, null, 3_000));
+    const old: ReconcileLeaseRecord = .{ .owner_node_id = 7, .expires_at_ms = 5_000 };
+    // A delayed acknowledgement can need one fresh renewal immediately.
+    try std.testing.expect(state.shouldProposeRenewal(1, old, 3_000));
+    state.noteRenewalProposed(1, state.desiredRecord(3_000));
+    try std.testing.expect(!state.shouldProposeRenewal(1, old, 3_001));
+    // A new term can replace an uncommitted old proposal without waiting for
+    // its expiry; observing lost leadership clears the same process-local debt.
+    try std.testing.expect(state.shouldProposeRenewal(2, old, 3_002));
+    state.noteRenewalProposed(2, state.desiredRecord(3_002));
+    try std.testing.expect(!state.shouldProposeRenewal(null, old, 3_003));
+    try std.testing.expect(state.pending_renewal == null);
+    try std.testing.expect(state.shouldProposeRenewal(3, null, 3_004));
+    state.noteRenewalProposed(3, state.desiredRecord(3_004));
+    try std.testing.expect(state.shouldProposeRenewal(3, null, 8_004));
+    state.noteRenewalProposed(3, state.desiredRecord(8_004));
+    const future: ReconcileLeaseRecord = .{ .owner_node_id = 7, .expires_at_ms = 20_000 };
+    try std.testing.expect(!state.shouldProposeRenewal(3, future, 8_005));
+    try std.testing.expect(state.pending_renewal == null);
+}
 
 test "reconcile lease state acquires on observed local leader lease" {
     var state = State.init(7, .{ .enabled = true, .lease_ttl_ms = 500 });

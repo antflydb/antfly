@@ -374,7 +374,7 @@ pub fn addOwnerTestRuns(b: *std.Build, owner: *std.Build.Step, shards: []const O
         audit.addArg("--inventory");
         audit.addFileArg2(inventory.captureStdErr(.{}), .{ .make_absolute = true });
         const run = addCuratedTestRunArtifact(b, shard.artifact, shard.filters);
-        run.addArg("--allow-empty-test-filter");
+        run.addArgs(&.{ "--allow-empty-test-filter", "--allow-empty-owner" });
         addRuntimeSkipTestFilters(run, skips);
         addRuntimeSkipTestFilters(run, shard.skip_filters);
         run.step.dependOn(previous);

@@ -46,6 +46,7 @@ const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").A
 const LmdbBackend = @import("../../../build_support/embedded/storage.zig").LmdbBackend;
 
 pub const AddTestsOptions = struct {
+    strip: bool,
     inference_enable_cuda: bool,
     apple_bridge: ?std.Build.LazyPath = null,
     vopr: *std.Build.Module,
@@ -141,6 +142,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_source_file = b.path("pkg/antfly/src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = options.strip,
     });
     test_imports.configure(b, antfly_test_mod, true, true);
     antfly_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
@@ -3507,7 +3509,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     root_test_step.dependOn(api_tests_addTests_result.distributed_query_availability_step);
     const run_lib_api_standalone_backup_restore_tests = api_tests_addTests_result.run_lib_api_standalone_backup_restore_tests;
-    const run_public_api_parity_aggregate_tests = api_tests_addTests_result.run_public_api_parity_aggregate_tests;
+    const public_api_parity_step = api_tests_addTests_result.public_api_parity_step;
     const run_lib_api_auth_tests = api_tests_addTests_result.run_lib_api_auth_tests;
     const run_algebraic_dynamic_template_tests = api_tests_addTests_result.run_algebraic_dynamic_template_tests;
     const run_lib_api_connections_tests = api_tests_addTests_result.run_lib_api_connections_tests;
@@ -3550,6 +3552,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "cdc work permit ",
             "metadata proposal receipt ",
             "metadata reconciliation plan uses one terminal receipt for ordered apply",
+            "metadata reconciliation sequential plans fence rejection proofs after a transition",
             "metadata reconciliation never appends an ordinary placement after hidden BEGIN races preflight",
             "table workflow cancellation stops before reconciliation lease work",
             "table workflow can drive real metadata service topology and split setup",
@@ -3590,6 +3593,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_metadata_service_tests = addFilteredTestRunArtifact(b, lib_metadata_service_tests);
     const lib_metadata_service_test_step = b.step("antfly-metadata-service-test", "Run metadata service/control-loop integration tests");
     lib_metadata_service_test_step.dependOn(&run_lib_metadata_service_tests.step);
+
+    const metadata_admission_proof_tests = b.addTest(.{
+        .name = "metadata-admission-proof-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{
+            "metadata reconciliation sequential plans fence rejection proofs after a transition",
+            "metadata mutation non-admission classification excludes ambiguous authority failures",
+            "metadata http server maps source split merge doc identity conflicts",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-admission-proof-test", "Verify compound metadata proposal outcomes and HTTP replay proofs")
+        .dependOn(&addFilteredTestRunArtifact(b, metadata_admission_proof_tests).step);
 
     const cypher_status_protocol_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -5436,9 +5452,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const integration_test_step = b.step("antfly-integration-test", "Run focused real HTTP and public API integration suites");
     integration_test_step.dependOn(&run_lib_metadata_vopr_public_integration_tests.step);
     integration_test_step.dependOn(&run_lib_metadata_vopr_forwarding_integration_tests.step);
-    // Both aggregates share this run node, so the default test DAG executes
-    // the stateful parity suite once. The focused alias remains independent.
-    integration_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
+    // Both aggregates share the audited focused owner group, so the default
+    // test DAG executes each stateful parity fixture exactly once.
+    integration_test_step.dependOn(public_api_parity_step);
     // Keep document-identity regressions in the owning integration suite.
     // The mixed lifecycle artifact remains intact so removing its public
     // shortcut does not discard metadata, cache, or distributed-query cases.
@@ -6032,7 +6048,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     unit_test_step.dependOn(&run_api_document_runs_tests.step);
     unit_test_step.dependOn(&run_document_runs_protocol_tests.step);
     // The storage support artifact owns portable backup; keep its focused target.
-    unit_test_step.dependOn(&run_public_api_parity_aggregate_tests.step);
+    unit_test_step.dependOn(public_api_parity_step);
     unit_test_step.dependOn(&run_lib_template_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
     unit_test_step.dependOn(&run_provider_default_tests.step);
