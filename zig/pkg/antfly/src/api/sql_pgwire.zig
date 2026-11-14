@@ -2177,3 +2177,25 @@ test "system catalog SQL pgwire retained policies survive repeated qualified pro
     defer changed.?.deinit(a);
     try std.testing.expectError(error.Forbidden, OwnedRead.validatePolicies(a, &changed.?, admitted, &policies));
 }
+
+test "system catalog SQL pgwire retained policies keep namespace scopes isolated" {
+    const a = std.testing.allocator;
+    var permission = try usermgr.Permission.initOwned(a, .table, "*", .read);
+    defer permission.deinit(a);
+    var permissions = [_]usermgr.Permission{permission};
+    const tenant_table = "\x00catalog:6:tenant7:allowed6:events";
+    var filters = [_]usermgr.RowFilterEntry{
+        try usermgr.RowFilterEntry.initOwned(a, "\x00catalog:7:default6:public*", "{\"term\":{\"visibility\":\"public\"}}"),
+        try usermgr.RowFilterEntry.initOwned(a, tenant_table, "{\"term\":{\"status\":\"open\"}}"),
+    };
+    defer for (&filters) |*entry| entry.deinit(a);
+    var admitted = (try http.cloneCatalogIdentity(a, .{ .username = @constCast("reader"), .permissions = &permissions, .row_filter = &filters })).?;
+    defer admitted.deinit(a);
+    try http.projectCatalogIdentity(a, &admitted, "docs", "table:default");
+    try http.projectCatalogIdentity(a, &admitted, tenant_table, "table:tenant");
+    const retained = [_]OwnedRead.Policy{.{ .table = "table:tenant", .filter = filters[1].filter }};
+    var fresh = (try http.cloneCatalogIdentity(a, .{ .username = @constCast("reader"), .permissions = &permissions, .row_filter = &filters })).?;
+    defer fresh.deinit(a);
+    try OwnedRead.validatePolicies(a, &fresh, admitted, &retained);
+    try OwnedRead.validatePolicies(a, &fresh, admitted, &retained);
+}

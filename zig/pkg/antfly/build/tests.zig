@@ -533,7 +533,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     row_filter_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const row_filter_tests = b.addTest(.{
         .root_module = row_filter_test_mod,
-        .filters = selectTestFilters(b, &.{ "auth row filter", "effective resolved row filter", "system catalog row filter", "system catalog projects only matching", "system catalog projection is idempotent", "system catalog signed trusted principal", "system catalog SQL pgwire retained policies" }),
+        .filters = selectTestFilters(b, &.{ "auth row filter", "effective resolved row filter", "system catalog row filter", "system catalog projects only matching", "system catalog projection", "system catalog signed trusted principal", "system catalog SQL pgwire retained policies" }),
     });
     b.step("antfly-row-filter-test", "Run credential row-filter scope, projection and retained-policy contracts")
         .dependOn(&b.addRunArtifact(row_filter_tests).step);

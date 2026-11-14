@@ -827,6 +827,12 @@ def test_system_catalog_scoped_permissions_and_row_filters(request, fixture_name
             ],
         },
     )
+    # This policy must not leak into the unrelated tenant namespace when its
+    # tables are bound to opaque storage IDs.
+    api.put(
+        "/auth/v1/users/reader/row-filters/*?database=default&namespace=public&all_tables=true",
+        {"term": {"visibility": "public"}},
+    )
     api.put(
         "/auth/v1/users/reader/row-filters/*?database=tenant&namespace=allowed&all_tables=true",
         {"term": {"tenant_id": "a"}},

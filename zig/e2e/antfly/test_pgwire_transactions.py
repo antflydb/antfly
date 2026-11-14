@@ -78,7 +78,10 @@ def test_pgwire_repeated_transaction_upserts(storage_engine):
 
 @pytest.mark.e2e_resource("antfly_process")
 @pytest.mark.parametrize("storage_engine", ["local", "lite"])
-def test_pgwire_scoped_filters_survive_mixed_qualified_bindings(storage_engine):
+@pytest.mark.parametrize("namespace", ["public", "allowed"])
+def test_pgwire_scoped_filters_survive_mixed_qualified_bindings(
+    storage_engine, namespace
+):
     """Repeated bindings must retain one stable policy across Execute batches."""
     import requests
 
@@ -100,12 +103,14 @@ def test_pgwire_scoped_filters_survive_mixed_qualified_bindings(storage_engine):
         with psycopg.connect(
             **connection, user="admin", password=harness.AUTH_BOOTSTRAP_PASSWORD
         ) as admin:
+            if namespace != "public":
+                admin.execute(f"CREATE SCHEMA {namespace}")
             admin.execute(
-                "CREATE TABLE scope_docs "
+                f"CREATE TABLE {namespace}.scope_docs "
                 "(id TEXT PRIMARY KEY, tenant_id TEXT, status TEXT)"
             )
             admin.execute(
-                "INSERT INTO scope_docs (id, tenant_id, status) VALUES "
+                f"INSERT INTO {namespace}.scope_docs (id, tenant_id, status) VALUES "
                 "('own-open', 'a', 'open'), ('own-closed', 'a', 'closed'), "
                 "('other-open', 'b', 'open')"
             )
@@ -118,7 +123,11 @@ def test_pgwire_scoped_filters_survive_mixed_qualified_bindings(storage_engine):
                     "initial_policies": [
                         {
                             "resource_type": "table",
-                            "resource": "scope_docs",
+                            "table_target": {
+                                "database": "default",
+                                "namespace": namespace,
+                                "table": "scope_docs",
+                            },
                             "type": "read",
                         }
                     ],
@@ -128,7 +137,10 @@ def test_pgwire_scoped_filters_survive_mixed_qualified_bindings(storage_engine):
             response.raise_for_status()
             for scope, predicate in (
                 ("*", {"term": {"tenant_id": "a"}}),
-                ("scope_docs", {"term": {"status": "open"}}),
+                (
+                    f"scope_docs?database=default&namespace={namespace}",
+                    {"term": {"status": "open"}},
+                ),
             ):
                 response = api.put(
                     server.url + f"/auth/v1/users/scoped_reader/row-filters/{scope}",
@@ -136,11 +148,22 @@ def test_pgwire_scoped_filters_survive_mixed_qualified_bindings(storage_engine):
                     timeout=30,
                 )
                 response.raise_for_status()
+            if namespace != "public":
+                response = api.put(
+                    server.url + "/auth/v1/users/scoped_reader/row-filters/*"
+                    "?database=default&namespace=public&all_tables=true",
+                    json={"term": {"visibility": "public"}},
+                    timeout=30,
+                )
+                response.raise_for_status()
         with psycopg.connect(
             **connection, user="scoped_reader", password="reader-secret"
         ) as reader:
+            relation = (
+                "scope_docs" if namespace == "public" else f"{namespace}.scope_docs"
+            )
             query = (
-                'SELECT a.id FROM scope_docs a JOIN "default"."public".scope_docs b '
+                f'SELECT a.id FROM {relation} a JOIN "default"."{namespace}".scope_docs b '
                 "ON a.id = b.id ORDER BY a.id"
             )
             for prepare in (False, True, True):

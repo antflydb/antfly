@@ -2004,6 +2004,15 @@ pub const AuthenticatedIdentity = struct {
     metadata_json: []u8 = &.{},
     roles: [][]u8 = &.{},
 
+    /// Resolve one storage binding before matching logical policy scopes. Keep
+    /// this single-hop: a logical table name may itself resemble a storage ID.
+    pub fn logicalTableName(self: AuthenticatedIdentity, name: []const u8) []const u8 {
+        for (self.catalog_aliases) |alias| {
+            if (std.mem.eql(u8, alias.physical, name)) return alias.logical;
+        }
+        return name;
+    }
+
     pub fn deinit(self: *AuthenticatedIdentity, alloc: std.mem.Allocator) void {
         for (self.catalog_aliases) |alias| {
             alloc.free(alias.logical);
@@ -31473,7 +31482,8 @@ pub fn authSubjectsToResponse(
 }
 
 pub fn hasEffectiveRowFilter(identity: ?AuthenticatedIdentity, table_name: []const u8) bool {
-    return usermgr.hasRowFilterForTable((identity orelse return false).row_filter, table_name);
+    const active_identity = identity orelse return false;
+    return usermgr.hasRowFilterForTable(active_identity.row_filter, active_identity.logicalTableName(table_name));
 }
 
 pub fn resolveEffectiveRowFilterJson(
@@ -31482,7 +31492,7 @@ pub fn resolveEffectiveRowFilterJson(
     table_name: []const u8,
 ) !?[]u8 {
     const active_identity = identity orelse return null;
-    const raw = (try usermgr.combinedRowFilterForTable(alloc, active_identity.row_filter, table_name)) orelse return null;
+    const raw = (try usermgr.combinedRowFilterForTable(alloc, active_identity.row_filter, active_identity.logicalTableName(table_name))) orelse return null;
     defer raw.deinit(alloc);
     return try resolveAuthRowFilterJson(alloc, active_identity, raw.json);
 }
@@ -59311,41 +59321,28 @@ pub fn projectCatalogIdentity(alloc: std.mem.Allocator, identity: *Authenticated
             system_catalog_routes.tableResourceMatches(permission.resource, logical) and
             !system_catalog_routes.tableResourceMatches(permission.resource, physical)) permission_count += 1;
     }
-    var filter_count: usize = 0;
-    for (identity.row_filter) |filter| {
-        if (!usermgr.isNullRowFilter(filter.filter) and
-            system_catalog.tableResourceMatches(filter.table, logical) and
-            !system_catalog.tableResourceMatches(filter.table, physical)) filter_count += 1;
-    }
-
-    // Build the projection before publishing its alias. On allocation failure
-    // the original identity stays intact and can be retried safely.
-    const permissions = try alloc.alloc(usermgr.Permission, identity.permissions.len + permission_count);
-    errdefer alloc.free(permissions);
-    @memcpy(permissions[0..identity.permissions.len], identity.permissions);
+    // Row policies remain immutable logical scopes. Resolving through aliases
+    // avoids treating opaque storage names as tables in default.public, and
+    // avoids copying every policy for every relation in a page arena.
+    // Build any new grants before publishing the alias so failures are atomic.
+    var replacement_permissions: ?[]usermgr.Permission = null;
     var permission_filled = identity.permissions.len;
-    errdefer for (permissions[identity.permissions.len..permission_filled]) |*entry| entry.deinit(alloc);
-    for (identity.permissions) |original| {
-        if (original.resource_type != .table or
-            !system_catalog_routes.tableResourceMatches(original.resource, logical) or
-            system_catalog_routes.tableResourceMatches(original.resource, physical)) continue;
-        permissions[permission_filled] = try usermgr.Permission.initOwned(alloc, .table, physical, original.type);
-        permissions[permission_filled].deny_mutation = original.deny_mutation;
-        permission_filled += 1;
-    }
-
-    const filters = try alloc.alloc(usermgr.RowFilterEntry, identity.row_filter.len + filter_count);
-    errdefer alloc.free(filters);
-    @memcpy(filters[0..identity.row_filter.len], identity.row_filter);
-    var filter_filled = identity.row_filter.len;
-    errdefer for (filters[identity.row_filter.len..filter_filled]) |*entry| entry.deinit(alloc);
-    for (identity.row_filter) |original| {
-        // Global filters already match immutable storage names.
-        if (usermgr.isNullRowFilter(original.filter) or
-            !system_catalog.tableResourceMatches(original.table, logical) or
-            system_catalog.tableResourceMatches(original.table, physical)) continue;
-        filters[filter_filled] = try usermgr.RowFilterEntry.initOwned(alloc, physical, original.filter);
-        filter_filled += 1;
+    errdefer if (replacement_permissions) |permissions| {
+        for (permissions[identity.permissions.len..permission_filled]) |*entry| entry.deinit(alloc);
+        alloc.free(permissions);
+    };
+    if (permission_count > 0) {
+        const permissions = try alloc.alloc(usermgr.Permission, identity.permissions.len + permission_count);
+        replacement_permissions = permissions;
+        @memcpy(permissions[0..identity.permissions.len], identity.permissions);
+        for (identity.permissions) |original| {
+            if (original.resource_type != .table or
+                !system_catalog_routes.tableResourceMatches(original.resource, logical) or
+                system_catalog_routes.tableResourceMatches(original.resource, physical)) continue;
+            permissions[permission_filled] = try usermgr.Permission.initOwned(alloc, .table, physical, original.type);
+            permissions[permission_filled].deny_mutation = original.deny_mutation;
+            permission_filled += 1;
+        }
     }
 
     const logical_copy = try alloc.dupe(u8, logical);
@@ -59356,11 +59353,11 @@ pub fn projectCatalogIdentity(alloc: std.mem.Allocator, identity: *Authenticated
     @memcpy(aliases[0..identity.catalog_aliases.len], identity.catalog_aliases);
     aliases[identity.catalog_aliases.len] = .{ .logical = logical_copy, .physical = physical_copy };
 
-    alloc.free(identity.permissions);
-    alloc.free(identity.row_filter);
+    if (replacement_permissions) |permissions| {
+        alloc.free(identity.permissions);
+        identity.permissions = permissions;
+    }
     alloc.free(identity.catalog_aliases);
-    identity.permissions = permissions;
-    identity.row_filter = filters;
     identity.catalog_aliases = aliases;
 }
 
@@ -59535,9 +59532,10 @@ test "system catalog projects only matching permission and row-filter scopes" {
     try projectCatalogIdentity(alloc, &identity, "\x00catalog:9:analytics6:public6:events", "table:immutable");
     try std.testing.expect(permissionsAllow(identity.permissions, .table, "table:immutable", .read));
     try std.testing.expect(!permissionsAllow(identity.permissions, .table, "table:immutable", .write));
-    try std.testing.expectEqual(@as(usize, 3), identity.row_filter.len);
-    try std.testing.expectEqualStrings("table:immutable", identity.row_filter[2].table);
-    try std.testing.expectEqualStrings(filters[0].filter, identity.row_filter[2].filter);
+    try std.testing.expectEqual(@as(usize, 2), identity.row_filter.len);
+    const resolved = (try resolveEffectiveRowFilterJson(alloc, identity, "table:immutable")).?;
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings(filters[0].filter, resolved);
 }
 
 fn projectCatalogStatusAlloc(alloc: std.mem.Allocator, body: []const u8, logical_name: []const u8) ![]u8 {
@@ -63454,4 +63452,86 @@ test "system catalog signed trusted principal combines all filter scopes" {
     const projected = (try resolveEffectiveRowFilterJson(a, identity, "table:immutable")).?;
     defer a.free(projected);
     try std.testing.expectEqualStrings(resolved, projected);
+}
+
+test "system catalog row filter scopes remain isolated across physical aliases" {
+    const a = std.testing.allocator;
+    const tenant_table = "\x00catalog:6:tenant7:allowed6:events";
+    var permission = try usermgr.Permission.initOwned(a, .table, "*", .read);
+    defer permission.deinit(a);
+    var permissions = [_]usermgr.Permission{permission};
+    var filters = [_]usermgr.RowFilterEntry{
+        try usermgr.RowFilterEntry.initOwned(a, "*", "{\"term\":{\"tenant\":\"a\"}}"),
+        try usermgr.RowFilterEntry.initOwned(a, "\x00catalog:7:default6:public*", "{\"term\":{\"visibility\":\"public\"}}"),
+        try usermgr.RowFilterEntry.initOwned(a, "\x00catalog:6:tenant7:allowed*", "{\"term\":{\"region\":\"us\"}}"),
+        try usermgr.RowFilterEntry.initOwned(a, tenant_table, "{\"term\":{\"status\":\"open\"}}"),
+    };
+    defer for (&filters) |*entry| entry.deinit(a);
+    var identity = (try cloneCatalogIdentity(a, .{ .username = @constCast("reader"), .permissions = &permissions, .row_filter = &filters })).?;
+    defer identity.deinit(a);
+    const logical = (try resolveEffectiveRowFilterJson(a, identity, tenant_table)).?;
+    defer a.free(logical);
+    try projectCatalogIdentity(a, &identity, tenant_table, "table:tenant");
+    try projectCatalogIdentity(a, &identity, "docs", "table:default");
+    const physical = (try resolveEffectiveRowFilterJson(a, identity, "table:tenant")).?;
+    defer a.free(physical);
+    try std.testing.expectEqualStrings(logical, physical);
+    const public = (try resolveEffectiveRowFilterJson(a, identity, "table:default")).?;
+    defer a.free(public);
+    try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"tenant\":\"a\"}},{\"term\":{\"visibility\":\"public\"}}]}", public);
+
+    var unrelated = (try cloneCatalogIdentity(a, .{ .username = @constCast("reader"), .permissions = &permissions, .row_filter = filters[1..2] })).?;
+    defer unrelated.deinit(a);
+    try projectCatalogIdentity(a, &unrelated, tenant_table, "table:tenant");
+    try std.testing.expect(!hasEffectiveRowFilter(unrelated, "table:tenant"));
+    const absent = try resolveEffectiveRowFilterJson(a, unrelated, "table:tenant");
+    defer if (absent) |bytes| a.free(bytes);
+    try std.testing.expect(absent == null);
+}
+
+test "system catalog row filter logical names cannot collide with physical aliases" {
+    const a = std.testing.allocator;
+    var filters = [_]usermgr.RowFilterEntry{
+        try usermgr.RowFilterEntry.initOwned(a, "calls", "{\"term\":{\"kind\":\"calls\"}}"),
+        try usermgr.RowFilterEntry.initOwned(a, "table:shared", "{\"term\":{\"kind\":\"logical\"}}"),
+    };
+    defer for (&filters) |*entry| entry.deinit(a);
+    var identity = (try cloneCatalogIdentity(a, .{ .username = @constCast("reader"), .row_filter = &filters })).?;
+    defer identity.deinit(a);
+    const named_like_storage = try (system_catalog.Target{ .table = "table:shared" }).resourceNameAlloc(a);
+    defer a.free(named_like_storage);
+    try projectCatalogIdentity(a, &identity, "calls", "table:shared");
+    try projectCatalogIdentity(a, &identity, named_like_storage, "table:second");
+    const calls = (try resolveEffectiveRowFilterJson(a, identity, "table:shared")).?;
+    defer a.free(calls);
+    const second = (try resolveEffectiveRowFilterJson(a, identity, "table:second")).?;
+    defer a.free(second);
+    try std.testing.expectEqualStrings(filters[0].filter, calls);
+    try std.testing.expectEqualStrings(filters[1].filter, second);
+}
+
+test "system catalog projection preserves immutable policy arrays with bounded allocation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const filter_count = 1024;
+    const filters = try a.alloc(usermgr.RowFilterEntry, filter_count);
+    for (filters, 0..) |*entry, i| entry.* = try usermgr.RowFilterEntry.initOwned(a, try std.fmt.allocPrint(a, "unrelated-{d}", .{i}), "{\"match_all\":{}}");
+    const permissions = try a.alloc(usermgr.Permission, 1);
+    permissions[0] = try usermgr.Permission.initOwned(a, .table, "*", .read);
+    var identity = AuthenticatedIdentity{ .username = try a.dupe(u8, "reader"), .permissions = permissions, .row_filter = filters };
+    defer identity.deinit(a);
+    var measured = std.testing.FailingAllocator.init(a, .{});
+    for (0..32) |i| {
+        const logical = try (system_catalog.Target{ .database = "tenant", .namespace = "allowed", .table = try std.fmt.allocPrint(a, "events-{d}", .{i}) }).resourceNameAlloc(a);
+        const physical = try std.fmt.allocPrint(a, "table:opaque-{d}", .{i});
+        try projectCatalogIdentity(measured.allocator(), &identity, logical, physical);
+    }
+    // Only aliases grow. Copying the unrelated policy vector per table would
+    // retain over 1 MiB in this page arena instead of this small alias budget.
+    try std.testing.expect(measured.allocated_bytes < 64 * 1024);
+    try std.testing.expect(identity.row_filter.ptr == filters.ptr);
+    try std.testing.expect(identity.permissions.ptr == permissions.ptr);
+    try std.testing.expectEqual(@as(usize, filter_count), identity.row_filter.len);
+    try std.testing.expectEqual(@as(usize, 32), identity.catalog_aliases.len);
 }
