@@ -1954,6 +1954,12 @@ test "lite subtree deletion bounds heap across private batches and preserves sna
         var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
         defer docs.close();
         docs.file.page_cache_enabled.store(false, .monotonic);
+        // perf/lwa-txn-overlay: see the matching comment in "lite subtree
+        // deletion rolls back earlier private batches on failure" -- keep
+        // the background idle-flush timer from folding the overlay (and
+        // bumping `commit_sequence` an extra time) during this test's own
+        // run.
+        docs.ride_along_idle_ns = 10 * std.time.ns_per_s;
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const mutations = try arena.allocator().alloc(native.CatalogMutation, count);

@@ -4452,6 +4452,12 @@ const OverlayUndoEntry = union(enum) {
     page: u64,
 };
 
+/// perf/lwa-txn-overlay (unbounded buffering): the default
+/// `RedoCommitState.large_txn_fallback_bytes` -- see that field's own
+/// doc comment and docs/design/lite-performance/
+/// lite-single-commit-write-path.md §9 for the sizing rationale.
+const default_large_txn_fallback_bytes: u64 = 16 * 1024;
+
 const RedoCommitState = struct {
     writer: redo_log.Writer,
     /// This transaction's accumulated logical mutations, encoded via
@@ -4516,6 +4522,18 @@ const RedoCommitState = struct {
     /// `shared` again -- every version it names is already exactly the
     /// state the transaction means to publish.
     overlay_undo: std.ArrayListUnmanaged(OverlayUndoEntry) = .empty,
+    /// perf/lwa-txn-overlay (unbounded buffering): once `logical_pending`
+    /// reaches this many bytes, `flushTransactionWrites` stops diverting
+    /// *new* private batches into the log/overlay for the remainder of
+    /// this transaction, falling back to the ordinary page-shaped commit
+    /// path instead (the same per-batch-bounded cost the non-redo path
+    /// has always had). Keeps one oversized transaction (`deleteTree`'s
+    /// own many-small-key subtree walk, in particular) from buffering
+    /// unboundedly no matter how large it grows -- see docs/design/
+    /// lite-performance/lite-single-commit-write-path.md §9 for the
+    /// sizing rationale. A small transaction never reaches this and
+    /// keeps the redo log's full I/O savings.
+    large_txn_fallback_bytes: u64 = default_large_txn_fallback_bytes,
 
     fn deinit(self: *RedoCommitState, allocator: Allocator) void {
         self.logical_pending.deinit(allocator);
@@ -4562,6 +4580,31 @@ const RedoCommitState = struct {
             .page => {},
         };
         self.overlay_undo.clearRetainingCapacity();
+    }
+
+    /// perf/lwa-txn-overlay (unbounded buffering): true once this
+    /// transaction's own buffered record has already reached
+    /// `large_txn_fallback_bytes` -- see that field's own doc comment.
+    /// Deliberately `logical_pending` alone, not `+ pending`: `pending`
+    /// (page-shaped external value chains) is written eagerly at stage
+    /// time, one document's own value at a time (`pageAllocatorForDivertingCommit`'s
+    /// own doc comment -- "one document write is one external value,
+    /// written once, with no comparable unbounded private-flush
+    /// accumulation to begin with"), so a single large document's own
+    /// legitimate external value must never disqualify *that same*
+    /// flush's logical diversion the moment it is staged -- it did,
+    /// before this exclusion, breaking "lite check tolerates page_count
+    /// run ahead of physical size on a still-diverting redo-log file"
+    /// and three sibling tests whose 64 KiB document values alone
+    /// exceeded the threshold on their very first (and only) write.
+    /// `logical_pending` is the buffer that actually grows unboundedly
+    /// across *many* private flushes within one long transaction
+    /// (`deleteTree`'s own subtree walk, this fallback's own target) --
+    /// `pending` growing the same way is a different, not-yet-observed
+    /// risk (many large documents in one long transaction), left for a
+    /// follow-up with a test that actually exercises it.
+    fn overLargeTransactionThreshold(self: *const RedoCommitState) bool {
+        return self.logical_pending.items.len >= self.large_txn_fallback_bytes;
     }
 
     /// Records one logical mutation for the in-flight transaction.
@@ -16190,7 +16233,16 @@ pub const NativeFile = struct {
         // specific call discovers. See `pageAllocatorForDivertingCommit`'s
         // own doc comment for why only this call site (not
         // `reclaimPagesImpl`, not bootstrap) takes the shortcut.
-        const diverting = self.redo != null and !self.redo.?.checkpointing;
+        //
+        // perf/lwa-txn-overlay (unbounded buffering): must stay exactly in
+        // sync with `flushTransactionWrites`'s own `diverting`, including
+        // the large-transaction fallback below -- this call always runs
+        // (at transaction start, or right after a flush replaces the
+        // previous `TransactionWrites`) at a moment when `logical_pending`/
+        // `pending` are stable until this same batch's own eventual flush
+        // (nothing else appends to either in between), so the threshold
+        // check reads the same bytes either place evaluates it.
+        const diverting = self.redo != null and !self.redo.?.checkpointing and !self.redo.?.overLargeTransactionThreshold();
         writes.* = .{
             .pages = if (diverting) try self.pageAllocatorForDivertingCommit(checkpoint) else try self.pageAllocatorFromFreeMap(checkpoint),
             .value_arena = std.heap.ArenaAllocator.init(self.allocator),
@@ -16532,7 +16584,14 @@ pub const NativeFile = struct {
         // per commit. `checkpointRedoLog` sets `checkpointing = true`
         // around its own transaction specifically so this check is false
         // then, and the real build below runs instead.
-        const diverting = self.redo != null and !self.redo.?.checkpointing;
+        //
+        // perf/lwa-txn-overlay (unbounded buffering): also false past
+        // `large_txn_fallback_bytes` -- see `RedoCommitState
+        // .large_txn_fallback_bytes`'s own doc comment. Must match
+        // `transactionWrites`'s own copy of this condition exactly for
+        // this same batch (see that call site's comment for why the
+        // inputs are stable between the two).
+        const diverting = self.redo != null and !self.redo.?.checkpointing and !self.redo.?.overLargeTransactionThreshold();
         var diverted_anything = false;
         // §9.7a: the `commit_sequence` this transaction will publish as,
         // known deterministically now, mirroring `commitTransactionWithDurability`'s

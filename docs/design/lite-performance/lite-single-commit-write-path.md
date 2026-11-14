@@ -2732,6 +2732,123 @@ full_index writes survive a crash during ride-along merge and
 retirement") now pass as a side effect; the two target tests remain
 among the 13 for the independent reasons above.
 
+### 9.7e Transaction isolation and the large-transaction fallback (`perf/lwa-txn-overlay`)
+
+Two gaps in the redo log's transaction model, found via
+`storage.lite.index_storage.test.lite subtree deletion rolls back
+earlier private batches on failure` and `...bounds heap across
+private batches and preserves snapshots` (`deleteTree`'s subtree walk:
+one transaction, many 64-key private flushes).
+
+**Bug 1: aborted/rolled-back writes stayed visible.**
+`appendLogicalMutation` pushed each mutation's new version onto the
+*shared* `SharedRedoOverlay` (§9.6a/§9.6b) the moment a private batch
+flushed -- before the transaction committed, and with nothing to undo
+it on `abortTransaction`/`rollbackTransactionSavepoint`. Under the
+single-writer model this is invisible to a reader *while* the
+transaction is still open (no other commit can have advanced
+`committedSequence()` past the still-uncommitted mutation's intended
+final sequence yet), but once the transaction aborts, `self.header`'s
+sequence counter is never consumed -- the *next* transaction computes
+and publishes that exact same sequence number. From that point on, any
+reader resolving at or past it finds the abandoned version, because it
+was never removed.
+
+Fixed with an undo log, not a change to *when* the push happens
+(`RedoCommitState.overlay_undo`): `appendLogicalMutation`/
+`appendPending` still push into `shared` immediately (preserving
+intra-transaction read-your-own-write for a native-level, direct
+`NativeFile` caller like `deleteTree`'s `CatalogDeleteBatch` -- it has
+no `docstore.Txn.pending_tree` of its own to fall back on, unlike an
+ordinary document write), but now also record enough to find and
+remove exactly that version/page again
+(`SharedRedoOverlay.removeLastVersion`/`discardPage`, safe under the
+single-writer model: nothing else can have appended for the same key
+while this transaction is still open, so the current head is always
+the node to remove). `abortTransaction` undoes the whole list;
+`rollbackTransactionSavepoint` undoes back to a savepoint mark
+(`TransactionSavepoint` gained `overlay_undo_mark`, plus
+`logical_pending_mark`/`pending_mark` so the eventual commit's own log
+record never encodes a mutation the savepoint discarded) --
+independent of `writes`'s own generation check, because a private
+flush (unlike a legacy page-shaped one) never touches `self.header`'s
+root pointers, so the existing checkpoint-restore cannot undo it the
+way it undoes a flushed legacy batch. `abortTransaction` also now
+clears `logical_pending`/`pending` outright: previously neither was
+reset on abort, so a failed transaction's partial record bytes would
+have bled into whatever the next transaction logs.
+
+A new test, "lite redo log abort and savepoint rollback discard
+overlay versions a private flush already pushed into the shared
+overlay" (`native.zig`), covers both paths directly: stage, force a
+private flush, abort (or roll back to a savepoint taken before a
+second flush); a concurrent `ReadView`, a later transaction, and a
+fresh reopen must all see the writes as absent.
+
+**Bug 2: unbounded per-transaction buffering.** `logical_pending`
+(the byte buffer `appendRecord` eventually logs) and the shared
+overlay's own per-key versions both accumulate for the *whole*
+transaction, cleared only at actual commit. `deleteTree`'s subtree
+walk is one transaction spanning many private flushes, so a
+16,384-small-key delete diverts every key, never converting any of
+them to real pages until a checkpoint -- several MB against a 512 KB
+test budget.
+
+Fixed with a size-triggered fallback, not a change to the log/overlay
+format: `RedoCommitState.large_txn_fallback_bytes` (default 16 KiB --
+`default_large_txn_fallback_bytes`) bounds `logical_pending.items.len
++ pending.items.len`. `flushTransactionWrites`'s `diverting` decision
+(and `transactionWrites`'s own up-front copy of the same condition,
+which must agree for a given private batch -- see that call site's own
+comment) adds `!redo.overLargeTransactionThreshold()`: once a
+transaction's own buffered record has already reached the threshold,
+every *later* private batch in that same transaction takes the
+ordinary, non-diverting commit path instead -- the same bounded-per-
+batch cost (editor scratch released each flush) the pre-redo-log
+design always had, confirmed by this session's own instrumentation
+(not merely assumed): the memory-bound test passes at a 4 KiB
+threshold, and still passes at 16 KiB, but fails again at 64 KiB,
+because the per-key overhead this bound has to cover is larger than
+`logical_pending` bytes alone -- the shared overlay keeps its own copy
+of the key (inside `VersionedOverlayEntry`) and `overlay_undo` keeps a
+*third* copy for undo-tracking (Bug 1's own fix), so a diverted key's
+real footprint is a small multiple of what `logical_pending` alone
+measures. 16 KiB was chosen with that multiple in mind, not just
+re-derived from the 4 KiB passing value, to leave a small transaction
+some of the redo log's own I/O savings rather than falling back
+almost immediately.
+
+Earlier-diverted batches and later-physical batches coexist correctly
+in one transaction: the diverted batches' content is already in
+`shared` (publish/undo per Bug 1's fix above) and encoded into
+`logical_pending`; the physical batches build real pages and advance
+`self.header.checkpoints[active]`'s root pointers directly, exactly as
+a non-redo commit does. The final commit's one `appendRecord` call
+already carries the *current* `CompactCheckpoint` (reflecting
+whatever the physical batches built) alongside the still-small
+logical payload, so no separate reconciliation step is needed --
+the record format already supported one commit mixing a page-shaped
+exception (external value chains) with logical mutations; this
+reuses exactly that, just for ordinary B-tree mutations instead.
+
+Explicitly not used for this: `checkpointRedoLog`'s own fold. It opens
+and commits its own native transaction (`self.beginTransaction()`/
+`self.commitTransactionWithDurability`), which only runs when no
+transaction is already open -- `commitTransactionWithDurability`
+clears `self.transaction_header` *before* either of its own
+`checkpointRedoLogNested()` call sites (§9.6c) run, which is exactly
+why those are safe; calling it from inside `flushTransactionWrites`,
+mid-transaction, is not available the same way, so the large-
+transaction fallback is a per-batch commit-path choice instead of a
+mid-transaction fold.
+
+Verified: both named tests pass 3/3 (both their multi-case variants:
+4,096/16,384 small keys and 4,096 large keys for the memory-bound
+test); the new overlay-undo test passes 3/3; `--test-filter "redo"`,
+`"savepoint"`, `"abort"`, `"rollback"`, `"index storage"`, `"subtree"`,
+and the redo differential oracle all stay green (see this branch's own
+report for exact counts).
+
 ### 9.8 Gates (from step (c) on)
 
 Unchanged from the task's own list, restated for traceability:
