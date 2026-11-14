@@ -187,3 +187,19 @@ test "index alias state and retry receipts survive table wire and backup restore
     const replayed = (try catalog.replay(scratch, root, "live", .{ .index = "text", .idempotency_key = "1" })).?;
     try std.testing.expectEqual(@as(u64, 1), replayed.swapped_at_ms);
 }
+
+test "index alias producer updates cannot bypass surviving consumer fences through table replacement" {
+    const a = std.testing.allocator;
+    var manager = metadata.TableManager.init(a);
+    defer manager.deinit();
+    const before: metadata.TableRecord = .{ .table_id = 42, .name = "docs", .indexes_json =
+        \\{"P":{"type":"embeddings","_index_incarnation":1,"dimension":384,"embedder":{"provider":"antfly","model":"A"},"sources":[{"artifact":"X"}]},"C":{"type":"embeddings","_index_incarnation":2,"dimension":384,"sources":[{"artifact":"X"}]},"D":{"type":"embeddings","_index_incarnation":3},"_index_aliases":{"live":{"index":"C"}}}
+    };
+    try manager.upsertTable(before);
+    const next = try @import("indexes.zig").addIndexToTableIndexesJson(a, before.indexes_json, "P", "{\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"antfly\",\"model\":\"B\"},\"sources\":[{\"artifact\":\"X\"}]}");
+    defer a.free(next);
+    var replacement = before;
+    replacement.indexes_json = next;
+    try std.testing.expectError(error.IndexReferencedByAlias, manager.upsertTable(replacement));
+    try std.testing.expectEqualStrings(before.indexes_json, manager.tables.get(42).?.indexes_json);
+}

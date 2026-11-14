@@ -193,6 +193,172 @@ pub fn configurationEqual(a: A, left: []const u8, right: []const u8) !bool {
     return std.mem.eql(u8, try std.json.Stringify.valueAlloc(s, l.value, .{}), try std.json.Stringify.valueAlloc(s, r.value, .{}));
 }
 
+/// A physical consumer's incarnation covers its entire artifact recipe. Reject
+/// upstream changes while that incarnation survives, including after an alias
+/// has moved away: already-bound requests can still carry its old fence. Rebuild
+/// dependent indexes under new incarnations before changing their producers.
+/// This runs on catalog mutations, never on search paths.
+pub fn validateDependencyMutation(out: A, before: []const u8, after: []const u8) !void {
+    if (std.mem.eql(u8, before, after)) return;
+    var arena = std.heap.ArenaAllocator.init(out);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const old = try parse(a, if (before.len == 0) "{}" else before);
+    const next = try parse(a, if (after.len == 0) "{}" else after);
+    if (old.value.object.get(key)) |bindings| if (bindings == .object) {
+        const current_bindings = next.value.object.get(key);
+        for (bindings.object.keys()) |alias| {
+            const target = try resolve(old.value, alias);
+            if (current_bindings == null or current_bindings.? != .object or !current_bindings.?.object.contains(alias)) continue;
+            if (!std.mem.eql(u8, target, try resolve(next.value, alias))) continue;
+            const l = old.value.object.get(target) orelse return error.IndexReferencedByAlias;
+            const r = next.value.object.get(target) orelse return error.IndexReferencedByAlias;
+            if (!ownerRecipeEqual(l, r) or !optionalRecipeEqual(l.object.get("_index_incarnation"), r.object.get("_index_incarnation"))) return error.IndexReferencedByAlias;
+        }
+    };
+    const prior = try ArtifactRecipes.init(a, old.value);
+    const replacement = try ArtifactRecipes.init(a, next.value);
+    var checked: std.StringHashMapUnmanaged(void) = .empty;
+    var entries = old.value.object.iterator();
+    while (entries.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const config = entry.value_ptr.*;
+        if (config != .object or config.object.get("type") == null) continue;
+        const surviving = next.value.object.get(name) orelse continue;
+        if (surviving != .object) continue;
+        const old_inc = config.object.get("_index_incarnation");
+        const new_inc = surviving.object.get("_index_incarnation");
+        if (old_inc != null and new_inc != null and !recipeEqual(old_inc.?, new_inc.?)) continue;
+        // An aliased owner also needs protection when only inline enrichment
+        // declarations change (these are absent from its runtime config hash).
+        try prior.checkSources(a, replacement, config, &checked);
+    }
+}
+
+const ArtifactRecipes = struct {
+    owners: std.StringHashMapUnmanaged(V) = .empty,
+    declarations: std.StringHashMapUnmanaged(V) = .empty,
+
+    fn init(a: A, root: V) !ArtifactRecipes {
+        var self: ArtifactRecipes = .{};
+        if (root.object.get("enrichments")) |definitions| try self.addDeclarations(a, definitions);
+        var entries = root.object.iterator();
+        while (entries.next()) |entry| {
+            const config = entry.value_ptr.*;
+            if (config != .object or config.object.get("type") == null) continue;
+            if (config.object.get("enrichments")) |definitions| try self.addDeclarations(a, definitions);
+            if (config.object.get("embedder") == null) continue;
+            if (config.object.get("enrichments")) |definitions| if (definitions == .array) {
+                for (definitions.array.items) |definition| if (definition == .object) {
+                    const kind = definition.object.get("kind");
+                    if (kind != null and (kind.? != .string or !std.mem.eql(u8, kind.?.string, "embedding"))) continue;
+                    if (definition.object.get("name")) |name| if (name == .string) try self.owners.put(a, name.string, config);
+                };
+            };
+            if (config.object.get("embedding_name")) |name| if (name == .string) {
+                try self.owners.put(a, name.string, config);
+            };
+            if (config.object.get("sources")) |sources| if (sources == .array) {
+                for (sources.array.items) |source| if (source == .object) {
+                    if (source.object.get("artifact")) |name| if (name == .string) {
+                        try self.owners.put(a, name.string, config);
+                    };
+                };
+            };
+        }
+        return self;
+    }
+    fn addDeclarations(self: *ArtifactRecipes, a: A, definitions: V) !void {
+        if (definitions != .array) return;
+        for (definitions.array.items) |definition| if (definition == .object) {
+            if (definition.object.get("name")) |name| if (name == .string) {
+                try self.declarations.put(a, name.string, definition);
+            };
+        };
+    }
+    fn checkSources(self: ArtifactRecipes, a: A, next: ArtifactRecipes, config: V, checked: *std.StringHashMapUnmanaged(void)) anyerror!void {
+        if (config.object.get("sources")) |sources| if (sources == .array) {
+            for (sources.array.items) |source| if (source == .object) {
+                if (source.object.get("artifact")) |name| if (name == .string) try self.checkArtifact(a, next, name.string, checked);
+            };
+        };
+        if (config.object.get("embedding_name")) |name| if (name == .string) try self.checkArtifact(a, next, name.string, checked);
+        if (config.object.get("enrichments")) |definitions| if (definitions == .array) {
+            for (definitions.array.items) |definition| if (definition == .object) {
+                if (definition.object.get("name")) |name| if (name == .string) try self.checkArtifact(a, next, name.string, checked);
+            };
+        };
+    }
+    fn checkArtifact(self: ArtifactRecipes, a: A, next: ArtifactRecipes, name: []const u8, checked: *std.StringHashMapUnmanaged(void)) anyerror!void {
+        var current = name;
+        while (true) {
+            const slot = try checked.getOrPut(a, current);
+            if (slot.found_existing) return;
+            if (!optionalOwnerRecipeEqual(self.owners.get(current), next.owners.get(current)) or
+                !optionalRecipeEqual(self.declarations.get(current), next.declarations.get(current))) return error.IndexReferencedByAlias;
+            if (self.declarations.get(current)) |definition| {
+                if (definition.object.get("source_artifact_name")) |source| if (source == .string and source.string.len != 0) {
+                    current = source.string;
+                    continue;
+                };
+            }
+            return;
+        }
+    }
+};
+fn optionalRecipeEqual(left: ?V, right: ?V) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return recipeEqual(left.?, right.?);
+}
+fn optionalOwnerRecipeEqual(left: ?V, right: ?V) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return ownerRecipeEqual(left.?, right.?);
+}
+fn recipeFieldIgnored(name: []const u8, object: std.json.ObjectMap) bool {
+    for ([_][]const u8{ "_index_incarnation", "_coverage_incarnation", "description", "validation" }) |field| {
+        if (std.mem.eql(u8, name, field)) return true;
+    }
+    // Only the known index-level embedder is represented by this persisted
+    // identity. Never ignore similarly named keys in user input or recipes.
+    return std.mem.eql(u8, name, "embedder") and object.contains("semantic_producer");
+}
+fn ownerRecipeEqual(left: V, right: V) bool {
+    if (left != .object or right != .object) return recipeEqual(left, right);
+    for (left.object.keys(), left.object.values()) |name, value| {
+        if (recipeFieldIgnored(name, left.object)) continue;
+        if (!recipeEqual(value, right.object.get(name) orelse return false)) return false;
+    }
+    for (right.object.keys()) |name| {
+        if (!recipeFieldIgnored(name, right.object) and !left.object.contains(name)) return false;
+    }
+    return true;
+}
+fn recipeEqual(left: V, right: V) bool {
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    return switch (left) {
+        .object => |object| blk: {
+            for (object.keys(), object.values()) |name, value| {
+                if (!recipeEqual(value, right.object.get(name) orelse break :blk false)) break :blk false;
+            }
+            for (right.object.keys()) |name| {
+                if (!object.contains(name)) break :blk false;
+            }
+            break :blk true;
+        },
+        .array => |array| blk: {
+            if (array.items.len != right.array.items.len) break :blk false;
+            for (array.items, right.array.items) |l, r| if (!recipeEqual(l, r)) break :blk false;
+            break :blk true;
+        },
+        .string => |value| std.mem.eql(u8, value, right.string),
+        .number_string => |value| std.mem.eql(u8, value, right.number_string),
+        .integer => |value| value == right.integer,
+        .float => |value| value == right.float,
+        .bool => |value| value == right.bool,
+        .null => true,
+    };
+}
+
 fn shape(config: V) !struct { kind: []const u8, sparse: bool } {
     if (config != .object) return error.InvalidTableIndexMetadata;
     const kind = config.object.get("type") orelse return error.InvalidTableIndexMetadata;
@@ -484,4 +650,54 @@ test "index alias admission globally reclaims expired history and bounds retaine
     try huge.object.put(a, "evidence", .{ .string = try a.alloc(u8, max_control_bytes) });
     @memset(@constCast(huge.object.get("evidence").?.string), 'x');
     try std.testing.expectError(error.IndexAliasReceiptCapacity, put(a, "{\"a\":{\"type\":\"full_text\"}}", "live", .{ .index = "a", .idempotency_key = "1" }, huge, 1));
+}
+
+test "index alias dependency recipes remain immutable across swaps until consumer incarnation retires" {
+    const a = std.testing.allocator;
+    const before =
+        \\{"P":{"type":"embeddings","_index_incarnation":1,"embedder":{"model":"A"},"sources":[{"artifact":"X"}]},"C":{"type":"embeddings","_index_incarnation":2,"sources":[{"artifact":"X"}]},"D":{"type":"embeddings","_index_incarnation":3},"_index_aliases":{"live":{"index":"C"}}}
+    ;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var root = try std.json.parseFromSliceLeaky(V, sa, before, .{});
+    try root.object.getPtr(key).?.object.getPtr("live").?.object.put(sa, "index", .{ .string = "D" });
+    const swapped = try std.json.Stringify.valueAlloc(sa, root, .{});
+    try validateDependencyMutation(a, before, swapped);
+    try root.object.getPtr("P").?.object.getPtr("embedder").?.object.put(sa, "model", .{ .string = "B" });
+    try root.object.getPtr("P").?.object.put(sa, "_index_incarnation", .{ .integer = 4 });
+    const changed = try std.json.Stringify.valueAlloc(sa, root, .{});
+    try std.testing.expectError(error.IndexReferencedByAlias, validateDependencyMutation(a, before, changed));
+    try std.testing.expectError(error.IndexReferencedByAlias, validateDependencyMutation(a, swapped, changed));
+    // Rebuilding the entire dependency closure makes every old fence stale.
+    try root.object.getPtr("C").?.object.put(sa, "_index_incarnation", .{ .integer = 5 });
+    try validateDependencyMutation(a, swapped, try std.json.Stringify.valueAlloc(sa, root, .{}));
+}
+
+test "index alias dependency recipes include transitive inline enrichments and ignore owner credentials" {
+    const a = std.testing.allocator;
+    const before =
+        \\{"P":{"type":"embeddings","_index_incarnation":1,"embedder":{"model":"A","api_key":"old"},"semantic_producer":"stable","sources":[{"artifact":"X"}],"enrichments":[{"name":"X","source_artifact_name":"units"}]},"C":{"type":"embeddings","_index_incarnation":2,"sources":[{"artifact":"X"}]},"enrichments":[{"name":"units","kind":"asset","field":"url"}]}
+    ;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var root = try std.json.parseFromSliceLeaky(V, sa, before, .{});
+    try root.object.getPtr("P").?.object.getPtr("embedder").?.object.put(sa, "api_key", .{ .string = "new" });
+    try validateDependencyMutation(a, before, try std.json.Stringify.valueAlloc(sa, root, .{}));
+    try root.object.getPtr("enrichments").?.array.items[0].object.put(sa, "field", .{ .string = "other" });
+    try std.testing.expectError(error.IndexReferencedByAlias, validateDependencyMutation(a, before, try std.json.Stringify.valueAlloc(sa, root, .{})));
+    // Inline edits must also fail even though index runtime hashes omit them.
+    try root.object.getPtr("P").?.object.getPtr("enrichments").?.array.items[0].object.put(sa, "source_artifact_name", .{ .string = "other" });
+    try std.testing.expectError(error.IndexReferencedByAlias, validateDependencyMutation(a, before, try std.json.Stringify.valueAlloc(sa, root, .{})));
+}
+
+test "index alias dependency recipes resolve inline-only executable owners" {
+    const before =
+        \\{"P":{"type":"embeddings","_index_incarnation":1,"embedder":{"model":"A"},"enrichments":[{"name":"X","kind":"embedding","field":"body"}]},"C":{"type":"embeddings","_index_incarnation":2,"sources":[{"artifact":"X"}]}}
+    ;
+    const after =
+        \\{"P":{"type":"embeddings","_index_incarnation":3,"embedder":{"model":"B"},"enrichments":[{"name":"X","kind":"embedding","field":"body"}]},"C":{"type":"embeddings","_index_incarnation":2,"sources":[{"artifact":"X"}]}}
+    ;
+    try std.testing.expectError(error.IndexReferencedByAlias, validateDependencyMutation(std.testing.allocator, before, after));
 }

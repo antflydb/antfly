@@ -1487,6 +1487,7 @@ pub const TableManager = struct {
         }
         if (self.tables.get(record.table_id)) |existing| {
             try validateObjectTableMutation(self.alloc, existing, record);
+            try @import("antfly_local_sources").api_index_metadata.aliases.validateDependencyMutation(self.alloc, existing.indexes_json, record.indexes_json);
             if (existing.storage_migration != null and !tableDefinitionsEqual(existing, record))
                 return error.VectorMigrationActive;
         }

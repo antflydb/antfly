@@ -331,6 +331,15 @@ existing partial-serving readiness state. A swap rejects an unready target,
 a different index kind, or a dense/sparse mismatch. Alias names cannot shadow
 concrete indexes, refer to another alias, or use reserved metadata names.
 
+Artifact-backed indexes pin their entire producer dependency chain. Changing an
+embedding model or an upstream enrichment requires rebuilding its dependent
+physical indexes under new incarnations. Remove retired consumers before
+changing their producers, even after moving an alias: an earlier query may
+still hold the retired consumer's incarnation fence. Credential and pacing
+changes that preserve the producer's stable semantic identity remain allowed.
+Graph definitions are validated after resolving alias names; swaps that would
+map overlapping relationships to the same physical edge index are rejected.
+
 Use the alias in `full_text_index`, `indexes`, embedding map keys, canonical `graph_queries`
 `index` fields, or graph metric requests. Resolution happens before embedding
 and shard dispatch. Native requests carry the selected index incarnation into

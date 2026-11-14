@@ -850,6 +850,13 @@ const LocalStandaloneMetadata = struct {
             if (metadata.lifecycle_store) |store| {
                 if (!try store.resolverProjectionValid(metadata.alloc, group_ids.main_metadata_group_id, table)) return error.ResolverCurationConflict;
             }
+            if (metadata.manager.tables.get(table.table_id)) |prior| {
+                if (!std.mem.eql(u8, prior.indexes_json, table.indexes_json)) {
+                    var arena = std.heap.ArenaAllocator.init(metadata.alloc);
+                    defer arena.deinit();
+                    if (metadata.system_catalog_state) |*catalog| try @import("../system_catalog/graph_bindings.zig").validateTableMutations(arena.allocator(), catalog.index.graphsForTable(table.table_id), table.table_id, table.indexes_json);
+                }
+            }
             try self.captureTable(metadata, table.table_id);
             try metadata.manager.upsertTable(table);
         }
@@ -2434,6 +2441,10 @@ const LocalStandaloneMetadata = struct {
         pub fn physicalById(self: @This(), id: u64) !?system_catalog.PhysicalTable {
             const table = self.owner.manager.tables.get(id) orelse return null;
             return .{ .id = table.table_id, .name = try self.alloc.dupe(u8, table.name) };
+        }
+        pub fn graphIndexName(self: @This(), id: u64, name: []const u8) ![]const u8 {
+            const table = self.owner.manager.tables.get(id) orelse return error.TableNotFound;
+            return @import("../system_catalog/graph_bindings.zig").indexName(self.alloc, table.indexes_json, name);
         }
         pub fn graphIndexIdentity(self: @This(), id: u64, name: []const u8) !?@import("cypher").catalog.IndexIdentity {
             const table = self.owner.manager.tables.get(id) orelse return null;
@@ -16858,4 +16869,37 @@ test "index alias standalone snapshot install preserves swaps receipts and stale
     const after = (try restored.tableByName(a, group, "docs")).?;
     defer antfly.metadata.table_manager.freeTable(a, after);
     try std.testing.expectEqualStrings(second.indexes_json, after.indexes_json);
+}
+
+test "index alias standalone graph CAS rejects convergence before durable publication" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    try LocalStandaloneMetadata.createTable(&metadata, alloc, "docs", .{});
+    for ([_][]const u8{ "g1", "g2" }) |name| try LocalStandaloneMetadata.createIndex(&metadata, alloc, "docs", name, "{\"type\":\"graph\"}");
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"complete\":true}", .{});
+    const before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("docs").?.*);
+    var installed = before;
+    installed.indexes_json = try aliases.put(a, before.indexes_json, "left", .{ .index = "g1", .idempotency_key = "1" }, ready, 1);
+    installed.indexes_json = try aliases.put(a, installed.indexes_json, "right", .{ .index = "g2", .idempotency_key = "2" }, ready, 2);
+    try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, installed);
+    _ = try metadata.statusSource().systemCatalog(a, .{}, .{ .mutate = .{ .mutation = .{ .kind = .graph, .action = .create, .name = "knowledge", .source_json =
+        \\{"labels":[{"name":"D","table":"docs"}],"relationships":[{"name":"R1","index":"left","source_label":"D","target_label":"D","stored_type":"edge"},{"name":"R2","index":"right","source_label":"D","target_label":"D","stored_type":"edge"}]}
+    } } });
+    var converged = installed;
+    converged.indexes_json = try aliases.put(a, installed.indexes_json, "left", .{ .index = "g2", .expected_index = "g1", .idempotency_key = "3" }, ready, 3);
+    const revision = metadata.durable_revision;
+    try std.testing.expectError(error.IndexAliasGraphConflict, LocalStandaloneMetadata.replaceTableDefinition(&metadata, installed, converged));
+    try std.testing.expectEqual(revision, metadata.durable_revision);
+    try std.testing.expectEqualStrings(installed.indexes_json, metadata.findTableByNameLocked("docs").?.indexes_json);
 }

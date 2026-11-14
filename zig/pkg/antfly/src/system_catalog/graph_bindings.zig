@@ -22,6 +22,34 @@ pub fn indexIdentity(a: std.mem.Allocator, indexes_json: []const u8, name: []con
     return indexIdentityFromValue(a, parsed.value, name);
 }
 
+pub fn indexName(a: std.mem.Allocator, indexes_json: []const u8, name: []const u8) ![]const u8 {
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, indexes_json, .{ .allocate = .alloc_always });
+    return @import("antfly_local_sources").api_index_metadata.aliases.resolve(root, name);
+}
+
+/// Validate only relationships owned by the affected physical table. Other
+/// tables cannot collide with these mappings. Call inside the catalog write
+/// transaction, using the table-to-graph reverse index.
+pub fn validateTableMutation(a: std.mem.Allocator, record: @import("antfly_local_sources").system_catalog_domain.Resource, table_id: u64, indexes_json: []const u8) !void {
+    return validateTableMutations(a, &.{record}, table_id, indexes_json);
+}
+pub fn validateTableMutations(a: std.mem.Allocator, records: []const @import("antfly_local_sources").system_catalog_domain.Resource, table_id: u64, indexes_json: []const u8) !void {
+    if (records.len == 0) return;
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, if (indexes_json.len == 0) "{}" else indexes_json, .{});
+    for (records) |record| try validateTableMutationValue(a, record, table_id, root);
+}
+fn validateTableMutationValue(a: std.mem.Allocator, record: @import("antfly_local_sources").system_catalog_domain.Resource, table_id: u64, root: std.json.Value) !void {
+    var graph = try @import("antfly_local_sources").system_catalog_domain.graphForExecution(a, record);
+    const relationships = try a.dupe(@import("cypher").catalog.Relationship, graph.relationships);
+    graph.relationships = relationships;
+    for (relationships) |*relationship| {
+        const label = graph.label(relationship.source_label) orelse return error.InvalidCatalogRecord;
+        if (label.table_id != table_id) continue;
+        relationship.index = try @import("antfly_local_sources").api_index_metadata.aliases.resolve(root, relationship.index);
+    }
+    graph.validate() catch return error.IndexAliasGraphConflict;
+}
+
 fn indexIdentityFromValue(a: std.mem.Allocator, root: std.json.Value, name: []const u8) !?@import("cypher").catalog.IndexIdentity {
     const concrete = try @import("antfly_local_sources").api_index_metadata.aliases.resolve(root, name);
     const config = root.object.get(concrete) orelse return null;
@@ -168,4 +196,60 @@ test "index alias graph binding bounds catalog allocations across shared relatio
         try std.testing.expectEqualStrings("g1", mapping.index);
         try std.testing.expectEqual(@as(u64, 41), mapping.identity.?.incarnation);
     }
+}
+
+test "index alias graph admission rejects converged physical mappings and indexes graph dependencies" {
+    const domain = @import("antfly_local_sources").system_catalog_domain;
+    const definition =
+        \\{"labels":[{"name":"D","table":"docs"}],"relationships":[{"name":"R1","index":"left","source_label":"D","target_label":"D","stored_type":"edge"},{"name":"R2","index":"right","source_label":"D","target_label":"D","stored_type":"edge"}]}
+    ;
+    const identity: @import("cypher").catalog.IndexIdentity = .{ .incarnation = 41, .config_hash = 99 };
+    const tables = [_]domain.PhysicalTable{.{ .id = 42, .name = "docs", .graph_indexes = &.{
+        .{ .name = "left", .concrete_name = "g1", .identity = identity },
+        .{ .name = "right", .concrete_name = "g2", .identity = identity },
+    } }};
+    const converged = [_]domain.PhysicalTable{.{ .id = 42, .name = "docs", .graph_indexes = &.{
+        .{ .name = "left", .concrete_name = "g2", .identity = identity },
+        .{ .name = "right", .concrete_name = "g2", .identity = identity },
+    } }};
+    const request: domain.Mutation = .{ .kind = .graph, .action = .create, .name = "knowledge", .source_json = definition };
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.InvalidCatalogMutation, domain.plan(a, .{}, request, &converged));
+    var created = try domain.plan(a, .{}, request, &tables);
+    defer created.deinit(a);
+    var state = try domain.MutableState.clone(a, .{ .resources = created.upserts, .next_id = created.next_id });
+    defer state.deinit();
+    try std.testing.expectEqual(@as(usize, 1), state.index.graphsForTable(42).len);
+    try std.testing.expectEqual(@as(usize, 0), state.index.graphsForTable(43).len);
+    const record = state.index.graphsForTable(42)[0];
+    const AllocationProbe = struct {
+        fn run(allocator: std.mem.Allocator, original: domain.Resource) !void {
+            var owned = try domain.MutableState.clone(allocator, .{ .resources = &.{original}, .next_id = 8 });
+            defer owned.deinit();
+            var replacement = original;
+            replacement.graph_tables = &.{.{ .label_index = 0, .table_id = 43, .storage_name = "other" }};
+            var upserts = [_]domain.Resource{replacement};
+            var change = try owned.apply(.{ .upserts = &upserts, .removes = &.{}, .next_id = 8 });
+            change.finish(&owned, false);
+            try std.testing.expectEqual(@as(usize, 1), owned.index.graphsForTable(42).len);
+            try std.testing.expectEqual(@as(usize, 0), owned.index.graphsForTable(43).len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, AllocationProbe.run, .{record});
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const before = "{\"g1\":{\"type\":\"graph\"},\"g2\":{\"type\":\"graph\"},\"_index_aliases\":{\"left\":{\"index\":\"g1\"},\"right\":{\"index\":\"g2\"}}}";
+    const after = "{\"g1\":{\"type\":\"graph\"},\"g2\":{\"type\":\"graph\"},\"_index_aliases\":{\"left\":{\"index\":\"g2\"},\"right\":{\"index\":\"g2\"}}}";
+    try validateTableMutation(arena.allocator(), record, 42, before);
+    try validateTableMutation(arena.allocator(), record, 43, after);
+    try std.testing.expectError(error.IndexAliasGraphConflict, validateTableMutation(arena.allocator(), record, 42, after));
+    var dropped = try domain.plan(a, state.value, .{ .kind = .graph, .action = .drop, .name = "knowledge" }, &tables);
+    defer dropped.deinit(a);
+    var change = try state.apply(dropped);
+    try std.testing.expectEqual(@as(usize, 0), state.index.graphsForTable(42).len);
+    change.finish(&state, false);
+    try std.testing.expectEqual(@as(usize, 1), state.index.graphsForTable(42).len);
+    var committed = try state.apply(dropped);
+    committed.finish(&state, true);
+    try std.testing.expectEqual(@as(usize, 0), state.index.graphsForTable(42).len);
 }

@@ -610,6 +610,7 @@ fn replaceTableDefinitionGuardedWithContextReceipt(
     if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
         try service.ensureLinearizableReadWithContext(context);
         if (!try store.resolverProjectionValid(service.alloc, service.metadata_group_id, replacement)) return error.ResolverCurationConflict;
+        try store.validateTableIndexMutation(service.metadata_group_id, expected, replacement);
     }
 
     if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {

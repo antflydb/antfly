@@ -4752,13 +4752,12 @@ pub const ApiHttpServer = struct {
         if (self.cfg.deployment_mode != .distributed) return;
         var snapshot = (try self.source.linearizableSnapshot(request)) orelse return error.IndexAliasProtocolUpgradeRequired;
         defer self.source.freeAdminSnapshot(&snapshot);
-        var found = false;
         for (snapshot.stores) |store| {
             if (!store.live or !metadata_table_manager.storeServesTableData(store.role)) continue;
-            found = true;
             if (!metadata_table_manager.indexAliasesProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)) return error.IndexAliasProtocolUpgradeRequired;
         }
-        if (!found) return error.IndexAliasProtocolUpgradeRequired;
+        // Empty data fleets are valid for object tables. The durable alias
+        // admission and subsequent store admission enforce the protocol floor.
     }
 
     pub fn ensurePrivacyAdmission(self: *ApiHttpServer, request: api_operation.RequestContext) !void {
@@ -18162,7 +18161,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return error.InvalidIndexRequest,
@@ -18550,7 +18549,7 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject, error.UnsupportedOperation => return error.MethodNotAllowed,
             else => return if (metadata_authority.isRetryableError(err)) error.NotLeader else error.InternalFailure,
         };
@@ -18585,7 +18584,7 @@ pub const ApiHttpServer = struct {
                 external_table = schema.external_base_source != null;
             }
             if (@import("relational_index_mutation.zig").drop(alloc, before, index_name) catch |err| switch (err) {
-                error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+                error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
                 else => return error.InternalFailure,
             }) |replacement| {
                 defer metadata_table_manager.freeTable(alloc, replacement);
@@ -18607,10 +18606,9 @@ pub const ApiHttpServer = struct {
             error.MetadataMutationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.IndexNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
-            error.IndexReferencedByAlias,
             error.InvalidEnrichmentConfig,
             error.ConflictingEnrichmentConfig,
             error.MissingEmbeddingArtifactEnrichment,
@@ -18801,7 +18799,7 @@ pub const ApiHttpServer = struct {
         self.source.replaceTableDefinition(table_before, replacement) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
@@ -18863,7 +18861,7 @@ pub const ApiHttpServer = struct {
         self.source.deleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             error.TableNotFound, error.EnrichmentNotFound => return error.NotFound,
-            error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
+            error.IndexAliasGraphConflict, error.IndexReferencedByAlias, error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.InvalidEnrichmentConfig,
@@ -63962,4 +63960,35 @@ test "system catalog row filter composition rejects oversized tails with bounded
             try std.testing.expectEqual(expected, measured.allocated_bytes);
         } else prefix_allocation = measured.allocated_bytes;
     }
+}
+
+test "index alias admission accepts empty object fleets and fences incompatible live data stores" {
+    const Fake = struct {
+        stores: []metadata_table_manager.StoreRecord = &.{},
+        frees: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 0 };
+        }
+        fn snapshot(ptr: *anyopaque, _: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = &.{}, .ranges = &.{}, .stores = self.stores, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(ptr: *anyopaque, _: *metadata_api.AdminSnapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.frees += 1;
+        }
+    };
+    var fake: Fake = .{};
+    var server = ApiHttpServer.init(std.testing.allocator, .{ .deployment_mode = .distributed }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .linearizable_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free } }, null, null);
+    defer server.deinit();
+    try server.ensureIndexAliasAdmission(.{});
+    var stores = [_]metadata_table_manager.StoreRecord{.{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .artifact_sources_protocol_version = 2 }};
+    fake.stores = &stores;
+    try std.testing.expectError(error.IndexAliasProtocolUpgradeRequired, server.ensureIndexAliasAdmission(.{}));
+    stores[0].role = "metadata";
+    try server.ensureIndexAliasAdmission(.{});
+    stores[0].role = "data";
+    stores[0].artifact_sources_protocol_version = 3;
+    try server.ensureIndexAliasAdmission(.{});
+    try std.testing.expectEqual(@as(usize, 4), fake.frees);
 }

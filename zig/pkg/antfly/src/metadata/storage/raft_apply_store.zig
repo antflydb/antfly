@@ -5827,7 +5827,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "12";
+const derived_catalog_index_version = "13";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -14557,6 +14557,13 @@ pub const RaftApplyStore = struct {
             const value = try decodeTableIdentity(self.view.alloc, bytes);
             if (value.table_id != id) return error.InvalidCatalogRecord;
             return .{ .id = value.table_id, .name = value.name };
+        }
+        pub fn graphIndexName(self: @This(), id: u64, name: []const u8) ![]const u8 {
+            var buf: [160]u8 = undefined;
+            const bytes = try self.view.txn.get(try tableKeyForGroup(&buf, self.view.group_id, id));
+            const table = try decodeTableRecord(self.view.alloc, bytes);
+            if (table.table_id != id) return error.InvalidCatalogRecord;
+            return @import("../../system_catalog/graph_bindings.zig").indexName(self.view.alloc, table.indexes_json, name);
         }
         pub fn graphIndexIdentity(self: @This(), id: u64, name: []const u8) !?@import("cypher").catalog.IndexIdentity {
             var buf: [160]u8 = undefined;
@@ -23933,6 +23940,20 @@ pub const RaftApplyStore = struct {
         return true;
     }
 
+    pub fn validateTableIndexMutation(self: *RaftApplyStore, group_id: u64, before: metadata.TableRecord, after: metadata.TableRecord) !void {
+        var txn = try self.beginQueryCatalogReadTxn(group_id);
+        defer txn.abort();
+        try self.validateTableIndexMutationTxn(&txn, group_id, before, after);
+    }
+    fn validateTableIndexMutationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, before: metadata.TableRecord, after: metadata.TableRecord) !void {
+        if (std.mem.eql(u8, before.indexes_json, after.indexes_json)) return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        try @import("antfly_local_sources").api_index_metadata.aliases.validateDependencyMutation(a, before.indexes_json, after.indexes_json);
+        try @import("../../system_catalog/graph_bindings.zig").validateTableMutations(a, try system_catalog_storage.graphsForTable(a, txn, group_id, after.table_id), after.table_id, after.indexes_json);
+    }
+
     fn putTableRecordTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
@@ -26055,6 +26076,7 @@ pub const RaftApplyStore = struct {
         if (encoded_existing) |encoded| {
             const existing = try decodeTableRecord(self.alloc, encoded);
             defer metadata_table_manager.freeTable(self.alloc, existing);
+            try self.validateTableIndexMutationTxn(txn, group_id, existing, record);
             if (source_tracked) previous_digest = relationTableSourceDigest(existing.table_id, existing.name, existing.schema_json);
             const lock_kind = if (!published_fk_generation and !metadata_table_manager.tableDefinitionsEqual(existing, record))
                 try self.fkTableLockKindTxn(txn, group_id, record.table_id)
@@ -28023,6 +28045,8 @@ test "index alias Raft admission permits rollout and fences returning legacy sto
     // Merely advertising new code must not interrupt the rolling upgrade.
     try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, legacy));
     const table: metadata.TableRecord = .{ .table_id = 42, .name = "docs", .indexes_json = "{\"_index_aliases\":{}}" };
+    // Object-backed tables can become ready before any data store exists.
+    try std.testing.expect(try admitIndexAliasTableTxn(&store, &txn, group, table));
     const old_store = try encodeStoreRecord(a, legacy);
     defer a.free(old_store);
     try txn.put(try storeKeyForGroup(&buf, group, legacy.store_id), old_store);
@@ -45303,4 +45327,43 @@ test "index alias query projection is persisted and borrowed without retry evide
     defer metadata_table_manager.freeTable(a, restored);
     try std.testing.expectEqualStrings(indexes, restored.indexes_json);
     try std.testing.expectEqualStrings(query_indexes, restored.query_indexes_json);
+}
+
+test "index alias graph dependency rows rebuild and reject converging table mutations atomically" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(sa, ".zig-cache/tmp/{s}/graph-alias-admission", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    var txn = try store.store.beginWriteTxn();
+    defer txn.abort();
+    const group: u64 = 21;
+    const graph: system_catalog.Resource = .{
+        .kind = .graph,
+        .id = 7,
+        .name = "knowledge",
+        .graph_revision = 1,
+        .source_json =
+        \\{"labels":[{"name":"D","table":"docs"}],"relationships":[{"name":"R1","index":"left","source_label":"D","target_label":"D","stored_type":"edge"},{"name":"R2","index":"right","source_label":"D","target_label":"D","stored_type":"edge"}]}
+        ,
+        .graph_tables = &.{.{ .label_index = 0, .table_id = 42, .storage_name = "docs" }},
+        .graph_indexes = &.{ .{ .mapping_index = 0, .identity = .{ .incarnation = 1, .config_hash = 1 } }, .{ .mapping_index = 1, .identity = .{ .incarnation = 2, .config_hash = 2 } } },
+    };
+    const before: metadata.TableRecord = .{ .table_id = 42, .name = "docs", .indexes_json = "{\"g1\":{\"type\":\"graph\"},\"g2\":{\"type\":\"graph\"},\"_index_aliases\":{\"left\":{\"index\":\"g1\"},\"right\":{\"index\":\"g2\"}}}" };
+    var after = before;
+    after.indexes_json = "{\"g1\":{\"type\":\"graph\"},\"g2\":{\"type\":\"graph\"},\"_index_aliases\":{\"left\":{\"index\":\"g2\"},\"right\":{\"index\":\"g2\"}}}";
+    try system_catalog_storage.writeResource(sa, &txn, group, graph);
+    try std.testing.expectEqual(@as(usize, 1), (try system_catalog_storage.graphsForTable(sa, &txn, group, 42)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try system_catalog_storage.graphsForTable(sa, &txn, group, 43)).len);
+    try std.testing.expectError(error.IndexAliasGraphConflict, store.validateTableIndexMutationTxn(&txn, group, before, after));
+    try system_catalog_storage.rebuildNameIndex(sa, &txn, group);
+    try std.testing.expectEqual(@as(usize, 1), (try system_catalog_storage.graphsForTable(sa, &txn, group, 42)).len);
+    try std.testing.expectError(error.IndexAliasGraphConflict, store.validateTableIndexMutationTxn(&txn, group, before, after));
+    try system_catalog_storage.removeResource(sa, &txn, group, graph);
+    try std.testing.expectEqual(@as(usize, 0), (try system_catalog_storage.graphsForTable(sa, &txn, group, 42)).len);
+    try store.validateTableIndexMutationTxn(&txn, group, before, after);
 }
