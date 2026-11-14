@@ -132,6 +132,15 @@ Wrap each arm with `measure_process.py --out <prefix> -- <command>`. It saves
 the child log and samples process RSS/PSS and per-process NVML GPU memory every
 20 ms, separating startup and inference. These are sampled process peaks;
 Torch allocator peaks are additional metrics, not substitutes for NVML.
+The sampler follows the child PID across physical GPUs independently of
+`CUDA_VISIBLE_DEVICES`, sums simultaneous usage across devices, and records
+observed device UUIDs and names. Missing or unavailable process GPU memory
+fails the measurement rather than publishing a zero-byte GPU peak. Attribution
+regressions run without NVIDIA hardware or optional monitoring packages:
+
+```sh
+python3 -m unittest discover -s zig/pkg/inference/scripts/glide -p test_measure_process.py -v
+```
 Run fresh processes in alternating order for repeated lifecycles, with no
 other GPU work or concurrent builds during final measurements.
 

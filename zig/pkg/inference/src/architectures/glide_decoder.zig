@@ -437,10 +437,12 @@ const Forward = struct {
             defer cb.free(all_rows);
             break :blk try self.gatherReadout(all_rows, hidden_size);
         };
-        const residual = if (prune) try self.gatherReadout(hidden, hidden_size) else hidden;
-        defer if (residual != hidden) cb.free(residual);
         const attn_res = blk: {
+            // Register cleanup before the fallible residual gather, and release
+            // both inputs before allocating the feed-forward activations.
             defer cb.free(mixed);
+            const residual = if (prune) try self.gatherReadout(hidden, hidden_size) else hidden;
+            defer if (residual != hidden) cb.free(residual);
             break :blk try cb.add(mixed, residual);
         };
         defer cb.free(attn_res);
