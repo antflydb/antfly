@@ -66,6 +66,30 @@ source/metadata/output quota from rejecting legal vision or decoder workspace,
 and avoids charging the execution lease again through the document allocator.
 Output-copy allocation failures roll back every completed result item.
 
+Encoded-reader preparation has its own process-admitted allocation owner,
+including manifest and tokenizer metadata, independent of document quotas.
+Session-backed readers borrow an execution view using the execution heap; their
+loaded metadata and teardown remain with the original reader. Multi-stage
+execution applies that allocator to nested recognizers as well. Moondream has
+no managed session execution lease, so its actual allocations remain admitted
+throughout reading, and a separate weight lease covers its mapped checkpoint
+until model teardown. Generative readers use the resident model's bound manifest
+rather than reopening and rescanning tokenizer metadata before generation.
+Warm direct generation also clones the publication-checked cached manifest;
+cold requests use admitted manifest discovery. LightOn cohort and continuous
+workers each admit prompt planning before the execution lease, returning that
+temporary credit before decoder allocation. Moondream's configuration probe
+propagates allocation errors instead of misclassifying contention as unsupported
+model artifacts.
+
+Boolean broker cancellation callbacks retain their first typed checkpoint
+failure atomically until the synchronous caller joins. The retained checkpoint
+control propagates through nested LightOn vision, prefill and page brokers as
+well as direct encoded-reader dispatch; boolean adapters cannot bypass capture.
+The encoded-reader boundary restores that error instead of reporting generic cancellation for an
+expired deadline or a one-shot checkpoint failure. Successful completion also
+checks this retained failure before copying results to the caller.
+
 CPU automatic scratch is a fraction of the safe process pool. Explicit caps,
 total host/combined budgets and live memory pressure still apply. Preflight
 failures record requested scratch, limiting policy and current reservations using

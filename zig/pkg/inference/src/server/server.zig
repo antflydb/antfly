@@ -6285,7 +6285,21 @@ pub const Node = struct {
         return output.text;
     }
 
-    fn generationPreparation(self: *Node) @import("../backends/admitted_allocator.zig").AdmittedAllocator {
+    fn generationAdmissionManifest(self: *Node, allocator: std.mem.Allocator, path: []const u8, control: InferenceExecutionControl) !manifest_mod.ModelManifest {
+        return (try self.model_manager.copyCachedGenerationManifestWithControl(allocator, path, control)) orelse
+            try self.loadBoundManifest(allocator, path, false, control);
+    }
+
+    /// Planning runs before the execution lease, including on independent
+    /// cohort/continuous workers. Its temporary allocations need their own owner.
+    fn countAdmittedPromptTokens(self: *Node, model_dir: []const u8, model: *model_manager_mod.LoadedModel, cfg: gpt_model_mod.Config, messages: []const generation.Message, max_tokens: i32) !NativePromptTokenCount {
+        var preparation = self.inferencePreparation();
+        defer preparation.deinit();
+        return countPromptTokens(preparation.allocator(), model_dir, model, cfg, messages, max_tokens, false, false) catch |err|
+            if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
+    }
+
+    fn inferencePreparation(self: *Node) @import("../backends/admitted_allocator.zig").AdmittedAllocator {
         const Preparation = struct {
             fn acquire(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
                 const node: *Node = @ptrCast(@alignCast(raw));
@@ -6320,7 +6334,7 @@ pub const Node = struct {
         prompt_cache_key: ?[]const u8,
         supplied_control: InferenceExecutionControl,
     ) !DirectGenerateOutput {
-        var preparation = self.generationPreparation();
+        var preparation = self.inferencePreparation();
         defer preparation.deinit();
         const preparation_allocator = preparation.allocator();
         // Model execution is owned by the generation resource lease below.
@@ -6346,7 +6360,7 @@ pub const Node = struct {
         execution_control = model_path_selection.bind(execution_control);
         defer self.allocator.free(model_path);
         const resolved_at_ns = embedTimingNowNs();
-        var admission_manifest = self.loadBoundManifest(preparation_allocator, model_path, false, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
+        var admission_manifest = self.generationAdmissionManifest(preparation_allocator, model_path, self.bindModelSelection(model_path_selection, execution_control)) catch |err|
             return if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
         defer admission_manifest.deinit();
         const executor_contract = try resolvedGenerateExecutorContract(self, &admission_manifest);
@@ -9409,7 +9423,7 @@ pub const Node = struct {
             qwen3vl_projector.supportsResidentVisionBudget(cfg) and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_RESIDENT_VISION_BUDGET");
         const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend);
         const messages = [_]generation.Message{.{ .role = "user", .content = prompt, .image_bytes = &.{image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = prompt } } }};
-        const estimate = try countPromptTokens(a, model_path, model, cfg, &messages, max_tokens, false, false);
+        const estimate = try self.countAdmittedPromptTokens(model_path, model, cfg, &messages, max_tokens);
         try validateMeasuredReadPrompt(try resolvedInferenceExecutorContract(self, "read", &model.manifest), estimate.token_count, @intCast(max_tokens));
         const limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(model.session, self.defaultGenerationLimits(.gpu)));
         var local_budget = runtime.tier.memory.RunBudget.init(limits);
@@ -9892,7 +9906,7 @@ pub const Node = struct {
         for (items, tasks) |item, *task| {
             const payload = item.payloadAs(LightOnReadPayload);
             const messages = [_]generation.Message{.{ .role = "user", .content = payload.prompt, .image_bytes = &.{payload.image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = payload.prompt } } }};
-            const estimate = try countPromptTokens(allocator, payload.model_path, model, cfg, &messages, payload.max_tokens, false, false);
+            const estimate = try self.countAdmittedPromptTokens(payload.model_path, model, cfg, &messages, payload.max_tokens);
             try validateMeasuredReadPrompt(try resolvedInferenceExecutorContract(self, "read", &model.manifest), estimate.token_count, @intCast(payload.max_tokens));
             // countPromptTokens owns no retained encode; it only returns shape.
             const components = [_]runtime.tier.memory.GptGenerationBudgetComponent{.{ .backend = backend, .kv_dtype = kv_dtype, .config = cfg, .workspace_capacity = model.session.generationWorkspaceCapacity() }};
@@ -9982,23 +9996,43 @@ pub const Node = struct {
         requested_prompt: ?[]const u8,
         requested_max_tokens: ?usize,
         reserved_units: *usize,
+        supplied_control: InferenceExecutionControl,
+        allow_incomplete: bool,
+    ) ![]Qwen3VlReadResult {
+        var cancellation = ReadCancellationBridge{ .control = &supplied_control };
+        const results = self.readQwen3VlImagesRetained(allocator, model_path, image_datas, requested_prompt, requested_max_tokens, reserved_units, cancellation.retainedControl(), allow_incomplete) catch |err|
+            return cancellation.failure() orelse err;
+        errdefer {
+            for (results) |*result| result.deinit(allocator);
+            allocator.free(results);
+        }
+        try cancellation.checkRetained();
+        return results;
+    }
+
+    fn readQwen3VlImagesRetained(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        image_datas: []const []const u8,
+        requested_prompt: ?[]const u8,
+        requested_max_tokens: ?usize,
+        reserved_units: *usize,
         control: InferenceExecutionControl,
         allow_incomplete: bool,
     ) ![]Qwen3VlReadResult {
         try control.update(.loading_model, 0, 1);
-        var manifest = try manifest_mod.loadFromDir(allocator, model_path);
-        defer manifest.deinit();
-        const contract = try resolvedInferenceExecutorContract(self, "read", &manifest);
-        const max_tokens: i32 = @intCast(resolveGenerativeReadMaxTokens(&manifest, requested_max_tokens, contract.batch.max_output_tokens_per_item));
-        try validateInferenceExecutorInvocation(contract, .{ .item_count = image_datas.len, .output_tokens_per_item = @intCast(max_tokens), .has_image = true });
         // Keep one handle alive across the serial batch so another request
         // cannot evict the resident decoder/projector between page images.
         // generateMessagesDirectPrepared acquires a short-lived execution
         // handle for each item and therefore reuses this same loaded model.
         var resident_model_handle = try self.model_manager.acquireFromDirWithControl(model_path, control);
         defer resident_model_handle.release();
-        if (!isGenerativeReadModel(&resident_model_handle.get().manifest))
-            return error.InvalidModelForReading;
+        const manifest = &resident_model_handle.get().manifest;
+        if (!isGenerativeReadModel(manifest)) return error.InvalidModelForReading;
+        const contract = try resolvedInferenceExecutorContract(self, "read", manifest);
+        const max_tokens: i32 = @intCast(resolveGenerativeReadMaxTokens(manifest, requested_max_tokens, contract.batch.max_output_tokens_per_item));
+        try validateInferenceExecutorInvocation(contract, .{ .item_count = image_datas.len, .output_tokens_per_item = @intCast(max_tokens), .has_image = true });
 
         const prompt = try resolveGenerativeReadPrompt(&resident_model_handle.get().manifest, requested_prompt);
         if (resident_model_handle.get().manifest.isLightOnOcr3() and (resident_model_handle.get().session.backend() == .metal or
@@ -10353,11 +10387,61 @@ pub const Node = struct {
         try control.check();
         var request_slot = try ReadRequestSlot.acquire(self, &control);
         defer request_slot.deinit();
-        const work = std.heap.smp_allocator;
-        var result = try self.readEncodedImagesReportedInWorkspace(work, model_name, request, control);
+        var preparation = self.inferencePreparation();
+        defer preparation.deinit();
+        const work = preparation.allocator();
+        var cancellation = ReadCancellationBridge{ .control = &control };
+        var result = self.readEncodedImagesReportedInWorkspace(work, model_name, request, cancellation.retainedControl(), cancellation.token()) catch |err| {
+            // Preserve even a one-shot checkpoint failure observed by a broker
+            // thread; a later callback invocation need not reproduce that error.
+            if (cancellation.failure()) |failure| return failure;
+            try control.check();
+            return if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
+        };
         defer result.deinit(work);
+        if (cancellation.failure()) |failure| return failure;
+        try control.check();
         return cloneReaderBatchResult(allocator, result);
     }
+
+    /// Boolean broker probes retain their first typed failure atomically.
+    /// The synchronous join keeps this bridge and control alive for all probes.
+    const ReadCancellationBridge = struct {
+        control: *const InferenceExecutionControl,
+        failure_code: std.atomic.Value(u32) = .init(0),
+
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checkRetained() catch return true;
+            return false;
+        }
+
+        fn checkRetained(self: *@This()) !void {
+            if (self.failure()) |err| return err;
+            self.control.check() catch |err| {
+                _ = self.failure_code.cmpxchgStrong(0, @intFromError(err), .acq_rel, .acquire);
+                return self.failure().?;
+            };
+        }
+
+        fn checkpoint(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try self.checkRetained();
+        }
+
+        fn retainedControl(self: *@This()) InferenceExecutionControl {
+            return self.control.withCheckpoint(self, checkpoint);
+        }
+
+        fn token(self: *@This()) ExecutorCancellation {
+            return .{ .ptr = self, .is_cancelled_fn = cancelled };
+        }
+
+        fn failure(self: *const @This()) ?anyerror {
+            const code = self.failure_code.load(.acquire);
+            return if (code == 0) null else @errorFromInt(@as(u16, @intCast(code)));
+        }
+    };
 
     fn readEncodedImagesReportedInWorkspace(
         self: *Node,
@@ -10365,18 +10449,11 @@ pub const Node = struct {
         model_name: []const u8,
         request: readers_api.EncodedRequest,
         supplied_control: InferenceExecutionControl,
+        cancellation: ExecutorCancellation,
     ) !readers_api.BatchResult {
         var execution_control = self.bindExecutionControl(null, supplied_control);
         try execution_control.check();
         const deadline_ns = execution_control.deadline_ns;
-        const Cancel = struct {
-            fn cancelled(raw: *const anyopaque) bool {
-                const active: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
-                active.check() catch return true;
-                return false;
-            }
-        };
-        const cancellation = ExecutorCancellation{ .ptr = &execution_control, .is_cancelled_fn = Cancel.cancelled };
         if (cancellation.isCancelled()) return error.Canceled;
         try ensureDirectEmbeddingDeadline(deadline_ns);
         if (request.images.len == 0) return error.ReadBatchTooLarge;
@@ -11438,6 +11515,26 @@ pub const Node = struct {
         result_allocators: ?[]const std.mem.Allocator,
         control: InferenceExecutionControl,
     ) !readers_api.BatchResult {
+        var preparation = self.inferencePreparation();
+        defer preparation.deinit();
+        return self.runReadImageBatchPrepared(allocator, preparation.allocator(), model_path, image_datas, encoded_images, prompt, requested_max_tokens, source_fingerprint, execution_fence, result_allocators, control) catch |err|
+            if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
+    }
+
+    fn runReadImageBatchPrepared(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        preparation_allocator: std.mem.Allocator,
+        model_path: []const u8,
+        image_datas: []const []const u8,
+        encoded_images: ?[]const readers_api.EncodedImage,
+        prompt: ?[]const u8,
+        requested_max_tokens: ?usize,
+        source_fingerprint: ?[]const u8,
+        execution_fence: ?*const readers_mod.ExecutionFence,
+        result_allocators: ?[]const std.mem.Allocator,
+        control: InferenceExecutionControl,
+    ) !readers_api.BatchResult {
         try control.check();
         if (result_allocators) |allocators| {
             if (allocators.len != image_datas.len) return error.InvalidReadResultCount;
@@ -11447,7 +11544,7 @@ pub const Node = struct {
         const admission_manifest: *const manifest_mod.ModelManifest = if (execution_fence) |fence|
             fence.manifest()
         else blk: {
-            owned_admission_manifest = try manifest_mod.loadFromDir(allocator, model_path);
+            owned_admission_manifest = try manifest_mod.loadFromDir(preparation_allocator, model_path);
             break :blk &owned_admission_manifest.?;
         };
         const executor_contract = try resolvedInferenceExecutorContract(self, "read", admission_manifest);
@@ -11472,10 +11569,10 @@ pub const Node = struct {
         });
 
         var reader = if (execution_fence) |fence|
-            try readers_mod.LoadedReader.loadFromExecutionFence(allocator, fence)
+            try readers_mod.LoadedReader.loadFromExecutionFence(preparation_allocator, fence)
         else
             try readers_mod.LoadedReader.loadFromDirWithControl(
-                allocator,
+                preparation_allocator,
                 model_path,
                 &self.session_manager,
                 &self.model_manager,
@@ -11511,20 +11608,15 @@ pub const Node = struct {
             allocator.free(out);
         }
 
-        const batch = try reader.readBatchReported(image_datas, .{
+        var owned_batch = try reader.readBatchInWorkspace(std.heap.smp_allocator, image_datas, .{
             .prompt = normalized_prompt,
             .max_tokens = max_tokens,
             .source_fingerprint = source_fingerprint,
             .execution_control = control,
         });
+        defer owned_batch.deinit();
+        const batch = owned_batch.batch;
         const results = batch.results;
-        defer {
-            for (results) |result| {
-                var tmp = result;
-                tmp.deinit();
-            }
-            allocator.free(results);
-        }
         if (results.len != image_datas.len) return error.InvalidReadResultCount;
 
         for (results, 0..) |result, i| {
@@ -52698,7 +52790,7 @@ test "generation preparation admits prompt formatting before execution and refun
     var initial = try node.model_manager.admitHostPreflight(1);
     initial.release();
     node.model_manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = 4096, .scratch_limit_bytes = 4096 };
-    var preparation = node.generationPreparation();
+    var preparation = node.inferencePreparation();
     defer preparation.deinit();
     const content = try a.alloc(u8, 8192);
     defer a.free(content);
@@ -52707,5 +52799,101 @@ test "generation preparation admits prompt formatting before execution and refun
     try std.testing.expectError(error.OutOfMemory, formatted);
     try std.testing.expectEqual(error.ResourceLimitExceeded, preparation.admission_error.?);
     try preparation.trim();
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().hostTotalBytes());
+}
+
+test "encoded reader restores typed checkpoint errors from boolean cancellation" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .max_concurrent_requests = 1 });
+    defer node.deinit();
+    const Probe = struct {
+        calls: usize = 0,
+        failure: anyerror,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 3) return self.failure;
+        }
+    };
+    for ([_]anyerror{ error.Timeout, error.CheckpointRevisionUnavailable }) |failure| {
+        var probe = Probe{ .failure = failure };
+        try std.testing.expectError(failure, node.readEncodedImagesReportedDirectWithControl(a, "unused", .{ .images = &.{} }, .{ .ptr = &probe, .check_fn = Probe.check }));
+        try std.testing.expect(probe.calls >= 3);
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+    }
+}
+
+test "encoded reader admits preparatory manifest allocations before loading models" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const padding = try a.alloc(u8, 32 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'x');
+    const config = try std.fmt.allocPrint(a, "{{\"model_type\":\"qwen2_vl\",\"ignored\":\"{s}\"}}", .{padding});
+    defer a.free(config);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = config });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var node = try Node.init(a, .{ .max_concurrent_requests = 1, .max_work_units = 64 });
+    defer node.deinit();
+    var initial = try node.model_manager.admitHostPreflight(1);
+    initial.release();
+    node.model_manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = 16 * 1024, .scratch_limit_bytes = 16 * 1024 };
+    try std.testing.expectError(error.ResourceLimitExceeded, node.readEncodedImagesReportedDirectWithControl(a, path, .{ .images = &.{.{ .bytes = @import("antfly_documents").fixtures.get("one-pixel.png"), .mime_type = "image/png" }} }, .{ .io = std.testing.io }));
+    try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+}
+
+test "reader retained control preserves one-shot failures through nested broker adapters" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.CheckpointRevisionUnavailable;
+        }
+        fn cancelled(raw: *const anyopaque) bool {
+            const control: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+            control.check() catch return true;
+            return false;
+        }
+        fn execute(_: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+            for (items) |item| {
+                item.control.check() catch |err| {
+                    item.slot.fail(err);
+                    continue;
+                };
+                item.slot.setValue(usize, 1, .serial);
+            }
+        }
+    };
+    var probe = Probe{};
+    const original = InferenceExecutionControl{ .ptr = &probe, .check_fn = Probe.check };
+    var retained = Node.ReadCancellationBridge{ .control = &original };
+    const control = retained.retainedControl();
+    var broker = executor_microbatch.Broker.init(std.testing.allocator);
+    defer broker.deinit();
+    const result = try broker.submitControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "nested-reader", .task = .read, .resource_class = .cpu }, .{ .mode = .native, .preferred_items = 1, .max_items = 1 }, .{}, .{}, null, .{ .ptr = &control, .is_cancelled_fn = Probe.cancelled }, &@as(usize, 1), &probe, Probe.execute);
+    try std.testing.expect(result.result == .item_error);
+    try std.testing.expectEqual(error.CheckpointRevisionUnavailable, retained.failure().?);
+    try std.testing.expectError(error.CheckpointRevisionUnavailable, control.check());
+}
+
+test "reader worker prompt planning admits before execution and refunds denials" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{});
+    defer node.deinit();
+    var initial = try node.model_manager.admitHostPreflight(1);
+    initial.release();
+    node.model_manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = 4096, .scratch_limit_bytes = 4096 };
+    const content = try a.alloc(u8, 8192);
+    defer a.free(content);
+    @memset(content, 'x');
+    // Formatting must fail before the helper can access a tokenizer or model
+    // execution state. Both cohort and continuous paths use this same owner.
+    var model: model_manager_mod.LoadedModel = undefined;
+    model.chat_tmpl = null;
+    try std.testing.expectError(error.ResourceLimitExceeded, node.countAdmittedPromptTokens("unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1));
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().hostTotalBytes());
 }

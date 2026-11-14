@@ -473,6 +473,21 @@ pub const MultiStageOCRPipeline = struct {
     layout: ?backends.Session = null,
     order: ?backends.Session = null,
 
+    /// Borrow immutable models and dictionaries for one synchronous execution.
+    /// Only transient buffers/results use work; teardown belongs to the loader.
+    pub fn executionView(self: MultiStageOCRPipeline, work: std.mem.Allocator) MultiStageOCRPipeline {
+        var view = self;
+        view.allocator = work;
+        if (view.recognizer) |*recognizer| switch (recognizer.*) {
+            .ctc => |*ctc| ctc.allocator = work,
+            .vision2seq => |*vision| {
+                vision.allocator = work;
+                vision.reader.allocator = work;
+            },
+        };
+        return view;
+    }
+
     pub fn deinit(self: *MultiStageOCRPipeline) void {
         if (self.recognizer) |*recognizer| {
             recognizer.deinit();
