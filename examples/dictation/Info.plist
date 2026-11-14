@@ -10,7 +10,7 @@
 <key>CFBundleIconFile</key><string>AppIcon.icns</string>
 <key>CFBundleShortVersionString</key><string>0.1.0</string>
 <key>LSMinimumSystemVersion</key><string>15.0</string>
-<key>NSMicrophoneUsageDescription</key><string>Record audio while you hold the dictation shortcut and send it to your configured Antfly server.</string>
+<key>NSMicrophoneUsageDescription</key><string>Record audio while you hold the dictation shortcut. Process it on this Mac or send it to your selected Antfly server.</string>
 <key>AntflyUpdatesEnabled</key><false/>
 <key>LSArchitecturePriority</key><array><string>arm64</string></array>
 <key>NSHighResolutionCapable</key><true/>
