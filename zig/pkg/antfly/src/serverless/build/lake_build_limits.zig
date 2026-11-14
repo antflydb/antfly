@@ -18,6 +18,12 @@
 const std = @import("std");
 const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 
+/// Private owners can deny an allocation before their parent sees it. Preserve
+/// that admission result without relabeling physical OOMs or unrelated errors.
+pub fn classifyPrivateAllocationFailure(err: anyerror, budget: anytype) anyerror {
+    return if (err == error.OutOfMemory and budget.allocationFailureIsLocal()) error.LakeSidecarBuildLimitExceeded else err;
+}
+
 pub const Limits = struct {
     max_batches: usize = 100_000,
     max_rows: u64 = 10_000_000,
@@ -323,4 +329,33 @@ test "external lake native publication headroom respects managed host admission 
     var arena = std.heap.ArenaAllocator.init(host.threadSafeAllocator());
     defer arena.deinit();
     try std.testing.expectEqual(@as(?usize, null), WorkingSetAllocator.headroom(arena.allocator()));
+}
+
+test "external lake execution private quota denial is classified before parent exhaustion" {
+    const a = std.testing.allocator;
+    var parent = try WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 1024 });
+    defer parent.deinit();
+    var private: @import("antfly_local_sources").sql_memory_budget = .{ .backing = parent.allocator(), .limit = 1 };
+    try std.testing.expectError(error.OutOfMemory, private.allocator().alloc(u8, 2));
+    try std.testing.expect(!parent.limitExceeded());
+    try std.testing.expectEqual(error.LakeSidecarBuildLimitExceeded, classifyPrivateAllocationFailure(error.OutOfMemory, &private));
+    try std.testing.expectEqual(error.Timeout, classifyPrivateAllocationFailure(error.Timeout, &private));
+    var healthy: @import("antfly_local_sources").sql_memory_budget = .{ .backing = a, .limit = 1024 };
+    try std.testing.expectEqual(error.OutOfMemory, classifyPrivateAllocationFailure(error.OutOfMemory, &healthy));
+}
+
+test "external lake execution recovered private denial cannot conceal backing OOM" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    var budget: @import("antfly_local_sources").sql_memory_budget = .{ .backing = failing.allocator(), .limit = 8 };
+    // Optional work fails admission, then mandatory work succeeds and frees.
+    try std.testing.expectError(error.OutOfMemory, budget.allocator().alloc(u8, 9));
+    const first = try budget.allocator().alloc(u8, 1);
+    budget.allocator().free(first);
+    // This failure reaches the backing allocator despite historical denial.
+    try std.testing.expectError(error.OutOfMemory, budget.allocator().alloc(u8, 1));
+    try std.testing.expectEqual(error.OutOfMemory, classifyPrivateAllocationFailure(error.OutOfMemory, &budget));
+    // Mixed histories stay conservatively unattributed, in either order.
+    try std.testing.expectError(error.OutOfMemory, budget.allocator().alloc(u8, 9));
+    try std.testing.expectEqual(error.OutOfMemory, classifyPrivateAllocationFailure(error.OutOfMemory, &budget));
 }

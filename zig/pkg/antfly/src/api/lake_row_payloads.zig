@@ -35,8 +35,12 @@ pub fn vectors(a: A, batch: rows.ColumnBatch, columns: []const []const u8, specs
             if (spec.kind != current.kind or spec.scale != current.scale) return error.UnsupportedExternalLakeIndex;
             spec.precision = @max(spec.precision, current.precision);
         } else spec.* = current;
-        if (kind == .vector_f32 or kind == .encoded) return error.UnsupportedExternalLakeIndex;
-        if (vector.values == .decimal128) {
+        if (kind == .encoded) return error.UnsupportedExternalLakeIndex;
+        if (vector.values == .vector_f32) {
+            const values = try a.alloc([]const u8, batch.rowCount());
+            for (values, vector.values.vector_f32, 0..) |*value, coordinates_, row| value.* = if (vector.nulls.isNull(row)) "" else try @import("antfly_vector").codec.encodePackedF32BytesAlloc(a, coordinates_);
+            vector.values = .{ .bytes = values };
+        } else if (vector.values == .decimal128) {
             const values = try a.alloc([]const u8, batch.rowCount());
             for (values, 0..) |*value, row| {
                 const bytes = try a.alloc(u8, 16);
@@ -149,13 +153,21 @@ pub const Cluster = struct {
                 return self_.input.cell(alloc, row, column);
             }
             fn physical(raw: *anyopaque, alloc: A, column: usize) !?local.sql_execution_batch.PhysicalColumn {
+                return physicalSelected(raw, alloc, column, null);
+            }
+            fn physicalSelected(raw: *anyopaque, alloc: A, column: usize, selected_rows: ?[]const usize) !?local.sql_execution_batch.PhysicalColumn {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
-                if (column == self_.input.width()) return .{ .vector = .{ .name = "_capture_bytes", .values = .{ .i64 = self_.sizes } }, .range = .{ .count = self_.sizes.len }, .kind = .integer };
-                return self_.input.physicalColumn(alloc, column);
+                if (column == self_.input.width()) {
+                    const values: local.sql_execution_batch.PhysicalColumn = .{ .vector = .{ .name = "_capture_bytes", .values = .{ .i64 = self_.sizes } }, .range = .{ .count = self_.sizes.len }, .kind = .integer };
+                    return if (selected_rows) |rows_| try values.select(alloc, rows_) else values;
+                }
+                // Spill appends often request one row. Forward that selection
+                // rather than rebuilding the entire captured batch per row.
+                return self_.input.physicalColumnSelected(alloc, column, selected_rows);
             }
         };
         var sized: Sized = .{ .input = try input.select(a, selected), .sizes = sizes };
-        const values: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &sized, .read = Sized.cell, .read_physical = Sized.physical, .count = selected.len, .width = source.len + 1 } };
+        const values: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &sized, .read = Sized.cell, .read_physical = Sized.physical, .read_physical_selected = Sized.physicalSelected, .count = selected.len, .width = source.len + 1 } };
         const datums = try a.alloc(Datum, keys.len);
         const order = try a.alloc([]const Datum, keys.len);
         const ordinals = try a.alloc(u64, keys.len);

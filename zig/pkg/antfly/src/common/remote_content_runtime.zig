@@ -313,6 +313,7 @@ pub const Runtime = struct {
         self.current.retain();
         return .{
             .config = self.current.remoteContent(),
+            .revision = self.current.hash,
             .context = self.current,
             .release_fn = releaseAdapter,
         };
@@ -558,6 +559,12 @@ test "remote content runtime publishes validated snapshots and retains readers" 
     defer held.deinit();
     try std.testing.expectEqualStrings("primary", held.config.default_s3.?);
     const initial_health = runtime.health();
+    try std.testing.expectEqual(initial_health.hash, held.revision.?);
+    // The normal immutable-publication path must not allocate or serialize
+    // credentials when the storage consumer already holds this revision.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    const unchanged = try config_mod.remoteContentSnapshotUpdateAlloc(failing.allocator(), &facade, &held.revision.?);
+    try std.testing.expect(unchanged.json == null);
     const initial_metadata = runtime.observed_metadata;
 
     const replacement =
@@ -578,6 +585,11 @@ test "remote content runtime publishes validated snapshots and retains readers" 
     defer current.deinit();
     try std.testing.expectEqualStrings("archive", current.config.default_s3.?);
     try std.testing.expectEqualStrings("primary", held.config.default_s3.?);
+    try std.testing.expectEqual(replacement_image.hash, current.revision.?);
+    const update = try config_mod.remoteContentSnapshotUpdateAlloc(alloc, &facade, &held.revision.?);
+    defer alloc.free(update.json.?);
+    try std.testing.expectEqual(current.revision.?, update.revision);
+    try std.testing.expect(std.mem.indexOf(u8, update.json.?, "archive") != null);
     try std.testing.expectEqual(initial_health.generation + 1, runtime.health().generation);
 
     const ConcurrentReader = struct {

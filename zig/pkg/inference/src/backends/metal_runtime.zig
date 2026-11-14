@@ -13694,7 +13694,7 @@ test "metal DeBERTa MPS attention is budgeted before the flash4 fallback" {
     const function_end = std.mem.indexOfPos(u8, source, function_start, "int termite_metal_decode_runtime_disentangled_relative_attention_backward_f32_device(").?;
     const function_source = source[function_start..function_end];
 
-    const mps_policy = std.mem.indexOf(u8, function_source, "termite_metal_deberta_mps_attention_scratch_max_bytes()").?;
+    const mps_policy = std.mem.indexOf(u8, function_source, "termite_metal_deberta_mps_attention_scratch_max_bytes(runtime)").?;
     const retained_capacity = std.mem.indexOf(u8, function_source, "retained_scratch_bytes > mps_attention_scratch_max_bytes").?;
     const mps_dispatch = std.mem.indexOf(u8, function_source, "encodeToCommandBuffer:command_buffer leftMatrix:packed_q rightMatrix:packed_k resultMatrix:cc").?;
     const flash_dispatch = std.mem.indexOf(u8, function_source, "setComputePipelineState:runtime->disentangled_relative_attention_f32_flash4_pipeline").?;
@@ -19478,6 +19478,30 @@ pub extern fn termite_metal_decode_runtime_memory_snapshot(
     runtime: ?*RawMetalDecodeRuntime,
     snapshot: *RawRuntimeMemoryStats,
 ) c_int;
+extern fn termite_metal_decode_runtime_configure_deberta_cache_limits(runtime: ?*RawMetalDecodeRuntime, packed_bytes: usize, attention_bytes: usize) c_int;
+extern fn termite_metal_decode_runtime_deberta_cache_limits(runtime: ?*RawMetalDecodeRuntime, packed_bytes: *usize, attention_bytes: *usize) c_int;
+
+pub fn configureDebertaCacheLimits(runtime: ?*RawMetalDecodeRuntime, packed_bytes: usize, attention_bytes: usize) !void {
+    if (termite_metal_decode_runtime_configure_deberta_cache_limits(runtime, packed_bytes, attention_bytes) != 0)
+        return error.MetalWorkspaceBusy;
+}
+
+test "GLiNER Decide Metal cache limits cannot change during an active frame" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const raw = provider.raw_decode_runtime orelse return error.TestUnexpectedResult;
+    const policy = @import("../models/gliner_decide_qualification.zig").MetalExecutionPolicy{};
+    try configureDebertaCacheLimits(raw, policy.packed_qkv_cache_bytes, policy.attention_scratch_bytes);
+    try beginFrame(raw);
+    try std.testing.expectError(error.MetalWorkspaceBusy, configureDebertaCacheLimits(raw, 1, 0));
+    try cancelFrame(raw);
+    var packed_limit: usize = 0;
+    var attention: usize = 0;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_deberta_cache_limits(raw, &packed_limit, &attention));
+    try std.testing.expectEqual(policy.packed_qkv_cache_bytes, packed_limit);
+    try std.testing.expectEqual(policy.attention_scratch_bytes, attention);
+}
 pub extern fn termite_metal_decode_runtime_begin_embedding_workspace(runtime: ?*RawMetalDecodeRuntime, bytes: usize) c_int;
 pub extern fn termite_metal_decode_runtime_end_embedding_workspace(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_trim_embedding_workspace(runtime: ?*RawMetalDecodeRuntime) c_int;

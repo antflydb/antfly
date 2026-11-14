@@ -43,6 +43,7 @@ fn readHttpStatusError(status: u16, capability_stale: bool) anyerror {
 }
 
 fn readAntflyHttpError(alloc: Allocator, status: u16, capability_stale: bool, body: []const u8) anyerror {
+    if (document_failure.capacityRefusal(alloc, status, body)) return error.InferenceCapacityUnavailable;
     if (status == 400) {
         if (document_failure.recognized(alloc, body)) |failure| {
             if (failure.cause) |cause|
@@ -2004,4 +2005,12 @@ test "audio source URL schemes ignore case while signed paths and queries stay b
 
 test {
     _ = pipeline_metrics;
+}
+
+test "reader cold start is admission refusal while execution errors remain budgeted" {
+    const a = std.testing.allocator;
+    const body = "{\"error\":\"INFERENCE_STARTING\",\"retryable\":true}";
+    try std.testing.expectEqual(error.InferenceCapacityUnavailable, readAntflyHttpError(a, 503, false, body));
+    try std.testing.expectEqual(error.ReadRequestFailed, readAntflyHttpError(a, 403, false, body));
+    try std.testing.expectEqual(error.ReadTransientFailure, readAntflyHttpError(a, 503, false, "{\"error\":\"MODEL_FAILED\",\"retryable\":true}"));
 }

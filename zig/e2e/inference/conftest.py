@@ -67,7 +67,7 @@ import requests
 
 from .models import (
     DEFAULT_EXTRACTOR_MODEL,
-    bootstrap_models_for_listing,
+    prefetch_test_models,
     inference_server_command,
     maybe_pull_missing_model,
     ml_dir,
@@ -559,6 +559,24 @@ class InferenceServer:
             self.output.close()
 
 
+def _model_provision_plan(items):
+    selected, groups = [], []
+    for item in items:
+        required = tuple(
+            name
+            for marker in item.iter_markers("inference_models")
+            for name in marker.args
+        )
+        if required:
+            # A concrete declaration replaces broad file/family defaults. Keep
+            # module/function markers together as one complete test dependency.
+            groups.append(required)
+        else:
+            marker = item.get_closest_marker("inference_model")
+            selected.append((Path(item.path).name, marker.args[0] if marker else None))
+    return selected, tuple(groups)
+
+
 @pytest.fixture(scope="session")
 def base_url(request):
     """Return the base URL of the inference server under test.
@@ -618,6 +636,8 @@ def base_url(request):
     except RuntimeError:
         pytest.skip("Set ANTFLY_INFERENCE_URL or ANTFLY_BIN to run E2E tests")
 
+    selected, groups = _model_provision_plan(request.session.items)
+    prefetch_test_models(selected, required_model_groups=groups)
     models_path = str(models_dir())
     ml_path = str(ml_dir())
 
@@ -970,10 +990,6 @@ def api(base_url):
             r = self.get("/models", retry_on_missing_model=False)
             _check(r)
             payload = r.json()
-            if bootstrap_models_for_listing(payload):
-                r = self.get("/models", retry_on_missing_model=False)
-                _check(r)
-                payload = r.json()
             return payload
 
         def readyz(self):
@@ -995,6 +1011,10 @@ def pytest_configure(config):
     """Model downloads are handled lazily by the request helpers when enabled."""
     config.addinivalue_line(
         "markers", "inference_model(name): primary model affinity for CI scheduling"
+    )
+    config.addinivalue_line(
+        "markers",
+        "inference_models(*names): concrete curated models required before catalog discovery",
     )
     if os.environ.get("ANTFLY_INFERENCE_DOWNLOAD") == "1":
         print(

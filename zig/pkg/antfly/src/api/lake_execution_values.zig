@@ -30,7 +30,7 @@ pub const Lease = struct {
     discard_checkpoint: ?*const fn (*anyopaque) anyerror!void = null,
 };
 
-pub const BuildPolicy = struct { allow_reuse: bool = true, identity_spill_bytes: u64 = 1024 * 1024 * 1024 };
+pub const BuildPolicy = struct { allow_reuse: bool = true, identity_spill_bytes: u64 = 1024 * 1024 * 1024, fuse_bulk_identity: bool = true, bulk_source_checkpoints: bool = true, bulk_compact_partitions: bool = false, bulk_prebind_parents: bool = true };
 
 /// Reopen physical clients in the execution owner. No reader, scanner, object
 /// store vtable, allocator state, or scheduler handle crosses this contract.

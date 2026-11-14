@@ -2978,3 +2978,32 @@ when evaluating later changes. All 604 native checks and 50 real Parquet/Iceberg
 E2E cases pass against the merged-main runtime. The observation distinguishes
 private reads, tracked memory and native build timing from network, RSS and
 complete publication latency.
+
+
+## Bulk construction recovery and bounded partition routing
+
+Reader protocol 103 adds private `construction` receipts to a build checkpoint.
+Protocol 97–102 serving generations remain readable, but cannot carry these receipts.
+Final publication and catalog validation reject construction work in a serving
+root. Runtime ABI 89 fences the changed catalog and build-policy layouts.
+
+Fresh single authored-vector builds can tee their typed identity scan into
+immutable exact-vector runs and routing scratch. Only a successful complete
+identity proof authorizes the durable source receipt. Restart reconstructs routing
+input from authenticated exact vectors and paged key chunks in producer order;
+only the small root reservoir is uploaded separately. Completed clustering gains
+a second fenced receipt. Ordinary and resumable GC retain both private phases.
+Partial subtrees are disposable; recovery does not claim to resume them.
+
+Bounded canonical regions allow child partitions to contain checked offsets rather
+than duplicate vectors. The same HBC mutation, native serialization, exact-vector
+lookup, and serving readers remain responsible for the final generation. See
+[bulk builder](../docs/design/vector-store/bulk-builder.md) and
+[source storage](../docs/design/vector-store/bulk-source-storage.md) for admission,
+fallback, recovery, and qualification details.
+
+The bulk-builder [review and qualification](../docs/design/vector-store/bulk-builder-review.md)
+records correctness coverage, source metadata-owner reclamation, measured
+publication policy and corpus-scale results. Private construction receipts stay
+non-serving; the completed generation and final metadata fence remain the
+publication boundary.

@@ -16,8 +16,8 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-// Version 88 fences graph table descriptor strides across hosted runtimes.
-pub const abi_version: u32 = 88;
+// Version 89 fences bulk construction receipts and build-policy layouts.
+pub const abi_version: u32 = 89;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -871,6 +871,11 @@ pub const Status = enum(u32) {
     cypher_write_union_unsupported = 911,
     cypher_invalid_regex = 912,
     storage_owner_admission_pending = 913,
+    unsupported_node_filter_query = 914,
+    process_fd_quota_exceeded = 915,
+    system_fd_quota_exceeded = 916,
+    persistent_descriptor_admission_exhausted = 917,
+    storage_descriptor_pressure = 918,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

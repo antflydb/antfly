@@ -322,6 +322,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http unsupported filter query response names the offending node",
         "api http server drop table observes metadata absence before local cleanup",
         "public api smoke integration creates table inserts and queries documents",
+        "public api integration supports hybrid query pruner and reranker",
         "provisioned table write source routes batch writes across ranges",
         "public api integration recreates managed embeddings index after corrupt artifact",
         "public api split integration uses distributed global text stats for bm25 and significant_terms",
@@ -412,12 +413,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "auth row filter resolver expands username references",
         "auth row filter resolver does not parse unused malformed metadata",
         "auth row filter resolver expands metadata references",
+        "auth row filter resolver fails closed for missing or incompatible identity values",
+        "auth row filter validator bounds policy tree depth before materialization",
         "auth row filter resolver shares one bounded metadata expansion budget",
+        "auth row filter resolver expands role references",
         "auth row filter validator accepts username references",
         "auth row filter admission requires executable Zig filter syntax",
         "auth row filter resolver rejects unsupported auth paths",
         "auth row filter validator rejects malformed auth node",
-        "effective resolved row filter prefers table filter before wildcard",
+        "effective resolved row filter combines table and wildcard",
         "artifact operations apply source document row filter visibility",
         "scan line key uses reserved _id document identity",
     };
@@ -1273,6 +1277,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "provisioned stale read admits before routing without a redundant catalog validation",
             "distributed graph source read rejects topology change before aggregation",
             "hosted cross-range graph query expands explicit local start keys",
+            "hosted cross-range graph start set follows final reranking",
             "provisioned reads reject a group removed from the table topology",
             "provisioned table read source rejects uncertified point reads and permits explicit stale reads",
             "catalog backed router skips non-serving relocation placements",
@@ -1294,6 +1299,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "public table batch handler preserves ambiguous write outcomes",
             "public table batch handler maps HA write gate errors",
             "public table batch handler returns concise dense repair backpressure",
+            "public table batch handler returns actionable descriptor pressure",
             "public table api carries borrowed cancellation into batch execution",
             "public create index exposes retryable storage descriptor exhaustion",
             "public create index exposes unsupported deployment capability",
@@ -1366,6 +1372,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "canonical relationship predicates",
             "projected graph endpoint routing recognizes every source form",
             "distributed graph edge reader finds fact owners outside the source endpoint shard",
+            "distributed min-hop paths stream bounded pages and admit each vertex once",
+            "distributed min-hop pages preserve",
+            "distributed min-hop page ownership",
+            "api http graph operator limits",
             "distributed graph edges response round trips owned edges",
             "internal batch parser owns and round trips graph mutations",
             "internal batch graph endpoint cleanup command",
@@ -1402,6 +1412,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_api_graph_snapshot_tests = addFilteredTestRunArtifact(b, lib_api_graph_snapshot_tests);
     const lib_api_graph_snapshot_test_step = b.step("antfly-api-graph-snapshot-test", "Run distributed graph snapshot-vector regression tests");
     lib_api_graph_snapshot_test_step.dependOn(&run_lib_api_graph_snapshot_tests.step);
+    const shortest_path_scale_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, &.{"shortest path production reader scans 122K"}),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-shortest-path-scale-test", "Run the real-reader 10K-node shortest-path budget regression")
+        .dependOn(&addFilteredTestRunArtifact(b, shortest_path_scale_tests).step);
     const lib_api_graph_wire_runtime_filters = &.{"graph hydrate response wire flattens index identity"};
     const lib_api_graph_wire_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -1703,6 +1720,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = @import("runtime_memory.zig").testCompileMaxRss("api-table-write-implementation-tests", b.graph.host.result, target.result, optimize, @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
+    const evaluation_graph_step = b.step("inference-evaluation-graph-test", "Verify final-ranked graph starts in public and cross-range queries");
+    const evaluation_public_graph = b.addRunArtifact(public_api_parity_tests);
+    evaluation_public_graph.addArgs(&.{ "--test-filter", "public api integration supports hybrid query pruner and reranker" });
+    const evaluation_distributed_graph = b.addRunArtifact(write_implementation_tests);
+    evaluation_distributed_graph.addArgs(&.{ "--test-filter", "hosted cross-range graph start set follows final reranking" });
+    @import("../../../build_support/antfly/test_support.zig").configureTestRun(evaluation_public_graph);
+    @import("../../../build_support/antfly/test_support.zig").configureTestRun(evaluation_distributed_graph);
+    evaluation_graph_step.dependOn(&evaluation_public_graph.step);
+    evaluation_graph_step.dependOn(&evaluation_distributed_graph.step);
     const run_api_table_writes_docid_tests = @import("linked_tests.zig").runPair(b, api_table_writes_docid_tests, write_implementation_tests);
     const run_api_table_reads_docid_tests = @import("linked_tests.zig").runPair(b, api_table_reads_linked_tests, write_implementation_tests);
     b.step("antfly-api-table-read-test", "Run table-read routing and internal group contracts").dependOn(&run_api_table_reads_docid_tests.step);
@@ -1994,6 +2020,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "provisioned named index repair keeps group queued for aggregate debt audit",
             "dirty table tracking stays bounded to writer cache ownership",
             "writer cache eviction retires dirty ownership after the last cache owner",
+            "persistent descriptor exhaustion is a retryable writer-open conflict",
             "prepared writer open evicts an inactive sibling group before retrying descriptor pressure",
             "prepared writer open reclaims descriptor capacity from startup cache",
             "forwarded write sources use the local writer owner dirty lifecycle",

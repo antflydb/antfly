@@ -1105,6 +1105,12 @@ pub const Detail = enum(c_int) {
     storage_owner_admission_pending,
     reembed_budget_exceeded,
     reembed_setup_retry,
+    unsupported_node_filter_query,
+    process_fd_quota_exceeded,
+    system_fd_quota_exceeded,
+    storage_descriptor_pressure,
+    input_output,
+    catalog_changed,
 };
 
 pub const Status = extern struct {
@@ -1122,6 +1128,7 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.CatalogChanged => status(.conflict, .catalog_changed),
         error.SqlStatementReadUnavailable => status(.retryable, .sql_statement_read_unavailable),
         error.UnsupportedSqlExecution => status(.unsupported, .unsupported_sql_execution),
         error.ConflictingPrivacyProducerOptions => status(.invalid_argument, .conflicting_privacy_producer_options),
@@ -1758,6 +1765,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.MetricStale => status(.retryable, .metric_stale),
         error.StorageReadTemporarilyUnavailable => status(.retryable, .storage_read_temporarily_unavailable),
         error.PersistentDescriptorAdmissionExhausted => status(.retryable, .persistent_descriptor_admission_exhausted),
+        error.ProcessFdQuotaExceeded => status(.retryable, .process_fd_quota_exceeded),
+        error.SystemFdQuotaExceeded => status(.retryable, .system_fd_quota_exceeded),
+        error.StorageDescriptorPressure => status(.retryable, .storage_descriptor_pressure),
+        error.InputOutput => status(.internal, .input_output),
         error.ResourceRequestTooLarge => status(.invalid_argument, .resource_request_too_large),
         error.ResourceTemporarilyUnavailable => status(.retryable, .resource_temporarily_unavailable),
         error.ConcurrencyUnavailable => status(.retryable, .concurrency_unavailable),
@@ -1816,6 +1827,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.InvalidEnrichmentConfig => status(.invalid_argument, .invalid_enrichment_config),
         error.UnsupportedQueryRequest, error.UnsupportedAggregation => status(.unsupported, .unsupported_query_request),
         error.UnsupportedHierarchyGrouping => status(.unsupported, .unsupported_query_request),
+        error.UnsupportedNodeFilterQuery => status(.invalid_argument, .unsupported_node_filter_query),
         error.UnsupportedFilterQueryRequest => status(.unsupported, .unsupported_filter_query_request),
         error.UnsupportedExclusionQueryRequest => status(.unsupported, .unsupported_exclusion_query_request),
         error.UnsupportedSyncLevel => status(.unsupported, .unsupported_sync_level),
@@ -2851,6 +2863,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_operation => "UnsupportedOperation",
         .unsupported_tensor_type => "UnsupportedTensorType",
         .unsupported_query_request => "UnsupportedQueryRequest",
+        .unsupported_node_filter_query => "UnsupportedNodeFilterQuery",
+        .catalog_changed => "CatalogChanged",
         .unsupported_filter_query_request => "UnsupportedFilterQueryRequest",
         .unsupported_exclusion_query_request => "UnsupportedExclusionQueryRequest",
         .unsupported_sync_level => "UnsupportedSyncLevel",
@@ -2900,6 +2914,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .ha_read_wait_for_apply => "HAReadWaitForApply",
         .ha_read_wait_for_metadata => "HAReadWaitForMetadata",
         .persistent_descriptor_admission_exhausted => "PersistentDescriptorAdmissionExhausted",
+        .process_fd_quota_exceeded => "ProcessFdQuotaExceeded",
+        .system_fd_quota_exceeded => "SystemFdQuotaExceeded",
+        .storage_descriptor_pressure => "StorageDescriptorPressure",
+        .input_output => "InputOutput",
         .invalid_graph_edges => "InvalidGraphEdges",
         .invalid_table_index_metadata => "InvalidTableIndexMetadata",
         .transaction_begin_failed => "TransactionBeginFailed",
@@ -3796,4 +3814,32 @@ test "storage owner lease admission retains retryability across runtime callback
     try std.testing.expectEqual(@backingInt(Code.retryable), wire.code);
     try std.testing.expect(errorHasStableDetail(error.StorageOwnerAdmissionPending));
     try std.testing.expectEqual(error.StorageOwnerAdmissionPending, errorFromStatus(wire));
+}
+
+test "unsupported graph node filter survives the runtime boundary as a client error" {
+    const wire = statusFromError(error.UnsupportedNodeFilterQuery);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), wire.code);
+    try std.testing.expectEqual(error.UnsupportedNodeFilterQuery, errorFromStatus(wire));
+    try std.testing.expect(errorHasStableDetail(error.UnsupportedNodeFilterQuery));
+}
+
+test "backup catalog conflicts retain their identity across runtime archives" {
+    const wire = statusFromError(error.CatalogChanged);
+    try std.testing.expectEqual(@backingInt(Code.conflict), wire.code);
+    try std.testing.expectEqual(error.CatalogChanged, errorFromStatus(wire));
+    try std.testing.expect(errorHasStableDetail(error.CatalogChanged));
+}
+
+test "descriptor exhaustion retains retryable public runtime identity" {
+    inline for (.{ error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.StorageDescriptorPressure }) |err| {
+        const value = statusFromError(err);
+        try std.testing.expectEqual(@backingInt(Code.retryable), value.code);
+        try std.testing.expectEqual(err, errorFromStatus(value));
+    }
+}
+
+test "positional IO errors preserve identity without becoming retryable pressure" {
+    const value = statusFromError(error.InputOutput);
+    try std.testing.expectEqual(@backingInt(Code.internal), value.code);
+    try std.testing.expectEqual(error.InputOutput, errorFromStatus(value));
 }

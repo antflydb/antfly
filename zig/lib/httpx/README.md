@@ -65,6 +65,23 @@ pub fn main() !void {
 }
 ```
 
+Buffered responses own their body separately from headers. Use
+`response.takeBodyAlloc(allocator)` to consume a body: it transfers the original
+buffer when allocation domains match, or copies into the destination before
+releasing the original. On allocation failure the response retains ownership.
+`response.deinit()` remains required to release headers. Borrowed bodies are
+always copied by this method.
+
+Gzip decoding handles concatenated members and verifies each member's CRC32 and
+uncompressed size. Encoded and decoded ceilings cover the whole response, for
+both buffered and writer APIs. Wrapped deflate also verifies Adler-32 while
+retaining raw-deflate fallback. A known oversized encoded Content-Length is
+rejected before body collection. Writer APIs can emit a prefix before discovering
+a late checksum/framing error; callers must treat an error as incomplete output.
+Connection-close framing terminates the HTTP body, but never substitutes for a
+complete compressed stream: truncated raw deflate, zlib, and gzip return errors
+through both APIs, just as they do with Content-Length or chunked framing.
+
 ### Server
 
 ```zig

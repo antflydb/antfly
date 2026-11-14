@@ -15530,9 +15530,21 @@ paths:
 
         writing fails after the HTTP response starts, the server instead emits
 
-        an `event: error` frame whose data is a plain-text error message, then
+        an `event: error` frame and closes without a `[DONE]` frame. Permanent
 
-        closes the stream without a `[DONE]` frame.
+        inference-budget failures carry a JSON `Error` object with
+
+        `error: MODEL_RESOURCE_LIMIT` (admission policy) or
+
+        `error: MEMORY_BUDGET_EXCEEDED` (request working set), `retryable: false`,
+
+        and, when known, `budget`, `required_bytes`, and `limit_bytes`.
+
+        The HTTP status remains
+
+        unchanged once streaming starts. Clients must also accept plain-text
+
+        error frames from older servers and other failure paths.
 
 
         ## Input Format
@@ -35723,7 +35735,16 @@ components:
 
             - `0.5` = balanced default
 
-            - `1.0` = highest recall
+            - `1.0` = exact dense top-k over the eligible indexed vectors
+
+
+            Full effort on dense HBC indexes establishes exactness using certified bounds and
+
+            authoritative scoring. It may examine every eligible vector;
+
+            latency scales with corpus size and can be substantially higher
+
+            than approximate search at values below `1.0`.
 
 
             When omitted, Antfly uses the balanced default effort (`0.5`) unless
@@ -43617,6 +43638,12 @@ components:
         - best_effort
       default: strict
       description: How generation-scoped source outcomes determine derived-index completeness.
+    LakeBulkBuildAlgorithm:
+      type: string
+      enum:
+        - lloyd
+        - emeans
+      description: Offline clustering algorithm for fresh native Parquet lake HBC indexes.
     ArtifactIndexSource:
       type: object
       additionalProperties: false
@@ -43811,6 +43838,19 @@ components:
           default: false
           description: When true, creates a sparse (SPLADE) inverted index. When false (default), creates
             a dense HBC vector index.
+        lake_bulk_build:
+          $ref: '#/components/schemas/LakeBulkBuildAlgorithm'
+          description: Optional offline clustering algorithm for fresh native Parquet lake HBC indexes.
+            Both algorithms train on bounded samples and partition the corpus on disk. E-means requires
+            l2_squared distance. Existing generations continue to use incremental updates.
+        lake_bulk_build_max_input_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Total vector and identity bytes admitted for a fresh offline lake build, with a
+            server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora.
+            Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this
+            input allowance.
         dimension:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -46608,6 +46648,12 @@ components:
         sparse:
           type: boolean
           default: false
+        lake_bulk_build:
+          $ref: '#/components/schemas/LakeBulkBuildAlgorithm'
+        lake_bulk_build_max_input_bytes:
+          type: integer
+          format: int64
+          minimum: 1
         dimension:
           type: integer
           minimum: 1
@@ -54973,6 +55019,21 @@ components:
         stage:
           type: string
           description: Extraction failure stage, when known
+        budget:
+          type: string
+          description: Blocking inference budget (host, backend, combined, scratch, or kv), when known
+        required_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Required working-set bytes, including resident resources, for the blocking budget
+        limit_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+          description: Configured bytes allowed by the blocking budget
     InferenceTransientCapacityError:
       type: object
       description: Actionable retry contract for temporary inference-capacity failures.
@@ -69543,26 +69604,31 @@ components:
         uri:
           type: string
           maxLength: 16384
-          description: HTTP(S) or S3 object URI resolved through configured content security and credentials.
+          description: HTTP(S), S3, or absolute file:// URI resolved through configured content security
+            and credentials. Local files require an explicit remote_content.security.allowed_paths allowlist.
         mime_type:
           type: string
         version:
           type: string
           minLength: 1
           maxLength: 4096
-          description: Quoted strong HTTP/S3 ETag or immutable S3 version ID; enforced on every range
-            read.
+          description: Quoted strong HTTP/S3 ETag, immutable S3 version ID, or lowercase SHA-256 hex digest
+            for file_sha256. Local files are verified in a bounded streaming scan; unchanged files reuse
+            a bounded process-local verification cache across continuation pages. Size, inode, mtime and
+            ctime are checked around every range read.
         version_kind:
           type: string
           enum:
             - strong_etag
             - s3_version_id
-          description: Defaults to strong_etag. S3 version IDs are supported only for S3 sources.
+            - file_sha256
+          description: Defaults to strong_etag. S3 version IDs require S3 sources; file_sha256 requires
+            a local file URI.
         length:
           type: integer
           format: int64
           minimum: 1
-          description: Exact immutable object length, verified against Content-Range.
+          description: Exact immutable object length, verified against Content-Range or local file metadata.
     ChunkEmbeddingContext:
       type: object
       required:

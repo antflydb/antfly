@@ -5392,14 +5392,14 @@ pub const ChunkOutputs = struct {
 
 pub const ChunkSourceReference = struct {
     type: []const u8,
-    /// HTTP(S) or S3 object URI resolved through configured content security and credentials.
+    /// HTTP(S), S3, or absolute file:// URI resolved through configured content security and credentials. Local files require an explicit remote_content.security.allowed_paths allowlist.
     uri: []const u8,
     mime_type: []const u8,
-    /// Quoted strong HTTP/S3 ETag or immutable S3 version ID; enforced on every range read.
+    /// Quoted strong HTTP/S3 ETag, immutable S3 version ID, or lowercase SHA-256 hex digest for file_sha256. Local files are verified in a bounded streaming scan; unchanged files reuse a bounded process-local verification cache across continuation pages. Size, inode, mtime and ctime are checked around every range read.
     version: []const u8,
-    /// Defaults to strong_etag. S3 version IDs are supported only for S3 sources.
+    /// Defaults to strong_etag. S3 version IDs require S3 sources; file_sha256 requires a local file URI.
     version_kind: ?[]const u8 = null,
-    /// Exact immutable object length, verified against Content-Range.
+    /// Exact immutable object length, verified against Content-Range or local file metadata.
     length: i64,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -7861,6 +7861,10 @@ pub const CreateEmbeddingsIndexRequest = struct {
     external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
+    /// Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates.
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    /// Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
@@ -7906,6 +7910,8 @@ pub const CreateEmbeddingsIndexRequest = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -7967,6 +7973,14 @@ pub const CreateEmbeddingsIndexRequest = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -8690,6 +8704,8 @@ pub const CreatedEmbeddingsIndex = struct {
     external: ?bool = null,
     external_vector_space: ?[]const u8 = null,
     sparse: ?bool = null,
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
@@ -8722,6 +8738,8 @@ pub const CreatedEmbeddingsIndex = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -8783,6 +8801,14 @@ pub const CreatedEmbeddingsIndex = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -8862,6 +8888,8 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     external: ?bool = null,
     external_vector_space: ?[]const u8 = null,
     sparse: ?bool = null,
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
@@ -8889,6 +8917,8 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -8935,6 +8965,14 @@ pub const CreatedEmbeddingsIndexConfig = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -14653,6 +14691,10 @@ pub const EmbeddingsIndexConfig = struct {
     external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
+    /// Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates.
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    /// Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
@@ -14694,6 +14736,8 @@ pub const EmbeddingsIndexConfig = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "field", "field", true },
         .{ "sources", "sources", true },
@@ -14742,6 +14786,14 @@ pub const EmbeddingsIndexConfig = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -21896,7 +21948,7 @@ pub const GlobalStatefulQueryRequest = struct {
     aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
     /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
-    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
+    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = exact dense top-k over the eligible indexed vectors Full effort on dense HBC indexes establishes exactness using certified bounds and authoritative scoring. It may examine every eligible vector; latency scales with corpus size and can be substantially higher than approximate search at values below `1.0`. When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
     /// Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging.
     select: ?std.json.Value = null,
@@ -28311,6 +28363,10 @@ pub const IndexConfig = struct {
     external_vector_space: ?[]const u8 = null,
     /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense HBC vector index.
     sparse: ?bool = null,
+    /// Optional offline clustering algorithm for fresh native Parquet lake HBC indexes. Both algorithms train on bounded samples and partition the corpus on disk. E-means requires l2_squared distance. Existing generations continue to use incremental updates.
+    lake_bulk_build: ?LakeBulkBuildAlgorithm = null,
+    /// Total vector and identity bytes admitted for a fresh offline lake build, with a server default of 512 MiB. Requires lake_bulk_build. Raise this limit for larger corpora. Live builder allocations remain capped at 256 MiB. Generation output is capped at twice this input allowance.
+    lake_bulk_build_max_input_bytes: ?i64 = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
     /// Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
@@ -28384,6 +28440,8 @@ pub const IndexConfig = struct {
         .{ "external", "external", true },
         .{ "external_vector_space", "external_vector_space", true },
         .{ "sparse", "sparse", true },
+        .{ "lake_bulk_build", "lake_bulk_build", true },
+        .{ "lake_bulk_build_max_input_bytes", "lake_bulk_build_max_input_bytes", true },
         .{ "dimension", "dimension", true },
         .{ "embedding_name", "embedding_name", true },
         .{ "source_artifact_name", "source_artifact_name", true },
@@ -28484,6 +28542,14 @@ pub const IndexConfig = struct {
         }
         if (self.sparse) |value| {
             try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build) |value| {
+            try jw.objectField("lake_bulk_build");
+            try jw.write(value);
+        }
+        if (self.lake_bulk_build_max_input_bytes) |value| {
+            try jw.objectField("lake_bulk_build_max_input_bytes");
             try jw.write(value);
         }
         if (self.dimension) |value| {
@@ -32042,6 +32108,12 @@ pub const InferenceError = struct {
     input_index: ?i64 = null,
     /// Extraction failure stage, when known
     stage: ?[]const u8 = null,
+    /// Blocking inference budget (host, backend, combined, scratch, or kv), when known
+    budget: ?[]const u8 = null,
+    /// Required working-set bytes, including resident resources, for the blocking budget
+    required_bytes: ?u64 = null,
+    /// Configured bytes allowed by the blocking budget
+    limit_bytes: ?u64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -32052,6 +32124,9 @@ pub const InferenceError = struct {
         .{ "retry_after_ms", "retry_after_ms", true },
         .{ "input_index", "input_index", true },
         .{ "stage", "stage", true },
+        .{ "budget", "budget", true },
+        .{ "required_bytes", "required_bytes", true },
+        .{ "limit_bytes", "limit_bytes", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -32088,6 +32163,18 @@ pub const InferenceError = struct {
         }
         if (self.stage) |value| {
             try jw.objectField("stage");
+            try jw.write(value);
+        }
+        if (self.budget) |value| {
+            try jw.objectField("budget");
+            try jw.write(value);
+        }
+        if (self.required_bytes) |value| {
+            try jw.objectField("required_bytes");
+            try jw.write(value);
+        }
+        if (self.limit_bytes) |value| {
+            try jw.objectField("limit_bytes");
             try jw.write(value);
         }
         try jw.endObject();
@@ -35863,6 +35950,32 @@ pub const KeyRange = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// Offline clustering algorithm for fresh native Parquet lake HBC indexes.
+pub const LakeBulkBuildAlgorithm = enum {
+    lloyd,
+    emeans,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .lloyd => "lloyd",
+            .emeans => "emeans",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "lloyd", .lloyd },
+            .{ "emeans", .emeans },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
@@ -47708,7 +47821,7 @@ pub const QueryRequest = struct {
     aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
     /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
-    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
+    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = exact dense top-k over the eligible indexed vectors Full effort on dense HBC indexes establishes exactness using certified bounds and authoritative scoring. It may examine every eligible vector; latency scales with corpus size and can be substantially higher than approximate search at values below `1.0`. When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
     /// Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging.
     select: ?std.json.Value = null,
@@ -57447,7 +57560,7 @@ pub const StatefulQueryRequest = struct {
     aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
     /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
     embeddings: ?std.json.ArrayHashMap(Embedding) = null,
-    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
+    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = exact dense top-k over the eligible indexed vectors Full effort on dense HBC indexes establishes exactness using certified bounds and authoritative scoring. It may examine every eligible vector; latency scales with corpus size and can be substantially higher than approximate search at values below `1.0`. When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
     search_effort: ?f32 = null,
     /// Pure named output expressions evaluated after final filtering, ranking and pagination; returned in _computed. Compatible with fields, which selects stored _source. Uses the SQL scalar engine and lazy CASE branches. Aliases may reference other select aliases with ref; cycles and collisions with evaluate.compute are rejected. Does not change hit membership or paging.
     select: ?std.json.Value = null,

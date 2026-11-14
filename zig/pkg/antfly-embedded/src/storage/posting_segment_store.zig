@@ -1012,6 +1012,18 @@ pub const Store = struct {
         return self.prepareCheckpointInternalMode(segment_generation, covered_source_sequence, null, flattened_wal_bytes, staged, mode);
     }
 
+    /// Bootstraps a complete immutable generation from a durable streaming
+    /// receipt. CURRENT remains unchanged until commitPrepared succeeds.
+    pub fn prepareStagedCheckpoint(
+        self: *Store,
+        segment_generation: u64,
+        covered_source_sequence: u64,
+        staged: StagedCheckpointSegment,
+    ) !PreparedPublication {
+        if (self.read_only) return error.ReadOnly;
+        return self.prepareCheckpointInternalMode(segment_generation, covered_source_sequence, null, null, staged, .full);
+    }
+
     pub fn prepareCheckpoint(self: *Store, segment_generation: u64, covered_source_sequence: u64, segment_bytes: []const u8) !PreparedPublication {
         if (self.read_only) return error.ReadOnly;
         return self.prepareCheckpointInternalMode(segment_generation, covered_source_sequence, segment_bytes, null, null, .full);

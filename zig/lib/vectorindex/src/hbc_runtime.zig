@@ -181,6 +181,19 @@ pub const NativeProjectionPlane = struct {
     /// residual checksum.
     residual_locations: ?NativeResidualLocationPlane = null,
 
+    pub fn slice(self: @This(), start: usize, end: usize) @This() {
+        return .{
+            .dims = self.dims,
+            .values = self.values[start * self.dims .. end * self.dims],
+            .scales = self.scales[start..end],
+            .error_norms = self.error_norms[start..end],
+            .decoded_norm_lower_bounds = self.decoded_norm_lower_bounds[start..end],
+            .checksums = if (self.checksums.len == 0) &.{} else self.checksums[start..end],
+            .verification = if (self.verification) |states| states[start..end] else null,
+            .residual_locations = if (self.residual_locations) |locations| locations.slice(start, end) else null,
+        };
+    }
+
     pub fn validateRow(self: @This(), row: usize) !void {
         if (row >= self.scales.len or row >= self.checksums.len or self.dims == 0 or
             row >= self.values.len / self.dims) return error.InvalidQuantizedDirectory;
@@ -260,6 +273,17 @@ pub const NativeProjectionBuildSource = struct {
 pub const WriteProfile = struct {
     bulk_build_store_ns: u64 = 0,
     bulk_build_tree_ns: u64 = 0,
+    bulk_spool_partition_bytes: u64 = 0,
+    bulk_spool_partition_read_bytes: u64 = 0,
+    bulk_projection_commit_ns: u64 = 0,
+    bulk_spool_compact_rows: u64 = 0,
+    bulk_build_leaf_cluster_ns: u64 = 0,
+    bulk_build_leaf_training_rows: usize = 0,
+    bulk_build_leaf_training_ns: u64 = 0,
+    bulk_build_leaf_route_ns: u64 = 0,
+    bulk_build_leaf_count: usize = 0,
+    bulk_build_leaf_min_members: usize = 0,
+    bulk_build_leaf_max_members: usize = 0,
     kmeans_assignment_calls: u64 = 0,
     kmeans_assignment_cpu_calls: u64 = 0,
     kmeans_assignment_metal_calls: u64 = 0,
@@ -305,6 +329,8 @@ pub const WriteProfile = struct {
     split_leaf_ns: u64 = 0,
     split_leaf_vector_load_ns: u64 = 0,
     split_leaf_partition_ns: u64 = 0,
+    emeans_leaf_split_calls: u64 = 0,
+    emeans_leaf_split_rebalances: u64 = 0,
     split_leaf_finalize_ns: u64 = 0,
     split_internal_ns: u64 = 0,
     insert_calls: u64 = 0,
@@ -432,12 +458,12 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     @import("antfly_platform").sync.lockYielding(mutex);
 }
 
-fn nodeCacheValueType(self: anytype) type {
-    return @FieldType(@TypeOf(self.node_cache).KV, "value");
+fn nodeCacheValueType(comptime Self: type) type {
+    return @FieldType(@FieldType(@typeInfo(Self).pointer.child, "node_cache").KV, "value");
 }
 
-fn quantizedCacheValueType(self: anytype) type {
-    return @FieldType(@TypeOf(self.quantized_cache).KV, "value");
+fn quantizedCacheValueType(comptime Self: type) type {
+    return @FieldType(@FieldType(@typeInfo(Self).pointer.child, "quantized_cache").KV, "value");
 }
 
 fn nodeCacheValuePtr(value_ptr: anytype) *types.Node {
@@ -494,8 +520,8 @@ fn cloneQuantizedCacheValue(value_ptr: anytype, alloc: Allocator) !QuantizedSet 
     return try quantizedCacheValuePtr(value_ptr).clone(alloc);
 }
 
-fn initNodeCacheValue(self: anytype, node: types.Node) !nodeCacheValueType(self) {
-    const Value = comptime nodeCacheValueType(self);
+fn initNodeCacheValue(self: anytype, node: types.Node) !nodeCacheValueType(@TypeOf(self)) {
+    const Value = comptime nodeCacheValueType(@TypeOf(self));
     return switch (@typeInfo(Value)) {
         .pointer => blk: {
             const entry = try self.alloc.create(@typeInfo(Value).pointer.child);
@@ -506,8 +532,8 @@ fn initNodeCacheValue(self: anytype, node: types.Node) !nodeCacheValueType(self)
     };
 }
 
-fn initQuantizedCacheValue(self: anytype, qs: QuantizedSet) !quantizedCacheValueType(self) {
-    const Value = comptime quantizedCacheValueType(self);
+fn initQuantizedCacheValue(self: anytype, qs: QuantizedSet) !quantizedCacheValueType(@TypeOf(self)) {
+    const Value = comptime quantizedCacheValueType(@TypeOf(self));
     return switch (@typeInfo(Value)) {
         .pointer => blk: {
             const entry = try self.alloc.create(@typeInfo(Value).pointer.child);
@@ -526,7 +552,7 @@ pub fn clearNodeCache(self: anytype) void {
     self.node_cache_slots.deinit(self.alloc);
     self.node_cache_slots = .empty;
     @memset(self.node_clock_keys, 0);
-    @memset(self.node_clock_refs, false);
+    @memset(self.node_clock_states, .empty);
     self.node_clock_hand = 0;
 }
 
@@ -538,7 +564,7 @@ pub fn clearQuantizedCache(self: anytype) void {
     self.quantized_cache_slots.deinit(self.alloc);
     self.quantized_cache_slots = .empty;
     @memset(self.quantized_clock_keys, 0);
-    @memset(self.quantized_clock_refs, false);
+    @memset(self.quantized_clock_states, .empty);
     self.quantized_clock_hand = 0;
 }
 
@@ -550,7 +576,7 @@ pub fn clearVectorCache(self: anytype) void {
     self.vector_cache_slots.deinit(self.alloc);
     self.vector_cache_slots = .empty;
     @memset(self.vector_clock_keys, 0);
-    @memset(self.vector_clock_refs, false);
+    @memset(self.vector_clock_states, .empty);
     self.vector_clock_hand = 0;
 }
 
@@ -562,14 +588,14 @@ pub fn clearMetadataCache(self: anytype) void {
     self.metadata_cache_slots.deinit(self.alloc);
     self.metadata_cache_slots = .empty;
     @memset(self.metadata_clock_keys, 0);
-    @memset(self.metadata_clock_refs, false);
+    @memset(self.metadata_clock_states, .empty);
     self.metadata_clock_hand = 0;
 }
 
 pub fn invalidateNodeCache(self: anytype, node_id: u64) void {
     if (self.node_cache_slots.fetchRemove(node_id)) |removed_slot| {
         self.node_clock_keys[removed_slot.value] = 0;
-        self.node_clock_refs[removed_slot.value] = false;
+        self.node_clock_states[removed_slot.value] = .empty;
     }
     if (self.node_cache.fetchRemove(node_id)) |removed| deinitNodeCacheValue(self.alloc, removed.value);
 }
@@ -577,7 +603,7 @@ pub fn invalidateNodeCache(self: anytype, node_id: u64) void {
 pub fn invalidateQuantizedCache(self: anytype, node_id: u64) void {
     if (self.quantized_cache_slots.fetchRemove(node_id)) |removed_slot| {
         self.quantized_clock_keys[removed_slot.value] = 0;
-        self.quantized_clock_refs[removed_slot.value] = false;
+        self.quantized_clock_states[removed_slot.value] = .empty;
     }
     if (self.quantized_cache.fetchRemove(node_id)) |removed| deinitQuantizedCacheValue(self.alloc, removed.value);
 }
@@ -585,7 +611,7 @@ pub fn invalidateQuantizedCache(self: anytype, node_id: u64) void {
 pub fn invalidateVectorCache(self: anytype, vector_id: u64) void {
     if (self.vector_cache_slots.fetchRemove(vector_id)) |removed_slot| {
         self.vector_clock_keys[removed_slot.value] = 0;
-        self.vector_clock_refs[removed_slot.value] = false;
+        self.vector_clock_states[removed_slot.value] = .empty;
     }
     if (self.vector_cache.fetchRemove(vector_id)) |removed| self.alloc.free(removed.value);
 }
@@ -593,57 +619,65 @@ pub fn invalidateVectorCache(self: anytype, vector_id: u64) void {
 pub fn invalidateMetadataCache(self: anytype, vector_id: u64) void {
     if (self.metadata_cache_slots.fetchRemove(vector_id)) |removed_slot| {
         self.metadata_clock_keys[removed_slot.value] = 0;
-        self.metadata_clock_refs[removed_slot.value] = false;
+        self.metadata_clock_states[removed_slot.value] = .empty;
     }
     if (self.metadata_cache.fetchRemove(vector_id)) |removed| self.alloc.free(removed.value);
 }
 
-fn touchClock(refs: []bool, slot_map: anytype, key: u64) void {
-    if (slot_map.get(key)) |slot| refs[slot] = true;
-}
-
-fn claimClockSlot(clock_keys: []u64, start_slot: usize, key: u64) ?usize {
-    if (clock_keys.len == 0) return null;
-    for (0..clock_keys.len) |offset| {
-        const slot = (start_slot + offset) % clock_keys.len;
-        const slot_key = clock_keys[slot];
-        if (slot_key == 0) {
-            clock_keys[slot] = key;
-            return slot;
+/// Shared local-cache clock. Occupancy is independent of the full u64 key,
+/// and replacing a victim always rebinds the reserved slot before publication.
+pub const Clock = struct {
+    pub const State = enum(u8) { empty, referenced, cold };
+    pub const NoProtection = struct {
+        pub fn protects(_: @This(), _: u64) bool {
+            return false;
         }
-    }
-    return null;
-}
-
-fn evictClockVictim(
-    clock_keys: []u64,
-    clock_refs: []bool,
-    hand: *usize,
-) ?u64 {
-    if (clock_keys.len == 0) return null;
-    var scanned: usize = 0;
-    const limit = clock_keys.len * 2;
-    while (scanned < limit) : (scanned += 1) {
-        const slot = hand.*;
-        const key = clock_keys[slot];
-        if (key != 0) {
-            if (clock_refs[slot]) {
-                clock_refs[slot] = false;
-            } else {
-                hand.* = (slot + 1) % clock_keys.len;
-                return key;
+    };
+    pub fn victim(keys: []const u64, states: []State, hand: *usize, protection: anytype) ?u64 {
+        if (keys.len == 0) return null;
+        var scanned: usize = 0;
+        while (scanned < keys.len * 2) : (scanned += 1) {
+            const slot = hand.*;
+            const key = keys[slot];
+            if (states[slot] != .empty and !protection.protects(key)) {
+                if (states[slot] == .referenced) states[slot] = .cold else {
+                    hand.* = (slot + 1) % keys.len;
+                    return key;
+                }
             }
+            hand.* = (slot + 1) % keys.len;
         }
-        hand.* = (slot + 1) % clock_keys.len;
+        return null;
     }
-    return null;
+    pub fn claim(keys: []u64, states: []State, start: usize, key: u64, reserved: ?usize) ?usize {
+        if (keys.len == 0) return null;
+        const slot = reserved orelse find_empty: {
+            for (0..keys.len) |offset| {
+                const candidate = (start + offset) % keys.len;
+                if (states[candidate] == .empty) break :find_empty candidate;
+            }
+            return null;
+        };
+        std.debug.assert(states[slot] == .empty);
+        keys[slot] = key;
+        states[slot] = .referenced;
+        return slot;
+    }
+};
+
+fn touchClock(states: []Clock.State, slot_map: anytype, key: u64) void {
+    if (slot_map.get(key)) |slot| states[slot] = .referenced;
+}
+
+fn evictClockVictim(keys: []u64, states: []Clock.State, hand: *usize) ?u64 {
+    return Clock.victim(keys, states, hand, Clock.NoProtection{});
 }
 
 fn ensureNodeCacheCapacity(self: anytype, key: u64) ?usize {
     if (self.config.max_cached_nodes == 0) return null;
     if (self.node_cache.contains(key)) return null;
     while (self.node_cache.count() >= self.config.max_cached_nodes) {
-        const victim = evictClockVictim(self.node_clock_keys, self.node_clock_refs, &self.node_clock_hand) orelse break;
+        const victim = evictClockVictim(self.node_clock_keys, self.node_clock_states, &self.node_clock_hand) orelse break;
         const slot = self.node_cache_slots.get(victim).?;
         invalidateNodeCache(self, victim);
         return slot;
@@ -655,7 +689,7 @@ fn ensureQuantizedCacheCapacity(self: anytype, key: u64) ?usize {
     if (self.config.max_cached_nodes == 0) return null;
     if (self.quantized_cache.contains(key)) return null;
     while (self.quantized_cache.count() >= self.config.max_cached_nodes) {
-        const victim = evictClockVictim(self.quantized_clock_keys, self.quantized_clock_refs, &self.quantized_clock_hand) orelse break;
+        const victim = evictClockVictim(self.quantized_clock_keys, self.quantized_clock_states, &self.quantized_clock_hand) orelse break;
         const slot = self.quantized_cache_slots.get(victim).?;
         invalidateQuantizedCache(self, victim);
         return slot;
@@ -667,7 +701,7 @@ fn ensureVectorCacheCapacity(self: anytype, key: u64) ?usize {
     if (self.config.max_cached_vectors == 0) return null;
     if (self.vector_cache.contains(key)) return null;
     while (self.vector_cache.count() >= self.config.max_cached_vectors) {
-        const victim = evictClockVictim(self.vector_clock_keys, self.vector_clock_refs, &self.vector_clock_hand) orelse break;
+        const victim = evictClockVictim(self.vector_clock_keys, self.vector_clock_states, &self.vector_clock_hand) orelse break;
         const slot = self.vector_cache_slots.get(victim).?;
         invalidateVectorCache(self, victim);
         return slot;
@@ -679,7 +713,7 @@ fn ensureMetadataCacheCapacity(self: anytype, key: u64) ?usize {
     if (self.config.max_cached_metadata == 0) return null;
     if (self.metadata_cache.contains(key)) return null;
     while (self.metadata_cache.count() >= self.config.max_cached_metadata) {
-        const victim = evictClockVictim(self.metadata_clock_keys, self.metadata_clock_refs, &self.metadata_clock_hand) orelse break;
+        const victim = evictClockVictim(self.metadata_clock_keys, self.metadata_clock_states, &self.metadata_clock_hand) orelse break;
         const slot = self.metadata_cache_slots.get(victim).?;
         invalidateMetadataCache(self, victim);
         return slot;
@@ -691,7 +725,7 @@ pub fn getCachedNodeClone(self: anytype, node_id: u64) !?types.Node {
     self.cache_mu.lockExclusive();
     defer self.cache_mu.unlockExclusive();
     if (self.node_cache.getPtr(node_id)) |cached| {
-        touchClock(self.node_clock_refs, self.node_cache_slots, node_id);
+        touchClock(self.node_clock_states, self.node_cache_slots, node_id);
         return try cloneNodeCacheValue(cached, self.alloc);
     }
     return null;
@@ -701,7 +735,7 @@ pub fn getCachedQuantizedClone(self: anytype, node_id: u64) !?QuantizedSet {
     self.cache_mu.lockExclusive();
     defer self.cache_mu.unlockExclusive();
     if (self.quantized_cache.getPtr(node_id)) |cached| {
-        touchClock(self.quantized_clock_refs, self.quantized_cache_slots, node_id);
+        touchClock(self.quantized_clock_states, self.quantized_cache_slots, node_id);
         return try cloneQuantizedCacheValue(cached, self.alloc);
     }
     return null;
@@ -711,7 +745,7 @@ pub fn getCachedMetadata(self: anytype, vector_id: u64) ?[]const u8 {
     self.cache_mu.lockExclusive();
     defer self.cache_mu.unlockExclusive();
     if (self.metadata_cache.get(vector_id)) |cached| {
-        touchClock(self.metadata_clock_refs, self.metadata_cache_slots, vector_id);
+        touchClock(self.metadata_clock_states, self.metadata_cache_slots, vector_id);
         return cached;
     }
     return null;
@@ -721,73 +755,76 @@ pub fn cacheNode(self: anytype, node: *const types.Node) !void {
     self.cache_mu.lockExclusive();
     defer self.cache_mu.unlockExclusive();
     if (self.config.max_cached_nodes == 0) return;
-    const reserved_slot = ensureNodeCacheCapacity(self, node.id);
+    try self.node_cache.ensureUnusedCapacity(self.alloc, 1);
+    try self.node_cache_slots.ensureUnusedCapacity(self.alloc, 1);
+    var cloned = try node.clone(self.alloc);
+    var owns_clone = true;
+    errdefer if (owns_clone) cloned.deinit(self.alloc);
+    const value = try initNodeCacheValue(self, cloned);
+    owns_clone = false;
+    errdefer deinitNodeCacheValue(self.alloc, value);
+    const reserved = ensureNodeCacheCapacity(self, node.id);
     invalidateNodeCache(self, node.id);
-    const cached_value = try initNodeCacheValue(self, try node.clone(self.alloc));
-    errdefer deinitNodeCacheValue(self.alloc, cached_value);
-    try self.node_cache.put(self.alloc, node.id, cached_value);
-    const slot = reserved_slot orelse claimClockSlot(self.node_clock_keys, self.node_clock_hand, node.id) orelse return error.CacheDisabled;
-    self.node_clock_refs[slot] = true;
-    try self.node_cache_slots.put(self.alloc, node.id, slot);
+    const slot = Clock.claim(self.node_clock_keys, self.node_clock_states, self.node_clock_hand, node.id, reserved) orelse return error.CacheDisabled;
+    self.node_cache.putAssumeCapacity(node.id, value);
+    self.node_cache_slots.putAssumeCapacity(node.id, slot);
 }
 
 pub fn cacheQuantized(self: anytype, node_id: u64, qs: *const QuantizedSet) !void {
-    self.cache_mu.lockExclusive();
-    defer self.cache_mu.unlockExclusive();
     if (self.config.max_cached_nodes == 0) return;
-    const reserved_slot = ensureQuantizedCacheCapacity(self, node_id);
-    invalidateQuantizedCache(self, node_id);
-    const cached_value = try initQuantizedCacheValue(self, try qs.clone(self.alloc));
-    errdefer deinitQuantizedCacheValue(self.alloc, cached_value);
-    try self.quantized_cache.put(self.alloc, node_id, cached_value);
-    const slot = reserved_slot orelse claimClockSlot(self.quantized_clock_keys, self.quantized_clock_hand, node_id) orelse return error.CacheDisabled;
-    self.quantized_clock_refs[slot] = true;
-    try self.quantized_cache_slots.put(self.alloc, node_id, slot);
+    // The owned helper consumes its argument on success and failure.
+    try cacheQuantizedOwned(self, node_id, try qs.clone(self.alloc));
 }
 
 pub fn cacheQuantizedOwned(self: anytype, node_id: u64, qs: QuantizedSet) !void {
     var owned = qs;
-    errdefer owned.deinit(self.alloc);
+    var owns_payload = true;
+    errdefer if (owns_payload) owned.deinit(self.alloc);
     self.cache_mu.lockExclusive();
     defer self.cache_mu.unlockExclusive();
     if (self.config.max_cached_nodes == 0) return error.CacheDisabled;
-    const reserved_slot = ensureQuantizedCacheCapacity(self, node_id);
+    try self.quantized_cache.ensureUnusedCapacity(self.alloc, 1);
+    try self.quantized_cache_slots.ensureUnusedCapacity(self.alloc, 1);
+    const value = try initQuantizedCacheValue(self, owned);
+    owns_payload = false;
+    errdefer deinitQuantizedCacheValue(self.alloc, value);
+    const reserved = ensureQuantizedCacheCapacity(self, node_id);
     invalidateQuantizedCache(self, node_id);
-    const cached_value = try initQuantizedCacheValue(self, owned);
-    errdefer deinitQuantizedCacheValue(self.alloc, cached_value);
-    try self.quantized_cache.put(self.alloc, node_id, cached_value);
-    const slot = reserved_slot orelse claimClockSlot(self.quantized_clock_keys, self.quantized_clock_hand, node_id) orelse return error.CacheDisabled;
-    self.quantized_clock_refs[slot] = true;
-    try self.quantized_cache_slots.put(self.alloc, node_id, slot);
+    const slot = Clock.claim(self.quantized_clock_keys, self.quantized_clock_states, self.quantized_clock_hand, node_id, reserved) orelse return error.CacheDisabled;
+    self.quantized_cache.putAssumeCapacity(node_id, value);
+    self.quantized_cache_slots.putAssumeCapacity(node_id, slot);
 }
 
 pub fn cacheVector(self: anytype, vector_id: u64, vector_data: []const f32) ![]const f32 {
     self.cache_mu.lockExclusive();
     defer self.cache_mu.unlockExclusive();
-    if (self.active_searches.load(.acquire) > 1) return vector_data;
-    if (self.config.max_cached_vectors == 0) return vector_data;
-    const reserved_slot = ensureVectorCacheCapacity(self, vector_id);
+    if (self.active_searches.load(.acquire) > 1 or self.config.max_cached_vectors == 0) return vector_data;
+    try self.vector_cache.ensureUnusedCapacity(self.alloc, 1);
+    try self.vector_cache_slots.ensureUnusedCapacity(self.alloc, 1);
+    const copied = try self.alloc.dupe(f32, vector_data);
+    errdefer self.alloc.free(copied);
+    const reserved = ensureVectorCacheCapacity(self, vector_id);
     invalidateVectorCache(self, vector_id);
-    try self.vector_cache.put(self.alloc, vector_id, try self.alloc.dupe(f32, vector_data));
-    const slot = reserved_slot orelse claimClockSlot(self.vector_clock_keys, self.vector_clock_hand, vector_id) orelse return error.CacheDisabled;
-    self.vector_clock_refs[slot] = true;
-    try self.vector_cache_slots.put(self.alloc, vector_id, slot);
-    return self.vector_cache.get(vector_id).?;
+    const slot = Clock.claim(self.vector_clock_keys, self.vector_clock_states, self.vector_clock_hand, vector_id, reserved) orelse return error.CacheDisabled;
+    self.vector_cache.putAssumeCapacity(vector_id, copied);
+    self.vector_cache_slots.putAssumeCapacity(vector_id, slot);
+    return copied;
 }
 
 pub fn cacheMetadata(self: anytype, vector_id: u64, metadata: []const u8) ![]const u8 {
     self.cache_mu.lockExclusive();
     defer self.cache_mu.unlockExclusive();
-    if (self.active_searches.load(.acquire) > 1) return metadata;
-    if (self.config.max_cached_metadata == 0) return metadata;
-    const reserved_slot = ensureMetadataCacheCapacity(self, vector_id);
+    if (self.active_searches.load(.acquire) > 1 or self.config.max_cached_metadata == 0) return metadata;
+    try self.metadata_cache.ensureUnusedCapacity(self.alloc, 1);
+    try self.metadata_cache_slots.ensureUnusedCapacity(self.alloc, 1);
+    const copied = try self.alloc.dupe(u8, metadata);
+    errdefer self.alloc.free(copied);
+    const reserved = ensureMetadataCacheCapacity(self, vector_id);
     invalidateMetadataCache(self, vector_id);
-    try self.metadata_cache.put(self.alloc, vector_id, try self.alloc.dupe(u8, metadata));
-    const slot = reserved_slot orelse claimClockSlot(self.metadata_clock_keys, self.metadata_clock_hand, vector_id) orelse return error.CacheDisabled;
-    self.metadata_clock_refs[slot] = true;
-    try self.metadata_cache_slots.put(self.alloc, vector_id, slot);
-    // The cache owns its copy. Callers retain the transaction/request view;
-    // returning cache memory here would outlive the eviction lock.
+    const slot = Clock.claim(self.metadata_clock_keys, self.metadata_clock_states, self.metadata_clock_hand, vector_id, reserved) orelse return error.CacheDisabled;
+    self.metadata_cache.putAssumeCapacity(vector_id, copied);
+    self.metadata_cache_slots.putAssumeCapacity(vector_id, slot);
+    // Callers retain their transaction/request view, not an unleased cache view.
     return metadata;
 }
 
@@ -904,4 +941,97 @@ pub fn transformVector(self: anytype, original: []const f32, transformed: []f32)
 pub fn nextNodeId(self: anytype) u64 {
     self.metadata.node_count += 1;
     return self.metadata.node_count;
+}
+
+test "cache clock rebinds evicted slots and tracks zero keys" {
+    var keys: [2]u64 = @splat(0);
+    var states: [2]Clock.State = @splat(.empty);
+    var hand: usize = 0;
+    var slots = std.AutoHashMap(u64, usize).init(std.testing.allocator);
+    defer slots.deinit();
+    for (0..128) |i| {
+        const key: u64 = if (i % 7 == 0) 0 else i;
+        var reserved: ?usize = null;
+        if (slots.fetchRemove(key)) |old| {
+            states[old.value] = .empty;
+            reserved = old.value;
+        }
+        if (reserved == null and slots.count() == 2) {
+            const victim = Clock.victim(&keys, &states, &hand, Clock.NoProtection{}).?;
+            reserved = slots.fetchRemove(victim).?.value;
+            states[reserved.?] = .empty;
+        }
+        const slot = Clock.claim(&keys, &states, hand, key, reserved).?;
+        try slots.put(key, slot);
+        try std.testing.expect(slots.count() <= 2);
+        for (states, 0..) |state, n| if (state != .empty) {
+            try std.testing.expectEqual(@as(?usize, n), slots.get(keys[n]));
+        };
+    }
+    const ProtectZero = struct {
+        pub fn protects(_: @This(), key: u64) bool {
+            return key == 0;
+        }
+    };
+    const victim = Clock.victim(&keys, &states, &hand, ProtectZero{}).?;
+    try std.testing.expect(victim != 0);
+}
+
+test "generic cache ownership remains valid at every allocation failure" {
+    const Check = struct {
+        const Lock = struct {
+            pub fn lockExclusive(_: *@This()) void {}
+            pub fn unlockExclusive(_: *@This()) void {}
+        };
+        const NodeEntry = struct { node: types.Node };
+        const QuantizedEntry = struct { quantized: QuantizedSet };
+        const Cache = struct {
+            alloc: Allocator,
+            cache_mu: Lock = .{},
+            active_searches: std.atomic.Value(usize) = .init(0),
+            config: struct { max_cached_nodes: usize = 2, max_cached_vectors: usize = 2, max_cached_metadata: usize = 2 } = .{},
+            node_cache: std.AutoHashMapUnmanaged(u64, *NodeEntry) = .empty,
+            node_cache_slots: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+            node_clock_keys: []u64,
+            node_clock_states: []Clock.State,
+            node_clock_hand: usize = 0,
+            quantized_cache: std.AutoHashMapUnmanaged(u64, *QuantizedEntry) = .empty,
+            quantized_cache_slots: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+            quantized_clock_keys: []u64,
+            quantized_clock_states: []Clock.State,
+            quantized_clock_hand: usize = 0,
+            vector_cache: std.AutoHashMapUnmanaged(u64, []f32) = .empty,
+            vector_cache_slots: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+            vector_clock_keys: []u64,
+            vector_clock_states: []Clock.State,
+            vector_clock_hand: usize = 0,
+            metadata_cache: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
+            metadata_cache_slots: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+            metadata_clock_keys: []u64,
+            metadata_clock_states: []Clock.State,
+            metadata_clock_hand: usize = 0,
+        };
+        fn run(a: Allocator) !void {
+            var keys: [4][2]u64 = @splat(@splat(0));
+            var states: [4][2]Clock.State = @splat(@splat(.empty));
+            var cache: Cache = .{ .alloc = a, .node_clock_keys = &keys[0], .node_clock_states = &states[0], .quantized_clock_keys = &keys[1], .quantized_clock_states = &states[1], .vector_clock_keys = &keys[2], .vector_clock_states = &states[2], .metadata_clock_keys = &keys[3], .metadata_clock_states = &states[3] };
+            defer clearNodeCache(&cache);
+            defer clearQuantizedCache(&cache);
+            defer clearVectorCache(&cache);
+            defer clearMetadataCache(&cache);
+            var coordinates = [_]f32{ 1, 2, 3, 4 };
+            for (0..5) |id| {
+                var node: types.Node = .{ .id = id, .is_leaf = true, .level = 0, .parent = 0, .centroid = coordinates[0..2], .children = &.{}, .members = &.{} };
+                try cacheNode(&cache, &node);
+                var quantized: QuantizedSet = .{ .nonquant = .{ .vectors = .{ .dims = 2, .count = 2, .data = &coordinates } } };
+                try cacheQuantized(&cache, id, &quantized);
+                const owned: QuantizedSet = .{ .nonquant = .{ .vectors = .{ .dims = 2, .count = 2, .data = try a.dupe(f32, &coordinates) } } };
+                try cacheQuantizedOwned(&cache, id, owned);
+                _ = try cacheVector(&cache, id, coordinates[0..2]);
+                _ = try cacheMetadata(&cache, id, "metadata");
+                try std.testing.expect(cache.node_cache.count() <= 2 and cache.quantized_cache.count() <= 2 and cache.vector_cache.count() <= 2 and cache.metadata_cache.count() <= 2);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

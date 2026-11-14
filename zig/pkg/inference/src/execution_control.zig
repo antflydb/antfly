@@ -127,16 +127,22 @@ pub const UninterruptibleGuard = struct {
 pub const InferenceExecutionControl = struct {
     /// False only for Node-owned startup/offline work with no request waiter.
     request_owned: bool = true,
+    /// Borrowed only by structured request work. Coalesced loads use their own
+    /// flight-owned sink and copy terminal details to each surviving waiter.
+    admission_failure: ?*@import("runtime/tier/memory.zig").AdmissionFailure = null,
     /// Verified selection carried by value through async admission/loading.
     model_selection: ?@import("registry/model_selection.zig").Constraint = null,
-    /// The HTTP route owns a request slot; audio leaves reserve only work units.
+    /// An enclosing HTTP/direct invocation owns the logical request slot;
+    /// nested leaves and physical batches reserve weighted work only.
     /// Internal execution policy, never decoded from a public request.
-    http_request_admitted: bool = false,
+    request_slot_admitted: bool = false,
     /// Trusted document orchestration pin; never decoded from public input.
     audio_execution: ?@import("documents/audio.zig").ExecutionSnapshot = null,
     /// Trusted document allowance, consumed by every Whisper decode attempt.
     audio_output_token_limit: ?usize = null,
     document_store: @import("antfly_runtime_abi").document_abi.View = .{},
+    /// Trusted request-owned policy snapshot. Never parsed from public input.
+    content_security_json: ?[]const u8 = null,
     document_session: ?*@import("antfly_document_runs").Session = null,
     document_dispatch_meter: ?*@import("antfly_document_runs").DispatchMeter = null,
     /// Runtime used for cancellation monitors and other structured background

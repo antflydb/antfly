@@ -21,6 +21,16 @@ const Imports = @import("../../../build_support/antfly/imports.zig").AntflyRootI
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, imports: Imports, vopr: *std.Build.Module, lmdb_engine: *std.Build.Module) void {
     const source_imports = sourceImports(b, imports);
     const test_imports = @import("../../../build_support/antfly/test_support.zig").Imports{ .runtime = source_imports, .vopr = vopr, .lmdb_engine = lmdb_engine };
+    const identity_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/lake_identity_publication_test_root.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, identity_module, false, true);
+    const identity_tests = b.addTest(.{ .root_module = identity_module, .filters = &.{"external lake execution bulk identity publication"} });
+    imports.build_info.linkTest(identity_tests.root_module);
+    b.step("lake-identity-publication-test", "Measure bounded identity chunks and verify the complete stored corpus").dependOn(&b.addRunArtifact(identity_tests).step);
+    const generation_module = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/lake_generation_publication_test_root.zig"), .target = target, .optimize = optimize });
+    test_imports.configure(b, generation_module, false, true);
+    const generation_tests = b.addTest(.{ .root_module = generation_module, .filters = &.{ "external lake execution generation publication", "external lake global frontier" } });
+    imports.build_info.linkTest(generation_tests.root_module);
+    b.step("lake-generation-publication-test", "Measure generation-map mutation amplification and verify every captured version").dependOn(&b.addRunArtifact(generation_tests).step);
     const provider = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/lake_execution_provider_probe_root.zig"), .target = target, .optimize = optimize, .pic = true });
     test_imports.configure(b, provider, false, true);
     // This fixture owns source implementations rather than production storage
@@ -29,7 +39,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     provider_options.addOption(bool, "shared_storage_core", false);
     provider_options.addOption(bool, "storage_engine_owner", true);
     provider.addOptions("storage_engine_options", provider_options);
-    const archive = @import("../../../build_support/embedded/shared_library.zig").addProviderArchive(b, provider, "lake-execution-abi-provider-probe", 5 * 1024 * 1024 * 1024);
+    const archive = @import("../../../build_support/embedded/shared_library.zig").addProviderArchive(b, provider, "lake-execution-abi-provider-probe", 12 * 1024 * 1024 * 1024);
     const consumer = b.createModule(.{ .root_source_file = b.path("pkg/antfly/src/lake_execution_linked_test_root.zig"), .target = target, .optimize = optimize });
     test_imports.configure(b, consumer, true, true);
     const consumer_options = b.addOptions();
@@ -45,7 +55,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
     runtime_module.addOptions("lake_execution_options", consumer_options);
     // Match the provider's explicit storage owner options in the source oracle.
     runtime_module.addOptions("storage_engine_options", provider_options);
-    const probe = b.addExecutable(.{ .name = "lake-execution-runtime-probe", .root_module = runtime_module, .max_rss = 5 * 1024 * 1024 * 1024, .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result) });
+    const probe = b.addExecutable(.{ .name = "lake-execution-runtime-probe", .root_module = runtime_module, .max_rss = 12 * 1024 * 1024 * 1024, .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result) });
     probe.root_module.linkLibrary(archive);
     imports.build_info.link(probe.root_module);
     b.step("lake-execution-runtime-probe-build", "Build and install the non-test lake runtime probe").dependOn(&b.addInstallArtifact(probe, .{}).step);

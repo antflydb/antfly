@@ -1100,14 +1100,14 @@ pub const ChunkOutputs = struct {
 
 pub const ChunkSourceReference = struct {
     type: []const u8,
-    /// HTTP(S) or S3 object URI resolved through configured content security and credentials.
+    /// HTTP(S), S3, or absolute file:// URI resolved through configured content security and credentials. Local files require an explicit remote_content.security.allowed_paths allowlist.
     uri: []const u8,
     mime_type: []const u8,
-    /// Quoted strong HTTP/S3 ETag or immutable S3 version ID; enforced on every range read.
+    /// Quoted strong HTTP/S3 ETag, immutable S3 version ID, or lowercase SHA-256 hex digest for file_sha256. Local files are verified in a bounded streaming scan; unchanged files reuse a bounded process-local verification cache across continuation pages. Size, inode, mtime and ctime are checked around every range read.
     version: []const u8,
-    /// Defaults to strong_etag. S3 version IDs are supported only for S3 sources.
+    /// Defaults to strong_etag. S3 version IDs require S3 sources; file_sha256 requires a local file URI.
     version_kind: ?[]const u8 = null,
-    /// Exact immutable object length, verified against Content-Range.
+    /// Exact immutable object length, verified against Content-Range or local file metadata.
     length: i64,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.

@@ -1,0 +1,262 @@
+{
+  "date": "2026-11-10",
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "dataset": "VectorDBBench Cohere Medium 1M",
+  "configuration": {
+    "vectors": 1000000,
+    "dimensions": 768,
+    "queries": 100,
+    "metric": "l2_squared",
+    "unit_normalized": true,
+    "leaf_capacity": 4096,
+    "training_centroids": 245,
+    "branching_factor": 16,
+    "backend": "cpu",
+    "runs_per_arm": 1,
+    "run_order": [
+      "sampled",
+      "full"
+    ],
+    "optimize": "ReleaseFast"
+  },
+  "parquet_preparation": {
+    "vectors": 1000000,
+    "dims": 768,
+    "queries": 100,
+    "parquet_scan_normalize_write_ns": 16267472000
+  },
+  "notes": [
+    "Both runs use the same prepared corpus and local native posting publication.",
+    "The sampled arm uses a uniform reservoir and assigns every row once to fixed trained centroids before packing.",
+    "Full-arm leaf training time includes its final corpus assignment. Sampled-arm training time includes reservoir selection and final sample assignment.",
+    "Both runs verified all members and tree links after reopening the published generation.",
+    "Peak RSS is measured for the entire benchmark child via getrusage; both arms hold the full float32 matrix.",
+    "The 95.5 percent target compares the first measured probe settings meeting the threshold. Recall at those points is close but unequal.",
+    "Single serial runs on a shared workstation. Query means are observations, without a controlled latency speedup claim.",
+    "Parquet preparation is a shared measured stage; local build timings exclude remote I/O, exact-vector LSM construction and lake manifest upload."
+  ],
+  "results": [
+    {
+      "arm": "full",
+      "algorithm": "emeans",
+      "count": 1000000,
+      "leaf_size": 4096,
+      "fixture_load_ns": 477516125,
+      "construction_ns": 271967661625,
+      "leaf_cluster_ns": 189281396000,
+      "posting_publish_ns": 1517262292,
+      "segments": 1,
+      "sample_limit": 0,
+      "training_rows": 1000000,
+      "training_ns": 189281396000,
+      "corpus_route_ns": 0,
+      "leaf_count": 342,
+      "min_leaf_members": 1220,
+      "max_leaf_members": 4091,
+      "peak_process_rss_bytes": 3453992960,
+      "user_cpu_seconds": 224.004823,
+      "system_cpu_seconds": 23.405919,
+      "other_construction_ns": 82686265625,
+      "build_and_reopen_ns": 273508665625,
+      "parquet_to_reopened_sidecar_phase_sum_ns": 290253653750,
+      "mean_leaf_members": 2923.9766081871344,
+      "first_tested_point_at_95_5_percent_recall": {
+        "probes": 64,
+        "recall_at_100": 0.9577,
+        "mean_query_ms": 9.59276792,
+        "vectors_scored": 19205587
+      },
+      "query_sweep": [
+        {
+          "probes": 16,
+          "recall_at_100": 0.8115,
+          "mean_query_ms": 7.66791041,
+          "vectors_scored": 4830126
+        },
+        {
+          "probes": 32,
+          "recall_at_100": 0.9028,
+          "mean_query_ms": 7.83504792,
+          "vectors_scored": 9683495
+        },
+        {
+          "probes": 48,
+          "recall_at_100": 0.9384,
+          "mean_query_ms": 7.93538708,
+          "vectors_scored": 14435413
+        },
+        {
+          "probes": 56,
+          "recall_at_100": 0.9494,
+          "mean_query_ms": 9.34838959,
+          "vectors_scored": 16840028
+        },
+        {
+          "probes": 64,
+          "recall_at_100": 0.9577,
+          "mean_query_ms": 9.59276792,
+          "vectors_scored": 19205587
+        },
+        {
+          "probes": 72,
+          "recall_at_100": 0.9622,
+          "mean_query_ms": 12.08127958,
+          "vectors_scored": 21587749
+        },
+        {
+          "probes": 80,
+          "recall_at_100": 0.9658,
+          "mean_query_ms": 10.16411875,
+          "vectors_scored": 23968689
+        },
+        {
+          "probes": 96,
+          "recall_at_100": 0.9725,
+          "mean_query_ms": 13.7143875,
+          "vectors_scored": 28706797
+        },
+        {
+          "probes": 128,
+          "recall_at_100": 0.9785,
+          "mean_query_ms": 14.45292375,
+          "vectors_scored": 38066508
+        },
+        {
+          "probes": 256,
+          "recall_at_100": 0.9861,
+          "mean_query_ms": 20.99120834,
+          "vectors_scored": 75424072
+        },
+        {
+          "probes": 512,
+          "recall_at_100": 0.9866,
+          "mean_query_ms": 22.39422167,
+          "vectors_scored": 100000000
+        },
+        {
+          "probes": 1024,
+          "recall_at_100": 0.9866,
+          "mean_query_ms": 22.705005,
+          "vectors_scored": 100000000
+        },
+        {
+          "probes": 2048,
+          "recall_at_100": 0.9866,
+          "mean_query_ms": 21.78366125,
+          "vectors_scored": 100000000
+        }
+      ]
+    },
+    {
+      "arm": "sampled",
+      "algorithm": "emeans",
+      "count": 1000000,
+      "leaf_size": 4096,
+      "fixture_load_ns": 532965167,
+      "construction_ns": 86604856500,
+      "leaf_cluster_ns": 34232202000,
+      "posting_publish_ns": 968747208,
+      "segments": 1,
+      "sample_limit": 50000,
+      "training_rows": 50000,
+      "training_ns": 8110212000,
+      "corpus_route_ns": 26121990000,
+      "leaf_count": 367,
+      "min_leaf_members": 800,
+      "max_leaf_members": 4095,
+      "peak_process_rss_bytes": 3970465792,
+      "user_cpu_seconds": 79.625681,
+      "system_cpu_seconds": 11.703367,
+      "other_construction_ns": 52372654500,
+      "build_and_reopen_ns": 87592325625,
+      "parquet_to_reopened_sidecar_phase_sum_ns": 104392762792,
+      "mean_leaf_members": 2724.7956403269754,
+      "first_tested_point_at_95_5_percent_recall": {
+        "probes": 72,
+        "recall_at_100": 0.9553,
+        "mean_query_ms": 6.26918125,
+        "vectors_scored": 20228002
+      },
+      "query_sweep": [
+        {
+          "probes": 16,
+          "recall_at_100": 0.8179,
+          "mean_query_ms": 4.9191620899999995,
+          "vectors_scored": 4581822
+        },
+        {
+          "probes": 32,
+          "recall_at_100": 0.8953,
+          "mean_query_ms": 4.83747667,
+          "vectors_scored": 9104096
+        },
+        {
+          "probes": 48,
+          "recall_at_100": 0.9327,
+          "mean_query_ms": 5.29717,
+          "vectors_scored": 13569686
+        },
+        {
+          "probes": 56,
+          "recall_at_100": 0.9436,
+          "mean_query_ms": 5.58565125,
+          "vectors_scored": 15768396
+        },
+        {
+          "probes": 64,
+          "recall_at_100": 0.9516,
+          "mean_query_ms": 5.89766083,
+          "vectors_scored": 18012236
+        },
+        {
+          "probes": 72,
+          "recall_at_100": 0.9553,
+          "mean_query_ms": 6.26918125,
+          "vectors_scored": 20228002
+        },
+        {
+          "probes": 80,
+          "recall_at_100": 0.9604,
+          "mean_query_ms": 6.56106292,
+          "vectors_scored": 22410498
+        },
+        {
+          "probes": 96,
+          "recall_at_100": 0.9687,
+          "mean_query_ms": 7.14561583,
+          "vectors_scored": 26784686
+        },
+        {
+          "probes": 128,
+          "recall_at_100": 0.9778,
+          "mean_query_ms": 8.28881708,
+          "vectors_scored": 35546579
+        },
+        {
+          "probes": 256,
+          "recall_at_100": 0.9866,
+          "mean_query_ms": 12.50174375,
+          "vectors_scored": 70581062
+        },
+        {
+          "probes": 512,
+          "recall_at_100": 0.9878,
+          "mean_query_ms": 16.00002667,
+          "vectors_scored": 100000000
+        },
+        {
+          "probes": 1024,
+          "recall_at_100": 0.9878,
+          "mean_query_ms": 16.13713875,
+          "vectors_scored": 100000000
+        },
+        {
+          "probes": 2048,
+          "recall_at_100": 0.9878,
+          "mean_query_ms": 16.092700830000002,
+          "vectors_scored": 100000000
+        }
+      ]
+    }
+  ]
+}

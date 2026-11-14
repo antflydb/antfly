@@ -1,0 +1,98 @@
+{
+  "date": "2026-11-09",
+  "tested_commit": "dda6151c6df9d559835ad7c72388ba4bf5e4a86c",
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "configuration": {
+    "vectors": 100000,
+    "dims": 128,
+    "samples": 3,
+    "batch_size": 1000,
+    "batches": 100,
+    "seed": 42,
+    "metric": "l2_squared",
+    "storage": "memory",
+    "build": "online_coalesced",
+    "backend": "cpu",
+    "leaf_size": 128,
+    "branching_factor": 128,
+    "assume_absent_ids": true,
+    "coalesce_leaf_writes": true,
+    "optimize": "ReleaseFast"
+  },
+  "notes": [
+    "Start from an empty index and insert every vector through 100 incremental batches; no initial bulk-build call.",
+    "Timed region covers the incremental insertion loop; excludes fixture generation, index open, embedding generation, and queries.",
+    "In-memory storage isolates indexing work; these are not disk-backed or HTTP ingestion measurements.",
+    "bulk_build_algo is not consulted by online_coalesced: all three settings retain the same incremental routing and Lloyd-based splitting.",
+    "Samples reuse the same seeded synthetic fixture; timings are subject to host load and order effects.",
+    "One query per workload only exercises reopen/search, and is not a recall evaluation."
+  ],
+  "results": [
+    {
+      "bulk_algorithm_setting": "hilbert_seeded",
+      "total_insert_seconds": [
+        8.37243,
+        7.452614,
+        7.478537
+      ],
+      "median_insert_seconds": 7.478537,
+      "median_ns_per_vector": 74785.37,
+      "median_vectors_per_second": 13371.6,
+      "insert_calls": 100000,
+      "split_leaf_calls": 1133,
+      "save_node_calls": 26278,
+      "leaves": 1134,
+      "min_leaf_members": 43,
+      "max_leaf_members": 128,
+      "query_result_digests": [
+        5502641806316195532,
+        5502641806316195532,
+        5502641806316195532
+      ]
+    },
+    {
+      "bulk_algorithm_setting": "kmeans",
+      "total_insert_seconds": [
+        7.608927,
+        7.807518,
+        7.127108
+      ],
+      "median_insert_seconds": 7.608927,
+      "median_ns_per_vector": 76089.27,
+      "median_vectors_per_second": 13142.46,
+      "insert_calls": 100000,
+      "split_leaf_calls": 1133,
+      "save_node_calls": 26278,
+      "leaves": 1134,
+      "min_leaf_members": 43,
+      "max_leaf_members": 128,
+      "query_result_digests": [
+        5502641806316195532,
+        5502641806316195532,
+        5502641806316195532
+      ]
+    },
+    {
+      "bulk_algorithm_setting": "emeans",
+      "total_insert_seconds": [
+        7.47561,
+        8.193974,
+        8.140092
+      ],
+      "median_insert_seconds": 8.140092,
+      "median_ns_per_vector": 81400.92,
+      "median_vectors_per_second": 12284.87,
+      "insert_calls": 100000,
+      "split_leaf_calls": 1133,
+      "save_node_calls": 26278,
+      "leaves": 1134,
+      "min_leaf_members": 43,
+      "max_leaf_members": 128,
+      "query_result_digests": [
+        5502641806316195532,
+        5502641806316195532,
+        5502641806316195532
+      ]
+    }
+  ]
+}

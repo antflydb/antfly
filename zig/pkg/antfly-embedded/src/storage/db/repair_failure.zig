@@ -33,6 +33,7 @@ const transient_names = [_][]const u8{
     "QueueFull",
     "EnrichmentRetryInProgress",
     "InferenceCapabilitiesStale",
+    "RemoteCapabilityDiscoveryTransient",
     "RemoteDocumentFetchFailed",
     "ConnectionResetByPeer",
     "ConnectionTimedOut",
@@ -73,6 +74,8 @@ pub fn isTransient(err: anyerror) bool {
 pub fn isAdmissionRefusalName(name: []const u8) bool {
     if (std.mem.eql(u8, name, "ResourceTemporarilyUnavailable") or
         std.mem.eql(u8, name, "InferenceCapacityUnavailable") or
+        // Discovery/activation failed before this document executed.
+        std.mem.eql(u8, name, "RemoteCapabilityDiscoveryTransient") or
         std.mem.eql(u8, name, "QueueFull") or
         // The managed embedding adapters' distinct identity for a local
         // provider's admission refusal, preserved separately from
@@ -396,13 +399,15 @@ test "admission retry wait counts overrunning sleeps against its delay" {
 }
 
 test "admission refusals are the transient failures that never ran" {
-    for ([_][]const u8{ "ResourceTemporarilyUnavailable", "InferenceCapacityUnavailable", "QueueFull", "AppleNativeBusy", "EmbedAdmissionRefused" }) |name| {
+    for ([_][]const u8{ "ResourceTemporarilyUnavailable", "InferenceCapacityUnavailable", "QueueFull", "AppleNativeBusy", "EmbedAdmissionRefused", "RemoteCapabilityDiscoveryTransient" }) |name| {
         try std.testing.expect(isAdmissionRefusalName(name));
         try std.testing.expect(isTransientName(name));
     }
     try std.testing.expect(!isAdmissionRefusalName("EmbedRateLimited"));
     try std.testing.expect(!isAdmissionRefusalName("Timeout"));
     try std.testing.expect(!isAdmissionRefusalName("MemoryBudgetExceeded"));
+    try std.testing.expect(!isAdmissionRefusalName("RemoteCapabilityDiscoveryRejected"));
+    try std.testing.expect(!isAdmissionRefusalName("InferenceEndpointAccessDenied"));
     // The managed embedding adapter's normalized name for a local admission
     // refusal is exempt; its sibling for a real provider transient failure
     // (5xx, timeout, connection error) is not.

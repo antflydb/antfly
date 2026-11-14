@@ -49,6 +49,8 @@ pub const Config = struct {
     /// JSON: the session loader enables it only after authenticating an exact
     /// artifact whose reviewed Metal parity requires F32 encoder mirrors.
     metal_require_f32_weight_mirrors: bool = false,
+    /// Installed only after authenticating an exact FP32 or Q8 Decide artifact.
+    metal_decide_execution_policy: bool = false,
 };
 
 pub const GlinerCountLayer = enum { count_lstm, count_lstm_v2 };

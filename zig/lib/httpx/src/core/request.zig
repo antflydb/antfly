@@ -55,6 +55,8 @@ pub const Request = struct {
     max_response_size: ?usize = null,
     /// Per-request retry ceiling; can only lower the client-wide policy.
     max_retries: ?u32 = null,
+    /// The caller guarantees server-side replay safety (for example a generation precondition).
+    replay_safe: bool = false,
     attempt_observer: ?@import("attempt_observer.zig").AttemptObserver = null,
     remaining_timeout_header: ?[]const u8 = null,
     /// Borrowed through synchronous execution, including retries and redirects.

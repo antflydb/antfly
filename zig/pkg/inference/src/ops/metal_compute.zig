@@ -1163,6 +1163,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         max_position_embeddings: usize,
         norm_eps_bits: u32,
         layers_hash: u64,
+        packed_qkv_cache_bytes: ?usize,
+        attention_scratch_bytes: ?usize,
     };
 
     const DeepSeekV4CacheKey = struct {
@@ -14696,9 +14698,40 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
 
+        // A Q8 relative table cannot feed layerNorm directly. Decode it on
+        // device instead of falling back through a full host download and
+        // upload whenever the requested bucket layout changes. The temporary
+        // has ordinary owned storage; only the normalized gathered table is
+        // retained by the existing bounded relative-embedding cache.
+        var decoded_weight: ?CT = null;
+        defer if (decoded_weight) |weight| freeOp(ctx, weight);
+        const weight_buf = toBuf(request.weight);
+        if (weight_buf.quantized_storage orelse weight_buf.runtime_quantized_storage) |storage| {
+            if (!std.meta.eql(storage.tensor_type, gguf_tensor_types.TensorType{ .known = .Q8_0 }) or
+                storage.packed_expert != null or storage.shape.len != 2 or
+                storage.shape[0] <= 0) return null;
+            const columns = std.math.cast(usize, storage.shape[1]) orelse return null;
+            if (columns != request.hidden_size) return null;
+            const rows: usize = @intCast(storage.shape[0]);
+            const slot = (try self.ensureQuantizedStorageLinearSlot(request.weight, request.hidden_size, rows)) orelse return null;
+            var dense = (try metal_runtime.decoderRuntimeCopyQuantLinearSlotToF32(
+                self.provider_impl,
+                slot,
+                0,
+                rows,
+                request.hidden_size,
+                rows,
+                1.0,
+            )) orelse return null;
+            decoded_weight = self.ctFromOwnedMetalTensor(dense) catch |err| {
+                dense.deinit();
+                return err;
+            };
+        }
+
         const normed = layerNormOp(
             ctx,
-            request.weight,
+            decoded_weight orelse request.weight,
             request.layer_norm_weight,
             request.layer_norm_bias,
             request.hidden_size,
@@ -33558,6 +33591,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .max_position_embeddings = request.max_position_embeddings,
             .norm_eps_bits = @bitCast(request.norm_eps),
             .layers_hash = debertaEncoderFramePlanLayerHash(request.layers),
+            .packed_qkv_cache_bytes = request.packed_qkv_cache_bytes,
+            .attention_scratch_bytes = request.attention_scratch_bytes,
         };
     }
 
@@ -33596,6 +33631,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (request.batch == 0 or request.seq_len == 0 or request.hidden_size == 0 or request.intermediate_size == 0) return false;
         if (request.num_attention_heads == 0 or request.hidden_size % request.num_attention_heads != 0) return false;
         if (request.position_buckets == 0 or request.max_position_embeddings == 0) return false;
+
+        if (request.packed_qkv_cache_bytes) |packed_bytes| {
+            const attention_bytes = request.attention_scratch_bytes orelse return false;
+            try metal_runtime.configureDebertaCacheLimits(self.provider_impl.raw_decode_runtime, packed_bytes, attention_bytes);
+        } else if (request.attention_scratch_bytes != null) return false;
 
         const plan_key = debertaEncoderFramePlanKey(request);
         if (self.hasReusableDebertaEncoderFramePlan(plan_key)) {

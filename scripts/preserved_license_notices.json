@@ -820,5 +820,17 @@
   },
   "zig/lib/extracting/src/case_data.zig": {
     "file": "LICENSES/third-party/Unicode-V3.txt"
+  },
+  "zig/lib/httpx/src/tls/certificate_compat.zig": {
+    "file": "LICENSES/third-party/Zig-TLS-MIT.txt"
+  },
+  "zig/lib/httpx/src/tls/certificate_compat/Bundle.zig": {
+    "file": "LICENSES/third-party/Zig-TLS-MIT.txt"
+  },
+  "zig/lib/httpx/src/tls/certificate_compat/Bundle/macos.zig": {
+    "file": "LICENSES/third-party/Zig-TLS-MIT.txt"
+  },
+  "zig/lib/httpx/src/tls/certificate_compat/Chain.zig": {
+    "file": "LICENSES/third-party/Zig-TLS-MIT.txt"
   }
 }

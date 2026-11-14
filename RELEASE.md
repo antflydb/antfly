@@ -5,6 +5,30 @@ image, and SDKs from tags. The intended long-term shape is that each supported
 OS, architecture, and libc ABI is built once and every downstream channel
 consumes those same archives.
 
+## SDK releases
+
+The core SDKs use independent tags: `go/pkg/sdk/vX.Y.Z`,
+`ts/antfly/sdk/vX.Y.Z`, `py/antfly/sdk/vX.Y.Z`, and `rs/antfly/sdk/vX.Y.Z`.
+Before tagging, update the TypeScript, Python, and Rust package versions and
+their lockfiles and workspace consumers. Python's public `__version__` must
+match its distribution version. Go releases need only the module tag.
+The TypeScript and Python tags trigger their existing registry workflows.
+
+After pushing a Rust SDK tag, dispatch its dedicated publisher from `main`:
+
+```sh
+gh workflow run rust-sdk-release.yml --ref main -f tag_name=rs/antfly/sdk/v0.3.0
+```
+
+The controller checks the tag's package version and main ancestry. Its read-only
+job tests and packages the SDK, verifies the bundled OpenAPI spec, and seals the
+crate with source commit, size, and digest. The protected `crates-io` job uploads
+those exact bytes without running Cargo or source build scripts with credentials.
+Re-run failed jobs on the same run to reuse the sealed crate. Existing registry
+versions are skipped only when their checksums match; conflicts fail closed.
+Configure `antfly-sdk`'s crates.io trusted publisher for `antflydb/antfly`,
+workflow `rust-sdk-release.yml`, environment `crates-io` before publication.
+
 ## Independent grep releases
 
 `antfly-grep` uses its own tags, versions and GitHub Releases:

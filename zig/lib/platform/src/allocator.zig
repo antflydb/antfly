@@ -146,20 +146,23 @@ pub fn concurrentFallback() std.mem.Allocator {
 /// Normalize base alignment too: mixed-alignment arena padding must not depend
 /// on a reused backing block's address and change the number of arena spills.
 pub fn checkAllAllocationFailures(backing: std.mem.Allocator, comptime test_fn: anytype, extra_args: anytype) !void {
-    var stable: Stable = .{ .backing = backing };
+    var stable: StableTestAllocator = .{ .backing = backing };
     try std.testing.checkAllAllocationFailures(stable.allocator(), test_fn, extra_args);
 }
 
-const Stable = struct {
+/// Test backing with deterministic base alignment and allocate/copy/free
+/// growth. Also useful for bounded-memory regressions that must succeed when
+/// the host allocator cannot grow an arena in place.
+pub const StableTestAllocator = struct {
     backing: std.mem.Allocator,
-    fn allocator(self: *Stable) std.mem.Allocator {
+    pub fn allocator(self: *StableTestAllocator) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
     fn stableAlignment(alignment: std.mem.Alignment) std.mem.Alignment {
         return @fromBackingInt(@intCast(@max(@backingInt(alignment), 6)));
     }
     fn alloc(context: *anyopaque, size: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
-        const self: *Stable = @ptrCast(@alignCast(context));
+        const self: *StableTestAllocator = @ptrCast(@alignCast(context));
         return self.backing.rawAlloc(size, stableAlignment(alignment), ra);
     }
     fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
@@ -169,7 +172,7 @@ const Stable = struct {
         return null;
     }
     fn free(context: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
-        const self: *Stable = @ptrCast(@alignCast(context));
+        const self: *StableTestAllocator = @ptrCast(@alignCast(context));
         self.backing.rawFree(bytes, stableAlignment(alignment), ra);
     }
 };

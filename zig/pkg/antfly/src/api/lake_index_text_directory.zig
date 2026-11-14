@@ -43,6 +43,9 @@ pub const Roots = struct {
     }
 };
 pub const RouteFilter = struct { ptr: *anyopaque, keep: *const fn (*anyopaque, corpus.SegmentRouting) anyerror!bool };
+/// Synchronous observer of validated routing. Record storage is borrowed only
+/// for the call; observers cannot retain pointers into the cursor scratch arena.
+pub const RouteObserver = struct { ptr: *anyopaque, record: *const fn (*anyopaque, *const SegmentRecord) anyerror!void };
 pub const Interval = struct { lower: u32, count: u32 };
 pub const FileRecord = struct { file: state.File, manifest: Chunk };
 pub const SegmentRecord = struct {
@@ -807,6 +810,23 @@ test "external lake exact segment admission skips missing unrelated descriptors 
         summary.* = null;
     }
     var group: corpus.FileGroup = .{ .file = .{ .id = "one-large-file", .digest = @splat(1) }, .segments = segments, .admissions = admissions, .summaries = summaries, .rows = &.{.{ .group = 0, .high = 0, .base = 0, .lower = 10, .count = 9 }} };
+    // Scoring admission must not fetch paged physical routes. The winner path
+    // still rejects a missing source proof rather than trusting the subset.
+    {
+        var paged = group;
+        paged.source_pages = &.{segments[0]}; // A real artifact, but not a source page.
+        paged.source_count = 1;
+        const descriptor = try put(ca, &store, paged, .none);
+        const descriptor_ref: @import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .text_segment, .artifact_id = descriptor.artifact_id, .checksum = descriptor.checksum, .byte_len = descriptor.byte_len };
+        const admitted = try corpus.loadCachedAdmissions(ca, store, descriptor_ref, .none, null);
+        try std.testing.expectEqual(segments.len, admitted.segments.len);
+        try std.testing.expectEqual(admissions[0].doc_count, admitted.admissions[0].doc_count);
+        if (corpus.loadCachedFile(ca, store, descriptor_ref, .none, null)) |_| return error.InvalidSourceProofAccepted else |_| {}
+        var invalid = paged;
+        invalid.admissions = admissions[0..1];
+        const bad = try put(ca, &store, invalid, .none);
+        try std.testing.expectError(error.InvalidNativeLakeTextCorpus, corpus.loadCachedAdmissions(ca, store, .{ .kind = .text_segment, .artifact_id = bad.artifact_id, .checksum = bad.checksum, .byte_len = bad.byte_len }, .none, null));
+    }
     try prepare(ca, &store, &group, .none);
     const manifest = try put(ca, &store, group, .none);
     const roots = try publish(a, &store, &.{group}, &.{manifest}, &.{}, &.{}, .{}, .none, std.testing.io);
@@ -1101,6 +1121,7 @@ pub const RoutingCursor = struct {
     last_segment_docs: u32 = 0,
     pending: ?struct { identity: Id, bytes: u64, documents: u32 } = null,
     filter: ?RouteFilter = null,
+    observer: ?RouteObserver = null,
     included: bool = true,
     pruned: u32 = 0,
     pub const Window = struct { identities: []const Id, doc_offset: u64 };
@@ -1146,6 +1167,7 @@ pub const RoutingCursor = struct {
         self.emitted = std.math.add(u32, self.emitted, 1) catch return error.InvalidNativeLakeTextCorpus;
         self.documents = std.math.add(u64, self.documents, record.route.doc_count) catch return error.InvalidNativeLakeTextCorpus;
         if (self.emitted > self.root.segment_count) return error.InvalidNativeLakeTextCorpus;
+        if (self.observer) |observer| try observer.record(observer.ptr, &record);
         self.included = if (self.filter) |filter| try filter.keep(filter.ptr, record.route) else true;
         if (!self.included) self.pruned += 1;
         return corpus.term_directory.identity(record.route.ref.artifact_id);

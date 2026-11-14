@@ -7,6 +7,14 @@ public enum ConnectionMode: String, Codable, Sendable { case managed, external }
 
 public enum TranscriberRoute: String, Codable, Sendable { case gateway, runtime }
 
+/// The complete recording is intact; only the bounded live queue overflowed.
+public struct LiveAudioOverflow: Error, LocalizedError, Sendable {
+  public init() {}
+  public var errorDescription: String? {
+    "Live audio processing fell behind. The complete recording remains available for clip processing."
+  }
+}
+
 public enum DictationError: Error, LocalizedError {
   case invalid(String)
   public var errorDescription: String? {
@@ -27,6 +35,8 @@ public struct Preset: Codable, Identifiable, Equatable, Sendable {
   public var model: String
   public var cleanupModel: String
   public var language: String
+  public var languageChoice: SpeechLanguageChoice?
+  public var fasterAppleSpeech: Bool?
   public var style: String
   public var context: String
   public var instructions: String
@@ -104,12 +114,14 @@ public struct Configuration: Codable, Equatable, Sendable {
   public var retainHistory = false
   public var retainAudio = false
   public var concurrentRequests: Int?
+  public var prewarmCleanup: Bool?
+  public var usesCleanupPrewarming: Bool { prewarmCleanup ?? true }
   public var microphoneID = ""
   public var selectedPreset = "slack"
   public var dictionary = ["Antfly", "Colony"]
   public var presets: [Preset] = [
-    Preset(id: "slack", name: "Slack", context: "a Slack message"),
-    Preset(id: "email", name: "Email", style: "formal", context: "an email"),
+    Preset(id: "slack", name: "Messages", context: "a message"),
+    Preset(id: "email", name: "Writing", style: "formal", context: "an email"),
     Preset(id: "verbatim", name: "Verbatim", style: "verbatim"),
   ]
   public init() {}
@@ -199,19 +211,41 @@ public struct Configuration: Codable, Equatable, Sendable {
   }
   /// Only automatic local defaults follow readiness; explicit/custom selections survive discovery.
   @discardableResult public mutating func selectAvailableManagedTranscriber(
-    from catalog: ModelCatalog, supportsApple: Bool
+    from catalog: ModelCatalog, supportsApple: Bool,
+    supportedAppleLanguages: [String]? = nil, nativeAppleStreaming: Bool = false
   ) -> Bool {
     guard usesManagedRuntime else { return false }
     let apple = catalog.transcriber("transcribers/apple-speech")
-    let available =
-      supportsApple && apple?.dictation != nil
-      && apple?.dictation?.readiness_error == nil
-    let selected = available ? "transcribers/apple-speech" : "transcribers/whisper"
     var changed = false
     for index in presets.indices {
       guard presets[index].automaticallySelectLocalTranscriber != false,
         ["transcribers/whisper", "transcribers/apple-speech"].contains(presets[index].model)
       else { continue }
+      let language = try? presets[index].resolvingLanguage(
+        supported: supportedAppleLanguages,
+        detectsLanguage: false
+      ).language
+      let ready =
+        language.map { !($0.isEmpty) && apple?.speechReadiness(language: $0).isReady == true }
+        ?? false
+      var appleCandidate = presets[index]
+      appleCandidate.model = "transcribers/apple-speech"
+      appleCandidate.transcriberRoute = .gateway
+      let selected =
+        supportsApple && ready && appleCandidate.hasCompatibleSharedProcessor(in: catalog)
+          && appleCandidate.supportsProcessing(
+            with: apple, nativeAppleStreaming: nativeAppleStreaming)
+        ? "transcribers/apple-speech" : "transcribers/whisper"
+      var selectedCandidate = presets[index]
+      selectedCandidate.model = selected
+      selectedCandidate.transcriberRoute = .gateway
+      guard
+        selectedCandidate.supportsProcessing(
+          with: catalog.transcriber(selected),
+          nativeAppleStreaming: selected == "transcribers/apple-speech" && nativeAppleStreaming)
+      else {
+        continue
+      }
       if presets[index].model != selected || presets[index].transcriberRoute != .gateway {
         presets[index].model = selected
         presets[index].transcriberRoute = .gateway
@@ -287,18 +321,27 @@ public struct DictationResult: Sendable {
 }
 
 public struct DiscoveredModel: Decodable, Identifiable, Sendable {
+  public struct NativeSpeechStatus: Decodable, Sendable {
+    public var speech_available: Bool?
+    public var speech_installed_locales: [String]?
+  }
   public struct DictationCapabilities: Decodable, Sendable {
     public var stable_segments: Bool?
     public var text_cleanup: Bool?
     public var live_preview: Bool
     public var recognition_hints: Bool
+    public var language_detection: Bool?
+    public var language_format: String?
     public var readiness_error: String?
+    public var native_status: NativeSpeechStatus?
     public var executor: String?
   }
   public var id: String
   public var task: String?
   public var executor: String?
+  public var backend_model: String?
   public var dictation: DictationCapabilities?
+  public var availability: String?
   public var executorName: String { executor ?? dictation?.executor ?? "runtime" }
 }
 public struct ModelCatalog: Decodable, Sendable {

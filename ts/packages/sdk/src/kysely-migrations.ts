@@ -1,7 +1,13 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-import type { Kysely, MigrationLockOptions } from "kysely";
+import {
+  type DatabaseIntrospector,
+  type Kysely,
+  type MigrationLockOptions,
+  sql,
+  type TableMetadata,
+} from "kysely";
 import {
   DEFAULT_MIGRATION_LOCK_TABLE,
   DEFAULT_MIGRATION_TABLE,
@@ -63,4 +69,49 @@ export async function prepareKyselyMigrationTables<DB>(
       await adapter.releaseMigrationLock(connection, lockOptions);
     }
   });
+}
+
+/** Private bootstrap view: Kysely needs only its own table names before loading migrations. */
+export function createMigrationBootstrap<DB>(
+  full: DatabaseIntrospector,
+  connection: Kysely<DB>,
+  options: PrepareKyselyMigrationTablesOptions & Pick<MigratorProps, "provider">
+): { introspector: DatabaseIntrospector; provider: MigratorProps["provider"] } {
+  let preflight = true;
+  const namespace = options.migrationTableSchema ?? "public";
+  const names = [
+    options.migrationTableName ?? DEFAULT_MIGRATION_TABLE,
+    options.migrationLockTableName ?? DEFAULT_MIGRATION_LOCK_TABLE,
+  ];
+  return {
+    introspector: {
+      getSchemas: () => full.getSchemas(),
+      async getTables(metadataOptions) {
+        if (!preflight) return full.getTables(metadataOptions);
+        const tables: TableMetadata[] = [];
+        for (const name of names) {
+          try {
+            // Use the same reserved connection and SQL authorization/scope as
+            // DDL. LIMIT 0 admits no documents and never scans the application
+            // catalog or describes unrelated tables over HTTP.
+            await sql`SELECT 1 FROM ${sql.id(namespace, name)} LIMIT 0`.execute(connection);
+            tables.push({ name, schema: namespace, isView: false, isForeign: false, columns: [] });
+          } catch (error) {
+            const code =
+              error && typeof error === "object" && "code" in error ? error.code : undefined;
+            if (code !== "42P01") throw error;
+          }
+        }
+        return tables;
+      },
+    },
+    provider: {
+      async getMigrations() {
+        // Restore the complete, fresh introspector before ANY application
+        // provider/up/down code runs. No application gets the bootstrap view.
+        preflight = false;
+        return options.provider.getMigrations();
+      },
+    },
+  };
 }

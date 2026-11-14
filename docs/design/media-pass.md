@@ -60,3 +60,76 @@ Serverless output receipts persist in the derived document. Unfinished outputs k
 To reproduce the decoder and AAC metadata component benchmark, run `zig build inference-test -Doptimize=ReleaseFast '-Dtest-filter=benchmark media seek windows'` from `zig/`. It checks sample checksums and reports cold index construction/copy separately from paging. These timings exclude network and model inference; cache retention remains subject to admission and the shared 64 MiB/eight-entry limit.
 
 Generation probes use named outputs, `observe_only: true`, and `execute: false` on every target. Enrichment workers normalize legacy single-embedding configurations into that observation contract. They resolve immutable source and model planning identities and return `observation` metadata separately from `data`. They do not enumerate source units, decode media, execute output models, or acknowledge chunk coverage. The response has no continuation and does not certify source completion. Local, supervised, and HTTP chunk providers use the same observation contract; older callbacks may still return a planned first member. Cold immutable MP3 and FLAC observation probes read no encoded audio bytes.
+
+## Local files in place
+
+A model-aware source field can hold a versioned local file reference:
+
+```json
+{
+  "type": "source",
+  "uri": "file:///Users/me/Videos/recording.mp4",
+  "mime_type": "video/mp4",
+  "version_kind": "file_sha256",
+  "version": "<64 lowercase hexadecimal SHA-256 characters>",
+  "length": 4294967296
+}
+```
+
+The file must be visible at the absolute path on the inference host. Storage
+checks the lexical path against its current `remote_content.security.allowed_paths`
+policy before each dispatch, including continuation and repair. The inference
+reader independently checks both the lexical path and the canonical open
+descriptor path, rejecting symlink escapes and nonregular files. Empty or omitted
+path allowlists deny access. Standalone inference inherits a fresh trusted
+snapshot of the storage policy on each request, including requests sent through
+the supervised worker. Policy bytes occupy a separately bounded 1 MiB raw RPC
+section, sharing receive admission without consuming the 1 MiB metadata or
+64 MiB application-body limits. Startup policy uses the same section. JSON
+escaping does not amplify policy memory or reduce application-body capacity.
+Explicit inference content-security configuration retains
+precedence; separately deployed inference must configure its own allowlist.
+Storage does not open the file and need not mount the inference filesystem.
+
+The worker verifies the caller's SHA-256 using a 256 KiB streaming buffer and
+retains the descriptor for that request. Media parsing uses the existing paged
+range reader; the file size can exceed `max_download_size_bytes`, which bounds
+individual ranges. A fixed 64-entry process-local verification cache avoids
+rehashing unchanged files on continuation pages. Cache hits still reopen and
+authorize the file and compare inode, size, mtime and ctime. Concurrent cold
+requests for the same file share one verification; unrelated files verify
+independently. The cache records the actual digest independently of the caller's
+claim, so incorrect claims cannot trigger repeated scans of unchanged bytes.
+Warm receipt hits bypass verification coordination, including when the same
+file has a busy verification slot or all slots are occupied. At most 64 distinct
+cold verifications can be outstanding; saturation returns a retryable resource
+error for misses. Cancelled waiters release their slots. Cache misses
+and metadata changes require a fresh hash; receipts never survive process
+restart. No file contents or decoded media are retained by this cache.
+
+Checks around each range read and at request completion reject modifications
+with `SourceVersionChanged`, including when read-ahead served the final bytes.
+This relies on a filesystem that updates mtime/ctime for writes; it is not a
+snapshot against a privileged writer or a filesystem that conceals mutations.
+Server requests retain their execution deadline while a supervised process
+boundary covers filesystem operations, including open, stat, reads and close.
+Embedded callers can supply their execution-control boundary; generic callers
+without one receive `FileTimeoutUnsupported` for finite hard I/O deadlines.
+Cancellation is checked between operations and while waiting for verification.
+Use a source object for local media: a plain `file://` string remains text.
+
+The transport regression benchmark streams a 128 MiB fixture without allocating
+the whole file. It checks one cold hash, warm paging with a 32 KiB allocator,
+three 4 KiB reads across the file, and reuse after an incorrect digest claim.
+On the development machine the cold verification took 648 ms and the warm open
+plus reads took 1 ms, using 1,646 allocator bytes. These are local filesystem
+measurements, excluding media decoding and model execution.
+
+Run `zig build lib-scraping-test inference-content-security-test
+inference-worker-transport-test` from `zig/` for transport, decoder, live-policy
+and worker-framing regressions. After building `antfly`, run
+`ANTFLY_WORKER_TRANSPORT_TESTS=1 uv run --project zig/e2e/antfly pytest
+zig/e2e/antfly/test_inference_worker_transport.py -k live_local_policy` from the
+repository root to qualify large startup/reloaded policies, CPU worker launch,
+local authorization, exact 64 MiB body limits and replacement after SIGKILL.
+This test requires no model weights.

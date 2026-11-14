@@ -3301,6 +3301,8 @@ pub const LoadedModel = struct {
     cleanup_head: ?*cleanup_model_mod.CleanupHead = null,
     cleanup_head_loaded: bool = false,
     resource_lease: ?runtime.tier.memory.AdmissionLease = null,
+    /// Sessions borrow this stable address while their ModelHandle is alive.
+    admission_residency: runtime.tier.memory.ResidencySource = .{},
     /// Protected by ModelManager.load_lock. A model can only be evicted while
     /// it has no active handles and is not pinned by preload configuration.
     active_handles: usize = 0,
@@ -3558,6 +3560,23 @@ pub const LoadedModel = struct {
         if (!std.meta.eql(self.managed_publication, try managed_receipt.publicationGeneration(self.allocator, self.publicationIo(control), self.model_dir))) return error.ModelArtifactsChanging;
     }
 
+    /// Called while constructing the model or holding embedding_session_lock.
+    /// Lease domains stay intact: tokenizer CPU residency must count against
+    /// shared host limits without consuming the GPU domain's policy allowance.
+    fn requiredSessionResidency(self: *const LoadedModel) !runtime.tier.memory.Residency {
+        var residency = runtime.tier.memory.Residency{};
+        for ([_]?runtime.tier.memory.AdmissionLease{ self.resource_lease, self.tokenizer_resource_lease, self.whisper_prompt_admission, self.vision_resource_lease, self.audio_resource_lease, self.text_projection_resource_lease, self.visual_projection_resource_lease, self.audio_projection_resource_lease }) |slot| {
+            if (slot) |lease| residency = try residency.merge(.fromLease(lease));
+        }
+        return residency;
+    }
+
+    fn refreshAdmissionResidency(self: *LoadedModel) void {
+        // These are disjoint leases already admitted by the same controller;
+        // their sum is bounded by its checked global accounting.
+        self.admission_residency.replace(self.requiredSessionResidency() catch unreachable);
+    }
+
     fn ensureOptionalSessionWithControl(
         self: *LoadedModel,
         kind: DeclaredOptionalSessionKind,
@@ -3596,12 +3615,16 @@ pub const LoadedModel = struct {
             control,
             .{ .path = self.model_dir, .publication = self.managed_publication },
             null,
+            try self.requiredSessionResidency(),
         );
         defer loaded.deinit();
         try self.verifyOwnerPublication(control);
         const owned = loaded.take();
         slot.* = owned.session;
         lease_slot.* = owned.resource_lease;
+        // The enclosing optional phase publishes only after every component
+        // succeeds. Until then its leases are ordinary in-flight contention.
+        if (slot.*.?.run_admission) |*admission| admission.residency_source = &self.admission_residency;
         return true;
     }
 
@@ -3655,6 +3678,7 @@ pub const LoadedModel = struct {
     pub fn materializeDeclaredOptionalSessions(self: *LoadedModel) !void {
         spinLock(&self.embedding_session_lock);
         defer self.embedding_session_lock.unlock();
+        defer self.refreshAdmissionResidency();
 
         for (declaredOptionalSessions(&self.manifest)) |declared| {
             _ = switch (declared.kind) {
@@ -3694,6 +3718,7 @@ pub const LoadedModel = struct {
             &self.vision_resource_lease,
             self.manifest.visual_model_path,
         );
+        self.refreshAdmissionResidency();
     }
 
     pub fn ensureVisionSessionWithControl(self: *LoadedModel, control: InferenceExecutionControl) !void {
@@ -3706,6 +3731,7 @@ pub const LoadedModel = struct {
             self.manifest.visual_model_path,
             control,
         );
+        self.refreshAdmissionResidency();
     }
 
     pub fn ensureEmbeddingAssets(self: *LoadedModel, include_text: bool, include_image: bool, include_audio: bool) !void {
@@ -3749,6 +3775,7 @@ pub const LoadedModel = struct {
             &self.text_projection,
             &self.text_projection_resource_lease,
         );
+        self.refreshAdmissionResidency();
         _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
@@ -3781,6 +3808,7 @@ pub const LoadedModel = struct {
                 self.manifest.visual_projection_path,
             );
         }
+        self.refreshAdmissionResidency();
     }
 
     pub fn ensurePrimaryEmbeddingAssetsLockedWithControl(
@@ -3817,6 +3845,7 @@ pub const LoadedModel = struct {
                 control,
             );
         }
+        self.refreshAdmissionResidency();
     }
 
     /// Admit the ephemeral audio sidecars as one phase. Any partial admission
@@ -3836,6 +3865,7 @@ pub const LoadedModel = struct {
             &self.audio_projection_resource_lease,
             self.manifest.audio_projection_path,
         );
+        self.refreshAdmissionResidency();
     }
 
     pub fn ensureAudioEmbeddingAssetsLockedWithControl(self: *LoadedModel, control: InferenceExecutionControl) !void {
@@ -3854,6 +3884,7 @@ pub const LoadedModel = struct {
             self.manifest.audio_projection_path,
             control,
         );
+        self.refreshAdmissionResidency();
     }
 
     /// Release the lazily loaded audio branch after its outputs have been
@@ -3868,6 +3899,7 @@ pub const LoadedModel = struct {
             &self.audio_session,
             &self.audio_resource_lease,
         );
+        self.refreshAdmissionResidency();
         // Audio sidecars are intentionally request-phased rather than cached.
         // Their backend allocations can be large and differently shaped from
         // the persistent vision/text sessions, so complete the physical
@@ -4043,12 +4075,16 @@ pub const LoadedModel = struct {
 
     pub fn glinerPipeline(self: *LoadedModel, allocator: std.mem.Allocator) GlinerPipeline {
         const tok = self.getTokenizer();
+        const metal_policy = session_factory.getGlinerDecideMetalExecutionPolicy(self.session);
         return .{
             .allocator = allocator,
             .session = self.session,
             .tok = tok,
             .execution_lock = self.targetInferenceExecutionMutex(),
             .config = .{
+                .decision_batch_size = if (metal_policy) |policy| policy.batch_items else 64,
+                .decision_batch_tokens = if (metal_policy) |policy| policy.padded_batch_tokens else 16384,
+                .decision_reuse_batch_padding = if (metal_policy) |policy| policy.reuse_batch_padding else false,
                 .max_width = self.manifest.gliner_max_width,
                 .max_length = if (self.manifest.gliner_architecture == .span and
                     self.manifest.gliner_span_encoder_family == .modern_bert and
@@ -4356,6 +4392,15 @@ test "embedding asset rollback closes only newly acquired primary sessions" {
     var visual_probe = CloseProbe{};
     var model: LoadedModel = undefined;
     model.managed_publication = null;
+    model.admission_residency = .{};
+    model.resource_lease = null;
+    model.tokenizer_resource_lease = null;
+    model.whisper_prompt_admission = null;
+    model.vision_resource_lease = null;
+    model.audio_resource_lease = null;
+    model.text_projection_resource_lease = null;
+    model.visual_projection_resource_lease = null;
+    model.audio_projection_resource_lease = null;
     model.text_projection = text_probe.session();
     model.vision_session = existing_vision_probe.session();
     model.visual_projection = visual_probe.session();
@@ -4419,6 +4464,13 @@ test "audio asset rollback closes every ephemeral session" {
     var projection_probe = CloseProbe{};
     var model: LoadedModel = undefined;
     model.managed_publication = null;
+    model.admission_residency = .{};
+    model.resource_lease = null;
+    model.tokenizer_resource_lease = null;
+    model.whisper_prompt_admission = null;
+    model.vision_resource_lease = null;
+    model.text_projection_resource_lease = null;
+    model.visual_projection_resource_lease = null;
     model.audio_session = audio_probe.session();
     model.audio_projection = projection_probe.session();
     model.audio_resource_lease = null;
@@ -4459,6 +4511,7 @@ const LoadFlight = struct {
     native_call_policy: execution_control_mod.NativeCallPolicy = .require_supervision,
     model: ?*LoadedModel = null,
     err: ?anyerror = null,
+    admission_failure: runtime.tier.memory.AdmissionFailure = .{},
     /// Protected by ModelManager.load_lock. The manager-owned task holds one
     /// reference and every request waiter holds another.
     refs: usize = 2,
@@ -4524,6 +4577,7 @@ const LoadFlightControl = struct {
 
     fn control(self: *@This()) InferenceExecutionControl {
         return .{
+            .admission_failure = &self.flight.admission_failure,
             .io = self.flight.io,
             .ptr = self,
             .check_fn = check,
@@ -4796,6 +4850,7 @@ fn attachSessionRunAdmission(
         .backend_class = backend_class,
         .limits = limits,
         .static_workspace_bytes = modelRunWorkspaceAllowance(weight_bytes),
+        .required_residency = resident,
         .model_profile = sessionRunAdmissionModelProfile(backend_runtime, man, qwen_cfg),
     };
 }
@@ -5368,7 +5423,7 @@ pub const ModelManager = struct {
         }
     };
 
-    fn loadNativeWhisperPrompt(self: *ModelManager, man: *const manifest_mod.ModelManifest, artifacts: *PublishedArtifacts, tokenizer: tokenizer_mod.Tokenizer) !ManagedWhisperPrompt {
+    fn loadNativeWhisperPrompt(self: *ModelManager, man: *const manifest_mod.ModelManifest, artifacts: *PublishedArtifacts, tokenizer: tokenizer_mod.Tokenizer, required: runtime.tier.memory.Residency, control: ?InferenceExecutionControl) !ManagedWhisperPrompt {
         const config_fallback = if (man.config_path == null) try artifacts.resolve("config.json") else null;
         defer if (config_fallback) |path| self.allocator.free(path);
         const config_path = man.config_path orelse config_fallback;
@@ -5386,11 +5441,13 @@ pub const ModelManager = struct {
         // JSON value trees can greatly exceed compact integer-list encodings.
         // Reserve their parse peak before reading, then retain only owned IDs.
         var admission = if (self.admission_enabled)
-            try self.acquireAmountsWithEviction(
-                .cpu,
-                self.admissionLimitsForBackend(.{ .backend = .native }),
-                .{ .host_weight_bytes = try checkedScaledBytes(encoded, 32, 1024 * 1024) },
-            )
+            try self.acquireRequestsWithEviction(&.{.{
+                .backend_class = .cpu,
+                .limits = self.admissionLimitsForBackend(.{ .backend = .native }),
+                .amounts = .{ .host_weight_bytes = try checkedScaledBytes(encoded, 32, 1024 * 1024) },
+                .required_residency = required,
+                .failure = if (control) |active| active.admission_failure else null,
+            }})
         else
             null;
         errdefer if (admission) |*lease| lease.release();
@@ -5914,9 +5971,17 @@ pub const ModelManager = struct {
     fn admitHostPreflightChecked(self: *ModelManager, bytes: usize, check_live_memory: bool) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
         const domain = self.resource_domain.?;
-        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory) catch |err| {
-            if (err != error.ResourceTemporarilyUnavailable or self.reclaimHostCache(bytes) == 0) return err;
-            return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory);
+        var pressure: ?runtime.tier.memory.AdmissionPressure = null;
+        const request = runtime.tier.memory.AdmissionRequest{ .backend_class = .cpu, .limits = domain.admission_limits, .amounts = .{ .host_scratch_bytes = bytes } };
+        return domain.admission.tryAcquireWithPressure(.cpu, request.limits, request.amounts, check_live_memory, &pressure) catch |err| {
+            if (err == error.ResourceTemporarilyUnavailable and self.reclaimHostCache(bytes) != 0) {
+                return domain.admission.tryAcquireWithPressure(.cpu, request.limits, request.amounts, check_live_memory, &pressure) catch |retry_err| {
+                    self.logRunAdmissionDenied(retry_err, pressure, &.{request});
+                    return retry_err;
+                };
+            }
+            self.logRunAdmissionDenied(err, pressure, &.{request});
+            return err;
         };
     }
 
@@ -6318,6 +6383,14 @@ pub const ModelManager = struct {
         var remaining: [2]runtime.tier.memory.AdmissionRequest = undefined;
         for (requests, 0..) |request, i| {
             remaining[i] = request.resources;
+            if (request.session.run_admission) |admission| {
+                const already_included = for (requests[0..i]) |previous| {
+                    if (previous.session.run_admission) |other| {
+                        if (admission.residency_source != null and admission.residency_source == other.residency_source) break true;
+                    }
+                } else false;
+                if (!already_included) remaining[i].required_residency = try remaining[i].required_residency.merge(admission.requiredResidency());
+            }
             if (request.session.generation_workspace) |workspace| {
                 result.workspace[i] = try workspace.acquire(&remaining[i].amounts);
             }
@@ -6924,8 +6997,12 @@ pub const ModelManager = struct {
         requested: []const runtime.tier.memory.AdmissionRequest,
     ) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
-        const requests = try self.allocator.dupe(runtime.tier.memory.AdmissionRequest, requested);
-        defer self.allocator.free(requests);
+        // Generation and component loading have at most two requests. Keep
+        // their reservation/eviction path allocation-free.
+        var small_requests: [2]runtime.tier.memory.AdmissionRequest = undefined;
+        const requests = if (requested.len <= small_requests.len) small_requests[0..requested.len] else try self.allocator.alloc(runtime.tier.memory.AdmissionRequest, requested.len);
+        defer if (requested.len > small_requests.len) self.allocator.free(requests);
+        @memcpy(requests, requested);
         for (requests) |*request| request.limits = self.physicalRunLimits(request.backend_class, request.limits);
         self.tightenUnifiedDeviceAdmission();
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
@@ -7236,7 +7313,7 @@ pub const ModelManager = struct {
         ) !ManagedHfTokenizer {
             var proof = try ComponentConstruction.init(self.manager.allocator, self.manager.session_manager.io orelse std.Options.debug_io, try self.selection(), null, self.borrowed_artifacts);
             defer proof.deinit();
-            var tokenizer = try self.manager.loadManagedHfTokenizerFileWithArtifacts(tokenizer_path, proof.artifacts());
+            var tokenizer = try self.manager.loadManagedHfTokenizerFileWithArtifacts(tokenizer_path, proof.artifacts(), null);
             errdefer tokenizer.deinit();
             try proof.finish();
             return tokenizer;
@@ -7566,6 +7643,7 @@ pub const ModelManager = struct {
             control,
             selected,
             borrowed,
+            .{},
         );
     }
 
@@ -7578,6 +7656,27 @@ pub const ModelManager = struct {
         control: ?InferenceExecutionControl,
         selected: ResolvedModel,
         borrowed: ?*PublishedArtifacts,
+        required_residency: runtime.tier.memory.Residency,
+    ) !ManagedSession {
+        var failure = runtime.tier.memory.AdmissionFailure.Capture.init(if (control) |active| active.admission_failure else null);
+        var scoped_control = control;
+        if (scoped_control) |*active| active.admission_failure = failure.sink();
+        return loadManagedSessionWithAdmissionUsingManagerImpl(self, model_path, preferred_backends, shared_backend_ctx, source_session_manager, scoped_control, selected, borrowed, required_residency) catch |err| {
+            failure.publish(err);
+            return err;
+        };
+    }
+
+    fn loadManagedSessionWithAdmissionUsingManagerImpl(
+        self: *ModelManager,
+        model_path: []const u8,
+        preferred_backends: []const backends.BackendType,
+        shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
+        source_session_manager: *const backends.SessionManager,
+        control: ?InferenceExecutionControl,
+        selected: ResolvedModel,
+        borrowed: ?*PublishedArtifacts,
+        required_residency: runtime.tier.memory.Residency,
     ) !ManagedSession {
         if (control) |active| try active.update(.loading_model, 0, 1);
         const io = if (control) |active| active.io orelse source_session_manager.io orelse std.Options.debug_io else source_session_manager.io orelse std.Options.debug_io;
@@ -7662,11 +7761,13 @@ pub const ModelManager = struct {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
-                resource_lease = self.acquireAmountsWithEviction(
-                    admissionBackendClassForRuntime(backend_runtime),
-                    admission_limits,
-                    admission_plan.peak,
-                ) catch |err| {
+                resource_lease = self.acquireRequestsWithEviction(&.{.{
+                    .backend_class = admissionBackendClassForRuntime(backend_runtime),
+                    .limits = admission_limits,
+                    .amounts = admission_plan.peak,
+                    .required_residency = required_residency,
+                    .failure = if (control) |active| active.admission_failure else null,
+                }}) catch |err| {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
                 };
@@ -7732,20 +7833,21 @@ pub const ModelManager = struct {
         self: *ModelManager,
         tokenizer_path: []const u8,
     ) !ManagedHfTokenizer {
-        return self.loadManagedHfTokenizerFileWithArtifacts(tokenizer_path, null);
+        return self.loadManagedHfTokenizerFileWithArtifacts(tokenizer_path, null, null);
     }
 
     fn loadManagedHfTokenizerFileWithArtifacts(
         self: *ModelManager,
         tokenizer_path: []const u8,
         artifacts: ?*const PublishedArtifacts,
+        control: ?InferenceExecutionControl,
     ) !ManagedHfTokenizer {
         const plan = try tokenizerFileAdmissionPlan(
             self.allocator,
             tokenizer_path,
             .huggingface,
         );
-        var resource_lease = try self.acquireTokenizerAdmission(plan);
+        var resource_lease = try self.acquireTokenizerAdmissionWithControl(plan, control);
         errdefer if (resource_lease) |*lease| lease.release();
 
         const tok_bytes = if (artifacts) |verified|
@@ -7775,16 +7877,18 @@ pub const ModelManager = struct {
         };
     }
 
-    fn acquireTokenizerAdmission(
-        self: *ModelManager,
-        plan: ModelLoadAdmissionPlan,
-    ) !?runtime.tier.memory.AdmissionLease {
+    fn acquireTokenizerAdmission(self: *ModelManager, plan: ModelLoadAdmissionPlan) !?runtime.tier.memory.AdmissionLease {
+        return self.acquireTokenizerAdmissionWithControl(plan, null);
+    }
+
+    fn acquireTokenizerAdmissionWithControl(self: *ModelManager, plan: ModelLoadAdmissionPlan, control: ?InferenceExecutionControl) !?runtime.tier.memory.AdmissionLease {
         if (!self.admission_enabled) return null;
-        return try self.acquireAmountsWithEviction(
-            .cpu,
-            self.admissionLimitsForBackend(.{ .backend = .native }),
-            plan.peak,
-        );
+        return try self.acquireRequestsWithEviction(&.{.{
+            .backend_class = .cpu,
+            .limits = self.admissionLimitsForBackend(.{ .backend = .native }),
+            .amounts = plan.peak,
+            .failure = if (control) |active| active.admission_failure else null,
+        }});
     }
 
     pub fn lockLoadedModels(self: *ModelManager) void {
@@ -8440,7 +8544,12 @@ pub const ModelManager = struct {
             loaded.active_handles += 1;
             self.unlockLoadedModels();
         }
-        if (maybe_err) |err| return err;
+        if (maybe_err) |err| {
+            if (err == error.ResourceLimitExceeded) if (control) |active| {
+                if (active.admission_failure) |sink| sink.record(flight.load_state.admission_failure.snapshot());
+            };
+            return err;
+        }
         return .{
             .manager = self,
             .assets = assets orelse return error.TokenizerLoadFailed,
@@ -8629,7 +8738,7 @@ pub const ModelManager = struct {
         defer sidecars.deinit();
         if (publication != null and !std.meta.eql(publication, sidecars.managed_publication)) return error.ModelArtifactsChanging;
 
-        var managed_tokenizer = try self.loadManagedHfTokenizerFileWithArtifacts(sidecars.tokenizer_path, &artifacts);
+        var managed_tokenizer = try self.loadManagedHfTokenizerFileWithArtifacts(sidecars.tokenizer_path, &artifacts, control);
         errdefer managed_tokenizer.deinit();
         const config_bytes = try artifacts.readPath(sidecars.config_path, 16 * 1024 * 1024);
         defer self.allocator.free(config_bytes);
@@ -9490,11 +9599,17 @@ pub const ModelManager = struct {
                 else => return err,
             };
         }
+        const failure = flight.admission_failure.snapshot();
         var result = self.consumeLoadFlightWaiter(flight_key, flight, .adopt);
         waiter_consumed = true;
         errdefer result.handle.release();
         if (control) |active| try active.check();
-        if (result.err) |err| return err;
+        if (result.err) |err| {
+            if (err == error.ResourceLimitExceeded) if (control) |active| {
+                if (active.admission_failure) |sink| sink.record(failure);
+            };
+            return err;
+        }
         if (result.handle.model == null) return error.NoBackendAvailable;
         return result.handle;
     }
@@ -9772,7 +9887,7 @@ pub const ModelManager = struct {
         const gemma_compat = tokenizerGemmaCompat(man, model_dir);
         const kind = try tokenizerKindWithArtifacts(man, &artifacts, gemma_compat);
         const plan = try tokenizerLoadAdmissionPlanWithArtifacts(self.allocator, model_dir, &man, kind, &artifacts);
-        var lease = try self.acquireTokenizerAdmission(plan);
+        var lease = try self.acquireTokenizerAdmissionWithControl(plan, control);
         errdefer if (lease) |*active| active.release();
         var hf: ?*hf_tokenizer.HfTokenizer = null;
         var sp: ?*sentencepiece.Processor = null;
@@ -9924,7 +10039,7 @@ pub const ModelManager = struct {
         else
             null;
         var tokenizer_resource_lease = if (tokenizer_admission_plan) |plan|
-            try self.acquireTokenizerAdmission(plan)
+            try self.acquireTokenizerAdmissionWithControl(plan, control)
         else
             null;
         errdefer if (tokenizer_resource_lease) |*lease| lease.release();
@@ -9995,6 +10110,7 @@ pub const ModelManager = struct {
             sm,
             control,
             &tokenizer_artifacts,
+            if (tokenizer_resource_lease) |lease| .fromLease(lease) else .{},
         );
         defer loaded_session.deinit();
         if (control) |active| try active.update(.loading_model, 3, 4);
@@ -10007,7 +10123,7 @@ pub const ModelManager = struct {
             try session_factory.sealGlinerDecisionTokenizerDigest(session, digest);
 
         var managed_whisper_prompt: ?ManagedWhisperPrompt = if (session_factory.getWhisperConfig(session) != null)
-            try self.loadNativeWhisperPrompt(&man, &tokenizer_artifacts, if (hf_tok) |ht| ht.tokenizer() else sp_tok.?.tokenizer())
+            try self.loadNativeWhisperPrompt(&man, &tokenizer_artifacts, if (hf_tok) |ht| ht.tokenizer() else sp_tok.?.tokenizer(), try (if (loaded_session.resource_lease) |lease| runtime.tier.memory.Residency.fromLease(lease) else runtime.tier.memory.Residency{}).merge(if (tokenizer_resource_lease) |lease| .fromLease(lease) else .{}), control)
         else
             null;
         errdefer if (managed_whisper_prompt) |*prompt| prompt.deinit();
@@ -10158,6 +10274,8 @@ pub const ModelManager = struct {
             .tokenizer_resource_lease = tokenizer_resource_lease,
             .resource_lease = loaded_session.resource_lease,
         };
+        model.refreshAdmissionResidency();
+        if (model.session.run_admission) |*admission| admission.residency_source = &model.admission_residency;
         model.session.execution_gate = &model.target_inference_run_lock;
         if (session_factory.getEmbeddingGemma2Config(model.session) != null) model.session.cohort_scheduler = &model.embedding_cohort_scheduler;
 
@@ -10828,6 +10946,7 @@ fn admissionEvictionTestModel(last_used_ns: u64) LoadedModel {
     model.last_used_ns = last_used_ns;
     model.pinned = false;
     model.retired = false;
+    model.admission_residency = .{};
     model.resource_lease = null;
     model.tokenizer_resource_lease = null;
     model.whisper_prompt_admission = null;
@@ -11661,6 +11780,10 @@ const ComponentArtifactEstimate = union(enum) {
         self: *const ComponentArtifactEstimate,
         backend: backends.BackendType,
     ) runtime.tier.memory.AdmissionAmounts {
+        if (backend == .cuda) return switch (self.*) {
+            .native => |man| cudaDecideQ8MirrorAdmission(man.*),
+            .disabled, .onnx => .{},
+        };
         if (backend != .metal) return .{};
         return switch (self.*) {
             .native => |man| session_factory.metalDebertaFastPathAdmissionAmounts(man.*),
@@ -11839,6 +11962,8 @@ fn estimateBaseModelLoadAdmission(
     }
     const extra_backend_resident = if (backend_runtime.backend == .metal)
         session_factory.metalDebertaFastPathAdmissionAmounts(man)
+    else if (backend_runtime.backend == .cuda)
+        cudaDecideQ8MirrorAdmission(man)
     else
         runtime.tier.memory.AdmissionAmounts{};
     var plan = try nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident);
@@ -12125,6 +12250,35 @@ fn onnxModelLoadAdmission(
     };
 }
 
+fn cudaDecideQ8MirrorAdmission(man: manifest_mod.ModelManifest) runtime.tier.memory.AdmissionAmounts {
+    // Cheap pre-load reservation only. Session construction still authenticates
+    // both Q8 files and sidecars before enabling any execution mirrors.
+    if (man.gliner_classification_head != .label_marker_mlp or man.gliner_span_encoder_family != .deberta or
+        man.nativeWeightArtifactKind() != .gguf) return .{};
+    return .{ .backend_weight_bytes = @import("../models/gliner_decide_qualification.zig").cuda_q8_projection_mirror_bytes };
+}
+
+test "Decide Q8 mirror admission reserves construction and resident bytes" {
+    var man = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .gliner_classification_head = .label_marker_mlp,
+        .gliner_span_encoder_family = .deberta,
+        .gguf_path = "gliner2-encoder.Q8_0.gguf",
+    };
+    const extra = cudaDecideQ8MirrorAdmission(man);
+    try std.testing.expectEqual(@as(usize, 704643072), extra.backend_weight_bytes);
+    const base = try nativeModelLoadAdmission(527210176, .cuda, .{});
+    const expanded = try nativeModelLoadAdmission(527210176, .cuda, extra);
+    try std.testing.expectEqual(base.peak.backend_weight_bytes + extra.backend_weight_bytes, expanded.peak.backend_weight_bytes);
+    try std.testing.expectEqual(base.resident.backend_weight_bytes + extra.backend_weight_bytes, expanded.resident.backend_weight_bytes);
+    man.gliner_span_encoder_family = .modern_bert;
+    try std.testing.expectEqual(@as(usize, 0), cudaDecideQ8MirrorAdmission(man).backend_weight_bytes);
+    man.gliner_span_encoder_family = .deberta;
+    man.gguf_path = null;
+    man.safetensors_path = "model.safetensors";
+    try std.testing.expectEqual(@as(usize, 0), cudaDecideQ8MirrorAdmission(man).backend_weight_bytes);
+}
+
 fn nativeModelLoadAdmission(
     weights: usize,
     backend: backends.BackendType,
@@ -12152,11 +12306,11 @@ fn nativeModelLoadAdmission(
             .peak = .{
                 // CUDA construction currently builds a complete native session first,
                 // then uploads every resident weight before releasing the native copy.
-                .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights),
+                .backend_weight_bytes = std.math.add(usize, try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights), extra_backend_resident.backend_weight_bytes) catch return error.ResourceLimitExceeded,
                 .host_weight_bytes = weights,
             },
             .resident = .{
-                .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights),
+                .backend_weight_bytes = std.math.add(usize, try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights), extra_backend_resident.backend_weight_bytes) catch return error.ResourceLimitExceeded,
             },
         },
         .native, .wasm => .{
@@ -12199,7 +12353,7 @@ fn loadSessionForPreferredBackends(
     source_session_manager: *const backends.SessionManager,
     control: ?InferenceExecutionControl,
 ) !LoadedSessionPlan {
-    return loadSessionForPreferredBackendsWithArtifacts(manager, preferred_backends, model_dir, man, source_session_manager, control, null);
+    return loadSessionForPreferredBackendsWithArtifacts(manager, preferred_backends, model_dir, man, source_session_manager, control, null, .{});
 }
 
 fn loadSessionForPreferredBackendsWithArtifacts(
@@ -12210,6 +12364,26 @@ fn loadSessionForPreferredBackendsWithArtifacts(
     source_session_manager: *const backends.SessionManager,
     control: ?InferenceExecutionControl,
     borrowed: ?*PublishedArtifacts,
+    required_residency: runtime.tier.memory.Residency,
+) !LoadedSessionPlan {
+    var failure = runtime.tier.memory.AdmissionFailure.Capture.init(if (control) |active| active.admission_failure else null);
+    var scoped_control = control;
+    if (scoped_control) |*active| active.admission_failure = failure.sink();
+    return loadSessionForPreferredBackendsWithArtifactsImpl(manager, preferred_backends, model_dir, provided_man, source_session_manager, scoped_control, borrowed, required_residency) catch |err| {
+        failure.publish(err);
+        return err;
+    };
+}
+
+fn loadSessionForPreferredBackendsWithArtifactsImpl(
+    manager: *ModelManager,
+    preferred_backends: []const backends.BackendType,
+    model_dir: []const u8,
+    provided_man: manifest_mod.ModelManifest,
+    source_session_manager: *const backends.SessionManager,
+    control: ?InferenceExecutionControl,
+    borrowed: ?*PublishedArtifacts,
+    required_residency: runtime.tier.memory.Residency,
 ) !LoadedSessionPlan {
     if (control) |active| try active.check();
     var proof = try ComponentConstruction.init(
@@ -12369,11 +12543,13 @@ fn loadSessionForPreferredBackendsWithArtifacts(
                 continue;
             };
             if (control) |active| try active.check();
-            resource_lease = manager.acquireAmountsWithEviction(
-                admissionBackendClassForRuntime(backend_runtime),
-                admission_limits,
-                admission_plan.peak,
-            ) catch |err| {
+            resource_lease = manager.acquireRequestsWithEviction(&.{.{
+                .backend_class = admissionBackendClassForRuntime(backend_runtime),
+                .limits = admission_limits,
+                .amounts = admission_plan.peak,
+                .required_residency = required_residency,
+                .failure = if (control) |active| active.admission_failure else null,
+            }}) catch |err| {
                 std.log.warn(
                     "loadModel({s}) backend {s} admission failed: {s}; peak_host={d} peak_backend={d} host_limit={d} backend_limit={d} combined_limit={d}",
                     .{
@@ -18643,7 +18819,7 @@ test "model selection native Whisper consumes only authenticated prompt sidecars
     var constrained = ModelManager.init(a, backends.SessionManager.initWithIo(a, io));
     defer constrained.deinit();
     try (ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 1, .combined_limit_bytes = 1 } }).configure(&constrained);
-    if (constrained.loadNativeWhisperPrompt(&metadata, &prompt_artifacts, prompt_tokenizer.tokenizer())) |value| {
+    if (constrained.loadNativeWhisperPrompt(&metadata, &prompt_artifacts, prompt_tokenizer.tokenizer(), .{}, null)) |value| {
         var unexpected = value;
         unexpected.deinit();
         return error.TestExpectedError;
@@ -18695,7 +18871,7 @@ test "model selection legacy Whisper metadata growth cannot exceed its admission
     defer manager.deinit();
     try (ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 128 * 1024 * 1024, .combined_limit_bytes = 128 * 1024 * 1024 } }).configure(&manager);
     const man = manifest_mod.ModelManifest{ .allocator = a };
-    try std.testing.expectError(error.FileTooLarge, manager.loadNativeWhisperPrompt(&man, &artifacts, tokenizer.tokenizer()));
+    try std.testing.expectError(error.FileTooLarge, manager.loadNativeWhisperPrompt(&man, &artifacts, tokenizer.tokenizer(), .{}, null));
     try std.testing.expect(!Probe.grow);
     try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
 }
@@ -18772,7 +18948,7 @@ test "component and primary construction reject same-receipt namespace retargets
                         var artifacts = try PublishedArtifacts.init(tracking.allocator(), counted, alias, null);
                         defer artifacts.deinit();
                         artifacts.verification_cache = &manager.verified_artifacts;
-                        try std.testing.expectError(error.ModelArtifactsChanging, loadSessionForPreferredBackendsWithArtifacts(&manager, &.{.native}, alias, man, &manager.session_manager, control, &artifacts));
+                        try std.testing.expectError(error.ModelArtifactsChanging, loadSessionForPreferredBackendsWithArtifacts(&manager, &.{.native}, alias, man, &manager.session_manager, control, &artifacts, .{}));
                         try std.testing.expect(manager.verified_artifacts.entries.count() > 0);
                     }
                     try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
@@ -20307,4 +20483,225 @@ test "model processor resampling fences declared and implicit image routes" {
     try std.testing.expectEqual(siglip, imagePreprocessingRevision(manifest, artifacts));
     inputs[0] = "audio";
     try std.testing.expectEqual(artifacts, imagePreprocessingRevision(manifest, artifacts));
+}
+
+test "generation admission includes required model residency without charging it twice" {
+    const memory = runtime.tier.memory;
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    const controller = manager.admissionController();
+    controller.configureSharedLimits(.{});
+    const limits = memory.Limits{ .host_limit_bytes = 100 };
+    var resident = try controller.tryAcquire(.gpu, limits, .{ .host_weight_bytes = 90 }, false);
+    defer resident.release();
+    const session = backends.Session{
+        .ptr = controller,
+        .vtable = undefined,
+        .run_admission = .{ .controller = controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 0, .required_residency = resident.amounts },
+    };
+    var exceeded: ?memory.AdmissionAmounts.LimitExceeded = null;
+    var request = GenerationAdmissionRequest{ .session = session, .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = .{ .host_weight_bytes = 20 }, .limit_exceeded = &exceeded } };
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&.{request}));
+    try std.testing.expectEqual(@as(usize, 110), exceeded.?.requested_bytes);
+    try std.testing.expectEqual(@as(usize, 100), exceeded.?.limit_bytes);
+    try std.testing.expect(!manager.memoryAdmissionDiagnostic().retryable);
+    request.resources.limits.host_limit_bytes = 110;
+    var admitted = try manager.acquireGenerationResources(&.{request});
+    defer admitted.release();
+    try std.testing.expectEqual(@as(usize, 110), controller.snapshot().hostTotalBytes());
+    try std.testing.expect(exceeded == null);
+}
+
+test "model residency follows optional session release and rollback" {
+    const memory = runtime.tier.memory;
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    const controller = manager.admissionController();
+    controller.configureSharedLimits(.{});
+    const limits = memory.Limits{ .host_limit_bytes = 100, .combined_limit_bytes = 100 };
+    var primary = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 20 }, false);
+    defer primary.release();
+    var model = admissionEvictionTestModel(0);
+    model.resource_lease = primary;
+    model.audio_resource_lease = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 40 }, false);
+    defer if (model.audio_resource_lease) |*lease| lease.release();
+    model.text_projection_resource_lease = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 20 }, false);
+    defer if (model.text_projection_resource_lease) |*lease| lease.release();
+    const Probe = struct {
+        fn close(_: *anyopaque) void {}
+    };
+    const vtable = backends.Session.VTable{ .run = undefined, .inputInfo = undefined, .outputInfo = undefined, .backend = undefined, .close = Probe.close };
+    var projection = backends.Session{ .ptr = controller, .vtable = &vtable };
+    try attachSessionRunAdmission(std.testing.allocator, &projection, controller, .{ .backend = .native }, limits, model.text_projection_resource_lease.?.amounts, null, &manager);
+    projection.run_admission.?.check_live_memory = false;
+    projection.run_admission.?.residency_source = &model.admission_residency;
+    model.audio_session = .{ .ptr = controller, .vtable = &vtable };
+    model.audio_projection = null;
+    model.text_projection = projection;
+    model.vision_session = null;
+    model.visual_projection = null;
+    model.refreshAdmissionResidency();
+    try std.testing.expectError(error.ResourceLimitExceeded, projection.admitHostPreprocess(30));
+    model.releaseAudioEmbeddingAssetsLocked();
+    try std.testing.expectEqual(@as(usize, 40), controller.snapshot().hostTotalBytes());
+    var permit = try projection.admitHostPreprocess(30);
+    try std.testing.expectEqual(@as(usize, 70), controller.snapshot().hostTotalBytes());
+    permit.deinit();
+    model.rollbackPrimaryEmbeddingAssetsLocked(.{ .text_projection = true });
+    try std.testing.expectEqualDeep(try model.requiredSessionResidency(), model.admission_residency.snapshot());
+    try std.testing.expectEqual(@as(usize, 20), (try model.admission_residency.snapshot().total()).hostTotalBytes());
+}
+
+test "generation residency includes tokenizer CPU ownership and preserves transient contention" {
+    const memory = runtime.tier.memory;
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    const controller = manager.admissionController();
+    controller.configureSharedLimits(.{ .host_limit_bytes = 100 });
+    const limits = memory.Limits{ .host_limit_bytes = 110 };
+    var weights = try controller.tryAcquire(.gpu, limits, .{ .host_weight_bytes = 90 }, false);
+    defer weights.release();
+    var tokenizer = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 5 }, false);
+    defer tokenizer.release();
+    var model = admissionEvictionTestModel(0);
+    model.resource_lease = weights;
+    model.tokenizer_resource_lease = tokenizer;
+    model.refreshAdmissionResidency();
+    const session = backends.Session{ .ptr = controller, .vtable = undefined, .run_admission = .{ .controller = controller, .backend_class = .gpu, .limits = limits, .static_workspace_bytes = 0, .residency_source = &model.admission_residency } };
+    var exceeded: ?memory.AdmissionAmounts.LimitExceeded = null;
+    const request = GenerationAdmissionRequest{ .session = session, .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = .{ .host_scratch_bytes = 10 }, .limit_exceeded = &exceeded } };
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&.{request}));
+    try std.testing.expectEqual(@as(usize, 105), exceeded.?.requested_bytes);
+    try std.testing.expectEqual(@as(usize, 100), exceeded.?.limit_bytes);
+    try std.testing.expect(!manager.memoryAdmissionDiagnostic().retryable);
+    var fitting = request;
+    fitting.resources.amounts.host_scratch_bytes = 5;
+    var admitted = try manager.acquireGenerationResources(&.{fitting});
+    try std.testing.expectEqual(@as(usize, 95), controller.snapshotBackend(.gpu).hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 5), controller.snapshotBackend(.cpu).hostTotalBytes());
+    admitted.release();
+    var unrelated = try controller.tryAcquire(.cpu, limits, .{ .host_scratch_bytes = 3 }, false);
+    defer unrelated.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireGenerationResources(&.{fitting}));
+    try std.testing.expect(exceeded == null);
+}
+
+test "generation admission counts a shared model residency source once" {
+    const memory = runtime.tier.memory;
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    const controller = manager.admissionController();
+    controller.configureSharedLimits(.{ .host_limit_bytes = 45 });
+    const limits = memory.Limits{ .host_limit_bytes = 100 };
+    var resident = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 30 }, false);
+    defer resident.release();
+    var source = memory.ResidencySource{};
+    source.replace(.fromLease(resident));
+    const session = backends.Session{ .ptr = controller, .vtable = undefined, .run_admission = .{ .controller = controller, .backend_class = .cpu, .limits = limits, .static_workspace_bytes = 0, .residency_source = &source } };
+    const request = GenerationAdmissionRequest{ .session = session, .resources = .{ .backend_class = .cpu, .limits = limits, .amounts = .{ .host_scratch_bytes = 5 } } };
+    var lease = try manager.acquireGenerationResources(&.{ request, request });
+    defer lease.release();
+    try std.testing.expectEqual(@as(usize, 40), controller.snapshot().hostTotalBytes());
+}
+
+test "optional admission staging stays retryable until its phase commits" {
+    const memory = runtime.tier.memory;
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    const controller = manager.admissionController();
+    controller.configureSharedLimits(.{});
+    const limits = memory.Limits{ .host_limit_bytes = 100 };
+    var primary = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 20 }, false);
+    defer primary.release();
+    var model = admissionEvictionTestModel(0);
+    model.resource_lease = primary;
+    model.refreshAdmissionResidency();
+    const Probe = struct {
+        fn close(_: *anyopaque) void {}
+    };
+    const vtable = backends.Session.VTable{ .run = undefined, .inputInfo = undefined, .outputInfo = undefined, .backend = undefined, .close = Probe.close };
+    const session = backends.Session{ .ptr = controller, .vtable = &vtable, .run_admission = .{ .controller = controller, .backend_class = .cpu, .limits = limits, .static_workspace_bytes = 0, .residency_source = &model.admission_residency, .check_live_memory = false } };
+    // A component has finished construction, but the multi-component phase
+    // has not committed. Other readers still use the committed primary set.
+    model.vision_resource_lease = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 60 }, false);
+    defer if (model.vision_resource_lease) |*lease| lease.release();
+    model.vision_session = .{ .ptr = controller, .vtable = &vtable };
+    model.text_projection = null;
+    model.visual_projection = null;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admitHostPreprocess(30));
+    model.rollbackPrimaryEmbeddingAssetsLocked(.{ .vision = true });
+    var recovered = try session.admitHostPreprocess(30);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 50), controller.snapshot().hostTotalBytes());
+}
+
+test "load admission failure details survive flight ownership and reach each waiter" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    const flight = try std.testing.allocator.create(LoadFlight);
+    flight.* = .{ .io = std.testing.io };
+    try manager.in_flight_loads.put(std.testing.allocator, try std.testing.allocator.dupe(u8, "denied"), flight);
+    defer manager.releaseLoadFlight("denied", flight);
+    try std.testing.expect(flight.tryAddWaiter());
+    flight.refs += 1;
+    const expected = runtime.tier.memory.AdmissionAmounts.LimitExceeded{ .limit = .host, .requested_bytes = 110, .limit_bytes = 100 };
+    // The shared task borrows only the flight's storage, never a request stack.
+    var active = LoadFlightControl{ .flight = flight };
+    active.control().admission_failure.?.record(expected);
+    manager.finishLoadFlight(flight, null, error.ResourceLimitExceeded);
+    var first = runtime.tier.memory.AdmissionFailure{};
+    var second = runtime.tier.memory.AdmissionFailure{};
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.waitForLoadFlight("denied", flight, .{ .admission_failure = &first }));
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.waitForLoadFlight("denied", flight, .{ .admission_failure = &second }));
+    try std.testing.expectEqualDeep(expected, first.snapshot().?);
+    try std.testing.expectEqualDeep(expected, second.snapshot().?);
+    first.record(null);
+    try std.testing.expectEqualDeep(expected, second.snapshot().?);
+}
+
+test "lazy component load admission retains its blocking budget and required bytes" {
+    const a = std.testing.allocator;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, a);
+    const root = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer a.free(root);
+    var manager = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    manager.configureAdmissionLimits(.{ .host_limit_bytes = 1 });
+    var failure = runtime.tier.memory.AdmissionFailure{};
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.loadManagedSessionWithAdmission(root, &.{.native}, null, .{ .admission_failure = &failure, .native_call_policy = .in_process }, .{ .path = root, .publication = try managed_receipt.publicationGeneration(a, std.testing.io, root) }, null));
+    const exceeded = failure.snapshot().?;
+    try std.testing.expect(exceeded.limit == .host);
+    try std.testing.expectEqual(@as(usize, 1), exceeded.limit_bytes);
+    try std.testing.expect(exceeded.requested_bytes > exceeded.limit_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
+}
+
+test "host preflight records policy denials and temporary contention" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = 100, .scratch_limit_bytes = 100 };
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.admitHostPreflightChecked(101, false));
+    var diagnostic = manager.memoryAdmissionDiagnostic();
+    try std.testing.expectEqualStrings("ResourceLimitExceeded", diagnostic.error_code);
+    try std.testing.expect(!diagnostic.retryable);
+    try std.testing.expectEqual(@as(u64, 101), diagnostic.requested_scratch_bytes);
+    var held = try manager.admitHostPreflightChecked(80, false);
+    defer held.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.admitHostPreflightChecked(30, false));
+    diagnostic = manager.memoryAdmissionDiagnostic();
+    try std.testing.expect(diagnostic.retryable);
+    try std.testing.expectEqual(@as(u64, 30), diagnostic.requested_scratch_bytes);
+    held.release();
+    var recovered = try manager.admitHostPreflightChecked(30, false);
+    recovered.release();
+    try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
 }

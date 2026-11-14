@@ -15516,6 +15516,8 @@ fn searchDenseInternal(
             profile.hbc_leaves_explored = profiled.profile.leaves_explored;
             profile.hbc_approx_vectors_scored = profiled.profile.approx_vectors_scored;
             profile.hbc_exact_vectors_scored = profiled.profile.exact_vectors_scored;
+            profile.hbc_exact_projection_vectors_scored = profiled.profile.exact_projection_vectors_scored;
+            profile.hbc_exact_vectors_pruned_by_bound = profiled.profile.exact_vectors_pruned_by_bound;
             profile.hbc_leaf_payload_stale = profiled.profile.leaf_payload_stale;
             profile.hbc_leaf_payload_missing = profiled.profile.leaf_payload_missing;
             profile.hbc_native_leaf_scan_hits = profiled.profile.native_leaf_scan_hits;

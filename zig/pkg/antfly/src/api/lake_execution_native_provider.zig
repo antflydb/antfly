@@ -71,17 +71,37 @@ const Callbacks = struct {
         return .fromError(err);
     }
 };
-fn attempt(request: c.Request, callbacks: *Callbacks, io: std.Io, cause: *c.Failure) ![]u8 {
+fn attempt(request: c.Request, callbacks: *Callbacks, io: std.Io, transport_io: ?std.Io, cause: *c.Failure) ![]u8 {
+    // Connections and TLS outlive individual upload calls, so admit their real
+    // allocator under a separate owner instead of rebinding shared clients.
+    var transport_memory: local.sql_memory_budget = .{ .backing = request.allocator, .limit = 128 * 1024 * 1024 };
+    defer if (comptime @hasDecl(@import("root"), "lakeExecutionProbeMemory"))
+        @import("root").lakeExecutionProbeMemory("transport", transport_memory.peak, transport_memory.limit);
+    return attemptWithTransport(request, callbacks, io, transport_io, cause, transport_memory.allocator()) catch |err|
+        return @import("../serverless/build/lake_build_limits.zig").classifyPrivateAllocationFailure(err, &transport_memory);
+}
+fn attemptWithTransport(request: c.Request, callbacks: *Callbacks, io: std.Io, transport_io: ?std.Io, cause: *c.Failure, transport_allocator: A) ![]u8 {
     const a = request.allocator;
     const context: Context = .{ .io = io, .checkpoint = .{ .ptr = callbacks, .check = Callbacks.check } };
     try context.ensureActive();
     try request.cancellation.check();
     const store_started = probeNow();
     var store = if (request.store.config) |config|
-        try Store.openRetainedNative(a, config, request.store.secrets, request.store.locator, false, request.store.deployment, request.store.local_base_dir)
+        try Store.openRetainedNativeWithTransport(transport_allocator, config, request.store.secrets, request.store.locator, false, request.store.deployment, request.store.local_base_dir, .{ .io = transport_io, .requests = request.source.requests, .query_requests = request.source.query_requests })
     else
-        try Store.openNative(a, null, request.store.secrets, false, request.store.deployment, request.store.local_base_dir);
+        try Store.openNativeWithTransport(transport_allocator, null, request.store.secrets, false, request.store.deployment, request.store.local_base_dir, .{ .io = transport_io, .requests = request.source.requests, .query_requests = request.source.query_requests });
     defer store.deinit();
+    if (comptime @hasDecl(@import("root"), "lakeExecutionProbeHttpFailure")) {
+        if (store.implementation.gcs_client) |gcs| {
+            const Observer = struct {
+                fn report(_: ?*anyopaque, event: @import("objectstore").Gcs.HttpDiagnostic) void {
+                    if (event.failure) |err| @import("root").lakeExecutionProbeHttpFailure(@tagName(event.method), event.body_bytes, event.attempts, event.elapsed_ns, err);
+                    if (event.status) |status| @import("root").lakeExecutionProbeHttpStatus(@tagName(event.method), event.body_bytes, event.attempts, event.elapsed_ns, status);
+                }
+            };
+            gcs.setDiagnostics(.{ .report = Observer.report });
+        }
+    }
     probeStage("store_open_ns", store_started);
     if (store.locator.protocol != request.store.locator.protocol or store.locator.tls != request.store.locator.tls or
         !std.mem.eql(u8, store.locator.root, request.store.locator.root) or !std.mem.eql(u8, store.locator.bucket, request.store.locator.bucket) or
@@ -90,6 +110,7 @@ fn attempt(request: c.Request, callbacks: *Callbacks, io: std.Io, cause: *c.Fail
     store.implementation.cloud_vacuum = request.store.cloud_vacuum;
     var source_options = request.source;
     source_options.read_only = true;
+    source_options.io = transport_io;
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, request.table.schema_json)) orelse return error.InvalidExternalTableBinding;
     defer binding.deinit(a);
     // Each writer family revisits source metadata and ranges. Keep reuse in
@@ -127,19 +148,25 @@ pub fn execute(request: c.Request) c.Response {
     var callbacks: Callbacks = .{ .host = request.control };
     var backing = c.memory.BorrowedAllocator.init(request.allocator, request.allocator_headroom) catch |err| return .{ .failure = .fromError(err) };
     var receiver = request.io.receive() catch |err| return .{ .failure = .fromError(err) };
+    var transport_receiver = if (request.transport_io) |borrow| borrow.receive() catch |err| return .{ .failure = .fromError(err) } else null;
     var cause: c.Failure = .{};
     // Headroom/admission inspects allocator identity. Keep the quota in this
     // owner instead of asking physical writers to interpret a foreign quota.
     var working = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(backing.allocator(), request.build_limits) catch |err| return .{ .failure = .fromError(err) };
     defer working.deinit();
+    defer if (comptime @hasDecl(@import("root"), "lakeExecutionProbeMemory"))
+        @import("root").lakeExecutionProbeMemory("build", working.quota.peak_bytes, request.build_limits.max_working_set_bytes);
     defer if (comptime @hasDecl(@import("root"), "lakeExecutionProbeQuota")) @import("root").lakeExecutionProbeQuota(working.quota.peak_bytes);
     var local_request = request;
     local_request.allocator = working.allocator();
-    const bytes = attempt(local_request, &callbacks, receiver.io(), &cause) catch |err| {
-        const failure = callbacks.failure(err);
+    const bytes = attempt(local_request, &callbacks, receiver.io(), if (transport_receiver) |*value| value.io() else null, &cause) catch |err| {
+        // Any backing OOM in this attempt makes private quota attribution
+        // ambiguous. Preserve physical OOM over a recovered historical denial.
+        const backing_failed = backing.backing_allocation_failed.load(.monotonic);
+        const failure = callbacks.failure(if (backing_failed and err == error.LakeSidecarBuildLimitExceeded) error.OutOfMemory else err);
         // A control callback may allocate from this owner's quota. Its error
         // token remains opaque, so classify that actual OOM by name as well.
-        const quota_oom = working.limitExceeded() and failure.ptr != null and std.mem.eql(u8, failure.ptr.?[0..failure.len], "OutOfMemory");
+        const quota_oom = !backing_failed and working.limitExceeded() and failure.ptr != null and std.mem.eql(u8, failure.ptr.?[0..failure.len], "OutOfMemory");
         return .{ .failure = if (quota_oom) .fromError(error.LakeSidecarBuildLimitExceeded) else failure, .artifact_cause = cause };
     };
     defer working.allocator().free(bytes);
@@ -161,5 +188,5 @@ fn get() callconv(.c) *const c.Endpoint {
     return &endpoint;
 }
 pub fn exportOperations() void {
-    @export(&get, .{ .name = "antfly_lake_execute_v3", .visibility = .hidden });
+    @export(&get, .{ .name = "antfly_lake_execute_v4", .visibility = .hidden });
 }

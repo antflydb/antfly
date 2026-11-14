@@ -47805,11 +47805,11 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 9), source.cached_routing_snapshot.?.snapshot.catalog_revision);
         }
 
-        test "remote routing normalizes every timeout class at the source boundary" {
+        test "remote routing preserves cancellation while normalizing timeout classes" {
             try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Timeout) == error.CatalogRoutingSnapshotTimeout);
             try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.DeadlineExceeded) == error.CatalogRoutingSnapshotTimeout);
-            try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Cancelled) == error.CatalogRoutingSnapshotTimeout);
-            try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Canceled) == error.CatalogRoutingSnapshotTimeout);
+            try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Cancelled) == error.Canceled);
+            try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Canceled) == error.Canceled);
             try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.CatalogRoutingSnapshotTimeout) == error.CatalogRoutingSnapshotTimeout);
             try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.NotLeader) == error.NotLeader);
         }
@@ -56337,7 +56337,10 @@ fn implementationTests() type {
                 try std.testing.expectEqualStrings("alice", restored_key.username);
                 try std.testing.expectEqual(@as(usize, 1), restored_key.roles.len);
                 try std.testing.expectEqualStrings("role:tenant-reader", restored_key.roles[0]);
-                try std.testing.expectEqual(@as(usize, 1), restored_key.row_filter.len);
+                try std.testing.expectEqual(@as(usize, 2), restored_key.row_filter.len);
+                const effective = (try antfly.usermgr.combinedRowFilterForTable(alloc, restored_key.row_filter, "docs")).?;
+                defer effective.deinit(alloc);
+                try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"tenant_id\":\"acme\"}},{\"term\":{\"tier\":\"gold\"}}]}", effective.json);
                 try restored_auth.updatePassword("alice", "post-seed-secret");
             }
             // Materialization is a one-shot install. Subsequent auth mutations survive

@@ -5,7 +5,23 @@ import Foundation
 
 public enum DictationMode: String, Codable, CaseIterable, Sendable {
   case verbatim, clean, rewrite
-  public var label: String { rawValue.capitalized }
+  public var label: String { self == .clean ? "Clean up" : rawValue.capitalized }
+  public var description: String {
+    switch self {
+    case .verbatim:
+      return "Keep the recognized wording. Voice formatting can still add line breaks."
+    case .clean:
+      return
+        "Remove fillers, fix punctuation, and apply preferred spellings using a text processor."
+    case .rewrite: return "Use a text processor to apply your tone and rewrite instructions."
+    }
+  }
+  public func validateProcessor(_ model: String) throws {
+    if self != .verbatim && model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      throw DictationError.invalid(
+        "Choose a text processor for \(label) in Presets, or select Verbatim.")
+    }
+  }
 }
 public enum ProcessingStrategy: String, Codable, CaseIterable, Sendable {
   case automatic, incremental, wholeUtterance
@@ -47,19 +63,28 @@ public struct DictationTiming: Sendable {
   public var cleanup: TimeInterval
   public var afterRelease: TimeInterval = 0
   public var total: TimeInterval
-  public init(recognition: TimeInterval = 0, cleanup: TimeInterval = 0, total: TimeInterval = 0) {
+  public var firstEvent: TimeInterval?
+  public var firstDraft: TimeInterval?
+  public init(
+    recognition: TimeInterval = 0, cleanup: TimeInterval = 0, total: TimeInterval = 0,
+    firstEvent: TimeInterval? = nil, firstDraft: TimeInterval? = nil
+  ) {
     self.recognition = recognition
     self.cleanup = cleanup
     self.total = total
+    self.firstEvent = firstEvent
+    self.firstDraft = firstDraft
   }
 }
 public struct ProcessingPlan: Sendable {
   public var session: Bool
   public var incrementalCleanup: Bool
   public var explanation: String
-  public init(preset: Preset, model: DiscoveredModel?) throws {
-    let stable = model?.dictation?.stable_segments == true
-    let textCleanup = model?.dictation?.text_cleanup == true && preset.usesNamedTranscriber
+  public init(preset: Preset, model: DiscoveredModel?, nativeAppleStreaming: Bool = false) throws {
+    let stable = nativeAppleStreaming || model?.dictation?.stable_segments == true
+    let textCleanup =
+      (nativeAppleStreaming || model?.dictation?.text_cleanup == true)
+      && preset.usesNamedTranscriber
     let canSession = stable && (preset.outputMode == .verbatim || textCleanup)
     let canIncrement = canSession && preset.outputMode != .rewrite
     if preset.processingStrategy == .incremental && !canIncrement {
@@ -72,7 +97,15 @@ public struct ProcessingPlan: Sendable {
     session = canSession
     incrementalCleanup =
       canIncrement && preset.processingStrategy != .wholeUtterance && preset.runsCleanup
-    if session {
+    if nativeAppleStreaming {
+      explanation =
+        incrementalCleanup
+        ? "Apple speech runs on this Mac while you speak. Text processing starts when final phrases arrive; release finishes the tail."
+        : "Apple speech runs on this Mac while you speak. "
+          + (preset.runsCleanup
+            ? "Text processing uses the complete utterance on release."
+            : "Release assembles the final transcript.")
+    } else if session {
       explanation =
         incrementalCleanup
         ? "Recognition and cleanup run while you speak. Release finishes the remaining tail."
@@ -90,7 +123,7 @@ extension Preset {
   public var outputMode: DictationMode {
     get {
       mode
-        ?? (style == "verbatim"
+        ?? (style == "verbatim" || cleanupModel.isEmpty
           ? .verbatim : (style == "clean" && instructions.isEmpty ? .clean : .rewrite))
     }
     set { mode = newValue }
@@ -150,5 +183,13 @@ actor InferenceGate {
   }
   func leave() {
     if waiters.isEmpty { held -= 1 } else { waiters.removeFirst().1.resume() }
+  }
+}
+
+extension Preset {
+  /// A recording must never wait on another preset's processor or on warmup
+  /// when its output does not require generation.
+  public func canUseCleanupPreparation(for model: String?) -> Bool {
+    runsCleanup && model == cleanupModel
   }
 }

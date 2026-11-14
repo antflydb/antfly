@@ -2823,6 +2823,9 @@ def test_native_remote_large_hydration_and_residual_filter(tmp_path):
 
 def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path):
     """Bounded index seeks and ordinal maps share exact bitmap semantics."""
+    from helpers import PhaseTimings
+
+    timings = PhaseTimings("indexed-metadata-scale")
     pa = pytest.importorskip("pyarrow")
     pq = pytest.importorskip("pyarrow.parquet")
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
@@ -2869,7 +2872,9 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             + hashlib.sha256(payload).hexdigest().encode()
             + payload
         )
+    timings.mark("independent-source-fixture")
     server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    timings.mark("server-startup")
     failed = True
     try:
 
@@ -3000,6 +3005,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         # This fixture builds several ordered indexes over more than 100,000
         # rows. Allow bounded Debug publication setup before checking indexed
         # query semantics; this is not a publication-latency benchmark.
+        timings.mark("table-admission")
         deadline = time.monotonic() + 600
         while True:
             resource = call("GET", "/tables/indexed_predicates/indexes/body_text")
@@ -3007,6 +3013,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
                 break
             assert time.monotonic() < deadline, str(resource) + server.debug_logs()
             time.sleep(0.1)
+        timings.mark("native-index-publication")
 
         def query(predicate, **options):
             return call(
@@ -3617,6 +3624,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         ):
             dated = query(predicate, count=True, fields=[], limit=0)
             assert dated["hits"]["total"] == {"value": 2, "relation": "exact"}, dated
+        timings.mark("indexed-query-assertions")
         failed = False
     finally:
         server.stop(test_failed=failed)

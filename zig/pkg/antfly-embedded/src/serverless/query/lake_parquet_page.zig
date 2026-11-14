@@ -340,10 +340,10 @@ fn decodeExtendedAlloc(comptime T: type, a: Allocator, header: Header, payload: 
                 for (0..width) |byte| buffer[byte] = data[byte * count + position.?];
                 value.* = if (width == 4) std.mem.readInt(i32, buffer[0..4], .little) else std.mem.readInt(i64, &buffer, .little);
             }
-        } else if (T == f64) {
+        } else if (T == f64 or T == f32) {
             var buffer: [8]u8 = undefined;
             for (0..width) |byte| buffer[byte] = data[byte * count + position.?];
-            value.* = if (width == 4) @as(f32, @bitCast(std.mem.readInt(u32, buffer[0..4], .little))) else @as(f64, @bitCast(std.mem.readInt(u64, &buffer, .little)));
+            value.* = @floatCast(if (width == 4) @as(f64, @as(f32, @bitCast(std.mem.readInt(u32, buffer[0..4], .little)))) else @as(f64, @bitCast(std.mem.readInt(u64, &buffer, .little))));
         } else unreachable;
         initialized += 1;
     }
@@ -581,6 +581,24 @@ pub fn decodePlainF32AsF64Alloc(alloc: Allocator, original_header: Header, origi
     return values;
 }
 
+pub fn decodePlainF32Alloc(alloc: Allocator, original_header: Header, original_payload: []const u8) ![]f32 {
+    if (try decodeExtendedAlloc(f32, alloc, original_header, original_payload, .{ .number = 4 }, false)) |decoded| return decoded.values;
+    const header = original_header;
+    const page_payload = original_payload;
+    try header.validatePlainRequired();
+    if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
+    const payload = page_payload[header.data_payload_offset..];
+    const count: usize = @intCast(header.value_count);
+    const needed = count * 4;
+    if (payload.len < needed) return error.InvalidParquetPage;
+    const values = try alloc.alloc(f32, count);
+    for (values, 0..) |*value, idx| {
+        const bits = std.mem.readInt(u32, payload[idx * 4 .. idx * 4 + 4][0..4], .little);
+        value.* = @as(f32, @bitCast(bits));
+    }
+    return values;
+}
+
 pub fn scanUncompressedPlainF32AsF64ColumnChunkAlloc(alloc: Allocator, column_chunk_bytes: []const u8) ![]f64 {
     return try scanPlainF32AsF64ColumnChunkAlloc(alloc, column_chunk_bytes, .uncompressed);
 }
@@ -809,6 +827,19 @@ pub fn decodePlainF32DictionaryPageAsF64Alloc(alloc: Allocator, header: Header, 
     return values;
 }
 
+pub fn decodePlainF32DictionaryPageAlloc(alloc: Allocator, header: Header, page_payload: []const u8) ![]f32 {
+    try header.validatePlainDictionary();
+    const count: usize = @intCast(header.value_count);
+    const needed = count * 4;
+    if (page_payload.len < needed) return error.InvalidParquetPage;
+    const values = try alloc.alloc(f32, count);
+    for (values, 0..) |*value, idx| {
+        const bits = std.mem.readInt(u32, page_payload[idx * 4 .. idx * 4 + 4][0..4], .little);
+        value.* = @as(f32, @bitCast(bits));
+    }
+    return values;
+}
+
 pub fn decodePlainI32DictionaryPageAsI64Alloc(alloc: Allocator, header: Header, page_payload: []const u8) ![]i64 {
     try header.validatePlainDictionary();
     const count: usize = @intCast(header.value_count);
@@ -863,6 +894,31 @@ pub fn decodeDictionaryF64DataPageAlloc(
     const indexes = try decodeHybridIndexesAlloc(alloc, payload[1..], bit_width, row_count);
     defer alloc.free(indexes);
     const values = try alloc.alloc(f64, row_count);
+    errdefer alloc.free(values);
+    for (indexes, values) |index, *value| {
+        if (index >= dictionary.len) return error.InvalidParquetPage;
+        value.* = dictionary[@intCast(index)];
+    }
+    return values;
+}
+
+pub fn decodeDictionaryF32DataPageAlloc(
+    alloc: Allocator,
+    header: Header,
+    dictionary: []const f32,
+    page_payload: []const u8,
+) ![]f32 {
+    try header.validateDictionaryRequired();
+    if (header.data_payload_offset > page_payload.len) return error.InvalidParquetPage;
+    const payload = page_payload[header.data_payload_offset..];
+    if (payload.len == 0) return error.InvalidParquetPage;
+    const bit_width_raw = payload[0];
+    if (bit_width_raw > 32) return error.UnsupportedParquetPage;
+    const bit_width: u6 = @intCast(bit_width_raw);
+    const row_count: usize = @intCast(header.value_count);
+    const indexes = try decodeHybridIndexesAlloc(alloc, payload[1..], bit_width, row_count);
+    defer alloc.free(indexes);
+    const values = try alloc.alloc(f32, row_count);
     errdefer alloc.free(values);
     for (indexes, values) |index, *value| {
         if (index >= dictionary.len) return error.InvalidParquetPage;
@@ -3315,15 +3371,16 @@ fn decodeCompressedExactAlloc(
         },
         .gzip => blk: {
             var in: std.Io.Reader = .fixed(compressed);
-            var window: [std.compress.flate.max_window_len]u8 = undefined;
-            var decompress: std.compress.flate.Decompress = .init(&in, .gzip, &window);
+            const window = try alloc.alloc(u8, std.compress.flate.max_window_len);
+            defer alloc.free(window);
+            var decompress: std.compress.flate.Decompress = .init(&in, .gzip, window);
             break :blk try decompress.reader.allocRemaining(alloc, .limited(read_limit));
         },
         .zstd => blk: {
-            var in: std.Io.Reader = .fixed(compressed);
-            var window: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;
-            var decompress: std.compress.zstd.Decompress = .init(&in, &window, .{});
-            break :blk try decompress.reader.allocRemaining(alloc, .limited(read_limit));
+            const output = try alloc.alloc(u8, expected_len);
+            errdefer alloc.free(output);
+            try @import("antfly_compress").zstd.decodeExact(alloc, compressed, output, .{});
+            break :blk output;
         },
     };
     errdefer alloc.free(decoded);

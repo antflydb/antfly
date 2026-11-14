@@ -150,7 +150,7 @@ pub const TlsSession = struct {
     net_in: ?SocketIoReader = null,
     net_out: ?SocketIoWriter = null,
 
-    ca_bundle: ?std.crypto.Certificate.Bundle = null,
+    ca_bundle: ?@import("certificate_compat.zig").Bundle = null,
     ca_bundle_lock: std.Io.RwLock = .init,
     client: ?TlsClient = null,
 
@@ -229,10 +229,11 @@ pub const TlsSession = struct {
         // An explicit CA file replaces system roots. This is required for the
         // projected Kubernetes service-account CA trust boundary.
         if (verify) {
-            var bundle: std.crypto.Certificate.Bundle = .{
+            var bundle: @import("certificate_compat.zig").Bundle = .{
                 .map = .{},
                 .bytes = .empty,
             };
+            errdefer bundle.deinit(self.allocator);
             const now = Io.Timestamp.now(self.io, .real);
             if (self.config.ca_file) |ca_file| {
                 if (!std.fs.path.isAbsolute(ca_file)) return error.InvalidCaFilePath;
@@ -240,10 +241,8 @@ pub const TlsSession = struct {
             } else {
                 try bundle.rescan(self.allocator, self.io, now);
             }
-            // Transfer ownership to self immediately so deinit() handles cleanup
-            // if a later fallible operation (e.g. tls.Client.init) fails. An errdefer
-            // on the local `bundle` would cause a double-free because `bundle` is
-            // captured by value while `self.ca_bundle` holds the same allocation.
+            // The block-local errdefer covers partial loading. On success,
+            // the session owns the bundle through every later handshake error.
             self.ca_bundle = bundle;
         }
 
@@ -294,7 +293,7 @@ pub const TlsSession = struct {
     fn caBundleOption(self: *Self) @FieldType(TlsClient.Options, "ca") {
         const CaOption = @FieldType(TlsClient.Options, "ca");
         const BundleOption = @FieldType(CaOption, "bundle");
-        if (BundleOption == std.crypto.Certificate.Bundle) {
+        if (BundleOption == @import("certificate_compat.zig").Bundle) {
             return .{ .bundle = self.ca_bundle.? };
         }
         return .{ .bundle = .{
@@ -555,4 +554,25 @@ test "residual TLS EOF ignores stale terminal record error" {
     defer session.client = null;
     var byte: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 0), try session.read(&byte));
+}
+
+test "TLS failed CA loading releases partially allocated bundle" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "invalid.pem", .data = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n" });
+    const path = try tmp.dir.realPathFileAlloc(io, "invalid.pem", a);
+    defer a.free(path);
+    const Quota = @import("../util/quota_allocator.zig").QuotaAllocator;
+    var quota = Quota{ .backing = a, .limit = 8 << 20 };
+    var config = TlsConfig.init(quota.allocator());
+    config.ca_file = path;
+    var session = TlsSession.init(config, io);
+    // Loading fails before the transport can be touched.
+    var socket: Socket = undefined;
+    session.attachSocket(&socket);
+    try std.testing.expectError(error.CertificateFieldHasInvalidLength, session.handshake("localhost"));
+    session.deinit();
+    try std.testing.expectEqual(@as(usize, 0), quota.live);
 }

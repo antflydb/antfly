@@ -16,6 +16,7 @@
 // Run through test_pgwire_drivers.py after building @antfly/sdk.
 import { inspect } from "node:util";
 import pg from "pg";
+import { createPhaseTimings, profileClientOperations } from "./worker-progress.mjs";
 import { AntflyClient } from "../../ts/packages/sdk/dist/index.js";
 import {
 	AntflyPersistentMigrationLock,
@@ -25,6 +26,28 @@ import {
 // Exercise parent-side failure reporting without creating a database claim.
 if (process.argv[2] === "exit-before-report") process.exit(17);
 
+// Keep bounded phase evidence in the subprocess outcome. In particular, a
+// contender timeout must distinguish a slow owner DDL/release from stale reads.
+// Parameters and connection URLs are never included in these diagnostics.
+const profile = createPhaseTimings();
+const wrapped = Symbol("migration query timings");
+class TimedPool extends pg.Pool {
+	async connect() {
+		const connection = await super.connect();
+		if (!connection[wrapped]) {
+			connection[wrapped] = true;
+			const original = connection.query.bind(connection);
+			connection.query = async (...args) => {
+				const sql = typeof args[0] === "string" ? args[0] : args[0]?.text ?? "";
+				const verb = sql.match(/^\s*(\w+)/)?.[1]?.toUpperCase() ?? "UNKNOWN";
+				const phase = sql.includes("_antfly_kysely_migration_claims") ? `CLAIM ${verb}` : verb;
+				return profile.track(phase, () => original(...args));
+			};
+		}
+		return connection;
+	}
+}
+
 const url = new URL(process.env.ANTFLY_PGWIRE_URL);
 const client = new AntflyClient({
 	baseUrl: process.env.ANTFLY_HTTP_URL,
@@ -33,8 +56,9 @@ const client = new AntflyClient({
 		password: decodeURIComponent(url.password),
 	},
 });
+const restoreClientProfiling = profileClientOperations(client.api, profile);
 const runtime = createAntflyPostgres({
-	pg,
+	pg: { ...pg, Pool: TimedPool },
 	client,
 	pool: { connectionString: url.toString() },
 });
@@ -66,12 +90,15 @@ try {
 		process.send({
 			error: result.error ? inspect(result.error, { depth: 5 }) : null,
 			applied: result.results?.length ?? 0,
+			timings: profile.snapshot(),
 		});
 	}
 } catch (error) {
-	process.send({ error: inspect(error, { depth: 5 }) });
+	process.send({ error: inspect(error, { depth: 5 }), timings: profile.snapshot() });
 	process.exitCode = 1;
 } finally {
+	restoreClientProfiling();
+	profile.close();
 	await runtime.close();
 	process.disconnect();
 }

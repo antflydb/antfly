@@ -25,6 +25,10 @@ pub const State = struct {
     owned: ?[]u8 = null,
     now_ms: u64 = 101,
     checkpoints: usize = 0,
+    checkpoint_path: ?[]const u8 = null,
+    interrupt_after_bulk_source: bool = false,
+    interrupt_at_bulk_receipt: ?usize = null,
+    bulk_receipts: usize = 0,
     discards: usize = 0,
     mutex: std.Io.Mutex = .init,
     io: std.Io,
@@ -33,6 +37,13 @@ pub const State = struct {
     }
     pub fn set(self: *@This(), bytes: []const u8) !void {
         const owned = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(owned);
+        if (self.checkpoint_path) |path| {
+            const temporary = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
+            defer self.allocator.free(temporary);
+            try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = temporary, .data = bytes });
+            try std.Io.Dir.cwd().rename(temporary, std.Io.Dir.cwd(), path, self.io);
+        }
         if (self.owned) |old| self.allocator.free(old);
         self.owned = owned;
         self.table.lake_index_catalog_json = owned;
@@ -57,10 +68,19 @@ pub const State = struct {
         defer self.mutex.unlock(self.io);
         var current = try catalog.parse(self.allocator, self.table.lake_index_catalog_json);
         defer current.deinit();
+        const changed_bulk = if (saved.construction.len != 0 and saved.declarations.len == 0) changed: {
+            if (current.value.checkpoint) |previous| if (previous.construction.len == saved.construction.len and
+                std.mem.eql(u8, previous.construction[0].manifest.artifact_id, saved.construction[0].manifest.artifact_id)) break :changed false;
+            break :changed true;
+        } else false;
         const bytes = try catalog.encode(self.allocator, try current.value.saveCheckpoint(saved, self.now_ms));
         defer self.allocator.free(bytes);
         try self.set(bytes);
         self.checkpoints += 1;
+        if (changed_bulk) {
+            self.bulk_receipts += 1;
+            if (self.interrupt_after_bulk_source or self.interrupt_at_bulk_receipt == self.bulk_receipts) return error.Cancelled;
+        }
     }
     fn discard(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));

@@ -954,7 +954,6 @@ pub const TextColumnProjection = struct {
         if (std.mem.eql(u8, self.paths[index], "_id")) return .{ .string = try @import("../rowsource/identity.zig").allocId(a, self.batch.rowRef(row)) };
         const column = self.columns[index] orelse return .null;
         if (column.nulls.isNull(row)) return .null;
-        if (column.values == .vector_f32) return error.UnsupportedSqlExecution;
         return column.values.jsonAt(a, row);
     }
 };

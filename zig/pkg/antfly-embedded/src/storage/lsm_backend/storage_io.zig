@@ -718,8 +718,9 @@ pub const Storage = struct {
     /// Optional immutable, lifetime-pinned random access. Unsupported backends
     /// must not emulate this by resolving the current pathname on each read.
     /// The storage owner must outlive the returned source. Each source pins
-    /// one immutable artifact version until close; pathname re-resolution is
-    /// forbidden after opening, including during vacuum and replacement.
+    /// one immutable artifact version until close. Native positional-read
+    /// optimizations may re-resolve a path only after verifying inode identity;
+    /// replacement or unlink must fall back to the pinned mapping.
     pub fn mapImmutableArtifact(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").MappedArtifact {
         const map = self.vtable.map_immutable_artifact orelse return error.MappedArtifactUnsupported;
         return BoundaryAbi.call("map_immutable_artifact", self.boundary_dispatch, map, .{ self.ptr, allocator, path });
@@ -1333,6 +1334,7 @@ else
             path_hash: u64,
             path: [:0]u8,
             fd: std.posix.fd_t,
+            identity: NativeFileIdentity,
             ref_count: usize = 0,
             last_access: u64 = 0,
             invalidated: bool = false,
@@ -1542,6 +1544,17 @@ else
         }
 
         fn retain(self: *FdCache, namespace: u64, io: std.Io, path: []const u8) !*Entry {
+            return self.retainWithAdmission(namespace, io, path, true);
+        }
+
+        fn tryRetain(self: *FdCache, namespace: u64, io: std.Io, path: []const u8) !?*Entry {
+            return self.retainWithAdmission(namespace, io, path, false) catch |err| switch (err) {
+                error.DescriptorAdmissionUnavailable => null,
+                else => return err,
+            };
+        }
+
+        fn retainWithAdmission(self: *FdCache, namespace: u64, io: std.Io, path: []const u8, wait: bool) !*Entry {
             const path_hash = namespacedPathHash(namespace, path);
             const shard = self.shardForHash(path_hash);
             // Cache hits already own a stable filename and descriptor. Avoid
@@ -1577,7 +1590,9 @@ else
                 observed_invalidation_epoch = shard.invalidation_epoch;
                 if (locked) shard.mutex.unlock();
 
-                try self.reserveDescriptors(io, 1);
+                if (wait) {
+                    try self.reserveDescriptors(io, 1);
+                } else if (!self.tryReserveDescriptors(io, 1)) return error.DescriptorAdmissionUnavailable;
                 var descriptor_reserved = true;
                 errdefer if (descriptor_reserved) self.releaseDescriptors(io, 1);
 
@@ -1603,6 +1618,7 @@ else
                     .path_hash = path_hash,
                     .path = owned_path,
                     .fd = fd,
+                    .identity = try nativeFileIdentity(fd),
                     .ref_count = 1,
                     .last_access = self.nextAccessLocked(),
                 };
@@ -2154,6 +2170,28 @@ const NativeStorageState = struct {
     }
 };
 
+/// Short-lived files created by non-NativeStorage providers still participate
+/// in the process admission domain. Admission is nonblocking so an artifact
+/// writer cannot deadlock while retaining its publication input/output lease.
+pub const ProcessNativeFdPermit = struct {
+    io: std.Io,
+    active: bool = false,
+
+    pub fn acquire(io: std.Io) !ProcessNativeFdPermit {
+        if (comptime supports_posix_fd_cache) {
+            if (!processNativeFdCache().tryReserveDescriptors(io, 1)) return error.StorageDescriptorPressure;
+            return .{ .io = io, .active = true };
+        }
+        return .{ .io = io };
+    }
+
+    pub fn release(self: *ProcessNativeFdPermit) void {
+        if (!self.active) return;
+        self.active = false;
+        if (comptime supports_posix_fd_cache) processNativeFdCache().releaseDescriptors(self.io, 1);
+    }
+};
+
 /// A permit from the runtime-wide storage descriptor budget. Cached LSM files
 /// retain one for the cache entry lifetime; short-lived consumers such as
 /// full-text segment mmap release theirs as soon as the source fd is closed.
@@ -2643,6 +2681,7 @@ const ThreadedNativeStorage = struct {
 
     const threaded_only_vtable: Storage.VTable = .{
         .acquire_lease = acquireErasedLease,
+        .map_immutable_artifact = if (supports_posix_fd_cache) NativeMappedArtifact.create else null,
         .create_dir_path = createDirPath,
         .read_file_alloc = readFileAlloc,
         .read_file_range_alloc = readFileRangeAlloc,
@@ -3313,6 +3352,105 @@ fn writeAllAtOffset(fd: std.posix.fd_t, bytes: []const u8, offset: u64) !void {
 fn closeFd(fd: std.posix.fd_t) void {
     _ = std.posix.system.close(fd);
 }
+
+const NativeFileIdentity = struct {
+    device: u64,
+    inode: u64,
+};
+
+fn nativeFileIdentity(fd: std.posix.fd_t) !NativeFileIdentity {
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        while (true) {
+            var statx = std.mem.zeroes(linux.Statx);
+            switch (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .INO = true }, &statx))) {
+                .SUCCESS => {
+                    if (!statx.mask.INO) return error.Unexpected;
+                    return .{ .device = (@as(u64, statx.dev_major) << 32) | statx.dev_minor, .inode = statx.ino };
+                },
+                .INTR => continue,
+                else => |err| return posixStatError(err),
+            }
+        }
+    } else {
+        var stat: std.posix.Stat = undefined;
+        while (true) {
+            switch (std.posix.errno(std.posix.system.fstat(fd, &stat))) {
+                .SUCCESS => return .{ .device = @bitCast(@as(i64, stat.dev)), .inode = @intCast(stat.ino) },
+                .INTR => continue,
+                else => |err| return posixStatError(err),
+            }
+        }
+    }
+}
+
+/// The mapping pins the inode; only short positional reads pin descriptors.
+/// Cache entries are shared with ordinary storage and evictable between reads.
+/// Retaining the state lets a generation lease outlive its NativeStorage owner.
+const NativeMappedArtifact = struct {
+    allocator: Allocator,
+    state: *NativeStorageState,
+    path: []u8,
+    identity: NativeFileIdentity,
+
+    fn create(raw: *anyopaque, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").MappedArtifact {
+        if (comptime !supports_posix_fd_cache) return error.MappedArtifactUnsupported;
+        const state: *NativeStorageState = @ptrCast(@alignCast(raw));
+        const retained = try state.acquireLease();
+        errdefer retained.release();
+        const io = state.threaded.io();
+        const entry = try state.fdCache().retain(state.cache_namespace, io, path);
+        defer state.fdCache().release(io, entry);
+        const size = std.math.cast(usize, try fileSizeFromFd(entry.fd)) orelse return error.FileTooBig;
+        if (size == 0) return error.EmptySegment;
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+        const self = try allocator.create(NativeMappedArtifact);
+        errdefer allocator.destroy(self);
+        const bytes = std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, entry.fd, 0) catch |err| switch (err) {
+            error.MemoryMappingNotSupported => return error.MappedArtifactUnavailable,
+            else => return err,
+        };
+        std.posix.madvise(bytes.ptr, bytes.len, std.posix.MADV.RANDOM) catch {};
+        self.* = .{ .allocator = allocator, .state = retained, .path = owned_path, .identity = entry.identity };
+        return .{ .bytes = bytes, .context = self, .release = release, .try_read_into = tryReadInto };
+    }
+
+    fn tryReadInto(raw: *anyopaque, offset: usize, out: []u8) !bool {
+        if (comptime !supports_posix_fd_cache) return false;
+        const self: *NativeMappedArtifact = @ptrCast(@alignCast(raw));
+        const io = self.state.threaded.io();
+        const cache = self.state.fdCache();
+        // Never wait while maintenance may own other descriptor permits.
+        // A missing/replaced path or admission pressure uses the original map.
+        const entry = (cache.tryRetain(self.state.cache_namespace, io, self.path) catch |err| switch (@as(anyerror, err)) {
+            error.FileNotFound,
+            error.NotDir,
+            error.AccessDenied,
+            error.PermissionDenied,
+            error.SymLinkLoop,
+            error.NameTooLong,
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
+            error.OutOfMemory,
+            error.SystemResources,
+            => return false,
+            else => return err,
+        }) orelse return false;
+        defer cache.release(io, entry);
+        if (!std.meta.eql(self.identity, entry.identity)) return false;
+        try readAllAtOffset(entry.fd, out, offset);
+        return true;
+    }
+
+    fn release(raw: *anyopaque) void {
+        const self: *NativeMappedArtifact = @ptrCast(@alignCast(raw));
+        const allocator = self.allocator;
+        self.state.release();
+        allocator.free(self.path);
+        allocator.destroy(self);
+    }
+};
 
 fn fileSizeFromFd(fd: std.posix.fd_t) !u64 {
     if (builtin.os.tag == .linux) {

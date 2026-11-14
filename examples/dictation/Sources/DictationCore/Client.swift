@@ -3,6 +3,23 @@
 
 import Foundation
 
+private final class CleanupMeasurements: @unchecked Sendable {
+  private let lock = NSLock()
+  private let began: TimeInterval
+  private var event: TimeInterval?
+  private var draft: TimeInterval?
+  init(began: TimeInterval) { self.began = began }
+  func record(_ timing: DictationTiming?) {
+    guard let timing else { return }
+    let offset = max(0, ProcessInfo.processInfo.systemUptime - began - timing.total)
+    lock.withLock {
+      if let first = timing.firstEvent { event = min(event ?? .infinity, offset + first) }
+      if let first = timing.firstDraft { draft = min(draft ?? .infinity, offset + first) }
+    }
+  }
+  var firsts: (TimeInterval?, TimeInterval?) { lock.withLock { (event, draft) } }
+}
+
 public actor AntflyClient {
   let origin: URL
   let token: String
@@ -64,6 +81,58 @@ public actor AntflyClient {
   public func models() async throws -> String {
     String(decoding: try await json("ai/v1/models", method: "GET"), as: UTF8.self)
   }
+  public static let speechAssetTimeout: TimeInterval = 30 * 60
+  /// Exercise the released engine's asset installation path without microphone audio.
+  /// Call only after the user opts into downloads in the managed engine configuration.
+  public func checkAppleSpeechAssets(language: String = "en-US") async throws {
+    try Task.checkCancellation()
+    var probe = Preset(id: "asset-check", name: "Language setup", style: "verbatim")
+    probe.model = "transcribers/apple-speech"
+    probe.language = language
+    let silence = try PCMRecording(samples: Data(count: 16000 * 4), sampleRate: 16000).wav()
+    let setupConfiguration = session.configuration
+    setupConfiguration.timeoutIntervalForRequest = Self.speechAssetTimeout + 30
+    setupConfiguration.timeoutIntervalForResource = Self.speechAssetTimeout + 30
+    let setupSession = URLSession(configuration: setupConfiguration)
+    defer { setupSession.invalidateAndCancel() }
+    var body = dictationBody(preset: probe, dictionary: [])
+    body["audio"] = "attachment:0"
+    var upload = request(
+      "ai/v1/dictate",
+      body: try AttachmentEnvelope.audio(metadata: encode(body), recording: silence))
+    upload.setValue(AttachmentEnvelope.contentType, forHTTPHeaderField: "Content-Type")
+    upload.setValue(
+      String(Int(Self.speechAssetTimeout * 1000)),
+      forHTTPHeaderField: "X-Antfly-Inference-Timeout-Ms")
+    upload.timeoutInterval = Self.speechAssetTimeout + 30
+    _ = try await consumeDictation(
+      upload, cleanup: false, transport: setupSession, events: { _ in }, progress: { _ in })
+    try Task.checkCancellation()
+  }
+  public func prewarmCleanup(model: String) async throws {
+    let body: [String: Any] = [
+      "model": model, "stream": false, "max_tokens": 8, "temperature": 0,
+      "messages": [
+        ["role": "system", "content": "Reply with exactly Ready."],
+        ["role": "user", "content": "Warm up."],
+      ],
+    ]
+    var upload = request("ai/v1/generate", body: try encode(body))
+    upload.timeoutInterval = 5
+    upload.setValue("3000", forHTTPHeaderField: "X-Antfly-Inference-Timeout-Ms")
+    let data = try await session.data(for: upload)
+    try Task.checkCancellation()
+    guard (data.1 as? HTTPURLResponse)?.statusCode == 200 else {
+      throw ServerFailure(response: data.1, body: Data(data.0.prefix(ServerFailure.maxBodyBytes)))
+    }
+    guard data.0.count <= 65536,
+      let value = try JSONSerialization.jsonObject(with: data.0) as? [String: Any],
+      let choices = value["choices"] as? [[String: Any]], choices.count == 1,
+      choices[0]["finish_reason"] as? String == "stop"
+    else {
+      throw DictationError.invalid("Text processor warmup did not complete.")
+    }
+  }
   private func dictationBody(preset: Preset, dictionary: [String]) -> [String: Any] {
     var body: [String: Any] = [
       "model": preset.model, "style": preset.requestStyle,
@@ -80,10 +149,12 @@ public actor AntflyClient {
     events: @Sendable @escaping (DictationProgress) async -> Void = { _ in },
     progress: @Sendable @escaping (String) async -> Void
   ) async throws -> DictationResult {
+    try preset.outputMode.validateProcessor(preset.cleanupModel)
     if let formatting, formatting.commands || formatting.pressEnter {
       let began = ProcessInfo.processInfo.systemUptime
       var recognition = preset
       recognition.cleanupModel = ""
+      recognition.outputMode = .verbatim
       var raw = try await dictate(
         audio: audio, preset: recognition, dictionary: dictionary,
         events: events, progress: progress)
@@ -100,10 +171,12 @@ public actor AntflyClient {
       var result = try await cleanupText(
         raw.raw, preset: preset, dictionary: dictionary,
         formatting: formatting, events: events)
+      let firstDraft = result.timing?.firstDraft.map { cleanupBegan - began + $0 }
       result.timing = DictationTiming(
         recognition: raw.timing?.recognition ?? cleanupBegan - began,
         cleanup: preset.runsCleanup ? ProcessInfo.processInfo.systemUptime - cleanupBegan : 0,
-        total: ProcessInfo.processInfo.systemUptime - began)
+        total: ProcessInfo.processInfo.systemUptime - began,
+        firstEvent: raw.timing?.firstEvent, firstDraft: firstDraft)
       return result
     }
     var body = dictationBody(preset: preset, dictionary: dictionary)
@@ -119,6 +192,9 @@ public actor AntflyClient {
     formatting: VoiceFormatting.Options? = nil, context: CleanupContext? = nil,
     events: @Sendable @escaping (DictationProgress) async -> Void = { _ in }
   ) async throws -> DictationResult {
+    do { try preset.outputMode.validateProcessor(preset.cleanupModel) } catch {
+      throw DictationError.cleanupFailed(raw: text, message: error.localizedDescription)
+    }
     guard text.utf8.count <= 65536 else {
       throw DictationError.invalid("Transcript exceeds the cleanup limit.")
     }
@@ -135,6 +211,7 @@ public actor AntflyClient {
       }
       do {
         let cleanupStarted = ProcessInfo.processInfo.systemUptime
+        let measurements = CleanupMeasurements(began: cleanupStarted)
         await events(DictationProgress(phase: .cleaning, raw: text))
         var protectedPreset = preset
         var combinedInstructions = preset.outputMode == .rewrite ? preset.instructions : ""
@@ -167,10 +244,16 @@ public actor AntflyClient {
               content, preset: preset, dictionary: dictionary,
               protectedInstructions: plan.instructions)
           } else {
-            chunk = try await self.cleanupText(
+            let response = try await self.cleanupText(
               content, preset: effectivePreset, dictionary: dictionary,
-              events: { event in await events(DictationProgress(phase: event.phase, raw: text)) }
-            ).text
+              events: { event in
+                await events(
+                  DictationProgress(
+                    phase: event.phase, raw: text,
+                    draft: plan.hasProtectedSpans ? "" : event.draft))
+              })
+            measurements.record(response.timing)
+            chunk = response.text
           }
           return leading + chunk + trailing
         }
@@ -180,7 +263,10 @@ public actor AntflyClient {
         result.text = restored.text
         result.formatting = restored
         let elapsed = ProcessInfo.processInfo.systemUptime - cleanupStarted
-        result.timing = DictationTiming(cleanup: elapsed, total: elapsed)
+        let firsts = measurements.firsts
+        result.timing = DictationTiming(
+          cleanup: elapsed, total: elapsed,
+          firstEvent: firsts.0, firstDraft: firsts.1)
         return result
       } catch is CancellationError { throw CancellationError() } catch {
         throw DictationError.cleanupFailed(raw: text, message: error.localizedDescription)
@@ -189,7 +275,11 @@ public actor AntflyClient {
     if !preset.runsCleanup || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       return DictationResult(raw: text, text: text)
     }
-    var body = dictationBody(preset: preset, dictionary: dictionary)
+    var effective = preset
+    effective.dictionary = []
+    var body = dictationBody(
+      preset: effective,
+      dictionary: CleanupVocabulary.relevant(dictionary + preset.dictionary, to: text))
     body["audio"] = ""
     body["transcript_text"] = text
     // Do not let the server's prose-based heuristic under-budget opaque
@@ -208,7 +298,7 @@ public actor AntflyClient {
     }
   }
   private func consumeDictation(
-    _ upload: URLRequest, cleanup: Bool,
+    _ upload: URLRequest, cleanup: Bool, transport: URLSession? = nil,
     events: @Sendable @escaping (DictationProgress) async -> Void,
     progress: @Sendable @escaping (String) async -> Void
   ) async throws -> DictationResult {
@@ -217,12 +307,14 @@ public actor AntflyClient {
     try Task.checkCancellation()
     let started = ProcessInfo.processInfo.systemUptime
     var recognized: TimeInterval?
+    var firstEvent: TimeInterval?
+    var firstDraft: TimeInterval?
     var raw = ""
     var text = ""
     var complete = false
     var done = false
     do {
-      let (bytes, response) = try await session.bytes(for: upload)
+      let (bytes, response) = try await (transport ?? session).bytes(for: upload)
       defer { bytes.task.cancel() }
       guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
         var body = Data()
@@ -249,6 +341,7 @@ public actor AntflyClient {
         guard
           let value = try JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any]
         else { continue }
+        if firstEvent == nil { firstEvent = ProcessInfo.processInfo.systemUptime - started }
         switch value["type"] as? String {
         case "dictation.transcript":
           guard recognized == nil, !complete,
@@ -264,6 +357,9 @@ public actor AntflyClient {
         case "dictation.delta":
           guard recognized != nil, !complete, let delta = value["delta"] as? String else {
             throw DictationError.invalid("Invalid dictation delta lifecycle.")
+          }
+          if cleanup && firstDraft == nil {
+            firstDraft = ProcessInfo.processInfo.systemUptime - started
           }
           text += delta
           await progress(text)
@@ -294,6 +390,7 @@ public actor AntflyClient {
         throw DictationError.invalid("Cleanup returned empty text for speech.")
       }
     } catch is CancellationError { throw CancellationError() } catch {
+      try Task.checkCancellation()
       if recognized != nil {
         throw DictationError.cleanupFailed(raw: raw, message: error.localizedDescription)
       }
@@ -304,7 +401,8 @@ public actor AntflyClient {
       raw: raw, text: text,
       timing: DictationTiming(
         recognition: (recognized ?? ended) - started,
-        cleanup: cleanup ? ended - (recognized ?? ended) : 0, total: ended - started))
+        cleanup: cleanup ? ended - (recognized ?? ended) : 0, total: ended - started,
+        firstEvent: firstEvent, firstDraft: firstDraft))
   }
   public func createSession(preset: Preset, dictionary: [String]) async throws -> String {
     var body: [String: Any] = [

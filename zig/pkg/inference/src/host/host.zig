@@ -50,6 +50,7 @@ pub const LinkedInferenceState = struct {
     worker: ?*worker_runtime.Client = null,
     warm_models: ResolvedWarmModels,
     content_security: ?std.json.Parsed(scraping.ContentSecurityConfig),
+    content_security_source: inference_bridge.ContentSecuritySource = .{},
     s3_credentials: ?std.json.Parsed(scraping.S3CredentialsConfig),
     runtime_config: std.json.Parsed(InferenceRuntimeConfig),
     owned_models_dir: ?[]u8,
@@ -64,6 +65,15 @@ pub const LinkedInferenceState = struct {
     /// states leave this null and dispatch directly to `node`.
     read_encoded_images_override: ?ReadEncodedImagesHandler = null,
     read_raster_images_override: ?ReadRasterImagesHandler = null,
+    /// Observe the fully decoded request at its dispatch site. This field and
+    /// all probes disappear from production builds.
+    chunk_request_probe: if (@import("builtin").is_test) ?ChunkRequestProbe else void = if (@import("builtin").is_test) null else {},
+};
+
+const ChunkRequestProbe = struct {
+    const Dispatch = enum { input, page, replay };
+    context: *anyopaque,
+    inspect: *const fn (*anyopaque, inference.server.chunk_response.Request, Dispatch, ?chunking_types.Replay) anyerror!void,
 };
 
 /// Stable, ref-counted copy of the standalone resource-owner capability. The
@@ -115,6 +125,7 @@ const InferenceRuntimeConfig = struct {
     audio_readers: []const @import("antfly_transcribing").NamedConfig = &.{},
     embedded_enabled: bool = true,
     /// Environment forwarded only when a server host launches its worker.
+    worker_executable: ?[]const u8 = null,
     worker_environment: []const worker_runtime.EnvironmentEntry = &.{},
     resources: inference.platform.resource_policy.Resources = .{},
     generation_batching: inference.platform.inference_settings.GenerationBatching = .{},
@@ -653,6 +664,61 @@ const ChunkInputRequest = struct {
     attachment_count: usize = 0,
 };
 
+// Native requests have no client-supplied operational ceilings. Start from the
+// node's configured limits, just like HTTP, rather than Request's defaults.
+// Keep the server's admission, bounded allocator and downward clamps in charge.
+fn nativeModelChunkRequest(limits: @FieldType(inference.server.chunk_response.Request, "limits"), input: inference_chunker.Input, cfg: chunking_types.Config, outputs: ?inference_chunker.outputs.Config, execute: bool) !inference.server.chunk_response.Request {
+    const wire = inference.server.chunk_response;
+    return .{
+        .limits = limits,
+        .max_working_bytes = limits.max_working_bytes,
+        .input = input,
+        .outputs = outputs,
+        .policy = try wire.parsePolicy(if (cfg.policy) |policy| converted: {
+            var value = wire.WirePolicy{};
+            inline for (@typeInfo(wire.WirePolicy).@"struct".field_names) |name| @field(value, name) = @field(policy, name);
+            break :converted value;
+        } else null),
+        .max_chunks = cfg.max_chunks,
+        .native_content = true,
+        .execute_outputs = execute,
+        .execute = execute,
+        .allow_partial = cfg.page,
+        .observe_only = cfg.page and cfg.observe_only,
+        .source_version = if (cfg.replay) |position| position.source_version else "",
+    };
+}
+
+test "native model chunk requests inherit configured ceilings for pages full input and replay" {
+    const Limits = @FieldType(inference.server.chunk_response.Request, "limits");
+    for ([_]usize{ 128, 512, 1024 }) |mib| {
+        var limits = Limits{ .max_working_bytes = mib * 1024 * 1024 };
+        // Cover other configurable ceilings too: native requests must not
+        // silently retain any default when an operator raises a node ceiling.
+        limits.max_chunks *= 2;
+        limits.max_index_packets *= 2;
+        limits.remote_fetched_bytes *= 2;
+        try limits.validate();
+        for ([_]bool{ false, true }) |page| {
+            for ([_]bool{ false, true }) |replay| {
+                const cfg = chunking_types.Config{
+                    .provider = .antfly,
+                    .page = page,
+                    .max_chunks = 2,
+                    .replay = if (replay) .{ .plan_id = "plan", .source_fingerprint = "source", .source_version = "version", .ordinal = 1 } else null,
+                };
+                const request = try nativeModelChunkRequest(limits, .{ .text = "fixture" }, cfg, null, false);
+                try std.testing.expectEqualDeep(limits, request.limits);
+                try std.testing.expectEqual(limits.max_working_bytes, request.max_working_bytes);
+                try std.testing.expectEqual(page, request.allow_partial);
+                try std.testing.expectEqualStrings(if (replay) "version" else "", request.source_version);
+                try std.testing.expect(!request.execute and !request.execute_outputs);
+                try std.testing.expect(request.native_content and !request.include_content);
+            }
+        }
+    }
+}
+
 const RewriteTextsRequest = struct {
     model: []const u8,
     inputs: []const []const u8,
@@ -786,12 +852,12 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
     const executor = try context.executor.receive();
 
     var content_security = if (context.content_security_json.slice()) |json|
-        try std.json.parseFromSlice(scraping.ContentSecurityConfig, alloc, json, .{ .ignore_unknown_fields = true })
+        try std.json.parseFromSlice(scraping.ContentSecurityConfig, alloc, json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always })
     else
         null;
     errdefer if (content_security) |*parsed| parsed.deinit();
     var s3_credentials = if (context.s3_credentials_json.slice()) |json|
-        try std.json.parseFromSlice(scraping.S3CredentialsConfig, alloc, json, .{ .ignore_unknown_fields = true })
+        try std.json.parseFromSlice(scraping.S3CredentialsConfig, alloc, json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always })
     else
         null;
     errdefer if (s3_credentials) |*parsed| parsed.deinit();
@@ -799,7 +865,7 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
         InferenceRuntimeConfig,
         alloc,
         context.runtime_config_json.slice(),
-        .{ .ignore_unknown_fields = false },
+        .{ .ignore_unknown_fields = false, .allocate = .alloc_always },
     );
     errdefer runtime_config.deinit();
     try runtime_config.value.kernel_jit.validate();
@@ -807,7 +873,9 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
     const use_worker = !supervised and !@import("builtin").is_test and
         runtime_config.value.embedded_enabled and
         context.execution_host == .server and
-        inference.backends.BackendRuntime.availableHasUninterruptibleCalls();
+        (inference.backends.BackendRuntime.availableHasUninterruptibleCalls() or
+            context.content_security_source.acquire != null or
+            (if (content_security) |parsed| if (parsed.value.allowed_paths) |paths| paths.len != 0 else false else false));
 
     const state = try alloc.create(LinkedInferenceState);
     errdefer alloc.destroy(state);
@@ -887,6 +955,7 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
         .node = undefined,
         .warm_models = warm_models,
         .content_security = content_security,
+        .content_security_source = context.content_security_source,
         .s3_credentials = s3_credentials,
         .runtime_config = runtime_config,
         .owned_models_dir = owned_models_dir,
@@ -976,6 +1045,9 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         context.out_response_json.* = .init(json);
         return;
     }
+    const owned_security = if (context.content_security_json.slice() == null) try state.content_security_source.copy(state.alloc) else null;
+    defer if (owned_security) |bytes| state.alloc.free(bytes);
+    const security_json = context.content_security_json.slice() orelse owned_security;
     const operation = std.enums.fromInt(inference_bridge.ProviderOperation, context.operation) orelse
         return error.UnsupportedOperation;
     const request_json = context.request_json.slice();
@@ -1006,6 +1078,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
     };
     var progress_adapter = ProgressAdapter{ .view = context.progress };
     const execution_control = inference.InferenceExecutionControl{
+        .content_security_json = security_json,
         .document_store = context.document_store,
         .deadline_ns = deadline_ns,
         // Give any model's current native call time to reach a safe boundary
@@ -1307,16 +1380,6 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 .max_tokens = decoded.metadata.value.max_tokens,
                 .source_fingerprint = decoded.metadata.value.source_fingerprint,
             };
-            const ReadCancellation = struct {
-                fn requested(raw: *const anyopaque) bool {
-                    const view: *const http_abi.CancellationView = @ptrCast(@alignCast(raw));
-                    return view.requested();
-                }
-            };
-            const executor_cancellation = inference.server.ExecutorCancellation{
-                .ptr = &context.cancellation,
-                .is_cancelled_fn = ReadCancellation.requested,
-            };
             // The override is an injected test executor with no model catalog.
             // Every production path resolves and enforces the concrete model
             // contract inside this ABI boundary.
@@ -1330,12 +1393,11 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 try validateEncodedReadCapabilities(read_capabilities, encoded_request);
             }
             if (operation == .read_encoded_images_reported and state.read_encoded_images_override == null) {
-                var batch = try state.node.readEncodedImagesReportedDirectWithContext(
+                var batch = try state.node.readEncodedImagesReportedDirectWithControl(
                     alloc,
                     decoded.metadata.value.model,
                     encoded_request,
-                    deadline_ns,
-                    executor_cancellation,
+                    execution_control,
                 );
                 defer batch.deinit(alloc);
                 break :blk try std.json.Stringify.valueAlloc(alloc, batch, .{});
@@ -1343,12 +1405,11 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             const result = if (state.read_encoded_images_override) |handler|
                 try handler.read(alloc, decoded.metadata.value.model, encoded_request)
             else result: {
-                const batch = try state.node.readEncodedImagesReportedDirectWithContext(
+                const batch = try state.node.readEncodedImagesReportedDirectWithControl(
                     alloc,
                     decoded.metadata.value.model,
                     encoded_request,
-                    deadline_ns,
-                    executor_cancellation,
+                    execution_control,
                 );
                 break :result batch.items;
             };
@@ -1580,14 +1641,11 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
 
             if (cfg.page) {
                 const target = selected_target orelse return error.InvalidChunkPolicy;
-                const wire = inference.server.chunk_response;
                 const cursor = if (cfg.replay) |position| try std.fmt.allocPrint(alloc, "{s}:{d}", .{ position.plan_id, position.ordinal }) else null;
                 defer if (cursor) |value| alloc.free(value);
-                const request: wire.Request = .{ .observe_only = cfg.observe_only, .outputs = if (output_config) |value| value.value else null, .input = input, .policy = try wire.parsePolicy(if (cfg.policy) |policy| convert: {
-                    var converted = wire.WirePolicy{};
-                    inline for (@typeInfo(wire.WirePolicy).@"struct".field_names) |name| @field(converted, name) = @field(policy, name);
-                    break :convert converted;
-                } else null), .max_chunks = cfg.max_chunks, .native_content = true, .execute_outputs = target.execute orelse true, .execute = target.execute orelse true, .allow_partial = true, .continuation = cursor, .source_version = if (cfg.replay) |position| position.source_version else "" };
+                var request = try nativeModelChunkRequest(state.node.config.chunking_limits, input, cfg, if (output_config) |value| value.value else null, target.execute orelse true);
+                request.continuation = cursor;
+                if (@import("builtin").is_test) if (state.chunk_request_probe) |probe| try probe.inspect(probe.context, request, .page, cfg.replay);
                 var page = try state.node.chunkModelPageDirect(alloc, state.io, execution_control, request, .{ .model = target.model, .model_identity = target.model_identity, .task_type = target.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (target.dimensions) |d| std.math.cast(usize, d) orelse return error.InvalidArguments else null });
                 defer page.deinit(alloc);
                 if (cfg.replay) |position| if (!std.mem.eql(u8, position.plan_id, page.plan_id) or !std.mem.eql(u8, position.source_fingerprint, page.source_fingerprint) or !std.mem.eql(u8, position.source_version, page.source_version)) return error.StaleChunkContinuation;
@@ -1595,17 +1653,13 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             }
             const result = if (selected_target) |target| aware: {
                 const wire = inference.server.chunk_response;
-                const model_request: wire.Request = .{ .outputs = if (output_config) |value| value.value else null, .input = input, .policy = try wire.parsePolicy(if (cfg.policy) |policy| convert: {
-                    var converted = wire.WirePolicy{};
-                    inline for (@typeInfo(wire.WirePolicy).@"struct".field_names) |name| @field(converted, name) = @field(policy, name);
-                    break :convert converted;
-                } else null), .max_chunks = cfg.max_chunks, .include_content = false, .native_content = true, .execute_outputs = target.execute orelse true, .execute = target.execute orelse true, .allow_partial = false };
+                const model_request = try nativeModelChunkRequest(state.node.config.chunking_limits, input, cfg, if (output_config) |value| value.value else null, target.execute orelse true);
                 const model_target = wire.Target{ .model = target.model, .model_identity = target.model_identity, .task_type = target.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (target.dimensions) |d| std.math.cast(usize, d) orelse return error.InvalidArguments else null };
                 if (cfg.replay) |replay| {
-                    var replay_request = model_request;
-                    replay_request.source_version = replay.source_version;
-                    break :aware try state.node.replayModelChunkDirect(alloc, state.io, execution_control, replay_request, model_target, replay.plan_id, replay.source_fingerprint, replay.ordinal);
+                    if (@import("builtin").is_test) if (state.chunk_request_probe) |probe| try probe.inspect(probe.context, model_request, .replay, replay);
+                    break :aware try state.node.replayModelChunkDirect(alloc, state.io, execution_control, model_request, model_target, replay.plan_id, replay.source_fingerprint, replay.ordinal);
                 }
+                if (@import("builtin").is_test) if (state.chunk_request_probe) |probe| try probe.inspect(probe.context, model_request, .input, null);
                 break :aware try state.node.chunkModelInputDirect(alloc, state.io, execution_control, model_request, model_target);
             } else legacy: {
                 const chunk_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .chunk);
@@ -2129,6 +2183,13 @@ fn localInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         defer response.alloc.free(response.header_views);
         return response.response;
     }
+    const owned_security = try route.owner.content_security_source.copy(context.allocator);
+    defer if (owned_security) |bytes| context.allocator.free(bytes);
+    var security_json = owned_security;
+    if (security_json) |*bytes| try context.setData("antfly.content_security_json", @ptrCast(bytes), null);
+    defer if (security_json != null) {
+        if (context.data) |*data| _ = data.remove("antfly.content_security_json");
+    };
     return route.handler.invoke(context);
 }
 
@@ -2166,6 +2227,10 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
     var http_context = httpx.Context.init(alloc, state.io, &http_request);
     defer http_context.deinit();
     http_context.params = params;
+    const owned_security = if (context.content_security_json.slice() == null and state.worker == null) try state.content_security_source.copy(alloc) else null;
+    defer if (owned_security) |bytes| alloc.free(bytes);
+    var security_json = context.content_security_json.slice() orelse owned_security;
+    if (security_json) |*bytes| try http_context.setData("antfly.content_security_json", @ptrCast(@constCast(bytes)), null);
     if (context.document_store.configured()) try http_context.setData("antfly.document_store", @ptrCast(@constCast(&context.document_store)), null);
     runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
     var response = if (state.worker) |worker| remote: {
@@ -4274,6 +4339,382 @@ test "linked embedding large image parity across public and grouped inputs" {
     }
 }
 
+test "native model chunk configured ceilings survive the real provider ABI" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var out: ?*anyopaque = null;
+    const handle = try linkedInferenceCreate(&.{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = root.ptr,
+        .data_dir_len = root.len,
+        .models_dir = .init(root),
+        .ml_dir = .init(root),
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = 0,
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .{},
+        .s3_credentials_json = .{},
+        .runtime_config_json = .init("{}"),
+        .executor = .init(&io),
+        .out_handle = &out,
+    });
+    defer linkedInferenceDestroy(handle);
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    const Probe = struct {
+        state: *LinkedInferenceState,
+        calls: usize = 0,
+        input_calls: usize = 0,
+        page_calls: usize = 0,
+        replay_calls: usize = 0,
+        expected: struct { page: bool, replay: bool, execute: bool, observe_only: bool } = undefined,
+        fn inspect(raw: *anyopaque, request: inference.server.chunk_response.Request, dispatch: ChunkRequestProbe.Dispatch, replay: ?chunking_types.Replay) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const expected = self.expected;
+            const expected_dispatch: ChunkRequestProbe.Dispatch = if (expected.page) .page else if (expected.replay) .replay else .input;
+            try std.testing.expectEqual(expected_dispatch, dispatch);
+            switch (dispatch) {
+                .input => self.input_calls += 1,
+                .page => self.page_calls += 1,
+                .replay => self.replay_calls += 1,
+            }
+            try std.testing.expectEqual(expected.replay, replay != null);
+            if (replay) |position| {
+                try std.testing.expectEqualStrings("plan", position.plan_id);
+                try std.testing.expectEqualStrings("source", position.source_fingerprint);
+                try std.testing.expectEqualStrings("source-version", position.source_version);
+                try std.testing.expectEqual(@as(u64, 7), position.ordinal);
+            }
+            try std.testing.expectEqualDeep(self.state.node.config.chunking_limits, request.limits);
+            try std.testing.expectEqual(self.state.node.config.chunking_limits.max_working_bytes, request.max_working_bytes);
+            try std.testing.expectEqual(@as(usize, 2), request.max_chunks);
+            try std.testing.expectEqual(expected.page, request.allow_partial);
+            try std.testing.expectEqual(expected.observe_only, request.observe_only);
+            try std.testing.expectEqual(expected.execute, request.execute);
+            try std.testing.expectEqual(request.execute, request.execute_outputs);
+            try std.testing.expect(request.native_content and !request.include_content);
+            try std.testing.expectEqual(@as(i64, 8 * std.time.ns_per_s), request.policy.window_ns);
+            try std.testing.expectEqualStrings("file:///unused/fixture.mp4", request.input.source.uri);
+            try std.testing.expectEqualStrings("source-version", request.input.source.version);
+            try std.testing.expectEqualStrings(if (expected.replay) "source-version" else "", request.source_version);
+            if (expected.page and expected.replay) {
+                try std.testing.expectEqualStrings("plan:7", request.continuation.?);
+            } else try std.testing.expect(request.continuation == null);
+            try std.testing.expectEqualStrings("embedding", request.outputs.?.boundary_model);
+            try std.testing.expectEqual(@as(usize, 2), request.outputs.?.targets.len);
+            for (request.outputs.?.targets) |target| try std.testing.expectEqual(request.execute, target.execute);
+            // Stop only at the model boundary. ABI decoding, named output
+            // merging, policy conversion and each real call site have run.
+            return error.ChunkRequestObserved;
+        }
+    };
+    var probe = Probe{ .state = state };
+    state.chunk_request_probe = .{ .context = &probe, .inspect = Probe.inspect };
+    for ([_]usize{ 128, 512, 1024 }) |mib| {
+        state.node.config.chunking_limits.max_working_bytes = mib * 1024 * 1024;
+        state.node.config.chunking_limits.max_chunks = 8192;
+        state.node.config.chunking_limits.max_index_packets = 2_000_000;
+        state.node.config.chunking_limits.remote_fetched_bytes = 1024 * 1024 * 1024;
+        for ([_]bool{ false, true }) |page| {
+            for ([_]bool{ false, true }) |replay| {
+                for ([_]bool{ false, true }) |execute| {
+                    const outputs = try std.json.Stringify.valueAlloc(a, inference_chunker.outputs.Config{
+                        .boundary_model = "embedding",
+                        .targets = &.{
+                            .{ .name = "embedding", .kind = .embedding, .model = "fixture-embedder", .dimensions = 768, .execute = execute },
+                            .{ .name = "speech", .kind = .transcribe, .model = "fixture-transcriber", .required = false, .execute = execute },
+                        },
+                    }, .{});
+                    defer a.free(outputs);
+                    const request = try std.json.Stringify.valueAlloc(a, ChunkInputRequest{
+                        .model = "fixed",
+                        .input = .{ .source = .{ .uri = "file:///unused/fixture.mp4", .mime_type = "video/mp4", .version = "source-version", .version_kind = .strong_etag, .length = 1 } },
+                        .config = .{
+                            .provider = .antfly,
+                            .page = page,
+                            .observe_only = page and !replay and !execute,
+                            .max_chunks = 2,
+                            .embedding = .{ .model = "fixture-embedder", .dimensions = 768, .execute = execute },
+                            .outputs_json = outputs,
+                            .policy = .{ .window_ns = 8 * std.time.ns_per_s },
+                            .replay = if (replay) .{ .plan_id = "plan", .source_fingerprint = "source", .source_version = "source-version", .ordinal = 7 } else null,
+                        },
+                    }, .{});
+                    defer a.free(request);
+                    var response: ?*anyopaque = null;
+                    var json: inference_bridge.String = undefined;
+                    // Keep the oracle outside JSON decoding: dropped input flags
+                    // must not change both the request and its expectations.
+                    probe.expected = .{ .page = page, .replay = replay, .execute = execute, .observe_only = page and !replay and !execute };
+                    const before = probe.calls;
+                    try std.testing.expectError(error.ChunkRequestObserved, linkedInferenceInvokeProvider(&.{
+                        .abi_version = inference_bridge.abi_version,
+                        .handle = handle,
+                        .operation = @backingInt(inference_bridge.ProviderOperation.chunk_input),
+                        .request_json = .init(request),
+                        .deadline_ns = platform_time.monotonicNs() + 60 * std.time.ns_per_s,
+                        .has_deadline = 1,
+                        .out_response_handle = &response,
+                        .out_response_json = &json,
+                    }));
+                    try std.testing.expectEqual(before + 1, probe.calls);
+                    try std.testing.expect(response == null);
+                    try std.testing.expectEqual(@as(usize, 0), state.node.inference_admission.inFlightUnits());
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 24), probe.calls);
+    try std.testing.expectEqual(@as(usize, 6), probe.input_calls);
+    try std.testing.expectEqual(@as(usize, 12), probe.page_calls);
+    try std.testing.expectEqual(@as(usize, 6), probe.replay_calls);
+}
+
+test "native model chunk executes WAV through provider ABI without probes" {
+    const model_path = @import("antfly_platform").env.getenv("ANTFLY_NATIVE_CHUNK_EXECUTION_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const samples: [3200]f32 = @splat(0.125);
+    const wav = try inference.pipelines.audio.wav.encodeInterleaved(a, &samples, 1, .{ .audio_format = 3, .sample_rate = 16000, .bits_per_sample = 32 });
+    defer a.free(wav);
+    try tmp.dir.writeFile(io, .{ .sub_path = "audio.wav", .data = wav });
+    const uri = try std.fmt.allocPrint(a, "file://{s}/audio.wav", .{root});
+    defer a.free(uri);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(wav, &digest, .{});
+    const version = std.fmt.bytesToHex(digest, .lower);
+    const policy = try std.json.Stringify.valueAlloc(a, .{ .allowed_paths = &.{root} }, .{});
+    defer a.free(policy);
+    // Embedded hosts require the same create/configure sequence as real
+    // callers. Use the production admission controller behind the owner ABI.
+    const Memory = inference.runtime.tier.memory;
+    const Owner = struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        controller: Memory.AdmissionController = .{},
+        leases: [4096]?Memory.AdmissionLease = @splat(null),
+        references: usize = 0,
+        reservations: usize = 0,
+        prompt_bytes: u64 = 0,
+        tokenizer_bytes: u64 = 0,
+        fn lock(self: *@This()) void {
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        }
+        fn from(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn amounts(value: *const inference_bridge.AdmissionAmounts) Memory.AdmissionAmounts {
+            var converted: Memory.AdmissionAmounts = .{};
+            inline for (comptime std.meta.fieldNames(Memory.AdmissionAmounts)) |name| @field(converted, name) = @field(value.*, name);
+            return converted;
+        }
+        fn retainContext(raw: *anyopaque) callconv(.c) u8 {
+            const self = from(raw);
+            self.lock();
+            defer self.mutex.unlock();
+            self.references += 1;
+            return 1;
+        }
+        fn releaseContext(raw: *anyopaque) callconv(.c) void {
+            const self = from(raw);
+            self.lock();
+            defer self.mutex.unlock();
+            std.debug.assert(self.references > 0);
+            self.references -= 1;
+        }
+        fn reserve(raw: *anyopaque, value: *const inference_bridge.AdmissionAmounts, lease_id: *usize) callconv(.c) inference_bridge.Status {
+            const self = from(raw);
+            self.lock();
+            defer self.mutex.unlock();
+            for (&self.leases, 0..) |*slot, index| if (slot.* == null) {
+                slot.* = self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = 8 << 30, .backend_limit_bytes = 8 << 30, .combined_limit_bytes = 16 << 30 }, amounts(value), false) catch |err| return inference_bridge.statusFromError(err);
+                self.reservations += 1;
+                lease_id.* = index + 1;
+                return .ok;
+            };
+            return inference_bridge.statusFromError(error.ResourceLimitExceeded);
+        }
+        fn retain(raw: *anyopaque, lease_id: usize, value: *const inference_bridge.AdmissionAmounts) callconv(.c) inference_bridge.Status {
+            const self = from(raw);
+            self.lock();
+            defer self.mutex.unlock();
+            std.debug.assert(lease_id > 0 and lease_id <= self.leases.len);
+            if (self.leases[lease_id - 1]) |*lease| {
+                lease.retain(amounts(value)) catch |err| return inference_bridge.statusFromError(err);
+                return .ok;
+            }
+            unreachable;
+        }
+        fn release(raw: *anyopaque, lease_id: usize) callconv(.c) void {
+            const self = from(raw);
+            self.lock();
+            defer self.mutex.unlock();
+            std.debug.assert(lease_id > 0 and lease_id <= self.leases.len);
+            self.leases[lease_id - 1].?.release();
+            self.leases[lease_id - 1] = null;
+        }
+        fn observePrompt(raw: *anyopaque, _: usize, previous: u64, next: u64) callconv(.c) u8 {
+            const self = from(raw);
+            self.lock();
+            defer self.mutex.unlock();
+            self.prompt_bytes = self.prompt_bytes - previous + next;
+            return 1;
+        }
+        fn observeTokenizer(raw: *anyopaque, _: usize, previous: u64, next: u64) callconv(.c) u8 {
+            const self = from(raw);
+            self.lock();
+            defer self.mutex.unlock();
+            self.tokenizer_bytes = self.tokenizer_bytes - previous + next;
+            return 1;
+        }
+        fn verifyReleased(self: *@This()) void {
+            std.debug.assert(self.references == 0 and self.prompt_bytes == 0 and self.tokenizer_bytes == 0);
+            for (self.leases) |lease| std.debug.assert(lease == null);
+            std.debug.assert(std.meta.eql(self.controller.snapshot(), Memory.AdmissionAmounts{}));
+        }
+    };
+    const budget_owner = try a.create(Owner);
+    budget_owner.* = .{};
+    defer a.destroy(budget_owner);
+    defer budget_owner.verifyReleased();
+    var out: ?*anyopaque = null;
+    const handle = try linkedInferenceCreate(&.{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = root.ptr,
+        .data_dir_len = root.len,
+        .models_dir = .init(std.fs.path.dirname(model_path).?),
+        .ml_dir = .init(root),
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = 0,
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .init(policy),
+        .s3_credentials_json = .{},
+        .runtime_config_json = .init("{}"),
+        .executor = .init(&io),
+        .out_handle = &out,
+        .execution_host = .embedded,
+    });
+    defer linkedInferenceDestroy(handle);
+    const budget = inference_bridge.ResourceBudget{
+        .abi_version = inference_bridge.abi_version,
+        .context = budget_owner,
+        .retain_context = Owner.retainContext,
+        .release_context = Owner.releaseContext,
+        .reserve_admission = Owner.reserve,
+        .retain_admission = Owner.retain,
+        .release_admission = Owner.release,
+        .observe_prompt_cache = Owner.observePrompt,
+        .observe_tokenizer_cache = Owner.observeTokenizer,
+    };
+    try linkedInferenceConfigure(&.{ .abi_version = inference_bridge.abi_version, .handle = handle, .resource_budget = &budget });
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    state.node.config.allow_unknown_models = true;
+    state.node.session_manager.required_backend = if (@import("builtin").os.tag == .macos) .metal else .native;
+    state.node.model_manager.session_manager.required_backend = state.node.session_manager.required_backend;
+    try std.testing.expect(state.chunk_request_probe == null);
+    const Invoke = struct {
+        fn call(comptime T: type, allocator: std.mem.Allocator, owner: *anyopaque, supplied_request: ChunkInputRequest) !std.json.Parsed(T) {
+            const body = try std.json.Stringify.valueAlloc(allocator, supplied_request, .{});
+            defer allocator.free(body);
+            var response: ?*anyopaque = null;
+            var json: inference_bridge.String = undefined;
+            try linkedInferenceInvokeProvider(&.{
+                .abi_version = inference_bridge.abi_version,
+                .handle = owner,
+                .operation = @backingInt(inference_bridge.ProviderOperation.chunk_input),
+                .request_json = .init(body),
+                .deadline_ns = platform_time.monotonicNs() + 180 * std.time.ns_per_s,
+                .has_deadline = 1,
+                .out_response_handle = &response,
+                .out_response_json = &json,
+            });
+            defer linkedInferenceDestroyProviderResponse(response.?);
+            return std.json.parseFromSlice(T, allocator, json.slice(), .{ .allocate = .alloc_always });
+        }
+        fn verify(chunks: []const inference_chunker.Chunk) !void {
+            try std.testing.expect(chunks.len != 0);
+            for (chunks) |chunk| {
+                const metadata = chunk.metadata.?;
+                try std.testing.expect(metadata.embedding_error == null);
+                try std.testing.expectEqual(@as(usize, 64), metadata.model_identity.len);
+                try std.testing.expectEqual(@as(usize, 64), metadata.model_revision.len);
+                const vector = metadata.embedding.?;
+                try std.testing.expect(vector.len > 0);
+                var norm: f64 = 0;
+                for (vector) |value| {
+                    try std.testing.expect(std.math.isFinite(value));
+                    norm += @as(f64, value) * value;
+                }
+                try std.testing.expect(norm > 0);
+            }
+        }
+    };
+    var request = ChunkInputRequest{
+        .model = "fixed",
+        .input = .{ .source = .{ .uri = uri, .mime_type = "audio/wav", .version = &version, .version_kind = .file_sha256, .length = wav.len } },
+        .config = .{ .provider = .antfly, .max_chunks = 16, .embedding = .{ .model = std.fs.path.basename(model_path), .execute = true }, .policy = .{ .window_ns = 50 * std.time.ns_per_ms, .step_ns = 50 * std.time.ns_per_ms } },
+    };
+    for ([_]usize{ 128, 1024 }) |mib| {
+        state.node.config.chunking_limits.max_working_bytes = mib * 1024 * 1024;
+        request.config.page = false;
+        request.config.replay = null;
+        request.config.max_chunks = 16;
+        var full = try Invoke.call([]inference_chunker.Chunk, a, handle, request);
+        defer full.deinit();
+        try Invoke.verify(full.value);
+        try std.testing.expectEqual(@as(usize, 4), full.value.len);
+        request.config.page = true;
+        request.config.max_chunks = 1;
+        var page = try Invoke.call(inference_chunker.types.ChunkPage, a, handle, request);
+        defer page.deinit();
+        try Invoke.verify(page.value.chunks);
+        try std.testing.expect(!page.value.complete);
+        try std.testing.expectEqual(@as(u64, 1), page.value.covered_through_ordinal);
+        request.config.page = false;
+        request.config.replay = .{ .plan_id = page.value.plan_id, .source_fingerprint = page.value.source_fingerprint, .source_version = page.value.source_version, .ordinal = 0 };
+        var replay = try Invoke.call([]inference_chunker.Chunk, a, handle, request);
+        defer replay.deinit();
+        try Invoke.verify(replay.value);
+        try std.testing.expectEqual(@as(usize, 1), replay.value.len);
+        const expected = page.value.chunks[0].metadata.?;
+        const actual = replay.value[0].metadata.?;
+        try std.testing.expectEqualStrings(expected.plan_id, actual.plan_id);
+        try std.testing.expectEqualDeep(expected.descriptor.coordinates, actual.descriptor.coordinates);
+        try std.testing.expectEqual(expected.embedding.?.len, actual.embedding.?.len);
+        for (expected.embedding.?, actual.embedding.?) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00001);
+        try std.testing.expectEqual(@as(usize, 0), state.node.inference_admission.inFlightUnits());
+    }
+    try std.testing.expect(budget_owner.reservations > 0);
+    state.node.config.chunking_limits.max_working_bytes = 1;
+    request.config.replay = null;
+    request.config.page = false;
+    try std.testing.expectError(error.SharedAdmissionExceeded, Invoke.call([]inference_chunker.Chunk, a, handle, request));
+    try std.testing.expectEqual(@as(usize, 0), state.node.inference_admission.inFlightUnits());
+}
+
 test "standalone chunk minimum content survives the real provider ABI" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4440,4 +4881,129 @@ test "linked embedding audio MIME hints match public and native grouped vectors"
     const grouped = inference.embedding_gemma2_pipeline;
     try std.testing.expectError(error.AudioTooLarge, grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{ .{ .text = "Describe this tone" }, .{ .audio = .{ .bytes = padded, .decode_options = .{ .mime_hint = "audio/mpeg" } } } } }, .{ .max_audio_decode_working_bytes = 1 }, loaded.embeddingExecutionLock(), node.bindExecutionControl(std.testing.io, .{})));
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "local source policy reload reaches the real provider ABI with finite deadlines" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "media", .data = "0123456789" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const uri = try std.fmt.allocPrint(a, "file://{s}/media", .{root});
+    defer a.free(uri);
+    const paths = [_][]u8{root};
+    const allowed = try std.json.Stringify.valueAlloc(a, .{ .allowed_paths = paths }, .{});
+    defer a.free(allowed);
+    const Publisher = struct {
+        json: []const u8 = "{\"allowed_paths\":[]}",
+        failed: bool = false,
+        fn acquire(raw: ?*anyopaque, out: *inference_bridge.String) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.failed) return inference_bridge.statusFromError(error.ResourceTemporarilyUnavailable);
+            out.* = .init(self.json);
+            return .ok;
+        }
+        fn release(_: ?*anyopaque, _: inference_bridge.String) callconv(.c) void {}
+    };
+    var publisher: Publisher = .{};
+    var out: ?*anyopaque = null;
+    const handle = try linkedInferenceCreate(&.{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = root.ptr,
+        .data_dir_len = root.len,
+        .models_dir = .init(root),
+        .ml_dir = .init(root),
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = 0,
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .init("{\"allowed_paths\":[]}"),
+        .s3_credentials_json = .{},
+        .runtime_config_json = .init("{}"),
+        .executor = .init(&io),
+        .out_handle = &out,
+        .execution_host = .embedded,
+        .content_security_source = .{ .context = &publisher, .acquire = Publisher.acquire, .release = Publisher.release },
+    });
+    defer linkedInferenceDestroy(handle);
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    // Admission uses a local test owner; request decoding and callback dispatch
+    // remain the production ABI implementation, including policy acquisition.
+    state.node.deinit();
+    state.node = try inference.server.Node.init(a, .{ .models_dir = root, .native_call_policy = .in_process, .content_security = .{ .allowed_paths = &.{} } });
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("0123456789", &digest, .{});
+    const version = std.fmt.bytesToHex(digest, .lower);
+    const request = try std.json.Stringify.valueAlloc(a, ChunkInputRequest{ .model = "", .input = .{ .source = .{ .uri = uri, .mime_type = "video/mp4", .version = &version, .version_kind = .file_sha256, .length = 10 } }, .config = .{ .provider = .antfly, .page = true, .max_chunks = 1, .embedding = .{ .model = "" } } }, .{});
+    defer a.free(request);
+    var response: ?*anyopaque = null;
+    var json: inference_bridge.String = undefined;
+    const invoke = inference_bridge.ProviderInvokeContext{ .abi_version = inference_bridge.abi_version, .handle = handle, .operation = @backingInt(inference_bridge.ProviderOperation.chunk_input), .request_json = .init(request), .deadline_ns = platform_time.monotonicNs() + 60 * std.time.ns_per_s, .has_deadline = 1, .out_response_handle = &response, .out_response_json = &json };
+    try std.testing.expectError(error.PathNotAllowed, linkedInferenceInvokeProvider(&invoke));
+    publisher.json = allowed;
+    try std.testing.expectError(error.InvalidChunkModel, linkedInferenceInvokeProvider(&invoke));
+    publisher.json = "{\"allowed_paths\":[]}";
+    try std.testing.expectError(error.PathNotAllowed, linkedInferenceInvokeProvider(&invoke));
+    publisher.failed = true;
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, linkedInferenceInvokeProvider(&invoke));
+    try std.testing.expect(response == null);
+}
+
+test "content security snapshot startup owns policy credentials and runtime strings" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const policy = try a.dupe(u8, "{\"allowed_paths\":[\"/owned\"],\"user_agent\":\"owned-agent\"}");
+    defer a.free(policy);
+    const credentials = try a.dupe(u8, "{\"endpoint\":\"owned-endpoint\"}");
+    defer a.free(credentials);
+    const runtime = try a.dupe(u8, "{\"worker_environment\":[{\"name\":\"OWNED_NAME\",\"value\":\"owned-value\"}]}");
+    defer a.free(runtime);
+    var out: ?*anyopaque = null;
+    const handle = try linkedInferenceCreate(&.{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = root.ptr,
+        .data_dir_len = root.len,
+        .models_dir = .init(root),
+        .ml_dir = .init(root),
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = 0,
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .init(policy),
+        .s3_credentials_json = .init(credentials),
+        .runtime_config_json = .init(runtime),
+        .executor = .init(&io),
+        .out_handle = &out,
+        .execution_host = .embedded,
+    });
+    defer linkedInferenceDestroy(handle);
+    @memset(policy, 'x');
+    @memset(credentials, 'x');
+    @memset(runtime, 'x');
+    const state: *LinkedInferenceState = @ptrCast(@alignCast(handle));
+    try std.testing.expectEqualStrings("/owned", state.content_security.?.value.allowed_paths.?[0]);
+    try std.testing.expectEqualStrings("owned-agent", state.content_security.?.value.user_agent.?);
+    try std.testing.expectEqualStrings("owned-endpoint", state.s3_credentials.?.value.endpoint.?);
+    try std.testing.expectEqualStrings("OWNED_NAME", state.runtime_config.value.worker_environment[0].name);
+    try std.testing.expectEqualStrings("owned-value", state.runtime_config.value.worker_environment[0].value);
 }

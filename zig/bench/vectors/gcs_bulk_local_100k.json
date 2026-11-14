@@ -1,0 +1,483 @@
+{
+  "version": 1,
+  "date": "2026-11-12",
+  "execution": "local macOS arm64 against GCS US-CENTRAL1, shared workstation, fast non-test native probe",
+  "limits": [
+    "One pair; WAN and unrelated host workloads affect timings.",
+    "Original optimized attempt is partial; separate reopen cannot supply its missing complete-operation timing.",
+    "Ten fixed queries, separate from historical 100-query filesystem qualification.",
+    "Native construction excludes source opening and serving recall; includes immutable publication and local test catalog save, not managed CAS/Raft.",
+    "Original build overlaps one-second profile, local scratch inventory and GCS object inventory; revised overlaps one-second profile.",
+    "No attributed total scratch peak, full HTTP request count or macOS network-byte counter.",
+    "Incremental diagnostic censored before vector construction; no completed latency comparison."
+  ],
+  "cases": [
+    {
+      "case": "local-100k-smoke",
+      "qualified": false,
+      "binary_sha256": "c64c71843d3e587df6b548bf170787c620fc7c0a56b056ee05ce7ea9eeea6051",
+      "base_revision": "85564b9f3b51051b2d2ce8eb2a61b2510a9e60e3",
+      "tracked_diff_sha256": "198674f237a8c05ff1940b1db19d4b198009d92b57b5e06cfec5dc55fddbf70c",
+      "harness_sha256": {
+        "gcs_bulk_local.py": "64f8ee396bcc56ae931c5dceb1793c50c315917c807eebcd698a4107250535ba",
+        "gcs_bulk_worker.py": "ddbecc77e763f8e4b1a1d48bd3b01f5f4e0046a298e64542329da48da1ea2d54",
+        "bench_bulk_pipeline.py": "9c589986ce921584e40e1bb6102475c18b2958ec6c0ec6b1a6a84c1df7947fa9"
+      },
+      "source_binding": {
+        "bytes": 290728759,
+        "sha256": "90c34801b7fc9757ed4a441dd401044b0a5cd1aa684127be04941c586dd48f6f",
+        "fixture": null
+      },
+      "source_generations": [
+        {
+          "name": "bulk-qualification/20261112-cohere-100k-90c34801/source/train.parquet",
+          "generation": "1794500890721348",
+          "sha256": "90c34801b7fc9757ed4a441dd401044b0a5cd1aa684127be04941c586dd48f6f"
+        }
+      ],
+      "attempts": [
+        {
+          "stage": "build",
+          "exit_code": -15,
+          "wall_ns": 809530221666,
+          "user_seconds": 10.637769,
+          "system_seconds": 5.438489,
+          "peak_rss_bytes": 1087078400,
+          "pod_network_bytes": null
+        }
+      ],
+      "completed_construction_from_log": {
+        "native_ns": 599578406000,
+        "identity_ns": 150337020000,
+        "source_receipt_ns": 359518225000,
+        "dense_ns": 81038722000,
+        "checkpoints": 2,
+        "status": "original recall stopped; separate process verified retained publication"
+      }
+    },
+    {
+      "case": "local-100k-baseline-reopen",
+      "qualified": true,
+      "binary_sha256": "28dcfa41869b2589eef72a5e103a577bd93f138c224d77be2ffce34fa8f9cb0a",
+      "base_revision": "85564b9f3b51051b2d2ce8eb2a61b2510a9e60e3",
+      "tracked_diff_sha256": "7e1cda05912f5b742dff0f1cd9241c62f4b3e870d504a2e2ea512b6b6e6eaf59",
+      "harness_sha256": {
+        "gcs_bulk_local.py": "ae70d495872c5d832819b72332881551d2801e1ca19f6f3331c120a79971496e",
+        "gcs_bulk_worker.py": "13ae50d24d0fd973ccc4ae404ede20211d7d7e5a2a7dda8f37da181cf3335986",
+        "bench_bulk_pipeline.py": "9c589986ce921584e40e1bb6102475c18b2958ec6c0ec6b1a6a84c1df7947fa9"
+      },
+      "source_binding": {
+        "bytes": 290728759,
+        "sha256": "90c34801b7fc9757ed4a441dd401044b0a5cd1aa684127be04941c586dd48f6f",
+        "fixture": null
+      },
+      "source_generations": [
+        {
+          "name": "bulk-qualification/20261112-cohere-100k-90c34801/source/train.parquet",
+          "generation": "1794500890721348",
+          "sha256": "90c34801b7fc9757ed4a441dd401044b0a5cd1aa684127be04941c586dd48f6f"
+        }
+      ],
+      "attempts": [
+        {
+          "stage": "reopen",
+          "exit_code": 0,
+          "wall_ns": 291410181625,
+          "user_seconds": 3.858838,
+          "system_seconds": 4.276665,
+          "peak_rss_bytes": 85917696,
+          "pod_network_bytes": null,
+          "native_ns": 0,
+          "checkpoints": 0,
+          "records": {
+            "PARQUET_BULK_BUILD_MODE": [
+              {
+                "caller": "fast",
+                "caller_value": 1,
+                "provider": 1,
+                "provider_is_test": false
+              }
+            ],
+            "PARQUET_BULK_PHASES": [
+              {
+                "names": [
+                  "identity",
+                  "fragments",
+                  "spool",
+                  "aggregate",
+                  "ordered",
+                  "text",
+                  "sparse",
+                  "dense",
+                  "bulk_tee",
+                  "bulk_receipt",
+                  "dense_ingest",
+                  "dense_cluster",
+                  "dense_checkpoint",
+                  "dense_upload"
+                ],
+                "ns": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "calls": [
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ]
+              }
+            ],
+            "PARQUET_BULK_RECALL": [
+              {
+                "queries": 10,
+                "probes": 512,
+                "k": 100,
+                "hits": 977,
+                "recall": 0.977,
+                "scored": 489396,
+                "elapsed_ns": 238312005000
+              },
+              {
+                "queries": 10,
+                "probes": 1024,
+                "k": 100,
+                "hits": 989,
+                "recall": 0.989,
+                "scored": 943739,
+                "elapsed_ns": 2031690000
+              },
+              {
+                "queries": 10,
+                "probes": 2048,
+                "k": 100,
+                "hits": 989,
+                "recall": 0.989,
+                "scored": 1000000,
+                "elapsed_ns": 985747000
+              },
+              {
+                "queries": 10,
+                "probes": 4096,
+                "k": 100,
+                "hits": 989,
+                "recall": 0.989,
+                "scored": 1000000,
+                "elapsed_ns": 954527000
+              },
+              {
+                "queries": 10,
+                "probes": 8192,
+                "k": 100,
+                "hits": 989,
+                "recall": 0.989,
+                "scored": 1000000,
+                "elapsed_ns": 951531000
+              }
+            ],
+            "PARQUET_BULK_SERVING_CACHE": [
+              {
+                "hits": 0,
+                "misses": 2616,
+                "stored_bytes": 67108864,
+                "protected_stored_bytes": 67108864,
+                "evictions": 1052,
+                "disk_unavailable": null,
+                "disk_init_attempts": 1,
+                "disk_init_failures": 0,
+                "disk_hits": 17245,
+                "mapping_hits": 0,
+                "disk_bytes": 4520315783,
+                "provider_reads": 1308,
+                "provider_bytes": 336282956,
+                "completed_queries": 0,
+                "query_total_ns": 0,
+                "query_publication_ns": 0,
+                "query_search_ns": 0,
+                "query_hydration_ns": 0,
+                "query_delivery_ns": 0
+              }
+            ]
+          },
+          "build_timing_available": false
+        }
+      ]
+    },
+    {
+      "case": "local-100k-parallel",
+      "qualified": true,
+      "binary_sha256": "28dcfa41869b2589eef72a5e103a577bd93f138c224d77be2ffce34fa8f9cb0a",
+      "base_revision": "85564b9f3b51051b2d2ce8eb2a61b2510a9e60e3",
+      "tracked_diff_sha256": "7e1cda05912f5b742dff0f1cd9241c62f4b3e870d504a2e2ea512b6b6e6eaf59",
+      "harness_sha256": {
+        "gcs_bulk_local.py": "ae70d495872c5d832819b72332881551d2801e1ca19f6f3331c120a79971496e",
+        "gcs_bulk_worker.py": "13ae50d24d0fd973ccc4ae404ede20211d7d7e5a2a7dda8f37da181cf3335986",
+        "bench_bulk_pipeline.py": "9c589986ce921584e40e1bb6102475c18b2958ec6c0ec6b1a6a84c1df7947fa9"
+      },
+      "source_binding": {
+        "bytes": 290728759,
+        "sha256": "90c34801b7fc9757ed4a441dd401044b0a5cd1aa684127be04941c586dd48f6f",
+        "fixture": null
+      },
+      "source_generations": [
+        {
+          "name": "bulk-qualification/20261112-cohere-100k-90c34801/source/train.parquet",
+          "generation": "1794500890721348",
+          "sha256": "90c34801b7fc9757ed4a441dd401044b0a5cd1aa684127be04941c586dd48f6f"
+        }
+      ],
+      "attempts": [
+        {
+          "stage": "build",
+          "exit_code": 0,
+          "wall_ns": 703628491792,
+          "user_seconds": 15.648165,
+          "system_seconds": 10.033025,
+          "peak_rss_bytes": 613597184,
+          "pod_network_bytes": null,
+          "native_ns": 374674661000,
+          "checkpoints": 2,
+          "records": {
+            "PARQUET_BULK_BUILD_MODE": [
+              {
+                "caller": "fast",
+                "caller_value": 1,
+                "provider": 1,
+                "provider_is_test": false
+              }
+            ],
+            "PARQUET_BULK_WORK": [
+              {
+                "identity_census_verified": true,
+                "identity_read_bytes": 0,
+                "identity_written_bytes": 1200000,
+                "identity_merge_inputs": 0,
+                "projection_cache_peak_bytes": 685,
+                "owned_index_count": 0,
+                "partition_bytes": 1030955272,
+                "partition_read_bytes": 1349155272,
+                "compact_rows": 0,
+                "projection_commit_ns": 588325000,
+                "save_node_ns": 0,
+                "update_parent_ns": 0,
+                "update_parent_calls": 0,
+                "training_ns": 946111000,
+                "routing_ns": 6947199000,
+                "allocator_peak_bytes": 53475836
+              }
+            ],
+            "PARQUET_BULK_PROJECTION": [
+              {
+                "runs": 8,
+                "bytes": 27038758
+              }
+            ],
+            "PARQUET_BULK_SOURCE": [
+              {
+                "runs": 2,
+                "reused_runs": 2,
+                "reused_bytes": 315512750,
+                "new_bytes": 0
+              }
+            ],
+            "PARQUET_BULK_MEMORY": [
+              {
+                "dense_allocator_peak_bytes": 53475836,
+                "source_allocator_peak_bytes": 39504883,
+                "max_vector_allocator_peak_bytes": 53475836
+              }
+            ],
+            "PARQUET_BULK_PHASES": [
+              {
+                "names": [
+                  "identity",
+                  "fragments",
+                  "spool",
+                  "aggregate",
+                  "ordered",
+                  "text",
+                  "sparse",
+                  "dense",
+                  "bulk_tee",
+                  "bulk_receipt",
+                  "dense_ingest",
+                  "dense_cluster",
+                  "dense_checkpoint",
+                  "dense_upload"
+                ],
+                "ns": [
+                  149421516000,
+                  0,
+                  0,
+                  462000,
+                  572000,
+                  1868000,
+                  220000,
+                  88558779000,
+                  12874092000,
+                  127676590000,
+                  0,
+                  9981121000,
+                  1937136000,
+                  44081097000
+                ],
+                "calls": [
+                  1,
+                  0,
+                  0,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1,
+                  40,
+                  1,
+                  1,
+                  1,
+                  1,
+                  1
+                ]
+              }
+            ],
+            "PARQUET_BULK_RECALL": [
+              {
+                "queries": 10,
+                "probes": 512,
+                "k": 100,
+                "hits": 977,
+                "recall": 0.977,
+                "scored": 489396,
+                "elapsed_ns": 270659927000
+              },
+              {
+                "queries": 10,
+                "probes": 1024,
+                "k": 100,
+                "hits": 989,
+                "recall": 0.989,
+                "scored": 943739,
+                "elapsed_ns": 1741878000
+              },
+              {
+                "queries": 10,
+                "probes": 2048,
+                "k": 100,
+                "hits": 989,
+                "recall": 0.989,
+                "scored": 1000000,
+                "elapsed_ns": 658766000
+              },
+              {
+                "queries": 10,
+                "probes": 4096,
+                "k": 100,
+                "hits": 989,
+                "recall": 0.989,
+                "scored": 1000000,
+                "elapsed_ns": 664297000
+              },
+              {
+                "queries": 10,
+                "probes": 8192,
+                "k": 100,
+                "hits": 989,
+                "recall": 0.989,
+                "scored": 1000000,
+                "elapsed_ns": 655935000
+              }
+            ],
+            "PARQUET_BULK_SERVING_CACHE": [
+              {
+                "hits": 0,
+                "misses": 2616,
+                "stored_bytes": 67108864,
+                "protected_stored_bytes": 67108864,
+                "evictions": 1052,
+                "disk_unavailable": null,
+                "disk_init_attempts": 1,
+                "disk_init_failures": 0,
+                "disk_hits": 17245,
+                "mapping_hits": 0,
+                "disk_bytes": 4520315783,
+                "provider_reads": 1308,
+                "provider_bytes": 336282948,
+                "completed_queries": 0,
+                "query_total_ns": 0,
+                "query_publication_ns": 0,
+                "query_search_ns": 0,
+                "query_hydration_ns": 0,
+                "query_delivery_ns": 0
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "case": "local-100k-incremental",
+      "qualified": false,
+      "binary_sha256": "28dcfa41869b2589eef72a5e103a577bd93f138c224d77be2ffce34fa8f9cb0a",
+      "base_revision": "85564b9f3b51051b2d2ce8eb2a61b2510a9e60e3",
+      "tracked_diff_sha256": "7e1cda05912f5b742dff0f1cd9241c62f4b3e870d504a2e2ea512b6b6e6eaf59",
+      "harness_sha256": {
+        "gcs_bulk_local.py": "ae70d495872c5d832819b72332881551d2801e1ca19f6f3331c120a79971496e",
+        "gcs_bulk_worker.py": "13ae50d24d0fd973ccc4ae404ede20211d7d7e5a2a7dda8f37da181cf3335986",
+        "bench_bulk_pipeline.py": "9c589986ce921584e40e1bb6102475c18b2958ec6c0ec6b1a6a84c1df7947fa9"
+      },
+      "source_binding": {
+        "bytes": 290728759,
+        "sha256": "90c34801b7fc9757ed4a441dd401044b0a5cd1aa684127be04941c586dd48f6f",
+        "fixture": null
+      },
+      "source_generations": [
+        {
+          "name": "bulk-qualification/20261112-cohere-100k-90c34801/source/train.parquet",
+          "generation": "1794500890721348",
+          "sha256": "90c34801b7fc9757ed4a441dd401044b0a5cd1aa684127be04941c586dd48f6f"
+        }
+      ],
+      "attempts": [
+        {
+          "stage": "build",
+          "exit_code": -15,
+          "wall_ns": 1215711342708,
+          "user_seconds": 10.302057,
+          "system_seconds": 5.835292,
+          "peak_rss_bytes": 673300480,
+          "pod_network_bytes": null
+        }
+      ],
+      "censor": {
+        "status": "censored_incomplete",
+        "reason": "Stopped diagnostic baseline after 20 minutes, still in logical-fragment preparation before vector construction. No completed build time or recall qualification.",
+        "utc": "2026-11-12T18:15:46.408177+00:00",
+        "pid": 54809,
+        "observed_elapsed_seconds": 1203,
+        "catalog_bytes": 1125,
+        "profile": "sample-construction.txt"
+      }
+    }
+  ]
+}
