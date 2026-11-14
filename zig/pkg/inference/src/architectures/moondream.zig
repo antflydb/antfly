@@ -101,8 +101,11 @@ pub const Config = struct {
 };
 
 /// True when a config.json declares the Moondream2 composite model.
-pub fn isMoondreamConfig(allocator: std.mem.Allocator, config_json: []const u8) bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json, .{}) catch return false;
+pub fn isMoondreamConfig(allocator: std.mem.Allocator, config_json: []const u8) !bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return false;
     const value = parsed.value.object.get("model_type") orelse return false;
@@ -880,8 +883,8 @@ test "parseConfig reads the expanded transformers.js PhiConfig" {
     );
     try std.testing.expectEqual(@as(usize, 32), config.rotary_dim);
     try std.testing.expectEqual(@as(usize, 8192), config.intermediate_size);
-    try std.testing.expect(!isMoondreamConfig(std.testing.allocator, "{\"model_type\":\"phi\"}"));
-    try std.testing.expect(isMoondreamConfig(std.testing.allocator, "{\"model_type\":\"moondream1\"}"));
+    try std.testing.expect(!try isMoondreamConfig(std.testing.allocator, "{\"model_type\":\"phi\"}"));
+    try std.testing.expect(try isMoondreamConfig(std.testing.allocator, "{\"model_type\":\"moondream1\"}"));
     try std.testing.expectError(error.InvalidMoondreamConfig, parseConfig(std.testing.allocator, "{\"model_type\":\"phi\"}"));
 }
 
@@ -972,4 +975,13 @@ test "bidirectional host attention averages over every key" {
     defer a.free(causal);
     try std.testing.expectApproxEqAbs(@as(f32, 2), causal[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 3), causal[1], 1e-6);
+}
+
+fn checkMoondreamProbeAllocationFailures(allocator: std.mem.Allocator) !void {
+    try std.testing.expect(try isMoondreamConfig(allocator, "{\"model_type\":\"moondream1\"}"));
+}
+
+test "moondream configuration probe preserves allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkMoondreamProbeAllocationFailures, .{});
+    try std.testing.expect(!try isMoondreamConfig(std.testing.allocator, "invalid json"));
 }

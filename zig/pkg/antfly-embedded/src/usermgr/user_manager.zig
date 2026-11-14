@@ -1831,10 +1831,29 @@ pub fn hasRowFilters(row_filters: []const RowFilterEntry) bool {
 
 /// Allocation-free presence check for mutation guards and discovery paths.
 pub fn hasRowFilterForTable(row_filters: []const RowFilterEntry, table: []const u8) bool {
-    for (row_filters) |entry| {
-        if (rowFilterApplies(entry, table)) return true;
+    var matching = matchingRowFilters(row_filters, table);
+    return matching.next() != null;
+}
+
+/// Borrows its entries, table name, and returned JSON. Request-serving callers
+/// can stop at a budget boundary without copying or parsing the remaining tail.
+pub const RowFilterIterator = struct {
+    entries: []const RowFilterEntry,
+    table: []const u8,
+    index: usize = 0,
+
+    pub fn next(self: *RowFilterIterator) ?[]const u8 {
+        while (self.index < self.entries.len) {
+            const entry = self.entries[self.index];
+            self.index += 1;
+            if (rowFilterApplies(entry, self.table)) return entry.filter;
+        }
+        return null;
     }
-    return false;
+};
+
+pub fn matchingRowFilters(row_filters: []const RowFilterEntry, table: []const u8) RowFilterIterator {
+    return .{ .entries = row_filters, .table = table };
 }
 
 fn rowFilterApplies(entry: RowFilterEntry, table: []const u8) bool {
@@ -1862,11 +1881,11 @@ pub fn combinedRowFilterForTable(alloc: Allocator, row_filters: []const RowFilte
     var count: usize = 0;
     var size: usize = 0;
     var single: []const u8 = undefined;
-    for (row_filters) |entry| {
-        if (!rowFilterApplies(entry, table)) continue;
+    var matching = matchingRowFilters(row_filters, table);
+    while (matching.next()) |filter| {
         count += 1;
-        size += entry.filter.len;
-        single = entry.filter;
+        size += filter.len;
+        single = filter;
     }
     if (count == 0) return null;
     if (count == 1) return .{ .json = single };
@@ -1874,14 +1893,14 @@ pub fn combinedRowFilterForTable(alloc: Allocator, row_filters: []const RowFilte
     const out = try alloc.alloc(u8, prefix.len + size + count - 1 + 2);
     @memcpy(out[0..prefix.len], prefix);
     var pos: usize = prefix.len;
-    for (row_filters) |entry| {
-        if (!rowFilterApplies(entry, table)) continue;
+    matching = matchingRowFilters(row_filters, table);
+    while (matching.next()) |filter| {
         if (pos > prefix.len) {
             out[pos] = ',';
             pos += 1;
         }
-        @memcpy(out[pos..][0..entry.filter.len], entry.filter);
-        pos += entry.filter.len;
+        @memcpy(out[pos..][0..filter.len], filter);
+        pos += filter.len;
     }
     @memcpy(out[pos..], "]}");
     return .{ .json = out, .allocation = out, .composed = true };
