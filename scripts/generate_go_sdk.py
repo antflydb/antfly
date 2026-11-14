@@ -18,7 +18,8 @@
 
 Go's compression implementation can change across toolchains. oapi-codegen
 embeds compressed specs, so pinning only oapi-codegen does not pin its output.
-Consumer Go minimums are independent of this generation toolchain.
+Consumer Go minimums are independent of this generation toolchain. Public SDK
+transport policies are applied in the same invocation, with checked hooks.
 """
 
 import json
@@ -34,6 +35,11 @@ def main() -> None:
     )
     env = {**os.environ, "GOTOOLCHAIN": "go" + policy["go"]["version"], "GOWORK": "off"}
     subprocess.run(["go", "tool", "oapi-codegen", *sys.argv[1:]], env=env, check=True)
+    # The public SDK is only valid after its checked transport hooks run.
+    # Keep this in the generator entry point so direct regeneration is safe too.
+    sdk_root = Path(__file__).resolve().parents[1] / "go/pkg/sdk"
+    if Path.cwd().resolve() == sdk_root:
+        subprocess.run(["go", "run", "./internal/gensqlpolicy"], env=env, check=True)
 
 
 if __name__ == "__main__":
