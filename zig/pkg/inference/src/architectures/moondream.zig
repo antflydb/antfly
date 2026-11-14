@@ -786,10 +786,13 @@ pub fn attentionHostParallel(
     head_dim: usize,
     causal: bool,
 ) ![]f32 {
-    const width = num_heads * head_dim;
-    if (q.len != rows * width or k.len != rows * width or v.len != rows * width) return error.InvalidAttentionShape;
-    const output = try allocator.alloc(f32, rows * width);
+    if (num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
+    const width = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
+    const elements = std.math.mul(usize, rows, width) catch return error.InvalidAttentionShape;
+    if (q.len != elements or k.len != elements or v.len != elements) return error.InvalidAttentionShape;
+    const output = try allocator.alloc(f32, elements);
     errdefer allocator.free(output);
+    if (rows == 0) return output;
     const cpus = std.Thread.getCpuCount() catch 1;
     const workers = @max(@as(usize, 1), @min(@min(cpus, 8), num_heads));
 
@@ -804,21 +807,21 @@ pub fn attentionHostParallel(
         head_start: usize,
         head_end: usize,
         query_offset: usize,
-        failed: bool = false,
+        packed_buf: []f32,
+        workspace: linalg.FlashCausalAttentionWorkspace,
+        failure: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            self.runInner() catch {
-                self.failed = true;
+            self.runInner() catch |err| {
+                self.failure = err;
             };
         }
 
         fn runInner(self: *@This()) !void {
-            const a = std.heap.page_allocator;
             const heads = self.head_end - self.head_start;
             const sub = heads * self.head_dim;
             const col = self.head_start * self.head_dim;
-            const packed_buf = try a.alloc(f32, 3 * self.rows * sub);
-            defer a.free(packed_buf);
+            const packed_buf = self.packed_buf;
             const pq = packed_buf[0 .. self.rows * sub];
             const pk = packed_buf[self.rows * sub ..][0 .. self.rows * sub];
             const pv = packed_buf[2 * self.rows * sub ..][0 .. self.rows * sub];
@@ -827,15 +830,28 @@ pub fn attentionHostParallel(
                 @memcpy(pk[r * sub ..][0..sub], self.k[r * self.width + col ..][0..sub]);
                 @memcpy(pv[r * sub ..][0..sub], self.v[r * self.width + col ..][0..sub]);
             }
-            const out = try linalg.flashCausalAttentionHost(a, pq, pk, pv, null, null, 0, 1, self.rows, self.rows, self.query_offset, 0, heads, heads, self.head_dim);
-            defer a.free(out);
+            const out = try linalg.flashCausalAttentionHostWithWorkspace(&self.workspace, pq, pk, pv, null, null, 0, 1, self.rows, self.rows, self.query_offset, 0, heads, heads, self.head_dim);
             for (0..self.rows) |r| @memcpy(self.out[r * self.width + col ..][0..sub], out[r * sub ..][0..sub]);
         }
     };
 
     var states: [8]Worker = undefined;
     var threads: [8]?std.Thread = @splat(null);
+    var prepared: usize = 0;
+    defer for (states[0..prepared]) |*state| {
+        state.workspace.deinit(allocator);
+        allocator.free(state.packed_buf);
+    };
+    // Reserve all worker storage serially through the caller's allocator. The
+    // request allocator is deliberately not thread-safe; workers only compute.
     for (0..workers) |w| {
+        const head_start = num_heads / workers * w + @min(w, num_heads % workers);
+        const head_end = num_heads / workers * (w + 1) + @min(w + 1, num_heads % workers);
+        const heads = head_end - head_start;
+        const packed_len = try std.math.mul(usize, 3, try std.math.mul(usize, rows, heads * head_dim));
+        const packed_buf = try allocator.alloc(f32, packed_len);
+        errdefer allocator.free(packed_buf);
+        const workspace = try linalg.FlashCausalAttentionWorkspace.init(allocator, 1, rows, rows, heads, head_dim);
         states[w] = .{
             .q = q,
             .k = k,
@@ -844,10 +860,13 @@ pub fn attentionHostParallel(
             .rows = rows,
             .width = width,
             .head_dim = head_dim,
-            .head_start = num_heads * w / workers,
-            .head_end = num_heads * (w + 1) / workers,
+            .head_start = head_start,
+            .head_end = head_end,
             .query_offset = if (causal) 0 else rows,
+            .packed_buf = packed_buf,
+            .workspace = workspace,
         };
+        prepared += 1;
     }
     // Worker 0 runs on the calling thread; spawn failures fall back inline.
     for (1..workers) |w| threads[w] = std.Thread.spawn(.{}, Worker.run, .{&states[w]}) catch null;
@@ -855,7 +874,7 @@ pub fn attentionHostParallel(
     for (1..workers) |w| {
         if (threads[w]) |t| t.join() else states[w].run();
     }
-    for (states[0..workers]) |state| if (state.failed) return error.OutOfMemory;
+    for (states[0..workers]) |state| if (state.failure) |err| return err;
     return output;
 }
 
@@ -984,4 +1003,35 @@ fn checkMoondreamProbeAllocationFailures(allocator: std.mem.Allocator) !void {
 test "moondream configuration probe preserves allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkMoondreamProbeAllocationFailures, .{});
     try std.testing.expect(!try isMoondreamConfig(std.testing.allocator, "invalid json"));
+}
+
+fn checkHostAttentionAllocationFailures(allocator: std.mem.Allocator) !void {
+    const q = [_]f32{ 1, 1, 1, 1 };
+    const k = [_]f32{ 0, 0, 0, 0 };
+    const v = [_]f32{ 2, 3, 4, 5 };
+    const result = try attentionHostParallel(allocator, &q, &k, &v, 2, 2, 1, false);
+    defer allocator.free(result);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4, 3, 4 }, result);
+}
+
+test "moondream parallel host attention rolls back every preparation allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkHostAttentionAllocationFailures, .{});
+}
+
+test "moondream parallel host attention accounts worker storage before dispatch" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const Scope = @import("../pipelines/preprocessing_memory.zig").Scope;
+    const Session = @import("../backends/session.zig").Session;
+    // The global output alone fits. Packed QKV plus per-worker output and tile
+    // scratch do not; these previously bypassed the supplied allocator.
+    var controller = memory.AdmissionController{};
+    const session = Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1024, .scratch_limit_bytes = 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var scope = Scope.child(std.testing.allocator, session, null);
+    defer scope.deinit();
+    const a = try scope.allocator();
+    const q: [64]f32 = @splat(1);
+    try std.testing.expectError(error.OutOfMemory, attentionHostParallel(a, &q, &q, &q, 16, 2, 2, false));
+    try std.testing.expectEqual(error.ResourceLimitExceeded, scope.failure(error.OutOfMemory));
+    try scope.trim();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
 }

@@ -102,6 +102,24 @@ pub fn ropeCore(output: []f32, positions: []const usize, head_dim: usize, rope_d
     }
 }
 
+const HostAttentionShape = struct { h_q: usize, h_kv: usize, heads_per_group: usize, q_expected: usize, mask_seq_len: usize };
+
+fn hostAttentionShape(q_len: usize, k_len: usize, v_len: usize, batch: usize, q_seq_len: usize, kv_seq_len: usize, query_position_offset: usize, kv_position_offset: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) !HostAttentionShape {
+    if (num_kv_heads == 0 or num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
+    if (num_heads % num_kv_heads != 0) return error.InvalidAttentionShape;
+    const H_q = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
+    const H_kv = std.math.mul(usize, num_kv_heads, head_dim) catch return error.InvalidAttentionShape;
+    const heads_per_group = num_heads / num_kv_heads;
+    const q_expected = std.math.mul(usize, std.math.mul(usize, batch, q_seq_len) catch return error.InvalidAttentionShape, H_q) catch return error.InvalidAttentionShape;
+    const kv_expected = std.math.mul(usize, std.math.mul(usize, batch, kv_seq_len) catch return error.InvalidAttentionShape, H_kv) catch return error.InvalidAttentionShape;
+    if (q_len != q_expected or k_len != kv_expected or v_len != kv_expected) return error.InvalidAttentionShape;
+    const query_end = std.math.add(usize, query_position_offset, q_seq_len) catch return error.InvalidAttentionShape;
+    const kv_total_end = std.math.add(usize, kv_position_offset, kv_seq_len) catch return error.InvalidAttentionShape;
+    const mask_seq_len = @max(query_end, kv_total_end);
+
+    return .{ .h_q = H_q, .h_kv = H_kv, .heads_per_group = heads_per_group, .q_expected = q_expected, .mask_seq_len = mask_seq_len };
+}
+
 /// Tiled flash causal attention supporting both MHA and GQA.
 pub fn flashCausalAttentionHost(
     allocator: std.mem.Allocator,
@@ -120,48 +138,87 @@ pub fn flashCausalAttentionHost(
     num_kv_heads: usize,
     head_dim: usize,
 ) ![]f32 {
-    if (num_kv_heads == 0 or num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
-    if (num_heads % num_kv_heads != 0) return error.InvalidAttentionShape;
-    const H_q = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
-    const H_kv = std.math.mul(usize, num_kv_heads, head_dim) catch return error.InvalidAttentionShape;
-    const heads_per_group = num_heads / num_kv_heads;
-    const q_expected = std.math.mul(usize, std.math.mul(usize, batch, q_seq_len) catch return error.InvalidAttentionShape, H_q) catch return error.InvalidAttentionShape;
-    const kv_expected = std.math.mul(usize, std.math.mul(usize, batch, kv_seq_len) catch return error.InvalidAttentionShape, H_kv) catch return error.InvalidAttentionShape;
-    if (Q.len != q_expected or K.len != kv_expected or V.len != kv_expected) return error.InvalidAttentionShape;
+    _ = try hostAttentionShape(Q.len, K.len, V.len, batch, q_seq_len, kv_seq_len, query_position_offset, kv_position_offset, num_heads, num_kv_heads, head_dim);
+    var workspace = try FlashCausalAttentionWorkspace.init(allocator, batch, q_seq_len, kv_seq_len, num_heads, head_dim);
+    errdefer allocator.free(workspace.output);
+    defer allocator.free(workspace.scratch);
+    return flashCausalAttentionHostWithWorkspace(&workspace, Q, K, V, bias, attn_or_mask, sliding_window, batch, q_seq_len, kv_seq_len, query_position_offset, kv_position_offset, num_heads, num_kv_heads, head_dim);
+}
+
+/// Prepared on the calling thread; execution never touches the allocator.
+/// Each concurrent attention invocation must have an exclusive workspace.
+pub const FlashCausalAttentionWorkspace = struct {
+    output: []f32,
+    scratch: []f32,
+
+    pub fn init(allocator: std.mem.Allocator, batch: usize, q_len: usize, kv_len: usize, heads: usize, dim: usize) !@This() {
+        if (heads == 0 or dim == 0) return error.InvalidAttentionShape;
+        const output_len = try std.math.mul(usize, try std.math.mul(usize, batch, q_len), try std.math.mul(usize, heads, dim));
+        const output = try allocator.alloc(f32, output_len);
+        errdefer allocator.free(output);
+        return .{ .output = output, .scratch = try allocator.alloc(f32, try scratchLength(q_len, kv_len, dim)) };
+    }
+
+    fn scratchLength(q_len: usize, kv_len: usize, dim: usize) !usize {
+        const bq: usize = @min(BLOCK_Q, q_len);
+        const bkv: usize = @min(BLOCK_KV, kv_len);
+        const tile = try std.math.mul(usize, bq, bkv);
+        const rows = try std.math.mul(usize, 2, bq);
+        const packs = try std.math.mul(usize, try std.math.mul(usize, 2, try std.math.add(usize, bq, bkv)), dim);
+        return std.math.add(usize, try std.math.add(usize, tile, rows), packs);
+    }
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.scratch);
+        allocator.free(self.output);
+    }
+};
+
+/// Allocation-free variant with borrowed output, invalidated by workspace reuse.
+pub fn flashCausalAttentionHostWithWorkspace(
+    workspace: *FlashCausalAttentionWorkspace,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    bias: ?[]const f32,
+    attn_or_mask: ?[]const u8,
+    sliding_window: usize,
+    batch: usize,
+    q_seq_len: usize,
+    kv_seq_len: usize,
+    query_position_offset: usize,
+    kv_position_offset: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) ![]f32 {
+    const shape = try hostAttentionShape(Q.len, K.len, V.len, batch, q_seq_len, kv_seq_len, query_position_offset, kv_position_offset, num_heads, num_kv_heads, head_dim);
+    const H_q = shape.h_q;
+    const H_kv = shape.h_kv;
+    const heads_per_group = shape.heads_per_group;
+    const q_expected = shape.q_expected;
+    const mask_seq_len = shape.mask_seq_len;
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
-    const query_end = std.math.add(usize, query_position_offset, q_seq_len) catch return error.InvalidAttentionShape;
-    const kv_total_end = std.math.add(usize, kv_position_offset, kv_seq_len) catch return error.InvalidAttentionShape;
-    const mask_seq_len = @max(query_end, kv_total_end);
 
-    const output_elems = std.math.mul(usize, batch, q_seq_len) catch return error.InvalidAttentionShape;
-    const output = try allocator.alloc(f32, std.math.mul(usize, output_elems, H_q) catch return error.InvalidAttentionShape);
-    errdefer allocator.free(output);
+    if (workspace.output.len != q_expected or workspace.scratch.len != try FlashCausalAttentionWorkspace.scratchLength(q_seq_len, kv_seq_len, head_dim)) return error.InvalidAttentionWorkspace;
+    const output = workspace.output;
     @memset(output, 0.0);
-
-    const bq = @min(BLOCK_Q, q_seq_len);
-    const bkv = @min(BLOCK_KV, kv_seq_len);
-    const score_tile = try allocator.alloc(f32, std.math.mul(usize, bq, bkv) catch return error.InvalidAttentionShape);
-    defer allocator.free(score_tile);
-    const row_max = try allocator.alloc(f32, bq);
-    defer allocator.free(row_max);
-    const row_sum = try allocator.alloc(f32, bq);
-    defer allocator.free(row_sum);
-
-    // Q/K/V are token-major here (each token packs all heads contiguously),
-    // so the per-head rows are strided by H_q/H_kv.  The register-tiled SGEMM
-    // expects contiguous matrices, so we pack each head's current Q-/K-/V-
-    // block into scratch buffers, run the GEMM, then scatter the packed
-    // output rows back to the strided `output` at the end of each Q-block.
-    // Packing cost: cur_bq + 2*cur_bkv head_dim-sized memcpys per K-block,
-    // which is < 2% of the GEMM work it enables.
-    const q_pack = try allocator.alloc(f32, bq * head_dim);
-    defer allocator.free(q_pack);
-    const k_pack = try allocator.alloc(f32, bkv * head_dim);
-    defer allocator.free(k_pack);
-    const v_pack = try allocator.alloc(f32, bkv * head_dim);
-    defer allocator.free(v_pack);
-    const out_pack = try allocator.alloc(f32, bq * head_dim);
-    defer allocator.free(out_pack);
+    const bq: usize = @min(BLOCK_Q, q_seq_len);
+    const bkv: usize = @min(BLOCK_KV, kv_seq_len);
+    var rest = workspace.scratch;
+    const score_tile = rest[0 .. bq * bkv];
+    rest = rest[score_tile.len..];
+    const row_max = rest[0..bq];
+    rest = rest[bq..];
+    const row_sum = rest[0..bq];
+    rest = rest[bq..];
+    const q_pack = rest[0 .. bq * head_dim];
+    rest = rest[q_pack.len..];
+    const k_pack = rest[0 .. bkv * head_dim];
+    rest = rest[k_pack.len..];
+    const v_pack = rest[0 .. bkv * head_dim];
+    rest = rest[v_pack.len..];
+    const out_pack = rest;
 
     for (0..batch) |b| {
         for (0..num_heads) |h| {
@@ -2601,11 +2658,13 @@ test "segmentAttentionHost cancellation drains running parallel heads before scr
         io: std.Io,
         entered: std.Io.Event = .unset,
         release: std.Io.Event = .unset,
+        started: std.atomic.Value(usize) = .init(0),
         finished: std.atomic.Value(usize) = .init(0),
     };
     const BlockingGemm = struct {
         var lifecycle: *Lifecycle = undefined;
         pub fn sgemmTransBSync(m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, beta: f32, c: []f32) void {
+            _ = lifecycle.started.fetchAdd(1, .acq_rel);
             lifecycle.entered.set(lifecycle.io);
             // Model an already-running BLAS call, which cannot be interrupted.
             lifecycle.release.waitUncancelable(lifecycle.io);
@@ -2647,9 +2706,13 @@ test "segmentAttentionHost cancellation drains running parallel heads before scr
     const result = request.cancel(io);
     pending = false;
     try std.testing.expectError(error.Canceled, result);
-    try std.testing.expectEqual(@as(usize, 4), lifecycle.finished.load(.acquire));
+    // Cancellation may prevent queued heads from starting. Every BLAS call
+    // that did start must finish before its borrowed scratch is released.
+    const drained = lifecycle.finished.load(.acquire);
+    try std.testing.expect(drained > 0);
+    try std.testing.expectEqual(lifecycle.started.load(.acquire), drained);
     try Case.run(io);
-    try std.testing.expectEqual(@as(usize, 8), lifecycle.finished.load(.acquire));
+    try std.testing.expectEqual(drained + 4, lifecycle.finished.load(.acquire));
 }
 
 test "segmentAttentionHost matches dense masked softmax with ranges, window, and fewer queries" {
@@ -3382,4 +3445,22 @@ test "embeddinggemma2 grouped shared KV workers drain allocation failure and can
     io.vtable = &table;
     try std.testing.expectError(error.Canceled, Case.run(std.testing.allocator, io));
     try Case.run(std.testing.allocator, std.testing.io);
+}
+
+test "prepared host attention workspace reuses scratch without retaining previous values" {
+    const a = std.testing.allocator;
+    var workspace = try FlashCausalAttentionWorkspace.init(a, 1, 2, 2, 1, 1);
+    defer workspace.deinit(a);
+    const q = [_]f32{ 1, 1 };
+    const k = [_]f32{ 0, 0 };
+    const first = try flashCausalAttentionHostWithWorkspace(&workspace, &q, &k, &.{ 2, 4 }, null, null, 0, 1, 2, 2, 0, 0, 1, 1, 1);
+    try std.testing.expectEqualSlices(f32, &.{ 2, 3 }, first);
+    const second = try flashCausalAttentionHostWithWorkspace(&workspace, &q, &k, &.{ 4, 8 }, null, null, 0, 1, 2, 2, 2, 0, 1, 1, 1);
+    try std.testing.expectEqualSlices(f32, &.{ 6, 6 }, second);
+    try std.testing.expectError(error.InvalidAttentionWorkspace, flashCausalAttentionHostWithWorkspace(&workspace, &.{1}, &.{0}, &.{2}, null, null, 0, 1, 1, 1, 0, 0, 1, 1, 1));
+}
+
+test "host attention validates shape before allocating workspace" {
+    try std.testing.expectError(error.InvalidAttentionShape, flashCausalAttentionHost(std.testing.failing_allocator, &.{1}, &.{1}, &.{1}, null, null, 0, 1, 1, 1, 0, 0, 0, 0, 1));
+    try std.testing.expectError(error.InvalidAttentionShape, flashCausalAttentionHost(std.testing.failing_allocator, &.{1}, &.{1}, &.{1}, null, null, 0, 1, 2, 1, 0, 0, 1, 1, 1));
 }

@@ -58,6 +58,9 @@ pub const Scope = struct {
     budget_bytes: usize = 0,
     local_controller: memory.AdmissionController = .{},
     started: bool = false,
+    // Retain the domain even when publication drops the borrowed Session and
+    // an empty result has no allocation reservations identifying its ledger.
+    process_controller: ?*memory.AdmissionController = null,
     /// Synchronous ancestor preparation remains live while a child executes.
     parent: ?*const Scope = null,
     /// External host output leases retained during synchronous post-processing.
@@ -67,7 +70,7 @@ pub const Scope = struct {
     execution_residency: memory.Residency = .{},
 
     pub fn init(backing: std.mem.Allocator, session: ?sessions.Session, credit: Credit, budget: ?*memory.RunBudget) @This() {
-        return .{ .owner = .{ .backing = backing, .session = session, .prepaid_host_bytes = credit.process_bytes }, .budget = budget, .borrowed_budget_bytes = credit.budget_bytes };
+        return .{ .owner = .{ .backing = backing, .session = session, .prepaid_host_bytes = credit.process_bytes }, .budget = budget, .borrowed_budget_bytes = credit.budget_bytes, .process_controller = if (session) |active| if (active.run_admission) |a| a.controller else null else null };
     }
 
     pub fn child(backing: std.mem.Allocator, session: sessions.Session, parent: ?*const Scope) @This() {
@@ -123,10 +126,18 @@ pub const Scope = struct {
         return permit.runTransferringOutputs(inputs, allocator_, control);
     }
 
+    // Published result scopes have no borrowed Session, but their retained
+    // domain still identifies the process ledger. Offline scopes instead
+    // use their own embedded ledger, which must be rehomed on transfer.
+    fn processController(self: *@This()) ?*memory.AdmissionController {
+        if (self.owner.session) |session| if (session.run_admission) |a| return a.controller;
+        return self.process_controller;
+    }
+
     pub fn absorb(self: *@This(), source: *@This()) !void {
         if (self.budget != null or source.budget != null) return error.InvalidAdmissionLeaseReduction;
-        const target_controller = if (self.owner.session) |session| if (session.run_admission) |a| a.controller else null else null;
-        const source_controller = if (source.owner.session) |session| if (session.run_admission) |a| a.controller else null else null;
+        const target_controller = self.processController();
+        const source_controller = source.processController();
         if (target_controller != source_controller) return error.InvalidAdmissionLeaseReduction;
         // Offline scopes use embedded ledgers. Rehome those leases before the
         // source's stack frame disappears; process-domain leases stay intact.
@@ -719,3 +730,16 @@ const Empty = struct {
         return &.{};
     }
 };
+
+test "prepared empty published output retains its process domain during ownership transfer" {
+    var controller = memory.AdmissionController{};
+    const session = sessions.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var target = Scope.child(std.testing.allocator, session, null);
+    defer target.deinit();
+    const owned = try Owned.create(std.testing.allocator, session, null, null);
+    defer Owned.release(owned);
+    try owned.publish();
+    try std.testing.expect(owned.scope.owner.reservation_controller == null);
+    try target.absorb(&owned.scope);
+    try std.testing.expectEqual(@as(usize, @sizeOf(Owned)), controller.snapshot().hostTotalBytes());
+}
