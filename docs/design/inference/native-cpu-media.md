@@ -172,6 +172,25 @@ retained its final phrase and timestamp (37.29 s), with zero normalized word
 errors. That longer recording used the earlier namespace-fix binary, identical
 Whisper implementation, and four efficiency cores while compilation overlapped;
 its 172.20 s startup is a functional check, not a matched performance result.
+The final executable repeated that long recording successfully in 171.43 s with
+automatic scratch (6 GiB), preserving the same final phrase and timestamp. A
+Whisper-small read with BLAS disabled also completed correctly (22.10 s on four
+efficiency cores with concurrent CPU checks).
+
+The dense Grepstein call-detail page (original PDF page 2, rendered 1051×1400)
+did **not** complete within a 1200 s client deadline, both as forced document
+OCR and as an already rendered image. The respective peak PSS values were
+2.21 and 2.34 GiB; the workers used approximately 3.7–3.8 CPU cores. Neither
+attempt reached a complete output, so neither passes correctness or throughput
+qualification. The document attempt recorded about 408 million minor faults
+and 9203 major faults. CPU activity and allocation/page churn require profiling;
+these observations do not distinguish slow vision/prefill/decode from repetitive
+generation. The previous nested-slot and document-output-quota failures no
+longer prevented execution, but this is not a qualified dense-page CPU fallback.
+The probe now allows a bounded 30 s response grace after the unchanged execution
+deadline so subsequent runs can retain the server's timeout identity rather than
+race it with the client socket timeout. No host cache flush or GPU workload
+interruption was performed.
 
 ## Adoption
 

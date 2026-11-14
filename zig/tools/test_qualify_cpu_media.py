@@ -20,7 +20,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from qualify_cpu_media import validate_read, validate_timeout, main
+from qualify_cpu_media import validate_read, validate_timeout, main, request
 
 
 class CompletionAssertions(unittest.TestCase):
@@ -76,6 +76,20 @@ class CompletionAssertions(unittest.TestCase):
 
 
 class DeadlineAssertions(unittest.TestCase):
+    def test_transport_grace_does_not_extend_execution_budget(self):
+        with patch("qualify_cpu_media.http.client.HTTPConnection") as connect:
+            connection = connect.return_value
+            connection.getresponse.return_value.status = 504
+            connection.getresponse.return_value.read.return_value = (
+                b'{"error":"Timeout"}'
+            )
+            status, body = request(8090, "/read", {}, 60, response_grace=30)
+            connect.assert_called_once_with("127.0.0.1", 8090, timeout=90)
+            headers = connection.request.call_args.args[3]
+            self.assertEqual("60000", headers["X-Antfly-Inference-Timeout-Ms"])
+            validate_timeout(status, body)
+            connection.close.assert_called_once()
+
     def test_only_known_timeout_contracts_pass(self):
         for code in ("INFERENCE_TIMEOUT", "Timeout"):
             validate_timeout(504, {"error": code})

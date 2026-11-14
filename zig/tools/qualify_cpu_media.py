@@ -77,8 +77,13 @@ def validate_timeout(status, response):
         raise ValueError("deadline probe did not return the expected timeout")
 
 
-def request(port, route, body, timeout, *, budget_ms=None):
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+def request(port, route, body, timeout, *, budget_ms=None, response_grace=0):
+    # Execution keeps its original deadline. Allow bounded cleanup/serialization
+    # time to deliver the actual timeout envelope rather than losing its identity
+    # to a simultaneous client socket timeout.
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", port, timeout=timeout + response_grace
+    )
     try:
         connection.request(
             "POST" if body is not None else "GET",
@@ -271,7 +276,9 @@ def run_case(args, case, index):
                 raise ValueError(f"model load failed: {status} {load}")
             for trial in range(args.trials):
                 tick = time.monotonic()
-                status, response = request(port, "/read", body, args.timeout)
+                status, response = request(
+                    port, "/read", body, args.timeout, response_grace=30
+                )
                 elapsed = time.monotonic() - tick
                 row = dict(
                     trial=trial, seconds=elapsed, status=status, response=response
@@ -302,7 +309,9 @@ def run_case(args, case, index):
                 )
                 result["cancellation"] = dict(status=status, response=canceled)
                 validate_timeout(status, canceled)
-                status, recovered = request(port, "/read", body, args.timeout)
+                status, recovered = request(
+                    port, "/read", body, args.timeout, response_grace=30
+                )
                 if status != 200:
                     raise ValueError("worker did not recover after cancellation")
                 validate_read(recovered, case["expected"])
