@@ -71,7 +71,7 @@ jobs:
       - uses: ./.github/actions/load-toolchain-policy
         id: toolchain
       - name: Install diagnostic tools
-        run: bash scripts/ci/install_ubuntu_packages.sh build-essential pkg-config llvm time file ca-certificates curl xz-utils
+        run: bash scripts/ci/install_ubuntu_packages.sh build-essential pkg-config llvm time file python3 ca-certificates curl xz-utils
       - name: Install Nix
         uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
