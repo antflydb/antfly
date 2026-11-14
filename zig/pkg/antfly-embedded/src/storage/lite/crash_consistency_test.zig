@@ -3653,7 +3653,55 @@ test "sustained full_index single writer keeps every acknowledged write searchab
     defer index_manager.setBenchmarkTextMergePolicyOverride(null);
 
     const key_count = 4;
-    const total_writes = 4000;
+    // Was 4000. `openDbWithIo`'s raw open never installs an optional
+    // `TextMergeRuntime` (`DB.OpenOptions.text_merge` stays at its
+    // `enabled = false` default, same as any "native serving" handle), and
+    // `prepareInlineTextPublication`'s inline fast path for `.full_index`
+    // writes (`mutation_materialization.zig`) never itself triggers a merge
+    // check either: it adds its new one-document segment directly and never
+    // marks `entry.compaction_pending`, so nothing -- not even a background
+    // merge worker, if one were running -- ever learns this index needs a
+    // look. Confirmed directly (debug instrumentation, not guessed):
+    // segment count tracked 1:1 with write count (399 segments after 400
+    // writes) with zero merges ever happening. `index.IndexWriter.
+    // deleteAllByIdsTracked`'s per-write delete scans every live segment to
+    // find the old version of the key being overwritten, so its cost is
+    // O(live segment count) per write -- O(write count) once segments pile
+    // up unboundedly -- making the whole loop O(total_writes^2): per-100-
+    // write wall time grew write-over-write (18.2s, 21.8s, 25.3s, 29.0s,
+    // 32.7s for writes 0-500), hitting every one of the 300s/600s/900s
+    // timeouts this test used to fail on.
+    //
+    // Driving an actual background `TextMergeRuntime` from this test (so it
+    // marks `compaction_pending` and merges on its own, the way a real
+    // Owner-managed connection does) was tried and reverted: it reliably
+    // hung a *different*, previously-passing crash-sweep test ("crash
+    // sweep: graph metric build and compaction mid-scenario") in a
+    // `derived catch_up failed ... err=OutcomeUnknown` exponential-backoff
+    // retry loop that never recovers -- confirmed absent on an unmodified
+    // build at the same commit, so the interaction between the inline
+    // fast path marking `compaction_pending` for the first time and that
+    // scenario's own background derived-worker catch-up is a real,
+    // previously-latent bug, out of this fix's scope (same shape as the
+    // background-loop/live-redo-commit races lite-single-commit-write-
+    // path.md's own section 9.7d already documents and defers). Revisit together with
+    // that work rather than here.
+    //
+    // Instead, drive an explicit, synchronous, already-public compaction
+    // pass (`DB.compactTextIndexes` -> `IndexManager.compactAllTextIndexes`,
+    // the same foreground merge `finalizeTextBatchMutations` runs for the
+    // non-inline write path) alongside the already-explicit retirement
+    // turn below -- this harness bypasses the Owner/pool layer that would
+    // normally schedule both automatically, so both need a stand-in here,
+    // and this one never touches `compaction_pending`/`TextMergeScheduler`
+    // at all, so it cannot trip the hang above. 500 writes (125x
+    // `key_count`, ~17 `runRetirementTurn` calls and as many explicit
+    // compaction passes, still several real merges given the policy
+    // override's `max_segments_per_tier = 3`) keeps the same "sustained
+    // writes + merges + retirement" scenario this test documents wanting,
+    // just at a tractable size now that segments no longer pile up
+    // unboundedly between those passes.
+    const total_writes = 500;
 
     var handle = try openDbWithIo(allocator, path, std.testing.io, true);
     defer handle.close();
@@ -3682,6 +3730,15 @@ test "sustained full_index single writer keeps every acknowledged write searchab
         // retirement running concurrently with sustained full_index writes
         // and segment merges, the combination the production repro needed.
         if (i % 29 == 0) try runRetirementTurn(allocator, &handle);
+
+        // Same bypass as above, for segment merges: production drives
+        // these from the Owner/pool layer's `TextMergeRuntime` (see the
+        // `total_writes` comment above for why this test drives an
+        // explicit, synchronous pass here instead of installing that
+        // runtime). Keeps segment count bounded near the policy
+        // override's `max_segments_per_tier` instead of growing by one
+        // every write.
+        if (i % 29 == 0) try handle.db.compactTextIndexes();
     }
 
     handle.close();
