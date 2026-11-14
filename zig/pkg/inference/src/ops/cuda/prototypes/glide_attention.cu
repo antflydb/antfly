@@ -13,8 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Packed bidirectional GQA. One warp owns a query/head; online softmax
-// keeps scratch independent of context length. Each lane owns eight channels.
 struct GlideAttentionParams {
     const float *q, *k, *v;
     float *out;
