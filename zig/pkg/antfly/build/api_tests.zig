@@ -342,7 +342,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "public-api-integration",
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_integration_runtime_filters),
-        .max_rss = 15 * 1024 * 1024 * 1024,
+        .max_rss = 0,
     });
     const run_public_api_integration = addFilteredTestRunArtifactWithRuntimeFilters(b, public_api_integration.executable, public_api_integration_runtime_filters);
     const public_api_parity_runtime_filters = selectTestFilters(b, &public_api_parity_default_filters);

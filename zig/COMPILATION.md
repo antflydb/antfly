@@ -2303,3 +2303,48 @@ headroom. With a 32 GiB aggregate budget, distributed work can overlap the
 API, while the storage archive must wait. Other owners, build modes,
 backends, custom CPU targets and sanitizer profiles retain their claims.
 The build policy regression checks the measured margin and overlap limits.
+
+### Public API contract and integration compiler owners (2026-11-14)
+
+The public API unit gate compiles transport/SQL contracts and its six native
+cluster integration fixtures as separate objects. Both remain part of the
+aggregate unit gate. The previous combined object reached 22,614,532,096 bytes
+against a 20 GiB claim in run 43565377975. Splitting separates fixture
+ownership, but does not by itself qualify the unstripped unit memory budget.
+
+`zig build public-api-parity-test` runs both owners. Runtime filters are checked
+against their combined inventory, including rejection of unmatched filters.
+An explicit `-Dtest-filter` retains the single-owner focused compile path so
+the selected test is not compiled and executed in both owners. The dedicated
+`inference-evaluation-graph-test` also follows the moved integration fixture.
+
+`zig build public-api-parity-compile` compiles both default owners without
+running their fixtures. The opt-in compile-cost workflow supports this target
+and uses the same pinned glibc-linked Nix Zig as production Linux CI. Select
+Debug with `strip: false` when qualifying unit reservations: a stripped build
+does not measure the unit gate's debug-symbol working set. The workflow keeps
+its disposable output on the ARC cache volume and removes it after retaining
+the measurements. Focused CAPI and storage-owner-source profiles additionally
+accept a literal `test_filter` and retain per-test timing output.
+
+The paired native Linux measurements show why symbol configuration must be
+part of admission qualification:
+
+| Profile run | Symbols | Contract object peak | Integration object peak |
+| --- | --- | ---: | ---: |
+| 43621672224 | stripped Debug | 11,473,981,440 B | 11,961,499,648 B |
+| 43624778060 | unstripped Debug | 21,511,946,240 B | 21,357,522,944 B |
+
+Both use baseline x86_64 GNU/Linux and pinned glibc-linked Nix Zig 0.17.0.
+The stripped result cannot qualify an unstripped reservation. CI now explicitly
+uses `-Doptimize=debug -Dstrip=true`: safety checks, error-return tracing and test
+selection remain enabled, while DWARF is omitted. CI stack dumps consequently
+have less symbol detail; reproduce a failure locally with `-Dstrip=false` for
+source-level debugging. Local build defaults remain unstripped.
+
+The matched stripped contract/integration reservations are 12/13 GiB, each
+covering its measured peak plus 10%, rounded up. Both allow a 7 GiB owner to
+overlap within the existing 20 GiB budget. Unstripped native Linux Debug instead
+reserves 23/22 GiB from its own measurements; it needs an aggregate budget that
+can admit those objects. Other host/optimization profiles keep their prior
+fallbacks. No runner resources or CI aggregate budget were increased.
