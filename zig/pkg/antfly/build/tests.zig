@@ -5821,6 +5821,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone chunk minimum content",
             "native model chunk requests inherit configured ceilings",
             "native model chunk configured ceilings survive the real provider ABI",
+            "native model chunk executes WAV through provider ABI without probes",
             "native call policy is scoped",
             "memory admission diagnostics retain",
             "session manager load clones preserve",
@@ -5847,6 +5848,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Qualification reads external fixture/model paths at execution time.
     // A prior opt-out must never cache a skip over a later live invocation.
     run_inference_host_tests.has_side_effects = true;
+    const native_chunk_execution_tests = b.addTest(.{
+        .root_module = test_imports.runtime.inference_host,
+        .filters = &.{"native model chunk executes WAV through provider ABI without probes"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+    });
+    const native_chunk_execution_run = b.addRunArtifact(native_chunk_execution_tests);
+    native_chunk_execution_run.has_side_effects = true;
+    b.step("inference-native-chunk-execution-test", "Execute native provider input/page/replay with an explicitly supplied real audio model")
+        .dependOn(&native_chunk_execution_run.step);
     lib_standalone_runtime_test_step.dependOn(&run_inference_host_tests.step);
     inference_host_test_step.dependOn(&run_inference_host_tests.step);
     // Keep the complete API worker fixture out of the inference-heavy runtime

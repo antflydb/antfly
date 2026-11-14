@@ -2580,6 +2580,23 @@ jobs:
           taskset -c ${{ steps.e2e_cpus.outputs.list }}
           scripts/ci/zig-vector-block-fd-test.sh
 
+      - name: Qualify public vector ingestion and recovery under descriptor pressure
+        run: >-
+          taskset -c ${{ steps.e2e_cpus.outputs.list }}
+          uv run --project zig/e2e/antfly python
+          zig/e2e/antfly/bench_descriptor_pressure.py zig/zig-out/bin/antfly
+          --documents 1024 --steady-seconds 2 --limits 256 1024
+          --output "${RUNNER_TEMP}/descriptor-pressure-reports"
+
+      - name: Retain descriptor pressure measurements
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: antfly-descriptor-pressure-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/descriptor-pressure-reports
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Run low-FD Autograph regression
         env:
           SKIP_BUILD: "1"
