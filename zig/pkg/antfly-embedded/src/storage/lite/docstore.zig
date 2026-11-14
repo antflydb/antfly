@@ -2257,13 +2257,18 @@ pub const CreateOptions = struct {
     /// See `OpenOptions.ride_along_idle_ns`.
     ride_along_idle_ns: ?u64 = null,
     /// docs/design/lite-performance/lite-single-commit-write-path.md §9,
-    /// point 3. `null` (the current default) opts a new file into
-    /// redo-log; `false` explicitly asks for the legacy copy-on-write
-    /// commit path instead. `true` is the same as the default, spelled
-    /// out. Combines with `reclamation.page_reuse` (indexed reclamation)
-    /// without restriction -- per-commit page allocation, retirement, and
-    /// reclamation defer to `checkpointRedoLog`'s own batched transaction
-    /// in that case, rather than running on every foreground commit.
+    /// point 3. `null` (the default) opts a new file into redo-log,
+    /// *unless* `reclamation.max_storage_bytes` is set and below
+    /// `native.NativeFile.use_redo_log_min_budget_bytes` (§9.7f), in
+    /// which case the default is legacy instead; `false`/`true`
+    /// explicitly pin legacy or redo-log regardless of budget and always
+    /// win over the default. Combines with `reclamation.page_reuse`
+    /// (indexed reclamation) without restriction -- per-commit page
+    /// allocation, retirement, and reclamation defer to
+    /// `checkpointRedoLog`'s own batched transaction in that case,
+    /// rather than running on every foreground commit. This is a
+    /// creation-time-only decision: `openWithOptions` has no such field
+    /// and never changes an existing file's mode on reopen.
     ///
     /// Flipped to default-on (§9.6c): the original 13-failure audit
     /// turned out to be two real bugs, both now fixed, not 13 unaudited
@@ -2764,7 +2769,19 @@ pub const Store = struct {
         // allocation, retirement, and indexed reclamation defer to
         // `checkpointRedoLog`'s own batched transaction instead of
         // running on every foreground commit (`NativeFile.transactionWrites`).
-        const use_redo_log = opts.use_redo_log orelse true;
+        //
+        // §9.7f: below `NativeFile.use_redo_log_min_budget_bytes`, that
+        // default flips to `false` (legacy) instead -- a small configured
+        // `reclamation.max_storage_bytes` makes the scaled redo-log
+        // reservation below a disproportionately large slice of the
+        // budget (see that constant's own doc comment for the numbers).
+        // An explicit `use_redo_log`, `true` or `false`, always wins; no
+        // budget at all (`max_storage_bytes == 0`, the common/production
+        // case) always keeps the `true` default. This is a creation-time
+        // decision only -- `openWithOptions` never consults it, so
+        // reopening an existing file never changes its mode.
+        const use_redo_log = opts.use_redo_log orelse
+            (opts.reclamation.max_storage_bytes == 0 or opts.reclamation.max_storage_bytes >= native.NativeFile.use_redo_log_min_budget_bytes);
         // §9.7a: `default_redo_log_capacity_bytes` (8 MiB) is reserved
         // eagerly, in full, the moment the file is created -- it is real
         // physical file size from byte zero, not amortized content. A

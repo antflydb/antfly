@@ -7212,6 +7212,28 @@ pub const NativeFile = struct {
     /// this is a deliberately modest default, not a measured optimum.
     pub const default_redo_log_capacity_bytes: u64 = 512 * 1024;
 
+    /// §9.7f: the floor below which `docstore.Store.createWithOptions`
+    /// defaults a newly-created file's `use_redo_log` to `false` (legacy
+    /// commit path) instead of `true`, when the caller configures a
+    /// `reclamation.max_storage_bytes` below this value and does not pass
+    /// an explicit `use_redo_log`. Below this floor, the scaled redo-log
+    /// reservation `docstore.zig` derives from the budget
+    /// (`max(max_storage_bytes / 4, 64 KiB)`) is a disproportionately
+    /// large slice of a small budget -- the 64 KiB absolute floor alone
+    /// is 25% of a 256 KiB budget, rising past 50% well below that -- so
+    /// legacy, which pays no such fixed reservation, is the better
+    /// default there. At exactly this floor the scaled reservation is
+    /// `max(4 MiB / 4, 64 KiB) = 1 MiB`, 25% of budget: the same
+    /// steady-state ratio every larger bounded budget already pays, so
+    /// this floor caps the *worst case* at that same ratio rather than
+    /// a worse one. 8x the unscaled `default_redo_log_capacity_bytes`
+    /// (512 KiB). An unbounded (`max_storage_bytes == 0`) store is
+    /// unaffected either way: it always defaults to `true`. An explicit
+    /// `use_redo_log`, `true` or `false`, always wins over this default,
+    /// and the policy applies only at creation -- reopening an existing
+    /// file never changes its mode.
+    pub const use_redo_log_min_budget_bytes: u64 = 4 * 1024 * 1024;
+
     /// Upgrades a freshly bootstrapped file (indexed or not) to the
     /// redo-log format in place: reserves `redo_log_capacity_bytes`
     /// (rounded up to a whole number of pages) as a dedicated, zero-filled
