@@ -522,6 +522,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     run_report_bench.step.dependOn(&admission_bench_tests.step);
     run_admission_bench.step.dependOn(&run_report_bench.step);
     b.step("antfly-system-catalog-report-bench", "Run opt-in report apply, repair and selected admission workloads").dependOn(&run_admission_bench.step);
+    // Keep credential-scope regressions inexpensive to repeat independently
+    // of the broader catalog, DDL and linked runtime suites.
+    const row_filter_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = selectTestFilters(b, &.{ "row filter", "row-filter", "system catalog projection is idempotent", "system catalog signed trusted principal", "system catalog SQL pgwire retained policies" }),
+    });
+    b.step("antfly-row-filter-test", "Run credential row-filter scope, projection and retained-policy contracts")
+        .dependOn(&b.addRunArtifact(row_filter_tests).step);
+
     const system_catalog_api_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
         .filters = &.{ "system catalog", "ordinary reads and writes distinguish absent policy from unavailable authority", "FK publication upgrade response excludes unknown mutation outcomes", "FK publication reports missing setting authority as service unavailable", "prepared query routing", "routing session pins every table", "metadata.table status encoder", "metadata.table detail encoder", "public table constraint lifecycle accepts explicit epoch zero" },
