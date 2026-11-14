@@ -95,6 +95,24 @@ pub const ReadResult = struct {
 
     storage: ?*@import("preprocessing_memory.zig").Owned = null,
 
+    /// Move admitted text into the document owner without overlapping payloads.
+    /// Keep the allocation base when trimming so the destination can free it.
+    /// Unowned native results retain the caller's copy-based fallback.
+    pub fn takeTrimmedTextInto(self: *ReadResult, target: *@import("preprocessing_memory.zig").Scope) !?[]u8 {
+        const storage = self.storage orelse return null;
+        const trimmed = std.mem.trim(u8, self.text, " \t\r\n");
+        if (trimmed.len == 0) {
+            self.allocator.free(self.text);
+            self.text = &.{};
+            return @constCast(self.text);
+        }
+        try target.absorb(&storage.scope);
+        const text = @constCast(self.text)[0..trimmed.len];
+        std.mem.copyForwards(u8, text, trimmed);
+        self.text = &.{};
+        return text;
+    }
+
     pub fn deinit(self: *ReadResult) void {
         if (self.storage) |storage| {
             @import("preprocessing_memory.zig").Owned.release(storage);
@@ -3644,4 +3662,65 @@ fn checkPreparedDecoder(a: std.mem.Allocator) !void {
 test "reading prepared decoder executes masks and tokens with owned output and complete rollback" {
     try checkPreparedDecoder(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPreparedDecoder, .{});
+}
+
+fn checkReadingTextTransfer(allocator: std.mem.Allocator) !void {
+    const memory = @import("preprocessing_memory.zig");
+    for ([_]bool{ false, true }) |admitted| {
+        for ([_][]const u8{ " \ttext\r\n", " \r\n", "" }) |input| {
+            var controller = admission_memory.AdmissionController{};
+            const session = backends.Session{ .ptr = undefined, .vtable = undefined, .run_admission = if (admitted) .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } else null };
+            var target = memory.Scope.child(allocator, session, null);
+            defer target.deinit();
+            const earlier = try (try target.allocator()).dupe(u8, "earlier document text");
+            try target.trim();
+            const owned = try memory.Owned.create(allocator, session, null, null);
+            var result = ReadResult{ .allocator = try owned.scope.allocator(), .storage = owned, .text = &.{} };
+            var result_live = true;
+            defer if (result_live) result.deinit();
+            result.text = try result.allocator.dupe(u8, input);
+            const expected = std.mem.trim(u8, input, " \t\r\n");
+            const original = result.text.ptr;
+            try owned.publish();
+            const before = controller.snapshot().host_scratch_bytes;
+            const text = (try result.takeTrimmedTextInto(&target)).?;
+            if (expected.len > 0) try std.testing.expectEqual(original, text.ptr);
+            try std.testing.expectEqualStrings(expected, text);
+            try std.testing.expect(controller.snapshot().host_scratch_bytes <= before);
+            if (expected.len > 0) try std.testing.expectEqual(before, controller.snapshot().host_scratch_bytes);
+            // Destroy the old frame before using or freeing the moved allocation.
+            result.deinit();
+            result_live = false;
+            try std.testing.expectEqualStrings(expected, text);
+            (try target.allocator()).free(text);
+            try std.testing.expectEqualStrings("earlier document text", earlier);
+            (try target.allocator()).free(earlier);
+            try target.trim();
+            try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+        }
+    }
+}
+
+test "reading owned text transfers without copying and survives source teardown" {
+    try checkReadingTextTransfer(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkReadingTextTransfer, .{});
+}
+
+test "reading text transfer rejects a different process ledger without changing source" {
+    const memory = @import("preprocessing_memory.zig");
+    var controllers = [_]admission_memory.AdmissionController{ .{}, .{} };
+    const session = backends.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controllers[0], .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var target = memory.Scope.child(std.testing.allocator, session, null);
+    defer target.deinit();
+    const owned = try memory.Owned.create(std.testing.allocator, session, null, null);
+    var result = ReadResult{ .allocator = try owned.scope.allocator(), .storage = owned, .text = &.{} };
+    defer result.deinit();
+    result.text = try result.allocator.dupe(u8, " text ");
+    try owned.publish();
+    target.owner.session.?.run_admission.?.controller = &controllers[1];
+    const before = controllers[0].snapshot();
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, result.takeTrimmedTextInto(&target));
+    try std.testing.expectEqualStrings(" text ", result.text);
+    try std.testing.expectEqualDeep(before, controllers[0].snapshot());
+    try std.testing.expectEqual(@as(usize, 0), controllers[1].snapshot().hostTotalBytes());
 }
