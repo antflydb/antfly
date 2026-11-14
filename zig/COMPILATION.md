@@ -2334,6 +2334,7 @@ part of admission qualification:
 | --- | --- | ---: | ---: |
 | 43621672224 | stripped Debug | 11,473,981,440 B | 11,961,499,648 B |
 | 43624778060 | unstripped Debug | 21,511,946,240 B | 21,357,522,944 B |
+| 43634863201 | stripped Debug, refreshed after main merge | 11,489,120,256 B | 11,489,062,912 B |
 
 Both use baseline x86_64 GNU/Linux and pinned glibc-linked Nix Zig 0.17.0.
 The stripped result cannot qualify an unstripped reservation. CI now explicitly
@@ -2348,3 +2349,10 @@ overlap within the existing 20 GiB budget. Unstripped native Linux Debug instead
 reserves 23/22 GiB from its own measurements; it needs an aggregate budget that
 can admit those objects. Other host/optimization profiles keep their prior
 fallbacks. No runner resources or CI aggregate budget were increased.
+
+The large resolver curation fixture keeps 17 profiles, 17,000 aliases and both
+at-most-eight edge-visit assertions, including reopen. Transactional warm
+projection setup avoids draining unrelated empty producers; the separate
+small legacy-adoption fixture retains the complete maintenance lifecycle.
+Matched local CPU Debug runs (`-Dmetal=false -Dstrip=true`) measured 94.6 s
+before this fixture isolation and 12.6 s afterward, excluding compilation.
