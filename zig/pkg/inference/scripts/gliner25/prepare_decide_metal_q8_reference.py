@@ -20,6 +20,7 @@ The resulting FP32 checkpoint represents the quantized weights, not the original
 FP32 model. Use it for correctness only; time the original Fastino checkpoint in
 separate fresh processes so reference construction cannot affect memory peaks.
 """
+
 import argparse
 import hashlib
 import json
@@ -53,14 +54,24 @@ def main():
         if sha(args.bundle / name) != expected:
             raise ValueError(f"Unexpected Q8 artifact: {name}")
     source = args.source / "model.safetensors"
-    if sha(source) != "40a5a23ff860dc3dff426cecd1048cacdd29c648c96db209dad818e9686dc997":
+    if (
+        sha(source)
+        != "40a5a23ff860dc3dff426cecd1048cacdd29c648c96db209dad818e9686dc997"
+    ):
         raise ValueError("Unexpected original FP32 checkpoint")
     weights = {}
     for name in PINS:
         for key, tensor in decoded_weights(args.bundle / name, device="cpu"):
             # The GGUF exporter removes the outer encoder wrapper from its
             # transformer stack, while keeping embedding/head names intact.
-            if key.startswith(("embeddings.", "encoder.layer.", "encoder.rel_embeddings.", "encoder.LayerNorm.")):
+            if key.startswith(
+                (
+                    "embeddings.",
+                    "encoder.layer.",
+                    "encoder.rel_embeddings.",
+                    "encoder.LayerNorm.",
+                )
+            ):
                 key = "encoder." + key
             if key in weights:
                 raise ValueError(f"Duplicate tensor {key}")
@@ -68,20 +79,31 @@ def main():
     with safe_open(source, framework="pt", device="cpu") as original:
         if set(weights) != set(original.keys()):
             difference = sorted(set(weights) ^ set(original.keys()))
-            raise ValueError(f"Tensor inventory differs ({len(difference)}): {difference[:12]}")
+            raise ValueError(
+                f"Tensor inventory differs ({len(difference)}): {difference[:12]}"
+            )
         for key, tensor in weights.items():
             if list(tensor.shape) != original.get_slice(key).get_shape():
                 raise ValueError(f"Tensor shape differs: {key}")
     args.output.mkdir(parents=True, exist_ok=False)
-    for name in ("config.json", "encoder_config/config.json", "tokenizer.json",
-                 "tokenizer_config.json", "special_tokens_map.json"):
+    for name in (
+        "config.json",
+        "encoder_config/config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+    ):
         target = args.output / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(args.bundle / name, target)
     target = args.output / "model.safetensors"
     save_file(weights, target, metadata={"format": "pt"})
-    receipt = dict(purpose="Independent decoded-Q8 correctness reference; never the FP32 timing baseline",
-                   source_bundle=PINS, tensor_count=len(weights), sha256=sha(target))
+    receipt = dict(
+        purpose="Independent decoded-Q8 correctness reference; never the FP32 timing baseline",
+        source_bundle=PINS,
+        tensor_count=len(weights),
+        sha256=sha(target),
+    )
     (args.output / "q8_reference.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps(receipt))
 
