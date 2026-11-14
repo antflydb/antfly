@@ -9950,7 +9950,31 @@ pub const NativeFile = struct {
         const active_records = active_graph.record_count;
         // Active pages are checked first so fallback certificates can rely on
         // their liveness even when the active checkpoint occupies slot one.
-        for ([_]usize{ self.header.active_checkpoint, 1 - @as(usize, self.header.active_checkpoint) }) |index| {
+        //
+        // perf/lwa-lease-fold: under redo, the *other* (inactive) slot is
+        // never a real recovery candidate the way it is under legacy --
+        // see `metadataReuseFrontier`'s own doc comment: an ordinary redo
+        // commit never touches either on-disk slot at all, only a real
+        // fold does, and that slot's own write is confirmed durable
+        // before the call that made it ever returns. The inactive slot
+        // is simply whatever the *previous* real fold left behind --
+        // stale, not a second valid recovery outcome -- and once
+        // `redo_folded_through`-gated reuse (this same perf/lwa-lease-fold
+        // change) lets a later real fold's own retirement free pages the
+        // inactive slot still references, validating it here as if it
+        // still needed every one of them to stay live is exactly the
+        // legacy double-buffer invariant this file no longer has: a
+        // `.free_map` page read through it can legitimately already be
+        // something else (reused once the redo-aware frontier agreed to
+        // it), which is not corruption, just this check asking a
+        // question redo's own recovery contract never promises an
+        // answer to. Validate only the slot redo's own recovery would
+        // ever actually choose.
+        const checked_slots: []const usize = if (self.redo != null)
+            &[_]usize{self.header.active_checkpoint}
+        else
+            &[_]usize{ self.header.active_checkpoint, 1 - @as(usize, self.header.active_checkpoint) };
+        for (checked_slots) |index| {
             const slot = self.header.checkpoints[index];
             if (!validCheckpointSlot(slot)) continue;
             const active = index == self.header.active_checkpoint;
@@ -10065,12 +10089,69 @@ pub const NativeFile = struct {
     fn metadataReuseFrontier(self: *NativeFile) u64 {
         var frontier: u64 = std.math.maxInt(u64);
         const header = self.transaction_header orelse self.header;
-        for (header.checkpoints) |slot| if (validCheckpointSlot(slot)) {
-            frontier = @min(frontier, slot.commit_sequence);
-        };
-        if (self.durable_header) |durable| for (durable.checkpoints) |slot| {
-            if (validCheckpointSlot(slot)) frontier = @min(frontier, slot.commit_sequence);
-        };
+        // perf/lwa-lease-fold: under redo, a crash cannot recover to an
+        // arbitrary earlier checkpoint slot the way legacy's own
+        // per-commit two-slot alternation needs to guard against --
+        // ordinary redo commits (diverting, or a bare already-real one)
+        // never touch either on-disk slot at all (`publishCheckpoint`'s
+        // own redo branch rewrites `self.header.checkpoints[active]`
+        // in-memory only); only a real fold (`checkpointRedoLog`, or
+        // this file's own ledger-only commit) ever performs the v8/v9
+        // slot write that advances `active_checkpoint`, and that write
+        // is confirmed durable (synced) before the call that made it
+        // ever returns -- by the time any later caller reaches this
+        // frontier, there is no in-flight, possibly-torn write for a
+        // crash to fall back past. Recovery's own real boundary under
+        // redo is `redo_folded_through` (format v11): "the slot recovery
+        // would choose" is simply `activeCheckpoint()` (the one real
+        // folds keep advancing; ordinary commits only ever bump its
+        // `commit_sequence` in memory, never its `redo_folded_through`,
+        // which already "carries forward unchanged" until the next real
+        // fold -- same field, same value, whether that commit reads it
+        // mid-transaction or `durable_header` holds an older copy), and
+        // its own `redo_folded_through` is exactly the point below which
+        // everything is already in the real tree; anything still above
+        // it is live-but-unfolded redo overlay content, already kept
+        // alive by the overlay's own retention (`SharedRedoOverlay.pin`/
+        // `maybeClearPages`), not by this frontier. Using the raw
+        // two-slot minimum here instead -- the legacy term below --
+        // treats every ordinary commit as if it were a real fold that
+        // might not have landed yet, which it structurally cannot be
+        // under redo: that term only ever advances on the next real
+        // fold, so a workload that only folds rarely (or whose folds
+        // never clear page-shaped debt at all) never reuses anything,
+        // independent of whether reuse would actually be safe.
+        //
+        // `self.redo.?.checkpointing` is true for exactly the span of a
+        // real-fold-equivalent commit's own transaction
+        // (`checkpointRedoLog`, `reclaimPagesImpl`'s own ledger-only
+        // commit) -- both call this function themselves, through their
+        // own `pageAllocatorFromFreeMapWithProof`'s inline drain and
+        // (`reclaimPagesImpl`) their own explicit `drainRetirement` call,
+        // *before* their own `publishCheckpoint` has run, so
+        // `header.checkpoints[active].redo_folded_through` read at that
+        // moment is still last fold's value, one commit stale -- the
+        // same "my own flip lands after I already read the old value"
+        // gap the two-slot term had, just moved to a different field.
+        // Unlike an ordinary commit, this exact transaction's own
+        // `redo_folded_through` is already fully determined before any
+        // of its own building starts (`self.transaction_header`, snapshot
+        // at `beginTransaction`, never moves again), and is one atomic
+        // unit with everything `drainRetirement` does here: either this
+        // whole transaction commits, making that boundary real, or it
+        // aborts and nothing this call did persists either. Safe to use
+        // early, exactly like `publicationEpoch()` -- same formula --
+        // already does for the retirement items this same fold queues.
+        if (self.redo) |redo| {
+            frontier = @min(frontier, if (redo.checkpointing) self.publicationEpoch() else header.checkpoints[header.active_checkpoint].redo_folded_through);
+        } else {
+            for (header.checkpoints) |slot| if (validCheckpointSlot(slot)) {
+                frontier = @min(frontier, slot.commit_sequence);
+            };
+            if (self.durable_header) |durable| for (durable.checkpoints) |slot| {
+                if (validCheckpointSlot(slot)) frontier = @min(frontier, slot.commit_sequence);
+            };
+        }
         if (self.epoch_window) |epochs| if (epochs.metadata) |sequence| {
             frontier = @min(frontier, sequence);
         };
@@ -21248,7 +21329,9 @@ fn decodePagePayload(raw: []const u8, expected_kind: PageKind) ![]const u8 {
         @backingInt(PageKind.commit_manifest) => .commit_manifest,
         else => return error.InvalidNativePageKind,
     };
-    if (kind != expected_kind) return error.UnexpectedNativePageKind;
+    if (kind != expected_kind) {
+        return error.UnexpectedNativePageKind;
+    }
 
     const payload_len = std.mem.readInt(u32, raw[8..12], .little);
     if (payload_len > raw.len - page_header_size) return error.InvalidNativePageLength;
