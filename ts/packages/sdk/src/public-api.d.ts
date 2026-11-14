@@ -2565,7 +2565,7 @@ export interface paths {
         get: operations["getTableIndexAlias"];
         /**
          * Atomically create or swap an index alias
-         * @description Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias; a full retention window rejects new mutations with HTTP 409.
+         * @description Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias, 64 aliases per table, and 512 KiB of retained alias control state per table. Every mutation reclaims expired receipts across the table; capacity exhaustion rejects new mutations with HTTP 409.
          */
         put: operations["putTableIndexAlias"];
         post?: never;
@@ -2591,7 +2591,7 @@ export interface paths {
         get: operations["getNamespaceTableIndexAlias"];
         /**
          * Atomically create or swap an index alias
-         * @description Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias; a full retention window rejects new mutations with HTTP 409.
+         * @description Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias, 64 aliases per table, and 512 KiB of retained alias control state per table. Every mutation reclaims expired receipts across the table; capacity exhaustion rejects new mutations with HTTP 409.
          */
         put: operations["putNamespaceTableIndexAlias"];
         post?: never;

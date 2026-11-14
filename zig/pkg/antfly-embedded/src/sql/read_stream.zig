@@ -886,6 +886,7 @@ pub const Stream = struct {
             if (binding.aggregate) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
             if (binding.window) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
             if (external or (backend.execution_io == null and backend.spill_manager == null) or limits.spill_bytes == 0 or binding.table == null) {
+                if (backend.index_attribution) |host| host.bind(host.ptr, null);
                 if (self.parameter_invocation) |invocation| invocation.deinitFrame();
                 if (self.settings) |view| view.deinit();
                 self.arena.deinit();
@@ -2976,4 +2977,23 @@ test "SQL owned streams release allocator capability after delivery decline and 
     var calls: usize = 0;
     try std.testing.expect((try Stream.openOwned(.{ .allocator = std.testing.allocator, .ptr = &calls, .release = Case.release }, fixture.backend(), &compiled, &.{}, .{})) == null);
     try std.testing.expectEqual(@as(usize, 1), calls);
+}
+
+test "index alias SQL attribution detaches when streaming declines" {
+    const Host = struct {
+        bound: ?@import("cypher").backend.IndexObserver = null,
+        fn bind(ptr: *anyopaque, sink: ?@import("cypher").backend.IndexObserver) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.bound = sink;
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture: Fixture = .{};
+    var host: Host = .{};
+    var backend = fixture.backend();
+    backend.index_attribution = .{ .ptr = &host, .bind = Host.bind };
+    var compiled = try compiler.compile(a, "SELECT count(*) FROM docs", .{});
+    defer compiled.deinit();
+    try std.testing.expect((try Stream.open(a, backend, &compiled, &.{}, .{})) == null);
+    try std.testing.expect(host.bound == null);
 }

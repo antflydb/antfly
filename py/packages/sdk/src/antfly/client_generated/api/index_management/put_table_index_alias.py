@@ -97,7 +97,8 @@ def sync_detailed(
     requires expected_index to be absent; replacement requires the exact current target. Retry the
     identical request with the same idempotency key to reconcile an ambiguous response, including after
     later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per
-    alias; a full retention window rejects new mutations with HTTP 409.
+    alias, 64 aliases per table, and 512 KiB of retained alias control state per table. Every mutation
+    reclaims expired receipts across the table; capacity exhaustion rejects new mutations with HTTP 409.
 
     Args:
         table_name (str):
@@ -138,7 +139,8 @@ def sync(
     requires expected_index to be absent; replacement requires the exact current target. Retry the
     identical request with the same idempotency key to reconcile an ambiguous response, including after
     later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per
-    alias; a full retention window rejects new mutations with HTTP 409.
+    alias, 64 aliases per table, and 512 KiB of retained alias control state per table. Every mutation
+    reclaims expired receipts across the table; capacity exhaustion rejects new mutations with HTTP 409.
 
     Args:
         table_name (str):
@@ -174,7 +176,8 @@ async def asyncio_detailed(
     requires expected_index to be absent; replacement requires the exact current target. Retry the
     identical request with the same idempotency key to reconcile an ambiguous response, including after
     later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per
-    alias; a full retention window rejects new mutations with HTTP 409.
+    alias, 64 aliases per table, and 512 KiB of retained alias control state per table. Every mutation
+    reclaims expired receipts across the table; capacity exhaustion rejects new mutations with HTTP 409.
 
     Args:
         table_name (str):
@@ -213,7 +216,8 @@ async def asyncio(
     requires expected_index to be absent; replacement requires the exact current target. Retry the
     identical request with the same idempotency key to reconcile an ambiguous response, including after
     later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per
-    alias; a full retention window rejects new mutations with HTTP 409.
+    alias, 64 aliases per table, and 512 KiB of retained alias control state per table. Every mutation
+    reclaims expired receipts across the table; capacity exhaustion rejects new mutations with HTTP 409.
 
     Args:
         table_name (str):

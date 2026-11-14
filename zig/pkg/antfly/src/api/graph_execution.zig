@@ -310,9 +310,11 @@ pub const AuthorityChannel = struct {
         var parsed = try local.api_query.parsePublicQueryRequestWithDeadline(owned, resolver.iface(), request.table, try std.json.Stringify.valueAlloc(owned, json, .{}), normalized.deadline_ns);
         defer parsed.deinit(owned);
         request.prepared_search_json = try local.api_local_query_contract.encodeQueryRequest(owned, parsed.req);
-        const attribution = self.attribution_allocator orelse owned;
         for (try local.api_query.resolvedIndexNames(owned, parsed.req) orelse &.{}) |name| {
-            if (self.attribution_sink) |sink| try sink.record(sink.ptr, name) else if (!self.resolved_search_indexes.contains(name)) try self.resolved_search_indexes.put(attribution, try attribution.dupe(u8, name), {});
+            if (self.attribution_sink) |sink| try sink.record(sink.ptr, name) else {
+                const attribution = self.attribution_allocator orelse return error.CypherSearchPreparationRequired;
+                if (!self.resolved_search_indexes.contains(name)) try self.resolved_search_indexes.put(attribution, try attribution.dupe(u8, name), {});
+            }
         }
     }
 };
