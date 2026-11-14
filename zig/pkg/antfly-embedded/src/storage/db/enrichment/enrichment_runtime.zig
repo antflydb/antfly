@@ -18211,15 +18211,70 @@ fn flushAssetProducerBatchItems(
     defer producer_lease_guard.stop();
 
     const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
+    const text_count = try partitionAssetProducerBatchByTransport(runtime.alloc, items);
+    var retry_error: ?anyerror = null;
+    if (text_count > 0) {
+        flushTextAssetProducerBatchItems(runtime, producer, items[0..text_count], window, scope) catch |err| {
+            if (scope.publication_failed or isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) return err;
+            // Preserve this partition's retry identity before entering its
+            // sibling, including an output awaiting artifact publication.
+            scope.deferRetry(err);
+            retry_error = err;
+        };
+    }
+    if (text_count < items.len) {
+        const documents = items[text_count..];
+        scope.enterOwned(assetProducerBatchFailureFingerprint(documents), .{ .assets = documents });
+        flushIndexDocumentBatch(runtime, producer, documents, window, scope) catch |err| {
+            if (scope.publication_failed or isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) return err;
+            scope.deferRetry(err);
+            if (retry_error == null) retry_error = err;
+        };
+    }
+    if (retry_error) |err| return err;
+}
+
+/// Stable, bounded partition of borrowed item descriptors. Homogeneous cohorts
+/// allocate no scratch space; mixed cohorts never copy or retain source bodies.
+/// Reorder the owning slice itself so failure scopes cannot outlive scratch.
+fn partitionAssetProducerBatchByTransport(a: Allocator, items: []AssetProducerBatchItem) !usize {
+    std.debug.assert(items.len > 0);
+    const first_document = try indexDocumentProducerRequired(a, items[0]);
+    var boundary: usize = 1;
+    while (boundary < items.len and (try indexDocumentProducerRequired(a, items[boundary])) == first_document) : (boundary += 1) {}
+    if (boundary == items.len) return if (first_document) 0 else items.len;
+
+    const ordered = try a.alloc(AssetProducerBatchItem, items.len);
+    defer a.free(ordered);
+    var texts: usize = 0;
+    var documents = items.len;
+    for (items, 0..) |item, index| {
+        const document = if (index < boundary) first_document else if (index == boundary) !first_document else try indexDocumentProducerRequired(a, item);
+        if (document) {
+            documents -= 1;
+            ordered[documents] = item;
+        } else {
+            ordered[texts] = item;
+            texts += 1;
+        }
+    }
+    std.debug.assert(texts == documents);
+    std.mem.reverse(AssetProducerBatchItem, ordered[documents..]);
+    @memcpy(items, ordered);
+    return texts;
+}
+
+fn flushTextAssetProducerBatchItems(
+    runtime: *EnrichmentRuntime,
+    producer: asset_producer_mod.Producer,
+    items: []AssetProducerBatchItem,
+    window: *GeneratedReplayWindow,
+    scope: *FailureScope,
+) !void {
+    scope.enterOwned(assetProducerBatchFailureFingerprint(items), .{ .assets = items });
     const requests = try runtime.alloc.alloc(asset_producer_mod.Request, items.len);
     defer runtime.alloc.free(requests);
     for (items, 0..) |*item, idx| requests[idx] = item.asRequest();
-
-    // One producer configuration can mix literal text and document locators.
-    // A later document must retain its checkpoint owner even when the first
-    // item is text; each invocation still selects its own transport.
-    for (items) |item| if (try indexDocumentProducerRequired(runtime.alloc, item))
-        return flushIndexDocumentBatch(runtime, producer, items, window, scope);
 
     const can_batch = assetProducerCanBatchGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
