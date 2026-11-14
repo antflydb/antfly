@@ -709,6 +709,15 @@ fn reclamationRestoreWorkspaceBoundsStagingAndReleasesAdmissionImpl(a: Allocator
     var live = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = use_redo_log, .reclamation = .{ .max_storage_bytes = limit } });
     defer live.close();
     live.maintenance_start_suppressed = true;
+    // `live`'s own freshly-created size, before anything below ever writes to
+    // it. Under redo this already includes `live`'s own fixed log-capacity
+    // reservation (CreateOptions.use_redo_log's doc comment), sized from
+    // `live`'s own `max_storage_bytes` (`limit`) -- a *different* amount
+    // from `staged`'s own reservation below, which is sized from the
+    // smaller, already-budget-reduced `workspace.options.max_storage_bytes`.
+    // That is the right baseline for the retirement check far below (the
+    // file that actually gets retired is `live`'s, not `staged`'s).
+    const live_baseline_size = (try live.file.file.stat(std.testing.io)).size;
     var workspace = try live.reserveGenerationWorkspace();
     var reserved = true;
     defer if (reserved) workspace.deinit();
@@ -726,39 +735,37 @@ fn reclamationRestoreWorkspaceBoundsStagingAndReleasesAdmissionImpl(a: Allocator
     try std.testing.expectError(error.LiteStorageBudgetExceeded, staged.putCatalogRecord("oversized", value));
     try std.testing.expectEqualDeep(before, staged.file.activeCheckpoint());
     try std.testing.expectEqual(before_size, (try staged.file.file.stat(std.testing.io)).size);
-    // KNOWN REDO-MODE BUG (same page-shaped-exception family as "lite
-    // reclamation vacuum preserves collector capacity with retained
-    // readers"'s own comment, a more severe manifestation): the rejected
-    // 1MiB "oversized" write above diverts, and its external value
-    // chain's own page-shaped allocation runs (and partially allocates
-    // fresh page ids, right up to the budget ceiling) before the budget
-    // check even rejects the overall commit. `checkpoint.page_count`
-    // itself correctly rolls back (the expectEqualDeep/expectEqual checks
-    // just above already prove that), but the underlying page-id cursor
-    // a diverting commit's allocator advances is not reset on abort, so
-    // it is left pinned at the budget ceiling -- every later write,
-    // however small, fails closed with the same LiteStorageBudgetExceeded
-    // until a real commit resets it. Reproduced here: the tiny
-    // "small"/"accepted" write right below fails for exactly this reason
-    // under redo. Skipped under redo until that leak is fixed.
-    if (!use_redo_log) {
-        try staged.putCatalogRecord("small", "accepted");
-        var pinned = try live.beginRead();
-        defer pinned.abort();
-        _ = try live.replaceWithPreparedGeneration(&staged);
-        workspace.deinit();
-        reserved = false;
-        const status = try live.reclamationStatus();
-        try std.testing.expectEqual(@as(u64, 0), status.temporary_bytes);
-        try std.testing.expectEqual(before_size, status.retired_file_bytes);
-        try std.testing.expect(status.totalBytes() <= limit);
-        const actual = (try live.getCatalogRecordAlloc(a, "small")).?;
-        defer a.free(actual);
-        try std.testing.expectEqualStrings("accepted", actual);
-    } else {
-        workspace.deinit();
-        reserved = false;
-    }
+    // Formerly a KNOWN REDO-MODE BUG here (Bug 2, perf/lwa-budget-tail): a
+    // budget-rejected diverting commit's speculative page-shaped divert
+    // (the external value chain above) advanced the page-id allocation
+    // cursor before the budget check aborted it, permanently pinning it at
+    // the ceiling -- every later write, however small, then failed closed
+    // with the same `error.LiteStorageBudgetExceeded`. perf/lwa-integration
+    // @9fed7ea83f (merged into this branch) already fixed the underlying
+    // cause (bare commits were diverting every page into the redo overlay
+    // instead of pwriting them, which this same budget boundary also hit);
+    // the "small"/"accepted" write below no longer reproduces that failure.
+    try staged.putCatalogRecord("small", "accepted");
+    var pinned = try live.beginRead();
+    defer pinned.abort();
+    _ = try live.replaceWithPreparedGeneration(&staged);
+    workspace.deinit();
+    reserved = false;
+    const status = try live.reclamationStatus();
+    try std.testing.expectEqual(@as(u64, 0), status.temporary_bytes);
+    // The file that actually becomes the retired generation here is
+    // `live`'s own (pre-existing) file, not `staged`'s -- compare against
+    // `live`'s own baseline, not `before_size` (`staged`'s baseline, sized
+    // from a smaller `max_storage_bytes` and therefore, under redo, a
+    // smaller fixed log-capacity reservation; see `live_baseline_size`'s own
+    // comment above). The two coincide under legacy, where neither file
+    // reserves anything size-dependent, which is why reusing `before_size`
+    // here was never caught as mode-specific before.
+    try std.testing.expectEqual(live_baseline_size, status.retired_file_bytes);
+    try std.testing.expect(status.totalBytes() <= limit);
+    const actual = (try live.getCatalogRecordAlloc(a, "small")).?;
+    defer a.free(actual);
+    try std.testing.expectEqualStrings("accepted", actual);
 }
 
 test "lite reclamation restore workspace bounds staging and releases admission" {
