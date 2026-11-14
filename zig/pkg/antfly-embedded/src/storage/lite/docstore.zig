@@ -3101,7 +3101,19 @@ pub const Store = struct {
         var source = blk: {
             if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
             defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
-            lockStore(self);
+            // Exclusive, not plain lockStore: `captureFullReadSnapshot`
+            // compares `self.header` against a fresh reopen of the same
+            // path and refuses (`EnrichmentWaitCanceled`) on any
+            // disagreement. A foreground group's `syncIfRequired` writes
+            // its durability barrier before releasing `self.mutex` for the
+            // sync itself (`commit_in_sync`), so a plain `lockStore` here
+            // could land inside that released window, see the new bytes
+            // already on disk, and spuriously refuse the very first
+            // snapshot a vacuum ever takes against a live, concurrently
+            // written file -- the same race `applyResidualVacuumChanges`'s
+            // own `takeResidualVacuumChangesAssumeLocked` already guards
+            // against with `lockStoreExclusive`, just not yet here.
+            lockStoreExclusive(self);
             defer self.mutex.unlock();
             if (cancel) |token| try token.check();
             if (self.generation_workspace_active or self.file.change_capture != null or (self.maintenance_running and !automatic)) {
@@ -7439,6 +7451,18 @@ test "lite artifact leases defer allocator proof until an authored write" {
     errdefer write.abort();
     try write.put("doc", "authored");
     try write.commit();
+    // §9 (redo + indexed reclamation): an ordinary foreground commit on a
+    // redo-log file diverts into the log (`transactionWrites`'s own
+    // `diverting` check) and never builds a real copy-on-write page for
+    // its logical roots, so it takes `pageAllocatorForDivertingCommit`,
+    // which skips the free-map load/verify entirely -- only
+    // `checkpointRedoLog`'s own undiverted transaction reaches
+    // `pageAllocatorFromFreeMapWithProof` and can complete the proof.
+    // The authored write above still only defers the proof one step
+    // further (to the next real fold), not all the way to never; this is
+    // the new place "an authored write" actually resolves to under redo.
+    try std.testing.expect(!store.file.free_pages_verified);
+    try store.checkpointRedoLog();
     try std.testing.expect(store.file.free_pages_verified);
     try std.testing.expect((try store.file.check()).valid);
 }
@@ -9914,10 +9938,30 @@ test "lite online vacuum catches foreground commits while its copy is blocked" {
     var vtable = std.Options.debug_io.vtable.*;
     vtable.fileSync = Gate.sync;
     const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
-    const storage_limit = 128 * 4096;
+    // §9.7a (vacuum redo-log retention, 0de1ef453d): redo-log is on by
+    // default now, and both the live file *and* a vacuum's own prepared/
+    // compacted image reserve a log region (scaled from this same
+    // `max_storage_bytes`) as real file bytes -- the compacted image's
+    // own copy of that reservation comes out of its workspace byte limit
+    // (`assessment_bytes` here, via `Store.performVacuum`'s `workspace`
+    // -> `source.vacuum_workspace_limit` -> `prepared.max_file_bytes`).
+    // 128 pages/16 pages were tuned pre-redo, when neither needed any
+    // extra room, and started failing admission
+    // (`LiteStorageBudgetExceeded`) before the test ever reached the
+    // foreground-commit race it exists to exercise. `page_reuse = false`
+    // (this test never needed indexed reclamation) keeps the live file's
+    // own admission math to just that log reservation plus this test's
+    // own tiny content, instead of also owing indexed reclamation's own
+    // fixed-size retirement reserve and ledger-rebuild cost on every
+    // commit and every synchronous 25%-remaining redo-log checkpoint --
+    // both sized independently of how little data this test ever writes,
+    // and both large enough on their own to blow through a budget this
+    // tight.
+    const storage_limit = 512 * 4096;
     var store = try Store.createWithOptions(alloc, path, .{ .io = io, .reclamation = .{
         .enabled = false,
-        .assessment_bytes = 16 * 4096,
+        .page_reuse = false,
+        .assessment_bytes = 160 * 4096,
         .max_storage_bytes = storage_limit,
     } });
     defer store.close();
@@ -9942,14 +9986,28 @@ test "lite online vacuum catches foreground commits while its copy is blocked" {
     // A paused rewrite reserves capacity before its first publication. A
     // large foreground mutation must leave that workspace available and
     // preserve the committed roots when admission rejects its tail pages.
-    const reservation = (try store.reclamationStatus()).temporary_bytes;
+    const status_before_oversized = try store.reclamationStatus();
+    const reservation = status_before_oversized.temporary_bytes;
     try std.testing.expect(reservation > 0);
-    const oversized: [128 * 4096]u8 = @splat('x');
+    // Sized off the budget actually remaining right now (storage_limit
+    // minus this file's current bytes minus the vacuum's own workspace
+    // reservation), not a fixed constant: just enough over that headroom
+    // to overflow it, rather than a value many times the whole budget --
+    // a page-by-page write that fails partway through still writes every
+    // page up to the one that trips the budget check, so a value sized
+    // off the *whole* budget pays for (and the rejected commit's
+    // savepoint rollback then discards) far more partial work than a
+    // value sized to just barely overflow the real headroom.
+    const headroom = storage_limit -| status_before_oversized.current_file_bytes -| reservation;
+    const oversized = try alloc.alloc(u8, headroom + 4096);
+    defer alloc.free(oversized);
+    @memset(oversized, 'x');
     write = try store.beginWrite();
-    try write.put("oversized", &oversized);
+    try write.put("oversized", oversized);
     try std.testing.expectError(error.LiteStorageBudgetExceeded, write.commit());
     write.abort();
-    try std.testing.expect((try store.reclamationStatus()).current_file_bytes <= storage_limit - reservation);
+    const status_after_abort = try store.reclamationStatus();
+    try std.testing.expect(status_after_abort.current_file_bytes <= storage_limit - reservation);
     try std.testing.expectError(error.FileBusy, store.vacuum());
     write = try store.beginWrite();
     try write.put("doc", "during copy");

@@ -8900,7 +8900,16 @@ pub const NativeFile = struct {
                     std.mem.eql(u8, root[160..192], &try state.incrementalFingerprint());
             }
             if (rebased and authenticated) {
-                if (state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
+                // §9.7d: on a redo-log file, a diverting commit's own
+                // page-shaped exception (an external value chain) can
+                // advance `checkpoint.page_count` without the ledger ever
+                // rebuilding to match -- the same lag `decodeFreeMapAlloc`
+                // and the sibling full-ledger-load check just below both
+                // already tolerate via `allow_behind`. This rebase
+                // fast-path compared the two unconditionally and flagged
+                // every such (legitimate) lag as `InvalidNativeAllocator`.
+                const allow_behind = self.header.redo_log_capacity != 0;
+                if (if (allow_behind) state.root.covered_pages > checkpoint.page_count else state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
                 self.allocator_ledger_rebased = true;
                 self.allocator_work.journal_rebases +|= 1;
                 self.allocator_work.journal_rebase_ns +|= @intCast(@max(0, started.durationTo(std.Io.Clock.awake.now(self.runtime())).nanoseconds));
@@ -8912,7 +8921,13 @@ pub const NativeFile = struct {
         if (checkpoint.free_map_root_page != 0) {
             const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
             defer self.allocator.free(payload);
-            if ((try allocator_v4.State.decodeRoot(payload)).covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
+            // §9.7d: same `allow_behind` lag as the rebase fast-path above
+            // and `decodeFreeMapAlloc` -- a redo-log file's diverting
+            // page-shaped exception can leave `checkpoint.page_count`
+            // legitimately ahead of what the ledger root itself covers.
+            const covered_pages = (try allocator_v4.State.decodeRoot(payload)).covered_pages;
+            const allow_behind = self.header.redo_log_capacity != 0;
+            if (if (allow_behind) covered_pages > checkpoint.page_count else covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
         }
         const started = std.Io.Clock.awake.now(self.runtime());
         self.allocator_work.full_loads +|= 1;
@@ -14165,10 +14180,29 @@ pub const NativeFile = struct {
                     if (cancel) |token| try token.check();
                     const key = keys[position];
                     if (root == 0 and std.mem.startsWith(u8, key, artifact_lease_key_prefix)) continue;
-                    const page = if (root == 2) try self.lookupDocumentIndexPage(checkpoint, key) else try self.lookupCatalogPage(checkpoint, if (root == 0) .metadata else .index, key);
+                    const root_kind: TransactionWrites.Root = switch (root) {
+                        0 => .metadata,
+                        1 => .index,
+                        else => .documents,
+                    };
                     const old_size = try destination.liveRecordSize(root, key);
                     var record: ?CatalogEntry = null;
-                    if (page) |id| {
+                    // §9.3a/§9.7c: a key captured while this source snapshot
+                    // was live may be committed but not yet checkpointed --
+                    // present only in the redo-log overlay, never in the
+                    // physical tree `lookupDocumentIndexPage`/
+                    // `lookupCatalogPage` walk below. Check the overlay
+                    // first, exactly like `getDocumentAtCheckpointAlloc`,
+                    // or an online vacuum silently drops every write that
+                    // landed after the last checkpoint but before this
+                    // catch-up round copied it (`entry.value` is owned by
+                    // `self.allocator` per `redoOverlayEntry`'s own doc
+                    // comment and must be freed once `copied` is built).
+                    const overlay_entry = try self.redoOverlayEntry(root_kind, checkpoint, key);
+                    defer if (overlay_entry) |entry| self.allocator.free(entry.value);
+                    if (overlay_entry) |entry| {
+                        if (!entry.is_delete) record = entry;
+                    } else if (if (root == 2) try self.lookupDocumentIndexPage(checkpoint, key) else try self.lookupCatalogPage(checkpoint, if (root == 0) .metadata else .index, key)) |id| {
                         const payload = try reader.read(self, self.allocator, checkpoint, id, if (root == 2) .document else .catalog);
                         if (root == 2) {
                             const doc = try decodeDocumentEntry(payload);
@@ -14559,6 +14593,26 @@ pub const NativeFile = struct {
             // can never be mistaken for a later, now-truncated-away
             // generation's stale copied bytes.
             var snapshot_checkpoint = checkpoint;
+            // §9.3/§9.3a: under redo, `self.activeCheckpoint().commit_sequence`
+            // is not the real physical checkpoint on disk -- `stageMutation`'s
+            // own "track private changes" bump (its own doc comment)
+            // advances it on every ordinary, overlay-only commit so
+            // in-process callers can tell versions apart, while the real
+            // on-disk slot (and the physical tree this raw byte copy above
+            // just reproduced) stays at the last real `checkpointRedoLog`
+            // fold's sequence. Stamping the bumped value into the
+            // snapshot's own slot told a reopening `recoverRedoLog`
+            // "every record through this sequence is already in the
+            // tree," which is false under redo: every log record at or
+            // below that sequence is then treated as superseded and never
+            // replayed into the overlay, silently losing every write that
+            // only ever lived in the log (confirmed live: a reopened
+            // snapshot resolved a secret's "head" pointer back to
+            // revision 0 even though the live file it was copied from
+            // resolved it correctly). Use the real physical sequence
+            // instead, the same one `publishRedoLogState`/
+            // `checkpointRedoLog` already treat as authoritative.
+            if (self.redo) |redo| snapshot_checkpoint.commit_sequence = redo.checkpoint_sequence;
             snapshot_checkpoint.presynced = true;
             snapshot_checkpoint.manifest_page = 0;
             snapshot_checkpoint.manifest_crc = 0;
@@ -31859,7 +31913,7 @@ test "lite redo log catalog cursor pinned to an older mark skips a key created o
     }
 }
 
-test "lite redo log vacuum captures uncheckpointed overlay and demotes the file rather than corrupting it" {
+test "lite redo log vacuum captures uncheckpointed overlay and keeps the file a redo-log file" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -31867,6 +31921,7 @@ test "lite redo log vacuum captures uncheckpointed overlay and demotes the file 
     defer a.free(path);
 
     var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    const original_redo_log_capacity = file.header.redo_log_capacity;
 
     try file.beginTransaction();
     try file.putDocument("doc:live", "small");
@@ -31886,16 +31941,17 @@ test "lite redo log vacuum captures uncheckpointed overlay and demotes the file 
     const vacuumed = try file.vacuum();
     _ = vacuumed;
 
-    // §9.4a: `prepareVacuum`'s compacted file never reserves a redo-log
-    // region, so a live handle's stale `redo.writer` (still pointing at
-    // the *old* file's fd/offsets after the swap) must not survive --
-    // otherwise the next commit would divert into a log region that
-    // does not exist in the new file, corrupting whatever bytes happen
-    // to sit at that offset instead. Confirm the demotion is complete
-    // and consistent, not just that nothing crashed.
-    try std.testing.expect(file.redo == null);
-    try std.testing.expectEqual(@as(u64, 0), file.header.redo_log_capacity);
-    try std.testing.expect(file.manifest_commits_enabled);
+    // §9 (vacuum redo-log retention, 0de1ef453d): vacuum used to always
+    // rebuild a plain, non-redo compacted image, permanently reverting a
+    // redo-log store to the legacy manifest-commit path the moment
+    // maintenance first ran. `prepareVacuum`/`replaceWithPreparedGeneration`
+    // now reserve a log region of the same capacity the source file
+    // already had and attach fresh redo state to it once the swap
+    // settles, so the vacuumed generation comes out as a redo-log file
+    // too -- confirm that directly, not a demotion.
+    try std.testing.expect(file.redo != null);
+    try std.testing.expectEqual(original_redo_log_capacity, file.header.redo_log_capacity);
+    try std.testing.expect(!file.manifest_commits_enabled);
 
     // The vacuum's own copy loop (`LiveRecordCursor`/`OverlayScanState`)
     // must have already merged that uncheckpointed overlay into the
@@ -31906,25 +31962,28 @@ test "lite redo log vacuum captures uncheckpointed overlay and demotes the file 
     try std.testing.expectEqualStrings("small", live);
     try std.testing.expectEqual(@as(?[]u8, null), try file.getDocumentAlloc(a, "doc:gone"));
 
-    // A plain commit on the now-demoted (non-redo) file must work
-    // through the ordinary copy-on-write path, not the diversion logic.
+    // A plain commit on the still-redo-log file must work through the
+    // ordinary diversion path, not fall back to manifest commits, and
+    // must not corrupt anything.
     try file.beginTransaction();
     try file.putDocument("doc:after", "fresh");
     try file.commitTransaction();
     const after = (try file.getDocumentAlloc(a, "doc:after")).?;
     defer a.free(after);
     try std.testing.expectEqualStrings("fresh", after);
+    try std.testing.expect((try file.check()).valid);
 
     file.close();
     var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
     defer reopened.close();
-    try std.testing.expect(reopened.redo == null);
+    try std.testing.expect(reopened.redo != null);
     const live_reopened = (try reopened.getDocumentAlloc(a, "doc:live")).?;
     defer a.free(live_reopened);
     try std.testing.expectEqualStrings("small", live_reopened);
     const after_reopened = (try reopened.getDocumentAlloc(a, "doc:after")).?;
     defer a.free(after_reopened);
     try std.testing.expectEqualStrings("fresh", after_reopened);
+    try std.testing.expect((try reopened.check()).valid);
 }
 
 test "lite redo log openIndexValue (artifact lease resolution) sees an uncheckpointed overlay entry" {
