@@ -1758,7 +1758,22 @@ test "lite allocator v4 releasing the last old reader starts idle retirement" {
     write = try store.beginWrite();
     try write.delete("large");
     try write.commit();
-    try std.testing.expect(store.maintenance_future == null);
+    // §9 (redo retirement signal): used to assert `maintenance_future ==
+    // null` here, on the assumption that nothing could have started the
+    // background loop yet. Under the ledger-only signal
+    // `startMaintenanceAssumeLocked` used to consult, that held
+    // incidentally: a reader-pinned delete leaves no *ledger* work to
+    // find this early. Once that signal became the full, redo-aware one
+    // (matching every other caller), the put+delete above chains a
+    // superseded version onto "large"'s head in the same uncheckpointed
+    // window -- genuine redo retirement debt `redoCheckpointWouldRetire`
+    // correctly reports right away, which legitimately starts
+    // `maintenanceLoop` immediately rather than waiting for the reader to
+    // release. That is the intended behavior this signal switch exists
+    // for, not a bug: the test's actual invariant -- idle retirement
+    // cannot *complete* until the pinning reader releases -- is already
+    // the `while` loop below, unaffected by exactly when the background
+    // loop happens to spin up.
     oldest.abort();
     oldest_open = false;
     const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(std.Io.Duration.fromSeconds(10));
@@ -2798,7 +2813,17 @@ pub const Store = struct {
         // publication mutex again on every reader/writer release: a continuous
         // group-commit writer could otherwise starve vacuum's return path.
         if (self.maintenance_started.load(.acquire)) return;
-        lockStore(self);
+        // Exclusive: `startMaintenanceAssumeLocked` reads `self.file`'s
+        // checkpoint/ledger/redo-debt state (`retirementNeedsServiceWithCancel`,
+        // `activeCheckpoint`) to decide whether to start the background
+        // `maintenanceLoop` -- the same category of `self.file` access
+        // `lockStoreExclusive`'s own doc comment calls out, so it must not
+        // run during another commit's released sync window. Plain
+        // `lockStore` let this read (and the decision to spawn the
+        // background loop) interleave with a live commit's in-flight
+        // redo-log publish; see `releaseWriterSlot`'s own fix for the
+        // opportunistic counterpart of this same bug.
+        lockStoreExclusive(self);
         defer self.mutex.unlock();
         self.startMaintenanceAssumeLocked();
     }
@@ -2823,12 +2848,16 @@ pub const Store = struct {
             self.file.activeCheckpoint().page_count *| self.file.header.page_size >= self.maintenance_policy.options.minimum_reclaim_bytes;
         if (!cheap_already_due) {
             const retirement_check_started = if (@import("builtin").is_test) std.Io.Clock.awake.now(self.file.runtime()).nanoseconds else 0;
-            // §9 (redo retirement signal): ledger-only here on purpose --
-            // see `retirementNeedsServiceLedgerOnlyWithCancel`'s own doc
-            // comment. Starting the background `maintenanceLoop` is the
-            // one caller of this check that isn't a direct, synchronous
-            // call the caller already controls the timing of.
-            const retirement = self.file.retirementNeedsServiceLedgerOnlyWithCancel(&self.maintenance_cancel) catch false;
+            // §9 (redo retirement signal): the full, redo-aware signal.
+            // This used to call `retirementNeedsServiceLedgerOnlyWithCancel`
+            // to avoid starting the background `maintenanceLoop` for a
+            // redo-debt-only reason, because doing so exposed a background/
+            // foreground writer-ownership race (see `maintainOnceWithCancel`'s
+            // retirement/reclaim block and `lockStoreExclusive`'s own doc
+            // comment on `releaseWriterSlot`'s opportunistic maintenance
+            // kick). That race is fixed; every caller of this check now
+            // shares the same signal.
+            const retirement = self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false;
             if (@import("builtin").is_test) {
                 const elapsed: u64 = @intCast(@max(0, std.Io.Clock.awake.now(self.file.runtime()).nanoseconds - retirement_check_started));
                 _ = self.test_retirement_check_count.fetchAdd(1, .release);
@@ -4680,7 +4709,27 @@ pub const Store = struct {
             // `startMaintenance()` again once it finishes (see
             // `driveMutationCoordinator`), so nothing is lost, only
             // deferred to a call that is not on this latency-sensitive path.
-            if (!self.maintenance_started.load(.acquire) and self.mutex.tryLock()) {
+            //
+            // `tryLockStoreExclusive`, not a plain `tryLock`: a plain
+            // `self.mutex.tryLock()` succeeds not only when the leader
+            // holds the mutex throughout (the common case this comment
+            // above describes, where contention correctly skips this
+            // turn), but also during the leader's own brief released sync
+            // window (`commit_in_sync != 0`, mutex unlocked around just
+            // the redo/manifest fsync -- see `applyMutationGroup`'s
+            // `sync_gate`/`lockStoreExclusive`'s own doc comment). A plain
+            // `tryLock` winning that race let `startMaintenanceAssumeLocked`
+            // read `self.file`'s checkpoint/ledger/redo-debt state (and,
+            // once the redo retirement signal considers redo debt, decide
+            // to spin up the background `maintenanceLoop`) while that
+            // commit's own publish was still in flight -- the
+            // concurrency bug the redo retirement signal's own design
+            // doc section flagged and deferred. `tryLockStoreExclusive`
+            // treats that window as contended too, so this opportunistic
+            // kick now only ever fires when the leader has fully
+            // finished (or has not started), exactly like every other
+            // caller that touches `self.file`.
+            if (!self.maintenance_started.load(.acquire) and tryLockStoreExclusive(self)) {
                 self.startMaintenanceAssumeLocked();
                 self.mutex.unlock();
             }
