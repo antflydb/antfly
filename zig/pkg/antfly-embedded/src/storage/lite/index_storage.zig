@@ -244,6 +244,8 @@ fn mapImmutableArtifact(ptr: *anyopaque, allocator: Allocator, path: []const u8)
     defer value.deinit(allocator);
     const lease = try self.docs.reserveArtifactBytes(value.length);
     errdefer docstore.ArtifactLease.release(lease);
+    var fd_permit = try storage_io.ProcessNativeFdPermit.acquire(self.docs.file.runtime());
+    defer fd_permit.release();
     const file = privateArtifactFile(allocator, self.docs) catch |err| switch (err) {
         error.AccessDenied, error.ReadOnlyFileSystem => if (self.docs.read_only) return error.MappedArtifactUnavailable else return err,
         else => return err,
@@ -549,6 +551,7 @@ const NativeAtomicWriteSink = struct {
     storage: *Store,
     path: []u8,
     file: ?std.Io.File = null,
+    fd_permit: ?storage_io.ProcessNativeFdPermit = null,
     tmp_path: ?[]u8 = null,
     persisted: usize = 0,
     buffered: usize = 0,
@@ -580,6 +583,7 @@ const NativeAtomicWriteSink = struct {
     pub fn deinit(self: *NativeAtomicWriteSink) void {
         const io = self.storage.docs.file.runtime();
         if (self.file) |file| file.close(io);
+        if (self.fd_permit) |*permit| permit.release();
         if (self.tmp_path) |path| {
             // A staging path can remain if its initial unlink failed.
             // Abort and failed publication must remove it even if canceled.
@@ -615,8 +619,11 @@ const NativeAtomicWriteSink = struct {
         const parent = std.fs.path.dirname(self.storage.docs.file.path) orelse ".";
         const path = try std.fs.path.join(self.allocator, &.{ parent, basename });
         errdefer self.allocator.free(path);
+        var fd_permit = try storage_io.ProcessNativeFdPermit.acquire(io);
+        errdefer fd_permit.release();
         const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
         self.file = file;
+        self.fd_permit = fd_permit;
         self.tmp_path = path;
         // On POSIX the descriptor owns the staging file after unlink. Abort,
         // cancellation, and process death then reclaim it without a scavenger.
@@ -2704,4 +2711,36 @@ test "lite atomic publication returns owned immutable source without requiring m
     var bytes: [8]u8 = undefined;
     try source.readInto(0, &bytes);
     try std.testing.expectEqualStrings("original", &bytes);
+}
+
+test "lite mapped artifacts and spilled writers obey process descriptor pressure" {
+    if (!supports_mapped_artifacts) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "descriptor-pressure.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    var store = Store.init(a, &docs);
+    const storage = store.storage();
+    try storage.writeFileAbsolute("/mapped", "pinned bytes");
+    var native_storage = try storage_io.NativeStorage.init(a, .threaded);
+    defer native_storage.deinit();
+    var pool = storage_io.NativeStoragePool.init(a);
+    defer pool.deinit();
+    const stats = pool.snapshotStats();
+    var occupying = try native_storage.acquireFdPermits(stats.fd_admission_capacity - stats.fd_persistent_reserve);
+    defer occupying.release();
+    try std.testing.expectError(error.StorageDescriptorPressure, storage.mapImmutableArtifact(a, "/mapped"));
+    var writer = try storage.beginAtomicWrite(a, "/spilled");
+    const bytes: [65 * 1024]u8 = @splat('x');
+    try std.testing.expectError(error.StorageDescriptorPressure, writer.appendSlice(&bytes));
+    writer.abort();
+    occupying.release();
+    var mapped = try storage.mapImmutableArtifact(a, "/mapped");
+    defer mapped.deinit();
+    try std.testing.expectEqualStrings("pinned bytes", mapped.bytes);
+    // Only the mapping's byte lease survives materialization, not its FD permit.
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
 }
