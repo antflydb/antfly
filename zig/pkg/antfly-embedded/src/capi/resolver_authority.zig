@@ -1407,19 +1407,19 @@ fn exerciseIndexedStaticProfiles(profile_count: usize, aliases_per_profile: usiz
     try tables.create(root, "entities", "{}", false);
     var out: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&out);
-    // The large fixture measures indexed warm admission, not legacy migration.
-    // Bootstrap the empty directory first; every subsequent resolver enrollment
-    // still exercises its real transactional profile and adjacency publication.
-    if (!legacy_adoption) {
-        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/new"), .fromSlice("{\"into\":\"concept/new-target\"}"), &out));
-        api.antfly_buffer_free(&out);
-    }
+    // Establish a real authority with the first profile. Later enrollments
+    // exercise warm transactional profile/adjacency publication, rather than
+    // rebuilding all 17,000 aliases merely to prepare the lookup assertions.
     for (0..profile_count) |i| {
         const static = try a.alloc(@import("antfly_resolver").KeyAlias, aliases_per_profile);
         for (static, 0..) |*alias, j| alias.* = .{ .key = try std.fmt.allocPrint(a, "concept/noise-{d}-{d}", .{ i, j }), .target = try std.fmt.allocPrint(a, "concept/target-{d}-{d}", .{ i, j }) };
         if (i == 0) static[0] = .{ .key = "concept/seed", .target = "concept/bridge" };
         if (i == 1) static[0] = .{ .key = "concept/bridge", .target = "concept/end" };
         _ = try root.db.upsertResolverWithResultOptions(.{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .source_artifact = try std.fmt.allocPrint(a, "kg-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(a, "out-{d}", .{i}), .key_template = "concept/{{_key}}", .aliases = static, .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
+        if (!legacy_adoption and i == 0) {
+            try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/new"), .fromSlice("{\"into\":\"concept/new-target\"}"), &out));
+            api.antfly_buffer_free(&out);
+        }
     }
     // Keep a distinct legacy fixture: pre-bootstrap enrollment is untrusted
     // until adoption has rebuilt it, after which warm operations use adjacency.
