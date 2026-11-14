@@ -2209,8 +2209,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL JSON null",
         "SQL staged",
         "SQL retained native scan",
-        "auth row filter",
-        "effective resolved row filter",
         "system catalog",
         "backup heartbeat ",
         "table storage creation intent survives",
