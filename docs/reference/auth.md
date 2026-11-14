@@ -169,8 +169,12 @@ Each stored policy is limited to 16,384 policy nodes and at most 64 levels
 of nesting. Antfly validates matching policies independently, so its generated
 conjunction does not consume a policy's nesting allowance. The effective
 conjunction is limited to 32,768 JSON values, including the generated wrapper,
-before and after identity expansion. This bound also keeps the resulting plan
-within the storage compiler's existing execution budget. Exceeding the aggregate
+before and after identity expansion. Matching policies are parsed one at a time;
+composition stops at the first denied or over-budget component without building
+or parsing the remaining conjunction. Temporary composition memory scales with
+the bounded accepted prefix and a reusable single-component workspace, rather
+than all matching policies. This bound also keeps the resulting plan within the
+storage compiler's existing execution budget. Exceeding the aggregate
 limit denies authorization (`403`); it does not make the client's query invalid.
 All matching policies share a separate 16,384-value identity-expansion budget.
 Missing, incompatible, or over-budget identity values deny the entire predicate.

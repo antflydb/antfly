@@ -156,12 +156,16 @@ pub const RunAdmission = struct {
     }
 
     fn acquireAmountsWithOwned(self: RunAdmission, amounts: memory.AdmissionAmounts, owned: memory.AdmissionAmounts, pressure: *?memory.AdmissionPressure) !memory.AdmissionLease {
+        return self.acquireAmountsWithResidency(amounts, owned, .{}, pressure);
+    }
+
+    fn acquireAmountsWithResidency(self: RunAdmission, amounts: memory.AdmissionAmounts, owned: memory.AdmissionAmounts, extra: memory.Residency, pressure: *?memory.AdmissionPressure) !memory.AdmissionLease {
         pressure.* = null;
         if (self.controller.consumeForcedRunDenialForTesting()) {
             std.log.warn("test-only forced inference run admission denial", .{});
             return error.ResourceTemporarilyUnavailable;
         }
-        const required = try self.requiredResidency().merge(.fromAmounts(self.backend_class, owned));
+        const required = try (try self.requiredResidency().merge(.fromAmounts(self.backend_class, owned))).merge(extra);
         return self.controller.tryAcquireRequestsWithPressure(&.{.{
             .backend_class = self.backend_class,
             .limits = self.limits,
@@ -946,6 +950,21 @@ pub const Session = struct {
         };
     }
 
+    /// Prepared inputs already have a live allocation owner. Include all of
+    /// that request's retained preparation in feasibility, charging execution
+    /// only for amounts not credited by planRun's storage provenance.
+    pub fn admitPrepared(self: Session, request: RunRequest, owned_host_bytes: usize) !RunPermit {
+        return self.admitPreparedWithResidency(request, owned_host_bytes, .{});
+    }
+
+    pub fn admitPreparedWithResidency(self: Session, request: RunRequest, owned_host_bytes: usize, required: memory.Residency) !RunPermit {
+        var pressure: ?memory.AdmissionPressure = null;
+        return .{ .session = self, .request = request, .lease = if (self.run_admission) |admission|
+            try admission.acquireAmountsWithResidency(try admission.estimateRequest(request, self.outputInfo()), .{ .host_scratch_bytes = owned_host_bytes }, required, &pressure)
+        else
+            null };
+    }
+
     /// Acquire only a later phase's additional peak while the original lease
     /// remains live. Counters, live-memory checks and external ownership all
     /// use ordinary admission; a rejected supplement leaves the base untouched.
@@ -1059,6 +1078,37 @@ pub const Session = struct {
         return bytes;
     }
 
+    /// Admission still retained by these outputs in this process domain.
+    /// Borrow only while all tensors remain live. Deduplicate the shared batch
+    /// owner; payload sizes alone omit shape storage and conservative headroom.
+    pub fn outputHostResidency(self: Session, outputs: []const Tensor) !usize {
+        const admission = self.run_admission orelse return 0;
+        var bytes: usize = 0;
+        for (outputs, 0..) |output, index| {
+            const lifetime = output.lifetime orelse continue;
+            if (lifetime.release != OutputAdmission.release) continue;
+            const entry: *const OutputAdmission.Entry = @ptrCast(@alignCast(lifetime.context));
+            const owner = entry.owner;
+            if (owner.lease.controller != admission.controller) continue;
+            var seen = false;
+            for (outputs[0..index]) |previous| {
+                const prior = previous.lifetime orelse continue;
+                if (prior.release != OutputAdmission.release) continue;
+                const other: *const OutputAdmission.Entry = @ptrCast(@alignCast(prior.context));
+                if (other.owner == owner) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            @import("antfly_platform").sync.lockYielding(&owner.mutex);
+            const retained = owner.lease.amounts.hostTotalBytes();
+            owner.mutex.unlock();
+            bytes = try addBytes(bytes, retained);
+        }
+        return bytes;
+    }
+
     /// Detach a lone surviving row from larger immutable host-cache columns.
     /// All candidates must be exclusive; reserve old/new overlap before copying
     /// and commit only after every copy and ownership descriptor succeeds.
@@ -1135,10 +1185,14 @@ pub const Session = struct {
     /// Grow one request's preprocessing reservation atomically. Existing owned
     /// scratch affects feasibility only; only the new bytes are charged.
     pub fn admitHostPreprocessOwned(self: Session, bytes: usize, owned_bytes: usize) !RunPermit {
+        return self.admitHostPreprocessOwnedWithResidency(bytes, owned_bytes, .{});
+    }
+
+    pub fn admitHostPreprocessOwnedWithResidency(self: Session, bytes: usize, owned_bytes: usize, extra: memory.Residency) !RunPermit {
         var pressure: ?memory.AdmissionPressure = null;
         return .{
             .session = self,
-            .lease = if (self.run_admission) |admission| try admission.acquireAmountsWithOwned(.{ .host_scratch_bytes = bytes }, .{ .host_scratch_bytes = owned_bytes }, &pressure) else null,
+            .lease = if (self.run_admission) |admission| try admission.acquireAmountsWithResidency(.{ .host_scratch_bytes = bytes }, .{ .host_scratch_bytes = owned_bytes }, extra, &pressure) else null,
         };
     }
 
@@ -1359,6 +1413,16 @@ pub const RunPermit = struct {
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
         return outputs;
+    }
+
+    /// Transfer only surviving output admission after a synchronous forward;
+    /// prepared inputs keep their independent owner and execution peaks retire.
+    pub fn runTransferringOutputs(self: *RunPermit, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) ![]Tensor {
+        if (self.execution_yielded) return self.runWithControl(inputs, allocator, control);
+        const outputs = try self.runWithControl(inputs, allocator, control);
+        if (self.execution_yielded) return outputs;
+        errdefer deinitTensorSlice(outputs, allocator);
+        return Session.attachOutputAdmission(outputs, allocator, &self.lease);
     }
 
     /// Use the chunk's existing admission for resident typed decisions.
@@ -2367,4 +2431,31 @@ test "session admission planning includes residency without reserving memory" {
     try std.testing.expect(try session.fitsRun(.{ .batch = 1, .sequence = 1, .input_bytes = 1, .output_bytes = 0, .workspace_bytes = 1, .workspace_planned = true }));
     try std.testing.expect(!try session.fitsRun(.{ .batch = 1, .sequence = 1, .input_bytes = 2, .output_bytes = 1, .workspace_bytes = 1, .workspace_planned = true }));
     try std.testing.expectEqualDeep(weights.amounts, controller.snapshot());
+}
+
+test "prepared postprocessing output residency deduplicates shared owners" {
+    const a = std.testing.allocator;
+    var controller = memory.AdmissionController{};
+    const Fake = struct {
+        fn info(_: *anyopaque) []const TensorInfo {
+            return &.{};
+        }
+    };
+    const session = Session{ .ptr = undefined, .vtable = &.{ .run = undefined, .inputInfo = Fake.info, .outputInfo = Fake.info, .backend = undefined, .close = undefined }, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 1024, .check_live_memory = false } };
+    var outputs = [_]Tensor{
+        try Tensor.initFloat32(a, "first", &.{2}, &.{ 1, 2 }),
+        try Tensor.initFloat32(a, "second", &.{2}, &.{ 3, 4 }),
+    };
+    var first_live = true;
+    defer {
+        if (first_live) outputs[0].deinit();
+        outputs[1].deinit();
+    }
+    var permit = try session.admit(.{ .output_bytes = 1024 });
+    defer permit.deinit();
+    _ = try Session.attachOutputAdmission(&outputs, a, &permit.lease);
+    try std.testing.expectEqual(controller.snapshot().hostTotalBytes(), try session.outputHostResidency(&outputs));
+    outputs[0].deinit();
+    first_live = false;
+    try std.testing.expectEqual(controller.snapshot().hostTotalBytes(), try session.outputHostResidency(outputs[1..]));
 }
