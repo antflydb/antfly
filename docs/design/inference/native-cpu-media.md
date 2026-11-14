@@ -82,6 +82,15 @@ temporary credit before decoder allocation. Moondream's configuration probe
 propagates allocation errors instead of misclassifying contention as unsupported
 model artifacts.
 
+Image preparation admission does not depend on a GPU execution lane. Ordinary
+vision readers share the bounded codec/resampling path, with separate ownership
+for the final pixel tensor and codec scratch. Flattened-patch readers admit
+source decoding and patch preparation. Multi-stage decoding, regional crops,
+detection/layout resizing and CTC preprocessing use the existing allocation-based
+preparation scope, retaining only live pixels when execution starts. Each phase
+returns unused capacity before acquiring model execution resources. Admission
+failure precedes the backing allocation and retains its policy/pressure identity.
+
 Boolean broker cancellation callbacks retain their first typed checkpoint
 failure atomically until the synchronous caller joins. The retained checkpoint
 control propagates through nested LightOn vision, prefill and page brokers as

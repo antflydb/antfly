@@ -292,14 +292,17 @@ pub const CTCRecognizer = struct {
     }
 
     pub fn recognize(self: *CTCRecognizer, img: image.Image, control: ?InferenceExecutionControl) !RecognitionResult {
+        var preparation = @import("preprocessing_memory.zig").Scope.init(self.allocator, self.session.withAdmissionControl(control), .{}, null);
+        defer preparation.deinit();
+        const work = try preparation.allocator();
         var input_width = self.preprocess.width;
         const pixel_values = if (self.preprocess.keep_aspect_ratio) blk: {
             if (self.preprocess.dynamic_width) {
                 input_width = try recognitionInputWidth(self.preprocess, img.width, img.height);
             }
 
-            break :blk try image.preprocessDecodedRectKeepAspectPadRightScaledWithResample(
-                self.allocator,
+            break :blk image.preprocessDecodedRectKeepAspectPadRightScaledWithResample(
+                work,
                 img,
                 input_width,
                 self.preprocess.height,
@@ -308,9 +311,9 @@ pub const CTCRecognizer = struct {
                 self.preprocess.rescale_factor,
                 self.preprocess.resample,
                 self.preprocess.pad_value_rgb,
-            );
-        } else try image.preprocessDecodedRectScaledWithResample(
-            self.allocator,
+            ) catch |err| return preparation.failure(err);
+        } else image.preprocessDecodedRectScaledWithResample(
+            work,
             img,
             self.preprocess.width,
             self.preprocess.height,
@@ -318,8 +321,9 @@ pub const CTCRecognizer = struct {
             self.preprocess.std,
             self.preprocess.rescale_factor,
             self.preprocess.resample,
-        );
-        defer self.allocator.free(pixel_values);
+        ) catch |err| return preparation.failure(err);
+        defer work.free(pixel_values);
+        try preparation.trim();
 
         const input_name = if (self.session.inputInfo().len > 0) self.session.inputInfo()[0].name else "x";
         const shape = [_]i64{
@@ -510,8 +514,12 @@ pub const MultiStageOCRPipeline = struct {
 
     pub fn runWithControl(self: *MultiStageOCRPipeline, image_bytes: []const u8, control: ?InferenceExecutionControl) !MultiStageOCRResult {
         if (control) |active| try active.update(.tokenizing, 0, 1);
-        const img = try image.decode(self.allocator, image_bytes);
-        defer img.deinit(self.allocator);
+        var preparation = @import("preprocessing_memory.zig").Scope.init(self.allocator, self.detector.withAdmissionControl(control), .{}, null);
+        defer preparation.deinit();
+        const work = try preparation.allocator();
+        const img = image.decode(work, image_bytes) catch |err| return preparation.failure(err);
+        defer img.deinit(work);
+        try preparation.trim();
         return self.runDecodedWithControl(img, control);
     }
 
@@ -549,8 +557,12 @@ pub const MultiStageOCRPipeline = struct {
             for (regions, 0..) |region, index| {
                 if (control) |active|
                     try active.update(.executing, @intCast(index), @intCast(regions.len));
-                const cropped = try crop.cropBBox(self.allocator, img, region.bbox, self.recognition_crop_orientation);
-                defer cropped.deinit(self.allocator);
+                var preparation = @import("preprocessing_memory.zig").Scope.init(self.allocator, self.detector.withAdmissionControl(control), .{}, null);
+                defer preparation.deinit();
+                const work = try preparation.allocator();
+                const cropped = crop.cropBBox(work, img, region.bbox, self.recognition_crop_orientation) catch |err| return preparation.failure(err);
+                defer cropped.deinit(work);
+                try preparation.trim();
 
                 const rec = try recognizer.recognize(cropped, control);
                 if (rec.text.len == 0) {
@@ -600,8 +612,11 @@ pub const MultiStageOCRPipeline = struct {
 
     fn detect(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) ![]TextRegion {
         const input_size = try detectionInputSize(self.detection_preprocess, img.width, img.height);
-        const pixel_values = try image.preprocessDecodedRectScaledWithResample(
-            self.allocator,
+        var preparation = @import("preprocessing_memory.zig").Scope.init(self.allocator, self.detector.withAdmissionControl(control), .{}, null);
+        defer preparation.deinit();
+        const work = try preparation.allocator();
+        const pixel_values = image.preprocessDecodedRectScaledWithResample(
+            work,
             img,
             input_size.width,
             input_size.height,
@@ -609,8 +624,9 @@ pub const MultiStageOCRPipeline = struct {
             self.detection_preprocess.std,
             self.detection_preprocess.rescale_factor,
             self.detection_preprocess.resample,
-        );
-        defer self.allocator.free(pixel_values);
+        ) catch |err| return preparation.failure(err);
+        defer work.free(pixel_values);
+        try preparation.trim();
 
         const input_name = if (self.detector.inputInfo().len > 0) self.detector.inputInfo()[0].name else "pixel_values";
         const shape = [_]i64{
@@ -635,8 +651,11 @@ pub const MultiStageOCRPipeline = struct {
     fn analyzeLayout(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) ![]LayoutRegion {
         const layout = self.layout orelse return self.allocator.dupe(LayoutRegion, &.{});
 
-        const pixel_values = try image.preprocessDecodedRectScaledWithResample(
-            self.allocator,
+        var preparation = @import("preprocessing_memory.zig").Scope.init(self.allocator, layout.withAdmissionControl(control), .{}, null);
+        defer preparation.deinit();
+        const work = try preparation.allocator();
+        const pixel_values = image.preprocessDecodedRectScaledWithResample(
+            work,
             img,
             self.detection_preprocess.width,
             self.detection_preprocess.height,
@@ -644,8 +663,9 @@ pub const MultiStageOCRPipeline = struct {
             self.detection_preprocess.std,
             self.detection_preprocess.rescale_factor,
             self.detection_preprocess.resample,
-        );
-        defer self.allocator.free(pixel_values);
+        ) catch |err| return preparation.failure(err);
+        defer work.free(pixel_values);
+        try preparation.trim();
 
         const input_name = if (layout.inputInfo().len > 0) layout.inputInfo()[0].name else "pixel_values";
         const shape = [_]i64{
@@ -1282,4 +1302,22 @@ test "media residency OCR recognition reuses resident outputs when reduction is 
         try std.testing.expectApproxEqAbs(@as(f64, 0.85), result.confidence, 1e-6);
         try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     }
+}
+
+test "multistage reader decoding and preprocessing deny before backing allocation" {
+    var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+    const session = backends.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1, .scratch_limit_bytes = 1 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var pipeline = MultiStageOCRPipeline{
+        .allocator = std.testing.failing_allocator,
+        .detector = session,
+        .detection_preprocess = .{ .width = 2, .height = 2 },
+        .post_processor = .{ .db = .{ .threshold = 0.3, .box_threshold = 0.5, .unclip_ratio = 1.5, .min_box_area = 1 } },
+    };
+    try std.testing.expectError(error.ResourceLimitExceeded, pipeline.run(@import("antfly_documents").fixtures.get("one-pixel.png")));
+    var rgb: [12]u8 = @splat(255);
+    const img = image.Image{ .data = &rgb, .width = 2, .height = 2, .channels = 3 };
+    try std.testing.expectError(error.ResourceLimitExceeded, pipeline.runDecoded(img));
+    var recognizer = CTCRecognizer{ .allocator = std.testing.failing_allocator, .session = session, .char_dict = &.{}, .preprocess = .{ .width = 2, .height = 2 } };
+    try std.testing.expectError(error.ResourceLimitExceeded, recognizer.recognize(img, null));
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
 }

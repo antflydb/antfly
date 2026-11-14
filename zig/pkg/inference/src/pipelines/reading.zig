@@ -159,7 +159,6 @@ pub const ReadingPipeline = struct {
     native_execution_lane: ?*@import("../execution_control.zig").ExecutionLane = null,
 
     fn admitPreprocessPixels(self: *ReadingPipeline, count: usize) !?session_mod.RunPermit {
-        if (self.native_execution_lane == null) return null;
         return try self.vision_encoder.admitHostPreprocess(std.math.mul(usize, count, @sizeOf(f32)) catch return error.InvalidInputShape);
     }
 
@@ -167,7 +166,7 @@ pub const ReadingPipeline = struct {
         return .{
             .io = self.config.preprocess_io,
             .control = self.imageWorkControl(),
-            .scratch_admission = if (self.native_execution_lane != null) scratch.descriptor() else null,
+            .scratch_admission = scratch.descriptor(),
         };
     }
 
@@ -197,12 +196,6 @@ pub const ReadingPipeline = struct {
 
     fn imageWorkControl(self: *ReadingPipeline) antfly_image.work_control.Control {
         return if (self.execution_control) |*control| control.imageWorkControl() else .{};
-    }
-
-    fn preprocessDecoded(self: *ReadingPipeline, decoded: image.Image) ![]f32 {
-        const scope = antfly_image.work_control.Scope.enter(self.imageWorkControl());
-        defer scope.deinit();
-        return image.preprocessDecodedWithResample(self.allocator, decoded, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample);
     }
 
     pub fn init(
@@ -263,33 +256,18 @@ pub const ReadingPipeline = struct {
         active_read_profile_source_fingerprint = self.config.source_fingerprint;
         defer active_read_profile_source_fingerprint = previous_source_fingerprint;
         resetLastReadTelemetry();
-        if (self.native_execution_lane != null) return self.readBoundedNativeImage(image_data);
-        const allocator = self.allocator;
-        const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
-        if (debug_cuda_session) std.log.info("reading: decode start bytes={d}", .{image_data.len});
-        const decode_start = nowNs();
-        const decoded = blk: {
-            const scope = antfly_image.work_control.Scope.enter(self.imageWorkControl());
-            defer scope.deinit();
-            break :blk try image.decode(allocator, image_data);
-        };
-        logReadProfile("decode", decode_start);
-        if (debug_cuda_session) std.log.info("reading: decode done", .{});
-        defer decoded.deinit(allocator);
-
-        if (expectsFlattenedPatches(self.vision_encoder)) {
-            if (debug_cuda_session) std.log.info("reading: pix2struct path", .{});
-            return self.readPix2StructDecoded(decoded);
-        }
-
-        const img_size: u32 = @intCast(self.config.image_size);
-        if (debug_cuda_session) std.log.info("reading: preprocess start image_size={d}", .{img_size});
-        const preprocess_start = nowNs();
-        const pixel_values = try self.preprocessDecoded(decoded);
-        logReadProfile("preprocess", preprocess_start);
-        if (debug_cuda_session) std.log.info("reading: preprocess done pixels={d}", .{pixel_values.len});
-        defer allocator.free(pixel_values);
-        return self.readPixelValues(pixel_values);
+        // Memory ownership is independent of the optional GPU execution lane.
+        // Ordinary encoder/decoder readers use the same bounded codec path.
+        if (!expectsFlattenedPatches(self.vision_encoder)) return self.readBoundedNativeImage(image_data);
+        var preparation = @import("preprocessing_memory.zig").Scope.init(self.allocator, self.vision_encoder.withAdmissionControl(self.execution_control), .{}, null);
+        defer preparation.deinit();
+        const work = try preparation.allocator();
+        const scope = antfly_image.work_control.Scope.enter(self.imageWorkControl());
+        defer scope.deinit();
+        const decoded = image.decode(work, image_data) catch |err| return preparation.failure(err);
+        defer decoded.deinit(work);
+        try preparation.trim();
+        return self.readPix2StructDecoded(decoded);
     }
 
     /// Read text from a homogeneous image batch. Unsupported model families fall
@@ -1172,28 +1150,20 @@ pub const ReadingPipeline = struct {
 
     fn readDecodedImpl(self: *ReadingPipeline, img: image.Image) !ReadResult {
         resetLastReadTelemetry();
-        if (expectsFlattenedPatches(self.vision_encoder)) {
-            return self.readPix2StructDecoded(img);
-        }
-
+        if (expectsFlattenedPatches(self.vision_encoder)) return self.readPix2StructDecoded(img);
         const allocator = self.allocator;
-        if (self.native_execution_lane != null) {
-            const side = std.math.mul(usize, self.config.image_size, self.config.image_size) catch return error.InvalidInputShape;
-            const count = std.math.mul(usize, side, 3) catch return error.InvalidInputShape;
-            var permit = try self.admitPreprocessPixels(count);
-            defer if (permit) |*owned| owned.deinit();
-            const pixels = try allocator.alloc(f32, count);
-            defer allocator.free(pixels);
-            {
-                var scratch = PreprocessScratchAdmission{ .allocator = allocator, .session = self.vision_encoder };
-                defer scratch.deinit();
-                try image.preprocessDecodedWithResampleIntoBounded(allocator, img, pixels, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample, self.preprocessOptions(&scratch));
-            }
-            return self.readPixelValues(pixels);
+        const side = std.math.mul(usize, self.config.image_size, self.config.image_size) catch return error.InvalidInputShape;
+        const count = std.math.mul(usize, side, 3) catch return error.InvalidInputShape;
+        var permit = try self.admitPreprocessPixels(count);
+        defer if (permit) |*owned| owned.deinit();
+        const pixels = try allocator.alloc(f32, count);
+        defer allocator.free(pixels);
+        {
+            var scratch = PreprocessScratchAdmission{ .allocator = allocator, .session = self.vision_encoder };
+            defer scratch.deinit();
+            try image.preprocessDecodedWithResampleIntoBounded(allocator, img, pixels, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample, self.preprocessOptions(&scratch));
         }
-        const pixel_values = try self.preprocessDecoded(img);
-        defer allocator.free(pixel_values);
-        return self.readPixelValues(pixel_values);
+        return self.readPixelValues(pixels);
     }
 
     fn readPixelValues(self: *ReadingPipeline, pixel_values: []const f32) !ReadResult {
@@ -1784,6 +1754,9 @@ pub const ReadingPipeline = struct {
 
     fn readPix2StructDecoded(self: *ReadingPipeline, img: image.Image) !ReadResult {
         const allocator = self.allocator;
+        var preparation = @import("preprocessing_memory.zig").Scope.init(allocator, self.vision_encoder.withAdmissionControl(self.execution_control), .{}, null);
+        defer preparation.deinit();
+        const work = try preparation.allocator();
         const patch_height = if (self.config.pix2struct_patch_height > 0) self.config.pix2struct_patch_height else 16;
         const patch_width = if (self.config.pix2struct_patch_width > 0) self.config.pix2struct_patch_width else 16;
         const max_patches = if (self.config.pix2struct_max_patches > 0) self.config.pix2struct_max_patches else 2048;
@@ -1791,17 +1764,18 @@ pub const ReadingPipeline = struct {
         var patches = blk: {
             const scope = antfly_image.work_control.Scope.enter(self.imageWorkControl());
             defer scope.deinit();
-            break :blk try image.preprocessDecodedPix2Struct(
-                allocator,
+            break :blk image.preprocessDecodedPix2Struct(
+                work,
                 img,
                 patch_height,
                 patch_width,
                 max_patches,
                 self.config.pix2struct_do_normalize,
                 self.config.resample,
-            );
+            ) catch |err| return preparation.failure(err);
         };
         defer patches.deinit();
+        try preparation.trim();
 
         const feature_depth = 2 + patch_height * patch_width * 3;
         const patch_shape = [_]i64{ 1, @intCast(max_patches), @intCast(feature_depth) };
@@ -3098,8 +3072,21 @@ test "reading cancellation interrupts encoded decode and borrowed raster preproc
     const rgba = @as([(32 * 32 * 4)]u8, @splat(127));
     const png = try antfly_image.png.encodeRgba(std.testing.allocator, 32, 32, &rgba);
     defer std.testing.allocator.free(png);
-    // Backend fields intentionally remain undefined: cancellation must stop
-    // inside preprocessing, before any model/session is consulted.
+    const MetadataOnly = struct {
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn run(_: *anyopaque, _: []const backends.Tensor, _: std.mem.Allocator) ![]backends.Tensor {
+            return error.UnexpectedModelExecution;
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    // Preparation may inspect admission and input metadata, but cancellation
+    // must stop inside the codec before a model forward or decoder is touched.
+    pipeline.vision_encoder = .{ .ptr = undefined, .vtable = &.{ .run = MetadataOnly.run, .inputInfo = MetadataOnly.info, .outputInfo = MetadataOnly.info, .backend = MetadataOnly.backend, .close = MetadataOnly.close } };
     try std.testing.expectError(error.Cancelled, pipeline.read(png));
     try std.testing.expectEqual(@as(usize, 3), probe.checks);
     probe.checks = 0;
@@ -3458,4 +3445,24 @@ test "LightOnOCR3 CUDA Florence incremental admission preserves complete KV capa
     live = false;
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
     try std.testing.expect(!probe.run_called);
+}
+
+test "reading legacy and flattened image preparation denies before backing allocation" {
+    const Fake = struct {
+        flattened: bool,
+        fn info(raw: *anyopaque) []const backends.TensorInfo {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.flattened) &.{.{ .name = "flattened_patches", .dtype = .f32, .shape = &.{ 1, 1, 1 } }} else &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 1, 3, 2, 2 } }};
+        }
+    };
+    for ([_]bool{ false, true }) |flattened| {
+        var fake = Fake{ .flattened = flattened };
+        var table: backends.Session.VTable = undefined;
+        table.inputInfo = Fake.info;
+        var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+        const session = backends.Session{ .ptr = &fake, .vtable = &table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1, .scratch_limit_bytes = 1 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+        var pipeline = ReadingPipeline.init(std.testing.failing_allocator, session, undefined, undefined, .{ .image_size = 2 }, null);
+        try std.testing.expectError(error.ResourceLimitExceeded, pipeline.read(@import("antfly_documents").fixtures.get("one-pixel.png")));
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+    }
 }
