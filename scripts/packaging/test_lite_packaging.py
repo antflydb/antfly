@@ -51,6 +51,23 @@ snapshot_spec.loader.exec_module(snapshot)
 
 
 class LitePackagingTests(unittest.TestCase):
+    def test_embedded_schema_inventory_tracks_the_source_contract(self):
+        from validate_source_contract import SUPPORTED_SCHEMAS
+
+        self.assertEqual(
+            tuple(s for s in SUPPORTED_SCHEMAS if s >= 2),
+            package.EMBEDDED_BUILD_CONTRACT_SCHEMAS,
+        )
+        platform = package.PACKAGE_PLATFORMS[0]
+        self.assertEqual(
+            package.archive_name("1.2.3", platform, 6),
+            package.archive_name("1.2.3", platform, 7),
+        )
+        with self.assertRaisesRegex(
+            ValueError, "unsupported embedded release build contract"
+        ):
+            package.archive_name("1.2.3", platform, max(SUPPORTED_SCHEMAS) + 1)
+
     def test_platform_packages_bundle_apache_library_without_unused_worker(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

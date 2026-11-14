@@ -1110,6 +1110,7 @@ pub const Detail = enum(c_int) {
     system_fd_quota_exceeded,
     storage_descriptor_pressure,
     input_output,
+    catalog_changed,
 };
 
 pub const Status = extern struct {
@@ -1127,6 +1128,7 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.CatalogChanged => status(.conflict, .catalog_changed),
         error.SqlStatementReadUnavailable => status(.retryable, .sql_statement_read_unavailable),
         error.UnsupportedSqlExecution => status(.unsupported, .unsupported_sql_execution),
         error.ConflictingPrivacyProducerOptions => status(.invalid_argument, .conflicting_privacy_producer_options),
@@ -2862,6 +2864,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_tensor_type => "UnsupportedTensorType",
         .unsupported_query_request => "UnsupportedQueryRequest",
         .unsupported_node_filter_query => "UnsupportedNodeFilterQuery",
+        .catalog_changed => "CatalogChanged",
         .unsupported_filter_query_request => "UnsupportedFilterQueryRequest",
         .unsupported_exclusion_query_request => "UnsupportedExclusionQueryRequest",
         .unsupported_sync_level => "UnsupportedSyncLevel",
@@ -3818,6 +3821,13 @@ test "unsupported graph node filter survives the runtime boundary as a client er
     try std.testing.expectEqual(@backingInt(Code.invalid_argument), wire.code);
     try std.testing.expectEqual(error.UnsupportedNodeFilterQuery, errorFromStatus(wire));
     try std.testing.expect(errorHasStableDetail(error.UnsupportedNodeFilterQuery));
+}
+
+test "backup catalog conflicts retain their identity across runtime archives" {
+    const wire = statusFromError(error.CatalogChanged);
+    try std.testing.expectEqual(@backingInt(Code.conflict), wire.code);
+    try std.testing.expectEqual(error.CatalogChanged, errorFromStatus(wire));
+    try std.testing.expect(errorHasStableDetail(error.CatalogChanged));
 }
 
 test "descriptor exhaustion retains retryable public runtime identity" {

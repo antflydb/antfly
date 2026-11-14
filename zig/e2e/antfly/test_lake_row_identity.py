@@ -354,40 +354,42 @@ def test_logical_identity_reuses_reordered_native_indexes(
             )
 
         def states():
-            result = []
-            for path in (server.root / "artifacts").rglob("*"):
-                if not path.is_file():
-                    continue
-                payload = path.read_bytes()
-                begin = payload.find(b'{"version":')
-                if begin < 0:
-                    continue
-                try:
-                    value = json.loads(payload[begin:])
-                except (ValueError, UnicodeDecodeError):
-                    continue
-                if (
-                    isinstance(value, dict)
-                    and "values_recipe" in value
-                    and "current" in value
-                ):
-                    if value.get("version") == 2:
-                        spaces = {
-                            view["id"]: view for view in value["coordinate_spaces"]
-                        }
-                        value["reused"] = [
-                            {
-                                "name": binding["name"],
-                                **{
-                                    k: v
-                                    for k, v in spaces[binding["space"]].items()
-                                    if k != "id"
-                                },
-                            }
-                            for binding in value["index_bindings"]
-                        ]
-                    result.append((path.stat().st_mtime_ns, value))
-            return [value for _, value in sorted(result, key=lambda item: item[0])]
+            # Check the serving cut returned by the real query. Builders also
+            # upload private checkpoint proofs; filesystem order/mtime never
+            # makes those proofs published index authority.
+            result = call("POST", "/tables/logical/query", text)
+            token = result["remote_snapshot"]
+            assert token.startswith("lake2:"), token
+
+            def artifact(artifact_id):
+                checksum = artifact_id.split(":")[1]
+                paths = list((server.root / "artifacts").rglob(checksum))
+                assert paths, artifact_id
+                payload = paths[0].read_bytes()
+                if payload.startswith(b"AFOBJ001"):
+                    payload = payload[84 + struct.unpack_from("<I", payload, 16)[0] :]
+                assert hashlib.sha256(payload).hexdigest() == checksum, artifact_id
+                return json.loads(payload)
+
+            envelope = artifact(token.removeprefix("lake2:"))
+            state = artifact(envelope["state"]["id"])
+            reference = state["publication"]["row_identity"]
+            assert reference is not None, state
+            value = artifact(reference["artifact_id"])
+            if value.get("version") == 2:
+                spaces = {view["id"]: view for view in value["coordinate_spaces"]}
+                value["reused"] = [
+                    {
+                        "name": binding["name"],
+                        **{
+                            k: v
+                            for k, v in spaces[binding["space"]].items()
+                            if k != "id"
+                        },
+                    }
+                    for binding in value["index_bindings"]
+                ]
+            return [value]
 
         attach("logical", True)
         revision = ready("logical")

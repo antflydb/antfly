@@ -163,7 +163,8 @@ pub fn addConfigured(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
         unit_step.dependOn(&b.addRunArtifact(evidence_tests).step);
         unit_build.dependOn(&b.addInstallArtifact(evidence_tests, .{}).step);
     }
-    const predicate_tests = b.addTest(.{ .root_module = lib.import_table.get("antfly_predicate_client").? });
+    // Imported cascade, vote and revision contracts run in lib-decisions-test.
+    const predicate_tests = b.addTest(.{ .root_module = lib.import_table.get("antfly_predicate_client").?, .filters = &.{"predicate_client.test."} });
     unit_step.dependOn(&b.addRunArtifact(predicate_tests).step);
     const search_mod = b.createModule(.{ .root_source_file = b.path("lib/regex/src/search.zig"), .target = target, .optimize = optimize, .link_libc = true });
     search_mod.addImport("antfly_grapheme", grapheme);

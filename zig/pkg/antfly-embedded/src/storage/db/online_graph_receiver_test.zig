@@ -31,8 +31,8 @@ test "online graph snapshot receiver rebinds native effects without changing sou
     defer source_dir.cleanup();
     var target_dir = try TestDirectory.init("graph-copy-target-layout");
     defer target_dir.cleanup();
-    const options: OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} } };
-    var donor = try DB.open(alloc, source_dir.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .start_optional_runtimes = false, .primary_backend = .{ .lsm = .{} } });
+    const options: OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 }, .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } };
+    var donor = try DB.open(alloc, source_dir.path(), .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
     defer donor.close();
     var receiver = try DB.open(alloc, target_dir.path(), options);
     defer receiver.close();
@@ -42,6 +42,11 @@ test "online graph snapshot receiver rebinds native effects without changing sou
     }
     try receiver.batch(.{ .writes = &.{.{ .key = "a", .value = "{}" }}, .sync_level = .write });
     try receiver.updateRange(.{ .start = "m", .end = "z" });
+    // The range fence withdraws the old source's graph owners. A committed
+    // apply waits for that replayable cleanup before accepting donor effects;
+    // this protocol fixture drives the same bounded maintenance explicitly.
+    while (try receiver.core.index_manager.runGraphOwnershipCleanupStep()) {}
+    try std.testing.expect(!receiver.core.index_manager.graphOwnershipCleanupPending());
     var source_command = try donor.artifactInventoryCommand(alloc);
     defer source_command.catalogs.deinit(alloc);
     var target_command = try receiver.artifactInventoryCommand(alloc);

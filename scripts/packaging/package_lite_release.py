@@ -55,7 +55,6 @@ SOURCE_LICENSE_FILES = (
     "source_license_roots.json",
     "embedded_asset_licenses.json",
 )
-
 EMBEDDED_BUILD_CONTRACT_SCHEMAS = (2, 3, 4, 5, 6, 7)
 
 

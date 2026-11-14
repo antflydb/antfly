@@ -38558,6 +38558,18 @@ pub const DB = struct {
         if (!installed or admission != .admitted) return false;
         if (item.kind == .dense_vector) {
             const entry = self.core.denseIndex(item.name) orelse return false;
+            if (entry.index.leann != null) {
+                // LEANN has no HBC posting/capture certificate. Its own
+                // committed graph (plus exact pending buffer) is the serving
+                // authority, including for replicated graph publication.
+                if (item.projection_checkpoint_published_count) |certified| {
+                    if (certified != item.doc_count) return false;
+                }
+                // Source replay can queue newer replicated records while the
+                // committed generation remains admitted and searchable. That
+                // debt gates completion/full_index, not serving admission.
+                return true;
+            }
             if (item.projection_checkpoint_published_count) |certified| {
                 const checkpoint: apply_state.ProjectionCheckpoint = .{
                     .applied_sequence = item.projection_checkpoint_applied_sequence,
@@ -38774,6 +38786,18 @@ pub const DB = struct {
     const DenseServingCounts = struct { doc_count: u64, node_count: u64, root_node: u64, revision: u64 };
 
     fn denseServingCounts(index: *hbc_mod.HBCIndex) DenseServingCounts {
+        if (index.leann) |store| {
+            // LEANN owns a graph and an exact pending buffer, not an HBC
+            // posting generation. The wrapper's empty HBC root cannot report
+            // the vectors that LEANN already serves.
+            const serving = store.stats();
+            return .{
+                .doc_count = serving.live,
+                .node_count = serving.graph_nodes,
+                .root_node = 0,
+                .revision = store.appliedRaftIndex(),
+            };
+        }
         if (index.nativeServingSnapshot()) |serving_snapshot| return .{
             .doc_count = serving_snapshot.active_count,
             .node_count = serving_snapshot.node_count,
@@ -52566,7 +52590,10 @@ test "generated memo reuses only source matched typed embedding artifacts" {
     defer directory.cleanup();
     const path = directory.path().ptr;
     defer cleanupTempDir(path);
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    // Stored sparse vectors must be checked against the active provider's
+    // revision, even when that provider uses the legacy unversioned contract.
+    var sparse_provider = embedder_mod.DeterministicSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{ .enrichment = .{ .sparse_embedder = sparse_provider.interface() } });
     defer db.close();
     var memo = GeneratedEmbeddingMemo.init(alloc);
     defer memo.deinit();
@@ -86673,7 +86700,7 @@ test "db document extraction completes image OCR with reader producer" {
     const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
-    var fake = TestAssetProducer{};
+    var fake = TestAssetProducer{ .reader_output = "[{\"text\":\"recognized image text\"}]" };
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -86702,6 +86729,11 @@ test "db document extraction completes image OCR with reader producer" {
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), fake.reader_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.reader_media_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.reader_source_text_bytes);
+    var expected_image_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("\x89PNG\r\n\x1a\nimage bytes", &expected_image_digest, .{});
+    try std.testing.expectEqualSlices(u8, &expected_image_digest, &fake.reader_media_digest);
 
     const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:image-ocr", "document_units_v1", "image:000001");
     defer alloc.free(unit_key);
@@ -86710,7 +86742,7 @@ test "db document extraction completes image OCR with reader producer" {
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"ocr_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"extraction_status\":\"completed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"ocr_used\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"reader:data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"recognized image text\"") != null);
 }
 
 test "db document extraction attempts forced OCR for a scanned PDF" {
@@ -86795,7 +86827,7 @@ test "db async document extraction reuses generated OCR text across streaming pa
     const path = path_tmp.path().ptr;
     defer cleanupTempDir(path);
 
-    var fake = TestAssetProducer{};
+    var fake = TestAssetProducer{ .reader_output = "[{\"text\":\"recognized image text\"}]" };
     var db = try DB.open(alloc, std.mem.span(path), .{
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{
@@ -86824,6 +86856,11 @@ test "db async document extraction reuses generated OCR text across streaming pa
 
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), fake.reader_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.reader_media_count);
+    try std.testing.expectEqual(@as(usize, 0), fake.reader_source_text_bytes);
+    var expected_image_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("\x89PNG\r\n\x1a\nimage bytes", &expected_image_digest, .{});
+    try std.testing.expectEqualSlices(u8, &expected_image_digest, &fake.reader_media_digest);
 
     const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:image-ocr-async", "document_units_v1", "image:000001");
     defer alloc.free(unit_key);
@@ -86831,7 +86868,7 @@ test "db async document extraction reuses generated OCR text across streaming pa
     defer alloc.free(unit_payload);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"method\":\"ocr_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"extraction_status\":\"completed\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"reader:data:image/png;base64,iVBORw0KGgppbWFnZSBieXRlcw==\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unit_payload, "\"text\":\"recognized image text\"") != null);
 }
 
 test "db document extraction stores structured OCR confidence and coordinates" {
@@ -150363,6 +150400,15 @@ test "db applies leader-planned leann records through ordered apply" {
     try std.testing.expect(leann_store.isReplicated());
     try std.testing.expectEqual(@as(u64, n), entry.index.stats().active_count);
     try std.testing.expectEqual(raft_index, leann_store.appliedRaftIndex());
+    const public_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, public_stats);
+    const public_index = for (public_stats.indexes) |item| {
+        if (std.mem.eql(u8, item.name, "leann_idx")) break item;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, n), public_index.doc_count);
+    try std.testing.expectEqual(leann_store.stats().graph_nodes, public_index.node_count);
+    try std.testing.expectEqual(types.DenseNativeStoragePhase.legacy, public_index.dense_native_storage_phase);
+    try std.testing.expect(public_index.serving_snapshot_ready);
 
     // Replaying an applied entry is a no-op.
     const before = try leann_store.replicated.?.replica.encodeState(alloc);
@@ -150377,6 +150423,21 @@ test "db applies leader-planned leann records through ordered apply" {
     var results = try entry.index.searchWithRequest(.{ .query = &[_]f32{ 2, 2.5, 1, 6 }, .k = 1 });
     defer results.deinit();
     try std.testing.expectEqual(@as(usize, 1), results.items.items.len);
+
+    // Pause the planner and enqueue another source image. The old committed
+    // graph remains searchable even while full_index coverage is outstanding.
+    const Pending = struct { vector_id: u64, vector: []const f32, metadata: []const u8 };
+    try leann_store.apply(&[_]Pending{.{ .vector_id = n + 1, .vector = &.{ 0, 0, 0, 1 }, .metadata = "doc:pending" }}, &.{});
+    try std.testing.expect(!leann_store.graphCovers(leann_store.coverageTarget().?));
+    const pending_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, pending_stats);
+    for (pending_stats.indexes) |item| if (std.mem.eql(u8, item.name, "leann_idx")) {
+        try std.testing.expectEqual(@as(u64, n), item.doc_count);
+        try std.testing.expect(item.serving_snapshot_ready);
+    };
+    var still_searchable = try entry.index.searchWithRequest(.{ .query = &[_]f32{ 2, 2.5, 1, 6 }, .k = 1 });
+    defer still_searchable.deinit();
+    try std.testing.expectEqual(@as(usize, 1), still_searchable.items.items.len);
 }
 
 test "db rejects leann records when leann replication is off" {
