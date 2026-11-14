@@ -1109,6 +1109,27 @@ pub const WriterLane = struct {
 
     const poll_initial_ns: i96 = 50 * std.time.ns_per_us;
     const poll_max_ns: i96 = 2 * std.time.ns_per_ms;
+    /// Floor under any wait for *this same process's* own `checked_out`
+    /// span to end (another local caller mid-staging, about to `checkin`),
+    /// regardless of how small the caller's own `busy_timeout_ms` is.
+    /// `checked_out`/`parked` are pure in-process bookkeeping -- nothing
+    /// external ever contends for them -- so with `busy_timeout_ms == 0`
+    /// (the documented "fails immediately" contract, meant for a genuinely
+    /// foreign holder: see `Connection.admissionDeadline`) a caller that
+    /// landed here would otherwise give up before the current holder's
+    /// `checkin` (normally well under a millisecond away: `checkin` runs
+    /// right after staging, long before that write's own durability wait)
+    /// ever has a chance to run. Bounded and cancellable like every other
+    /// admission wait here, just never shorter than this for a condition
+    /// that is certain to resolve shortly on its own.
+    ///
+    /// Kept to a few `poll_max_ns` ticks, not hundreds of milliseconds: an
+    /// uncapped-rate caller retrying this same path in a tight loop (an
+    /// ordinary pattern for a read on a busy connection) turns every extra
+    /// millisecond of floor here into real, same-sized slowdown across
+    /// every such call site, not just the rare one that actually needed to
+    /// wait out a staging window measured in microseconds.
+    const min_local_wait_ns: i96 = 4 * std.time.ns_per_ms;
 
     /// Whether `connection.refresh(root, intent)` might actually need to
     /// do something (the detached allocator-proof admission branch) for
@@ -1151,6 +1172,11 @@ pub const WriterLane = struct {
     pub fn checkout(self: *WriterLane, connection: *Connection, intent: api.StorageIntent) !*h.Handle {
         const io = h.handleLockIo();
         const deadline = connection.admissionDeadline();
+        // See `min_local_wait_ns`'s doc comment: the "someone else is
+        // checked out" poll below only ever waits on this same process's
+        // own lane, never a foreign holder, so it floors `deadline` rather
+        // than using it directly.
+        const local_wait_deadline = @max(deadline, std.Io.Clock.awake.now(io).nanoseconds + min_local_wait_ns);
         var backoff_ns: i96 = poll_initial_ns;
         self.mutex.lockUncancelable(io);
         while (true) {
@@ -1234,7 +1260,7 @@ pub const WriterLane = struct {
             // late here is never fatal to getting the fast path.
             self.waiting += 1;
             self.mutex.unlock(io);
-            const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+            const remaining = local_wait_deadline - std.Io.Clock.awake.now(io).nanoseconds;
             if (remaining <= 0) {
                 self.mutex.lockUncancelable(io);
                 self.waiting -= 1;
@@ -1297,6 +1323,46 @@ pub const WriterLane = struct {
         if (self.last_root == null or self.last_root != current_root) return null;
         self.parked = null;
         return lease;
+    }
+
+    /// Like `takeParkedForStore`, but when nothing is parked *yet* only
+    /// because this same process's lane is still between `checkout` and
+    /// `checkin` (`checked_out`), wait for it instead of handing the
+    /// caller back to `takeParkedForStore`'s doc comment's "ordinary path"
+    /// -- a fresh kernel acquisition that can only ever self-conflict with
+    /// the lease this same process is actively holding right now, and,
+    /// with `busy_timeout_ms == 0`, would fail before `checkin` (imminent)
+    /// ever runs. Registers in `waiting` exactly like `checkout`'s own
+    /// poll, so `checkin` hands the lease over unconditionally (zero cost)
+    /// the moment the current holder finishes staging. `deadline` is the
+    /// caller's own admission deadline; floored by `min_local_wait_ns`
+    /// since this wait is never on a foreign holder. Returns `null` if the
+    /// floor expires with the lane still checked out (a caller is then
+    /// free to fall through to its own ordinary, busy_timeout_ms-governed
+    /// path) or if nothing was ever checked out in the first place.
+    pub fn waitParkedForStore(self: *WriterLane, connection: *Connection, deadline: i96) ?native.PathWriterLock {
+        if (self.takeParkedForStore(connection)) |lease| return lease;
+        const io = h.handleLockIo();
+        const local_wait_deadline = @max(deadline, std.Io.Clock.awake.now(io).nanoseconds + min_local_wait_ns);
+        var backoff_ns: i96 = poll_initial_ns;
+        self.mutex.lockUncancelable(io);
+        while (self.checked_out) {
+            self.waiting += 1;
+            self.mutex.unlock(io);
+            const remaining = local_wait_deadline - std.Io.Clock.awake.now(io).nanoseconds;
+            if (remaining <= 0) {
+                self.mutex.lockUncancelable(io);
+                self.waiting -= 1;
+                self.mutex.unlock(io);
+                return null;
+            }
+            io.sleep(.fromNanoseconds(@min(backoff_ns, remaining)), .awake) catch {};
+            backoff_ns = @min(backoff_ns * 2, poll_max_ns);
+            self.mutex.lockUncancelable(io);
+            self.waiting -= 1;
+        }
+        self.mutex.unlock(io);
+        return self.takeParkedForStore(connection);
     }
 
     /// How long a lease must have been held before a *genuinely foreign*
@@ -3502,7 +3568,13 @@ pub const Connection = struct {
             // invisible to `takeRetained()` above. Reclaim it here before
             // ever attempting a fresh kernel acquisition that would
             // contend with this same process's own already-held lock.
-            if (self.owner.writer_lane.takeParkedForStore(self)) |held| {
+            // `waitParkedForStore`, not plain `takeParkedForStore`: if the
+            // lane is still `checked_out` (another local caller mid-
+            // staging, not parked yet), wait for its imminent `checkin`
+            // instead of falling straight through to a fresh acquisition
+            // that would only ever self-conflict with it -- see that
+            // function's own doc comment.
+            if (self.owner.writer_lane.waitParkedForStore(self, deadline)) |held| {
                 var lease = held;
                 stats.recordAcquired(.handoff, 0);
                 lease.startHold(stats);
