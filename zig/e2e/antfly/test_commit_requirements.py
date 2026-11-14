@@ -101,7 +101,9 @@ def test_direct_gate_commits_extraction_transforms_deletes_and_transactions(
     )
     assert changed["status"].startswith("committed"), changed
     assert stateful_api.lookup_key(table, "doc")["counter"] == 2
-    response = stateful_api.s.get(f"{stateful_api.url}/tables/{table}/documents/victim")
+    response = stateful_api.s.get(
+        f"{stateful_api.url}/tables/{table}/documents/victim", timeout=30
+    )
     assert response.status_code == 404, response.text
     assert_extracted("doc")
 
@@ -145,5 +147,7 @@ def test_direct_gate_commits_extraction_transforms_deletes_and_transactions(
     assert rejected.status_code >= 400, rejected.text
     assert stateful_api.lookup_key(table, "doc")["counter"] == 2
     assert stateful_api.lookup_key(audit, "accepted")["counter"] == 1
-    absent = stateful_api.s.get(f"{stateful_api.url}/tables/{table}/documents/invalid")
+    absent = stateful_api.s.get(
+        f"{stateful_api.url}/tables/{table}/documents/invalid", timeout=30
+    )
     assert absent.status_code == 404, absent.text
