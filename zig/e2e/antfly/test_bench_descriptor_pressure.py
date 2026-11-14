@@ -95,3 +95,26 @@ def test_linux_mapping_rss_includes_deleted_vectors_and_excludes_other_maps(
     monkeypatch.setattr(bench.sys, "platform", "linux")
     monkeypatch.setattr(bench, "Path", lambda _: smaps)
     assert bench.vector_mapping_rss(123) == 20 * 1024
+
+
+def test_server_wrapper_limits_only_child_and_preserves_spaced_arguments(tmp_path):
+    import json
+    import resource
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from bench_descriptor_pressure import write_server_wrapper
+
+    wrapper = tmp_path / "server with spaces.sh"
+    before = resource.getrlimit(resource.RLIMIT_NOFILE)
+    write_server_wrapper(wrapper, Path(sys.executable), 256)
+    code = "import json, resource, sys; print(json.dumps([resource.getrlimit(resource.RLIMIT_NOFILE)[0], sys.argv[1:]]))"
+    result = subprocess.run(
+        [str(wrapper), "-c", code, "argument with spaces"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(result.stdout) == [256, ["argument with spaces"]]
+    assert resource.getrlimit(resource.RLIMIT_NOFILE) == before

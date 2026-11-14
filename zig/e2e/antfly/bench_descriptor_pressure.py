@@ -26,6 +26,7 @@ import argparse
 import ctypes
 import datetime
 import resource
+import shlex
 import hashlib
 import json
 import math
@@ -221,13 +222,24 @@ def wait_visible(session, url, count):
         time.sleep(0.25)
 
 
+def write_server_wrapper(path, binary, limit):
+    # Shell quoting supports interpreter/binary paths containing spaces. The
+    # wrapper changes only its own limit, then replaces itself with the server.
+    code = (
+        "import os, resource, sys; "
+        f"resource.setrlimit(resource.RLIMIT_NOFILE, ({limit}, resource.getrlimit(resource.RLIMIT_NOFILE)[1])); "
+        f"os.execv({str(binary)!r}, [{str(binary)!r}, *sys.argv[1:]])"
+    )
+    path.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(code)} "$@"\n'
+    )
+    path.chmod(0o700)
+
+
 def qualify(binary, limit, count, data, output, steady_seconds):
     row = corpus(data, count)
-    wrapper = output / f"server-{limit}.py"
-    wrapper.write_text(
-        f"#!{sys.executable}\nimport os, resource, sys\nresource.setrlimit(resource.RLIMIT_NOFILE, ({limit}, resource.getrlimit(resource.RLIMIT_NOFILE)[1]))\nos.execv({str(binary)!r}, [{str(binary)!r}, *sys.argv[1:]])\n"
-    )
-    wrapper.chmod(0o700)
+    wrapper = output / f"server-{limit}.sh"
+    write_server_wrapper(wrapper, binary, limit)
     report = {
         "soft_limit": limit,
         "documents": count,

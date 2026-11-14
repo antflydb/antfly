@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "captured_utc": "2026-11-14T04:34:53.969360+00:00",
+  "engine_source_commit": "6d453bbbf83ae2bf2b374fdd806bf1adfe1c94e1",
+  "engine_binary_sha256": "3d1dfd09c0574f66d419c62435d095d9c3aea74cef167cf0e688a3f6f2c57ba6",
+  "host": {
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "client_nofile": [
+      1048576,
+      9223372036854775807
+    ],
+    "shared_workstation": true
+  },
+  "workload": {
+    "source": "synthetic: random.Random(row+126), uniform(-1,1)",
+    "corpus_sha256": "b191b6652426020eeefab6974e27712017dc7bc479ee6199bd94b96fbbdd29f5",
+    "documents": 100000,
+    "dimensions": 768,
+    "permission_fields": 8,
+    "distance_metric": "cosine",
+    "external_vectors": true,
+    "shards": 1,
+    "batch_size": 256,
+    "sync_level": "full_index",
+    "concurrent_query_workers": 1,
+    "query": "self-match of first inserted vector",
+    "query_think_seconds": 0.02,
+    "steady_query_seconds": 10,
+    "fd_and_process_rss_sampling_seconds": 0.05,
+    "ordered_trials": [
+      256,
+      1024,
+      65536
+    ]
+  },
+  "profiles": [
+    {
+      "soft_limit": 256,
+      "completed": true,
+      "committed": 100000,
+      "ingestion_seconds": 514.8772881659679,
+      "documents_per_second": 194.22103537758989,
+      "peak_fds": 232,
+      "peak_rss_bytes": 1037484032,
+      "batch_latency": {
+        "count": 391,
+        "p50_ms": 1221.3614579522982,
+        "p95_ms": 1606.4613750204444,
+        "p99_ms": 1866.9446670101024,
+        "max_ms": 2124.0523330052383
+      },
+      "query_latency": {
+        "ingestion": {
+          "count": 6206,
+          "p50_ms": 35.94381202128716,
+          "p95_ms": 249.8604590073228,
+          "p99_ms": 360.24183401605114,
+          "max_ms": 768.1802499573678
+        },
+        "steady": {
+          "count": 155,
+          "p50_ms": 43.54908398818225,
+          "p95_ms": 45.7822079770267,
+          "p99_ms": 54.12699998123571,
+          "max_ms": 54.92520902771503
+        }
+      },
+      "graceful_exit_code": 0,
+      "recovered_exit_code": 0,
+      "recovered_visible_documents": 100000,
+      "samples": 9682,
+      "peak_vector_mapping_rss_bytes": null
+    },
+    {
+      "soft_limit": 1024,
+      "completed": true,
+      "committed": 100000,
+      "ingestion_seconds": 550.9254579999833,
+      "documents_per_second": 181.51275920889287,
+      "peak_fds": 542,
+      "peak_rss_bytes": 983826432,
+      "batch_latency": {
+        "count": 391,
+        "p50_ms": 1275.4009580239654,
+        "p95_ms": 1679.3853339622729,
+        "p99_ms": 3908.736667013727,
+        "max_ms": 8291.75870801555
+      },
+      "query_latency": {
+        "ingestion": {
+          "count": 6204,
+          "p50_ms": 36.79824998835102,
+          "p95_ms": 269.8057500529103,
+          "p99_ms": 390.79637499526143,
+          "max_ms": 3325.314665969927
+        },
+        "steady": {
+          "count": 156,
+          "p50_ms": 38.28060449450277,
+          "p95_ms": 44.10470899892971,
+          "p99_ms": 59.174333000555634,
+          "max_ms": 159.50462501496077
+        }
+      },
+      "graceful_exit_code": 0,
+      "recovered_exit_code": 0,
+      "recovered_visible_documents": 100000,
+      "samples": 10264,
+      "peak_vector_mapping_rss_bytes": null
+    },
+    {
+      "soft_limit": 65536,
+      "completed": true,
+      "committed": 100000,
+      "ingestion_seconds": 558.0474352919846,
+      "documents_per_second": 179.19623615450803,
+      "peak_fds": 720,
+      "peak_rss_bytes": 849772544,
+      "batch_latency": {
+        "count": 391,
+        "p50_ms": 1310.6711250147782,
+        "p95_ms": 1916.3044589804485,
+        "p99_ms": 2430.035667028278,
+        "max_ms": 2977.018582983874
+      },
+      "query_latency": {
+        "ingestion": {
+          "count": 6127,
+          "p50_ms": 40.792583022266626,
+          "p95_ms": 268.0486250319518,
+          "p99_ms": 393.4504170319997,
+          "max_ms": 1026.009207998868
+        },
+        "steady": {
+          "count": 159,
+          "p50_ms": 38.4605840081349,
+          "p95_ms": 44.36766600701958,
+          "p99_ms": 55.1434580120258,
+          "max_ms": 267.96600001398474
+        }
+      },
+      "graceful_exit_code": 0,
+      "recovered_exit_code": 0,
+      "recovered_visible_documents": 100000,
+      "samples": 10363,
+      "peak_vector_mapping_rss_bytes": null
+    }
+  ],
+  "scope": [
+    "One ordered trial per limit on a shared macOS ARM64 host; observations, not a statistical speed comparison or production sizing guarantee.",
+    "End-to-end ingestion includes client synthetic vector generation, JSON serialization, index acknowledgement and final visibility checks.",
+    "Queries run concurrently with ingestion and in a separate steady phase. No write or query failure is retried.",
+    "All profiles use fresh server data and the same corpus digest. OS caches are warm; no cache purge or CPU/container resource isolation.",
+    "First profile overlapped worktree cleanup. Other host work is not controlled.",
+    "RSS is whole-server resident memory. Sampled FD/RSS peaks are lower bounds, not hard quotas.",
+    "macOS per-vector-mapping RSS is unavailable. The Linux runner samples .afvb mapping RSS separately, including deleted generations.",
+    "This synthetic workload is not Cohere recall/distribution qualification or a mixed-query performance benchmark."
+  ]
+}

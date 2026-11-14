@@ -91,3 +91,23 @@ ANTFLY_NATIVE_CHUNK_EXECUTION_MODEL=/absolute/path/to/embeddinggemma2-bundle \
   python3 tools/run_bounded_zig_build.py --zig zig -- build \
   inference-native-chunk-execution-test
 ```
+
+### Recorded synthetic qualification
+
+The [recorded 100,000-document run](../../zig/bench/vectors/descriptor_pressure_100k.json)
+passed at all three limits with identical corpus digests, concurrent self-queries,
+full recovered visibility, and successful graceful exits before and after reopen:
+
+| Soft limit | Ingestion seconds | Sampled peak FDs | Sampled peak RSS (MiB) | Query p99 during ingestion (ms) | Steady query p99 (ms) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 | 514.9 | 232 | 989.4 | 360.2 | 54.1 |
+| 1,024 | 550.9 | 542 | 938.3 | 390.8 | 59.2 |
+| 65,536 | 558.0 | 720 | 810.4 | 393.5 | 55.1 |
+
+These are single ordered observations on a shared macOS ARM64 host with warm OS
+caches and a fixed self-query, not evidence of a speed advantage for lower limits.
+The first profile overlapped worktree cleanup. Process RSS includes the growing
+index, mappings and other server allocations; it does not isolate vector mapping
+residency on macOS. The JSON records the binary hash, exact timing distributions,
+workload, sampling scope and limitations. The Linux CI report supplies the
+additional per-mapping residency observations for its smaller corpus.
