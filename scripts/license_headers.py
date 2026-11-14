@@ -294,6 +294,17 @@ def strip_existing_antfly_header(text: str, path: Path) -> tuple[str, int]:
             break
         end += 1
         body = line[len(prefix) :].strip()
+        if body.startswith("SPDX-License-Identifier:"):
+            # A short SPDX notice ends here unless a full legal notice follows.
+            # Ordinary adjacent comments belong to the source, not the header.
+            following = end
+            while following < len(lines) and lines[following].strip() == prefix:
+                following += 1
+            next_line = lines[following].strip() if following < len(lines) else ""
+            if not next_line.startswith(prefix) or not next_line[
+                len(prefix) :
+            ].lstrip().startswith("Licensed under"):
+                break
         if (
             body == "limitations."
             or body == "except in compliance with the Elastic License 2.0."
