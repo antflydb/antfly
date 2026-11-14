@@ -173,7 +173,7 @@ pub const StreamVerifier = struct {
         root: u128,
         requirement: publication.Digest,
         observation: Observation,
-        value: union(enum) { skipped: Skipped, native: @import("artifact_native_stream.zig").Closure, document: streams.DocumentClosure, extraction: streams.ExtractionClosure, chunks: streams.Closure, units: @import("artifact_unit_progress.zig").Closure, projection: @import("artifact_projection_certificate.zig").Closure, graph: @import("artifact_graph_completion.zig").Closure },
+        value: union(enum) { prepared: @import("prepared_producer_acceptance.zig").Closure, skipped: Skipped, native: @import("artifact_native_stream.zig").Closure, document: streams.DocumentClosure, extraction: streams.ExtractionClosure, chunks: streams.Closure, units: @import("artifact_unit_progress.zig").Closure, projection: @import("artifact_projection_certificate.zig").Closure, graph: @import("artifact_graph_completion.zig").Closure },
         pub fn deinit(self: *@This()) void {
             switch (self.value) {
                 inline else => |*value| value.deinit(),
@@ -243,6 +243,10 @@ pub const StreamVerifier = struct {
             return try skipped(alloc, txn, root, document, node);
         }
         if (node.kind == .native_effects and @import("group_source_identity.zig").isAnchor(document)) return try skipped(alloc, txn, root, document, node);
+        if (node.kind == .generated) {
+            if (try @import("prepared_producer_acceptance.zig").read(alloc, txn, root, document, node.id, if (node.embedding.len != 0) node.embedding else if (node.artifact.len != 0) node.artifact else node.name)) |closure|
+                return .{ .root = root, .requirement = node.id, .observation = closure.observation, .value = .{ .prepared = closure } };
+        }
         if (node.kind == .unit_children) {
             try node.requireValidIdentity();
             const completion = if (self.plan.completion_plan) |*value| value else return error.ArtifactCatalogDrift;

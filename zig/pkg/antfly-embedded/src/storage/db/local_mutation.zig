@@ -253,6 +253,10 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const flushDurableReplicationOutboxesLocked = commit.flushDurableReplicationOutboxesLocked;
         pub const flushTransactionReplicationOutbox = commit.flushTransactionReplicationOutbox;
         pub const generatedPrecomputeModeForSyncLevel = preparation.generatedPrecomputeModeForSyncLevel;
+        pub const capturePreparedEnrichments = preparation.capturePreparedEnrichments;
+        pub const validatePreparedEnrichments = preparation.validatePreparedEnrichments;
+        pub const restorePreparedEnrichments = preparation.restorePreparedEnrichments;
+        pub const restorePreparedEnrichmentsForRows = preparation.restorePreparedEnrichmentsForRows;
         pub const generatedPrecomputeMode = preparation.generatedPrecomputeMode;
         pub const graphMutationIdentityEql = materialization.graphMutationIdentityEql;
         pub const hasConfiguredResolvers = materialization.hasConfiguredResolvers;

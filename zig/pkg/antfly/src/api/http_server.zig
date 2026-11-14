@@ -14764,9 +14764,6 @@ pub const ApiHttpServer = struct {
         req: db_mod.types.BatchRequest,
         request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBatchError!void {
-        // Until this surface carries prepared outputs through its transaction
-        // protocol, reject before schema preparation, proposal or WAL admission.
-        if (req.commit_requires == .direct_enrichments) return error.UnsupportedCommitRequirement;
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
         const source = self.table_writes orelse return error.NotFound;
@@ -14791,6 +14788,7 @@ pub const ApiHttpServer = struct {
         const txn_writes: []const db_mod.types.TransactionWrite = @ptrCast(req.writes);
         const tables = [_]distributed_txn.TableCommitRequest{.{
             .table_name = table_name,
+            .commit_requires = req.commit_requires,
             .writes = txn_writes,
             .deletes = req.deletes,
             .transforms = req.transforms,
@@ -29724,10 +29722,10 @@ test "httpx inference gateway authorization tells disabled public inference apar
     }
 }
 
-test "api http commit requirements reject before coordinator admission" {
+test "api http commit requirements require a coordinator source" {
     var server = ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
     defer server.deinit();
-    try std.testing.expectError(error.UnsupportedCommitRequirement, ApiHttpServer.executePublicTableBatch(&server, std.testing.allocator, "docs", .{ .commit_requires = .direct_enrichments }, .{}));
+    try std.testing.expectError(error.NotFound, ApiHttpServer.executePublicTableBatch(&server, std.testing.allocator, "docs", .{ .commit_requires = .direct_enrichments }, .{}));
     try std.testing.expectError(error.NotFound, ApiHttpServer.executePublicTableBatch(&server, std.testing.allocator, "docs", .{ .commit_requires = .none }, .{}));
 }
 

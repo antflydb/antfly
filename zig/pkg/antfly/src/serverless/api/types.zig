@@ -27,6 +27,8 @@ pub const MutationKind = enum(u8) {
     checkpoint = 3,
     /// Internal self-contained derived output carrying admitted source cost.
     enriched = 4,
+    /// Atomic primary postimage plus direct outputs; private WAL format v5.
+    prepared = 5,
 };
 
 pub const DocumentMutation = struct {

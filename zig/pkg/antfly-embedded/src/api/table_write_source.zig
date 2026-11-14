@@ -659,7 +659,6 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
     ) !?void {
-        if (req.commit_requires == .direct_enrichments) return error.UnsupportedCommitRequirement;
         return try BoundaryAbi.call("batch", self.boundary_dispatch, self.vtable.batch, .{ self.ptr, alloc, table_name, req });
     }
 
@@ -1023,7 +1022,6 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
     ) !?void {
-        if (req.commit_requires == .direct_enrichments) return error.UnsupportedCommitRequirement;
         const fn_ptr = self.vtable.batch_group_local orelse return null;
         return try BoundaryAbi.call("batch_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, req });
     }

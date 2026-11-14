@@ -24,7 +24,7 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 90 also fences certified graph document-key descriptor domains.
 // Version 91 fences selected-role merge-readiness projection responses.
 // Version 92 requires native batch decoders to preserve commit prerequisites.
-pub const abi_version: u32 = 92;
+pub const abi_version: u32 = 93;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1924,6 +1924,12 @@ pub extern fn antfly_storage_owner_preflight_write_admission(
     owner: ?*anyopaque,
     request: *const WriteAdmissionRequest,
     out_has_groups: *u8,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_prepare_enrichments(
+    owner: ?*anyopaque,
+    request: *const WriteAdmissionRequest,
+    out_command: *OwnedBytes,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_find_median_key(

@@ -434,6 +434,12 @@ pub const Owner = struct {
         return result;
     }
 
+    pub fn prepareEnrichments(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
+        var response = Response{};
+        try statusToError(abi.antfly_storage_owner_prepare_enrichments(self.handle, &.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(request_json) }, &response.buffer));
+        return response;
+    }
+
     pub fn preflightWriteAdmission(self: *Owner, table_name: []const u8) !void {
         _ = try self.preflightWriteAdmissionJson(table_name, "");
     }

@@ -330,6 +330,8 @@ pub const BatchRequest = struct {
     document_version_scheme: DocumentVersionScheme = .admit_current,
     sync_level: SyncLevel = .write,
     commit_requires: ?CommitRequires = null,
+    /// Private immutable producer effects. Never accepted by public codecs.
+    prepared_enrichments_json: ?[]const u8 = null,
     /// Internal single-participant transaction contract. Transform expansion
     /// still runs under the DB apply lock, but the batch is rejected before
     /// mutation if it would emit graph projection deltas that the distributed
@@ -1756,6 +1758,8 @@ pub const TransactionVersionPredicate = struct {
 pub const TransactionIntegrityOperation = @import("relational_integrity_contract.zig").Operation;
 
 pub const TransactionIntentRequest = struct {
+    commit_requires: ?CommitRequires = null,
+    prepared_enrichments_json: ?[]const u8 = null,
     document_version_scheme: DocumentVersionScheme = .admit_current,
     row_policy_principal_proof: []const u8 = "",
     row_policy_database: []const u8 = "",

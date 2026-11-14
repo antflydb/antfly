@@ -4100,6 +4100,18 @@ pub fn storageOwnerPreflightWriteAdmission(
     return .ok;
 }
 
+pub fn storageOwnerPrepareEnrichments(owner: ?*anyopaque, request: *const kernel_owner_abi.WriteAdmissionRequest, out_command: *kernel_owner_abi.OwnedBytes) callconv(.c) kernel_owner_abi.Status {
+    out_command.* = .{};
+    if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
+    const handle = asHandle(owner) orelse return .invalid_argument;
+    _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
+    var owned = batch_api.parseOwnerBatchRequest(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
+    defer owned.deinit(handle.alloc);
+    const command = handle.db.prepareDirectEnrichments(handle.alloc, owned.req) catch |err| return storageOwnerStatusFromError(err);
+    out_command.* = .{ .ptr = command.ptr, .len = @intCast(command.len) };
+    return .ok;
+}
+
 pub fn storageOwnerFindMedianKey(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.TableRequest,

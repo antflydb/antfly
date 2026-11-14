@@ -317,6 +317,7 @@ pub const OwnedTransactionCommitRequest = struct {
             offset += table_writes.len;
             out[i] = .{
                 .table_name = self.physicalName(table.table_name),
+                .commit_requires = table.batch.req.commit_requires,
                 .schema_version = table.schema_version,
                 .relational_schema_version = table.relational_schema_version,
                 .relational_integrity_generation_set = if (table.conflict_guards) |guards| guards.value.generation_set else null,
@@ -4804,9 +4805,7 @@ fn parseCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedTrans
         else => return error.InvalidTransactionCommitRequest,
     };
 
-    if (root.get("commit_requires")) |requirement_value| {
-        if (try db_mod.types.parseCommitRequires(requirement_value) == .direct_enrichments) return error.UnsupportedCommitRequirement;
-    }
+    const default_requirement = if (root.get("commit_requires")) |requirement_value| try db_mod.types.parseCommitRequires(requirement_value) else null;
 
     var req: OwnedTransactionCommitRequest = .{};
     errdefer req.deinit(alloc);
@@ -4816,6 +4815,9 @@ fn parseCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedTrans
 
     const tables_value = root.get("tables") orelse return error.InvalidTransactionCommitRequest;
     req.tables = try parseTables(alloc, tables_value);
+    for (req.tables) |*table| if (table.batch.req.commit_requires == null) {
+        table.batch.req.commit_requires = default_requirement;
+    };
 
     if (root.get("sync_level")) |sync_level_value| {
         req.sync_level = parseSyncLevel(sync_level_value) orelse return error.InvalidTransactionCommitRequest;
@@ -5484,7 +5486,6 @@ pub fn isEmptySessionCommitBody(body: []const u8) bool {
 fn parseTableBatch(alloc: std.mem.Allocator, value: std.json.Value) !batch_api.OwnedBatchRequest {
     var owned = try batch_api.public_codec.parseBatchValue(alloc, value);
     errdefer owned.deinit(alloc);
-    if (owned.req.commit_requires == .direct_enrichments) return error.UnsupportedCommitRequirement;
     return batch_api.takePublic(&owned);
 }
 
@@ -6190,9 +6191,13 @@ test "multi batch parser accepts the public batch envelope without a read set" {
     try std.testing.expectEqual(@as(usize, 1), req.tables[1].batch.deletes.len);
 }
 
-test "multi batch commit requirements reject before transaction planning" {
+test "multi batch commit requirements survive transaction planning" {
     const a = std.testing.allocator;
-    try std.testing.expectError(error.UnsupportedCommitRequirement, parseMultiBatchRequest(a, "{\"tables\":{\"docs\":{\"inserts\":{\"a\":{}},\"commit_requires\":\"direct_enrichments\"}}}"));
+    var gated = try parseMultiBatchRequest(a, "{\"tables\":{\"docs\":{\"inserts\":{\"a\":{}},\"commit_requires\":\"direct_enrichments\"}}}");
+    defer gated.deinit(a);
+    var distributed = try gated.distributedTables(a);
+    defer distributed.deinit();
+    try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, distributed.tables[0].commit_requires.?);
     var no_gate = try parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"commit_requires\":\"none\"}}}");
     defer no_gate.deinit(a);
 }

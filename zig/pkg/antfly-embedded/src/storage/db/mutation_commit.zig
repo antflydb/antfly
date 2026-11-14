@@ -167,6 +167,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const encodeTimestampValue = S.encodeTimestampValue;
         const encodeDocumentTimestampValue = S.encodeDocumentTimestampValue;
         const freeOwnedKeySlice = S.freeOwnedKeySlice;
+        const capturePreparedEnrichments = S.capturePreparedEnrichments;
+        const validatePreparedEnrichments = S.validatePreparedEnrichments;
+        const restorePreparedEnrichments = S.restorePreparedEnrichments;
+        const restorePreparedEnrichmentsForRows = S.restorePreparedEnrichmentsForRows;
         const generatedPrecomputeMode = S.generatedPrecomputeMode;
         const graphCleanupReplayWritesAlloc = S.graphCleanupReplayWritesAlloc;
         const graphEndpointCleanupDeletesAlloc = S.graphEndpointCleanupDeletesAlloc;
@@ -363,12 +367,29 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         noinline fn batchInternalPreparedOwned(
             self: *S.PreparedBatchOwner,
-            req: types.BatchRequest,
+            incoming_req: types.BatchRequest,
             profile: ?*BatchProfile,
             opts: BatchExecutionOptions,
             generated_memo: *GeneratedEmbeddingMemo,
             prepared_row_allocator: *PreparedRowAllocator,
         ) anyerror!void {
+            var decoded_prepared = if (incoming_req.prepared_enrichments_json) |json|
+                try std.json.parseFromSlice(execution_resources.PreparedEnrichments, S.ownerField(self, "alloc").*, json, .{ .allocate = .alloc_always })
+            else
+                null;
+            defer if (decoded_prepared) |*packet| packet.deinit();
+            var req = incoming_req;
+            if (decoded_prepared) |packet| {
+                if (req.commit_requires != .direct_enrichments) return error.InvalidBatchRequest;
+                if (opts.transaction_resolution == null) {
+                    req.writes = packet.value.writes;
+                    req.deletes = packet.value.deletes;
+                    req.transforms = &.{};
+                    req.graph_writes = packet.value.graph_writes;
+                    req.graph_deletes = packet.value.graph_deletes;
+                }
+            }
+
             if (comptime @import("../engine_selection.zig").enabled) {
                 prepared_row_allocator.captureIoDomain();
                 return @import("antfly_source_root").antfly_sources.storage_engine.call("batchPrepared", .{ self, req, profile, opts, generated_memo, prepared_row_allocator });
@@ -626,6 +647,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break;
                 };
                 if (eligible) {
+                    if (req.commit_requires == .direct_enrichments) preparation.generated_snapshot = try self.captureGeneratedWriteReadSnapshot(preparation_alloc, effective_req.writes);
                     const requires_inline_generated =
                         (req.sync_level == .full_text or req.sync_level == .enrichments or req.sync_level == .full_index or req.commit_requires == .direct_enrichments) or
                         opts.force_generated_artifact_names.len != 0 or
@@ -753,7 +775,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         var extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, rows.len);
                         defer preparation_alloc.free(extracted_rows);
                         for (rows, 0..) |maybe_row, index| extracted_rows[index] = maybe_row.?.extracted;
-                        preparation.generated = try prepareGeneratedEnrichments(
+                        preparation.generated = if (decoded_prepared) |packet| if (opts.transaction_resolution != null) try restorePreparedEnrichments(preparation_alloc, packet.value) else try restorePreparedEnrichmentsForRows(self, preparation_alloc, effective_req, extracted_rows, preparation.write_plan.?.plan(), packet.value) else try prepareGeneratedEnrichments(
                             self,
                             preparation_alloc,
                             effective_req,
@@ -842,7 +864,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try doc_plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(preparation_alloc, write.key, parsed.value, &extracted_rows[i]);
                         }
                     }
-                    preparation.document_generated = try prepareGeneratedEnrichments(
+                    preparation.document_generated = if (decoded_prepared) |packet| if (opts.transaction_resolution != null) try restorePreparedEnrichments(preparation_alloc, packet.value) else try restorePreparedEnrichmentsForRows(self, preparation_alloc, effective_req, extracted_rows[0..extracted_rows_initialized], preparation.write_plan.?.plan(), packet.value) else try prepareGeneratedEnrichments(
                         self,
                         preparation_alloc,
                         effective_req,
@@ -908,15 +930,31 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer preparation_alloc.free(overwrite_probe_values);
             var semantic_noop_store_keys = std.StringHashMapUnmanaged(void).empty;
             defer semantic_noop_store_keys.deinit(preparation_alloc);
-            const can_elide_primary_noops = if (request_schema_view) |view|
+            const can_elide_primary_noops = decoded_prepared == null and (if (request_schema_view) |view|
                 view.storageMode() == .document
             else
-                true;
+                true);
             if (can_elide_primary_noops) {
                 try semantic_noop_store_keys.ensureTotalCapacity(
                     preparation_alloc,
                     std.math.cast(u32, effective_req.writes.len) orelse return error.InvalidBatchRequest,
                 );
+            }
+
+            if (opts.preparation_capture) |capture| {
+                if (req.commit_requires != .direct_enrichments) return error.InvalidBatchRequest;
+                if (preparation.write_plan == null) preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+                if (preparation.generated == null and preparation.document_generated == null)
+                    preparation.document_generated = try prepareGeneratedEnrichments(self, preparation_alloc, effective_req, &.{}, .direct, &.{}, null, generated_memo);
+                try capturePreparedEnrichments(self, capture, effective_req, preparation.write_plan.?.plan(), if (preparation.generated) |*generated| generated else &preparation.document_generated.?);
+                errdefer if (capture.json) |json| {
+                    capture.alloc.free(json);
+                    capture.json = null;
+                };
+                try self.validateTransformReadSnapshot(transform_snapshot);
+                try self.validateGeneratedWriteReadSnapshot(preparation.generated_snapshot);
+                if (preparation.write_plan.?.generation() != S.ownerField(self, "core").*.index_manager.writePlanGeneration()) return error.PreparedGenerationChanged;
+                return;
             }
 
             var snapshot_mutation = if (opts.snapshot_mutation) |lease| lease.retain() else S.ownerField(self, "core").*.snapshot_admission.acquireMutation();
@@ -1257,6 +1295,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
             if (preparation.write_plan) |pinned| if (pinned.plan().group_sources) |group_plan| {
                 if (group_plan.entries.len > 0 and pinned.generation() != S.ownerField(self, "core").*.index_manager.writePlanGeneration()) return error.PreparedGenerationChanged;
+            };
+            if (opts.transaction_resolution == null) if (decoded_prepared) |packet| {
+                if (preparation.write_plan == null) preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+                try validatePreparedEnrichments(self, preparation_alloc, packet.value, preparation.write_plan.?.plan());
             };
             const use_preprepared_rows = blk: {
                 const rows = preparation.rows orelse break :blk false;
@@ -2275,9 +2317,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.delete_artifacts_ns, delete_artifacts_start_ns);
 
             const use_thin_replay_fast_path =
-                effective_req.sync_level != .full_text and
-                effective_req.sync_level != .enrichments and
-                effective_req.sync_level != .full_index and
+                (decoded_prepared != null or (effective_req.sync_level != .full_text and
+                    effective_req.sync_level != .enrichments and
+                    effective_req.sync_level != .full_index)) and
                 opts.force_generated_artifact_names.len == 0 and
                 !splitShadowRequiresMaterializedDerivedBatch(self);
             // Producer admission is independent of the replay representation.
@@ -2321,6 +2363,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 } else if (use_preprepared_document_generated) {
                     precomputed_generated = preparation.document_generated.?;
                     preparation.document_generated = null;
+                } else if (decoded_prepared) |packet| {
+                    // Durable transaction resolution may deliberately bypass
+                    // current-generation speculative preparation. It must still
+                    // consume the frozen effects, never invoke a producer.
+                    precomputed_generated = try restorePreparedEnrichments(preparation_alloc, packet.value);
                 } else {
                     precomputed_generated = try prepareGeneratedEnrichments(
                         self,
@@ -2333,6 +2380,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         generated_memo,
                     );
                 }
+
+                if (opts.transaction_resolution != null) if (decoded_prepared) |packet| {
+                    var plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+                    defer plan.release();
+                    if (plan.plan().artifact_catalogs == null or !std.mem.eql(u8, &packet.value.catalog_digest, &plan.plan().artifact_catalogs.?.digest())) {
+                        // A durable vote retains its admitted output, but may
+                        // not certify a replacement catalog. Replay owes the
+                        // current requirements after this historical commit.
+                        for (precomputed_generated.coverage_outcomes) |outcome| outcome.deinit(preparation_alloc);
+                        if (precomputed_generated.coverage_outcomes.len != 0) preparation_alloc.free(precomputed_generated.coverage_outcomes);
+                        precomputed_generated.coverage_outcomes = &.{};
+                        precomputed_generated.pending_catalog_work = true;
+                    }
+                };
 
                 if (opts.document_child_range_dispatcher) |dispatcher| {
                     try document_child_range_effects.partitionRemoteDocumentChildRangeGeneratedBatch(childRangeManifestReader(self), preparation_alloc, &precomputed_generated, &remote_child_range_dispatches, .{ .ptr = dispatcher.ptr, .select = dispatcher.select_destination });
@@ -2351,10 +2412,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
                 enrichment_fully_precomputed = effective_req.sync_level == .enrichments and
-                    precomputed_generated.generated_enrichment_refs.len == 0 and !precomputed_generated.pending_child_work;
+                    precomputed_generated.generated_enrichment_refs.len == 0 and !precomputed_generated.pending_child_work and !precomputed_generated.pending_catalog_work;
             }
             const include_generated_enrichment_hint = use_thin_replay_fast_path and
-                (if (prepare_generated) precomputed_generated.generated_enrichment_refs.len != 0 or precomputed_generated.pending_child_work else S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets());
+                (if (prepare_generated) precomputed_generated.generated_enrichment_refs.len != 0 or precomputed_generated.pending_child_work or precomputed_generated.pending_catalog_work else S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets());
             if (effective_req.merge_artifacts.len > 0 or (if (req.merge_page) |page| page.artifact_effects.len != 0 else false) or write_buffers.explicit_embedding_artifact_writes.items.len > 0 or
                 write_buffers.explicit_graph_artifact_writes.items.len > 0 or
                 precomputed_generated.artifact_writes.len > 0)
@@ -3184,6 +3245,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 write_buffers.store_writes.items,
             );
             defer authored_acceptance.deinit();
+            var generated_acceptance: ?@import("prepared_producer_acceptance.zig").Prepared = if (effective_req.commit_requires == .direct_enrichments) blk: {
+                var authority_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer authority_read.abort();
+                const current_authority = try @import("artifact_publication.zig").authority(&authority_read);
+                var current = if (decoded_prepared) |packet| std.meta.eql(current_authority, packet.value.authority) else true;
+                var plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
+                defer plan.release();
+                if (decoded_prepared) |packet| current = current and plan.plan().artifact_catalogs != null and std.mem.eql(u8, &packet.value.catalog_digest, &plan.plan().artifact_catalogs.?.digest());
+                break :blk try @import("prepared_producer_acceptance.zig").Prepared.init(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, plan.plan(), S.ownerField(self, "root_incarnation").*, sequence, if (current) precomputed_generated.prepared_producers else &.{}, write_buffers.store_writes.items, precomputed_generated.artifact_writes, precomputed_generated.artifact_delete_keys, if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null);
+            } else null;
+            defer if (generated_acceptance) |*acceptance| acceptance.deinit();
+            const commit_participant = if (generated_acceptance) |*acceptance| acceptance.participant() else if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null;
+
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             if (comptime @import("builtin").is_test) if (test_before_primary_commit) |hook| {
                 test_before_primary_commit = null;
@@ -3203,7 +3277,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     resolution.status,
                     resolution.commit_version,
                     .{
-                        .commit_participant = if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
+                        .commit_participant = commit_participant,
                         .writes = write_buffers.store_writes.items,
                         .deletes = write_buffers.delete_keys.items,
                         .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
@@ -3227,7 +3301,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     write_buffers.delete_keys.items,
                     replay_append,
                     store_batch_options,
-                    if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
+                    commit_participant,
                 );
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
@@ -3432,7 +3506,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             opts: BatchExecutionOptions,
             allocator_guard: *PreparedRowAllocator,
         ) anyerror!void {
-            if (req.commit_requires == .direct_enrichments and
+            if (req.commit_requires == .direct_enrichments and req.prepared_enrichments_json == null and opts.preparation_capture == null and
                 (opts.ordered_apply_receipt != null or opts.replication_applied_lsn_marker != null or
                     opts.bypass_replication_write_gate or opts.transaction_resolution != null or
                     opts.document_child_range_dispatcher != null or
@@ -4139,6 +4213,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .deletes = graph_batch.deletes,
                     .graph_writes = graph_batch.graph_writes,
                     .graph_deletes = graph_batch.graph_deletes,
+                    .commit_requires = if (intents.prepared_enrichments_json != null) .direct_enrichments else null,
+                    .prepared_enrichments_json = intents.prepared_enrichments_json,
                     .timestamp_ns = commit_version,
                     .document_version_scheme = if (intents.document_revisions) .revision_v1 else .legacy,
                     .sync_level = commit_sync_level,

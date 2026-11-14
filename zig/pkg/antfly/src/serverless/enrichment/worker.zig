@@ -220,6 +220,37 @@ pub const SparseEnricher = struct {
         self.* = undefined;
     }
 
+    /// Execute only source-local stages against an uncommitted postimage.
+    /// This request-owned enricher never appends WAL or publishes artifacts.
+    pub fn prepareDirectBody(self: *SparseEnricher, body: []const u8, policy: catalog_mod.NamespacePolicy, exclude_model_sources: bool) ![]u8 {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, body, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidDocumentBody;
+        // Client-supplied completion markers cannot satisfy a commit gate.
+        _ = parsed.value.object.swapRemove("_enrichment");
+        var current = try std.json.Stringify.valueAlloc(self.alloc, parsed.value, .{});
+        errdefer self.alloc.free(current);
+        const source = try self.alloc.dupe(u8, current);
+        defer self.alloc.free(source);
+        const pipeline = @import("pipeline.zig").builtinPipelineForPolicy(policy);
+        var eligible: usize = 0;
+        for (pipeline.slice()) |spec| {
+            if (exclude_model_sources and spec.stage == .chunk_embeddings) continue;
+            eligible += 1;
+            const preference: catalog_mod.EnrichmentModelPreference = if ((spec.stage == .lexical_sparse and self.sparse_embedder != null) or (spec.stage == .chunk_embeddings and self.chunk_embedder != null)) .require_model else spec.model_preference;
+            const result = try buildDerivedBodyAlloc(self, spec.stage, source, spec.pipeline_version, preference);
+            if (result.body) |next| {
+                defer self.alloc.free(next);
+                const merged = try preserveOtherEnrichmentOutputsAlloc(self.alloc, current, next, spec.stage);
+                self.alloc.free(current);
+                current = merged;
+            }
+            if (current.len > 8 * 1024 * 1024) return error.CommitRequirementTooLarge;
+        }
+        if (pipeline.len != 0 and eligible == 0) return error.UnsupportedCommitRequirement;
+        return current;
+    }
+
     pub fn configureModelChunkerFromIndexes(self: *SparseEnricher, indexes: std.json.Value, index_name: []const u8, options: @import("antfly_local_sources").inference_managed_embedder.InitOptions) !void {
         if (indexes != .object) return error.InvalidChunkerConfig;
         const index = indexes.object.get(index_name) orelse {
@@ -4544,4 +4575,20 @@ test "model aware media serverless completed input accounting survives output gr
         };
     }
     try std.testing.expect(rejected);
+}
+
+test "commit requirements serverless direct preparation rejects models and ignores forged completion" {
+    const a = std.testing.allocator;
+    var enricher = SparseEnricher.init(a, undefined, undefined, undefined, undefined);
+    defer enricher.deinit();
+    try enricher.setSparseEmbedder(FailingSparseEmbedder.interface(), "sparse");
+    try std.testing.expectError(error.SparseEmbeddingModelFailed, enricher.prepareDirectBody("{\"text\":\"source\",\"sparse_embedding\":{\"1\":1},\"_enrichment\":{\"lexical_sparse_version\":999}}", .{ .enrichment_enabled = true }, false));
+    enricher.clearSparseEmbedder();
+    const body = try enricher.prepareDirectBody("{\"text\":\"source document\"}", .{ .chunk_preview_enabled = true }, false);
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.contains("chunk_preview"));
+    // A model/media-only plan cannot silently become an empty gate.
+    try std.testing.expectError(error.UnsupportedCommitRequirement, enricher.prepareDirectBody("{\"text\":\"source\"}", .{ .chunk_embeddings_enabled = true }, true));
 }

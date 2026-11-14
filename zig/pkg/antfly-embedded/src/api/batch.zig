@@ -116,6 +116,7 @@ pub fn encodeBatchResponse(alloc: std.mem.Allocator, result: BatchResult) ![]u8 
     return ant_json.valueAlloc(alloc, result, .{ .emit_null_optional_fields = false });
 }
 const private_fields = [_][]const u8{
+    "_prepared_enrichments",
     "_activate_range_tracking",
     "_artifact_catalog",
     "_artifact_publication",

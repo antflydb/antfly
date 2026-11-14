@@ -5402,6 +5402,16 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, req, null);
     }
 
+    pub fn prepareEnrichments(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest) ![]u8 {
+        const json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
+        defer alloc.free(json);
+        var lease = try self.acquire(group_id, table_name);
+        defer lease.deinit();
+        var response = try lease.owner().prepareEnrichments(table_name, json);
+        defer response.deinit();
+        return alloc.dupe(u8, response.bytes());
+    }
+
     fn batchGroupLocalWithDescriptor(
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
@@ -6040,6 +6050,8 @@ pub const ProvisionedKernelOwnerSource = struct {
             .row_policy_database = req.row_policy_database,
             .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
             .normalized_graph_rows = req.normalized_graph_rows,
+            .commit_requires = req.commit_requires,
+            .prepared_enrichments_json = req.prepared_enrichments_json,
             .writes = writes,
             .deletes = req.deletes,
             .transforms = req.transforms,

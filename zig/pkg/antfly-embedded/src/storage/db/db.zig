@@ -7684,6 +7684,28 @@ pub const DB = struct {
     /// is committed (pending or needing repair); before it, the batch was not
     /// applied unless the error is an unknown outcome. Keeps `batch`'s
     /// ANTFLY_BENCH_METRICS phase profile.
+    /// Capture normalized source mutations and producer outputs without commit.
+    pub const validatePreparedEnrichments = local_mutation.validatePreparedEnrichments;
+
+    pub fn prepareDirectEnrichments(self: *DB, alloc: Allocator, req: types.BatchRequest) ![]u8 {
+        if (req.commit_requires != .direct_enrichments or req.prepared_enrichments_json != null) return error.InvalidBatchRequest;
+        const digest = try execution_resources.PreparedEnrichments.requestDigest(alloc, req);
+        if (req.transaction) |control| if (control == .prepare) {
+            var manager = try self.core.initTxnManager();
+            defer manager.deinit();
+            if (try manager.loadPreparedEnrichments(alloc, control.prepare.txn_id)) |bytes| {
+                errdefer alloc.free(bytes);
+                var packet = try std.json.parseFromSlice(execution_resources.PreparedEnrichments, alloc, bytes, .{});
+                defer packet.deinit();
+                if (!std.mem.eql(u8, &packet.value.request_digest, &digest)) return error.VersionConflict;
+                return bytes;
+            }
+        };
+        var output = execution_resources.PreparationCapture{ .alloc = alloc, .request_digest = digest };
+        try self.batchInternal(req, null, .{ .preparation_capture = &output, .wait_for_sync_level = false });
+        return output.json orelse error.InvalidBatchRequest;
+    }
+
     pub fn batchTracked(self: *DB, req: types.BatchRequest, primary_committed: *bool) anyerror!void {
         return self.batchTrackedWithMarker(req, primary_committed, null);
     }
@@ -25796,7 +25818,40 @@ pub const DB = struct {
         });
     }
 
-    pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
+    fn transactionPreparationRequest(req: types.TransactionIntentRequest) types.BatchRequest {
+        return .{
+            .commit_requires = req.commit_requires,
+            .writes = @ptrCast(req.writes),
+            .deletes = req.deletes,
+            .transforms = req.transforms,
+            .graph_writes = req.graph_writes,
+            .graph_deletes = req.graph_deletes,
+            .predicates = req.predicates,
+            .integrity = req.integrity,
+            .integrity_commands = req.integrity_commands,
+            .schema_version = req.schema_version,
+            .relational_schema_version = req.relational_schema_version,
+            .relational_integrity_generation_set = req.relational_integrity_generation_set,
+            .relational_activation = req.relational_activation,
+            .relational_retirement = req.relational_retirement,
+            .relational_index_maintenance = req.relational_index_maintenance,
+            .restore_staging_scope = req.restore_staging_scope,
+            .restore_staging_plan_id = req.restore_staging_plan_id,
+            .relational_repair = req.relational_repair,
+            .normalized_graph_rows = req.normalized_graph_rows,
+        };
+    }
+
+    pub fn writeTransaction(self: *DB, txn_id: types.TxnId, incoming_req: types.TransactionIntentRequest) !void {
+        var req = incoming_req;
+        var prepared_json: ?[]u8 = null;
+        defer if (prepared_json) |bytes| self.alloc.free(bytes);
+        if (req.commit_requires == .direct_enrichments and req.prepared_enrichments_json == null) {
+            var preparation_req = transactionPreparationRequest(req);
+            preparation_req.transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 0 } };
+            prepared_json = try self.prepareDirectEnrichments(self.alloc, preparation_req);
+            req.prepared_enrichments_json = prepared_json;
+        }
         if (comptime storage_engine.enabled) return storage_engine.call("writeTransaction", .{ self, txn_id, req });
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
@@ -25871,12 +25926,58 @@ pub const DB = struct {
     fn writeTransactionInternalOnce(
         self: *DB,
         txn_id: types.TxnId,
-        req: types.TransactionIntentRequest,
+        incoming_req: types.TransactionIntentRequest,
         ordered_receipt: ?OrderedApplyReceipt,
         preparation_alloc: Allocator,
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
     ) !void {
+        var req = incoming_req;
+        var packet = if (req.prepared_enrichments_json) |json|
+            try std.json.parseFromSlice(execution_resources.PreparedEnrichments, preparation_alloc, json, .{ .allocate = .alloc_always })
+        else
+            null;
+        defer if (packet) |*value| value.deinit();
+        if (req.commit_requires == .direct_enrichments and packet == null) return error.InvalidBatchRequest;
+        if (packet) |value| {
+            if (req.commit_requires != .direct_enrichments) return error.InvalidBatchRequest;
+            const digest = try execution_resources.PreparedEnrichments.requestDigest(preparation_alloc, transactionPreparationRequest(req));
+            if (!std.mem.eql(u8, &digest, &value.value.request_digest)) return error.InvalidBatchRequest;
+            {
+                try self.lockApplyForPortableRuntime();
+                defer self.core.unlockApply();
+                var manager = try self.core.initTxnManager();
+                defer manager.deinit();
+                if (try manager.loadPreparedEnrichments(preparation_alloc, txn_id)) |previous| {
+                    defer preparation_alloc.free(previous);
+                    if (!std.mem.eql(u8, previous, req.prepared_enrichments_json.?)) return error.VersionConflict;
+                    if (ordered_receipt) |identity| {
+                        switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
+                            .already_applied => return,
+                            .apply => {},
+                        }
+                        var marker_value: [ordered_apply_receipt_value_len]u8 = undefined;
+                        const marker = orderedApplyReceiptWrite(identity, &marker_value);
+                        try self.core.store.putBatch(&.{marker}, &.{});
+                    }
+                    return;
+                }
+            }
+            const writes = try preparation_alloc.alloc(types.TransactionWrite, value.value.writes.len);
+            errdefer preparation_alloc.free(writes);
+            for (writes, value.value.writes) |*out, write| out.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
+            req.writes = writes;
+            req.deletes = value.value.deletes;
+            req.transforms = &.{};
+            req.graph_writes = value.value.graph_writes;
+            req.graph_deletes = value.value.graph_deletes;
+            // Reuse the capture-only admission pipeline to authenticate the
+            // closed producer set and physical key scopes without inference.
+            var capture: execution_resources.PreparationCapture = .{ .alloc = preparation_alloc };
+            defer if (capture.json) |bytes| preparation_alloc.free(bytes);
+            try self.batchInternal(.{ .writes = value.value.writes, .deletes = value.value.deletes, .graph_writes = value.value.graph_writes, .graph_deletes = value.value.graph_deletes, .commit_requires = .direct_enrichments, .prepared_enrichments_json = req.prepared_enrichments_json }, null, .{ .preparation_capture = &capture, .wait_for_sync_level = false });
+        }
+        defer if (packet != null) preparation_alloc.free(req.writes);
         if (req.relational_index_maintenance != null and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
                 req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or
@@ -26087,6 +26188,11 @@ pub const DB = struct {
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
+        if (packet) |value| {
+            var plan = try self.core.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            try self.validatePreparedEnrichments(preparation_alloc, value.value, plan.plan());
+        }
         if (binding == null) try self.validatePreparedSchemaViewLocked(prepared_schema_view);
         if (row_policy_principal) |principal| {
             const view = prepared_schema_view orelse return error.RowPolicyCatalogChanged;
@@ -26205,6 +26311,21 @@ pub const DB = struct {
         const index_spans = try self.collectIndexSpanReservations(preparation_alloc, intents.items, prepared_schema_view);
         defer if (index_spans.len != 0) preparation_alloc.free(index_spans);
         try self.prepareOnlineVectorIntentBoundsLocked(preparation_alloc, intents.items, prepared_schema_view);
+        if (packet) |value| if (value.value.artifact_writes.len != 0 or value.value.artifact_deletes.len != 0) {
+            // The retained-source reservation covers generated effects before
+            // this participant votes yes, including output-only tombstones.
+            const first = for (intents.items) |*intent| {
+                if (!isMetadataKey(intent.key)) break intent;
+            } else return error.InvalidBatchRequest;
+            for (value.value.artifact_writes) |write| {
+                first.retained_artifact_bytes = std.math.add(u64, first.retained_artifact_bytes, 16 + write.key.len + write.value.len) catch return error.TransactionTooLarge;
+                first.retained_artifact_keys = std.math.add(u64, first.retained_artifact_keys, 1) catch return error.TransactionTooLarge;
+            }
+            for (value.value.artifact_deletes) |key| {
+                first.retained_artifact_bytes = std.math.add(u64, first.retained_artifact_bytes, 16 + key.len) catch return error.TransactionTooLarge;
+                first.retained_artifact_keys = std.math.add(u64, first.retained_artifact_keys, 1) catch return error.TransactionTooLarge;
+            }
+        };
         var endpoint_dependencies = std.heap.ArenaAllocator.init(preparation_alloc);
         defer endpoint_dependencies.deinit();
         try self.prepareGraphEndpointDependenciesLocked(preparation_alloc, endpoint_dependencies.allocator(), txn_id, intents.items, prepared_schema_view, &predicates);
@@ -26220,10 +26341,11 @@ pub const DB = struct {
                 txn_id,
                 intents.items,
                 predicates.items,
-                .{ .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
+                .{ .prepared_enrichments_json = req.prepared_enrichments_json, .writes = &.{marker}, .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null }, .preparation_allocator = preparation_alloc, .index_span_digests = index_spans, .graph_sources = graph_sources, .document_revisions = req.document_version_scheme == .revision_v1 or (req.document_version_scheme == .admit_current and ordered_receipt == null) },
             );
         } else {
             try self.core.writeIntentsExtraBatch(txn_id, intents.items, predicates.items, .{
+                .prepared_enrichments_json = req.prepared_enrichments_json,
                 .document_revisions = req.document_version_scheme == .revision_v1 or req.document_version_scheme == .admit_current,
                 .preparation_allocator = preparation_alloc,
                 .schema_binding = .{ .version = if (prepared_schema_view) |view| view.version() else null },
@@ -35018,7 +35140,9 @@ pub const DB = struct {
         const retired_unit_jobs = try @import("artifact_unit_jobs.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
         const retired_authored = try @import("artifact_authored_acceptance.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
         const swept_authored = try @import("artifact_authored_acceptance.zig").collectCurrentPage(scratch, self.core.store, self.root_incarnation);
-        const retired = retired_work and retired_proofs and retired_checkpoints and retired_streams and retired_completions and retired_native and retired_inventories and retired_units and retired_unit_jobs and retired_authored and swept_authored;
+        const retired_prepared = try @import("prepared_producer_acceptance.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
+        const swept_prepared = try @import("prepared_producer_acceptance.zig").collectCurrentPage(scratch, self.core.store, self.root_incarnation);
+        const retired = retired_work and retired_proofs and retired_checkpoints and retired_streams and retired_completions and retired_native and retired_inventories and retired_units and retired_unit_jobs and retired_authored and swept_authored and retired_prepared and swept_prepared;
         if (publication_mode == .ordered) {
             var prepared = (try @import("artifact_producer_baseline.zig").prepareRaft(scratch, self.core.store)) orelse {
                 var validation = (try @import("artifact_producer_validation.zig").prepareRaft(scratch, self.core.store)) orelse {
@@ -85802,6 +85926,157 @@ test "db commit requirements output budget stops subsequent producer work atomic
     try std.testing.expect(!committed);
     for ([_][]const u8{ "one", "two", "three" }) |key|
         try std.testing.expect((try db.get(a, key)) == null);
+}
+
+test "db commit requirements prepared command replays binary artifacts without inference" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+        forbidden: bool = false,
+        fn produce(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.forbidden) return error.TestUnexpectedResult;
+            self.calls += 1;
+            return out.dupe(u8, &.{ 0xff, 0, 0xfe });
+        }
+    };
+    for ([_]bool{ false, true }) |ordered_apply| {
+        var directory = try TestDirectory.init("commit-requirements");
+        defer directory.cleanup();
+        var fake = Fake{};
+        var db = try DB.open(a, directory.path(), .{
+            .identity_namespace = if (ordered_apply) .{ .table_id = 1, .shard_id = 2, .range_id = 2 } else .{},
+            .online_source_authority = if (ordered_apply) .raft else null,
+            .start_index_workers = false,
+            .start_optional_runtime_workers = false,
+            .enrichment = .{ .owner_id = "prepared", .asset_producer = .{ .ptr = &fake, .vtable = &.{
+                .produce = Fake.produce,
+                .invocation_memory_for_requests = TestAssetProducer.invocationMemory,
+            } } },
+        });
+        defer db.close();
+        try db.addEnrichment(.{
+            .name = "binary",
+            .kind = .asset,
+            .field = "body",
+            .content_type = "application/octet-stream",
+            .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        });
+        if (ordered_apply) {
+            const publication = @import("artifact_publication.zig");
+            var inventory = try db.artifactInventoryCommand(a);
+            defer inventory.catalogs.deinit(a);
+            inventory.binding.effect_protocol = 15;
+            var namespace: publication.Namespace = undefined;
+            doc_identity.encodeNamespace(&namespace, db.core.identity_namespace);
+            var txn = try db.core.store.beginWriteTxn();
+            errdefer txn.abort();
+            const catalogs = try @import("artifact_inventory.zig").catalogs(&txn);
+            const authority: publication.Authority = .{ .namespace = namespace, .epoch = 1, .catalog_digest = catalogs.digest() };
+            try @import("artifact_inventory.zig").stageOrdered(a, &txn, inventory, 1);
+            try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = namespace, .authority_epoch = authority.epoch, .catalog_digest = authority.catalog_digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+            try @import("artifact_producer_obligations.zig").begin(a, &txn, authority);
+            try @import("artifact_producer_validation.zig").begin(a, &txn, authority);
+            try txn.commit();
+        }
+        var request = types.BatchRequest{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"hello\"}" }}, .sync_level = .write, .commit_requires = .direct_enrichments };
+        const packet = try db.prepareDirectEnrichments(a, request);
+        defer a.free(packet);
+        try std.testing.expect((try db.get(a, "doc")) == null);
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        fake.forbidden = true;
+        request.prepared_enrichments_json = packet;
+        if (ordered_apply) try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 2 }, true) else try db.batch(request);
+        const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "binary");
+        defer a.free(key);
+        const artifact = try db.core.store.get(a, key);
+        defer a.free(artifact);
+        try std.testing.expectEqualSlices(u8, &.{ 0xff, 0, 0xfe }, artifact);
+        if (ordered_apply) {
+            // Identical log-entry replay is a no-op; a different entry may not
+            // reuse a stale source fence.
+            try db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 2 }, true);
+            try std.testing.expectError(error.VersionConflict, db.applyOrderedCommittedMutation(request, .{ .term = 1, .index = 3 }, true));
+            var read = try db.core.store.beginReadTxn();
+            defer read.abort();
+            var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+            defer plan.release();
+            const producer = plan.plan().generated_templates[0];
+            const binding = (try @import("artifact_producer_input.zig").authorizeTemplate(a, &read, producer, plan.plan())).?;
+            var closure = (try @import("prepared_producer_acceptance.zig").read(a, &read, db.root_incarnation, "doc", binding.requirement.id, "binary")).?;
+            defer closure.deinit();
+            try closure.requireCurrent(&read, db.root_incarnation);
+            try db.applyOrderedCommittedMutation(.{ .deletes = &.{"doc"}, .commit_requires = .none }, .{ .term = 1, .index = 4 }, true);
+            try std.testing.expect(try @import("prepared_producer_acceptance.zig").collectCurrentPage(a, db.core.store, db.root_incarnation));
+            try std.testing.expectError(error.NotFound, db.core.store.get(a, closure.receipt_key));
+            // A pinned pre-delete reader retains its coherent old evidence.
+            try closure.requireCurrent(&read, db.root_incarnation);
+        } else try std.testing.expectError(error.VersionConflict, db.batch(request));
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    }
+}
+
+test "db commit requirements transaction retains prepared effects through restart and abort" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        calls: usize = 0,
+        forbidden: bool = false,
+        fn produce(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.forbidden) return error.TestUnexpectedResult;
+            self.calls += 1;
+            return out.dupe(u8, "prepared transaction output");
+        }
+    };
+    var directory = try TestDirectory.init("commit-requirements-transaction");
+    defer directory.cleanup();
+    var fake = Fake{};
+    const options: OpenOptions = .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "prepared-transaction", .asset_producer = .{ .ptr = &fake, .vtable = &.{ .produce = Fake.produce, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } } } };
+    var committed: types.TxnId = undefined;
+    var aborted: types.TxnId = undefined;
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}" });
+        try db.batch(.{ .writes = &.{.{ .key = "keep", .value = "{\"body\":\"original\"}" }}, .commit_requires = .none });
+        committed = try db.beginTransaction(100);
+        aborted = try db.beginTransaction(101);
+        try db.writeTransaction(committed, .{ .writes = &.{.{ .key = "accepted", .value = "{\"body\":\"new\"}" }}, .commit_requires = .direct_enrichments });
+        try db.writeTransaction(aborted, .{ .writes = &.{.{ .key = "rejected", .value = "{\"body\":\"abort me\"}" }}, .deletes = &.{"keep"}, .commit_requires = .direct_enrichments });
+        try std.testing.expectEqual(@as(usize, 2), fake.calls);
+        fake.forbidden = true;
+        try db.writeTransaction(committed, .{ .writes = &.{.{ .key = "accepted", .value = "{\"body\":\"new\"}" }}, .commit_requires = .direct_enrichments });
+        try std.testing.expectError(error.VersionConflict, db.writeTransaction(committed, .{ .writes = &.{.{ .key = "accepted", .value = "{\"body\":\"different\"}" }}, .commit_requires = .direct_enrichments }));
+        try std.testing.expectEqual(@as(usize, 2), fake.calls);
+        try std.testing.expect((try db.get(a, "accepted")) == null);
+        try std.testing.expect((try db.get(a, "rejected")) == null);
+        const artifact_key = try internal_keys.artifactNamedPrefixAlloc(a, "accepted", "asset", "summary");
+        defer a.free(artifact_key);
+        try std.testing.expectError(error.NotFound, db.core.store.get(a, artifact_key));
+        try std.testing.expectError(error.IntentConflict, db.batch(.{ .writes = &.{.{ .key = "accepted", .value = "{}" }}, .commit_requires = .none }));
+        try db.addEnrichment(.{ .name = "later", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"later-generator\"}}" });
+    }
+    fake.forbidden = true;
+    {
+        var db = try DB.open(a, directory.path(), options);
+        defer db.close();
+        try db.commitTransaction(committed, 200);
+        try db.abortTransaction(aborted, 201);
+        // Terminal retries neither publish outputs again nor invoke a model.
+        try db.commitTransaction(committed, 200);
+        try db.abortTransaction(aborted, 201);
+        const accepted = (try db.get(a, "accepted")).?;
+        defer a.free(accepted);
+        const keep = (try db.get(a, "keep")).?;
+        defer a.free(keep);
+        try std.testing.expect((try db.get(a, "rejected")) == null);
+        const key = try internal_keys.artifactNamedPrefixAlloc(a, "accepted", "asset", "summary");
+        defer a.free(key);
+        const artifact = try db.core.store.get(a, key);
+        defer a.free(artifact);
+        try std.testing.expectEqualStrings("prepared transaction output", artifact);
+        try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    }
 }
 
 test "db commit requirements missing provider cannot defer required work" {

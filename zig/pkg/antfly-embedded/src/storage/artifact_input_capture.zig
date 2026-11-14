@@ -65,6 +65,8 @@ pub const Capture = struct {
     }
 
     pub fn touch(self: *Capture, alloc: std.mem.Allocator, txn: anytype, key: []const u8, value: ?[]const u8) !void {
+        errdefer self.poisoned = true;
+        if (self.participant) |participant| if (participant.charge) |charge| try charge(participant.ptr, key, value);
         if (self.staging) return;
         if (self.participant) |participant| participant.observe(participant.ptr, key, value);
         self.allocator = alloc;
@@ -205,6 +207,20 @@ pub const Capture = struct {
         }
         var artifacts = self.artifacts.keyIterator();
         while (artifacts.next()) |artifact| try txn.put(&publication.artifactRevisionKey(expected.namespace, artifact.*), &encoded);
+        // A producer's closed result is invalidated by changes to that stream,
+        // not by unrelated siblings publishing against the same primary row.
+        var scope_keys: std.AutoHashMapUnmanaged(publication.ProducerScopeRevisionKey, void) = .empty;
+        const scope_alloc = self.allocator orelse return error.ArtifactCatalogCorrupt;
+        defer scope_keys.deinit(scope_alloc);
+        var scope_artifacts = self.artifacts.keyIterator();
+        while (scope_artifacts.next()) |artifact| {
+            const stream = (try keys.artifactNameAlloc(scope_alloc, artifact.*)) orelse continue;
+            defer scope_alloc.free(stream);
+            const document = try @import("db/artifact_publication_owner.zig").documentAlloc(scope_alloc, artifact.*);
+            defer scope_alloc.free(document);
+            const key = publication.producerScopeRevisionKey(expected.namespace, document, stream);
+            if (!(try scope_keys.getOrPut(scope_alloc, key)).found_existing) try txn.put(&key, &encoded);
+        }
         if (self.participant) |participant| {
             var view_txn = txn;
             try participant.stage(participant.ptr, @import("commit_participant.zig").View.from(&view_txn), &encoded);

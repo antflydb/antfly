@@ -882,6 +882,7 @@ pub const storage_db_field_projection_source = @import("storage/db/field_project
 pub const storage_source_value_identity = @import("storage/source_value_identity.zig");
 
 pub const storage_db_commit_requirements = @import("storage/db/commit_requirements.zig");
+pub const storage_db_prepared_producer_acceptance = @import("storage/db/prepared_producer_acceptance.zig");
 pub const storage_db_mutation_plan = @import("storage/db/mutation_plan.zig");
 
 pub const storage_db_query_cypher_projection = @import("storage/db/query/cypher_projection.zig");

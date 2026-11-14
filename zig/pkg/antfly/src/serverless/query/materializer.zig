@@ -130,11 +130,11 @@ pub fn materializeWithBodiesAlloc(alloc: Allocator, base_docs: []const Document,
         slot.last_lsn = mutation.lsn;
         slot.last_timestamp_ns = mutation.timestamp_ns;
         switch (mutation.kind) {
-            .upsert, .checkpoint, .enriched => {
+            .upsert, .checkpoint, .enriched, .prepared => {
                 const raw = mutation.body orelse "";
                 if (mutation.kind == .upsert and facts.isInternalBody(raw)) return error.InvalidDocumentBody;
                 var source_input_bytes: ?u64 = null;
-                const next_body = if (mutation.kind == .enriched) enriched: {
+                const next_body = if ((mutation.kind == .enriched or mutation.kind == .prepared)) enriched: {
                     const value = try facts.parseEnrichedBody(raw);
                     source_input_bytes = value.source_input_bytes;
                     break :enriched try alloc.dupe(u8, value.body);
@@ -295,4 +295,17 @@ test "serverless materializer preserves private source accounting and public rep
     try std.testing.expectEqual(@as(?u64, null), replaced[0].source_input_bytes);
     try std.testing.expectError(error.InvalidDocumentBody, materializeAlloc(a, &.{.{ .lsn = 1, .timestamp_ns = 1, .kind = .upsert, .doc_id = "a", .body = payload }}));
     try std.testing.expectError(error.InvalidDocumentBody, materializeAlloc(a, &.{.{ .lsn = 1, .timestamp_ns = 1, .kind = .enriched, .doc_id = "a", .body = "AFDEN001" }}));
+}
+
+test "commit requirements prepared WAL postimage preserves source cost and primary position" {
+    const a = std.testing.allocator;
+    const body = "{\"text\":\"source\",\"generated\":\"prepared\"}";
+    const payload = try facts.encodeEnrichedBodyAlloc(a, body, 6);
+    defer a.free(payload);
+    const docs = try materializeAlloc(a, &.{.{ .lsn = 7, .timestamp_ns = 11, .kind = .prepared, .doc_id = "doc", .body = payload }});
+    defer freeDocuments(a, docs);
+    try std.testing.expectEqual(@as(usize, 1), docs.len);
+    try std.testing.expectEqualStrings(body, docs[0].body);
+    try std.testing.expectEqual(@as(?u64, 6), docs[0].source_input_bytes);
+    try std.testing.expectEqual(@as(u64, 7), docs[0].last_lsn);
 }

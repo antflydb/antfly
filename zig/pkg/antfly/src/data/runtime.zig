@@ -1444,6 +1444,11 @@ const RaftTableApplyStateMachine = struct {
                     if (err == @field(@import("../api/relational_row_errors.zig").PolicyError, field)) return null;
                 }
             };
+            if (req.prepared_enrichments_json != null) switch (err) {
+                error.CommitRequirementTooLarge => return .transaction_too_large,
+                error.EnrichmentSourceChanged, error.ArtifactCatalogDrift => return .version_conflict,
+                else => {},
+            };
             return fromError(err);
         }
     };
@@ -12710,6 +12715,8 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null)
+            return @import("../common/data_raft_protocol.zig").batch_prepared_enrichments_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))
             return @import("../common/data_raft_protocol.zig").batch_dense_artifact_flags_protocol_version;
         if (req.graph_endpoint_cleanup) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_neutral_protocol_version;
@@ -13277,13 +13284,13 @@ pub const DataServer = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        req: antfly.db.types.BatchRequest,
+        incoming_req: antfly.db.types.BatchRequest,
         route: DataRaftBatchRoute,
         leader_wait_ns: u64,
     ) !void {
-        // Never let the replicated apply's write-only wait erase an admission
-        // prerequisite. Enabling gates requires an immutable prepared command.
-        if (req.commit_requires == .direct_enrichments) return error.UnsupportedCommitRequirement;
+        var req = incoming_req;
+        var prepared_json: ?[]u8 = null;
+        defer if (prepared_json) |bytes| alloc.free(bytes);
         try @import("antfly_local_sources").storage_db_artifact_publication.validateRequest(alloc, req);
         try @import("antfly_local_sources").storage_db_artifact_publication_transport.validateBatchRequest(req);
         // Do not allow a private/direct batch route to bypass the metadata
@@ -13443,6 +13450,25 @@ pub const DataServer = struct {
                 if (self.dataRaftMonotonicNs() >= deadline_ns) {
                     std.log.warn("data raft pre-admission failed group_id={} phase=protocol_preflight err=Timeout", .{group_id});
                     return error.LeaderUnavailable;
+                }
+                // Inference runs only on the preflighted leader, outside the
+                // Raft proposal lock. Receiver-owned source/catalog fences are
+                // rechecked atomically at ordered apply on every replica.
+                if (req.commit_requires == .direct_enrichments and req.prepared_enrichments_json == null) {
+                    const activation = protocol_activation_entry.?;
+                    if (activation.protocol_version.load(.acquire) < minimum_protocol_version and
+                        protocol_preflight.activatable_version < minimum_protocol_version and
+                        activation.pending_version.load(.acquire) < minimum_protocol_version) return error.RaftBatchMergeProtocolUnavailable;
+                    if (protocol_activation_lock_owned) {
+                        protocol_activation_entry.?.activation_mutex.unlock();
+                        protocol_activation_lock_owned = false;
+                    }
+                    if (comptime linked_storage) {
+                        prepared_json = try (try self.ensureKernelOwnerSource()).prepareEnrichments(alloc, group_id, table_name, req);
+                        req.prepared_enrichments_json = prepared_json;
+                    } else return error.CommitRequirementUnavailable;
+                    try ensureDataRaftBatchRouteActive(route);
+                    if (self.dataRaftMonotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                 }
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 if (req.restore_staging_scope) |scope| {

@@ -506,6 +506,7 @@ test "merge page tail binding cannot be downgraded to snapshot only wire" {
 }
 
 pub const OwnedBatchRequest = struct {
+    prepared_enrichments_json: ?[]u8 = null,
     writes: []db_mod.types.BatchWrite = &.{},
     deletes: [][]const u8 = &.{},
     transforms: []db_mod.types.DocumentTransform = &.{},
@@ -550,6 +551,7 @@ pub const OwnedBatchRequest = struct {
     req: db_mod.types.BatchRequest = .{},
 
     pub fn deinit(self: *OwnedBatchRequest, alloc: std.mem.Allocator) void {
+        if (self.prepared_enrichments_json) |json| alloc.free(json);
         @import("relational_integrity_wire.zig").free(alloc, self.integrity);
         if (self.integrity_commands) |*commands| commands.deinit();
         if (self.graph_endpoint_cleanup_guards) |*guards| guards.deinit();
@@ -739,10 +741,11 @@ fn parseBatchRequestWithOptions(
     };
     defer parsed.deinit();
     const versioned = parsed.value == .array;
+    const prepared_envelope = versioned and parsed.value.array.items.len == 2 and parsed.value.array.items[0] == .string and std.mem.eql(u8, parsed.value.array.items[0].string, "prepared-enrichments-batch-v1");
     const document_versions_envelope = versioned and parsed.value.array.items.len == 2 and parsed.value.array.items[0] == .string and std.mem.eql(u8, parsed.value.array.items[0].string, "document-revisions-batch-v1");
     const root_value = if (versioned) blk: {
         const entries = parsed.value.array.items;
-        if (!allow_internal or entries.len != 2 or entries[0] != .string or (!document_versions_envelope and !std.mem.eql(u8, entries[0].string, "row-semantics-batch-v1"))) return error.InvalidBatchRequest;
+        if (!allow_internal or entries.len != 2 or entries[0] != .string or (!prepared_envelope and !document_versions_envelope and !std.mem.eql(u8, entries[0].string, "row-semantics-batch-v1"))) return error.InvalidBatchRequest;
         break :blk entries[1];
     } else parsed.value;
     if (root_value != .object) return error.InvalidBatchRequest;
@@ -1669,7 +1672,13 @@ fn parseBatchRequestWithOptions(
     // strings, not the entire parsed request, alive with the owned batch.
     const admission_bytes: ?[]u8 = if (row_policy_proof.len == 0) null else try std.mem.concat(alloc, u8, &.{ row_policy_proof, row_policy_database });
     errdefer if (admission_bytes) |bytes| alloc.free(bytes);
+    const prepared_json = if (root.get("_prepared_enrichments")) |value| blk: {
+        if (!allow_internal or !prepared_envelope or value != .object) return error.InvalidBatchRequest;
+        break :blk try std.json.Stringify.valueAlloc(alloc, value, .{});
+    } else null;
+    errdefer if (prepared_json) |json| alloc.free(json);
     const result_value: OwnedBatchRequest = .{
+        .prepared_enrichments_json = prepared_json,
         .writes = writes,
         .deletes = deletes,
         .transforms = transforms,
@@ -1753,6 +1762,7 @@ fn parseBatchRequestWithOptions(
             .timestamp_ns = timestamp_ns,
             .document_version_scheme = document_version_scheme,
             .sync_level = sync_level,
+            .prepared_enrichments_json = prepared_json,
             .commit_requires = if (root.get("commit_requires")) |value| try @import("../storage/db/mutation_values.zig").parseCommitRequires(value) else null,
             .reject_graph_transform_projections = reject_graph_transform_projections,
             .split_checkpoint = split_checkpoint,
@@ -1782,7 +1792,8 @@ fn parseBatchRequestWithOptions(
     try @import("../storage/db/online_source_contract.zig").validateRequest(result_value.req);
     try @import("../storage/db/artifact_inventory.zig").validateRequest(result_value.req);
     if (requiresRowSemanticsEnvelope(result_value.req.writes, result_value.req.predicates) and !versioned) return error.InvalidBatchRequest;
-    if (allow_internal and requiresDocumentVersionsEnvelope(result_value.req) != document_versions_envelope) return error.InvalidBatchRequest;
+    if (prepared_envelope != (result_value.req.prepared_enrichments_json != null or result_value.req.commit_requires == .direct_enrichments)) return error.InvalidBatchRequest;
+    if (allow_internal and !prepared_envelope and requiresDocumentVersionsEnvelope(result_value.req) != document_versions_envelope) return error.InvalidBatchRequest;
     return result_value;
 }
 
@@ -1952,8 +1963,8 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
-    const versioned = requiresRowSemanticsEnvelope(req.writes, req.predicates) or requiresDocumentVersionsEnvelope(req);
-    if (versioned) try writer.writeAll(if (requiresDocumentVersionsEnvelope(req)) "[\"document-revisions-batch-v1\"," else "[\"row-semantics-batch-v1\",");
+    const versioned = req.prepared_enrichments_json != null or req.commit_requires == .direct_enrichments or requiresRowSemanticsEnvelope(req.writes, req.predicates) or requiresDocumentVersionsEnvelope(req);
+    if (versioned) try writer.writeAll(if (req.prepared_enrichments_json != null or req.commit_requires == .direct_enrichments) "[\"prepared-enrichments-batch-v1\"," else if (requiresDocumentVersionsEnvelope(req)) "[\"document-revisions-batch-v1\"," else "[\"row-semantics-batch-v1\",");
 
     try writer.writeAll("{\"inserts\":{");
     for (if (req.merge_page != null) &.{} else req.writes, 0..) |write, i| {
@@ -2382,6 +2393,10 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
             },
         }
         try writer.writeByte('}');
+    }
+    if (req.prepared_enrichments_json) |json| {
+        try writer.writeAll(",\"_prepared_enrichments\":");
+        try writer.writeAll(json);
     }
     if (req.commit_requires) |requirement| try writer.print(",\"commit_requires\":\"{s}\"", .{@tagName(requirement)});
     try writer.print(",\"sync_level\":\"{s}\"}}", .{syncLevelName(req.sync_level)});

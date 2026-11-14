@@ -96,6 +96,7 @@ pub fn encodeWithStorageOwnerDescriptor(
     req: db_mod.types.BatchRequest,
     descriptor: ?descriptor_contract.Descriptor,
 ) ![]u8 {
+    if (req.commit_requires == .direct_enrichments and req.prepared_enrichments_json == null) return error.InvalidBatchRequest;
     const batch_json = try batch_api.encodeBatchRequest(alloc, req);
     defer alloc.free(batch_json);
 

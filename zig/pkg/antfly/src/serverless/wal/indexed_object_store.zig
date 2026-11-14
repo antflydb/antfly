@@ -278,7 +278,16 @@ pub const IndexedObjectStore = struct {
         for (groups, pending[0..groups.len]) |group, *item| item.* = .{ .timestamp = group.timestamp, .payloads = group.payloads, .id = group.id };
         return self.appendGroups(namespace, pending[0..groups.len]);
     }
+    pub fn appendBatchIdempotentIfLatest(self: *@This(), namespace: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, expected_latest: u64) !BatchResult {
+        const results = try self.appendGroupsGuarded(namespace, &.{.{ .timestamp = timestamp, .payloads = payloads, .id = id }}, expected_latest);
+        defer self.alloc.free(results);
+        return results[0];
+    }
+
     fn appendGroups(self: *@This(), namespace: []const u8, groups: []const PendingGroup) ![]BatchResult {
+        return self.appendGroupsGuarded(namespace, groups, null);
+    }
+    fn appendGroupsGuarded(self: *@This(), namespace: []const u8, groups: []const PendingGroup, expected_latest: ?u64) ![]BatchResult {
         if (groups.len == 0 or groups.len > 16) return error.InvalidWalBatch;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -355,6 +364,7 @@ pub const IndexedObjectStore = struct {
                         continue;
                     }
                 }
+                if (expected_latest) |expected| if (current.value.latest_lsn != expected) return error.VersionConflict;
                 const first = last + 1;
                 last = std.math.add(u64, last, group.payloads.len) catch return error.WalLsnExhausted;
                 if (self.max_new_lsn) |maximum| if (last > maximum) return error.PublicationLagExceeded;
@@ -1533,6 +1543,7 @@ pub const IndexedObjectStore = struct {
         .append_idempotent = erasedIdempotent,
         .append_batch = erasedUnkeyedBatch,
         .append_batch_idempotent = erasedBatch,
+        .append_batch_idempotent_if_latest = erasedConditionalBatch,
         .append_idempotent_if_latest = erasedConditional,
         .read_snapshot = erasedSnapshot,
         .read_point_alloc = erasedPoint,
@@ -1561,6 +1572,10 @@ pub const IndexedObjectStore = struct {
     fn erasedUnkeyedBatch(raw: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8) !BatchResult {
         const self: *@This() = @ptrCast(@alignCast(raw));
         return self.appendBatch(ns, timestamp, payloads);
+    }
+    fn erasedConditionalBatch(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, expected: u64) !BatchResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.appendBatchIdempotentIfLatest(ns, timestamp, payloads, id, expected);
     }
     fn erasedBatch(raw: *anyopaque, ns: []const u8, t: u64, payloads: []const []const u8, id: []const u8) !BatchResult {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -2476,4 +2491,26 @@ test "serverless indexed WAL captured reader preserves cuts budgets cancellation
             try std.testing.expectError(error.WalSnapshotExpired, expiring.next(a));
         }
     }
+}
+
+test "commit requirements conditional WAL batch has no stale prefix and replays its receipt" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var wal = try IndexedObjectStore.init(a, client, "db", "gated");
+    defer wal.deinit();
+    var erased = wal.walStore();
+    try std.testing.expect(erased.supportsConditionalBatchAppend());
+    _ = try wal.append("docs", 1, "concurrent source");
+    try std.testing.expectError(error.VersionConflict, erased.appendBatchIdempotentIfLatest("docs", 2, &.{ "first", "second" }, "gate", 0));
+    try std.testing.expectEqual(@as(u64, 1), try wal.latestLsn("docs"));
+    const accepted = try erased.appendBatchIdempotentIfLatest("docs", 2, &.{ "first", "second" }, "gate", 1);
+    try std.testing.expectEqual(@as(u64, 2), accepted.start_lsn);
+    try std.testing.expectEqual(@as(u64, 3), accepted.end_lsn);
+    // The durable receipt wins over a now-stale read fence.
+    try std.testing.expectEqual(accepted, try erased.appendBatchIdempotentIfLatest("docs", 2, &.{ "first", "second" }, "gate", 1));
+    try std.testing.expectError(error.WalIdempotencyConflict, erased.appendBatchIdempotentIfLatest("docs", 2, &.{ "changed", "second" }, "gate", 1));
+    try std.testing.expectEqual(@as(u64, 3), try wal.latestLsn("docs"));
 }
