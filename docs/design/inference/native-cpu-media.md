@@ -96,10 +96,13 @@ taskset -c 5-8 python3 zig/tools/qualify_cpu_media.py \
 On Linux, the report samples PSS, CPU ticks and major/minor faults for the owned
 supervisor and workers. It records runtime/config/fixture/checkpoint/OpenBLAS
 hashes, affinity and host load. Preserve server logs for backend selection,
-resolved memory policy and admission diagnostics. Add
-`TERMITE_WHISPER_TRACE_PIPELINE=1` for Whisper mel/encoder/prefill/decode timings
-and `TERMITE_SERVER_GENERATE_TIMING=1` for serial reader resolution, loading,
-setup and generation timings (including vision, prefill and decode). Compare
+resolved memory policy and admission diagnostics. Set
+`TERMITE_SERVER_GENERATE_TIMING=1` for serial reader resolution, loading,
+setup and generation timings (including vision, prefill and decode). For a
+separate Whisper phase diagnostic, `antfly-inference-dev transcribe MODEL_DIR
+speech.wav --backend native --language en` emits `timing_ms` with mel, encoder,
+prefill and decode times. That direct CLI diagnostic does not replace the
+windowed `/read` check or its inclusive startup measurement. Compare
 load latency, first complete request, startup-to-first-complete and warm requests
 separately. A fast model-instance POST is not successful execution.
 
