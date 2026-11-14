@@ -309,7 +309,9 @@ Incremental explicitly requires stable sessions and disallows Rewrite. Automatic
 and Whole utterance can fall back to the recorded clip using the same provider if
 session recognition fails, including finalization after release; the UI explains
 this. Cleanup failures and cancellation never re-run recognition. Explicit
-Incremental fails instead.
+Incremental fails instead. A live-only queue overflow on release also uses the
+preserved clip in Automatic/Whole utterance; capture errors and invalid complete
+recordings never take this fallback.
 
 External Apple transcribers without stable-segment metadata recognize recorded
 files after release. The bundled Apple engine uses native streaming on supported
@@ -738,3 +740,7 @@ Simplified Chinese), then tries the next preferred language rather than silently
 switching scripts. Transcript assembly preserves explicit whitespace and uses
 boundary scripts rather than the preset language when inferring spaces, so Latin
 words stay separated in mixed-language dictation.
+
+Cancel and **Use original now** signal the live pipeline before waiting for its
+consumers. Canceling a submission also cancels its independent cleanup worker;
+owned teardown drains recognition, cleanup, and transport work, including on quit.

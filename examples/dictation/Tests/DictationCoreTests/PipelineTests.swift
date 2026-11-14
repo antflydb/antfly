@@ -427,3 +427,79 @@ private actor FormattingCleaner {
   await cleaner.release.send()
   #expect(try await finishing.value.text == "HELLO")
 }
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func cancelingSubmissionCancelsIndependentCleanupBeforeAwaitingTeardown() async throws {
+  let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let began = Signal()
+  let cleaning = Signal()
+  let canceled = Signal()
+  let pipeline = LiveDictation(
+    incremental: true, needsCleanup: true,
+    recognize: { _, commit in commit ? [] : [final(1, "speech", 0)] },
+    clean: { _ in
+      await began.send()
+      do {
+        try await Task.sleep(for: .seconds(30))
+        Issue.record("Cleanup should be canceled before its normal completion")
+        return DictationResult(raw: "speech", text: "speech")
+      } catch {
+        await canceled.send()
+        throw error
+      }
+    },
+    observe: { event in
+      if event.phase == .cleaning { await cleaning.send() }
+    })
+  try await pipeline.append(Data([1]))
+  await began.wait()
+  let store = Store(directory: root, registerHotkey: false)
+  let snapshot = store.config
+  store.runSubmission(preset: snapshot.preset(for: nil), snapshot: snapshot, destination: nil) {
+    try await pipeline.finish(Data())
+  }
+  await cleaning.wait()
+  store.cancel()
+  await canceled.wait()
+  await store.pipelineTeardownTask?.value
+  #expect(store.state == .idle && store.result.isEmpty)
+  await store.prepareToQuit()
+}
+
+@Test func tailRecoveryDistinguishesLiveOverflowFromInvalidCapture() async throws {
+  for allowFallback in [false, true] {
+    let pipeline = LiveDictation(
+      incremental: false, needsCleanup: false,
+      recognize: { _, _ in
+        Issue.record("Overflow must not commit an incomplete tail")
+        return []
+      },
+      clean: { DictationResult(raw: $0, text: $0) })
+    do {
+      let result = try await pipeline.finishWithRecognitionFallback(
+        tail: { throw LiveAudioOverflow() }, allowFallback: allowFallback
+      ) { DictationResult(raw: "preserved clip", text: "preserved clip") }
+      #expect(allowFallback && result.text == "preserved clip")
+    } catch is LiveDictation.RecognitionFailure { #expect(!allowFallback) }
+    await pipeline.cancel()
+  }
+  for cancel in [false, true] {
+    let pipeline = LiveDictation(
+      incremental: false, needsCleanup: false, recognize: { _, _ in [] },
+      clean: { DictationResult(raw: $0, text: $0) })
+    await #expect(throws: (any Error).self) {
+      try await pipeline.finishWithRecognitionFallback(
+        tail: {
+          if cancel { throw CancellationError() }
+          throw DictationError.invalid("Complete recording is invalid")
+        }, allowFallback: true
+      ) {
+        Issue.record("Invalid capture and cancellation cannot use recorded fallback")
+        return DictationResult(raw: "unexpected", text: "unexpected")
+      }
+    }
+    await pipeline.cancel()
+  }
+}

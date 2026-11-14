@@ -7,6 +7,14 @@ public enum ConnectionMode: String, Codable, Sendable { case managed, external }
 
 public enum TranscriberRoute: String, Codable, Sendable { case gateway, runtime }
 
+/// The complete recording is intact; only the bounded live queue overflowed.
+public struct LiveAudioOverflow: Error, LocalizedError, Sendable {
+  public init() {}
+  public var errorDescription: String? {
+    "Live audio processing fell behind. The complete recording remains available for clip processing."
+  }
+}
+
 public enum DictationError: Error, LocalizedError {
   case invalid(String)
   public var errorDescription: String? {

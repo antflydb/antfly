@@ -211,12 +211,32 @@ public actor LiveDictation {
     _ tail: Data, allowFallback: Bool,
     fallback: @Sendable () async throws -> DictationResult
   ) async throws -> DictationResult {
-    do { return try await finish(tail) } catch let failure as RecognitionFailure {
-      try Task.checkCancellation()
-      guard allowFallback else { throw failure }
+    try await finishWithRecognitionFallback(
+      tail: { tail }, allowFallback: allowFallback, fallback: fallback)
+  }
+  /// Acquire the final live tail inside recovery. Only a live-only overflow is
+  /// recoverable here; capture failures and invalid full recordings stay errors.
+  public func finishWithRecognitionFallback(
+    tail: @Sendable () async throws -> Data, allowFallback: Bool,
+    fallback: @Sendable () async throws -> DictationResult
+  ) async throws -> DictationResult {
+    try Task.checkCancellation()
+    guard !stopped else { throw CancellationError() }
+    do {
+      let audio: Data
+      do { audio = try await tail() } catch let failure as LiveAudioOverflow {
+        throw RecognitionFailure(detail: failure.localizedDescription)
+      }
+      return try await finish(audio)
+    } catch let failure as RecognitionFailure {
       await cancel()
       try Task.checkCancellation()
+      guard allowFallback else { throw failure }
       return try await fallback()
+    } catch {
+      await cancel()
+      try Task.checkCancellation()
+      throw error
     }
   }
   public func finish(_ tail: Data) async throws -> DictationResult {
@@ -232,7 +252,13 @@ public actor LiveDictation {
       if needsCleanup && !raw.isEmpty {
         await observe(DictationProgress(phase: .cleaning, raw: raw, draft: draft))
       }
-      if let worker { await worker.value }
+      if let pending = worker {
+        await withTaskCancellationHandler {
+          await pending.value
+        } onCancel: {
+          pending.cancel()
+        }
+      }
       try Task.checkCancellation()
       guard !stopped else { throw CancellationError() }
       let original = raw
@@ -304,8 +330,8 @@ public actor LiveDictation {
   public func cancel() async {
     stopped = true
     worker?.cancel()
-    if let worker { await worker.value }
     dispose()
+    if let worker { await worker.value }
     await disposal?.value
   }
 }

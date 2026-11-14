@@ -198,9 +198,7 @@ final class SpeechAudioBuffer: @unchecked Sendable {
     if previewOverflow {
       previewOverflow = false
       pending.removeAll(keepingCapacity: true)
-      throw DictationError.invalid(
-        "Live audio processing fell behind. The complete recording remains available for clip processing."
-      )
+      throw LiveAudioOverflow()
     }
     let result = pending
     pending.removeAll(keepingCapacity: true)

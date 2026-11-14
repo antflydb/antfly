@@ -224,6 +224,7 @@ struct PreparedModelSetup: Sendable {
   private(set) var requestTask: Task<Void, Never>?
   private var previewTask: Task<Void, Never>?
   private var cadenceTask: Task<Void, Never>?
+  private(set) var pipelineTeardownTask: Task<Void, Never>?
   private var timeoutTask: Task<Void, Never>?
   private(set) var generation = UUID()
   struct SubmissionContext {
@@ -1025,7 +1026,8 @@ struct PreparedModelSetup: Sendable {
         }
         if usesSession, let pipeline = live {
           return try await pipeline.finishWithRecognitionFallback(
-            mic.buffer.drain(), allowFallback: preset.processingStrategy != .incremental
+            tail: { [buffer = mic.buffer] in try buffer.drain() },
+            allowFallback: preset.processingStrategy != .incremental
           ) { @MainActor [self] in
             processingWarning =
               "Live recognition failed on release. Processing the recorded clip with the same speech engine."
@@ -1694,14 +1696,17 @@ struct PreparedModelSetup: Sendable {
     requestTask?.cancel()
     previewTask?.cancel()
     cadenceTask?.cancel()
-    if let live {
-      let pump = previewTask
-      let active = requestTask
-      Task {
-        await pump?.value
-        await active?.value
-        await live.cancel()
-      }
+    let closingPipeline = live
+    let pump = previewTask
+    let active = requestTask
+    let previousTeardown = pipelineTeardownTask
+    pipelineTeardownTask = Task {
+      // Signal cancellation before waiting for consumers that may be awaiting
+      // the pipeline's independent cleanup worker or recognition finalization.
+      await closingPipeline?.cancel()
+      await pump?.value
+      await active?.value
+      await previousTeardown?.value
     }
     live = nil
     overlayTask?.cancel()
@@ -1730,6 +1735,7 @@ struct PreparedModelSetup: Sendable {
     await discoveryTask?.value
     hotkey?.unregister()
     cancel()
+    await pipelineTeardownTask?.value
     runtimeModeTask?.cancel()
     await runtimeModeTask?.value
     cancelModelSetup()
