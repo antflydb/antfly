@@ -6687,6 +6687,21 @@ pub const NativeFile = struct {
     /// processes those maps later. Owned by `checkpointRedoLog`; cleared
     /// (and freed) by whichever of the two reaches it first.
     redo_fold_retain_pending: ?[]const u64 = null,
+    /// perf/lwa-orphan-pages: page ids `checkpointRedoLog` found owned by
+    /// a version its own fold just discovered superseded or deleted,
+    /// strictly within the window just folded -- see
+    /// `redo_overlay.SharedRedoOverlay.SupersededChain`'s own doc comment
+    /// for the orphaned-page-retention bug this fixes. Consumed once by
+    /// `flushTransactionWrites`'s own real (non-diverting) fold, the same
+    /// way and at the same point as `redo_fold_retain_pending` -- each
+    /// chain this names gets retained (idempotently: harmless if
+    /// `redo_fold_retain_pending`'s own sweep, or a surviving head's own
+    /// write, already retained some of its pages) and then immediately
+    /// queued for retirement, exactly like a normal, non-redo overwrite's
+    /// `IndexEditor` replace already does inline for the record it
+    /// displaces. Owned by `checkpointRedoLog`; cleared (and freed) by
+    /// whichever of the two reaches it first.
+    redo_fold_retire_pending: ?[]const redo_overlay.SharedRedoOverlay.SupersededChain = null,
     /// Accumulates (page_id, crc) for every data page `PageWriteBatch`
     /// physically writes since the *last durable checkpoint publish* --
     /// across staging (`stageMutation`'s eager external-value writes,
@@ -7666,6 +7681,15 @@ pub const NativeFile = struct {
         // and the "redo differential oracle" / "crash sweep ... dense
         // native-catalog" failures this caused.
         const fold_floor = redo.checkpoint_sequence;
+        // perf/lwa-orphan-pages: every page-shaped chain this fold's own
+        // overlay snapshot finds superseded or deleted within
+        // `(fold_floor, new fold]`, across every root -- see
+        // `redo_overlay.SharedRedoOverlay.SupersededChain`'s own doc
+        // comment. Collected across all three roots' loop iterations
+        // below, then handed to `flushTransactionWrites` the same way
+        // `redo_fold_retain_pending` already is.
+        var retiring_chains: std.ArrayListUnmanaged(redo_overlay.SharedRedoOverlay.SupersededChain) = .empty;
+        errdefer retiring_chains.deinit(self.allocator);
         for (0..3) |root_idx| {
             // A fully-owned snapshot, folded outside `shared`'s own lock
             // (`snapshotHeadsAlloc`'s own doc comment) -- `putDocumentBatch`/
@@ -7680,6 +7704,13 @@ pub const NativeFile = struct {
                 }
                 self.allocator.free(heads);
             }
+            // Same `fold_floor` boundary as `heads` above -- see
+            // `snapshotSupersededChainsAlloc`'s own doc comment for why
+            // this never double-counts a chain an earlier fold already
+            // retired.
+            const superseded = try redo.shared.snapshotSupersededChainsAlloc(self.allocator, io, @intCast(root_idx), fold_floor);
+            defer self.allocator.free(superseded);
+            try retiring_chains.appendSlice(self.allocator, superseded);
             if (heads.len == 0) continue;
             if (root_idx == @backingInt(TransactionWrites.Root.documents)) {
                 var docs = try std.ArrayListUnmanaged(DocumentMutation).initCapacity(self.allocator, heads.len);
@@ -7715,17 +7746,34 @@ pub const NativeFile = struct {
                 try self.putCatalogBatchForRoot(if (root_idx == 0) .metadata else .index, batch.items, .{});
             }
         }
+        // `retiring_chains` never grew at all (stays `.empty`, nothing
+        // allocated) when nothing was superseded in this fold's own
+        // window -- nothing to free in that case, and no explicit deinit
+        // call here either: this list's own `errdefer` (just above the
+        // loop) already owns cleanup for every path out of this
+        // function, and calling `deinit` a second time on the same value
+        // (once here, once from that still-registered errdefer were a
+        // later error to occur) would poison it (`deinit` sets `self.*
+        // = undefined`) before the errdefer's own call ever ran.
+        if (retiring_chains.items.len != 0) {
+            self.redo_fold_retire_pending = try retiring_chains.toOwnedSlice(self.allocator);
+        }
         // Builds the real pages above, then (via `flushTransactionWrites`,
         // `commitTransactionWithDurability`, `publishCheckpoint`, all
         // running their ordinary non-redo behavior because `checkpointing`
         // is true) syncs them and writes a real, physical checkpoint slot.
         // `flushTransactionWrites` itself consumes and frees
-        // `self.redo_fold_retain_pending` (see that field's own doc
-        // comment); this only cleans up if something above returned an
-        // error before `flushTransactionWrites` ever ran.
+        // `self.redo_fold_retain_pending`/`self.redo_fold_retire_pending`
+        // (see those fields' own doc comments); this only cleans up if
+        // something above returned an error before `flushTransactionWrites`
+        // ever ran.
         errdefer if (self.redo_fold_retain_pending) |pending| {
             self.allocator.free(pending);
             self.redo_fold_retain_pending = null;
+        };
+        errdefer if (self.redo_fold_retire_pending) |retiring| {
+            self.allocator.free(retiring);
+            self.redo_fold_retire_pending = null;
         };
         try self.commitTransactionWithDurability(true, null);
 
@@ -16957,6 +17005,42 @@ pub const NativeFile = struct {
                             try state.retain(page_id);
                         }
                     }
+                }
+            }
+        }
+        // perf/lwa-orphan-pages (Bug 1): `checkpointRedoLog`'s own
+        // `redo_fold_retire_pending` (see that field's own doc comment)
+        // names every page-shaped chain this fold's overlay snapshot
+        // found superseded or deleted strictly within the window just
+        // folded -- a version a later write in the same uncheckpointed
+        // window already overwrote or deleted before any fold ever
+        // applied it to the real tree, so the loop above never retains it
+        // as a side effect of writing a surviving record. Retaining each
+        // one here is idempotent (`retainUnretainedValueChainPages`'s own
+        // `count(page) == 0` guard skips any page the sweep above, or a
+        // surviving head's own write, already retained) and then
+        // immediately queuing it for retirement gives the ledger the same
+        // ownership a normal, non-redo overwrite's `IndexEditor` replace
+        // already assigns inline when it displaces a record -- `.value`-
+        // kind retirement's own epoch-gated completion (the switch a few
+        // hundred lines up) defers the actual release until no reader
+        // pinned at an older physical checkpoint could still need these
+        // bytes, exactly like any other superseded value chain. Without
+        // this, nothing ever marks a superseded page-shaped run for
+        // retirement at all: it is retained once (by the sweep above, or
+        // `retainUnretainedValueChainPages`'s own surviving-head walk
+        // finding it already live) and never released, inflating
+        // `retirementReserveBytes`/`current_file_bytes` forever.
+        if (self.redo_fold_retire_pending) |retiring| {
+            defer {
+                self.allocator.free(retiring);
+                self.redo_fold_retire_pending = null;
+            }
+            if (writes.pages.ledger) |state| {
+                const checkpoint = self.activeCheckpoint();
+                for (retiring) |chain| {
+                    try self.retainUnretainedValueChainPages(state, checkpoint, chain.external_value_root_page, chain.external_value_len, null);
+                    try state.retire(.{ .epoch = self.publicationEpoch(), .page = chain.external_value_root_page, .length = chain.external_value_len, .kind = .value });
                 }
             }
         }
