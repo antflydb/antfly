@@ -8811,7 +8811,21 @@ pub const NativeFile = struct {
                     std.mem.eql(u8, root[160..192], &try state.incrementalFingerprint());
             }
             if (rebased and authenticated) {
-                if (state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
+                // §9 (redo + indexed reclamation): same `allow_behind` lag
+                // as `validateIndexedAllocator`'s own `covered_pages` check
+                // -- a diverting commit advances `checkpoint.page_count` on
+                // its own, directly, for a fresh external value chain
+                // (`pageAllocatorForDivertingCommit`), without ever
+                // touching the ledger, so `checkpoint.page_count`
+                // legitimately runs ahead of the ledger's own
+                // `covered_pages` between two real checkpoints. Without
+                // this, every ledger load against such a checkpoint --
+                // `retirementNeedsService`, `reclaimPagesForMaintenance`,
+                // any other `loadLedger*` caller -- fails closed with
+                // `error.InvalidNativeAllocator` on a perfectly healthy
+                // redo-log file the moment a diverting commit lands.
+                const allow_behind = self.header.redo_log_capacity != 0;
+                if (if (allow_behind) state.root.covered_pages > checkpoint.page_count else state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
                 self.allocator_ledger_rebased = true;
                 self.allocator_work.journal_rebases +|= 1;
                 self.allocator_work.journal_rebase_ns +|= @intCast(@max(0, started.durationTo(std.Io.Clock.awake.now(self.runtime())).nanoseconds));
@@ -8823,7 +8837,12 @@ pub const NativeFile = struct {
         if (checkpoint.free_map_root_page != 0) {
             const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
             defer self.allocator.free(payload);
-            if ((try allocator_v4.State.decodeRoot(payload)).covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
+            // Same `allow_behind` lag as the rebase branch above and
+            // `validateIndexedAllocator`'s own `covered_pages` check --
+            // see that comment.
+            const allow_behind = self.header.redo_log_capacity != 0;
+            const covered_pages = (try allocator_v4.State.decodeRoot(payload)).covered_pages;
+            if (if (allow_behind) covered_pages > checkpoint.page_count else covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
         }
         const started = std.Io.Clock.awake.now(self.runtime());
         self.allocator_work.full_loads +|= 1;
