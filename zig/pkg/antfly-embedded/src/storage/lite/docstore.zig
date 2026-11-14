@@ -204,6 +204,98 @@ test "issue1362 background assessments preserve same-owner page reuse" {
     try std.testing.expect((try store.file.check()).valid);
 }
 
+// Regression: `Policy.completed` used to reset `assessed_retirement_bytes`/
+// `next_assessment_size` from "now" -- whatever `retirement_bytes` happened
+// to be, and whatever `requestReassessment` had (or hadn't) been called,
+// *at completion time* -- rather than from what the vacuum run that is
+// completing actually started with. A request made while that run was
+// already in flight (hook fires mid-`performVacuum`, well after the run's
+// own `Policy.Snapshot` was captured) got silently discarded the instant
+// that run's own, now-stale completion ran: the owner went idle with no
+// error, the file stayed over its envelope, and nothing else was due to
+// notice until unrelated size/activity growth eventually cleared the
+// ordinary thresholds on their own -- observed live via "lite reclamation
+// automatic worker bounds sustained overwrite history (redo)" stalling at
+// the exact same file size every time it happened.
+//
+// The `.copy` maintenance-test-hook phase fires synchronously, on this same
+// call stack, partway through `performVacuum` -- deterministically "while a
+// vacuum is in flight" with no threads or timing needed at all.
+test "lite reclamation completed does not discard a reassessment request made while its own vacuum is in flight" {
+    const Hook = struct {
+        store: *Store,
+        requested: bool = false,
+        fn notify(ptr: *anyopaque, phase: Store.MaintenancePhase) !void {
+            if (phase != .copy) return;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // A restored/imported generation, a config change, or simply
+            // another caller -- asking for an out-of-band reassessment
+            // while this exact vacuum run is still in flight.
+            self.store.requestReassessment();
+            self.requested = true;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reassessment-in-flight.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+
+    const value: [8192]u8 = @splat('v');
+    for (0..64) |i| {
+        var key: [32]u8 = undefined;
+        try store.file.putDocument(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+    }
+    for (0..64) |i| {
+        var key: [32]u8 = undefined;
+        try store.file.deleteDocument(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+    }
+    _ = try store.file.reclaimPages(8192);
+    store.maintenance_policy = try reclamation.Policy.init(.{ .minimum_reclaim_bytes = 4096, .assessment_bytes = 4096, .amplification = 2 });
+
+    var hook: Hook = .{ .store = &store };
+    store.test_maintenance_hook = .{ .ptr = &hook, .notify = Hook.notify };
+    defer store.test_maintenance_hook = null;
+
+    try store.maintainOnce(true);
+    try std.testing.expect(hook.requested);
+    const rewrites_after_first = store.maintenance_policy.status.rewrite_count;
+    try std.testing.expect(rewrites_after_first >= 1);
+
+    // The request made during that vacuum must not have been silently
+    // discarded by its own stale completion: the owner's very next check
+    // must still see a reassessment due, regardless of the file's current
+    // size.
+    const size = (try store.file.file.stat(store.file.runtime())).size;
+    try std.testing.expect(store.maintenance_policy.due(size));
+
+    // Fresh garbage for a genuine second rewrite opportunity: the first
+    // vacuum already fully compacted everything reclaimable at the time
+    // the request arrived, so `due() == true` alone proves the request
+    // survived, but a second `maintainOnce` finding nothing left to
+    // reclaim would correctly skip the rewrite regardless -- not a sign
+    // the request was lost. New debt makes the "did it actually act, not
+    // just report due" check meaningful too.
+    for (0..64) |i| {
+        var key: [32]u8 = undefined;
+        try store.file.putDocument(try std.fmt.bufPrint(&key, "fresh-{d}", .{i}), &value);
+    }
+    for (0..64) |i| {
+        var key: [32]u8 = undefined;
+        try store.file.deleteDocument(try std.fmt.bufPrint(&key, "fresh-{d}", .{i}));
+    }
+    _ = try store.file.reclaimPages(8192);
+
+    // And a second `maintainOnce`, with nothing else changed, must actually
+    // act on that -- not merely report `due()` true while doing nothing.
+    try store.maintainOnce(true);
+    try std.testing.expect(store.maintenance_policy.status.rewrite_count > rewrites_after_first);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
 fn reclamationStaleQuotaEstimatesExpireAfterRootsShrinkImpl(a: Allocator, use_redo_log: bool) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -307,7 +399,7 @@ test "lite reclamation writer busy retries gate image copies until publication i
     for (0..4) |_| {
         const before = Hook.writes;
         const retry = store.maintenance_policy.status.state == .deferred;
-        store.maintainOnceWithCancel(retry, &store.maintenance_cancel) catch |err| {
+        store.maintainOnceWithCancel(retry, &store.maintenance_cancel, false) catch |err| {
             try std.testing.expectEqual(error.FileBusy, err);
             store.recordMaintenanceError(err);
         };
@@ -401,7 +493,7 @@ test "lite reclamation retries reuse estimates and reassess changed roots when a
     for (0..5) |_| {
         try std.testing.expectEqual(reclamation.State.deferred, store.maintenance_policy.status.state);
         const retry = store.maintenance_policy.status.state == .deferred or store.maintenance_policy.status.state == .failed;
-        try store.maintainOnceWithCancel(retry, &store.maintenance_cancel);
+        try store.maintainOnceWithCancel(retry, &store.maintenance_cancel, false);
         try std.testing.expectEqualDeep(checkpoint, store.file.activeCheckpoint());
     }
     try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
@@ -501,7 +593,7 @@ test "lite reclamation worker cancels post assessment status replay after foregr
     Hook.owner = &store;
     defer Hook.owner = null;
     defer store.file.test_cancel_on_read = null;
-    try std.testing.expectError(error.MaintenanceCanceled, store.maintainOnceWithCancel(false, &store.maintenance_cancel));
+    try std.testing.expectError(error.MaintenanceCanceled, store.maintainOnceWithCancel(false, &store.maintenance_cancel, false));
     try std.testing.expect(store.maintenance_cancel.requested.load(.acquire));
     try std.testing.expect(Hook.owner_reads <= 2);
     try std.testing.expectEqualDeep(Hook.checkpoint, store.file.activeCheckpoint());
@@ -946,6 +1038,20 @@ fn reclamationShrinkingObservesPartiallyLivePackedRecordsImpl(a: Allocator, use_
     }
     try write.commit();
     const before = (try store.reclamationStatus()).current_file_bytes;
+    // The first assessment above (the plain `maintainOnce(false)` right
+    // after the initial write) resets its own activity-based reassessment
+    // threshold to roughly physical/4 (reclamation.zig's
+    // resetAssessmentBudget) -- under redo that `physical` already
+    // includes the file's fixed, non-reclaimable log-capacity reservation
+    // (header.redo_log_capacity, CreateOptions.use_redo_log's doc
+    // comment), raising the bar for how much deletion activity justifies
+    // a second look well past what these 64 small deletes generate. The
+    // size-based half of the same `due()` check (`next_assessment_size`)
+    // is unaffected by that and simply hasn't been reached yet either;
+    // forcing it low makes the loop below reassess on its own next call,
+    // exactly as it already does for the legacy variant where the
+    // activity-based threshold alone is small enough to clear.
+    //
     // This deletion leaves exactly one live record in every packed
     // bundle, by design -- physical/compact sits right at
     // `amplification`'s own enforced floor (2, `Options.validate`'s
@@ -972,8 +1078,12 @@ fn reclamationShrinkingObservesPartiallyLivePackedRecordsImpl(a: Allocator, use_
     // retained readers"'s own comment names, not reachable by any
     // `amplification`/`fixed_overhead` adjustment. Skipped under redo
     // until that leak is fixed; the forced-threshold bypass below stays
-    // for the same reason.
-    if (use_redo_log) store.maintenance_policy.next_assessment_size = 0;
+    // for the same reason. `store.requestReassessment()`, not the bare
+    // `Policy` poke this replaces: see that method's own doc comment for
+    // why a bare poke alone is not actually safe against a vacuum
+    // already in flight, even though this test's own redo-mode path
+    // never reaches a successful rewrite anyway.
+    if (use_redo_log) store.requestReassessment();
     for (0..32) |_| try store.maintainOnce(false);
     const status = try store.reclamationStatus();
     // perf/lwa-reclaim-reconcile: re-tried unconditionally on the merged
@@ -2033,12 +2143,17 @@ test "lite reclamation automatic worker bounds sustained overwrite history (redo
 // re-queuing for the whole call, which -- before the fix -- reliably lost
 // every bare attempt across all `max_rounds` and gave up.
 //
-// `automatic: true`: the one caller this fix actually changes (the
-// maintenance worker's own dedicated background task, which can never be
-// the same thread that already holds this store's writer slot). A manual
-// `vacuum()` call deliberately keeps the old give-up behavior instead --
-// see "lite native docstore reserves one writer until abort or commit",
-// which blocking here would deadlock.
+// `performVacuum(null, true, true)`: the last argument,
+// `from_background_worker`, is the one this fix actually keys off (not
+// `automatic`, which answers a different, policy question -- see
+// `maintainOnceWithCancel`'s own doc comment for why conflating the two
+// deadlocked a direct, synchronous caller that already held the writer
+// slot). `true` here because this test's own call is from the main test
+// thread, never the thread holding the writer slot (a separate
+// `io.concurrent` task, below). A manual `vacuum()` call deliberately
+// keeps the old give-up behavior instead -- see "lite native docstore
+// reserves one writer until abort or commit", which blocking here would
+// deadlock.
 test "lite vacuum completes under a sustained competing writer via a fair final round" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
     const Writer = struct {
@@ -2108,7 +2223,7 @@ test "lite vacuum completes under a sustained competing writer via a fair final 
 
     const writes_before = writer.writes.load(.monotonic);
     const vacuum_started_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
-    _ = try store.performVacuum(null, true);
+    _ = try store.performVacuum(null, true, true);
     const vacuum_ns: u64 = @intCast(std.Io.Clock.awake.now(std.testing.io).nanoseconds - vacuum_started_ns);
 
     writer.stop.store(true, .release);
@@ -3418,7 +3533,7 @@ pub const Store = struct {
             self.mutex.unlock();
             if (@import("builtin").is_test) _ = self.test_maintenance_cycles.fetchAdd(1, .release);
             var failed = false;
-            self.maintainOnceWithCancel(retry, &self.maintenance_cancel) catch |err| {
+            self.maintainOnceWithCancel(retry, &self.maintenance_cancel, true) catch |err| {
                 failed = true;
                 self.recordMaintenanceError(err);
             };
@@ -3466,7 +3581,10 @@ pub const Store = struct {
     /// without a concurrency lane and deterministic qualification. Ordinary
     /// clients need no maintenance loop. `force` retries existing debt.
     pub fn maintainOnce(self: *Store, force: bool) !void {
-        return self.maintainOnceWithCancel(force, null);
+        // `false`: a direct, synchronous caller can never be assumed off
+        // this store's own writer thread -- see `maintainOnceWithCancel`'s
+        // own doc comment.
+        return self.maintainOnceWithCancel(force, null, false);
     }
 
     /// The detached connection owner calls this before provider/index work,
@@ -3488,7 +3606,23 @@ pub const Store = struct {
         if (!self.file.free_pages_verified) return error.EnrichmentWaitCanceled;
     }
 
-    fn maintainOnceWithCancel(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken) !void {
+    /// `from_background_worker`: `true` only from `maintenanceLoop`'s own
+    /// call, on its dedicated background task -- by construction never a
+    /// thread that could already hold this store's writer slot, since that
+    /// task never itself opens a write transaction. Every other caller
+    /// (`maintainOnce`'s public callers, and every test here that drives
+    /// this function directly and synchronously) must pass `false`:
+    /// "automatic" (`performVacuum`'s own `automatic: bool`, still set from
+    /// `force or retry`-independent call-site intent) answers "is this the
+    /// maintenance subsystem's own vacuum, not a user's `vacuum()` call" --
+    /// a *policy* question -- not "is the calling thread safe to block for
+    /// a writer ticket", a *concurrency* question these used to be wrongly
+    /// conflated under one `automatic` flag (regression: "lite reclamation
+    /// writer busy retries gate image copies until publication is
+    /// available" calls this synchronously while its own thread holds an
+    /// open `Txn`/the writer slot -- blocking that same thread on its own,
+    /// never-to-be-released hold deadlocked it).
+    fn maintainOnceWithCancel(self: *Store, force: bool, cancel: ?*const maintenance.CancelToken, from_background_worker: bool) !void {
         if (self.read_only) return;
         // External owners also defer requested allocator-format conversion to
         // this detached maintenance turn. Vacuum uses the same short capture
@@ -3640,7 +3774,14 @@ pub const Store = struct {
         // lock before vacuum; the owner takes its own capture snapshot.
         if (snapshot) |*source| source.close();
         snapshot = null;
-        const report = self.performVacuum(cancel, true) catch |err| {
+        // Captured here, before the run -- not re-derived from "now" once it
+        // returns. `performVacuum` can run for a while, contended, escalating
+        // through a fair writer ticket; see `Policy.completed`'s own doc
+        // comment for why using "now" at that point silently discards
+        // whatever debt accrued or `requestReassessment` call arrived while
+        // this exact run was in flight.
+        const vacuum_started = self.maintenance_policy.snapshot();
+        const report = self.performVacuum(cancel, true, from_background_worker) catch |err| {
             if (err == error.FileBusy or err == error.WouldBlock) {
                 lockStore(self);
                 self.shrink_waiting_for_writer = true;
@@ -3657,7 +3798,7 @@ pub const Store = struct {
         // redo-log reservation (passed as `fixed_overhead`) is this new
         // generation's own, same as the assessment path above; see
         // `Policy.worthwhile`'s own doc comment.
-        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, self.file.header.redo_log_capacity);
+        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started, self.file.header.redo_log_capacity);
     }
 
     fn admitShrinkWorkspaceAssumeLocked(self: *Store, compact: u64, cancel: ?*const maintenance.CancelToken) !?u64 {
@@ -3902,12 +4043,35 @@ pub const Store = struct {
         return snapshot.checkAtFileSizeWithCancel(size, cancel);
     }
 
+    /// `Policy.requestReassessment`, plus the one thing a bare `Policy`
+    /// cannot do for itself: wake the maintenance loop. That loop blocks
+    /// indefinitely on `maintenance_wake.waitUncancelable` once an ordinary
+    /// cycle finishes with nothing else pending (`maintenanceLoop`'s own
+    /// `else` branch, no `rewrite_retry_at_ns` deadline) -- a request made
+    /// after it has already gone back to sleep otherwise sits honored
+    /// (`due()` correctly returns true the moment anything checks) but
+    /// unnoticed until some *unrelated* later event happens to wake it,
+    /// which may never come (observed live: "lite reclamation automatic
+    /// worker bounds sustained overwrite history (redo)" idling with a
+    /// pending, un-discarded request for the remainder of its own 30s
+    /// deadline). Every Store-level caller that wants an out-of-band
+    /// reassessment noticed promptly -- not just correctly preserved --
+    /// must come through here, never `self.maintenance_policy.
+    /// requestReassessment()` directly.
+    pub fn requestReassessment(self: *Store) void {
+        self.maintenance_policy.requestReassessment();
+        self.maintenance_wake.set(self.file.runtime());
+    }
+
     pub fn vacuum(self: *Store) !native.VacuumReport {
         return try self.vacuumWithCancel(null);
     }
 
     pub fn vacuumWithCancel(self: *Store, cancel: ?*const @import("../maintenance.zig").CancelToken) !native.VacuumReport {
-        const report = try self.performVacuum(cancel, false);
+        // See the matching comment in `maintainOnceWithCancel`: captured
+        // before the run, not re-derived from "now" once it returns.
+        const vacuum_started = self.maintenance_policy.snapshot();
+        const report = try self.performVacuum(cancel, false, false);
         lockStore(self);
         defer self.mutex.unlock();
         self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
@@ -3917,11 +4081,15 @@ pub const Store = struct {
         // redo-log reservation (passed as `fixed_overhead`) is this new
         // generation's own, same as the assessment path above; see
         // `Policy.worthwhile`'s own doc comment.
-        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, self.file.header.redo_log_capacity);
+        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started, self.file.header.redo_log_capacity);
         return report;
     }
 
-    fn performVacuum(self: *Store, cancel: ?*const maintenance.CancelToken, automatic: bool) !native.VacuumReport {
+    /// `from_background_worker`: see `maintainOnceWithCancel`'s own doc
+    /// comment -- a strictly narrower, concurrency-only question than
+    /// `automatic`'s policy one. Only `true` when the caller is provably
+    /// not the thread that could be holding this store's writer slot.
+    fn performVacuum(self: *Store, cancel: ?*const maintenance.CancelToken, automatic: bool, from_background_worker: bool) !native.VacuumReport {
         if (self.read_only) return error.ReadOnly;
         const io = self.file.runtime();
         var capture = native.ChangeCapture{};
@@ -4044,17 +4212,21 @@ pub const Store = struct {
         // the bare, nonblocking `reserveWriterSlot` -- but it is also why
         // giving up after the *final* round's own bare attempt failed was
         // wrong for the one caller that can never be the reentrant one:
-        // `automatic` (the maintenance worker's own dedicated background
-        // task, never a thread that could already hold this store's writer
-        // slot itself). A sustained foreground writer that keeps re-queuing
-        // through the fair, ticketed `reserveWriterSlotYielding` every
-        // ordinary commit already uses can win every one of this loop's
-        // bare nonblocking attempts indefinitely -- `writer_active`/
-        // `next_writer_ticket` just never line up for a probe that never
-        // takes a ticket of its own -- so online vacuum could lose forever
-        // under sustained write load (observed live: "lite reclamation
-        // automatic worker bounds sustained overwrite history", 1-in-5ish).
-        // For `automatic` only, the last round escalates to that same fair
+        // `from_background_worker` (`maintenanceLoop`'s own dedicated
+        // background task, never a thread that could already hold this
+        // store's writer slot itself -- *not* the same thing as
+        // `automatic`; see `maintainOnceWithCancel`'s own doc comment for
+        // why conflating the two deadlocked a direct, synchronous caller
+        // that already held the slot). A sustained foreground writer that
+        // keeps re-queuing through the fair, ticketed
+        // `reserveWriterSlotYielding` every ordinary commit already uses
+        // can win every one of this loop's bare nonblocking attempts
+        // indefinitely -- `writer_active`/`next_writer_ticket` just never
+        // line up for a probe that never takes a ticket of its own -- so
+        // online vacuum could lose forever under sustained write load
+        // (observed live: "lite reclamation automatic worker bounds
+        // sustained overwrite history", 1-in-5ish). Only from the
+        // background worker, the last round escalates to that same fair
         // queue instead of probing: it takes a real ticket, so it is
         // guaranteed to be served once every writer *already* queued ahead
         // of it (never an unbounded or growing set -- new writers queue
@@ -4068,7 +4240,7 @@ pub const Store = struct {
             const final_round = round + 1 == max_rounds;
             if (!self.file.no_sync) try image.prepared.file.sync(io);
             const reserved = blk: {
-                if (final_round and automatic) {
+                if (final_round and from_background_worker) {
                     try self.reserveWriterSlotYielding();
                     break :blk true;
                 }
@@ -4294,7 +4466,7 @@ pub const Store = struct {
         const old_handle = self.file.file.handle;
         defer if (self.file.file.handle != old_handle) {
             self.retireReadGeneration(old_bytes);
-            self.maintenance_policy.next_assessment_size = 0;
+            self.requestReassessment();
             self.maintenance_policy.assessed_retirement_bytes = self.file.retirement_activity_bytes;
         };
         return try self.file.replaceWithPreparedGeneration(&prepared.file);
