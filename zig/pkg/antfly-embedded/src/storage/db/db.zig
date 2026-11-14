@@ -85228,52 +85228,121 @@ fn jsonTestNumber(value: std.json.Value) f64 {
 test "db mixed extraction batches retain document checkpoint ownership in either order" {
     const a = std.testing.allocator;
     const Producer = struct {
+        const Blocked = enum { none, text, document };
+        blocked: Blocked = .none,
         documents: std.atomic.Value(usize) = .init(0),
-        texts: std.atomic.Value(usize) = .init(0),
+        batch_calls: std.atomic.Value(usize) = .init(0),
+        batch_items: std.atomic.Value(usize) = .init(0),
         fn plain(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
             return error.TestMissingInvocationContext;
         }
+        fn output(alloc: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            return std.fmt.allocPrint(alloc, "{{\"source\":{f}}}", .{std.json.fmt(request.source_text, .{})});
+        }
         fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request, context: asset_producer_mod.InvocationContext) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (std.mem.endsWith(u8, request.source_text, ".pdf")) {
-                if (context.document_checkpoints == null) return error.TestMissingDocumentCheckpoint;
-                _ = self.documents.fetchAdd(1, .monotonic);
-            } else {
-                _ = self.texts.fetchAdd(1, .monotonic);
+            if (!std.mem.endsWith(u8, request.source_text, ".pdf")) {
+                if (self.blocked == .text) return error.InferenceTransportUnavailable;
+                return error.TestUnexpectedTextSingleton;
             }
-            return alloc.dupe(u8, "{\"entities\":[]}");
+            if (context.document_checkpoints == null) return error.TestMissingDocumentCheckpoint;
+            if (self.blocked == .document) return error.InferenceTransportUnavailable;
+            _ = self.documents.fetchAdd(1, .monotonic);
+            return output(alloc, request);
+        }
+        fn batch(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer_mod.Request, context: asset_producer_mod.InvocationContext) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (context.document_checkpoints != null) return error.TestUnexpectedTextCheckpoint;
+            if (self.blocked == .text) return error.InferenceTransportUnavailable;
+            _ = self.batch_calls.fetchAdd(1, .monotonic);
+            _ = self.batch_items.fetchAdd(requests.len, .monotonic);
+            const outputs = try alloc.alloc([]u8, requests.len);
+            @memset(outputs, &.{});
+            errdefer {
+                for (outputs) |bytes| alloc.free(bytes);
+                alloc.free(outputs);
+            }
+            for (requests, outputs) |request, *bytes| {
+                if (std.mem.endsWith(u8, request.source_text, ".pdf")) return error.TestDocumentInTextBatch;
+                bytes.* = try output(alloc, request);
+            }
+            return outputs;
+        }
+        fn mode(_: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !inference_work.BatchMode {
+            return .native;
         }
         fn interface(self: *@This()) asset_producer_mod.Producer {
-            return .{ .ptr = self, .vtable = &.{ .produce = plain, .produce_with_context = produce, .foreground_bounded = true, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } };
+            return .{ .ptr = self, .vtable = &.{ .produce = plain, .produce_with_context = produce, .produce_batch_with_context = batch, .batch_mode = mode, .foreground_bounded = true, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } };
         }
     };
-    for ([_]bool{ false, true }) |document_first| {
-        var directory = try TestDirectory.init("mixed-document-checkpoints");
-        defer directory.cleanup();
-        var producer: Producer = .{};
-        var db = try DB.open(a, directory.path(), .{
-            .start_index_workers = false,
-            .start_optional_runtime_workers = false,
-            .start_independent_maintenance = false,
-            .enrichment = .{ .asset_producer = producer.interface() },
-        });
-        defer db.close();
-        try db.addEnrichment(.{ .name = "inspection", .kind = .asset, .field = "body", .content_type = "application/json", .producer_json = "{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\",\"model\":\"fixture\"}}", .execution = .{ .batch_items = 2, .batch_bytes = 1024 * 1024 } });
-        const text = "{\"body\":\"literal text\"}";
-        const document = "{\"body\":\"https://example.test/input.pdf\"}";
-        try db.batch(.{ .writes = &.{
-            .{ .key = "a", .value = if (document_first) document else text },
-            .{ .key = "b", .value = if (document_first) text else document },
-        }, .sync_level = .write });
-        try db.runUntilIdle();
-        try std.testing.expectEqual(@as(usize, 1), producer.documents.load(.acquire));
-        try std.testing.expectEqual(@as(usize, 1), producer.texts.load(.acquire));
-        for ([_][]const u8{ "a", "b" }) |key| {
-            const artifact = try internal_keys.artifactNamedPrefixAlloc(a, key, "asset", "inspection");
-            defer a.free(artifact);
-            const stored = try db.core.store.get(a, artifact);
-            defer a.free(stored);
-            try std.testing.expectEqualStrings("{\"entities\":[]}", stored);
+    // Cover homogeneous cohorts, a document at either end or in the middle,
+    // and interleaved documents. All remaining text shares one physical batch.
+    for ([_]Producer.Blocked{ .none, .text, .document }) |blocked| {
+        for ([_]u8{ 0, 1, 8, 128, 0b10101010, 255 }) |document_mask| {
+            if ((blocked == .text and document_mask == 255) or (blocked == .document and document_mask == 0)) continue;
+            var directory = try TestDirectory.init("mixed-document-checkpoints");
+            defer directory.cleanup();
+            var producer: Producer = .{ .blocked = blocked };
+            errdefer std.debug.print("mixed batch case: blocked={s}, mask={d}, batches={d}, items={d}, documents={d}\n", .{ @tagName(blocked), document_mask, producer.batch_calls.load(.acquire), producer.batch_items.load(.acquire), producer.documents.load(.acquire) });
+            var db = try DB.open(a, directory.path(), .{
+                .start_index_workers = false,
+                .start_optional_runtime_workers = false,
+                .start_independent_maintenance = false,
+                .enrichment = .{ .owner_id = "mixed-producer", .asset_producer = producer.interface(), .inline_retry_max_attempts = 1 },
+            });
+            defer db.close();
+            try db.addEnrichment(.{ .name = "inspection", .kind = .asset, .field = "body", .content_type = "application/json", .producer_json = "{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\",\"model\":\"fixture\"}}", .execution = .{ .batch_items = 8, .batch_bytes = 1024 * 1024 } });
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var writes: [8]@import("mutation_values.zig").BatchWrite = undefined;
+            var sources: [8][]const u8 = undefined;
+            for (&writes, &sources, 0..) |*write, *source, index| {
+                source.* = if (document_mask & (@as(u8, 1) << @intCast(index)) != 0) try std.fmt.allocPrint(scratch, "https://example.test/input-{d}.pdf", .{index}) else try std.fmt.allocPrint(scratch, "literal text {d}", .{index});
+                write.* = .{ .key = try std.fmt.allocPrint(scratch, "doc:{d}", .{index}), .value = try std.fmt.allocPrint(scratch, "{{\"body\":{f}}}", .{std.json.fmt(source.*, .{})}) };
+            }
+            try db.batch(.{ .writes = &writes, .sync_level = .write });
+            if (blocked != .none) {
+                try std.testing.expectError(error.EnrichmentRetryInProgress, db.runUntilIdleWithoutWaitingForEnrichmentRetries());
+                // A retry in either transport must not suppress the other group's
+                // publication, and recovering it must not regenerate that sibling.
+                for (writes, sources) |write, source| {
+                    const document = std.mem.endsWith(u8, source, ".pdf");
+                    const artifact = try internal_keys.artifactNamedPrefixAlloc(a, write.key, "asset", "inspection");
+                    defer a.free(artifact);
+                    if (document == (blocked == .document)) {
+                        try std.testing.expectError(error.NotFound, db.core.store.get(a, artifact));
+                    } else {
+                        const stored = try db.core.store.get(a, artifact);
+                        defer a.free(stored);
+                        const expected = try Producer.output(a, .{ .producer_type = .extractor, .config_json = "{}", .source_text = source });
+                        defer a.free(expected);
+                        try std.testing.expectEqualStrings(expected, stored);
+                    }
+                }
+                producer.blocked = .none;
+            }
+            try db.runUntilIdle();
+            const documents: usize = @popCount(document_mask);
+            try std.testing.expectEqual(documents, producer.documents.load(.acquire));
+            if (blocked == .text) {
+                // Durable retry budgets can split recovery into smaller native
+                // batches. Every text still succeeds exactly once below.
+                const batches = producer.batch_calls.load(.acquire);
+                try std.testing.expect(batches >= 1 and batches <= 8 - documents);
+            } else {
+                try std.testing.expectEqual(@as(usize, if (documents == 8) 0 else 1), producer.batch_calls.load(.acquire));
+            }
+            try std.testing.expectEqual(8 - documents, producer.batch_items.load(.acquire));
+            for (writes, sources) |write, source| {
+                const artifact = try internal_keys.artifactNamedPrefixAlloc(a, write.key, "asset", "inspection");
+                defer a.free(artifact);
+                const stored = try db.core.store.get(a, artifact);
+                defer a.free(stored);
+                const expected = try Producer.output(a, .{ .producer_type = .extractor, .config_json = "{}", .source_text = source });
+                defer a.free(expected);
+                try std.testing.expectEqualStrings(expected, stored);
+            }
         }
     }
 }

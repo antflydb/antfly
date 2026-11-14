@@ -31627,100 +31627,116 @@ pub fn resolveEffectiveRowFilterJson(
     identity: ?AuthenticatedIdentity,
     table_name: []const u8,
 ) !?[]u8 {
-    const active_identity = identity orelse return null;
-    const raw = (try usermgr.combinedRowFilterForTable(alloc, active_identity.row_filter, active_identity.logicalTableName(table_name))) orelse return null;
-    defer raw.deinit(alloc);
-    return try resolveAuthRowFilterJsonWithComposition(alloc, active_identity, raw.json, raw.composed);
+    const active = identity orelse return null;
+    var matching = usermgr.matchingRowFilters(active.row_filter, active.logicalTableName(table_name));
+    const first = matching.next() orelse return null;
+    var lookahead = matching;
+    if (lookahead.next() == null) return try resolveAuthRowFilterJson(alloc, active, first);
+    return try resolveAuthRowFilterComponents(alloc, active, first, matching);
 }
+
+fn parseAuthRowFilter(alloc: std.mem.Allocator, json: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidQueryRequest,
+    };
+}
+
+/// Metadata is loaded at most once, only when a visited component needs it.
+/// Expansion authority is shared even though components have separate limits.
+const AuthRowFilterResolver = struct {
+    alloc: std.mem.Allocator,
+    identity: AuthenticatedIdentity,
+    metadata: ?std.json.Parsed(std.json.Value) = null,
+    remaining_expansion_nodes: usize = auth_filter_max_tree_nodes,
+
+    fn deinit(self: *AuthRowFilterResolver) void {
+        if (self.metadata) |*metadata| metadata.deinit();
+    }
+
+    fn resolve(self: *AuthRowFilterResolver, alloc: std.mem.Allocator, value: std.json.Value) !std.json.Value {
+        if (self.metadata == null and authFilterUsesMetadataReference(value)) {
+            self.metadata = std.json.parseFromSlice(
+                std.json.Value,
+                self.alloc,
+                if (self.identity.metadata_json.len > 0) self.identity.metadata_json else "{}",
+                .{},
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.AuthRowFilterNoMatch,
+            };
+        }
+        var remaining: usize = auth_filter_max_tree_nodes;
+        return resolveAuthRowFilterValue(alloc, .{
+            .identity = self.identity,
+            .metadata = if (self.metadata) |metadata| metadata.value else null,
+            .remaining_expansion_nodes = &self.remaining_expansion_nodes,
+        }, value, .filter, &remaining);
+    }
+};
 
 pub fn resolveAuthRowFilterJson(
     alloc: std.mem.Allocator,
     identity: AuthenticatedIdentity,
     filter_json: []const u8,
 ) ![]u8 {
-    return resolveAuthRowFilterJsonWithComposition(alloc, identity, filter_json, false);
-}
-
-fn resolveAuthRowFilterJsonWithComposition(
-    alloc: std.mem.Allocator,
-    identity: AuthenticatedIdentity,
-    filter_json: []const u8,
-    composed: bool,
-) ![]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidQueryRequest,
-    };
+    var parsed = try parseAuthRowFilter(alloc, filter_json);
     defer parsed.deinit();
-    // Only the conjunction manufactured by scope composition gets an
-    // aggregate budget. Stored/user-authored trees retain admission limits.
-    const components = if (composed) parsed.value.object.get("conjuncts").?.array.items else &.{parsed.value};
-    var remaining_input_nodes: usize = auth_filter_max_composed_nodes - (if (composed) @as(usize, 2) else 0);
-    for (components) |component| {
-        var remaining: usize = auth_filter_max_tree_nodes;
-        try validateAuthRowFilterValueBounded(component, 0, &remaining);
-        const used = auth_filter_max_tree_nodes - remaining;
-        if (used > remaining_input_nodes) return error.Forbidden;
-        remaining_input_nodes -= used;
-    }
-
-    var parsed_metadata: ?std.json.Parsed(std.json.Value) = null;
-    defer if (parsed_metadata) |*metadata| metadata.deinit();
-    if (authFilterUsesMetadataReference(parsed.value)) {
-        parsed_metadata = std.json.parseFromSlice(
-            std.json.Value,
-            alloc,
-            if (identity.metadata_json.len > 0) identity.metadata_json else "{}",
-            .{},
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return try alloc.dupe(u8, "{\"match_none\":{}}"),
-        };
-    }
-    var remaining_expansion_nodes: usize = auth_filter_max_tree_nodes;
-    const context = AuthRowFilterResolveContext{
-        .identity = identity,
-        .metadata = if (parsed_metadata) |metadata| metadata.value else null,
-        .remaining_expansion_nodes = &remaining_expansion_nodes,
-    };
-    if (composed) {
-        var arena = std.heap.ArenaAllocator.init(alloc);
-        defer arena.deinit();
-        const scratch = arena.allocator();
-        var values = std.json.Array.init(scratch);
-        var remaining_output_nodes: usize = auth_filter_max_composed_nodes - 2;
-        for (components) |component| {
-            var remaining: usize = auth_filter_max_tree_nodes;
-            const value = resolveAuthRowFilterValue(scratch, context, component, .filter, &remaining) catch |err| switch (err) {
-                error.AuthRowFilterNoMatch => return try alloc.dupe(u8, "{\"match_none\":{}}"),
-                else => return err,
-            };
-            // Expansion can make a small template larger. Bound the actual
-            // executable result as well as the stored templates.
-            consumeAuthContextJsonBudget(value, 0, &remaining_output_nodes) catch return error.Forbidden;
-            try values.append(value);
-        }
-        var object = std.json.ObjectMap.empty;
-        try object.put(scratch, "conjuncts", .{ .array = values });
-        return json_helpers.stringifyJsonValueAlloc(alloc, .{ .object = object });
-    }
-    var remaining_nodes: usize = auth_filter_max_tree_nodes;
-    var resolved = resolveAuthRowFilterValue(
-        alloc,
-        context,
-        parsed.value,
-        .filter,
-        &remaining_nodes,
-    ) catch |err| switch (err) {
-        // Identity metadata is allowed to vary independently of policy
-        // admission. Missing or type-incompatible values must deny the whole
-        // policy, never turn a protected read into a server error or weaken a
-        // negative branch.
+    try validateAuthRowFilterValue(parsed.value);
+    var resolver = AuthRowFilterResolver{ .alloc = alloc, .identity = identity };
+    defer resolver.deinit();
+    var resolved = resolver.resolve(alloc, parsed.value) catch |err| switch (err) {
         error.AuthRowFilterNoMatch => return try alloc.dupe(u8, "{\"match_none\":{}}"),
         else => return err,
     };
     defer json_helpers.deinitJsonValue(alloc, &resolved);
-    return try json_helpers.stringifyJsonValueAlloc(alloc, resolved);
+    return json_helpers.stringifyJsonValueAlloc(alloc, resolved);
+}
+
+fn resolveAuthRowFilterComponents(
+    alloc: std.mem.Allocator,
+    identity: AuthenticatedIdentity,
+    first: []const u8,
+    remaining_filters: usermgr.RowFilterIterator,
+) ![]u8 {
+    var resolver = AuthRowFilterResolver{ .alloc = alloc, .identity = identity };
+    defer resolver.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var parse_arena = std.heap.ArenaAllocator.init(alloc);
+    defer parse_arena.deinit();
+    var values = std.json.Array.init(scratch);
+    var remaining_input_nodes: usize = auth_filter_max_composed_nodes - 2;
+    var remaining_output_nodes: usize = auth_filter_max_composed_nodes - 2;
+    var matching = remaining_filters;
+    var next: ?[]const u8 = first;
+    while (next) |json| : (next = matching.next()) {
+        // Every executable filter needs at least its object and body. Deny
+        // before parsing another component once either budget is exhausted.
+        if (remaining_input_nodes < 2 or remaining_output_nodes < 2) return error.Forbidden;
+        // Reuse the template workspace even when the request allocator is an
+        // arena whose free() cannot reclaim intermediate parser allocations.
+        if (!parse_arena.reset(.retain_capacity)) return error.OutOfMemory;
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, parse_arena.allocator(), json, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidQueryRequest,
+        };
+        const used = try authRowFilterNodeCount(parsed);
+        if (used > remaining_input_nodes) return error.Forbidden;
+        remaining_input_nodes -= used;
+        const value = resolver.resolve(scratch, parsed) catch |err| switch (err) {
+            error.AuthRowFilterNoMatch => return try alloc.dupe(u8, "{\"match_none\":{}}"),
+            else => return err,
+        };
+        consumeAuthContextJsonBudget(value, 0, &remaining_output_nodes) catch return error.Forbidden;
+        try values.append(value);
+        // Only the bounded resolved prefix survives the next workspace
+        // reset. No combined input or unvisited tail is materialized.
+    }
+    var object = std.json.ObjectMap.empty;
+    try object.put(scratch, "conjuncts", .{ .array = values });
+    return json_helpers.stringifyJsonValueAlloc(alloc, .{ .object = object });
 }
 
 pub fn validateAuthRowFilterJson(
@@ -31934,8 +31950,13 @@ fn authFilterUsesMetadataReference(value: std.json.Value) bool {
 }
 
 fn validateAuthRowFilterValue(value: std.json.Value) !void {
+    _ = try authRowFilterNodeCount(value);
+}
+
+fn authRowFilterNodeCount(value: std.json.Value) !usize {
     var remaining_nodes: usize = auth_filter_max_tree_nodes;
-    return try validateAuthRowFilterValueBounded(value, 0, &remaining_nodes);
+    try validateAuthRowFilterValueBounded(value, 0, &remaining_nodes);
+    return auth_filter_max_tree_nodes - remaining_nodes;
 }
 
 fn validateAuthRowFilterValueBounded(
@@ -63913,4 +63934,32 @@ test "index alias object engine admission rejects private controls before storag
         }
     }
     try std.testing.expectEqual(@as(usize, 0), server.index_alias_cache.retained_bytes);
+}
+
+test "system catalog row filter composition rejects oversized tails with bounded allocation" {
+    const a = std.testing.allocator;
+    var policy = std.ArrayListUnmanaged(u8).empty;
+    defer policy.deinit(a);
+    try policy.appendSlice(a, "{\"terms\":{\"tenant\":[");
+    for (0..9000) |i| try policy.appendSlice(a, if (i == 0) "\"a\"" else ",\"a\"");
+    try policy.appendSlice(a, "]}}");
+    try validateAuthRowFilterJson(a, policy.items);
+    const filters = try a.alloc(usermgr.RowFilterEntry, 1000);
+    defer a.free(filters);
+    for (filters) |*entry| entry.* = .{ .table = @constCast("docs"), .filter = policy.items };
+    const buffer = try a.alloc(u8, 16 * 1024 * 1024);
+    defer a.free(buffer);
+    var prefix_allocation: ?usize = null;
+    for ([_]usize{ 100, 1000 }) |count| {
+        var bounded = std.heap.FixedBufferAllocator.init(buffer);
+        var measured = std.testing.FailingAllocator.init(bounded.allocator(), .{});
+        const identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = filters[0..count] };
+        // The 1,000-policy input would require a 36 MB combined JSON buffer
+        // before parsing. Serving must deny within this fixed 16 MiB budget.
+        try std.testing.expectError(error.Forbidden, resolveEffectiveRowFilterJson(measured.allocator(), identity, "docs"));
+        if (prefix_allocation) |expected| {
+            // The unvisited tail must not affect composition allocations.
+            try std.testing.expectEqual(expected, measured.allocated_bytes);
+        } else prefix_allocation = measured.allocated_bytes;
+    }
 }
