@@ -2151,3 +2151,29 @@ test "SQL pgwire native trusted credential and identity allocation failures rele
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fixture.run, .{ &server, token });
 }
+
+test "system catalog SQL pgwire retained policies survive repeated qualified projection" {
+    const a = std.testing.allocator;
+    var permission = try usermgr.Permission.initOwned(a, .table, "docs", .read);
+    defer permission.deinit(a);
+    var restrictions = [_]usermgr.RowFilterEntry{
+        try usermgr.RowFilterEntry.initOwned(a, "*", "{\"term\":{\"tenant\":\"a\"}}"),
+        try usermgr.RowFilterEntry.initOwned(a, "docs", "{\"term\":{\"status\":\"open\"}}"),
+    };
+    defer for (&restrictions) |*entry| entry.deinit(a);
+    var permissions = [_]usermgr.Permission{permission};
+    var admitted = (try http.cloneCatalogIdentity(a, .{ .username = @constCast("reader"), .permissions = &permissions, .row_filter = &restrictions })).?;
+    defer admitted.deinit(a);
+    try http.projectCatalogIdentity(a, &admitted, "docs", "table:immutable");
+    try http.projectCatalogIdentity(a, &admitted, "\x00catalog:7:default6:public4:docs", "table:immutable");
+    const filter = (try http.resolveEffectiveRowFilterJson(a, admitted, "table:immutable")).?;
+    defer a.free(filter);
+    const policies = [_]OwnedRead.Policy{.{ .table = "table:immutable", .filter = filter }};
+    var fresh = (try http.cloneCatalogIdentity(a, .{ .username = @constCast("reader"), .permissions = &permissions, .row_filter = &restrictions })).?;
+    defer fresh.deinit(a);
+    try OwnedRead.validatePolicies(a, &fresh, admitted, &policies);
+    try OwnedRead.validatePolicies(a, &fresh, admitted, &policies);
+    var changed = try http.cloneCatalogIdentity(a, .{ .username = @constCast("reader"), .permissions = &permissions, .row_filter = restrictions[0..1] });
+    defer changed.?.deinit(a);
+    try std.testing.expectError(error.Forbidden, OwnedRead.validatePolicies(a, &changed.?, admitted, &policies));
+}

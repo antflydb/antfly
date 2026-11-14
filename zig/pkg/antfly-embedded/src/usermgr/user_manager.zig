@@ -154,8 +154,10 @@ pub const RowFilterEntry = struct {
     filter: []u8,
 
     pub fn initOwned(alloc: Allocator, table: []const u8, filter: []const u8) !RowFilterEntry {
+        const owned_table = try alloc.dupe(u8, table);
+        errdefer alloc.free(owned_table);
         return .{
-            .table = try alloc.dupe(u8, table),
+            .table = owned_table,
             .filter = try alloc.dupe(u8, filter),
         };
     }
@@ -1767,7 +1769,7 @@ fn mergeRowFilterEntry(
     merged: *std.StringArrayHashMapUnmanaged([]u8),
     entry: RowFilterEntry,
 ) !void {
-    if (std.mem.eql(u8, std.mem.trim(u8, entry.filter, " \t\r\n"), "null")) return;
+    if (isNullRowFilter(entry.filter)) return;
     const gop = try merged.getOrPut(alloc, entry.table);
     if (!gop.found_existing) {
         gop.key_ptr.* = try alloc.dupe(u8, entry.table);
@@ -1826,7 +1828,13 @@ fn combineLayeredRowFilters(
 ) ![]RowFilterEntry {
     // Preserve scopes rather than expanding wildcard predicates into every table.
     // Query-time composition applies each matching restriction exactly once.
-    const out = try alloc.alloc(RowFilterEntry, base.len + overlay.len);
+    var count: usize = 0;
+    for ([_][]const RowFilterEntry{ base, overlay }) |layer| {
+        for (layer) |entry| if (!isNullRowFilter(entry.filter)) {
+            count += 1;
+        };
+    }
+    const out = try alloc.alloc(RowFilterEntry, count);
     var filled: usize = 0;
     errdefer {
         for (out[0..filled]) |*entry| entry.deinit(alloc);
@@ -1834,11 +1842,22 @@ fn combineLayeredRowFilters(
     }
     for ([_][]const RowFilterEntry{ base, overlay }) |layer| {
         for (layer) |entry| {
+            if (isNullRowFilter(entry.filter)) continue;
             out[filled] = try RowFilterEntry.initOwned(alloc, entry.table, entry.filter);
             filled += 1;
         }
     }
     return out;
+}
+
+pub fn isNullRowFilter(filter: []const u8) bool {
+    return std.mem.eql(u8, std.mem.trim(u8, filter, " \t\r\n"), "null");
+}
+
+/// Whether a credential carries any restriction, including on other tables.
+pub fn hasRowFilters(row_filters: []const RowFilterEntry) bool {
+    for (row_filters) |entry| if (!isNullRowFilter(entry.filter)) return true;
+    return false;
 }
 
 /// Allocation-free presence check for mutation guards and discovery paths.
@@ -1850,13 +1869,25 @@ pub fn hasRowFilterForTable(row_filters: []const RowFilterEntry, table: []const 
 }
 
 fn rowFilterApplies(entry: RowFilterEntry, table: []const u8) bool {
-    return !std.mem.eql(u8, std.mem.trim(u8, entry.filter, " \t\r\n"), "null") and
+    return !isNullRowFilter(entry.filter) and
         catalog_names.tableResourceMatches(entry.table, table);
 }
 
-/// Compose all applicable scopes in linear time with one output allocation.
+/// The single-filter result borrows its input; keep the row-filter entries
+/// alive until deinit. Multiple-filter results own their flat JSON buffer.
+pub const RowFilterJson = struct {
+    json: []const u8,
+    allocation: ?[]u8 = null,
+
+    pub fn deinit(self: RowFilterJson, alloc: Allocator) void {
+        if (self.allocation) |bytes| alloc.free(bytes);
+    }
+};
+
+/// Compose all applicable scopes in linear time. Borrow a single filter;
+/// allocate one flat output only when multiple restrictions match.
 /// A null policy adds no restriction and cannot erase another policy.
-pub fn combinedRowFilterForTable(alloc: Allocator, row_filters: []const RowFilterEntry, table: []const u8) !?[]u8 {
+pub fn combinedRowFilterForTable(alloc: Allocator, row_filters: []const RowFilterEntry, table: []const u8) !?RowFilterJson {
     var count: usize = 0;
     var size: usize = 0;
     var single: []const u8 = undefined;
@@ -1867,7 +1898,7 @@ pub fn combinedRowFilterForTable(alloc: Allocator, row_filters: []const RowFilte
         single = entry.filter;
     }
     if (count == 0) return null;
-    if (count == 1) return try alloc.dupe(u8, single);
+    if (count == 1) return .{ .json = single };
     const prefix = "{\"conjuncts\":[";
     const out = try alloc.alloc(u8, prefix.len + size + count - 1 + 2);
     @memcpy(out[0..prefix.len], prefix);
@@ -1882,7 +1913,7 @@ pub fn combinedRowFilterForTable(alloc: Allocator, row_filters: []const RowFilte
         pos += entry.filter.len;
     }
     @memcpy(out[pos..], "]}");
-    return out;
+    return .{ .json = out, .allocation = out };
 }
 
 fn randomBytes(alloc: Allocator, io: std.Io, len: usize) ![]u8 {
@@ -2243,9 +2274,9 @@ test "usermgr roles inherit permissions and row filters" {
         alloc.free(scoped);
     }
     const effective = (try combinedRowFilterForTable(alloc, scoped, "docs")).?;
-    defer alloc.free(effective);
-    try std.testing.expect(std.mem.indexOf(u8, effective, "\"tenant_id\":\"acme\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, effective, "\"acl.groups\"") != null);
+    defer effective.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, effective.json, "\"tenant_id\":\"acme\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, effective.json, "\"acl.groups\"") != null);
 
     const direct = try manager.listRowFilters("alice");
     defer {
@@ -2305,8 +2336,8 @@ test "usermgr api keys validate and persist creator-scoped permissions" {
     try std.testing.expect(std.mem.indexOf(u8, validated.row_filter[0].filter, "\"tenant_id\":\"acme\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, validated.row_filter[2].filter, "\"team\":\"eng\"") != null);
     const effective_filter = (try combinedRowFilterForTable(alloc, validated.row_filter, "docs")).?;
-    defer alloc.free(effective_filter);
-    try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"tenant_id\":\"acme\"}},{\"term\":{\"region\":\"us\"}},{\"term\":{\"team\":\"eng\"}}]}", effective_filter);
+    defer effective_filter.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"tenant_id\":\"acme\"}},{\"term\":{\"region\":\"us\"}},{\"term\":{\"team\":\"eng\"}}]}", effective_filter.json);
     try std.testing.expectError(error.ApiKeyInvalid, manager.validateApiKey(created.key.key_id, "bad"));
 
     const credential = try std.fmt.allocPrint(alloc, "api-key:{s}", .{created.key.key_id});
@@ -2473,13 +2504,55 @@ test "row filter scopes are conjunctive through api key layering" {
         for (layered) |*entry| entry.deinit(alloc);
         alloc.free(layered);
     }
-    try std.testing.expectEqual(base.len + overlay.len, layered.len);
+    try std.testing.expectEqual(@as(usize, 3), layered.len);
     const combined = (try combinedRowFilterForTable(alloc, layered, target)).?;
-    defer alloc.free(combined);
-    try std.testing.expectEqualStrings("{\"conjuncts\":[" ++ tenant ++ "," ++ namespace ++ "," ++ table ++ "]}", combined);
+    defer combined.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"conjuncts\":[" ++ tenant ++ "," ++ namespace ++ "," ++ table ++ "]}", combined.json);
     const other = (try combinedRowFilterForTable(alloc, layered, "docs")).?;
-    defer alloc.free(other);
-    try std.testing.expectEqualStrings(tenant, other);
+    defer other.deinit(alloc);
+    try std.testing.expectEqualStrings(tenant, other.json);
     try std.testing.expect(!hasRowFilterForTable(&overlay, "docs"));
     try std.testing.expect(try combinedRowFilterForTable(alloc, overlay[1..], target) == null);
+}
+
+test "row filter null api keys carry no durable restriction and single filters borrow" {
+    const alloc = std.testing.allocator;
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policies = casbin.MemoryAdapter.init(alloc);
+    defer policies.deinit();
+    var manager = try UserManager.init(alloc, store.iface(), try initDefaultEnforcer(alloc, policies.iface()));
+    defer manager.deinit();
+    var permission = try Permission.initOwned(alloc, .table, "docs", .admin);
+    defer permission.deinit(alloc);
+    var user = try manager.createUser("alice", "secret", &.{permission});
+    defer user.deinit(alloc);
+    var unrestricted = try RowFilterEntry.initOwned(alloc, "*", " \nnull\t ");
+    defer unrestricted.deinit(alloc);
+    var key = try manager.createApiKey("alice", "legacy-null", &.{permission}, &.{unrestricted}, null);
+    defer key.deinit(alloc);
+    var validated = try manager.validateApiKey(key.key.key_id, key.key_secret);
+    defer validated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), validated.row_filter.len);
+    try std.testing.expect(!hasRowFilters(&.{unrestricted}));
+    const principal = try std.fmt.allocPrint(alloc, "api-key:{s}", .{key.key.key_id});
+    defer alloc.free(principal);
+    const durable = try manager.durableCredentialRowFilters(principal);
+    defer {
+        for (durable) |*entry| entry.deinit(alloc);
+        alloc.free(durable);
+    }
+    try std.testing.expectEqual(@as(usize, 0), durable.len);
+    try manager.setRowFilter("alice", "*", "{\"term\":{\"tenant\":\"a\"}}");
+    const restricted = try manager.durableCredentialRowFilters(principal);
+    defer {
+        for (restricted) |*entry| entry.deinit(alloc);
+        alloc.free(restricted);
+    }
+    // Neither selecting nor releasing a single filter may allocate.
+    const filter = (try combinedRowFilterForTable(std.testing.failing_allocator, restricted, "docs")).?;
+    defer filter.deinit(std.testing.failing_allocator);
+    try std.testing.expect(filter.allocation == null);
+    try std.testing.expectEqualStrings("{\"term\":{\"tenant\":\"a\"}}", filter.json);
+    try std.testing.expect(filter.json.ptr == restricted[0].filter.ptr);
 }

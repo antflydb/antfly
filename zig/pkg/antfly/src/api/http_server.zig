@@ -5930,7 +5930,7 @@ pub const ApiHttpServer = struct {
                     for (filters) |*filter| filter.deinit(manager.alloc);
                     manager.alloc.free(filters);
                 }
-                if (filters.len != 0) return error.MemoryRowPolicyUnsupported;
+                if (usermgr.hasRowFilters(filters)) return error.MemoryRowPolicyUnsupported;
                 context.admin = permissionsAllow(permissions, .table, logical, .admin);
                 context.curator = permissionsAllow(permissions, .table, logical, .curator);
             }
@@ -18303,7 +18303,7 @@ pub const ApiHttpServer = struct {
         };
         for (try self.logicalTableNamesInArena(arena.allocator(), .{}, names)) |name| {
             if (!permissionsAllow(permissions, .table, name, .admin)) return error.StoredDestinationAuthorizationRevoked;
-            for (restrictions) |entry| if (system_catalog.tableResourceMatches(entry.table, name)) return error.StoredDestinationAuthorizationRevoked;
+            if (usermgr.hasRowFilterForTable(restrictions, name)) return error.StoredDestinationAuthorizationRevoked;
         }
     }
 
@@ -22478,7 +22478,7 @@ pub const ApiHttpServer = struct {
                     for (filters) |*filter| filter.deinit(manager.alloc);
                     manager.alloc.free(filters);
                 }
-                if (filters.len > 0) return .{ .state = .denied };
+                if (usermgr.hasRowFilters(filters)) return .{ .state = .denied };
                 identity = try cloneCatalogIdentity(server.alloc, .{ .username = @constCast(self.executor), .permissions = permissions, .live_user_manager = manager, .credential_principal = @constCast(self.executor) });
             }
             if (server.cfg.auth_enabled and identity == null) return .{ .state = .denied };
@@ -22559,7 +22559,7 @@ pub const ApiHttpServer = struct {
                 for (filters) |*filter| filter.deinit(manager.alloc);
                 manager.alloc.free(filters);
             }
-            if (filters.len != 0) return error.MemoryRowPolicyUnsupported;
+            if (usermgr.hasRowFilters(filters)) return error.MemoryRowPolicyUnsupported;
         }
     };
 
@@ -23338,7 +23338,7 @@ pub const ApiHttpServer = struct {
         if (method == .get and std.mem.eql(u8, suffix, "lookup") and options.lookup_consistency != .stale)
             return try contextual_operations.textAlloc(self.alloc, 400, "object document lookup supports only consistency=stale (published generations); use sync_level=full_index on writes to wait for publication");
 
-        if (identity) |user| if (user.row_filter.len != 0) return try contextual_operations.textAlloc(self.alloc, 409, "object-backed document tables do not support credential row filters");
+        if (identity) |user| if (usermgr.hasRowFilters(user.row_filter)) return try contextual_operations.textAlloc(self.alloc, 409, "object-backed document tables do not support credential row filters");
         // Policy enforcement belongs to native storage owners. Check the
         // durable publication before bypassing those owners for object data.
         var policy_context = context;
@@ -31483,8 +31483,8 @@ pub fn resolveEffectiveRowFilterJson(
 ) !?[]u8 {
     const active_identity = identity orelse return null;
     const raw = (try usermgr.combinedRowFilterForTable(alloc, active_identity.row_filter, table_name)) orelse return null;
-    defer alloc.free(raw);
-    return try resolveAuthRowFilterJson(alloc, active_identity, raw);
+    defer raw.deinit(alloc);
+    return try resolveAuthRowFilterJson(alloc, active_identity, raw.json);
 }
 
 pub fn resolveAuthRowFilterJson(
@@ -59293,29 +59293,75 @@ test "query builder dependency 503 responses preserve public retry contract" {
 }
 
 pub fn projectCatalogIdentity(alloc: std.mem.Allocator, identity: *AuthenticatedIdentity, logical: []const u8, physical: []const u8) !void {
-    try appendCatalogAlias(alloc, identity, logical, physical);
-    const permission_count = identity.permissions.len;
-    for (0..permission_count) |i| {
-        const original = identity.permissions[i];
-        if (original.resource_type != .table or !system_catalog_routes.tableResourceMatches(original.resource, logical)) continue;
-        var permission = try usermgr.Permission.initOwned(alloc, .table, physical, original.type);
-        permission.deny_mutation = original.deny_mutation;
-        errdefer permission.deinit(alloc);
-        identity.permissions = try alloc.realloc(identity.permissions, identity.permissions.len + 1);
-        identity.permissions[identity.permissions.len - 1] = permission;
+    // A relation can bind the same target through qualified and unqualified
+    // names. Never append its predicates twice or alter retained policy JSON.
+    for (identity.catalog_aliases) |alias| {
+        if (!std.mem.eql(u8, alias.physical, physical)) continue;
+        const existing = try system_catalog.Target.parse(alias.logical);
+        const target = try system_catalog.Target.parse(logical);
+        if (!std.mem.eql(u8, existing.database, target.database) or
+            !std.mem.eql(u8, existing.namespace, target.namespace) or
+            !std.mem.eql(u8, existing.table, target.table)) return error.CatalogGenerationChanged;
+        return;
     }
-    // Global filters already match the physical name. Project only scopes
-    // that would otherwise be lost when the catalog maps to immutable storage.
-    const filter_count = identity.row_filter.len;
-    for (0..filter_count) |i| {
-        const original = identity.row_filter[i];
-        if (!system_catalog.tableResourceMatches(original.table, logical) or
+
+    var permission_count: usize = 0;
+    for (identity.permissions) |permission| {
+        if (permission.resource_type == .table and
+            system_catalog_routes.tableResourceMatches(permission.resource, logical) and
+            !system_catalog_routes.tableResourceMatches(permission.resource, physical)) permission_count += 1;
+    }
+    var filter_count: usize = 0;
+    for (identity.row_filter) |filter| {
+        if (!usermgr.isNullRowFilter(filter.filter) and
+            system_catalog.tableResourceMatches(filter.table, logical) and
+            !system_catalog.tableResourceMatches(filter.table, physical)) filter_count += 1;
+    }
+
+    // Build the projection before publishing its alias. On allocation failure
+    // the original identity stays intact and can be retried safely.
+    const permissions = try alloc.alloc(usermgr.Permission, identity.permissions.len + permission_count);
+    errdefer alloc.free(permissions);
+    @memcpy(permissions[0..identity.permissions.len], identity.permissions);
+    var permission_filled = identity.permissions.len;
+    errdefer for (permissions[identity.permissions.len..permission_filled]) |*entry| entry.deinit(alloc);
+    for (identity.permissions) |original| {
+        if (original.resource_type != .table or
+            !system_catalog_routes.tableResourceMatches(original.resource, logical) or
+            system_catalog_routes.tableResourceMatches(original.resource, physical)) continue;
+        permissions[permission_filled] = try usermgr.Permission.initOwned(alloc, .table, physical, original.type);
+        permissions[permission_filled].deny_mutation = original.deny_mutation;
+        permission_filled += 1;
+    }
+
+    const filters = try alloc.alloc(usermgr.RowFilterEntry, identity.row_filter.len + filter_count);
+    errdefer alloc.free(filters);
+    @memcpy(filters[0..identity.row_filter.len], identity.row_filter);
+    var filter_filled = identity.row_filter.len;
+    errdefer for (filters[identity.row_filter.len..filter_filled]) |*entry| entry.deinit(alloc);
+    for (identity.row_filter) |original| {
+        // Global filters already match immutable storage names.
+        if (usermgr.isNullRowFilter(original.filter) or
+            !system_catalog.tableResourceMatches(original.table, logical) or
             system_catalog.tableResourceMatches(original.table, physical)) continue;
-        var filter = try usermgr.RowFilterEntry.initOwned(alloc, physical, original.filter);
-        errdefer filter.deinit(alloc);
-        identity.row_filter = try alloc.realloc(identity.row_filter, identity.row_filter.len + 1);
-        identity.row_filter[identity.row_filter.len - 1] = filter;
+        filters[filter_filled] = try usermgr.RowFilterEntry.initOwned(alloc, physical, original.filter);
+        filter_filled += 1;
     }
+
+    const logical_copy = try alloc.dupe(u8, logical);
+    errdefer alloc.free(logical_copy);
+    const physical_copy = try alloc.dupe(u8, physical);
+    errdefer alloc.free(physical_copy);
+    const aliases = try alloc.alloc(AuthenticatedIdentity.CatalogAlias, identity.catalog_aliases.len + 1);
+    @memcpy(aliases[0..identity.catalog_aliases.len], identity.catalog_aliases);
+    aliases[identity.catalog_aliases.len] = .{ .logical = logical_copy, .physical = physical_copy };
+
+    alloc.free(identity.permissions);
+    alloc.free(identity.row_filter);
+    alloc.free(identity.catalog_aliases);
+    identity.permissions = permissions;
+    identity.row_filter = filters;
+    identity.catalog_aliases = aliases;
 }
 
 fn appendCatalogAlias(alloc: std.mem.Allocator, identity: *AuthenticatedIdentity, logical: []const u8, physical: []const u8) !void {
@@ -63352,4 +63398,62 @@ test "system catalog row filter scopes preserve tenant restriction and resolve a
     const physical = (try resolveEffectiveRowFilterJson(alloc, projected, "table:immutable")).?;
     defer alloc.free(physical);
     try std.testing.expectEqualStrings(resolved, physical);
+}
+
+test "system catalog projection is idempotent and failure atomic" {
+    const Fixture = struct {
+        fn check(failing: std.mem.Allocator) !void {
+            const a = std.testing.allocator;
+            var permission = try usermgr.Permission.initOwned(a, .table, "docs", .read);
+            defer permission.deinit(a);
+            var restriction = try usermgr.RowFilterEntry.initOwned(a, "docs", "{\"term\":{\"tenant\":\"a\"}}");
+            defer restriction.deinit(a);
+            var permissions = [_]usermgr.Permission{permission};
+            var restrictions = [_]usermgr.RowFilterEntry{restriction};
+            var identity = (try cloneCatalogIdentity(a, .{ .username = @constCast("reader"), .permissions = &permissions, .row_filter = &restrictions })).?;
+            defer identity.deinit(a);
+            projectCatalogIdentity(failing, &identity, "docs", "table:immutable") catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), identity.catalog_aliases.len);
+                try std.testing.expectEqual(@as(usize, 1), identity.permissions.len);
+                try std.testing.expectEqual(@as(usize, 1), identity.row_filter.len);
+                // A failed attempt must not leave an alias that suppresses retry.
+                try projectCatalogIdentity(a, &identity, "docs", "table:immutable");
+                return err;
+            };
+            const permission_count = identity.permissions.len;
+            const filter_count = identity.row_filter.len;
+            // Equivalent qualification must be a no-allocation no-op.
+            try projectCatalogIdentity(std.testing.failing_allocator, &identity, "\x00catalog:7:default6:public4:docs", "table:immutable");
+            try std.testing.expectEqual(permission_count, identity.permissions.len);
+            try std.testing.expectEqual(filter_count, identity.row_filter.len);
+            try std.testing.expectEqual(@as(usize, 1), identity.catalog_aliases.len);
+            try std.testing.expectError(error.CatalogGenerationChanged, projectCatalogIdentity(std.testing.failing_allocator, &identity, "other", "table:immutable"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+}
+
+test "system catalog signed trusted principal combines all filter scopes" {
+    const Fake = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+    };
+    const a = std.testing.allocator;
+    const secret = "scoped-trusted-principal-test-secret";
+    const payload = "{\"iss\":\"trusted-upstream\",\"sub\":\"reader\",\"tables\":[\"*\"],\"operations\":[\"read\"],\"metadata\":{\"tenant\":\"a\"},\"row_filter\":{\"*\":{\"term\":{\"tenant\":{\"$auth\":\"metadata.tenant\"}}},\"\\u0000catalog:7:default6:public*\":{\"term\":{\"region\":\"us\"}},\"docs\":{\"term\":{\"status\":\"open\"}},\"\\u0000catalog:7:default6:public4:docs\":null},\"exp\":4102444800}";
+    const token = try encodeTrustedPrincipalToken(a, secret, payload);
+    defer a.free(token);
+    var server = ApiHttpServer.init(a, .{ .trusted_principal_secret = secret, .trusted_principal_issuer = "trusted-upstream" }, .{ .ptr = undefined, .vtable = &.{ .status = Fake.status } }, null, null);
+    defer server.deinit();
+    var identity = try server.authenticateRequest(.{ .trusted_principal = token });
+    defer identity.deinit(a);
+    const logical = "\x00catalog:7:default6:public4:docs";
+    const resolved = (try resolveEffectiveRowFilterJson(a, identity, logical)).?;
+    defer a.free(resolved);
+    try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"tenant\":\"a\"}},{\"term\":{\"region\":\"us\"}},{\"term\":{\"status\":\"open\"}}]}", resolved);
+    try projectCatalogIdentity(a, &identity, logical, "table:immutable");
+    const projected = (try resolveEffectiveRowFilterJson(a, identity, "table:immutable")).?;
+    defer a.free(projected);
+    try std.testing.expectEqualStrings(resolved, projected);
 }
