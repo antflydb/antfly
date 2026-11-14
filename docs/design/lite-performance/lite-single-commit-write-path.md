@@ -3048,11 +3048,6 @@ Bug 3 above) rather than by shrinking the reservation itself. The
 decision is creation-time only -- `OpenOptions` has no `use_redo_log`
 field, so reopening an existing file never changes the mode it was
 created with, independent of whatever budget the reopen itself passes.
-A more thorough fix for the unbounded case -- growing the reservation
-from a small floor as the file's real data grows, instead of reserving
-the maximum eagerly -- is still a larger, separate change (§9.4's own
-checkpointer would need to drive the growth) and is left for whoever
-picks this up next.
 
 Every other `use_redo_log`-threading layer (`backend.zig`'s
 `Handle.createWithOptions`, the capi/`db.zig` open-options seam,
@@ -3076,6 +3071,102 @@ Not changed in this pass: `use_redo_log` still defaults to `true`
 globally once `page_reuse`/`indexed_reclamation` allow it, for every
 caller at or above the 4 MiB floor (including the common/production
 case of no budget at all) -- only the small-budget default moved.
+
+### 9.7g The reservation follows the budget after creation too (`perf/lwa-small-budget-policy`)
+
+§9.7f's own gap, picked up directly: a redo-log file's capacity
+reservation was frozen at whatever `NativeFile
+.redoLogCapacityForBudget` computed from `reclamation.max_storage_bytes`
+*at creation*, even after the caller lowered the budget well below it
+afterward (`maintenance_policy.options.max_storage_bytes`, refreshed
+into `NativeFile.redo_log_budget_bytes` on every commit by
+`docstore.Store.refreshAdmissionAssumeLocked`, but never fed back into
+the reservation itself). This is exactly what "lite reclamation vacuum
+preserves collector capacity with retained readers (redo)" hit: an
+unbounded store's full, un-scaled 512 KiB reservation, still in place
+after the test tightens the budget well below it, left too little real
+headroom for `pageAllocatorForDivertingCommit`'s own admission check
+(Bug 2 above) to admit one more small write.
+
+**The fold is the resize point.** `checkpointRedoLog` already empties
+and resets the log on every fold; `NativeFile.maybeShrinkRedoLogCapacity`,
+called from that same epilogue (inside the existing `!pinned_below`
+branch -- no cross-process reader pinned below the checkpoint this
+fold just published), re-derives the target capacity from the
+*current* `redo_log_budget_bytes` and shrinks to it when smaller than
+what is currently reserved. Growing back is deliberately not attempted
+here: once a shrunk range's pages are released to the free map, a
+later write may claim one of them for ordinary content, and safely
+re-reserving the same contiguous range for a larger log again would
+need to relocate whatever has since claimed it -- raising a lowered
+budget back up keeps whatever smaller capacity the most recent shrink
+left it at (a dedicated vacuum/rewrite still enlarges it), the same
+class of gap the unbounded case's own eager-reservation tradeoff above
+already accepts.
+
+**Mechanics, and why the order matters.** For an indexed
+(`page_reuse = true`) file, the freed pages are released into the real
+free map (`allocator_v4.State.releaseMetadata`, not
+`retire`/`complete`: these pages were reserved directly by
+`enableRedoLog`'s own `allocateFresh` loop at reference count 0, never
+`retain`ed, so they need the same direct-to-free transition that
+primitive already exists for, not the general retire/eligible/complete
+lifecycle a retained *content* page needs). For a non-indexed
+(`page_reuse = false`) file there is no free map to release into at
+all -- page ids there are a one-way, append-only counter, the same
+reason non-indexed vacuum works by rewriting a whole new, smaller file
+rather than freeing pages in place -- so only the accounted/active
+`header.redo_log_capacity` shrinks there; the physical bytes stay
+reserved for the file's lifetime, same as every other never-reclaimed
+cost a non-indexed store already accepts. Either way, the new, smaller
+`header.redo_log_capacity` is written and **synced to disk before**
+the ledger change that frees the pages is itself published as a real
+checkpoint. A crash in between leaves the header already showing the
+smaller capacity (safe: a recovered writer re-opens bounded to it,
+never appending past where the shrink intended) with those pages still
+shown reserved in the ledger (safe: merely not yet reclaimed, retried
+on a later fold) -- never the reverse, which would let an ordinary
+write claim one of them for real content while a recovered writer
+still believed it owned that exact byte range for the log.
+
+**Cross-process consistency came for free.** `header.redo_log_capacity`
+was previously documented as immutable for a redo-log file's lifetime
+once set (`NativeFile.captureFullReadSnapshot`'s own header-equivalence
+comment); this pass makes it mutable, but every mechanism that relied
+on that assumption already re-reads the full on-disk header whenever
+the *checkpoint* changes, and a capacity-shrinking fold always changes
+the checkpoint (it is a real, non-diverting commit) -- so
+`refreshCrossProcessRedoOverlay`'s own "re-open semantics" re-read and
+`captureFullReadSnapshot`'s own equivalence check both already pick up
+a new capacity exactly when they need to, with no change to either.
+
+**Admission counts the shrunk reservation once the fold runs.** Freeing
+the log's own pages does not, by itself, change
+`pageAllocatorForDivertingCommit`'s admission math -- that check
+compares raw page-id headroom under the budget
+(`limit/page_size - next.page_count`) against
+`retirementReservePages`'s own fixed overhead, neither side of which a
+freed-but-still-counted page id moves. What was missing, and is fixed
+alongside the resize: that check never credited *any* already-free,
+reusable pages toward the available side, unlike a real (non-diverting)
+commit's own `persistAllocator` check, which already adds
+`state.free_pages` when the free map is verified. Diverting commits
+never reuse a page for their own one page-shaped exception
+(`PageAllocator.append_only`), but that is a reason *this* commit
+cannot reuse one, not a reason the file has no usable headroom: a free
+page -- whether from ordinary prior retirement or from this fold's own
+shrink -- is exactly the headroom the check exists to recognize.
+Brought to parity with the real-commit check (gated on
+`free_pages_verified`, and only when `indexed_reclamation` is set,
+matching `retirementReserveBytesWithCancel`'s own early return for a
+non-indexed file). `docstore.Store.submitScopedMutation` retries a
+`LiteStorageBudgetExceeded` rejection once, by running a fold and
+re-staging, but only when there is a real, currently-oversized
+reservation to shrink (`redoLogCapacityForBudget(redo_log_budget_bytes)
+< header.redo_log_capacity`) -- never for an ordinary, already
+right-sized budget rejection, so every other existing
+"budget correctly rejects this write" test's own behavior is
+unaffected.
 
 ### 9.8 Gates (from step (c) on)
 

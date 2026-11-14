@@ -701,37 +701,26 @@ fn reclamationVacuumPreservesCollectorCapacityWithRetainedReadersImpl(a: Allocat
     try std.testing.expectError(error.LiteStorageBudgetExceeded, store.vacuum());
     try std.testing.expectEqualDeep(before, store.file.activeCheckpoint());
     try std.testing.expectEqual(before_handle, store.file.file.handle);
-    // perf/lwa-reclaim-reconcile: re-checked directly (not inferred) --
-    // this still fails under redo, but not from Bug 1's orphaned-page
-    // leak (fixed) or a new bug this branch introduces. `size` above
-    // already includes this file's own fixed, un-scaled
-    // `NativeFile.default_redo_log_capacity_bytes` reservation (512 KiB):
-    // `max_storage_bytes` was still 0 (unbounded) at creation time, so
-    // `createWithOptions`'s own §9.7a scaling -- which only ever runs
-    // against the budget the *caller* passes in at creation -- never
-    // saw the tight budget assigned here afterward and could not scale
-    // the reservation down to match it. The same `compact * 2` (64 KiB)
-    // headroom this test leaves above the vacuum-rejecting budget is
-    // ample for legacy's own real, already-grown file, but not enough
-    // for the diverting commit's own conservative admission check (Bug
-    // 2, perf/lwa-budget-tail: `pageAllocatorForDivertingCommit`'s
-    // mirrored `retirementReservePages` headroom check, now correctly
-    // enforced) once that fixed reservation has already eaten most of
-    // the budget. This is exactly §9.7f's own documented, explicitly
-    // deferred gap (the unbounded case's reservation only ever grows
-    // from a small floor instead of being reserved eagerly at the
-    // maximum -- "a larger, separate change ... left for whoever picks
-    // this up next"), reached here through a budget tightened *after*
-    // creation rather than through this task's own at-creation default
-    // policy; that policy does not reach this test; (it only runs when
-    // the caller omits `use_redo_log` at creation, and both variants
-    // here pin it explicitly either way, plus `max_storage_bytes` is
-    // literally unset until after creation).
-    if (use_redo_log) {
-        try std.testing.expectError(error.LiteStorageBudgetExceeded, store.putCatalogRecord("next", "value"));
-    } else {
-        try store.putCatalogRecord("next", "value");
-    }
+    // perf/lwa-reclaim-reconcile / §9.7f (redo-log capacity resize):
+    // formerly a KNOWN REDO-MODE GAP here -- `size` above already
+    // included this file's own fixed, un-scaled
+    // `NativeFile.default_redo_log_capacity_bytes` reservation (512
+    // KiB), because `max_storage_bytes` was still 0 (unbounded) at
+    // creation time, so `createWithOptions`'s own §9.7a scaling (which
+    // only ever runs against the budget the caller passes in at
+    // creation) never saw the tight budget assigned here afterward.
+    // That left too little of the `compact * 2` headroom above for the
+    // diverting commit's own conservative admission check (Bug 2,
+    // perf/lwa-budget-tail), even though the vacuum-rejecting budget
+    // above correctly fails either way. Fixed directly, not worked
+    // around: `submitScopedMutation`'s own retry (§9.7f) catches
+    // exactly this -- an oversized, stale reservation is the reason
+    // this write was rejected -- folds (`checkpointRedoLog`'s own
+    // `maybeShrinkRedoLogCapacity`, which re-derives the reservation
+    // from whatever budget is current on *every* fold, not just at
+    // creation) and retries once, so the small write below now succeeds
+    // in both modes.
+    try store.putCatalogRecord("next", "value");
     pinned.abort();
     pin_active = false;
     if (!use_redo_log) {
@@ -3021,10 +3010,7 @@ pub const Store = struct {
         // of the budget, floored at 64 KiB so there is still a usable log
         // -- rather than the flat default; an unbounded (`0`) budget, the
         // common/production case, keeps the full default untouched.
-        const redo_log_capacity_bytes = if (opts.reclamation.max_storage_bytes != 0)
-            @min(native.NativeFile.default_redo_log_capacity_bytes, @max(opts.reclamation.max_storage_bytes / 4, 64 * 1024))
-        else
-            native.NativeFile.default_redo_log_capacity_bytes;
+        const redo_log_capacity_bytes = native.NativeFile.redoLogCapacityForBudget(opts.reclamation.max_storage_bytes);
         const minimum = native.NativeFile.minimumOwnerStorageBytes(opts.reclamation.page_reuse) +| (if (use_redo_log) redo_log_capacity_bytes else 0);
         if (opts.reclamation.max_storage_bytes != 0 and minimum > opts.reclamation.max_storage_bytes) return error.LiteStorageBudgetExceeded;
         const available = if (opts.reclamation.capacity_probe) |probe|
@@ -3047,6 +3033,7 @@ pub const Store = struct {
         file.externally_locked = opts.externally_locked;
         file.reserve_retirement_capacity = true;
         if (opts.reclamation.max_storage_bytes != 0) file.max_file_bytes = opts.reclamation.max_storage_bytes;
+        file.redo_log_budget_bytes = opts.reclamation.max_storage_bytes;
         file.vacuum_target_indexed = opts.reclamation.page_reuse;
         var result: Store = .{
             .score_cache_owner = next_score_cache_owner.fetchAdd(1, .monotonic),
@@ -3144,6 +3131,77 @@ pub const Store = struct {
         var read = try reopened.beginRead();
         defer read.abort();
         try std.testing.expectEqualStrings("value", try read.get("doc"));
+    }
+
+    // §9.7f: the redo-log capacity reservation must track the *current*
+    // budget, not just the one in effect at creation. These two tests
+    // cover `checkpointRedoLog`'s own `maybeShrinkRedoLogCapacity`: an
+    // unbounded store (the full, un-scaled default reservation) whose
+    // budget is lowered well below it afterward, same as the scenario
+    // "lite reclamation vacuum preserves collector capacity with
+    // retained readers (redo)" hit directly.
+    test "lite small budget default policy lowering the budget shrinks an existing redo log at the next fold" {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "policy-shrink-fold.aflite");
+        defer a.free(path);
+        var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = true });
+        defer store.close();
+        try std.testing.expectEqual(native.NativeFile.default_redo_log_capacity_bytes, store.file.header.redo_log_capacity);
+        try store.putCatalogRecord("seed", "value");
+        // Lowering the budget alone does not shrink anything yet --
+        // `refreshAdmissionAssumeLocked` (run by the write just below)
+        // only keeps `redo_log_budget_bytes` current; the fold is what
+        // actually resizes.
+        const small_budget: u64 = 1024 * 1024;
+        store.maintenance_policy.options.max_storage_bytes = small_budget;
+        try store.putCatalogRecord("touch", "value");
+        try std.testing.expectEqual(native.NativeFile.default_redo_log_capacity_bytes, store.file.header.redo_log_capacity);
+        try store.file.checkpointRedoLog();
+        const expected = native.NativeFile.redoLogCapacityForBudget(small_budget);
+        try std.testing.expect(expected < native.NativeFile.default_redo_log_capacity_bytes);
+        try std.testing.expectEqual(expected, store.file.header.redo_log_capacity);
+        // The whole point: an ordinary small write still succeeds after
+        // the shrink, well within the lowered budget.
+        try store.putCatalogRecord("after-shrink", "value");
+        const value = (try store.getCatalogRecordAlloc(a, "after-shrink")).?;
+        defer a.free(value);
+        try std.testing.expectEqualStrings("value", value);
+        try std.testing.expect((try store.checkWithCancel(null)).valid);
+    }
+
+    test "lite small budget default policy shrunk redo log capacity survives reopen" {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "policy-shrink-reopen.aflite");
+        defer a.free(path);
+        const small_budget: u64 = 1024 * 1024;
+        const expected = native.NativeFile.redoLogCapacityForBudget(small_budget);
+        {
+            var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = true });
+            defer store.close();
+            try store.putCatalogRecord("seed", "value");
+            store.maintenance_policy.options.max_storage_bytes = small_budget;
+            try store.putCatalogRecord("touch", "value");
+            try store.file.checkpointRedoLog();
+            try std.testing.expectEqual(expected, store.file.header.redo_log_capacity);
+        }
+        // The shrunk capacity (and the offset/header fields it depends
+        // on) must read back correctly from disk, not just survive in
+        // this instance's own memory.
+        var reopened = try Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+        defer reopened.close();
+        try std.testing.expectEqual(expected, reopened.file.header.redo_log_capacity);
+        const seed = (try reopened.getCatalogRecordAlloc(a, "seed")).?;
+        defer a.free(seed);
+        try std.testing.expectEqualStrings("value", seed);
+        try reopened.putCatalogRecord("after-reopen", "value");
+        const after = (try reopened.getCatalogRecordAlloc(a, "after-reopen")).?;
+        defer a.free(after);
+        try std.testing.expectEqualStrings("value", after);
+        try std.testing.expect((try reopened.checkWithCancel(null)).valid);
     }
 
     fn stopMaintenance(self: *Store) void {
@@ -4100,6 +4158,12 @@ pub const Store = struct {
     /// Called by serialized adapters before direct native publication.
     pub fn refreshAdmissionAssumeLocked(self: *Store) !void {
         const options = self.maintenance_policy.options;
+        // §9.7f: the *configured* budget, deliberately not the
+        // disk/workspace-adjusted `max_file_bytes` computed below --
+        // `checkpointRedoLog`'s own `maybeShrinkRedoLogCapacity` must
+        // track a budget the caller actually set, never a transient dip
+        // in available disk space.
+        self.file.redo_log_budget_bytes = options.max_storage_bytes;
         self.maintenance_policy.status.artifact_file_bytes = self.artifactBytes();
         const budget_limit: ?u64 = if (options.max_storage_bytes == 0) null else options.max_storage_bytes -| self.totalRetiredFileBytes() -| self.maintenance_policy.status.temporary_bytes -| self.artifactBytes();
         const size = self.file.activeCheckpoint().page_count *| self.file.header.page_size;
@@ -5435,7 +5499,35 @@ pub const Store = struct {
 
     fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool) !void {
         const ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
-        return ticket.wait();
+        ticket.wait() catch |err| {
+            // §9.7f: a redo-log file's own fixed log-capacity reservation
+            // can go stale -- frozen at whatever it was sized to when
+            // `max_storage_bytes` was last this large -- after the
+            // caller lowers the budget well below it
+            // (`refreshAdmissionAssumeLocked` updates
+            // `self.file.redo_log_budget_bytes` on every commit, but
+            // nothing previously ever re-sized the reservation itself
+            // to match). Rejected only for that reason, a fold
+            // (`checkpointRedoLog`, whose own epilogue shrinks the
+            // reservation to what the *current* budget implies,
+            // `NativeFile.maybeShrinkRedoLogCapacity`) can free enough
+            // of it for this exact write to go on to succeed. Retried at
+            // most once, and only when there is a real, currently
+            // oversized reservation to shrink -- never for an ordinary,
+            // already-right-sized budget rejection (every other
+            // existing "budget correctly rejects this write" test's own
+            // behavior is unaffected: for those, this condition is
+            // false and the original error returns unchanged).
+            if (err == error.LiteStorageBudgetExceeded and self.file.redo != null and
+                native.NativeFile.redoLogCapacityForBudget(self.file.redo_log_budget_bytes) < self.file.header.redo_log_capacity)
+            {
+                if (self.file.checkpointRedoLog()) |_| {
+                    const retry_ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
+                    return retry_ticket.wait();
+                } else |_| {}
+            }
+            return err;
+        };
     }
 
     /// Apply every member of one bounded group inside a single native
