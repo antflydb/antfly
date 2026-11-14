@@ -7877,6 +7877,21 @@ pub const NativeFile = struct {
         // `redo_fold_retain_pending` already is.
         var retiring_chains: std.ArrayListUnmanaged(redo_overlay.SharedRedoOverlay.SupersededChain) = .empty;
         errdefer retiring_chains.deinit(self.allocator);
+        // perf/lwa-lease-fold: every root page a *surviving* head (any
+        // root, this same fold) still points at via its own
+        // `external_value_root_page` -- an open artifact lease's own
+        // catalog record (`artifact_source.zig`'s `Capture.apply`) is
+        // exactly this: it never writes a new value chain, it just
+        // copies an *existing* `external_value_root_page` into a second,
+        // independent record. When the original record superseded by
+        // this same fold (an overwrite or delete) happens to point at
+        // the identical chain -- aliasing, not a coincidence of ids,
+        // since nothing else hands out that exact page number again --
+        // retiring that chain below must not also release the surviving
+        // alias's own hold on it. See the loop below, after every root
+        // has been collected, for how this set is used.
+        var surviving_roots: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer surviving_roots.deinit(self.allocator);
         for (0..3) |root_idx| {
             // A fully-owned snapshot, folded outside `shared`'s own lock
             // (`snapshotHeadsAlloc`'s own doc comment) -- `putDocumentBatch`/
@@ -7890,6 +7905,9 @@ pub const NativeFile = struct {
                     self.allocator.free(h.value);
                 }
                 self.allocator.free(heads);
+            }
+            for (heads) |h| {
+                if (!h.is_delete and h.external_value_root_page != 0) try surviving_roots.put(self.allocator, h.external_value_root_page, {});
             }
             // Same `fold_floor` boundary as `heads` above -- see
             // `snapshotSupersededChainsAlloc`'s own doc comment for why
@@ -7933,17 +7951,69 @@ pub const NativeFile = struct {
                 try self.putCatalogBatchForRoot(if (root_idx == 0) .metadata else .index, batch.items, .{});
             }
         }
-        // `retiring_chains` never grew at all (stays `.empty`, nothing
-        // allocated) when nothing was superseded in this fold's own
-        // window -- nothing to free in that case, and no explicit deinit
-        // call here either: this list's own `errdefer` (just above the
-        // loop) already owns cleanup for every path out of this
-        // function, and calling `deinit` a second time on the same value
-        // (once here, once from that still-registered errdefer were a
-        // later error to occur) would poison it (`deinit` sets `self.*
-        // = undefined`) before the errdefer's own call ever ran.
+        // perf/lwa-lease-fold: drop every retiring chain whose root page
+        // is still referenced by a live owner -- either a surviving head
+        // collected just above (`surviving_roots`), or a reference this
+        // fold did not create at all (the page already had a nonzero
+        // ledger count *before* this fold's own build ran, e.g. an
+        // artifact lease's own catalog record a previous fold already
+        // retained -- nothing below this point has retained anything
+        // yet: every build above only stages into `TransactionWrites
+        // .maps`; the real `IndexEditor`/retain pass does not run until
+        // `flushTransactionWrites`, well after this). Retiring one of
+        // these anyway would queue a `.value` retirement that, once
+        // drained, releases a reference that reference's own surviving
+        // owner still needs -- the exact corruption a leased immutable
+        // source's pages must never suffer (see `retainUnretainedValueChainPages`'s
+        // own doc comment: it is safe to call after a surviving record
+        // already retained the same root, but the matching `retire()`
+        // call below is not, and this is the only point with enough
+        // information to tell the two cases apart). A chain filtered out
+        // here needs no retain of its own either: whatever still
+        // references its pages already retains them (the surviving
+        // head's own `retainRecord`/`retainUnretainedValueChainPages`
+        // sweep in `flushTransactionWrites`, or the prior fold that
+        // established the pre-existing count), and `redo_fold_retain_pending`'s
+        // generic staged-page sweep covers any continuation page neither
+        // of those reaches.
         if (retiring_chains.items.len != 0) {
-            self.redo_fold_retire_pending = try retiring_chains.toOwnedSlice(self.allocator);
+            const ledger_state: ?*allocator_v4.State = if (self.transaction_writes) |writes| writes.pages.ledger else null;
+            var keep: usize = 0;
+            for (retiring_chains.items) |chain| {
+                const referenced = surviving_roots.contains(chain.external_value_root_page) or
+                    (if (ledger_state) |state| state.count(chain.external_value_root_page) != 0 else false);
+                if (referenced) continue;
+                retiring_chains.items[keep] = chain;
+                keep += 1;
+            }
+            retiring_chains.shrinkRetainingCapacity(keep);
+        }
+        // `retiring_chains` used to never grow at all (stay `.empty`,
+        // nothing allocated) whenever `items.len == 0` here -- nothing
+        // to free in that case, so the code below this comment used to
+        // skip `toOwnedSlice` entirely rather than risk a double-`deinit`
+        // against the `errdefer` registered where this list was
+        // declared (`deinit` leaves the list `undefined`; calling it a
+        // second time on that is its own bug, not a safe no-op).
+        // perf/lwa-lease-fold: that is no longer the only way to reach
+        // `items.len == 0` -- the surviving-owner filter just above can
+        // empty a list that *did* allocate (grew while collecting, then
+        // every entry filtered out), and that backing allocation is
+        // real and leaks if nothing frees it (reproduced live: "lite
+        // fold with an open lease never corrupts the leased bytes"
+        // leaking exactly one `retiring_chains` growth on a fold whose
+        // only superseded chain was also the lease's own surviving
+        // alias). `toOwnedSlice` unconditionally, regardless of length,
+        // sidesteps both problems at once: it always leaves the list in
+        // the same safe, empty, re-`deinit`-able state `toOwnedSlice`
+        // already left it in on the non-empty path before this change,
+        // whether or not anything was ever appended, so the still-armed
+        // `errdefer` stays harmless either way.
+        const retiring_owned = try retiring_chains.toOwnedSlice(self.allocator);
+        if (retiring_owned.len != 0) {
+            self.redo_fold_retire_pending = retiring_owned;
+        } else {
+            self.allocator.free(retiring_owned);
         }
         // Builds the real pages above, then (via `flushTransactionWrites`,
         // `commitTransactionWithDurability`, `publishCheckpoint`, all

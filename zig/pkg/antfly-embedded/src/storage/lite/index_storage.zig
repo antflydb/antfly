@@ -2511,6 +2511,61 @@ test "lite artifact leases survive owner close and do not pin document retiremen
     try std.testing.expect((try reopened.checkWithCancel(null)).valid);
 }
 
+// Regression (perf/lwa-lease-fold): deterministic, no maintenance loop, no
+// budget -- an explicit `checkpointRedoLog` fold, called directly, used to
+// retire the leased chain's own pages out from under the still-open lease
+// whenever the lease's own catalog record (an alias pointing at the exact
+// same `external_value_root_page`, never a new chain) and the original
+// key's own supersession landed in the same fold window: `checkpointRedoLog`
+// retained the chain once (via the generic staged-page sweep or the
+// surviving alias's own write) and then *also* queued it for retirement,
+// releasing the alias's only hold on it. Draining that bogus retirement
+// (a second `checkpointRedoLog`/`reclaimPages` call, or ordinary maintenance)
+// then genuinely reused the page, corrupting the lease's own bytes.
+test "lite fold with an open lease never corrupts the leased bytes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "lease-fold-corruption.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var store = Store.init(a, &docs);
+    const storage = store.storage();
+    const payload = try a.alloc(u8, 256 * 1024);
+    defer a.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i);
+    try storage.writeFileAbsolute("/leased", payload);
+    var source = try storage.openLeasedImmutableSource(a, "/leased");
+    defer source.close();
+    // The lease's own catalog record and the original key's own delete
+    // both land in the same, still-unfolded redo window.
+    try storage.deleteFileAbsolute("/leased");
+    // Force the fold the lease is supposed to survive, directly -- no
+    // maintenance loop, no budget, no reliance on background timing.
+    try docs.checkpointRedoLog();
+    var out: [4096]u8 = undefined;
+    try source.readInto(0, &out);
+    try std.testing.expectEqualSlices(u8, payload[0..out.len], &out);
+    try source.readInto(payload.len - out.len, &out);
+    try std.testing.expectEqualSlices(u8, payload[payload.len - out.len ..], &out);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
+    // A second fold (nothing new superseded this time) must not disturb
+    // the still-live lease either, and page reuse driven by unrelated
+    // churn afterward must not land on the lease's own pages.
+    try docs.checkpointRedoLog();
+    for (0..8) |_| {
+        try storage.writeFileAbsolute("/other", payload);
+        try storage.deleteFileAbsolute("/other");
+    }
+    try docs.checkpointRedoLog();
+    _ = try docs.file.reclaimPages(8192);
+    try source.readInto(0, &out);
+    try std.testing.expectEqualSlices(u8, payload[0..out.len], &out);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
+}
+
 test "lite artifact leases close without reentering writer admission" {
     const Admission = struct {
         calls: usize = 0,
