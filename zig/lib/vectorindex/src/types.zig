@@ -55,6 +55,17 @@ pub const NativeResidualLocationPlane = struct {
             .residual_checksum = self.residual_checksums[index],
         };
     }
+
+    pub fn slice(self: @This(), start: usize, end: usize) @This() {
+        return .{
+            .reader_generations = self.reader_generations[start..end],
+            .reader_shard_ids = self.reader_shard_ids[start..end],
+            .revisions = self.revisions[start..end],
+            .residual_offsets = self.residual_offsets[start..end],
+            .residual_lengths = self.residual_lengths[start..end],
+            .residual_checksums = self.residual_checksums[start..end],
+        };
+    }
 };
 const Allocator = std.mem.Allocator;
 const vec = @import("antfly_vector").vector;

@@ -90,6 +90,8 @@ pub fn fromStorage(profile: db_query_search.DenseSearchProfile) query_api.QueryR
         .hbc_leaves_explored = profile.hbc_leaves_explored,
         .hbc_approx_vectors_scored = profile.hbc_approx_vectors_scored,
         .hbc_exact_vectors_scored = profile.hbc_exact_vectors_scored,
+        .hbc_exact_projection_vectors_scored = profile.hbc_exact_projection_vectors_scored,
+        .hbc_exact_vectors_pruned_by_bound = profile.hbc_exact_vectors_pruned_by_bound,
         .hbc_leaf_payload_stale = profile.hbc_leaf_payload_stale,
         .hbc_leaf_payload_missing = profile.hbc_leaf_payload_missing,
         .hbc_native_leaf_scan_hits = profile.hbc_native_leaf_scan_hits,

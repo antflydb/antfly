@@ -655,6 +655,61 @@ const ChunkInputRequest = struct {
     attachment_count: usize = 0,
 };
 
+// Native requests have no client-supplied operational ceilings. Start from the
+// node's configured limits, just like HTTP, rather than Request's defaults.
+// Keep the server's admission, bounded allocator and downward clamps in charge.
+fn nativeModelChunkRequest(limits: @FieldType(inference.server.chunk_response.Request, "limits"), input: inference_chunker.Input, cfg: chunking_types.Config, outputs: ?inference_chunker.outputs.Config, execute: bool) !inference.server.chunk_response.Request {
+    const wire = inference.server.chunk_response;
+    return .{
+        .limits = limits,
+        .max_working_bytes = limits.max_working_bytes,
+        .input = input,
+        .outputs = outputs,
+        .policy = try wire.parsePolicy(if (cfg.policy) |policy| converted: {
+            var value = wire.WirePolicy{};
+            inline for (@typeInfo(wire.WirePolicy).@"struct".field_names) |name| @field(value, name) = @field(policy, name);
+            break :converted value;
+        } else null),
+        .max_chunks = cfg.max_chunks,
+        .native_content = true,
+        .execute_outputs = execute,
+        .execute = execute,
+        .allow_partial = cfg.page,
+        .observe_only = cfg.page and cfg.observe_only,
+        .source_version = if (cfg.replay) |position| position.source_version else "",
+    };
+}
+
+test "native model chunk requests inherit configured ceilings for pages full input and replay" {
+    const Limits = @FieldType(inference.server.chunk_response.Request, "limits");
+    for ([_]usize{ 128, 512, 1024 }) |mib| {
+        var limits = Limits{ .max_working_bytes = mib * 1024 * 1024 };
+        // Cover other configurable ceilings too: native requests must not
+        // silently retain any default when an operator raises a node ceiling.
+        limits.max_chunks *= 2;
+        limits.max_index_packets *= 2;
+        limits.remote_fetched_bytes *= 2;
+        try limits.validate();
+        for ([_]bool{ false, true }) |page| {
+            for ([_]bool{ false, true }) |replay| {
+                const cfg = chunking_types.Config{
+                    .provider = .antfly,
+                    .page = page,
+                    .max_chunks = 2,
+                    .replay = if (replay) .{ .plan_id = "plan", .source_fingerprint = "source", .source_version = "version", .ordinal = 1 } else null,
+                };
+                const request = try nativeModelChunkRequest(limits, .{ .text = "fixture" }, cfg, null, false);
+                try std.testing.expectEqualDeep(limits, request.limits);
+                try std.testing.expectEqual(limits.max_working_bytes, request.max_working_bytes);
+                try std.testing.expectEqual(page, request.allow_partial);
+                try std.testing.expectEqualStrings(if (replay) "version" else "", request.source_version);
+                try std.testing.expect(!request.execute and !request.execute_outputs);
+                try std.testing.expect(request.native_content and !request.include_content);
+            }
+        }
+    }
+}
+
 const RewriteTextsRequest = struct {
     model: []const u8,
     inputs: []const []const u8,
@@ -1589,14 +1644,10 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
 
             if (cfg.page) {
                 const target = selected_target orelse return error.InvalidChunkPolicy;
-                const wire = inference.server.chunk_response;
                 const cursor = if (cfg.replay) |position| try std.fmt.allocPrint(alloc, "{s}:{d}", .{ position.plan_id, position.ordinal }) else null;
                 defer if (cursor) |value| alloc.free(value);
-                const request: wire.Request = .{ .observe_only = cfg.observe_only, .outputs = if (output_config) |value| value.value else null, .input = input, .policy = try wire.parsePolicy(if (cfg.policy) |policy| convert: {
-                    var converted = wire.WirePolicy{};
-                    inline for (@typeInfo(wire.WirePolicy).@"struct".field_names) |name| @field(converted, name) = @field(policy, name);
-                    break :convert converted;
-                } else null), .max_chunks = cfg.max_chunks, .native_content = true, .execute_outputs = target.execute orelse true, .execute = target.execute orelse true, .allow_partial = true, .continuation = cursor, .source_version = if (cfg.replay) |position| position.source_version else "" };
+                var request = try nativeModelChunkRequest(state.node.config.chunking_limits, input, cfg, if (output_config) |value| value.value else null, target.execute orelse true);
+                request.continuation = cursor;
                 var page = try state.node.chunkModelPageDirect(alloc, state.io, execution_control, request, .{ .model = target.model, .model_identity = target.model_identity, .task_type = target.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (target.dimensions) |d| std.math.cast(usize, d) orelse return error.InvalidArguments else null });
                 defer page.deinit(alloc);
                 if (cfg.replay) |position| if (!std.mem.eql(u8, position.plan_id, page.plan_id) or !std.mem.eql(u8, position.source_fingerprint, page.source_fingerprint) or !std.mem.eql(u8, position.source_version, page.source_version)) return error.StaleChunkContinuation;
@@ -1604,16 +1655,10 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             }
             const result = if (selected_target) |target| aware: {
                 const wire = inference.server.chunk_response;
-                const model_request: wire.Request = .{ .outputs = if (output_config) |value| value.value else null, .input = input, .policy = try wire.parsePolicy(if (cfg.policy) |policy| convert: {
-                    var converted = wire.WirePolicy{};
-                    inline for (@typeInfo(wire.WirePolicy).@"struct".field_names) |name| @field(converted, name) = @field(policy, name);
-                    break :convert converted;
-                } else null), .max_chunks = cfg.max_chunks, .include_content = false, .native_content = true, .execute_outputs = target.execute orelse true, .execute = target.execute orelse true, .allow_partial = false };
+                const model_request = try nativeModelChunkRequest(state.node.config.chunking_limits, input, cfg, if (output_config) |value| value.value else null, target.execute orelse true);
                 const model_target = wire.Target{ .model = target.model, .model_identity = target.model_identity, .task_type = target.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (target.dimensions) |d| std.math.cast(usize, d) orelse return error.InvalidArguments else null };
                 if (cfg.replay) |replay| {
-                    var replay_request = model_request;
-                    replay_request.source_version = replay.source_version;
-                    break :aware try state.node.replayModelChunkDirect(alloc, state.io, execution_control, replay_request, model_target, replay.plan_id, replay.source_fingerprint, replay.ordinal);
+                    break :aware try state.node.replayModelChunkDirect(alloc, state.io, execution_control, model_request, model_target, replay.plan_id, replay.source_fingerprint, replay.ordinal);
                 }
                 break :aware try state.node.chunkModelInputDirect(alloc, state.io, execution_control, model_request, model_target);
             } else legacy: {

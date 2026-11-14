@@ -42,6 +42,7 @@ pub const SearchScratch = struct {
 
     global_subgroups: @import("global_subgroup_plan.zig").Plan = .{},
     dims: usize,
+    certified_query_norm_upper: f32 = 0,
     estimate: quantizer.RaBitQuantizer.EstimateScratch,
     transformed_query: []f32,
     centroid: []f32,

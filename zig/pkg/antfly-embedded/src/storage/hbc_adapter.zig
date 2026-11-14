@@ -5474,6 +5474,10 @@ pub const HBCIndex = struct {
         /// as this search transaction. External exact-vector projections must
         /// not return a revision newer than this sequence.
         source_sequence: ?u64 = null,
+        /// Exact search consumes and completes one wave at a time. Drop the
+        /// previous wave's locations while retaining the query's source lease.
+        projection_cache_scope: enum { query, wave } = .query,
+        query_norm_upper: ?f32 = null,
     };
     pub const ExternalVectorBatchDistanceLoader = *const fn (
         ctx: *anyopaque,
@@ -16786,6 +16790,51 @@ pub const HBCIndex = struct {
         return true;
     }
 
+    /// Deterministic source-generation intervals for complete-snapshot search.
+    /// Capability rejection leaves the ordinary authoritative path available.
+    pub fn scoreExternalVectorsBoundedWithScratch(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_ids: []const u64,
+        query: []const f32,
+        query_measure: f32,
+        query_norm_upper: f32,
+        distances: []f32,
+        bounds: []f32,
+        metadata: []?[]const u8,
+        metadata_ready: bool,
+        vector_views: [][]const f32,
+        lookups: []FixedKeyLookup,
+        keys: [][]const u8,
+        values: []?[]const u8,
+        batch: []f32,
+        profile: *SearchProfile,
+    ) !bool {
+        if (!self.externalBoundedScoringAvailable(txn)) return false;
+        const loader = self.external_vector_batch_bounded_distance_loader orelse return false;
+        const ctx = self.external_vector_ctx orelse return false;
+        if (!metadata_ready) {
+            const start = platform_time.monotonicNs();
+            try self.getMetadataManySortedInTxnWithScratchUncached(txn, vector_ids, metadata, lookups, keys, values);
+            profile.rerank_metadata_vectors_loaded += vector_ids.len;
+            profile.rerank_metadata_lookup_ns += platform_time.monotonicNs() - start;
+        }
+        @memset(distances, std.math.inf(f32));
+        @memset(bounds, std.math.inf(f32));
+        loader(ctx, vector_ids, metadata, query, query_measure, self.config.metric, distances, bounds, batch, self.config.dims, .{
+            .artifact_keys = keys,
+            .raw_values = values,
+            .vector_views = vector_views,
+            .source_sequence = experimentalPostingSourceSequenceFromTxn(txn),
+            .projection_cache_scope = .wave,
+            .query_norm_upper = query_norm_upper,
+        }, profile) catch |err| switch (err) {
+            error.Unsupported => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     pub fn scoreExternalVectorsSortedWithScratch(
         self: *HBCIndex,
         txn: anytype,
@@ -16813,6 +16862,8 @@ pub const HBCIndex = struct {
             values_storage,
             batch_scratch,
             true,
+            false,
+            null,
         );
     }
 
@@ -16843,7 +16894,29 @@ pub const HBCIndex = struct {
             values_storage,
             batch_scratch,
             false,
+            false,
+            null,
         );
+    }
+
+    pub fn scoreExternalVectorsWithScratchProfiled(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_ids: []const u64,
+        query: []const f32,
+        query_measure: f32,
+        distances: []f32,
+        metadata: []?[]const u8,
+        vector_views: [][]const f32,
+        lookups: []FixedKeyLookup,
+        keys: [][]const u8,
+        values: []?[]const u8,
+        batch: []f32,
+        metadata_ready: bool,
+        profile: *SearchProfile,
+        comptime use_cache: bool,
+    ) !bool {
+        return self.scoreExternalVectorsSortedWithScratchCachePolicy(txn, vector_ids, query, query_measure, distances, metadata, vector_views, lookups, keys, values, batch, use_cache, metadata_ready, profile);
     }
 
     fn scoreExternalVectorsSortedWithScratchCachePolicy(
@@ -16860,6 +16933,8 @@ pub const HBCIndex = struct {
         values_storage: []?[]const u8,
         batch_scratch: []f32,
         comptime use_cache: bool,
+        metadata_ready: bool,
+        profile: ?*SearchProfile,
     ) !bool {
         const loader = self.external_vector_batch_distance_loader orelse return false;
         const ctx = self.external_vector_ctx orelse return false;
@@ -16870,24 +16945,17 @@ pub const HBCIndex = struct {
 
         for (distances[0..vector_ids.len]) |*distance| distance.* = std.math.inf(f32);
         const metadata = metadata_storage[0..vector_ids.len];
-        if (use_cache) {
-            try self.getMetadataManySortedInTxnWithScratch(
-                txn,
-                vector_ids,
-                metadata,
-                lookup_storage,
-                key_views_storage,
-                values_storage,
-            );
-        } else {
-            try self.getMetadataManySortedInTxnWithScratchUncached(
-                txn,
-                vector_ids,
-                metadata,
-                lookup_storage,
-                key_views_storage,
-                values_storage,
-            );
+        if (!metadata_ready) {
+            const start = platform_time.monotonicNs();
+            if (use_cache) {
+                try self.getMetadataManySortedInTxnWithScratch(txn, vector_ids, metadata, lookup_storage, key_views_storage, values_storage);
+            } else {
+                try self.getMetadataManySortedInTxnWithScratchUncached(txn, vector_ids, metadata, lookup_storage, key_views_storage, values_storage);
+            }
+            if (profile) |p| {
+                p.rerank_metadata_vectors_loaded += vector_ids.len;
+                p.rerank_metadata_lookup_ns += platform_time.monotonicNs() - start;
+            }
         }
         loader(
             ctx,
@@ -16905,7 +16973,7 @@ pub const HBCIndex = struct {
                 .vector_views = vector_view_storage,
                 .source_sequence = experimentalPostingSourceSequenceFromTxn(txn),
             },
-            null,
+            profile,
         ) catch |err| switch (err) {
             error.Unsupported => return false,
             else => return err,
@@ -25841,7 +25909,7 @@ fn testNativeSubgroupLifecycleMode(directory_mode: HBCConfig.CentroidDirectoryMo
         defer complete.results.deinit();
         try std.testing.expectEqual(@as(u64, 0), complete.profile.subgroup_vectors_skipped);
         try std.testing.expectEqual(@as(u64, 0), complete.profile.approx_vectors_scored);
-        try std.testing.expectEqual(@as(u64, 128), complete.profile.exact_vectors_scored);
+        try std.testing.expectEqual(@as(u64, 128), complete.profile.exact_vectors_scored + complete.profile.exact_vectors_pruned_by_bound);
         for (baseline.results.items.items, complete.results.items.items) |a, b| {
             try std.testing.expectEqual(a.vector_id, b.vector_id);
             try std.testing.expectEqual(a.distance, b.distance);
@@ -25909,6 +25977,188 @@ fn testNativeSubgroupLifecycleMode(directory_mode: HBCConfig.CentroidDirectoryMo
         try std.testing.expectEqual(@as(u64, 1), updated.items.items[0].vector_id);
         try std.testing.expectApproxEqAbs(@as(f32, 0), updated.items.items[0].distance, 0.000001);
     }
+}
+
+test "full effort projection screening matches authoritative scan across metrics and filters" {
+    const Fixture = struct {
+        loads: usize = 0,
+        bounds_enabled: bool = true,
+        zero_bounds: bool = false,
+        bounds_calls: usize = 0,
+
+        fn vector(id: u64) [3]f32 {
+            const angle = @as(f32, @floatFromInt(id % 384)) * 0.049;
+            return .{ @cos(angle), @sin(angle), @as(f32, @floatFromInt(id % 7)) * 0.01 };
+        }
+        fn load(raw: *anyopaque, alloc: Allocator, id: u64, _: []const u8) ![]f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.loads += 1;
+            return alloc.dupe(f32, &vector(id));
+        }
+        fn available(raw: *anyopaque, _: ?u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.bounds_enabled;
+        }
+        fn bounded(raw: *anyopaque, ids: []const u64, _: []const ?[]const u8, query: []const f32, measure: f32, metric: vec.DistanceMetric, distances: []f32, bounds: []f32, _: []f32, _: usize, _: HBCIndex.ExternalVectorBatchDistanceScratch, _: ?*SearchProfile) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.bounds_calls += 1;
+            for (ids, distances, bounds) |id, *distance, *bound| {
+                if (self.zero_bounds) {
+                    distance.* = vec.distanceToQuery(query, measure, &vector(id), metric);
+                    bound.* = 0;
+                    continue;
+                }
+                var half: [3]f16 = undefined;
+                for (vector(id), &half) |component, *out| out.* = @floatCast(component);
+                const result = vec.certifiedDistanceToQueryF16(query, measure, vec.projectionQueryNormUpper(query), &half, 1, 0.001, 0.99, metric);
+                distance.* = result.distance;
+                bound.* = result.error_bound;
+            }
+        }
+        fn projections(_: *anyopaque, ids: []const u64, _: []const ?[]const u8, values: []NativeProjectionBuildValue, scratch: []u8, dims: usize, _: u64) !void {
+            for (ids, values, 0..) |id, *value, row| {
+                const bytes = scratch[row * dims * 2 ..][0 .. dims * 2];
+                for (vector(id), 0..) |component, d| {
+                    const half: f16 = @floatCast(component);
+                    std.mem.writeInt(u16, bytes[d * 2 ..][0..2], @bitCast(half), .little);
+                }
+                value.* = .{ .bytes = bytes, .scale = 1, .error_norm = 0.001, .decoded_norm_lower_bound = 0.99, .checksum = @import("antfly_hash").Crc32.hash(bytes) };
+            }
+        }
+    };
+    for ([_]vec.DistanceMetric{ .inner_product, .cosine, .l2_squared }) |metric| {
+        for ([_]HBCConfig.CentroidDirectoryMode{ .hbc, .flat_exact }) |directory_mode| {
+            var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+            defer allocator_state.deinit();
+            const alloc = allocator_state.allocator();
+            var tp: TestPath = .{};
+            const path = tp.init();
+            defer tp.cleanup();
+            var runtime = std.Io.Threaded.init(alloc, .{});
+            defer runtime.deinit();
+            var idx = try HBCIndex.open(alloc, path, .{ .dims = 3, .metric = metric, .leaf_size = 512, .branching_factor = 2, .use_quantization = true, .centroid_directory_mode = directory_mode, .storage_backend = .lsm, .max_cached_vectors = 0 });
+            defer idx.close();
+            idx.setIo(runtime.io());
+            var context: Fixture = .{};
+            idx.setExternalVectorLoader(&context, Fixture.load);
+            for (1..385) |id| {
+                const vector = Fixture.vector(id);
+                try idx.insertWithMetadata(id, &vector, if (id % 2 == 0) "even" else "odd");
+            }
+            _ = try idx.publishExperimentalPostingCheckpoint(384);
+            const requests = [_]SearchRequest{
+                .{ .query = &.{ 1, 0, 0 }, .k = 5, .search_effort = 1 },
+                .{ .query = &.{ 1, 0, 0 }, .k = 5, .search_effort = 1, .filter_prefix = "even", .exclude_ids = &.{ 2, 4 } },
+                .{ .query = &.{ 1, 0, 0 }, .k = 5, .search_effort = 1, .distance_over = 0.1, .distance_under = 0.8 },
+                .{ .query = &.{ 1, 0, 0 }, .k = 385, .search_effort = 1 },
+            };
+            var baselines: [requests.len]SearchResults = undefined;
+            var baseline_count: usize = 0;
+            defer for (baselines[0..baseline_count]) |*result| result.deinit();
+            for (requests, &baselines) |request, *baseline| {
+                baseline.* = try idx.searchWithRequest(request);
+                baseline_count += 1;
+            }
+            idx.setExternalVectorProjectionBuildLoader(&context, Fixture.projections, false);
+            idx.external_vector_projection_build_retain = directory_mode == .flat_exact;
+            idx.setExternalVectorBatchBoundedDistanceLoader(&context, Fixture.bounded);
+            idx.setExternalVectorBoundedDistanceAvailable(&context, Fixture.available);
+            _ = try idx.publishExperimentalPostingCheckpoint(384);
+            for (requests, baselines, 0..) |request, baseline, request_index| {
+                context.loads = 0;
+                var screened = try idx.searchProfiledRequest(request);
+                defer screened.results.deinit();
+                try std.testing.expectEqual(baseline.items.items.len, screened.results.items.items.len);
+                for (baseline.items.items, screened.results.items.items) |expected, actual| {
+                    try std.testing.expectEqual(expected.vector_id, actual.vector_id);
+                    try std.testing.expectEqual(expected.distance, actual.distance);
+                }
+                if (request_index == 0) {
+                    try std.testing.expect(screened.profile.exact_vectors_pruned_by_bound > 0);
+                    try std.testing.expectEqual(@as(u64, 384), screened.profile.exact_vectors_scored + screened.profile.exact_vectors_pruned_by_bound);
+                    try std.testing.expect(context.loads < 384);
+                }
+            }
+            if (directory_mode == .hbc) {
+                context.zero_bounds = true;
+                context.loads = 0;
+                context.bounds_calls = 0;
+                var reused = try idx.searchProfiledRequest(requests[0]);
+                defer reused.results.deinit();
+                try std.testing.expect(context.bounds_calls > 0);
+                try std.testing.expect(context.loads < 384);
+                try std.testing.expectEqual(@as(u64, 384), reused.profile.exact_vectors_scored);
+                try std.testing.expectEqual(@as(u64, 0), reused.profile.exact_projection_vectors_scored);
+                for (baselines[0].getHits(), reused.results.getHits()) |want, got| {
+                    try std.testing.expectEqual(want.vector_id, got.vector_id);
+                    try std.testing.expectEqual(want.distance, got.distance);
+                }
+                context.bounds_enabled = false;
+                context.loads = 0;
+                var fallback = try idx.searchProfiledRequest(requests[0]);
+                defer fallback.results.deinit();
+                try std.testing.expectEqual(@as(usize, 384), context.loads);
+                try std.testing.expectEqual(@as(u64, 0), fallback.profile.exact_vectors_pruned_by_bound);
+                for (baselines[0].getHits(), fallback.results.getHits()) |want, got| {
+                    try std.testing.expectEqual(want.vector_id, got.vector_id);
+                    try std.testing.expectEqual(want.distance, got.distance);
+                }
+            }
+        }
+    }
+}
+
+test "full effort mixed source certificates preserve exact top-k tie order" {
+    const Fixture = struct {
+        bounded_calls: usize = 0,
+        fn vector(id: u64) [3]f32 {
+            return if (id >= 1000) .{ -1, 0, 0 } else .{ 1, 0, 0 };
+        }
+        fn load(_: *anyopaque, alloc: Allocator, id: u64, _: []const u8) ![]f32 {
+            return alloc.dupe(f32, &vector(id));
+        }
+        fn available(_: *anyopaque, _: ?u64) bool {
+            return true;
+        }
+        fn bounded(raw: *anyopaque, ids: []const u64, _: []const ?[]const u8, query: []const f32, measure: f32, metric: vec.DistanceMetric, distances: []f32, bounds: []f32, _: []f32, _: usize, _: HBCIndex.ExternalVectorBatchDistanceScratch, _: ?*SearchProfile) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.bounded_calls += 1;
+            for (ids, distances, bounds) |id, *distance, *bound| {
+                distance.* = vec.distanceToQuery(query, measure, &vector(id), metric);
+                bound.* = if (id % 2 == 0) 0 else 0.01;
+            }
+        }
+    };
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    var path: TestPath = .{};
+    const directory = path.init();
+    defer path.cleanup();
+    var runtime = std.Io.Threaded.init(alloc, .{});
+    defer runtime.deinit();
+    var idx = try HBCIndex.open(alloc, directory, .{ .dims = 3, .metric = .inner_product, .leaf_size = 512, .branching_factor = 2, .storage_backend = .lsm, .max_cached_vectors = 0 });
+    defer idx.close();
+    idx.setIo(runtime.io());
+    var fixture: Fixture = .{};
+    idx.setExternalVectorLoader(&fixture, Fixture.load);
+    // The first wave establishes a worse cutoff. In the next wave, odd IDs
+    // need completion while later even IDs already have exact scores.
+    for (1000..1128) |id| try idx.insertWithMetadata(id, &Fixture.vector(id), "doc");
+    for (1..129) |id| try idx.insertWithMetadata(id, &Fixture.vector(id), "doc");
+    _ = try idx.publishExperimentalPostingCheckpoint(1);
+    idx.setExternalVectorBatchBoundedDistanceLoader(&fixture, Fixture.bounded);
+    idx.setExternalVectorBoundedDistanceAvailable(&fixture, Fixture.available);
+    for ([_]usize{ 1, 7, 64 }) |k| {
+        var result = try idx.searchWithRequest(.{ .query = &.{ 1, 0, 0 }, .k = k, .search_effort = 1, .load_metadata = false });
+        defer result.deinit();
+        try std.testing.expectEqual(k, result.getHits().len);
+        for (result.getHits(), 1..) |hit, id| {
+            try std.testing.expectEqual(@as(u64, @intCast(id)), hit.vector_id);
+            try std.testing.expectEqual(@as(f32, -1), hit.distance);
+        }
+    }
+    try std.testing.expect(fixture.bounded_calls > 0);
 }
 
 test "global subgroup plan preserves native lifecycle with flat routing" {
@@ -30687,6 +30937,18 @@ test "native posting row integration survives mutation checkpoint and reopen" {
             var filtered = try idx.searchWithRequest(.{ .query = &vector(20), .k = 64, .filter_prefix = "member", .distance_under = 1.0e9 });
             defer filtered.deinit();
             try std.testing.expectEqualDeep(hits.getHits(), filtered.getHits());
+            var complete = try idx.searchProfiledRequest(.{ .query = &vector(20), .k = 64, .search_effort = 1 });
+            defer complete.results.deinit();
+            try std.testing.expectEqual(@as(u64, 0), complete.profile.approx_vectors_scored);
+            try std.testing.expectEqual(@as(usize, 64 - deleted.len), complete.results.getHits().len);
+            for (complete.results.getHits()) |hit| {
+                try std.testing.expect(std.mem.indexOfScalar(u64, deleted, hit.vector_id) == null);
+                try std.testing.expectEqual(vec.distanceToQuery(&vector(20), switch (idx.config.metric) {
+                    .l2_squared => vec.dot(&vector(20), &vector(20)),
+                    .cosine => vec.norm(&vector(20)),
+                    .inner_product => @as(f32, 0),
+                }, if (hit.vector_id == fixture.changed_id) &replacement else &vector(hit.vector_id), idx.config.metric), hit.distance);
+            }
         }
     };
     for ([_]vec.DistanceMetric{ .l2_squared, .cosine, .inner_product }) |metric| {
