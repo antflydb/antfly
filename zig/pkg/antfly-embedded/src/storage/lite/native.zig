@@ -7800,6 +7800,33 @@ pub const NativeFile = struct {
             self.allocator.free(retiring);
             self.redo_fold_retire_pending = null;
         };
+        // perf/lwa-reclaim-reconcile: this fold's own real commit goes
+        // through `flushTransactionWrites`'s `!diverting` branch, which
+        // (same as any ordinary bare/non-diverting commit) calls
+        // `persistAllocator`, whose own reserve-capacity admission check
+        // (`persistAllocator`'s own comment; mirrored for a diverting
+        // commit by Bug 2, perf/lwa-budget-tail) fails closed whenever
+        // free page-id headroom under `max_file_bytes` is below
+        // `retirementReservePages`'s own fixed overhead. Near budget --
+        // exactly when this fold is most needed -- that headroom is
+        // tightest, so without this exemption the one commit that exists
+        // to relieve the pressure (folding every diverted commit's own
+        // superseded chains back into the ledger, `reclaimPagesImpl`'s
+        // own fold call just above this function, via
+        // `checkpointRedoLog() catch {}`) could itself fail closed with
+        // the same `error.LiteStorageBudgetExceeded`, leaving the real
+        // retirement debt (`redoCheckpointWouldRetire`) permanently
+        // unserviced -- confirmed live via "lite reclamation capacity
+        // reserve sustains bounded overwrites"/"drains wide value
+        // graphs" looping through every retry with
+        // `retirementNeedsService()` correctly reporting debt but never
+        // able to act on it. `reclaimPagesImpl`'s own ledger-only
+        // retirement body (a few lines below this function's own caller)
+        // already exempts itself from this exact check the same way, for
+        // the same reason.
+        const previous_maintenance = self.maintenance_publication;
+        self.maintenance_publication = true;
+        defer self.maintenance_publication = previous_maintenance;
         try self.commitTransactionWithDurability(true, null);
 
         // Everything above is durable now; only space reclamation is
