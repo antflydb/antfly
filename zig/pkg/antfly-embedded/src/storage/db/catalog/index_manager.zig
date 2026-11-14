@@ -2527,7 +2527,11 @@ pub const IndexManager = struct {
         working_slice: resource_manager_mod.Slice = .dense_apply_working_set,
         recycle_raw_reads: bool = true,
         cache_raw_values: bool = true,
+        /// Request-local copies and shared decoded residency have independent
+        /// purposes. Candidate-only exact queries can reuse shared residency
+        /// without retaining a second copy of every vector in the request.
         cache_vectors: bool = true,
+        cache_decoded_vectors: bool = true,
         block_cache_admission: backend_types.Namespace.BlockCacheAdmission = .retain,
         decoded_residency_lease: ?hbc_mod.DecodedVectorResidencyLease = null,
 
@@ -2674,15 +2678,15 @@ pub const IndexManager = struct {
         }
 
         fn cacheDecodedVector(self: *@This(), index: *hbc_mod.HBCIndex, vector_id: u64, vector: []const f32) void {
-            if (!self.cache_vectors and self.working_slice == .dense_search_working_set) return;
+            if (!self.cache_decoded_vectors) return;
             const lease = if (self.decoded_residency_lease) |*value| value else return;
             _ = index.cacheVectorForResidencyLease(lease, vector_id, vector) catch {};
         }
 
         fn ensureDecodedResidencyCapacity(self: *@This(), vector_count: usize, dims: usize) void {
-            // Exact waves do not populate decoded residency. In particular,
-            // do not recycle their pinned snapshot to change cache policy.
-            if (!self.cache_vectors and self.working_slice == .dense_search_working_set) return;
+            // Exhaustive HBC scans disable decoded residency. Candidate-only
+            // exact batches may fill their admitted shared-cache lease.
+            if (!self.cache_decoded_vectors) return;
             const lease = if (self.decoded_residency_lease) |*value| value else return;
             const required_bytes = @as(u64, @intCast(vector_count)) *| hbc_mod.estimateDecodedVectorResidencyBytes(dims);
             if (lease.ensureCapacity(required_bytes)) return;
@@ -19553,6 +19557,7 @@ pub const IndexManager = struct {
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
                 .cache_vectors = false,
+                .cache_decoded_vectors = false,
             },
         };
     }
@@ -19578,6 +19583,7 @@ pub const IndexManager = struct {
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
                 .cache_vectors = (req.search_effort orelse 0) < 1,
+                .cache_decoded_vectors = (req.search_effort orelse 0) < 1,
                 .block_cache_admission = if (decoded_residency_lease != null) .transient else .retain,
                 .decoded_residency_lease = decoded_residency_lease,
             };
@@ -19585,15 +19591,18 @@ pub const IndexManager = struct {
         }
         var native_location_session: ?*DenseVectorLoadSession = null;
         var previous_cache_vectors: bool = false;
+        var previous_cache_decoded_vectors: bool = false;
         if (active_dense_vector_load_session) |session| {
             if (entry.vector_loader_context != null and session.context == entry.vector_loader_context.?) {
                 session.clearNativeVectorLocations();
                 previous_cache_vectors = session.cache_vectors;
+                previous_cache_decoded_vectors = session.cache_decoded_vectors;
                 if ((req.search_effort orelse 0) >= 1) {
                     // Query entry is a safe boundary to discard a prior probe's
                     // borrowed values. Exact fallback needs one stable snapshot.
                     if (session.read_txn) |*txn| if (txn.probe != null) session.recycleRawReadState();
                     session.cache_vectors = false;
+                    session.cache_decoded_vectors = false;
                 }
                 native_location_session = session;
             }
@@ -19601,6 +19610,7 @@ pub const IndexManager = struct {
         defer if (native_location_session) |session| {
             session.clearNativeVectorLocations();
             session.cache_vectors = previous_cache_vectors;
+            session.cache_decoded_vectors = previous_cache_decoded_vectors;
         };
 
         return try entry.index.searchWithRequest(req);
@@ -19627,6 +19637,7 @@ pub const IndexManager = struct {
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
                 .cache_vectors = (req.search_effort orelse 0) < 1,
+                .cache_decoded_vectors = (req.search_effort orelse 0) < 1,
                 .block_cache_admission = if (decoded_residency_lease != null) .transient else .retain,
                 .decoded_residency_lease = decoded_residency_lease,
             };
@@ -19634,15 +19645,18 @@ pub const IndexManager = struct {
         }
         var native_location_session: ?*DenseVectorLoadSession = null;
         var previous_cache_vectors: bool = false;
+        var previous_cache_decoded_vectors: bool = false;
         if (active_dense_vector_load_session) |session| {
             if (entry.vector_loader_context != null and session.context == entry.vector_loader_context.?) {
                 session.clearNativeVectorLocations();
                 previous_cache_vectors = session.cache_vectors;
+                previous_cache_decoded_vectors = session.cache_decoded_vectors;
                 if ((req.search_effort orelse 0) >= 1) {
                     // Query entry is a safe boundary to discard a prior probe's
                     // borrowed values. Exact fallback needs one stable snapshot.
                     if (session.read_txn) |*txn| if (txn.probe != null) session.recycleRawReadState();
                     session.cache_vectors = false;
+                    session.cache_decoded_vectors = false;
                 }
                 native_location_session = session;
             }
@@ -19650,6 +19664,7 @@ pub const IndexManager = struct {
         defer if (native_location_session) |session| {
             session.clearNativeVectorLocations();
             session.cache_vectors = previous_cache_vectors;
+            session.cache_decoded_vectors = previous_cache_decoded_vectors;
         };
 
         return try entry.index.searchProfiledRequest(req);
@@ -47315,6 +47330,26 @@ test "production external scorers use bounded cache-first artifact batches" {
     // cannot serve this path and only adds allocation/cache-lock churn.
     try std.testing.expectEqual(metadata_insertions_before, entry.index.hbcCacheStats().metadata.insertions);
 
+    // Full-effort HBC scanning has the opposite shared-cache policy from
+    // candidate-only exact scoring: do not rotate decoded residency while
+    // streaming the corpus, even though primary reads remain cacheable.
+    for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
+    entry.index.abortVectorCacheMutations();
+    const scan_insertions_before = entry.index.hbcCacheStats().vector.insertions;
+    var complete_scan = try manager.searchDenseEntryProfiledWithRequest(entry, .{
+        .query = vectors[far_query_idx * dims ..][0..dims],
+        .k = 10,
+        .search_effort = 1,
+        .filter_ids = candidate_ids,
+        .load_metadata = false,
+    });
+    defer complete_scan.results.deinit();
+    try std.testing.expectEqual(@as(u64, candidate_count), complete_scan.profile.exact_vectors_scored);
+    try std.testing.expectEqual(scan_insertions_before, entry.index.hbcCacheStats().vector.insertions);
+    try std.testing.expectEqual(@as(u64, 0), hbc_cache.decoded_query_entitled_bytes.load(.acquire));
+    try std.testing.expectEqual(candidate_ids[far_query_idx], complete_scan.results.getHits()[0].vector_id);
+
+    const exact_metadata_insertions_before = entry.index.hbcCacheStats().metadata.insertions;
     // Missing/corrupt external artifacts are candidate-local failures. They
     // must not fail the whole request (the old scalar fallback did).
     const missing_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_keys[missing_candidate_idx], "semantic_idx");
@@ -47333,6 +47368,12 @@ test "production external scorers use bounded cache-first artifact batches" {
     hbc_mod.setTestGetVectorViewOrScratchHook(&vector_namespace_probes, VectorNamespaceProbeCounter.onLoad);
     defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
 
+    // Exact candidate scoring may populate shared decoded residency while
+    // keeping its request-local vector cache empty. Start cold so earlier
+    // rerank fills cannot hide an unused residency entitlement.
+    for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
+    entry.index.abortVectorCacheMutations();
+    const exact_insertions_before = entry.index.hbcCacheStats().vector.insertions;
     var outcome = try manager.exactScoreDenseEntryWithRequest(entry, .{
         .query = vectors[far_query_idx * dims ..][0..dims],
         .k = 10,
@@ -47347,9 +47388,11 @@ test "production external scorers use bounded cache-first artifact batches" {
     try std.testing.expectEqual(@as(u64, 2), outcome.profile.raw_batch_reads);
     try std.testing.expectEqual(@as(u64, 0), outcome.profile.raw_scalar_reads);
     try std.testing.expectEqual(@as(u64, 0), outcome.profile.request_vector_cache_entries);
+    try std.testing.expect(entry.index.hbcCacheStats().vector.insertions > exact_insertions_before);
+    try std.testing.expectEqual(@as(u64, 0), hbc_cache.decoded_query_entitled_bytes.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), vector_namespace_probes.count);
     try std.testing.expect(entry.index.hbcCacheStats().vector.used_bytes > 0);
-    try std.testing.expectEqual(metadata_insertions_before, entry.index.hbcCacheStats().metadata.insertions);
+    try std.testing.expectEqual(exact_metadata_insertions_before, entry.index.hbcCacheStats().metadata.insertions);
     try std.testing.expectEqual(@as(u64, 1), outcome.profile.missing_vectors);
     try std.testing.expect(outcome.profile.workspace_bytes > 0);
     try std.testing.expect(outcome.profile.artifact_read_ns > 0);
@@ -49230,6 +49273,186 @@ test "native float16 residual rerank returns authoritative float32 score" {
     try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(actual)));
 }
 
+// Opt-in ReleaseFast A/B measurement of the production scorers. The old
+// decoded-admission policy is reproduced with its explicit switch; the scan
+// control disables only certified screening, keeping the exact source equal.
+test "benchmark exact search cache and certified scoring" {
+    if (getenv("ANTFLY_BENCH_EXACT_POLICY") == null) return error.SkipZigTest;
+    // Match standalone benchmarks, excluding DebugAllocator bookkeeping
+    // from allocation-heavy cold/uncached query timings.
+    const alloc = std.heap.c_allocator;
+    const count = if (getenv("ANTFLY_BENCH_EXACT_VECTORS")) |raw|
+        try std.fmt.parseInt(usize, std.mem.span(raw), 10)
+    else
+        4096;
+    const dims = 128;
+    const query_count = 8;
+    const samples = 24;
+    const rounds = 4;
+    const k = 20;
+    if (count < k) return error.InvalidArgument;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer primary.close();
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{ .soft_limit_bytes = 64 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 };
+    var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resources.deinit(alloc);
+    var cache = hbc_mod.Cache.init(alloc);
+    defer cache.deinit();
+    cache.attachResourceManager(&resources);
+    var memory = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var manager = try IndexManager.initWithOptions(alloc, path, .{ .resource_manager = &resources, .hbc_cache = &cache });
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&primary, &.{.{ .name = "bench", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":128,\"metric\":\"inner_product\",\"embedding_name\":\"bench\",\"external\":true}" }});
+    const vectors = try alloc.alloc(f32, count * dims);
+    defer alloc.free(vectors);
+    const writes = try alloc.alloc(mapper.DenseEmbeddingWrite, count);
+    defer alloc.free(writes);
+    const keys = try alloc.alloc([]u8, count);
+    defer alloc.free(keys);
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| alloc.free(key);
+    const ids = try alloc.alloc(u64, count);
+    defer alloc.free(ids);
+    var random_state = std.Random.DefaultPrng.init(0xbe4c_2026);
+    for (writes, 0..) |*write, row| {
+        keys[row] = try std.fmt.allocPrint(alloc, "doc:{d:0>6}", .{row});
+        initialized += 1;
+        const vector = vectors[row * dims ..][0..dims];
+        for (vector) |*component| component.* = random_state.random().float(f32) * 2 - 1;
+        _ = vector_mod.normalize(vector);
+        ids[row] = deterministicDenseVectorId(keys[row]);
+        write.* = .{ .index_name = @constCast("bench"), .doc_key = keys[row], .vector = vector, .artifact_key = null };
+    }
+    try manager.applyDenseEmbeddingWritesByNameWithOptions(&primary, "bench", writes, .{ .mode = .bulk_ingest });
+    const entry = manager.denseIndex("bench").?;
+    manager.clearVectorBlockGenerationForTest();
+    entry.index.setRetainedVectorCacheEnabled(true);
+    var queries: [query_count][dims]f32 = undefined;
+    var oracle: [query_count]hbc_mod.SearchResults = undefined;
+    var oracle_count: usize = 0;
+    defer for (oracle[0..oracle_count]) |*result| result.deinit();
+    for (&queries, &oracle) |*query, *expected| {
+        for (query) |*component| component.* = random_state.random().float(f32) * 2 - 1;
+        _ = vector_mod.normalize(query);
+        expected.* = try hbc_mod.SearchResults.initCapacity(alloc, k, k, k);
+        oracle_count += 1;
+        for (ids, 0..) |id, row| expected.addResult(id, vector_mod.distanceToQuery(query, 0, vectors[row * dims ..][0..dims], .inner_product), 0);
+        expected.sort();
+    }
+    var cold: [2][rounds]u64 = undefined;
+    var warm: [2][rounds * (samples - 1)]u64 = undefined;
+    for (0..rounds) |round| for (0..2) |phase| {
+        const mode = (round + phase) % 2; // Alternate order to reduce drift.
+        for (ids) |id| entry.index.invalidateVectorCache(id);
+        entry.index.abortVectorCacheMutations();
+        for (0..samples) |sample| {
+            const q = sample % query_count;
+            const start = platform_time.monotonicNs();
+            var outcome = blk: {
+                const lease = entry.index.acquireDecodedVectorResidency(count) orelse return error.TestUnexpectedResult;
+                var session: IndexManager.DenseVectorLoadSession = .{
+                    .context = entry.vector_loader_context.?,
+                    .working_slice = .dense_search_working_set,
+                    .cache_vectors = false,
+                    .cache_decoded_vectors = mode == 1,
+                    .cache_raw_values = false,
+                    .recycle_raw_reads = false,
+                    .block_cache_admission = .transient,
+                    .decoded_residency_lease = lease,
+                };
+                defer session.deinit();
+                const previous = IndexManager.active_dense_vector_load_session;
+                IndexManager.active_dense_vector_load_session = &session;
+                defer IndexManager.active_dense_vector_load_session = previous;
+                break :blk try manager.exactScoreDenseEntryWithRequest(entry, .{ .query = &queries[q], .k = k, .filter_ids = ids, .load_metadata = false });
+            };
+            const elapsed = platform_time.monotonicNs() - start;
+            defer outcome.results.deinit();
+            try std.testing.expectEqual(oracle[q].getHits().len, outcome.results.getHits().len);
+            for (oracle[q].getHits(), outcome.results.getHits()) |want, got| {
+                try std.testing.expectEqual(want.vector_id, got.vector_id);
+                try std.testing.expectEqual(want.distance, got.distance);
+            }
+            if (sample == 0) cold[mode][round] = elapsed else warm[mode][round * (samples - 1) + sample - 1] = elapsed;
+        }
+    };
+    for (0..2) |mode| {
+        std.mem.sort(u64, &cold[mode], {}, std.sort.asc(u64));
+        std.mem.sort(u64, &warm[mode], {}, std.sort.asc(u64));
+        std.debug.print("exact_policy_bench mode={s} vectors={d} dims={d} k={d} cold_median_ns={d} warm_median_ns={d} checked_queries={d} exact_topk=true\n", .{ if (mode == 0) "before" else "fixed", count, dims, k, cold[mode][rounds / 2], warm[mode][warm[mode].len / 2], rounds * samples });
+    }
+
+    // Full-effort certified scan versus exhaustive source residual scoring.
+    _ = try entry.index.publishExperimentalPostingCheckpoint(9);
+    const sequence = entry.index.experimental_posting_read_generation.?.covered_source_sequence.load(.acquire);
+    var writer = try vector_block_mod.Writer.initWithEncoding(alloc, 1, 0, 1, sequence, .float16);
+    defer writer.deinit();
+    const artifacts = try alloc.alloc(IndexManager.DenseArtifactReadKey, count);
+    defer alloc.free(artifacts);
+    var artifact_count: usize = 0;
+    defer for (artifacts[0..artifact_count]) |artifact| alloc.free(artifact.key);
+    for (keys, 0..) |key, row| {
+        artifacts[row] = IndexManager.DenseArtifactReadKey.init(try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, key, "bench"), row);
+        artifact_count += 1;
+    }
+    std.mem.sort(IndexManager.DenseArtifactReadKey, artifacts, {}, struct {
+        fn less(_: void, lhs: IndexManager.DenseArtifactReadKey, rhs: IndexManager.DenseArtifactReadKey) bool {
+            const l = vector_block_mod.keyHash(lhs.key);
+            const r = vector_block_mod.keyHash(rhs.key);
+            return if (l == r) std.mem.lessThan(u8, lhs.key, rhs.key) else l < r;
+        }
+    }.less);
+    for (artifacts) |artifact| try writer.appendVector(artifact.key, sequence, 1, vectors[artifact.position * dims ..][0..dims]);
+    const block = try writer.build();
+    defer alloc.free(block);
+    var store = try vector_block_store_mod.Store.open(alloc, memory.storage(), "/exact-policy-bench");
+    defer store.deinit();
+    store.covered_source_sequence = sequence;
+    try store.publishGeneration(1, sequence, &.{.{ .shard_id = 0, .bytes = block }}, true);
+    manager.installVectorBlockGeneration(try SharedVectorBlockGeneration.create(alloc, try vector_block_store_mod.Store.openWithBlocks(alloc, memory.storage(), "/exact-policy-bench")));
+    const bounded_available = entry.index.external_vector_bounded_distance_available;
+    defer entry.index.external_vector_bounded_distance_available = bounded_available;
+    const Unscreened = struct {
+        fn available(_: *anyopaque, _: ?u64) bool {
+            return false;
+        }
+    };
+    var scans: [2][rounds * samples]u64 = undefined;
+    var pruned: [2]u64 = .{ 0, 0 };
+    var scored: [2]u64 = .{ 0, 0 };
+    for (0..rounds) |round| for (0..2) |phase| {
+        const mode = (round + phase) % 2;
+        entry.index.external_vector_bounded_distance_available = if (mode == 0) Unscreened.available else bounded_available;
+        for (0..samples) |sample| {
+            const q = sample % query_count;
+            const start = platform_time.monotonicNs();
+            var result = try manager.searchDenseEntryProfiledWithRequest(entry, .{ .query = &queries[q], .k = k, .search_effort = 1, .load_metadata = false });
+            scans[mode][round * samples + sample] = platform_time.monotonicNs() - start;
+            defer result.results.deinit();
+            try std.testing.expectEqual(oracle[q].getHits().len, result.results.getHits().len);
+            for (oracle[q].getHits(), result.results.getHits()) |want, got| {
+                try std.testing.expectEqual(want.vector_id, got.vector_id);
+                try std.testing.expectEqual(want.distance, got.distance);
+            }
+            pruned[mode] += result.profile.exact_vectors_pruned_by_bound;
+            scored[mode] += result.profile.exact_vectors_scored;
+        }
+    };
+    for (0..2) |mode| {
+        std.mem.sort(u64, &scans[mode], {}, std.sort.asc(u64));
+        std.debug.print("exact_scan_bench mode={s} vectors={d} dims={d} k={d} median_ns={d} exact_scored={d} pruned={d} checked_queries={d} exact_topk=true\n", .{ if (mode == 0) "unscreened" else "certified", count, dims, k, scans[mode][scans[mode].len / 2], scored[mode], pruned[mode], rounds * samples });
+    }
+}
+
 test "exact direct document fallback bounds waves and preserves transient snapshot" {
     const alloc = std.testing.allocator;
     const count = 384;
@@ -49305,7 +49528,8 @@ test "exact direct document fallback bounds waves and preserves transient snapsh
             try std.testing.expectEqual(@as(f32, @floatFromInt(row * row)), hit.distance);
         }
         try std.testing.expect(session.read_txn != null and session.read_txn.?.read != null);
-        try std.testing.expect(session.cache_vectors); // Caller policy restored.
+        try std.testing.expect(session.cache_vectors); // Caller policies restored.
+        try std.testing.expect(session.cache_decoded_vectors);
         try std.testing.expectEqual(@as(u64, 0), session.raw_read_value_bytes);
         try std.testing.expectEqual(@as(usize, 0), session.raw_cache.count());
         try std.testing.expectEqual(@as(usize, 0), session.vector_cache.count());

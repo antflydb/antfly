@@ -80,13 +80,24 @@ transaction arena. Direct-document vector fields use the same wave-scoped
 read policy. Cache-residency transitions preserve captured primary snapshots.
 A complete native source generation needs only its immutable generation lease;
 a primary read snapshot is acquired lazily if fallback requires it. Exact scans
-do not populate decoded-vector residency.
+do not populate decoded-vector residency. Candidate-only exact scoring keeps
+its separate shared decoded-cache policy: an admitted residency lease can be
+filled without retaining duplicate vectors in the request-local cache.
 
 Both local and authoritative projection paths use the shared certified SIMD
 kernel. It includes reconstruction error and arithmetic error in both the
 projection and float32 scoring kernels, and declines pruning at unsafe
 magnitudes. Its norm guard shares the score traversal. The request's query norm
 is computed once, and the finite exact max-heap provides an O(1) cutoff per wave.
+
+The opt-in `benchmark exact search cache and certified scoring` test measures
+both policies through production scorers against brute-force top-k. Enable it
+with `ANTFLY_BENCH_EXACT_POLICY=1`, use a ReleaseFast storage test build, and
+optionally set `ANTFLY_BENCH_EXACT_VECTORS` (default 4096). It alternates control
+and treatment order, reports decoded-cache-cold and repeated-query timings,
+and separately compares certified full-effort search with screening disabled.
+It uses the C allocator so allocation-tracking test overhead is not timed.
+See [the benchmark results and reproduction notes](bench/vectors/exact_search_policy_bench.md).
 
 ## Multi-bit RaBitQ codes
 
