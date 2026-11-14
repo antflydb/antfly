@@ -1029,8 +1029,15 @@ const recovery_agenda = @import("recovery_agenda.zig");
 // `feature_flags_offset`) carrying each mode as its own bit -- extensible
 // to a fourth/fifth mode without ever needing another magic string or
 // another priority-ordered branch.
+// v11 (perf/lwa-fold-boundary): the checkpoint slot payload grows by one
+// field, `redo_folded_through` (`checkpoint_slot_payload_size` 136 -> 144)
+// -- the real, durable fold boundary a slot's own roots reflect,
+// independent of its `commit_sequence`. A v10-or-earlier build has no way
+// to interpret the extra 8 bytes (nor to know it must), so this is a hard
+// version bump, refused the same way v9->v10 was, not a migration:
+// Antfly is unreleased.
 pub const magic = "AFLITE\x0cP";
-pub const format_version: u32 = 10;
+pub const format_version: u32 = 11;
 pub const default_page_size: u32 = 4096;
 
 /// §9.5/§9.7a: explicit, independently-encoded mode bits, read from/written
@@ -4351,6 +4358,39 @@ pub const CheckpointSlot = struct {
     /// while a page it names was never actually written (the write and the
     /// slot's own sync are not atomic with each other).
     presynced: bool = true,
+    /// perf/lwa-fold-boundary: the real, durable fold boundary this slot's
+    /// own roots actually reflect -- the same sequence `RedoCommitState
+    /// .checkpoint_sequence` tracks in memory, persisted here so a *cold*
+    /// reopen (a fresh process, no in-memory state at all) can tell "every
+    /// log record at or below this sequence is already in these real
+    /// pages" apart from "`commit_sequence` has simply advanced past it."
+    /// Those two used to be the same field (`commit_sequence` itself),
+    /// which is exactly the bug class this exists to close: a real publish
+    /// that advances `commit_sequence` for bookkeeping reasons (a bare
+    /// log-full fallback slot, a ledger-only reclaim commit, a stable
+    /// snapshot's copied slot) without ever folding the overlay's still-
+    /// pending logical heads into these roots used to leave
+    /// `recoverRedoLog` trusting `commit_sequence` as if it had, silently
+    /// skipping -- as already-real -- log records that were never folded
+    /// (`ee1241f843`/`e85c073f3c`/`2b6ee404e8`, three separate instances
+    /// of exactly this). Written by every real (physically-synced)
+    /// checkpoint publish, not just a fold: `checkpointRedoLog`'s own
+    /// commit and `prepareVacuum`'s compaction (which folds everything by
+    /// construction) advance it to their own new `commit_sequence`; every
+    /// other real publish reaching `publishCheckpoint`'s own disk-write
+    /// tail only ever does so once its own caller has already proven
+    /// (`reclaimPagesImpl`'s and the log-full bare-slot fallback's own
+    /// "still unfolded" guards, kept for exactly this reason even though
+    /// the recovery-side data-loss bug they were first written against is
+    /// now closed structurally here) that the shared overlay holds no
+    /// unfolded logical work at all -- so stamping that publish's own
+    /// `commit_sequence` here is not merely a safe upper bound, it is the
+    /// exact value, and leaving a stale, carried-forward one instead would
+    /// create a real gap in the log's own sequence numbering (see
+    /// `publishCheckpoint`'s own comment at the write site). Zero for a
+    /// non-redo-log file (meaningless there) and for a brand-new/bootstrap
+    /// checkpoint (nothing to fold yet, correctly).
+    redo_folded_through: u64 = 0,
 };
 
 /// A compact, log-record-sized encoding of exactly the `CheckpointSlot`
@@ -7311,6 +7351,15 @@ pub const NativeFile = struct {
         } else {
             checkpoint.page_count += log_pages;
         }
+        // perf/lwa-fold-boundary: this file has no redo log at all yet
+        // (`self.redo == null`, asserted above) -- everything this
+        // checkpoint names is real, physical content, so its own
+        // `commit_sequence` is trivially the fold boundary too. Every
+        // later real publish either advances this in lockstep
+        // (`checkpointRedoLog`'s fold, `prepareVacuum`'s compaction) or
+        // carries it forward unchanged; see `redo_folded_through`'s own
+        // doc comment.
+        checkpoint.redo_folded_through = checkpoint.commit_sequence;
         self.header.checkpoints = .{ checkpoint, checkpoint };
         self.header.redo_log_offset = offset;
         self.header.redo_log_capacity = capacity;
@@ -7342,7 +7391,7 @@ pub const NativeFile = struct {
         try self.file.writePositionalAll(io, &header_buf, 0);
         if (!self.no_sync) try self.file.sync(io);
 
-        try self.attachFreshRedoState(io, offset, capacity, checkpoint.commit_sequence);
+        try self.attachFreshRedoState(io, offset, capacity, checkpoint.commit_sequence, checkpoint.commit_sequence);
     }
 
     /// Shared tail of `enableRedoLog` and `prepareVacuum`'s own redo-log
@@ -7360,7 +7409,7 @@ pub const NativeFile = struct {
     /// registry entry (true for both callers: `enableRedoLog` runs after
     /// `createWithIo`/`createWithOptions`'s own bootstrap; `prepareVacuum`
     /// calls this on `prepared`, after `inode_lock.open` on its tmp path).
-    fn attachFreshRedoState(self: *NativeFile, io: std.Io, offset: u64, capacity: u64, checkpoint_sequence: u64) !void {
+    fn attachFreshRedoState(self: *NativeFile, io: std.Io, offset: u64, capacity: u64, durable_sequence: u64, checkpoint_sequence: u64) !void {
         std.debug.assert(self.redo == null);
         self.manifest_commits_enabled = false;
         const entry = self.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
@@ -7384,7 +7433,34 @@ pub const NativeFile = struct {
         // (`Store.Ticket`'s own durability wait, cross-process readers via
         // `publishRedoLogState` below) must see that immediately, not
         // revert to "nothing is durable yet" the moment a vacuum lands.
-        self.redo = RedoCommitState{ .writer = redo_log.Writer.init(self.file, io, offset, capacity), .shared = shared, .checkpoint_sequence = checkpoint_sequence, .durable_sequence = checkpoint_sequence };
+        //
+        // perf/lwa-fold-boundary: `durable_sequence` (the tip) and
+        // `checkpoint_sequence` (the fold boundary) are no longer always
+        // the same number, so they are now two separate parameters rather
+        // than one reused for both. `enableRedoLog`'s own caller still
+        // passes the same value for each (nothing has diverged yet for a
+        // brand-new file), and a genuinely vacuum-compacted `prepared`
+        // also still passes the same value for each (`prepareVacuum`'s
+        // own compaction folds everything, so its new checkpoint's
+        // `redo_folded_through == commit_sequence` by construction) --
+        // but `replaceWithPreparedGeneration`'s own caller, reached from
+        // this same shared tail, can legitimately pass two different
+        // ones: if `prepared`'s inode already carries a shared overlay
+        // with content durably logged past its own last real fold (not
+        // true for an ordinary vacuum-built `prepared`, which is never
+        // itself redo-attached before this call -- but true whenever a
+        // caller hands this a `prepared` that was written to directly
+        // under redo, as the inode's shared overlay persists past the
+        // `self.redo = null` reset above, independent of whether this
+        // function's own freshly-attached state's fold boundary covers
+        // it), the tip must still name every such durably-logged
+        // version (so `committedSequence()`/`readMark`-based reads keep
+        // resolving them through that still-live overlay), while the
+        // fold boundary must stay at the real value or a later
+        // `checkpointRedoLog` on `self` would wrongly treat that
+        // unfolded content as already covered (`redo_folded_through`'s
+        // own doc comment).
+        self.redo = RedoCommitState{ .writer = redo_log.Writer.init(self.file, io, offset, capacity), .shared = shared, .checkpoint_sequence = checkpoint_sequence, .durable_sequence = durable_sequence };
     }
 
     /// Replays the valid log prefix past the on-disk checkpoint's own
@@ -7410,6 +7486,18 @@ pub const NativeFile = struct {
     /// structure every later opener on this inode shares.
     fn recoverRedoLog(self: *NativeFile, allocator: Allocator, io: std.Io) !void {
         const checkpoint = self.activeCheckpoint();
+        // perf/lwa-fold-boundary: the real, durable fold boundary this
+        // on-disk slot's own roots reflect -- NOT `checkpoint.commit_sequence`,
+        // which several real-publish paths (a stable-snapshot copy, a
+        // log-full bare-slot fallback, a ledger-only reclaim commit) can
+        // leave strictly ahead of what was actually folded. Captured here,
+        // before anything below overwrites `self.header.checkpoints[active]`,
+        // and used as `start_after_sequence` for both replay passes --
+        // `commit_sequence` is only ever the fold boundary too when
+        // nothing has advanced it without folding, which is exactly the
+        // bug class `redo_folded_through` exists to stop recovery from
+        // having to assume. See that field's own doc comment.
+        const folded_through = checkpoint.redo_folded_through;
         const MetaCtx = struct {
             compact: ?CompactCheckpoint = null,
             fn onRecord(ctx_ptr: ?*anyopaque, record: redo_log.RecordView) anyerror!void {
@@ -7419,7 +7507,7 @@ pub const NativeFile = struct {
             }
         };
         var meta_ctx: MetaCtx = .{};
-        const outcome = try redo_log.replay(allocator, self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, checkpoint.commit_sequence, MetaCtx.onRecord, &meta_ctx);
+        const outcome = try redo_log.replay(allocator, self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, folded_through, MetaCtx.onRecord, &meta_ctx);
         // A torn tail or a clean (never-written-past-the-checkpoint) end
         // are both benign (§9.5) -- the valid prefix, possibly empty, is
         // everything this recovery trusts. A corrupt record is not: this
@@ -7427,13 +7515,25 @@ pub const NativeFile = struct {
         // acknowledged work.
         if (outcome.stop_reason == .corrupt_record) return error.NativeRedoLogCorrupt;
         if (meta_ctx.compact) |compact| {
+            // `CompactCheckpoint` carries no `redo_folded_through` of its
+            // own (a log record's own embedded checkpoint is always just
+            // the *tip* as of that commit, never a fold boundary -- only
+            // `checkpointRedoLog`'s own fold and `prepareVacuum`'s
+            // compaction ever advance one, and neither ever appends a log
+            // record for the commit that does) -- so `toCheckpointSlot()`
+            // comes back with the field defaulted to zero. Restore the
+            // value this on-disk slot actually carried: the latest log
+            // record only ever refines the *tip* (roots/commit_sequence),
+            // never the fold boundary, which stays exactly what the real,
+            // physically-published checkpoint slot said it was.
             self.header.checkpoints[self.header.active_checkpoint] = compact.toCheckpointSlot();
+            self.header.checkpoints[self.header.active_checkpoint].redo_folded_through = folded_through;
         }
         self.manifest_commits_enabled = false;
 
         const entry = self.inode_lock_ref.load(.acquire) orelse return error.InvalidTransactionState;
         const PopulateCtx = struct { file: *NativeFile, io: std.Io, start_after_sequence: u64 };
-        var pctx = PopulateCtx{ .file = self, .io = io, .start_after_sequence = checkpoint.commit_sequence };
+        var pctx = PopulateCtx{ .file = self, .io = io, .start_after_sequence = folded_through };
         const shared = try inode_lock.ensureRedoOverlay(entry, io, &pctx, struct {
             fn populate(ctx: *PopulateCtx, overlay: *redo_overlay.SharedRedoOverlay, pop_allocator: Allocator) anyerror!void {
                 const RecordCtx = struct {
@@ -7488,7 +7588,7 @@ pub const NativeFile = struct {
             .writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, outcome.valid_bytes, resumed_sequence),
             .shared = shared,
             .durable_sequence = resumed_sequence,
-            .checkpoint_sequence = checkpoint.commit_sequence,
+            .checkpoint_sequence = folded_through,
         };
         self.publishRedoLogState();
     }
@@ -8002,7 +8102,14 @@ pub const NativeFile = struct {
             const recovered = try recoverActiveCheckpoint(self.file, io, header, file_size, false);
             header.active_checkpoint = recovered.index;
             try self.adoptIndexPublicationHeader(header);
-            redo.checkpoint_sequence = self.header.checkpoints[self.header.active_checkpoint].commit_sequence;
+            // perf/lwa-fold-boundary: `commit_sequence` is the writer's
+            // *tip*, not its fold boundary -- the same distinction
+            // `recoverRedoLog` makes on a cold open. `redo_folded_through`
+            // just came back from the on-disk slot this re-read loaded,
+            // so it is this process's own correct, authoritative fold
+            // boundary going forward, exactly as if this were a fresh
+            // open.
+            redo.checkpoint_sequence = self.header.checkpoints[self.header.active_checkpoint].redo_folded_through;
         }
 
         if (published.durable_sequence > redo.durable_sequence) {
@@ -14814,6 +14921,13 @@ pub const NativeFile = struct {
             .page_count = next_page_id,
             .namespace_directory_root_page = namespace_directory_root_page,
             .document_index_root_page = document_index_root_page,
+            // perf/lwa-fold-boundary: vacuum's compaction folds everything
+            // -- every live mutation already reached this generation's own
+            // tree through the ordinary copy pass above, never through a
+            // log -- so this new checkpoint's fold boundary is its own
+            // `commit_sequence`, exactly like `checkpointRedoLog`'s own
+            // fold. See `redo_folded_through`'s own doc comment.
+            .redo_folded_through = previous.commit_sequence + 1,
         };
         if (indexed) {
             // A replacement inode has a new logical lineage. Its freshly copied
@@ -15068,7 +15182,27 @@ pub const NativeFile = struct {
             // resolved it correctly). Use the real physical sequence
             // instead, the same one `publishRedoLogState`/
             // `checkpointRedoLog` already treat as authoritative.
+            //
+            // perf/lwa-fold-boundary: kept even now that recovery itself
+            // reads `redo_folded_through` (set right below, to the same
+            // value) rather than trusting `commit_sequence` as the fold
+            // boundary -- this still matters independently, because
+            // `commit_sequence` is also this slot's own *tip* (compared
+            // directly by `readMark`/`committedSequence`-style callers,
+            // and by `recoverRedoLog`'s own metadata pass whenever the
+            // copied log region happens to hold nothing past the fold to
+            // correct it from). Leaving it at the inflated, bumped-for-
+            // bookkeeping value would make the snapshot's reported tip
+            // disagree with what its own copied tree pages actually
+            // contain.
             if (self.redo) |redo| snapshot_checkpoint.commit_sequence = redo.checkpoint_sequence;
+            // The fold boundary itself: this snapshot's tree pages are a
+            // raw byte copy, so they reflect real content only up to the
+            // source's last real fold -- exactly `redo.checkpoint_sequence`
+            // -- regardless of how much further the copied log region (if
+            // any was included in `snapshot_size`) advances the tip once
+            // replayed on reopen.
+            if (self.redo) |redo| snapshot_checkpoint.redo_folded_through = redo.checkpoint_sequence;
             snapshot_checkpoint.presynced = true;
             snapshot_checkpoint.manifest_page = 0;
             snapshot_checkpoint.manifest_crc = 0;
@@ -17841,6 +17975,22 @@ pub const NativeFile = struct {
             !self.checkpoint_publication_uncertain)
         {
             next.commit_sequence = previous.checkpoints[previous.active_checkpoint].commit_sequence + 1;
+            // perf/lwa-fold-boundary: must be set *before* `sealAllocatorCheckpoint`
+            // below, not after -- that call stamps a fingerprint of `next`
+            // into the free-map root page, which a later reopen's
+            // `inheritAllocatorCertificate` recomputes and compares byte
+            // for byte; setting this field any later (e.g. back inside
+            // `publishCheckpoint`, once it is about to write the slot)
+            // would let the on-disk slot end up with a different
+            // `redo_folded_through` than the one just sealed, failing
+            // that comparison on every subsequent open. `self.redo ==
+            // null or self.redo.?.checkpointing` is exactly "this will be
+            // a real, physically-written checkpoint, not a diverted or
+            // large-transaction-fallback one logged instead" -- see
+            // `redo_folded_through`'s own doc comment for why that is
+            // the correct boundary value for such a commit, not merely a
+            // safe one.
+            if (self.redo == null or self.redo.?.checkpointing) next.redo_folded_through = next.commit_sequence;
             try self.sealAllocatorCheckpoint(previous, next);
         }
         self.header = previous;
@@ -17871,6 +18021,13 @@ pub const NativeFile = struct {
             self.namespace_directory_delta_depth = 0;
         }
         if (changed) next.commit_sequence = previous.checkpoints[previous.active_checkpoint].commit_sequence + 1;
+        // perf/lwa-fold-boundary: the general case of the same stamp the
+        // certify-on-commit branch above already applies for itself --
+        // most commits never go through that branch at all, so this is
+        // where they get it instead. Harmless to reapply when that
+        // branch already ran (same value, `next.commit_sequence` is
+        // unchanged by this line too in that case).
+        if (changed and (self.redo == null or self.redo.?.checkpointing)) next.redo_folded_through = next.commit_sequence;
         if (deferred_publication) {
             defer self.notifyPublication();
             // Keep the last durable checkpoint slots intact until an explicit
@@ -18741,6 +18898,40 @@ pub const NativeFile = struct {
             // `error.OutcomeUnknown`.
             redo_fell_back_to_slot = true;
         }
+        // perf/lwa-fold-boundary: `commitTransactionWithDurability`'s own
+        // central site already stamps `redo_folded_through` for every
+        // case where `self.redo.?.checkpointing` is knowable *before*
+        // this call (non-redo files, `checkpointRedoLog`'s own fold,
+        // `reclaimPagesImpl`'s ledger-only commit) -- early enough that
+        // `sealAllocatorCheckpoint`'s own fingerprint (computed before
+        // this function ever runs) already reflects it. The one case
+        // that decision cannot see coming is this one:
+        // `redo_fell_back_to_slot` is only known *here*, once the log-full
+        // handling above has run. Stamp it now, for the same reason as
+        // the early cases -- this commit's own content is already real
+        // physical pages (flushed just above) and, by the time this
+        // branch is reached, the shared overlay has already been proven
+        // to hold no unfolded logical work at all
+        // (`publishCheckpoint`'s own `has_unfolded_logical_work` check
+        // above folds first otherwise) -- so `checkpoint.commit_sequence`
+        // is not merely a safe upper bound on the fold boundary here, it
+        // is the boundary. Carrying forward a stale value here instead
+        // (the literal reading of "every other real publish carries the
+        // folded-through value forward unchanged") would leave a real
+        // gap in the log's own sequence numbering -- this commit's own
+        // sequence, consumed above but never logged -- sitting *above*
+        // the recorded boundary instead of within the superseded run
+        // `redo_log.replay`'s own gap tolerance is built to absorb,
+        // which a future reopen's strict continuity check cannot tell
+        // apart from real corruption. Scoped to this one branch, not
+        // every path through this function, because a certify-on-commit
+        // fingerprint (`sealAllocatorCheckpoint`, gated on
+        // `self.free_pages_verified`, never true for a commit that
+        // diverted or attempted to) is never in flight for a commit that
+        // reaches this branch -- unlike the early, `self.redo == null`
+        // case, which every such fingerprint *does* go through. See
+        // `redo_folded_through`'s own doc comment.
+        if (redo_fell_back_to_slot) checkpoint.redo_folded_through = checkpoint.commit_sequence;
         const next_slot: u8 = if (self.header.active_checkpoint == 0) 1 else 0;
 
         // The whole slot -- roots, logical generations, and the manifest
@@ -19049,7 +19240,20 @@ pub const NativeFile = struct {
         // from a swapped-in generation instead of a freshly bootstrapped
         // file.
         if (self.header.redo_log_capacity != 0) {
-            try self.attachFreshRedoState(io, self.header.redo_log_offset, self.header.redo_log_capacity, self.activeCheckpoint().commit_sequence);
+            // perf/lwa-fold-boundary: for a genuinely vacuum-compacted
+            // `prepared` (the only case this function's own doc comment
+            // above promises), `redo_folded_through == commit_sequence`
+            // already -- `prepareVacuum`'s compaction folds everything --
+            // so these two arguments name the same value. They can
+            // legitimately differ if `prepared`'s inode already carries a
+            // shared overlay with content logged past its own last real
+            // fold (see `attachFreshRedoState`'s own doc comment on this
+            // split): the tip (`commit_sequence`) still names every such
+            // version, so reads keep resolving them through that
+            // surviving overlay, while the fold boundary
+            // (`redo_folded_through`) stays truthful for `self`'s own
+            // later folds.
+            try self.attachFreshRedoState(io, self.header.redo_log_offset, self.header.redo_log_capacity, self.activeCheckpoint().commit_sequence, self.activeCheckpoint().redo_folded_through);
         } else {
             self.manifest_commits_enabled = true;
         }
@@ -20364,7 +20568,9 @@ fn manifestEntryLessThan(_: void, lhs: ManifestEntry, rhs: ManifestEntry) bool {
 /// `out` must be exactly one physical page (`header.page_size` bytes): the
 /// whole page is zeroed first (as `encodePageParts` does), so a slot
 /// written at a smaller size would leave stale bytes in the tail.
-const checkpoint_slot_payload_size: usize = 136;
+/// perf/lwa-fold-boundary: 136 + 8 bytes for `redo_folded_through` (format
+/// v11; see `format_version`'s own doc comment).
+const checkpoint_slot_payload_size: usize = 144;
 
 /// Deterministic field-by-field encoding (explicit zero-fill, no struct
 /// padding) so the same logical `CheckpointSlot` always produces identical
@@ -20388,6 +20594,7 @@ fn encodeCheckpointSlotPayload(out: *[checkpoint_slot_payload_size]u8, slot: Che
     std.mem.writeInt(u32, out[120..124], slot.manifest_crc, .little);
     std.mem.writeInt(u32, out[124..128], slot.manifest_page_count, .little);
     out[128] = @intFromBool(slot.presynced);
+    std.mem.writeInt(u64, out[136..144], slot.redo_folded_through, .little);
 }
 
 fn encodeCheckpointSlotPage(out: []u8, slot: CheckpointSlot) void {
@@ -20417,6 +20624,7 @@ fn decodeCheckpointSlotPage(raw: []const u8) !CheckpointSlot {
         .manifest_crc = std.mem.readInt(u32, payload[120..124], .little),
         .manifest_page_count = std.mem.readInt(u32, payload[124..128], .little),
         .presynced = payload[128] != 0,
+        .redo_folded_through = std.mem.readInt(u64, payload[136..144], .little),
     };
 }
 
@@ -32732,6 +32940,74 @@ test "lite redo log vacuum captures uncheckpointed overlay and keeps the file a 
     defer a.free(after_reopened);
     try std.testing.expectEqualStrings("fresh", after_reopened);
     try std.testing.expect((try reopened.check()).valid);
+}
+
+// perf/lwa-fold-boundary: `copyStableSnapshotToPath` stamps the snapshot's
+// own slot with `redo.checkpoint_sequence` (the real fold boundary), not
+// `self.activeCheckpoint().commit_sequence` (the tip, bumped by every
+// ordinary overlay-only commit) -- see that function's own comment
+// (ee1241f843 fixed this; this is its first deterministic regression
+// test, now also covering `redo_folded_through`). A deterministic
+// reproduction of that bug class: write enough to leave the overlay with
+// both a live document and a superseded (put-then-delete) one, neither
+// ever folded by an explicit `checkpointRedoLog`, snapshot, then reopen
+// the *snapshot* (a fresh process in spirit, no in-memory overlay carried
+// over) and confirm the live write survives and the deleted one does not
+// resurrect.
+test "lite redo log stable snapshot captures uncheckpointed overlay and recovers it correctly on reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-snapshot-source.aflite");
+    defer a.free(path);
+    const snapshot_path = try testPath(a, tmp, "redo-snapshot-copy.aflite");
+    defer a.free(snapshot_path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer file.close();
+
+    try file.beginTransaction();
+    try file.putDocument("doc:live", "small");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("doc:gone", "deleted");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.deleteDocument("doc:gone");
+    try file.commitTransaction();
+
+    // Nothing checkpointed yet: both the live document and the
+    // tombstone/overwrite pair are overlay-only (`logical_overlay`),
+    // never reflected in the physical tree at all -- exactly the state
+    // that used to be lost (or resurrected) by a reopen that trusted
+    // `commit_sequence` as the fold boundary.
+    try std.testing.expect(file.redo.?.shared.count(std.testing.io, @backingInt(TransactionWrites.Root.documents)) > 0);
+
+    _ = try file.copyStableSnapshotToPath(snapshot_path, false);
+
+    // Reopening the *snapshot*, not `file`: this is the scenario the bug
+    // class is about -- a fresh handle with no in-memory overlay carried
+    // over, relying entirely on what `recoverRedoLog` replays from the
+    // snapshot's own on-disk slot and copied log bytes.
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, snapshot_path, .{});
+    defer reopened.close();
+    try std.testing.expect(reopened.redo != null);
+
+    const live = (try reopened.getDocumentAlloc(a, "doc:live")).?;
+    defer a.free(live);
+    try std.testing.expectEqualStrings("small", live);
+    try std.testing.expectEqual(@as(?[]u8, null), try reopened.getDocumentAlloc(a, "doc:gone"));
+    try std.testing.expect((try reopened.check()).valid);
+
+    // The snapshot must still be a fully working redo-log file, not a
+    // read-only artifact: an ordinary commit on it must divert and
+    // recover normally too.
+    try reopened.beginTransaction();
+    try reopened.putDocument("doc:after", "fresh");
+    try reopened.commitTransaction();
+    const after = (try reopened.getDocumentAlloc(a, "doc:after")).?;
+    defer a.free(after);
+    try std.testing.expectEqualStrings("fresh", after);
 }
 
 test "lite redo log openIndexValue (artifact lease resolution) sees an uncheckpointed overlay entry" {

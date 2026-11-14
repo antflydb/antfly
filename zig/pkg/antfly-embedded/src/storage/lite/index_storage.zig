@@ -1996,6 +1996,90 @@ test "lite subtree deletion bounds heap across private batches and preserves sna
     }
 }
 
+// perf/lwa-fold-boundary: the large-transaction fallback (§9.7e,
+// `RedoCommitState.overLargeTransactionThreshold`) makes some of *this*
+// transaction's own later private batches real, physical B-tree writes
+// instead of diverting them -- but it must never be mistaken for a fold
+// of anything *else*: an unrelated, still-unfolded commit from earlier in
+// the same file's lifetime (never run through an explicit
+// `checkpointRedoLog`) must survive both this large commit and a
+// subsequent reopen unchanged. Deterministic regression test for the
+// structural fold-boundary fix (`redo_folded_through`): before it, any
+// real-publish path that advanced `commit_sequence` without folding
+// could cause exactly this content to be silently skipped as "already
+// checkpointed" on the next reopen.
+test "lite subtree deletion's large-transaction fallback preserves an unrelated unfolded commit across reopen" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/large-txn-fold-boundary.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
+    var docs_open = true;
+    defer if (docs_open) docs.close();
+    docs.file.page_cache_enabled.store(false, .monotonic);
+    // Keep the background idle-flush timer from opportunistically folding
+    // the overlay (and bumping `commit_sequence`/`redo_folded_through` on
+    // its own) during this test's own run -- same reasoning as the
+    // sibling tests above.
+    docs.ride_along_idle_ns = 10 * std.time.ns_per_s;
+
+    // An earlier, wholly unrelated commit whose own mutation stays
+    // overlay-only: never folded by an explicit `checkpointRedoLog`, and
+    // not touched at all by the large transaction below. Through
+    // `Store.beginWrite`/`Txn`, not a bare `docs.file.putDocument` call
+    // (a bare, no-`Txn` commit always writes a real, physical page
+    // directly, 4a7817f3dd, never diverting into the overlay regardless
+    // of redo-log status) and not a raw `docs.file.beginTransaction()`
+    // either (bypasses `Store`'s own mutex/staging machinery that
+    // `deleteTree` below also needs, which deadlocked when tried).
+    {
+        var txn = try docs.beginWrite();
+        errdefer txn.abort();
+        try txn.put("doc:early", "unfolded");
+        try txn.commit();
+    }
+    // root index 2 == `TransactionWrites.Root.documents` (not `pub`, so
+    // named by its known-stable backing value here instead).
+    try std.testing.expect(docs.file.redo.?.shared.count(std.testing.io, 2) > 0);
+
+    // One single transaction (`deleteTree`'s own subtree walk) large
+    // enough to cross `large_txn_fallback_bytes` (16 KiB default): per
+    // §9.7e, this commit's own later private batches switch from
+    // diverting into real, physical B-tree writes mid-transaction.
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const count = 16384;
+    const mutations = try arena.allocator().alloc(native.CatalogMutation, count);
+    for (mutations, 0..) |*mutation, i| {
+        const key = try arena.allocator().alloc(u8, 128);
+        @memset(key, 'x');
+        _ = try std.fmt.bufPrint(key[0..15], "/scope/{d:0>8}", .{i});
+        mutation.* = .{ .key = key, .value = "" };
+    }
+    try docs.file.putIndexCatalogBatch(mutations);
+    try docs.file.putIndexCatalogRecord("/scope", "exact");
+    var store = Store.initWithNamespace(a, &docs, "/scope");
+    try store.storage().deleteTree("/scope");
+
+    // Still readable on the live handle immediately after the large
+    // commit.
+    const early = (try docs.file.getDocumentAlloc(a, "doc:early")).?;
+    defer a.free(early);
+    try std.testing.expectEqualStrings("unfolded", early);
+    try std.testing.expectEqual(@as(?usize, null), try docs.file.getIndexCatalogRecordSize("/scope"));
+
+    docs.close();
+    docs_open = false;
+    var reopened = try docstore.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer reopened.close();
+    const early_reopened = (try reopened.file.getDocumentAlloc(a, "doc:early")).?;
+    defer a.free(early_reopened);
+    try std.testing.expectEqualStrings("unfolded", early_reopened);
+    try std.testing.expectEqual(@as(?usize, null), try reopened.file.getIndexCatalogRecordSize("/scope"));
+    try std.testing.expect((try reopened.checkWithCancel(null)).valid);
+}
+
 test "lite subtree deletion rolls back earlier private batches on failure" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
