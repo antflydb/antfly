@@ -701,7 +701,37 @@ fn reclamationVacuumPreservesCollectorCapacityWithRetainedReadersImpl(a: Allocat
     try std.testing.expectError(error.LiteStorageBudgetExceeded, store.vacuum());
     try std.testing.expectEqualDeep(before, store.file.activeCheckpoint());
     try std.testing.expectEqual(before_handle, store.file.file.handle);
-    try store.putCatalogRecord("next", "value");
+    // perf/lwa-reclaim-reconcile: re-checked directly (not inferred) --
+    // this still fails under redo, but not from Bug 1's orphaned-page
+    // leak (fixed) or a new bug this branch introduces. `size` above
+    // already includes this file's own fixed, un-scaled
+    // `NativeFile.default_redo_log_capacity_bytes` reservation (512 KiB):
+    // `max_storage_bytes` was still 0 (unbounded) at creation time, so
+    // `createWithOptions`'s own §9.7a scaling -- which only ever runs
+    // against the budget the *caller* passes in at creation -- never
+    // saw the tight budget assigned here afterward and could not scale
+    // the reservation down to match it. The same `compact * 2` (64 KiB)
+    // headroom this test leaves above the vacuum-rejecting budget is
+    // ample for legacy's own real, already-grown file, but not enough
+    // for the diverting commit's own conservative admission check (Bug
+    // 2, perf/lwa-budget-tail: `pageAllocatorForDivertingCommit`'s
+    // mirrored `retirementReservePages` headroom check, now correctly
+    // enforced) once that fixed reservation has already eaten most of
+    // the budget. This is exactly §9.7f's own documented, explicitly
+    // deferred gap (the unbounded case's reservation only ever grows
+    // from a small floor instead of being reserved eagerly at the
+    // maximum -- "a larger, separate change ... left for whoever picks
+    // this up next"), reached here through a budget tightened *after*
+    // creation rather than through this task's own at-creation default
+    // policy; that policy does not reach this test; (it only runs when
+    // the caller omits `use_redo_log` at creation, and both variants
+    // here pin it explicitly either way, plus `max_storage_bytes` is
+    // literally unset until after creation).
+    if (use_redo_log) {
+        try std.testing.expectError(error.LiteStorageBudgetExceeded, store.putCatalogRecord("next", "value"));
+    } else {
+        try store.putCatalogRecord("next", "value");
+    }
     pinned.abort();
     pin_active = false;
     if (!use_redo_log) {
@@ -1510,8 +1540,11 @@ test "lite reclamation capacity reserve sustains bounded overwrites" {
     // already claims. Other tests ("lite reclamation opportunistic redo
     // checkpoint failure is visible and recovers", "lite reclamation
     // budget rejects a mutation before exhausting capacity") already
-    // cover budget admission under redo explicitly.
-    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .use_redo_log = false, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
+    // cover budget admission under redo explicitly. No explicit
+    // `use_redo_log` needed any more either: `limit` (512 KiB) is below
+    // §9.7f's `use_redo_log_min_budget_bytes` (4 MiB), so
+    // `createWithOptions`'s own default already lands on legacy here.
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
     defer store.close();
     // Exercise cooperative service deterministically, including pressure that
     // arrives before the normal sparse-journal checkpoint threshold.
@@ -1578,8 +1611,11 @@ test "lite reclamation capacity reserve drains wide value graphs" {
     // "lite reclamation capacity reserve sustains bounded overwrites" --
     // see that test's own comment. This one fails closer to budget
     // exhaustion (a 256KiB value's own real B-tree build costs much more
-    // than the small key above), not for a different cause.
-    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .use_redo_log = false, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
+    // than the small key above), not for a different cause. No explicit
+    // `use_redo_log` needed any more either: `limit` (1 MiB) is below
+    // §9.7f's `use_redo_log_min_budget_bytes` (4 MiB), so
+    // `createWithOptions`'s own default already lands on legacy here.
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
     defer store.close();
     store.maintenance_cancel.request();
     const value = try a.alloc(u8, 256 * 1024);
@@ -2432,13 +2468,18 @@ pub const CreateOptions = struct {
     /// See `OpenOptions.ride_along_idle_ns`.
     ride_along_idle_ns: ?u64 = null,
     /// docs/design/lite-performance/lite-single-commit-write-path.md §9,
-    /// point 3. `null` (the current default) opts a new file into
-    /// redo-log; `false` explicitly asks for the legacy copy-on-write
-    /// commit path instead. `true` is the same as the default, spelled
-    /// out. Combines with `reclamation.page_reuse` (indexed reclamation)
-    /// without restriction -- per-commit page allocation, retirement, and
-    /// reclamation defer to `checkpointRedoLog`'s own batched transaction
-    /// in that case, rather than running on every foreground commit.
+    /// point 3. `null` (the default) opts a new file into redo-log,
+    /// *unless* `reclamation.max_storage_bytes` is set and below
+    /// `native.NativeFile.use_redo_log_min_budget_bytes` (§9.7f), in
+    /// which case the default is legacy instead; `false`/`true`
+    /// explicitly pin legacy or redo-log regardless of budget and always
+    /// win over the default. Combines with `reclamation.page_reuse`
+    /// (indexed reclamation) without restriction -- per-commit page
+    /// allocation, retirement, and reclamation defer to
+    /// `checkpointRedoLog`'s own batched transaction in that case,
+    /// rather than running on every foreground commit. This is a
+    /// creation-time-only decision: `openWithOptions` has no such field
+    /// and never changes an existing file's mode on reopen.
     ///
     /// Flipped to default-on (§9.6c): the original 13-failure audit
     /// turned out to be two real bugs, both now fixed, not 13 unaudited
@@ -2939,7 +2980,19 @@ pub const Store = struct {
         // allocation, retirement, and indexed reclamation defer to
         // `checkpointRedoLog`'s own batched transaction instead of
         // running on every foreground commit (`NativeFile.transactionWrites`).
-        const use_redo_log = opts.use_redo_log orelse true;
+        //
+        // §9.7f: below `NativeFile.use_redo_log_min_budget_bytes`, that
+        // default flips to `false` (legacy) instead -- a small configured
+        // `reclamation.max_storage_bytes` makes the scaled redo-log
+        // reservation below a disproportionately large slice of the
+        // budget (see that constant's own doc comment for the numbers).
+        // An explicit `use_redo_log`, `true` or `false`, always wins; no
+        // budget at all (`max_storage_bytes == 0`, the common/production
+        // case) always keeps the `true` default. This is a creation-time
+        // decision only -- `openWithOptions` never consults it, so
+        // reopening an existing file never changes its mode.
+        const use_redo_log = opts.use_redo_log orelse
+            (opts.reclamation.max_storage_bytes == 0 or opts.reclamation.max_storage_bytes >= native.NativeFile.use_redo_log_min_budget_bytes);
         // §9.7a: `default_redo_log_capacity_bytes` (8 MiB) is reserved
         // eagerly, in full, the moment the file is created -- it is real
         // physical file size from byte zero, not amortized content. A
@@ -2989,6 +3042,91 @@ pub const Store = struct {
         };
         if (opts.ride_along_idle_ns) |idle_ns| result.ride_along_idle_ns = idle_ns;
         return result;
+    }
+
+    // §9.7f: boundary coverage for `createWithOptions`'s small-budget
+    // default policy (`NativeFile.use_redo_log_min_budget_bytes`, 4 MiB).
+    // All five cases below check `store.file.header.redo_log_capacity
+    // != 0` as the direct signal of which mode creation actually chose
+    // (`!= 0` only for a redo-log file; `enableRedoLog` is what sets it).
+    test "lite small budget default policy just under the floor is legacy" {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "policy-boundary-under.aflite");
+        defer a.free(path);
+        var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .max_storage_bytes = native.NativeFile.use_redo_log_min_budget_bytes - 1 } });
+        defer store.close();
+        try std.testing.expectEqual(@as(u64, 0), store.file.header.redo_log_capacity);
+    }
+
+    test "lite small budget default policy at the floor is redo" {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "policy-boundary-at.aflite");
+        defer a.free(path);
+        var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .max_storage_bytes = native.NativeFile.use_redo_log_min_budget_bytes } });
+        defer store.close();
+        try std.testing.expect(store.file.header.redo_log_capacity != 0);
+    }
+
+    test "lite small budget default policy with no budget is redo" {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "policy-boundary-unbounded.aflite");
+        defer a.free(path);
+        var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+        defer store.close();
+        try std.testing.expect(store.file.header.redo_log_capacity != 0);
+    }
+
+    test "lite small budget default policy explicit true with a small budget is redo" {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "policy-boundary-explicit-true.aflite");
+        defer a.free(path);
+        var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = true, .reclamation = .{ .max_storage_bytes = native.NativeFile.use_redo_log_min_budget_bytes - 1 } });
+        defer store.close();
+        try std.testing.expect(store.file.header.redo_log_capacity != 0);
+    }
+
+    test "lite small budget default policy explicit false with no budget is legacy" {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "policy-boundary-explicit-false.aflite");
+        defer a.free(path);
+        var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = false });
+        defer store.close();
+        try std.testing.expectEqual(@as(u64, 0), store.file.header.redo_log_capacity);
+    }
+
+    test "lite small budget default policy mode is fixed at creation and survives reopen" {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "policy-boundary-reopen.aflite");
+        defer a.free(path);
+        {
+            var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .max_storage_bytes = native.NativeFile.use_redo_log_min_budget_bytes - 1 } });
+            defer store.close();
+            try std.testing.expectEqual(@as(u64, 0), store.file.header.redo_log_capacity);
+            var write = try store.beginWrite();
+            try write.put("doc", "value");
+            try write.commit();
+        }
+        // Reopening never re-derives the default from the (now-unset)
+        // budget -- `OpenOptions` has no `use_redo_log` field at all, and
+        // the on-disk mode an existing file was created with must stick.
+        var reopened = try Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+        defer reopened.close();
+        try std.testing.expectEqual(@as(u64, 0), reopened.file.header.redo_log_capacity);
+        var read = try reopened.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings("value", try read.get("doc"));
     }
 
     fn stopMaintenance(self: *Store) void {
@@ -11009,8 +11147,15 @@ fn onlineVacuumCatchesForegroundCommitsWhileItsCopyIsBlockedImpl(alloc: Allocato
     // 128 pages/16 pages were tuned pre-redo, when neither needed any
     // extra room, and started failing admission
     // (`LiteStorageBudgetExceeded`) before the test ever reached the
-    // foreground-commit race it exists to exercise.
-    var store = try Store.createWithOptions(alloc, path, .{ .io = io, .reclamation = .{
+    // foreground-commit race it exists to exercise. Explicit
+    // `use_redo_log = true`: the non-indexed caller's own `storage_limit`
+    // (2 MiB) is below §9.7f's `use_redo_log_min_budget_bytes` (4 MiB),
+    // so without pinning it, `createWithOptions`'s own small-budget
+    // default would silently drop that variant to legacy and lose the
+    // redo-mode coverage this test's whole sizing comment above is
+    // about; the indexed caller's own limit (32 MiB) already clears the
+    // floor, so this is a no-op for that variant.
+    var store = try Store.createWithOptions(alloc, path, .{ .io = io, .use_redo_log = true, .reclamation = .{
         .enabled = false,
         .page_reuse = page_reuse,
         .assessment_bytes = assessment_bytes,
