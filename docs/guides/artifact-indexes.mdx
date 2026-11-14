@@ -309,9 +309,62 @@ or credit that work as ready.
 generation. It does not make arbitrary producer mapping edits a transaction
 across every document or shard. To keep a serving application on one model space
 throughout an upgrade, create a separately named producer, artifact, and index
-for the new revision, wait for that index's readiness, then switch query routing
-and the query embedder together. Keep the old resources until callers have moved.
-This also provides an explicit rollback target.
+for the new revision and wait for that index's readiness. A table-scoped index
+alias lets native HTTP queries name a stable target while the database selects
+the concrete index and its query embedder together:
+
+```http
+PUT /db/v1/tables/docs/index-aliases/chunk_vectors
+Content-Type: application/json
+
+{
+  "index": "chunk_vectors_gemma2",
+  "expected_index": "chunk_vectors_bge",
+  "require": "complete",
+  "idempotency_key": "upgrade-gemma2-2026-11-14"
+}
+```
+
+Create an alias by omitting `expected_index`; replace it by supplying its exact
+current target. `require` defaults to `complete`; `queryable` also permits the
+existing partial-serving readiness state. A swap rejects an unready target,
+a different index kind, or a dense/sparse mismatch. Alias names cannot shadow
+concrete indexes, refer to another alias, or use reserved metadata names.
+
+Use the alias in `full_text_index`, `indexes`, embedding map keys, canonical `graph_queries`
+`index` fields, or graph metric requests. Resolution happens before embedding
+and shard dispatch. Native query results include `resolved_indexes` with the
+concrete names used. Filters, documents, and prompts are never rewritten.
+`GET /db/v1/tables/docs/index-aliases/chunk_vectors` returns the current and
+previous targets, swap timestamp, and the recorded readiness proof. Mutations
+require table administration permission; reads require table read permission.
+The database/namespace-qualified table routes support the same operations.
+Finish upgrading metadata and data nodes before enabling aliases in a
+distributed cluster. Admission checks peer capabilities, and the replicated
+catalog rejects older data-store registrations once aliases are present.
+
+Retry an ambiguous mutation with the identical body and idempotency key. The
+recorded response is returned even after another swap or rollback; a retry does
+not reactivate its original target. Receipts are retained for at least 24 hours,
+with at most 128 retained receipts per alias. Admission returns a conflict if
+that window is full, rather than evicting a receipt that a caller may still
+need. Do not reuse keys for new operations. Read the alias to inspect the live
+target independently of an older operation's receipt.
+
+Keep the old resources for rollback. Swap back with a new idempotency key and
+the current target as `expected_index`. Deleting or changing the configuration
+of a currently referenced concrete index is rejected. Alias state and receipts
+are part of the table catalog and travel with its existing persistence and
+replication paths.
+
+SQL graph mappings may name an alias: each execution binds a copy of the
+mapping to the concrete graph index and its incarnation from the statement's
+catalog cut. SQL HTTP and Cypher responses also report `resolved_indexes`.
+Fixed mappings continue to pin their original incarnations.
+SQL SEARCH hosts that supply a table catalog use the same structural binding.
+Embedded alias management is not exposed by the C ABI; embedded applications
+must continue using concrete index names. Schema-owned relational indexes are
+not alias targets yet; alias mutations naming one return HTTP 501.
 
 An asynchronous source write can be acknowledged while its previous published
 vector is still queryable. Aggregate `coverage.complete` describes processing

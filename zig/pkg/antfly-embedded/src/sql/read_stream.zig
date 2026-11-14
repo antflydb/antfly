@@ -1127,7 +1127,7 @@ pub const Stream = struct {
         }
         self.emitted += read;
         self.exhausted = spool.index == spool.count();
-        return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .columns = self.context.binding.columns, .rows = rows[0..read], .sql_nulls = flags[0..read], .command_tag = "SELECT" } };
+        return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .resolved_indexes = try runtime.resolvedGraphIndexNames(arena.allocator(), self.context.binding), .columns = self.context.binding.columns, .rows = rows[0..read], .sql_nulls = flags[0..read], .command_tag = "SELECT" } };
     }
     fn columnProgram(self: *Stream, a: std.mem.Allocator, program: *const @import("scalar.zig").Program, page: catalog.ColumnPage) ![]const @import("scalar.zig").Datum {
         if (try @import("vector_eval.zig").evaluateDictionaryColumns(a, program, page, self.context.binding.scalars.columns, self.context.parameters)) |encoded| {
@@ -1468,7 +1468,7 @@ pub const Stream = struct {
             }
             if (bytes >= self.context.limits.page_bytes) break;
         }
-        return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .columns = self.context.binding.columns, .rows = rows.items, .sql_nulls = flags.items, .command_tag = "SELECT" } };
+        return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .resolved_indexes = try runtime.resolvedGraphIndexNames(arena.allocator(), self.context.binding), .columns = self.context.binding.columns, .rows = rows.items, .sql_nulls = flags.items, .command_tag = "SELECT" } };
     }
     fn columnsEligible(self: *Stream) bool {
         const cursor = self.cursor orelse return false;
@@ -1598,6 +1598,7 @@ pub const Stream = struct {
             self.cursor = null;
         }
         return .{ .arena = arena, .exhausted = self.exhausted, .output = .{
+            .resolved_indexes = try runtime.resolvedGraphIndexNames(arena.allocator(), self.context.binding),
             .columns = self.context.binding.columns,
             .rows = rows.items,
             .sql_nulls = flags.items,

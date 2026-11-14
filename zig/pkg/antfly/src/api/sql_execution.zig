@@ -738,7 +738,7 @@ pub const Adapter = struct {
         const state = try std.json.parseFromSliceLeaky(system_catalog.State, alloc, bytes, .{ .allocate = .alloc_always });
         const record = state.find(.graph, 0, definition.name.table) orelse return error.CatalogNotFound;
         const cypher = @import("cypher");
-        const graph = try system_catalog.graphForExecution(alloc, record);
+        var graph = try system_catalog.graphForExecution(alloc, record);
         const logical = try cypher.catalog.parseDefinition(alloc, record.name, graph.incarnation, graph.revision, record.source_json);
         var targets: std.ArrayList(system_catalog.Target) = .empty;
         const positions = try alloc.alloc(usize, logical.labels.len);
@@ -753,6 +753,8 @@ pub const Adapter = struct {
             };
         }
         const dependencies = try self.resolveMany(alloc, targets.items, .read);
+        const resolved_record = try @import("../system_catalog/graph_bindings.zig").resolveAliases(alloc, record, dependencies);
+        graph = try system_catalog.graphForExecution(alloc, resolved_record);
         for (@constCast(graph.labels), positions) |*physical, position| {
             const target = targets.items[position];
             const table = dependencies[position];
@@ -763,7 +765,7 @@ pub const Adapter = struct {
         }
         try cypher.binder.validate(alloc, graph, definition.query);
         const binding = try alloc.create(catalog.graph_relation.Binding);
-        binding.* = .{ .definition = definition, .graph = graph, .catalog_json = try std.json.Stringify.valueAlloc(alloc, record, .{}), .dependencies = dependencies };
+        binding.* = .{ .definition = definition, .graph = graph, .catalog_json = try std.json.Stringify.valueAlloc(alloc, resolved_record, .{}), .dependencies = dependencies };
         const table: catalog.Table = .{ .id = record.id, .physical_name = record.name, .schema_version = 1, .storage_mode = .document, .columns = try catalog.graph_relation.columns(alloc, binding.*), .scope = .{ .database = database, .namespace = namespace, .name = record.name, .revision = state.revision }, .graph = binding };
         try self.recordPreparedBinding(alloc, table);
         return table;
@@ -806,6 +808,10 @@ pub const Adapter = struct {
         const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
         if (table.table_id == 0 or definition.table_id != table.table_id) return error.InvalidSqlBackendResponse;
         var binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), alloc, definition.schema_json, table.table_id, table.name);
+        binding.index_catalog_json = if (std.mem.indexOf(u8, definition.indexes_json, "_index_aliases") != null)
+            try self.server.index_alias_cache.project(self.server.alloc, alloc, definition.indexes_json)
+        else
+            "{}";
         if (binding.external_base_source != null and action != .read and action != .admin) return error.ExternalLakeReadOnly;
         if (binding.external_base_source != null) binding.external_indexes = .{
             .catalog_json = definition.lake_index_catalog_json,

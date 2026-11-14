@@ -122,6 +122,9 @@ pub const Table = struct {
     /// External bindings are read-only and pinned by the serving cursor.
     external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
     external_indexes: ?ExternalIndexes = null,
+    /// Execution-owned catalog cut for resolving explicit index aliases.
+    /// Never retain this in a schema or prepared-plan cache.
+    index_catalog_json: []const u8 = "{}",
     columns: []const Column,
     indexes: []const Index = &.{},
     constraints: []const Constraint = &.{},

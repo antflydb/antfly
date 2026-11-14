@@ -2551,6 +2551,56 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/index-aliases/{aliasName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        /** Inspect an index alias */
+        get: operations["getTableIndexAlias"];
+        /**
+         * Atomically create or swap an index alias
+         * @description Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias; a full retention window rejects new mutations with HTTP 409.
+         */
+        put: operations["putTableIndexAlias"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        /** Inspect an index alias */
+        get: operations["getNamespaceTableIndexAlias"];
+        /**
+         * Atomically create or swap an index alias
+         * @description Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias; a full retention window rejects new mutations with HTTP 409.
+         */
+        put: operations["putNamespaceTableIndexAlias"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/indexes": {
         parameters: {
             query?: never;
@@ -7777,6 +7827,8 @@ export interface components {
          *     descriptor in the corresponding SQLColumn. They are not JSON columns.
          */
         SQLResponse: {
+            /** @description Concrete graph index names selected from the statement catalog cut. */
+            resolved_indexes?: string[];
             columns: components["schemas"]["SQLColumn"][];
             rows: unknown[][];
             /**
@@ -14222,6 +14274,8 @@ export interface components {
             limits?: components["schemas"]["GraphQueryLimits"];
         };
         GraphQueryResult: {
+            /** @description Concrete graph index names selected from the statement catalog cut. */
+            resolved_indexes?: string[];
             /** @enum {integer} */
             wire_version: 1;
             columns: string[];
@@ -15171,6 +15225,8 @@ export interface components {
         };
         /** @description Fields shared by canonical and stateful query result envelopes. */
         QueryResultBase: {
+            /** @description Concrete index names selected for this query before embedding and execution. */
+            resolved_indexes?: string[];
             /**
              * @description Ranking contract for a composed result.
              * @enum {string}
@@ -23757,6 +23813,26 @@ export interface components {
             context?: Record<string, never>[];
             /** @description IDs of retrieved documents (for retrieval metrics) */
             retrieved_ids?: string[];
+        };
+        IndexAlias: {
+            index: string;
+            previous_index?: string | null;
+            /** Format: int64 */
+            swapped_at_ms: number;
+            /** @enum {string} */
+            require: "queryable" | "complete";
+            idempotency_key: string;
+            readiness: components["schemas"]["IndexReadinessStatus"];
+        };
+        IndexAliasRequest: {
+            index: string;
+            expected_index?: string;
+            /**
+             * @default complete
+             * @enum {string}
+             */
+            require?: "queryable" | "complete";
+            idempotency_key: string;
         };
         IndexMaintenanceOwnerProof: {
             group_id: string;
@@ -37405,6 +37481,164 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current alias and committed readiness proof */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexAlias"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Stale expected target, incompatible kind, unready target, or catalog conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description This index kind or runtime does not support alias mutations */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    putTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexAliasRequest"];
+            };
+        };
+        responses: {
+            /** @description Current alias and committed readiness proof */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexAlias"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Stale expected target, incompatible kind, unready target, or catalog conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getNamespaceTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current alias and committed readiness proof */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexAlias"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Stale expected target, incompatible kind, unready target, or catalog conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+            /** @description This index kind or runtime does not support alias mutations */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    putNamespaceTableIndexAlias: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                aliasName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexAliasRequest"];
+            };
+        };
+        responses: {
+            /** @description Current alias and committed readiness proof */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexAlias"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Stale expected target, incompatible kind, unready target, or catalog conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
         };
     };
     listIndexes: {

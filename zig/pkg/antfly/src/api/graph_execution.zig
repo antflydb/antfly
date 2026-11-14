@@ -63,7 +63,7 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
     const bytes = try server.source.systemCatalog(scratch, context, .{ .read = .{ .kind = .graph, .name = name } });
     const state = try std.json.parseFromSliceLeaky(domain.State, scratch, bytes, .{ .allocate = .alloc_always });
     const record = state.find(.graph, 0, name) orelse return error.CatalogNotFound;
-    const graph = try domain.graphForExecution(scratch, record);
+    var graph = try domain.graphForExecution(scratch, record);
     var sql: @import("sql_execution.zig").Adapter = .{ .server = server, .identity = identity, .context = context };
     var tables: std.ArrayList(port.GraphTable) = .empty;
     var targets: std.ArrayList(domain.Target) = .empty;
@@ -81,6 +81,8 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
         };
     }
     const resolved = try sql.resolveMany(scratch, targets.items, if (writes and !compiled.query.explain) .read_write else .read);
+    const resolved_record = try @import("../system_catalog/graph_bindings.zig").resolveAliases(scratch, record, resolved);
+    graph = try domain.graphForExecution(scratch, resolved_record);
     for (@constCast(graph.labels), positions) |*physical, position| {
         const target = targets.items[position];
         const table = resolved[position];
@@ -125,7 +127,7 @@ pub fn execute(a: std.mem.Allocator, server: *server_mod.ApiHttpServer, identity
             const write_source = server.table_writes orelse return error.CypherMutationsUnavailable;
             for (read_tables.items) |table| try write_source.activateRangeTracking(scratch, table.name, context);
         }
-        read = try source.openCypherStatement(a, .{ .catalog_json = try std.json.Stringify.valueAlloc(scratch, record, .{}), .tables = read_tables.items, .partial_graph = needed != null, .cut_id = std.fmt.bytesToHex(nonce, .lower), .expires_ms = now / std.time.ns_per_ms + 30_000, .ttl_now_ns = now, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
+        read = try source.openCypherStatement(a, .{ .catalog_json = try std.json.Stringify.valueAlloc(scratch, resolved_record, .{}), .tables = read_tables.items, .partial_graph = needed != null, .cut_id = std.fmt.bytesToHex(nonce, .lower), .expires_ms = now / std.time.ns_per_ms + 30_000, .ttl_now_ns = now, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
         channel.read = &read.?;
         client = .{ .channel = channel.rpcChannel(), .incarnation = graph.incarnation, .revision = graph.revision };
         provider = client.backend();

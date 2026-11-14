@@ -5494,6 +5494,8 @@ pub const GraphQueryRequest = struct {
 };
 
 pub const GraphQueryResult = struct {
+    /// Concrete graph index names selected from the statement catalog cut.
+    resolved_indexes: ?[]const []const u8 = null,
     wire_version: i64,
     columns: []const []const u8,
     rows: []const []const GraphWireValue,
@@ -5508,6 +5510,7 @@ pub const GraphQueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "resolved_indexes", "resolved_indexes", true },
         .{ "wire_version", "wire_version", false },
         .{ "columns", "columns", false },
         .{ "rows", "rows", false },
@@ -5530,6 +5533,10 @@ pub const GraphQueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.resolved_indexes) |value| {
+            try jw.objectField("resolved_indexes");
+            try jw.write(value);
+        }
         try jw.objectField("wire_version");
         try jw.write(self.wire_version);
         try jw.objectField("columns");
@@ -9366,6 +9373,8 @@ pub const QueryResponses = struct {
 
 /// Result of a canonical query operation.
 pub const QueryResult = struct {
+    /// Concrete index names selected for this query before embedding and execution.
+    resolved_indexes: ?[]const []const u8 = null,
     /// Ranking contract for a composed result.
     source_ranking: ?[]const u8 = null,
     /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
@@ -9397,6 +9406,7 @@ pub const QueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "resolved_indexes", "resolved_indexes", true },
         .{ "source_ranking", "source_ranking", true },
         .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
@@ -9424,6 +9434,10 @@ pub const QueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.resolved_indexes) |value| {
+            try jw.objectField("resolved_indexes");
+            try jw.write(value);
+        }
         if (self.source_ranking) |value| {
             try jw.objectField("source_ranking");
             try jw.write(value);
@@ -9489,6 +9503,8 @@ pub const QueryResult = struct {
 
 /// Fields shared by canonical and stateful query result envelopes.
 pub const QueryResultBase = struct {
+    /// Concrete index names selected for this query before embedding and execution.
+    resolved_indexes: ?[]const []const u8 = null,
     /// Ranking contract for a composed result.
     source_ranking: ?[]const u8 = null,
     /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
@@ -9519,6 +9535,7 @@ pub const QueryResultBase = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "resolved_indexes", "resolved_indexes", true },
         .{ "source_ranking", "source_ranking", true },
         .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
@@ -9545,6 +9562,10 @@ pub const QueryResultBase = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.resolved_indexes) |value| {
+            try jw.objectField("resolved_indexes");
+            try jw.write(value);
+        }
         if (self.source_ranking) |value| {
             try jw.objectField("source_ranking");
             try jw.write(value);
@@ -14101,6 +14122,8 @@ pub const SQLRequest = struct {
 
 /// Ordinal result rows with corresponding logical column metadata. SQL NULL is JSON null; sql_nulls distinguishes it from a JSON column containing the JSON literal null. Integer-typed values are exact decimal strings; datetime values are strings. Objects and arrays in JSON columns remain JSON. Array-typed columns contain SQLArrayValue envelopes, with their element descriptor in the corresponding SQLColumn. They are not JSON columns.
 pub const SQLResponse = struct {
+    /// Concrete graph index names selected from the statement catalog cut.
+    resolved_indexes: ?[]const []const u8 = null,
     columns: []const SQLColumn,
     rows: []const []const std.json.Value,
     /// Number of rows affected by a mutation, or zero for a read-only statement.
@@ -14119,6 +14142,7 @@ pub const SQLResponse = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "resolved_indexes", "resolved_indexes", true },
         .{ "columns", "columns", false },
         .{ "rows", "rows", false },
         .{ "rows_affected", "rows_affected", false },
@@ -14141,6 +14165,10 @@ pub const SQLResponse = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.resolved_indexes) |value| {
+            try jw.objectField("resolved_indexes");
+            try jw.write(value);
+        }
         try jw.objectField("columns");
         try jw.write(self.columns);
         try jw.objectField("rows");
@@ -15519,6 +15547,8 @@ pub const StatefulQueryResponses = struct {
 
 /// Result emitted by the stateful compatibility transport.
 pub const StatefulQueryResult = struct {
+    /// Concrete index names selected for this query before embedding and execution.
+    resolved_indexes: ?[]const []const u8 = null,
     /// Ranking contract for a composed result.
     source_ranking: ?[]const u8 = null,
     /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
@@ -15550,6 +15580,7 @@ pub const StatefulQueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "resolved_indexes", "resolved_indexes", true },
         .{ "source_ranking", "source_ranking", true },
         .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
@@ -15577,6 +15608,10 @@ pub const StatefulQueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.resolved_indexes) |value| {
+            try jw.objectField("resolved_indexes");
+            try jw.write(value);
+        }
         if (self.source_ranking) |value| {
             try jw.objectField("source_ranking");
             try jw.write(value);

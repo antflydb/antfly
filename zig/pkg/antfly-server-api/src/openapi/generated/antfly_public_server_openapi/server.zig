@@ -700,6 +700,27 @@ pub fn parseNamespaceUnsuppressEntityBody(allocator: std.mem.Allocator, body: []
     return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Inspect an index alias
+pub const GetNamespaceTableIndexAliasPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    alias_name: []const u8,
+};
+
+/// Atomically create or swap an index alias
+pub const PutNamespaceTableIndexAliasPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    alias_name: []const u8,
+};
+
+/// Parse the JSON request body for putNamespaceTableIndexAlias.
+pub fn parsePutNamespaceTableIndexAliasBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexAliasRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.IndexAliasRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// List indexes for an explicit namespace table
 pub const ListNamespaceTableIndexesPathParams = struct {
     /// Database name
@@ -1728,6 +1749,23 @@ pub fn parseUnsuppressEntityBody(allocator: std.mem.Allocator, body: []const u8)
     return std.json.parseFromSlice(antfly_resolvers_openapi.ResolverUnmergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Inspect an index alias
+pub const GetTableIndexAliasPathParams = struct {
+    table_name: []const u8,
+    alias_name: []const u8,
+};
+
+/// Atomically create or swap an index alias
+pub const PutTableIndexAliasPathParams = struct {
+    table_name: []const u8,
+    alias_name: []const u8,
+};
+
+/// Parse the JSON request body for putTableIndexAlias.
+pub fn parsePutTableIndexAliasBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_indexes_openapi.IndexAliasRequest) {
+    return std.json.parseFromSlice(antfly_indexes_openapi.IndexAliasRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// List all indexes for a table
 pub const ListIndexesPathParams = struct {
     /// Name of the table
@@ -2440,6 +2478,8 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:suppress", .operation_id = "namespaceSuppressEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unmerge", .operation_id = "namespaceUnmergeEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:unsuppress", .operation_id = "namespaceUnsuppressEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "getNamespaceTableIndexAlias", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "putNamespaceTableIndexAlias", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes", .operation_id = "listNamespaceTableIndexes", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "getNamespaceTableIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}", .operation_id = "createNamespaceTableIndex", .request_body = .buffered, .streaming_response = false },
@@ -2547,6 +2587,8 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:suppress", .operation_id = "suppressEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:unmerge", .operation_id = "unmergeEntity", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/entities/{key}:unsuppress", .operation_id = "unsuppressEntity", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "getTableIndexAlias", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/tables/{tableName}/index-aliases/{aliasName}", .operation_id = "putTableIndexAlias", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex", .request_body = .buffered, .streaming_response = false },
@@ -2694,6 +2736,8 @@ pub const routes = [_]Route{
 //   fn namespaceSuppressEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn namespaceUnmergeEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn namespaceUnsuppressEntity(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn getNamespaceTableIndexAlias(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, alias_name: []const u8) !httpx.Response
+//   fn putNamespaceTableIndexAlias(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, alias_name: []const u8) !httpx.Response
 //   fn listNamespaceTableIndexes(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn getNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createNamespaceTableIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
@@ -2801,6 +2845,8 @@ pub const routes = [_]Route{
 //   fn suppressEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn unmergeEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
 //   fn unsuppressEntity(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8) !httpx.Response
+//   fn getTableIndexAlias(self: *Impl, ctx: *httpx.Context, table_name: []const u8, alias_name: []const u8) !httpx.Response
+//   fn putTableIndexAlias(self: *Impl, ctx: *httpx.Context, table_name: []const u8, alias_name: []const u8) !httpx.Response
 //   fn listIndexes(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response

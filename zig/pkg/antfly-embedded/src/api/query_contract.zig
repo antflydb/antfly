@@ -2469,6 +2469,8 @@ pub const SemanticResolver = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Coordinator-only catalog binding, before parsing or embedding.
+        bind_index_aliases: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!?[]u8 = null,
         resolve_dense_query: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -3024,7 +3026,9 @@ pub fn parseQueryRequestWithDeadline(
     body: []const u8,
     execution_deadline_ns: ?u64,
 ) !OwnedQueryRequest {
-    var owned = try parseQueryRequestWithDeadlineCore(alloc, semantic_resolver, table_name, body, execution_deadline_ns);
+    const bound = if (semantic_resolver) |resolver| if (resolver.vtable.bind_index_aliases) |bind| try bind(resolver.ptr, alloc, table_name, body) else null else null;
+    defer if (bound) |bytes| alloc.free(bytes);
+    var owned = try parseQueryRequestWithDeadlineCore(alloc, semantic_resolver, table_name, bound orelse body, execution_deadline_ns);
     errdefer owned.deinit(alloc);
     // Internal HTTP hops must retain the authenticated physical cut when the
     // generated public contract strips private shard fields. Public admission
@@ -4157,6 +4161,20 @@ fn preparedComputedOutput(a: std.mem.Allocator, req: db_mod.types.SearchRequest,
 fn hasNamedProjection(projection: ?*const field_projection.Plan) bool {
     return if (projection) |plan| plan.bindings.len != 0 else false;
 }
+fn resolvedIndexNames(a: std.mem.Allocator, req: db_mod.types.SearchRequest) !?[]const []const u8 {
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    if (req.index_name) |name| try appendUniqueOwnedString(a, &names, name);
+    if (req.primary_text_index_name) |name| try appendUniqueOwnedString(a, &names, name);
+    for (req.full_text_queries) |query| try appendUniqueOwnedString(a, &names, query.index_name);
+    for (req.dense_queries) |query| try appendUniqueOwnedString(a, &names, query.index_name);
+    for (req.sparse_queries) |query| try appendUniqueOwnedString(a, &names, query.index_name);
+    for (req.graph_queries) |query| try appendUniqueOwnedString(a, &names, query.query.index_name);
+    for (req.graph_metric_queries) |query| try appendUniqueOwnedString(a, &names, query.query.index_name);
+    if (req.graph_metric_rerank) |query| try appendUniqueOwnedString(a, &names, query.index_name);
+    if (names.items.len == 0) return null;
+    return try names.toOwnedSlice(a);
+}
+
 fn toOpenApiHitForWire(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: *db_mod.types.SearchHit, projection: ?*const field_projection.Plan) !metadata_openapi.QueryHit {
     const ready = try preparedComputedOutput(a, req, hit.*, projection);
     if (ready != null and (field_projection.storageEligible(req) or field_projection.hydrationEligible(req)) and hit.source_value == null and hit.column_source == null) {
@@ -4606,6 +4624,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
                 .live_read = if (req.response_live_read) true else null,
+                .resolved_indexes = try resolvedIndexNames(arena, req),
             };
             if (graph_results == null and typed_delivery) if (delivery) |sink| if (sink.typed_result) |target| {
                 if (sink.hydrator != null) return error.InvalidArgument;
@@ -4646,6 +4665,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
                 .live_read = if (req.response_live_read) true else null,
+                .resolved_indexes = try resolvedIndexNames(arena, req),
             };
             break :blk if (hasColumnSources(emitted_hits) or hasFinalizedWireSources(req, emitted_hits, projection) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, null, req, query_results[0], emitted_hits, delivery, &delivered, projection) else try std.json.Stringify.valueAlloc(
                 alloc,

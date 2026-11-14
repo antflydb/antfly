@@ -7370,6 +7370,7 @@ pub const AntflyApiHandler = struct {
             .columns = columns,
             .rows = result.output.rows,
             .sql_nulls = result.output.sql_nulls,
+            .resolved_indexes = result.output.resolved_indexes,
             .session_id = if (job.adapter.result_session_id) |*id| id else null,
             .transaction_status = switch (job.adapter.transaction_status) {
                 .idle => .idle,
@@ -10363,6 +10364,54 @@ pub const AntflyApiHandler = struct {
         return respondOwnedApiResponse(ctx, &resp);
     }
 
+    fn indexAliasRequest(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, alias_name: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const table = (try self.resolvePublicTableName(ctx, table_name, &identity)) orelse return ctx.response.build();
+        defer ctx.allocator.free(table);
+        const permission: usermgr.PermissionType = if (ctx.request.method == .PUT) .admin else .read;
+        if (identity) |authenticated| if (!http_server_mod.permissionsAllow(authenticated.permissions, .table, table, permission)) return jsonErrorResponse(ctx, 403, "table permission required");
+        const name = (try decodePathParamOrBadRequest(ctx, alias_name)) orelse return ctx.response.build();
+        defer ctx.allocator.free(name);
+        const body = if (ctx.request.method == .PUT) (try ctx.body()) orelse "" else null;
+        const response = @import("index_aliases.zig").execute(self.api_server, ctx.allocator, table, name, body, operationContext(ctx, identity)) catch |err| {
+            if (err == error.MetadataMutationOutcomeUnknown) {
+                try ctx.setHeader(metadata_http_routes.Routes.raft_mutation_outcome_header, metadata_http_routes.Routes.raft_mutation_outcome_unknown);
+                try ctx.setHeader("Retry-After", "1");
+            }
+            return jsonErrorResponse(ctx, switch (err) {
+                error.TableNotFound, error.IndexNotFound, error.IndexAliasNotFound, error.NotFound => 404,
+                error.InvalidIndexAliasRequest => 400,
+                error.IndexAliasNameConflict, error.IndexAliasExpectedIndexMismatch, error.IndexAliasIdempotencyConflict, error.IncompatibleIndexAliasTarget, error.IndexAliasTargetNotReady, error.IndexAliasReceiptCapacity, error.TableGenerationChanged, error.TableTransitionActive, error.VectorMigrationActive, error.Conflict => 409,
+                error.UnsupportedOperation, error.IndexAliasProtocolUpgradeRequired, error.TableTopologyProtocolUpgradeRequired => 501,
+                error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout, error.MetadataMutationOutcomeUnknown => 503,
+                error.Canceled, error.Cancelled => 499,
+                error.DeadlineExceeded => 504,
+                else => 500,
+            }, @errorName(err));
+        };
+        defer ctx.allocator.free(response);
+        return jsonResponse(ctx, 200, response);
+    }
+
+    pub fn getTableIndexAlias(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, alias_name: []const u8) !httpx.Response {
+        return self.indexAliasRequest(ctx, table_name, alias_name);
+    }
+    pub fn putTableIndexAlias(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, alias_name: []const u8) !httpx.Response {
+        return self.indexAliasRequest(ctx, table_name, alias_name);
+    }
+    pub fn getNamespaceTableIndexAlias(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, alias_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.indexAliasRequest(ctx, table_name, alias_name);
+    }
+    pub fn putNamespaceTableIndexAlias(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, alias_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.indexAliasRequest(ctx, table_name, alias_name);
+    }
+
     pub fn getIndex(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -11670,6 +11719,85 @@ const HttpxE2eServer = struct {
         return std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}", .{addr.ip4.port});
     }
 };
+
+test "httpx index alias routes register with the generated API" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    var source: u8 = 0;
+    var api = ApiHttpServer.init(a, .{}, .{ .ptr = &source, .vtable = &.{ .status = undefined } }, null, null);
+    defer api.deinit();
+    var server = httpx.Server.initWithConfig(a, io_impl.io(), .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api };
+    try handler.initRuntime(a);
+    defer handler.deinitRuntime();
+    try handler.registerRoutes(&server);
+}
+
+test "httpx index alias GET permits readers and PUT requires table admin and readiness" {
+    const a = std.testing.allocator;
+    var auth = try initTestAuthManager(a);
+    try bindTestAuthManager(a, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var read_permission = try usermgr.Permission.initOwned(a, .table, "*", .read);
+    defer read_permission.deinit(a);
+    var reader = try auth.manager.createUser("alias_reader", "secret", &.{read_permission});
+    defer reader.deinit(a);
+    var admin_permission = try usermgr.Permission.initOwned(a, .table, "*", .admin);
+    defer admin_permission.deinit(a);
+    var admin = try auth.manager.createUser("alias_admin", "secret", &.{admin_permission});
+    defer admin.deinit(a);
+    const Source = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+        commits: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = &self.tables, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn replace(ptr: *anyopaque, _: metadata_table_manager.TableRecord, _: metadata_table_manager.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.commits += 1;
+        }
+    };
+    var source: Source = .{ .tables = .{.{ .table_id = 1, .name = "docs", .indexes_json = "{\"v1\":{\"type\":\"full_text\"},\"_index_aliases\":{\"live\":{\"index\":\"v1\",\"previous_index\":null,\"swapped_at_ms\":1,\"require\":\"complete\",\"idempotency_key\":\"1\",\"readiness\":{\"complete\":true}}}}" }} };
+    var api = ApiHttpServer.init(a, .{ .deployment_mode = .standalone, .auth_enabled = true, .user_manager = &auth.manager }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.free, .replace_table_definition = Source.replace } }, null, null);
+    defer api.deinit();
+    var e2e: HttpxE2eServer = undefined;
+    try e2e.init(a, &api);
+    defer e2e.deinit();
+    var io = std.Io.Threaded.init(a, .{});
+    defer io.deinit();
+    var client = httpx.Client.initWithConfig(a, io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try e2e.baseUrl(a);
+    defer a.free(base);
+    const url = try std.fmt.allocPrint(a, "{s}/db/v1/tables/docs/index-aliases/live", .{base});
+    defer a.free(url);
+    const reader_auth = try encodeBasicAuthorization(a, "alias_reader", "secret");
+    defer a.free(reader_auth);
+    const admin_auth = try encodeBasicAuthorization(a, "alias_admin", "secret");
+    defer a.free(admin_auth);
+    const reader_headers = [_][2][]const u8{ .{ "authorization", reader_auth }, .{ "content-type", "application/json" } };
+    const admin_headers = [_][2][]const u8{ .{ "authorization", admin_auth }, .{ "content-type", "application/json" } };
+    var get = try requestWithRetry(&client, io.io(), .GET, url, null, &reader_headers, 10);
+    defer get.deinit();
+    try std.testing.expectEqual(@as(u16, 200), get.status.code);
+    const body = "{\"index\":\"v1\",\"expected_index\":\"v1\",\"idempotency_key\":\"2\"}";
+    var denied = try requestWithRetry(&client, io.io(), .PUT, url, body, &reader_headers, 10);
+    defer denied.deinit();
+    try std.testing.expectEqual(@as(u16, 403), denied.status.code);
+    var pending = try requestWithRetry(&client, io.io(), .PUT, url, body, &admin_headers, 10);
+    defer pending.deinit();
+    try std.testing.expectEqual(@as(u16, 409), pending.status.code);
+    try std.testing.expectEqual(@as(usize, 0), source.commits);
+}
 
 fn listenHttpxE2eServer(server: *httpx.Server) void {
     server.listen() catch |err| switch (err) {

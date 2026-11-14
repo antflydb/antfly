@@ -447,6 +447,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     run_lib_api_auth_tests.step.dependOn(&openapi_root_check.step);
     const lib_api_auth_test_step = b.step("antfly-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
+    const alias_http_tests = b.addTest(.{
+        .name = "index-alias-http-tests",
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = &.{"index alias"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_alias_http_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, alias_http_tests, &.{"index alias"});
+    b.step("antfly-index-alias-http-test", "Verify alias routes, table permissions and readiness over HTTP").dependOn(&run_alias_http_tests.step);
+    lib_api_auth_test_step.dependOn(&run_alias_http_tests.step);
 
     // The real MCP transport/database security regression does not need the
     // monolithic library discovery root or its full-suite memory reservation.
@@ -999,6 +1008,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configureConsumer(b, api_table_reads_docid_test_mod);
     api_table_reads_docid_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const index_alias_tests = @import("linked_tests.zig").add(b, .{
+        .name = "index-alias-tests",
+        .root_module = api_table_reads_docid_test_mod,
+        .filters = &.{"index alias"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-index-alias-test", "Verify alias admission, SQL graph binding, query pinning and HTTP registration").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, index_alias_tests.executable, &.{"index alias"}).step);
     const api_public_table_http_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_public_table_http_test_root.zig"),
         .target = target,

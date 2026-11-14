@@ -62,6 +62,7 @@ pub const Limits = struct {
 };
 pub const Column = describe.Column;
 pub const Output = struct {
+    resolved_indexes: ?[]const []const u8 = null,
     columns: []const Column = &.{},
     rows: []const []const Json = &.{},
     native_rows: ?[]const []const Datum = null,
@@ -83,7 +84,7 @@ pub const Output = struct {
     /// representation. Keep the public result envelope explicit at every ABI.
     pub fn jsonStringify(self: Output, writer: anytype) !void {
         if (self.native_rows != null) return error.WriteFailed;
-        try writer.write(.{ .columns = self.columns, .rows = self.rows, .sql_nulls = self.sql_nulls, .rows_affected = self.rows_affected, .command_tag = self.command_tag, .mutation_outcome = self.mutation_outcome, .ddl_receipt = self.ddl_receipt });
+        try writer.write(.{ .columns = self.columns, .rows = self.rows, .sql_nulls = self.sql_nulls, .rows_affected = self.rows_affected, .command_tag = self.command_tag, .mutation_outcome = self.mutation_outcome, .ddl_receipt = self.ddl_receipt, .resolved_indexes = self.resolved_indexes });
     }
 };
 /// An execution-scoped allocator whose control state outlives returned rows or
@@ -268,7 +269,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
         const estimate_parameters = if (estimate_frame) |invocation| try invocation.compatibilityValues(arena) else parameters;
         const rendered = try @import("explain.zig").renderMeasured(arena, explanation, binding, if (explanation.analyze) &profile else null, backend, estimate_parameters);
         const row = try arena.dupe(Json, &.{.{ .string = rendered }});
-        return .{ .columns = try arena.dupe(Column, &.{.{ .name = "QUERY PLAN", .type = .string }}), .rows = try arena.dupe([]const Json, &.{row}), .command_tag = "EXPLAIN" };
+        return .{ .columns = try arena.dupe(Column, &.{.{ .name = "QUERY PLAN", .type = .string }}), .rows = try arena.dupe([]const Json, &.{row}), .command_tag = "EXPLAIN", .resolved_indexes = try resolvedGraphIndexNames(arena, binding) };
     }
     const ddl = @import("ddl_runtime.zig");
     if (ddl.accepts(compiled.statement)) {
@@ -298,7 +299,7 @@ fn runWithBinding(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: c
     const context = Context{ .alloc = alloc, .arena = arena, .backend = statement_backend, .binding = binding, .parameters = prepared_parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null, .sink = sink };
     const stage = if (limits.profile) |profile| try profile.registerStage(@tagName(compiled.statement), if (binding.table) |table| table.physical_name else null) else null;
     const started = if (limits.profile) |profile| profile.now() else null;
-    const output = context.run(compiled.statement) catch |err| {
+    var output = context.run(compiled.statement) catch |err| {
         if (limits.profile) |profile| profile.record(stage, started, 0, false, true);
         return err;
     };
@@ -306,7 +307,34 @@ fn runWithBinding(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: c
     if (limits.profile) |profile| {
         if (context.spill) |spill| profile.spill_written_bytes = spill.written_bytes;
     }
+    output.resolved_indexes = try resolvedGraphIndexNames(arena, binding);
     return output;
+}
+
+pub fn resolvedGraphIndexNames(a: std.mem.Allocator, bound: describe.BoundStatement) !?[]const []const u8 {
+    const relation = bound.relation orelse return null;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |name| a.free(name);
+        names.deinit(a);
+    }
+    for (relation.scans) |scan| if (scan.table.graph) |graph| {
+        const selected = try @import("cypher").dependencies.selectedIndexes(scratch.allocator(), graph.definition.query, graph.graph);
+        for (selected) |name| {
+            const found = for (names.items) |prior| {
+                if (std.mem.eql(u8, prior, name)) break true;
+            } else false;
+            if (!found) {
+                const owned = try a.dupe(u8, name);
+                errdefer a.free(owned);
+                try names.append(a, owned);
+            }
+        }
+    };
+    if (names.items.len == 0) return null;
+    return try names.toOwnedSlice(a);
 }
 
 pub const RowSink = struct {

@@ -17,6 +17,36 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const catalog = @import("catalog.zig");
+
+/// Owned concrete adjacency names selected by a bound graph execution.
+pub fn selectedIndexes(a: std.mem.Allocator, query: ast.Query, graph: catalog.Graph) ![]const []const u8 {
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |name| a.free(name);
+        names.deinit(a);
+    }
+    const append = struct {
+        fn unique(alloc: std.mem.Allocator, list: *std.ArrayList([]const u8), name: []const u8) !void {
+            for (list.items) |prior| if (std.mem.eql(u8, prior, name)) return;
+            const owned = try alloc.dupe(u8, name);
+            errdefer alloc.free(owned);
+            try list.append(alloc, owned);
+        }
+    }.unique;
+    for (graph.labels) |label| {
+        if (try indexesForTable(scratch.allocator(), query, graph, label.table)) |selected| {
+            for (selected) |name| try append(a, &names, name);
+        } else {
+            for (graph.relationships) |mapping| {
+                const source = graph.label(mapping.source_label) orelse return error.InvalidGraphDefinition;
+                if (std.mem.eql(u8, source.table, label.table)) try append(a, &names, mapping.index);
+            }
+        }
+    }
+    return try names.toOwnedSlice(a);
+}
 const Plan = struct {
     graph: catalog.Graph,
     tables: std.StringHashMapUnmanaged(void) = .empty,

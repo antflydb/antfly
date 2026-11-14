@@ -21134,6 +21134,7 @@ pub const RaftApplyStore = struct {
                 var applied = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, record);
                 applied.replica_root_incarnation = header.replica_root_incarnation;
                 applied.replica_root_public_key = header.replica_root_public_key;
+                if (!try admitIndexAliasStoreTxn(self, txn, group_id, applied)) return;
                 if (!try admitDenseNativeStoreTxn(self, txn, group_id, applied)) return;
                 if (!try admitRelationalTopologyStoreTxn(txn, group_id, applied)) return;
                 const reports_changed = self.updateStoreComponentsTxn(txn, group_id, record.store_id, applied, true) catch |err| switch (err) {
@@ -21151,6 +21152,7 @@ pub const RaftApplyStore = struct {
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
                 const applied = try self.normalizeStoreUpsertDrainIntentTxn(txn, group_id, record);
                 if (!try admitRelationalTopologyStoreTxn(txn, group_id, applied)) return;
+                if (!try admitIndexAliasStoreTxn(self, txn, group_id, applied)) return;
                 if (!try admitDenseNativeStoreTxn(self, txn, group_id, applied)) return;
                 if (storeRuntimeStatusRecordVersion(applied)) |version| {
                     try activateRuntimeStatusProtocolTxn(txn, group_id, version);
@@ -21172,6 +21174,7 @@ pub const RaftApplyStore = struct {
                 const key = try storeKeyForGroup(&key_buf, group_id, record.store_id);
                 const applied = try self.normalizeStoreDrainIntentTxn(txn, group_id, record);
                 if (!try admitRelationalTopologyStoreTxn(txn, group_id, applied)) return;
+                if (!try admitIndexAliasStoreTxn(self, txn, group_id, applied)) return;
                 if (!try admitDenseNativeStoreTxn(self, txn, group_id, applied)) return;
                 if (storeRuntimeStatusRecordVersion(applied)) |version| {
                     try activateRuntimeStatusProtocolTxn(txn, group_id, version);
@@ -23620,6 +23623,10 @@ pub const RaftApplyStore = struct {
                 try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
             return;
         }
+        if (!try admitIndexAliasTableTxn(self, txn, group_id, replacement)) {
+            try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
+            return;
+        }
         if (!try privacyKeysReady(self.alloc, txn, group_id, replacement)) {
             if (!try metadata_table_manager.privacyProgressOnly(self.alloc, current, replacement))
                 try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
@@ -26038,6 +26045,7 @@ pub const RaftApplyStore = struct {
         record: metadata.TableRecord,
         published_fk_generation: bool,
     ) !void {
+        if (!try admitIndexAliasTableTxn(self, txn, group_id, record)) return;
         const encoded_existing = txn.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -27977,6 +27985,89 @@ fn activateRuntimeStatusProtocolTxn(
 
     decoded.runtime_status_record_version = target_version;
     try writeMetadataIncarnationRecordTxn(txn, group_id, decoded);
+}
+
+fn admitIndexAliasTableTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table: metadata.TableRecord) !bool {
+    if (!topology_protocol.usesIndexAliases(table.indexes_json)) return true;
+    var buf: [160]u8 = undefined;
+    const prefix = try storePrefixForGroup(&buf, group_id);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var entry = try cursor.seekAtOrAfter(prefix);
+    while (entry) |kv| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+        const store = try RaftApplyStore.decodeStoredHeader(self.alloc, kv.value);
+        defer metadata_table_manager.freeStore(self.alloc, store);
+        if (!store.live or !metadata_table_manager.storeServesTableData(store.role)) continue;
+        if (!metadata_table_manager.indexAliasesProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)) return false;
+    }
+    return true;
+}
+
+test "index alias Raft admission permits rollout and fences returning legacy stores" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/alias-admission", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    var txn = try store.store.beginWriteTxn();
+    defer txn.abort();
+    const group: u64 = 21;
+    var buf: [160]u8 = undefined;
+    const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.index_aliases_version, .incarnation = "0123456789abcdef0123456789abcdef".*, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+    defer a.free(activation);
+    try txn.put(try RaftApplyStore.topologyActivationKeyForGroup(&buf, group), activation);
+    const legacy: metadata.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 7, .status_generation = 1, .artifact_sources_protocol_version = 2 };
+    // Merely advertising new code must not interrupt the rolling upgrade.
+    try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, legacy));
+    const table: metadata.TableRecord = .{ .table_id = 42, .name = "docs", .indexes_json = "{\"_index_aliases\":{}}" };
+    const old_store = try encodeStoreRecord(a, legacy);
+    defer a.free(old_store);
+    try txn.put(try storeKeyForGroup(&buf, group, legacy.store_id), old_store);
+    try std.testing.expect(!try admitIndexAliasTableTxn(&store, &txn, group, table));
+    var modern = legacy;
+    modern.artifact_sources_protocol_version = 3;
+    const new_store = try encodeStoreRecord(a, modern);
+    defer a.free(new_store);
+    try txn.put(try storeKeyForGroup(&buf, group, modern.store_id), new_store);
+    try std.testing.expect(try admitIndexAliasTableTxn(&store, &txn, group, table));
+    const encoded = try encodeTableRecord(a, table);
+    defer a.free(encoded);
+    try txn.put(try tableKeyForGroup(&buf, group, table.table_id), encoded);
+    try std.testing.expect(!try admitIndexAliasStoreTxn(&store, &txn, group, legacy));
+    try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, modern));
+    var metadata_only = legacy;
+    metadata_only.role = "metadata";
+    try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, metadata_only));
+    var retired = legacy;
+    retired.live = false;
+    try std.testing.expect(try admitIndexAliasStoreTxn(&store, &txn, group, retired));
+}
+
+fn admitIndexAliasStoreTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, incoming: metadata.StoreRecord) !bool {
+    if (!incoming.live or !metadata_table_manager.storeServesTableData(incoming.role) or metadata_table_manager.indexAliasesProtocolSupported(incoming.reporter_incarnation, incoming.artifact_sources_protocol_version)) return true;
+    var buf: [160]u8 = undefined;
+    const raw = (try RaftApplyStore.stagingGet(txn, try RaftApplyStore.topologyActivationKeyForGroup(&buf, group_id))) orelse return true;
+    if (raw.len > 1024) return error.InvalidCatalogRecord;
+    var activation = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, raw, .{});
+    defer activation.deinit();
+    if (activation.value.version < topology_protocol.index_aliases_version) return true;
+    // Advertising the new capability can activate the decoder before an alias
+    // exists. Keep legacy heartbeats working during that rollout. Once alias
+    // state commits, reject old registrations in the same transaction; neither
+    // a racing proposal nor leader/standby promotion can reopen admission.
+    const prefix = try tablePrefixForGroup(&buf, group_id);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var entry = try cursor.seekAtOrAfter(prefix);
+    while (entry) |kv| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+        const table = try borrowTableProjection(kv.value, .query);
+        if (topology_protocol.usesIndexAliases(table.query_definition.?.indexes_json)) return false;
+    }
+    return true;
 }
 
 /// Atomically admits a store against the durable dense-native capability
