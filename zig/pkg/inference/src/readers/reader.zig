@@ -242,7 +242,10 @@ const native_moondream = struct {
     ) !LoadedReader {
         if (control) |active| try active.check();
         if (!try probe(allocator, model_path)) return error.UnsupportedMoondreamArtifacts;
-        const io = if (control) |active| active.io orelse session_manager.io orelse std.Options.debug_io else session_manager.io orelse std.Options.debug_io;
+        const execution_io = if (control) |active| active.io orelse session_manager.io else session_manager.io;
+        // The debug I/O fallback serves metadata access only. Passing it as
+        // an explicit executor would suppress the pipeline's parallel default.
+        const io = execution_io orelse std.Options.debug_io;
         var artifacts = try @import("../registry/published_artifacts.zig").PublishedArtifacts.init(allocator, io, model_path, if (control) |active| if (active.model_selection) |selected| .{ .publication = selected.publication } else null else null);
         defer artifacts.deinit();
         const weights_path = (try artifacts.resolve(@import("../pipelines/moondream.zig").weights_file)) orelse return error.NoDenseWeightSource;
@@ -255,7 +258,7 @@ const native_moondream = struct {
         const owner = @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(allocator);
         var binding = if (owner) |o| if (lease.controller) |controller| try o.requireResidency(controller, .fromLease(lease)) else null else null;
         errdefer if (binding) |*held| held.deinit();
-        var reader = try NativeMoondreamLoadedReader.loadFromDirWithControl(allocator, model_path, control, io);
+        var reader = try NativeMoondreamLoadedReader.loadFromDirWithControl(allocator, model_path, control, execution_io);
         reader.preparation_residency = binding;
         reader.weight_lease = lease;
         return .{ .moondream = reader };

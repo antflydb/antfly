@@ -155,17 +155,59 @@ pub const AdmittedAllocator = struct {
         return .{ .owner = self, .addition = residency };
     }
 
-    /// Move proven allocations and leases between synchronous owners sharing
-    /// a backing heap and process domain, without copying data or reacquiring.
-    pub fn absorb(self: *@This(), source: *@This()) !void {
+    const AbsorbTotals = struct { live: usize, reserved: usize, metadata: usize };
+
+    fn validateAbsorb(self: *const @This(), source: *const @This(), source_domain: ?*memory.AdmissionController) !AbsorbTotals {
         if (self == source or self.backing.ptr != source.backing.ptr or self.backing.vtable != source.backing.vtable or self.prepaid_host_bytes != 0 or source.prepaid_host_bytes != 0)
             return error.InvalidAdmissionLeaseReduction;
         const controller = if (self.session) |session| if (session.run_admission) |admission| admission.controller else null else null;
-        if (source.reservations != null and controller != null and source.reservation_controller != controller) return error.InvalidAdmissionLeaseReduction;
-        if (self.reservations != null and source.reservations != null and self.reservation_controller != source.reservation_controller) return error.InvalidAdmissionLeaseReduction;
-        const live = try std.math.add(usize, self.live_bytes, source.live_bytes);
-        const reserved = try std.math.add(usize, self.reserved_bytes, source.reserved_bytes);
-        const metadata = try std.math.add(usize, self.metadata_bytes, source.metadata_bytes);
+        if (source.reservations != null and controller != null and source_domain != controller) return error.InvalidAdmissionLeaseReduction;
+        if (self.reservations != null and source.reservations != null and self.reservation_controller != source_domain) return error.InvalidAdmissionLeaseReduction;
+        return .{
+            .live = try std.math.add(usize, self.live_bytes, source.live_bytes),
+            .reserved = try std.math.add(usize, self.reserved_bytes, source.reserved_bytes),
+            .metadata = try std.math.add(usize, self.metadata_bytes, source.metadata_bytes),
+        };
+    }
+
+    /// Move proven allocations and leases without copying or reacquiring.
+    /// Every rejection leaves both owners unchanged.
+    pub fn absorb(self: *@This(), source: *@This()) !void {
+        const totals = try self.validateAbsorb(source, source.reservation_controller);
+        self.commitAbsorb(source, totals);
+    }
+
+    /// Offline ledgers are embedded in their scopes and cannot escape them.
+    /// Acquire one replacement lease before mutating either owner, then
+    /// consolidate local reservations and commit without fallible operations.
+    pub fn absorbLocal(self: *@This(), source: *@This(), target_domain: *memory.AdmissionController, source_domain: *memory.AdmissionController) !void {
+        var totals = try self.validateAbsorb(source, target_domain);
+        var reservation = source.reservations;
+        while (reservation) |node| : (reservation = node.next) {
+            const lease = node.lease orelse return error.InvalidAdmissionLeaseReduction;
+            if (lease.controller != source_domain or lease.external_lease != null or lease.live_reserved_bytes != 0 or lease.live_settled_bytes != 0 or lease.retain_backend_class != .cpu or lease.amounts.host_scratch_bytes != node.bytes or lease.amounts.hostTotalBytes() != node.bytes or lease.amounts.backendTotalBytes() != 0)
+                return error.InvalidAdmissionLeaseReduction;
+        }
+        if (source.reservations) |first| {
+            const replacement = try target_domain.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = source.reserved_bytes }, false);
+            var next = first.next;
+            first.lease.?.release();
+            first.lease = replacement;
+            first.bytes = source.reserved_bytes;
+            first.next = null;
+            while (next) |node| {
+                next = node.next;
+                node.lease.?.release();
+                source.backing.destroy(node);
+            }
+            totals.metadata -= source.metadata_bytes - @sizeOf(Reservation);
+            source.metadata_bytes = @sizeOf(Reservation);
+            source.reservation_controller = target_domain;
+        }
+        self.commitAbsorb(source, totals);
+    }
+
+    fn commitAbsorb(self: *@This(), source: *@This(), totals: AbsorbTotals) void {
         if (self.reservations == null) self.reservation_controller = source.reservation_controller;
         if (source.blocks) |head| {
             var tail = head;
@@ -180,9 +222,9 @@ pub const AdmittedAllocator = struct {
             tail.next = self.reservations;
             self.reservations = head;
         }
-        self.live_bytes = live;
-        self.reserved_bytes = reserved;
-        self.metadata_bytes = metadata;
+        self.live_bytes = totals.live;
+        self.reserved_bytes = totals.reserved;
+        self.metadata_bytes = totals.metadata;
         source.blocks = null;
         source.reservations = null;
         source.live_bytes = 0;
