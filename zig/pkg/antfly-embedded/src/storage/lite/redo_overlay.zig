@@ -623,6 +623,14 @@ pub const SharedRedoOverlay = struct {
             const gop = try self.maps[root].getOrPut(allocator, key);
             if (gop.found_existing) {
                 node.older = gop.value_ptr.*;
+                // Mirror `appendVersion`'s own accounting: chaining onto an
+                // existing head means that head is now superseded, exactly
+                // the same retirement debt a live commit's `appendVersion`
+                // counts. Replay (this function) previously left this debt
+                // invisible to `pendingRetirementVersions`/`redoCheckpointWouldRetire`
+                // after a reopen, even though the chain it rebuilds is
+                // byte-for-byte what a live session would have produced.
+                self.pending_retirement_versions += 1;
             } else {
                 const owned_key = try allocator.dupe(u8, key);
                 errdefer allocator.free(owned_key);
