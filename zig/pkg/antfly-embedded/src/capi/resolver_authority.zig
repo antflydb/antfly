@@ -1384,6 +1384,14 @@ test "capi resolver curation prepared adoption fences a source config edit" {
 }
 
 test "capi resolver curation indexed static profiles exclude seventeen thousand unrelated aliases after projection and reopen" {
+    try exerciseIndexedStaticProfiles(17, 1000, false);
+}
+
+test "capi resolver curation indexed static profiles adopt legacy enrollment before warm mutations and reopen" {
+    try exerciseIndexedStaticProfiles(2, 2, true);
+}
+
+fn exerciseIndexedStaticProfiles(profile_count: usize, aliases_per_profile: usize, legacy_adoption: bool) !void {
     const api = @import("db.zig");
     const a0 = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a0);
@@ -1397,18 +1405,28 @@ test "capi resolver curation indexed static profiles exclude seventeen thousand 
     var handle = try api.publishHandle(root);
     defer api.antfly_db_close(handle);
     try tables.create(root, "entities", "{}", false);
-    for (0..17) |i| {
-        const static = try a.alloc(@import("antfly_resolver").KeyAlias, 1000);
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    // The large fixture measures indexed warm admission, not legacy migration.
+    // Bootstrap the empty directory first; every subsequent resolver enrollment
+    // still exercises its real transactional profile and adjacency publication.
+    if (!legacy_adoption) {
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/new"), .fromSlice("{\"into\":\"concept/new-target\"}"), &out));
+        api.antfly_buffer_free(&out);
+    }
+    for (0..profile_count) |i| {
+        const static = try a.alloc(@import("antfly_resolver").KeyAlias, aliases_per_profile);
         for (static, 0..) |*alias, j| alias.* = .{ .key = try std.fmt.allocPrint(a, "concept/noise-{d}-{d}", .{ i, j }), .target = try std.fmt.allocPrint(a, "concept/target-{d}-{d}", .{ i, j }) };
         if (i == 0) static[0] = .{ .key = "concept/seed", .target = "concept/bridge" };
         if (i == 1) static[0] = .{ .key = "concept/bridge", .target = "concept/end" };
         _ = try root.db.upsertResolverWithResultOptions(.{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .source_artifact = try std.fmt.allocPrint(a, "kg-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(a, "out-{d}", .{i}), .key_template = "concept/{{_key}}", .aliases = static, .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
     }
-    var out: h.capi.Buffer = .{};
-    defer api.antfly_buffer_free(&out);
-    // Cold adoption folds legacy policy once. Warm operations use adjacency.
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/new"), .fromSlice("{\"into\":\"concept/new-target\"}"), &out));
-    api.antfly_buffer_free(&out);
+    // Keep a distinct legacy fixture: pre-bootstrap enrollment is untrusted
+    // until adoption has rebuilt it, after which warm operations use adjacency.
+    if (legacy_adoption) {
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/new"), .fromSlice("{\"into\":\"concept/new-target\"}"), &out));
+        api.antfly_buffer_free(&out);
+    }
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
     native.static_profiles.test_edge_visits.store(0, .monotonic);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/seed"), .fromSlice("{\"into\":\"concept/final\",\"replace\":true}"), &out));
