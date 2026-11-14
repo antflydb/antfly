@@ -648,6 +648,58 @@ def test_standalone_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthA
     hidden = auth_api.request_raw("GET", "/tables/docs/documents/doc:other")
     assert hidden.status_code == 404, hidden.text
 
+    # Admission limits apply to each policy, including when the combined
+    # executable predicate exceeds a single policy's node/depth allowance.
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    auth_api.put(
+        "/auth/v1/users/reader/row-filters/docs",
+        {"terms": {"tier": ["gold"] * 9000}},
+    )
+    deep = {"term": {"tenant_id": "a"}}
+    for _ in range(30):
+        deep = {"conjuncts": [deep]}
+    for global_policy in ({"terms": {"tenant_id": ["a"] * 9000}}, deep):
+        auth_api.s.headers["Authorization"] = _basic_auth(
+            "admin", AUTH_BOOTSTRAP_PASSWORD
+        )
+        auth_api.put("/auth/v1/users/reader/row-filters/*", global_policy)
+        auth_api.s.headers["Authorization"] = _basic_auth("reader", "reader")
+        response = auth_api.post(
+            "/tables/docs/query",
+            {"full_text_search": {"match_all": {}}, "limit": 10},
+        )["responses"][0]
+        assert [hit["_id"] for hit in response["hits"]["hits"]] == ["doc:gold"]
+
+    # The explicit aggregate cap is an authorization denial on every read
+    # surface, including handlers that resolve policies before dispatch.
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    for scope, field, value in (
+        ("*", "tenant_id", "a"),
+        ("docs", "tier", "gold"),
+        ("*?database=default&namespace=public&all_tables=true", "tenant_id", "a"),
+    ):
+        auth_api.put(
+            f"/auth/v1/users/reader/row-filters/{scope}",
+            {"terms": {field: [value] * 12000}},
+        )
+    auth_api.s.headers["Authorization"] = _basic_auth("reader", "reader")
+    denied = auth_api.request_raw(
+        "POST",
+        "/tables/docs/query",
+        json={"full_text_search": {"match_all": {}}, "limit": 10},
+        timeout=30,
+    )
+    assert denied.status_code == 403, denied.text
+    denied = auth_api.request_raw("GET", "/tables/docs/documents/doc:gold", timeout=30)
+    assert denied.status_code == 403, denied.text
+    denied = auth_api.request_raw(
+        "POST",
+        "/tables/docs/documents",
+        json={"from": "doc:", "to": "doc;", "inclusive_from": True},
+        timeout=30,
+    )
+    assert denied.status_code == 403, denied.text
+
 
 def test_stateful_auth_uses_configured_admin_password(stateful_auth_api: AuthApi):
     response = stateful_auth_api.s.get(f"{stateful_auth_api.url}/status", timeout=30)

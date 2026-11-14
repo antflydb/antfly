@@ -1442,6 +1442,7 @@ pub const AntflyApiHandler = struct {
 
     fn mapIngressError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         if (metadata_authority.isRetryableError(err)) return metadataNotLeaderResponse(ctx);
+        if (err == error.Forbidden) return jsonErrorResponse(ctx, 403, "forbidden");
         return err;
     }
 

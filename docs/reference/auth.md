@@ -165,6 +165,16 @@ At read time, Antfly:
 3. Resolves `$auth` references against the authenticated identity.
 4. Combines the result with the caller's query with `AND`.
 
+Each stored policy is limited to 16,384 policy nodes and at most 64 levels
+of nesting. Antfly validates matching policies independently, so its generated
+conjunction does not consume a policy's nesting allowance. The effective
+conjunction is limited to 32,768 JSON values, including the generated wrapper,
+before and after identity expansion. This bound also keeps the resulting plan
+within the storage compiler's existing execution budget. Exceeding the aggregate
+limit denies authorization (`403`); it does not make the client's query invalid.
+All matching policies share a separate 16,384-value identity-expansion budget.
+Missing, incompatible, or over-budget identity values deny the entire predicate.
+
 Queries, document scans, lookups, and retrieval-agent queries apply these
 filters. In a join, the right table's filter is applied as well.
 

@@ -31494,7 +31494,7 @@ pub fn resolveEffectiveRowFilterJson(
     const active_identity = identity orelse return null;
     const raw = (try usermgr.combinedRowFilterForTable(alloc, active_identity.row_filter, active_identity.logicalTableName(table_name))) orelse return null;
     defer raw.deinit(alloc);
-    return try resolveAuthRowFilterJson(alloc, active_identity, raw.json);
+    return try resolveAuthRowFilterJsonWithComposition(alloc, active_identity, raw.json, raw.composed);
 }
 
 pub fn resolveAuthRowFilterJson(
@@ -31502,10 +31502,31 @@ pub fn resolveAuthRowFilterJson(
     identity: AuthenticatedIdentity,
     filter_json: []const u8,
 ) ![]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{}) catch return error.InvalidQueryRequest;
+    return resolveAuthRowFilterJsonWithComposition(alloc, identity, filter_json, false);
+}
+
+fn resolveAuthRowFilterJsonWithComposition(
+    alloc: std.mem.Allocator,
+    identity: AuthenticatedIdentity,
+    filter_json: []const u8,
+    composed: bool,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidQueryRequest,
+    };
     defer parsed.deinit();
-    try validateAuthRowFilterValue(parsed.value);
-    var remaining_nodes: usize = auth_filter_max_tree_nodes;
+    // Only the conjunction manufactured by scope composition gets an
+    // aggregate budget. Stored/user-authored trees retain admission limits.
+    const components = if (composed) parsed.value.object.get("conjuncts").?.array.items else &.{parsed.value};
+    var remaining_input_nodes: usize = auth_filter_max_composed_nodes - (if (composed) @as(usize, 2) else 0);
+    for (components) |component| {
+        var remaining: usize = auth_filter_max_tree_nodes;
+        try validateAuthRowFilterValueBounded(component, 0, &remaining);
+        const used = auth_filter_max_tree_nodes - remaining;
+        if (used > remaining_input_nodes) return error.Forbidden;
+        remaining_input_nodes -= used;
+    }
 
     var parsed_metadata: ?std.json.Parsed(std.json.Value) = null;
     defer if (parsed_metadata) |*metadata| metadata.deinit();
@@ -31520,10 +31541,34 @@ pub fn resolveAuthRowFilterJson(
             else => return try alloc.dupe(u8, "{\"match_none\":{}}"),
         };
     }
+    var remaining_expansion_nodes: usize = auth_filter_max_tree_nodes;
     const context = AuthRowFilterResolveContext{
         .identity = identity,
         .metadata = if (parsed_metadata) |metadata| metadata.value else null,
+        .remaining_expansion_nodes = &remaining_expansion_nodes,
     };
+    if (composed) {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var values = std.json.Array.init(scratch);
+        var remaining_output_nodes: usize = auth_filter_max_composed_nodes - 2;
+        for (components) |component| {
+            var remaining: usize = auth_filter_max_tree_nodes;
+            const value = resolveAuthRowFilterValue(scratch, context, component, .filter, &remaining) catch |err| switch (err) {
+                error.AuthRowFilterNoMatch => return try alloc.dupe(u8, "{\"match_none\":{}}"),
+                else => return err,
+            };
+            // Expansion can make a small template larger. Bound the actual
+            // executable result as well as the stored templates.
+            consumeAuthContextJsonBudget(value, 0, &remaining_output_nodes) catch return error.Forbidden;
+            try values.append(value);
+        }
+        var object = std.json.ObjectMap.empty;
+        try object.put(scratch, "conjuncts", .{ .array = values });
+        return json_helpers.stringifyJsonValueAlloc(alloc, .{ .object = object });
+    }
+    var remaining_nodes: usize = auth_filter_max_tree_nodes;
     var resolved = resolveAuthRowFilterValue(
         alloc,
         context,
@@ -31721,6 +31766,11 @@ fn materializeAuthFilterTemplateValue(
 
 const auth_filter_max_tree_depth: u8 = 64;
 const auth_filter_max_tree_nodes: usize = 16_384;
+// Every compiled filter node occupies at least two JSON values (its object
+// and body). This aggregate cap fits the storage compiler's 16,384-node
+// budget, including our conjunction. Each component still has depth <64;
+// the synthetic object/array add two JSON levels, not policy recursion.
+const auth_filter_max_composed_nodes: usize = 2 * auth_filter_max_tree_nodes;
 
 fn authFilterUsesMetadataReference(value: std.json.Value) bool {
     return switch (value) {
@@ -31795,6 +31845,7 @@ fn validateAuthRowFilterValueBounded(
 const AuthRowFilterResolveContext = struct {
     identity: AuthenticatedIdentity,
     metadata: ?std.json.Value,
+    remaining_expansion_nodes: ?*usize = null,
 };
 
 fn resolveAuthRowFilterValue(
@@ -31824,7 +31875,7 @@ fn resolveAuthRowFilterValue(
                     alloc,
                     context,
                     path,
-                    remaining_nodes.*,
+                    if (context.remaining_expansion_nodes) |remaining| @min(remaining_nodes.*, remaining.*) else remaining_nodes.*,
                 ) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.AuthRowFilterNoMatch,
@@ -31835,6 +31886,7 @@ fn resolveAuthRowFilterValue(
                     return error.AuthRowFilterNoMatch;
                 }
                 remaining_nodes.* -= auth_value.node_count;
+                if (context.remaining_expansion_nodes) |remaining| remaining.* -= auth_value.node_count;
                 break :blk resolved;
             }
             if (remaining_nodes.* == 0) return error.AuthRowFilterNoMatch;
@@ -63534,4 +63586,125 @@ test "system catalog projection preserves immutable policy arrays with bounded a
     try std.testing.expect(identity.permissions.ptr == permissions.ptr);
     try std.testing.expectEqual(@as(usize, filter_count), identity.row_filter.len);
     try std.testing.expectEqual(@as(usize, 32), identity.catalog_aliases.len);
+}
+
+test "system catalog row filter composition preserves admitted node budgets" {
+    const a = std.testing.allocator;
+    var policy = std.ArrayListUnmanaged(u8).empty;
+    defer policy.deinit(a);
+    try policy.appendSlice(a, "{\"terms\":{\"tenant\":[");
+    for (0..9000) |i| try policy.appendSlice(a, if (i == 0) "\"a\"" else ",\"a\"");
+    try policy.appendSlice(a, "]}}");
+    try validateAuthRowFilterJson(a, policy.items);
+    const filters = [_]usermgr.RowFilterEntry{
+        .{ .table = @constCast("*"), .filter = policy.items },
+        .{ .table = @constCast("docs"), .filter = policy.items },
+    };
+    const identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = @constCast(&filters) };
+    const result = (try resolveEffectiveRowFilterJson(a, identity, "docs")).?;
+    defer a.free(result);
+    var prepared = try search_pattern_filter.PreparedPatternFilter.init(a, result);
+    defer prepared.deinit();
+    try std.testing.expect(try search_pattern_filter.storedDocMatchesPatternFilter(a, "one", "{\"tenant\":\"a\"}", result));
+    try std.testing.expect(!try search_pattern_filter.storedDocMatchesPatternFilter(a, "two", "{\"tenant\":\"b\"}", result));
+    // Aggregate allowance must not relax single-policy admission.
+    try std.testing.expectError(error.InvalidQueryRequest, validateAuthRowFilterJson(a, result));
+}
+
+test "system catalog row filter composition preserves admitted depth budgets" {
+    const a = std.testing.allocator;
+    var policy = std.ArrayListUnmanaged(u8).empty;
+    defer policy.deinit(a);
+    for (0..30) |_| try policy.appendSlice(a, "{\"conjuncts\":[");
+    try policy.appendSlice(a, "{\"term\":{\"tenant\":\"a\"}}");
+    for (0..30) |_| try policy.appendSlice(a, "]}");
+    try validateAuthRowFilterJson(a, policy.items);
+    const filters = [_]usermgr.RowFilterEntry{
+        .{ .table = @constCast("*"), .filter = policy.items },
+        .{ .table = @constCast("docs"), .filter = @constCast("{\"match_all\":{}}") },
+    };
+    const identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = @constCast(&filters) };
+    const result = (try resolveEffectiveRowFilterJson(a, identity, "docs")).?;
+    defer a.free(result);
+    try std.testing.expect(try search_pattern_filter.storedDocMatchesPatternFilter(a, "one", "{\"tenant\":\"a\"}", result));
+    try std.testing.expect(!try search_pattern_filter.storedDocMatchesPatternFilter(a, "two", "{\"tenant\":\"b\"}", result));
+    try std.testing.expectError(error.InvalidQueryRequest, validateAuthRowFilterJson(a, result));
+}
+
+test "system catalog row filter composition bounds aggregate execution work" {
+    const a = std.testing.allocator;
+    var policy = std.ArrayListUnmanaged(u8).empty;
+    defer policy.deinit(a);
+    try policy.appendSlice(a, "{\"conjuncts\":[");
+    for (0..8190) |i| try policy.appendSlice(a, if (i == 0) "{\"match_all\":{}}" else ",{\"match_all\":{}}");
+    try policy.appendSlice(a, "]}");
+    try validateAuthRowFilterJson(a, policy.items);
+    const filters = [_]usermgr.RowFilterEntry{
+        .{ .table = @constCast("*"), .filter = policy.items },
+        .{ .table = @constCast("docs"), .filter = policy.items },
+        .{ .table = @constCast("docs"), .filter = @constCast("{\"match_all\":{}}") },
+        .{ .table = @constCast("docs"), .filter = policy.items },
+    };
+    var identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = @constCast(filters[0..3]) };
+    const result = (try resolveEffectiveRowFilterJson(a, identity, "docs")).?;
+    defer a.free(result);
+    // Exactly 32,768 JSON values and 16,384 compiled nodes.
+    var prepared = try search_pattern_filter.PreparedPatternFilter.init(a, result);
+    defer prepared.deinit();
+    identity.row_filter = @constCast(&filters);
+    try std.testing.expectError(error.Forbidden, resolveEffectiveRowFilterJson(a, identity, "docs"));
+}
+
+test "system catalog row filter composition shares identity expansion budget" {
+    const a = std.testing.allocator;
+    var metadata = std.ArrayListUnmanaged(u8).empty;
+    defer metadata.deinit(a);
+    try metadata.appendSlice(a, "{\"groups\":[");
+    for (0..9000) |i| try metadata.appendSlice(a, if (i == 0) "\"a\"" else ",\"a\"");
+    try metadata.appendSlice(a, "]}");
+    const filters = [_]usermgr.RowFilterEntry{
+        .{ .table = @constCast("*"), .filter = @constCast("{\"terms\":{\"tenant\":{\"$auth\":\"metadata.groups\"}}}") },
+        .{ .table = @constCast("docs"), .filter = @constCast("{\"terms\":{\"tenant\":{\"$auth\":\"metadata.groups\"}}}") },
+    };
+    const identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = @constCast(&filters), .metadata_json = metadata.items };
+    const result = (try resolveEffectiveRowFilterJson(a, identity, "docs")).?;
+    defer a.free(result);
+    try std.testing.expectEqualStrings("{\"match_none\":{}}", result);
+}
+
+test "system catalog row filter composition bounds expanded aggregate" {
+    const a = std.testing.allocator;
+    var policy = std.ArrayListUnmanaged(u8).empty;
+    defer policy.deinit(a);
+    try policy.appendSlice(a, "{\"conjuncts\":[{\"terms\":{\"status\":[");
+    for (0..6000) |i| try policy.appendSlice(a, if (i == 0) "\"open\"" else ",\"open\"");
+    try policy.appendSlice(a, "]}},{\"terms\":{\"tenant\":{\"$auth\":\"metadata.groups\"}}}]}");
+    try validateAuthRowFilterJson(a, policy.items);
+    var metadata = std.ArrayListUnmanaged(u8).empty;
+    defer metadata.deinit(a);
+    try metadata.appendSlice(a, "{\"groups\":[");
+    for (0..5000) |i| try metadata.appendSlice(a, if (i == 0) "\"a\"" else ",\"a\"");
+    try metadata.appendSlice(a, "]}");
+    const filters = [_]usermgr.RowFilterEntry{
+        .{ .table = @constCast("*"), .filter = policy.items },
+        .{ .table = @constCast("docs"), .filter = policy.items },
+        .{ .table = @constCast("docs"), .filter = policy.items },
+    };
+    const identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = @constCast(&filters), .metadata_json = metadata.items };
+    try std.testing.expectError(error.Forbidden, resolveEffectiveRowFilterJson(a, identity, "docs"));
+}
+
+test "system catalog row filter composition releases partial allocations" {
+    const Fixture = struct {
+        fn check(a: std.mem.Allocator) !void {
+            const filters = [_]usermgr.RowFilterEntry{
+                .{ .table = @constCast("*"), .filter = @constCast("{\"terms\":{\"tenant\":{\"$auth\":\"metadata.groups\"}}}") },
+                .{ .table = @constCast("docs"), .filter = @constCast("{\"term\":{\"tier\":\"gold\"}}") },
+            };
+            const identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = @constCast(&filters), .metadata_json = @constCast("{\"groups\":[\"a\",\"b\"]}") };
+            const result = (try resolveEffectiveRowFilterJson(a, identity, "docs")).?;
+            defer a.free(result);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
 }
