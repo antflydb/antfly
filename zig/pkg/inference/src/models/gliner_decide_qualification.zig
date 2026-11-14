@@ -208,6 +208,42 @@ pub fn metalExecutionPolicy(identity: Identity) ?MetalExecutionPolicy {
     return if (isLegacyDecide(identity) or isLegacyDecideQ8(identity)) .{} else null;
 }
 
+/// Shared physical-forward policy for loaded-model, benchmark and HTTP callers.
+/// Only an authenticated pinned artifact receives these execution limits.
+pub const ExecutionBatchPolicy = struct {
+    batch_items: usize,
+    padded_batch_tokens: usize,
+    reuse_batch_padding: bool = false,
+};
+
+pub fn executionBatchPolicy(identity: Identity, backend: Backend) ?ExecutionBatchPolicy {
+    if (backend == .metal) {
+        const policy = metalExecutionPolicy(identity) orelse return null;
+        return .{ .batch_items = policy.batch_items, .padded_batch_tokens = policy.padded_batch_tokens, .reuse_batch_padding = policy.reuse_batch_padding };
+    }
+    if (backend == .cuda and (isLegacyDecide(identity) or isLegacyDecideQ8(identity)))
+        return .{ .batch_items = cuda_batch_items, .padded_batch_tokens = cuda_batch_items * legacy_cuda_limits.sequence_tokens };
+    return null;
+}
+
+test "Decide CUDA execution batches bind both pinned artifacts without changing Metal" {
+    for ([_]Identity{ legacyIdentity(), pinned_legacy_q8_identity }) |identity| {
+        const cuda = executionBatchPolicy(identity, .cuda).?;
+        try std.testing.expectEqual(@as(usize, 8), cuda.batch_items);
+        try std.testing.expectEqual(@as(usize, 4096), cuda.padded_batch_tokens);
+        try std.testing.expect(!cuda.reuse_batch_padding);
+        const metal = executionBatchPolicy(identity, .metal).?;
+        try std.testing.expectEqual(@as(usize, 8), metal.batch_items);
+        try std.testing.expectEqual(@as(usize, 1000), metal.padded_batch_tokens);
+        try std.testing.expect(metal.reuse_batch_padding);
+        try std.testing.expect(executionBatchPolicy(identity, .native) == null);
+        var changed = identity;
+        changed.weight.sha256[0] ^= 1;
+        try std.testing.expect(executionBatchPolicy(changed, .cuda) == null);
+    }
+    try std.testing.expect(executionBatchPolicy(pinned_fp32_identity, .cuda) == null);
+}
+
 /// Conservative admission hint, never an execution or qualification grant.
 /// The loader still authenticates the complete consumed identity before
 /// installing the policy. Unknown weights may only be over-reserved here.

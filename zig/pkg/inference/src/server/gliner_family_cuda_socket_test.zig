@@ -602,6 +602,7 @@ fn distinctInputBatches(environment: [*:0]const u8, comptime role: enum { base, 
         try batchPool(&node, transport, directory, cases[0..values.len], true);
         // Also exercise full physical cohorts independently of length bucketing.
         try batchPool(&node, transport, directory, cases[0..1], true);
+        try directDecideBatch32(&node, directory);
     }
     // A queued request at the model's cap must cancel without launches and recover.
     const selected = if (role == .multi) cases[4..8] else if (role == .base) cases[0..8] else cases[0..values.len];
@@ -618,6 +619,40 @@ fn distinctInputBatches(environment: [*:0]const u8, comptime role: enum { base, 
     defer a.free(expected);
     try queuedCancellation(&node, transport, directory, "/ai/v1/extract", body, expected);
     try transport.finish();
+}
+
+fn directDecideBatch32(node: *Node, directory: []const u8) !void {
+    const a = std.testing.allocator;
+    const gliner = @import("../pipelines/gliner.zig");
+    var handle = node.model_manager.acquireLoadedModel(directory) orelse return error.MissingLoadedModel;
+    defer handle.release();
+    const loaded = handle.get();
+    var pipeline = loaded.glinerPipeline(a);
+    try std.testing.expectEqual(@as(usize, 8), pipeline.config.decision_batch_size);
+    const labels = [_]gliner.DecisionLabel{ .{ .name = "yes" }, .{ .name = "no" } };
+    const tasks = [_]gliner.DecisionTask{.{ .name = "urgent", .labels = &labels }};
+    const requests: [32]gliner.DecisionRequest = @splat(.{ .text = "Water is leaking onto the bed. Please send someone immediately.", .tasks = &tasks });
+    const single = try pipeline.decideBatch(requests[0..1]);
+    defer {
+        for (single) |*result| result.deinit(a);
+        a.free(single);
+    }
+    const before = factory.getCudaRuntimeStats(loaded.session).?;
+    const results = try pipeline.decideBatch(&requests);
+    defer {
+        for (results) |*result| result.deinit(a);
+        a.free(results);
+    }
+    const after = factory.getCudaRuntimeStats(loaded.session).?;
+    // Each physical decision forward downloads exactly one logit tensor.
+    try std.testing.expectEqual(@as(usize, 4), after.to_float32_calls - before.to_float32_calls);
+    try std.testing.expectEqual(@as(usize, 32), results.len);
+    for (results) |result| {
+        try std.testing.expectEqual(single[0].raw_logits.len, result.raw_logits.len);
+        for (single[0].raw_logits, result.raw_logits) |expected, actual|
+            try std.testing.expectApproxEqAbs(expected, actual, 5e-3);
+    }
+    std.debug.print("direct_decide_batch model={s} items=32 physical_forwards=4 parity=true\n", .{std.fs.path.basename(directory)});
 }
 
 test "GLiNER production CUDA distinct input batches base" {

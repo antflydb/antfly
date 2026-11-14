@@ -4075,16 +4075,16 @@ pub const LoadedModel = struct {
 
     pub fn glinerPipeline(self: *LoadedModel, allocator: std.mem.Allocator) GlinerPipeline {
         const tok = self.getTokenizer();
-        const metal_policy = session_factory.getGlinerDecideMetalExecutionPolicy(self.session);
+        const batch_policy = session_factory.getGlinerDecideExecutionBatchPolicy(self.session);
         return .{
             .allocator = allocator,
             .session = self.session,
             .tok = tok,
             .execution_lock = self.targetInferenceExecutionMutex(),
             .config = .{
-                .decision_batch_size = if (metal_policy) |policy| policy.batch_items else 64,
-                .decision_batch_tokens = if (metal_policy) |policy| policy.padded_batch_tokens else 16384,
-                .decision_reuse_batch_padding = if (metal_policy) |policy| policy.reuse_batch_padding else false,
+                .decision_batch_size = if (batch_policy) |policy| policy.batch_items else 64,
+                .decision_batch_tokens = if (batch_policy) |policy| policy.padded_batch_tokens else 16384,
+                .decision_reuse_batch_padding = if (batch_policy) |policy| policy.reuse_batch_padding else false,
                 .max_width = self.manifest.gliner_max_width,
                 .max_length = if (self.manifest.gliner_architecture == .span and
                     self.manifest.gliner_span_encoder_family == .modern_bert and

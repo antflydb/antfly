@@ -426,7 +426,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
         .name = "gliner25-decide-cuda-serving-tests",
         .max_rss = 11 * 1024 * 1024 * 1024,
         .root_module = suite.tests.root_module,
-        .filters = &.{ "Decide CUDA serving required artifact", "GLiNER production CUDA distinct input batches Decide", "qualified FP32 attention policy", "Decide Q8 CUDA qualification binds", "Decide CUDA legacy geometry", "Decide Q8 projection mirrors", "Decide Q8 mirror admission", "GLiNER Decide CUDA Q8 half staging", "GLiNER Decide CUDA Q8 execution mirror" },
+        .filters = &.{ "Decide CUDA serving required artifact", "Decide CUDA execution batches", "model listing reports an unreadable model", "executor contract failures preserve", "gliner span configuration diagnostics", "span GLiNER native config", "always-download files pull the GLiNER2.5 boundary encoder", "GLiNER production CUDA distinct input batches Decide", "qualified FP32 attention policy", "Decide Q8 CUDA qualification binds", "Decide CUDA legacy geometry", "Decide Q8 projection mirrors", "Decide Q8 mirror admission", "GLiNER Decide CUDA Q8 half staging", "GLiNER Decide CUDA Q8 execution mirror" },
         .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
     });
     ctx.step("gliner25-decide-cuda-serving-test-build", "Build focused original Decide CUDA batch and cancellation tests").dependOn(&b.addInstallArtifact(decide_serving_tests, .{}).step);
