@@ -8900,7 +8900,16 @@ pub const NativeFile = struct {
                     std.mem.eql(u8, root[160..192], &try state.incrementalFingerprint());
             }
             if (rebased and authenticated) {
-                if (state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
+                // §9.7d: on a redo-log file, a diverting commit's own
+                // page-shaped exception (an external value chain) can
+                // advance `checkpoint.page_count` without the ledger ever
+                // rebuilding to match -- the same lag `decodeFreeMapAlloc`
+                // and the sibling full-ledger-load check just below both
+                // already tolerate via `allow_behind`. This rebase
+                // fast-path compared the two unconditionally and flagged
+                // every such (legitimate) lag as `InvalidNativeAllocator`.
+                const allow_behind = self.header.redo_log_capacity != 0;
+                if (if (allow_behind) state.root.covered_pages > checkpoint.page_count else state.root.covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
                 self.allocator_ledger_rebased = true;
                 self.allocator_work.journal_rebases +|= 1;
                 self.allocator_work.journal_rebase_ns +|= @intCast(@max(0, started.durationTo(std.Io.Clock.awake.now(self.runtime())).nanoseconds));
@@ -8912,7 +8921,13 @@ pub const NativeFile = struct {
         if (checkpoint.free_map_root_page != 0) {
             const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
             defer self.allocator.free(payload);
-            if ((try allocator_v4.State.decodeRoot(payload)).covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
+            // §9.7d: same `allow_behind` lag as the rebase fast-path above
+            // and `decodeFreeMapAlloc` -- a redo-log file's diverting
+            // page-shaped exception can leave `checkpoint.page_count`
+            // legitimately ahead of what the ledger root itself covers.
+            const covered_pages = (try allocator_v4.State.decodeRoot(payload)).covered_pages;
+            const allow_behind = self.header.redo_log_capacity != 0;
+            if (if (allow_behind) covered_pages > checkpoint.page_count else covered_pages != checkpoint.page_count) return error.InvalidNativeAllocator;
         }
         const started = std.Io.Clock.awake.now(self.runtime());
         self.allocator_work.full_loads +|= 1;
