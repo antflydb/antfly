@@ -210,7 +210,7 @@ test "lite reclamation stale quota estimates expire after roots shrink" {
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "review-stale-quota.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = false } });
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = false, .reclamation = .{ .enabled = false, .page_reuse = false } });
     defer store.close();
     store.maintenance_start_suppressed = true;
     const value = try a.alloc(u8, 128 * 1024);
@@ -537,7 +537,7 @@ test "lite reclamation vacuum preserves collector capacity with retained readers
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "vacuum-collector-capacity.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .assessment_bytes = 4096, .minimum_reclaim_bytes = 4096 } });
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = false, .reclamation = .{ .enabled = false, .assessment_bytes = 4096, .minimum_reclaim_bytes = 4096 } });
     defer store.close();
     store.maintenance_start_suppressed = true;
     const large = try a.alloc(u8, 400 * 1024);
@@ -635,7 +635,7 @@ test "lite reclamation restore workspace bounds staging and releases admission" 
     const staged_path = try testPath(a, tmp, "workspace-staged.aflite");
     defer a.free(staged_path);
     const limit = 256 * 4096;
-    var live = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .max_storage_bytes = limit } });
+    var live = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = false, .reclamation = .{ .max_storage_bytes = limit } });
     defer live.close();
     live.maintenance_start_suppressed = true;
     var workspace = try live.reserveGenerationWorkspace();
@@ -644,7 +644,7 @@ test "lite reclamation restore workspace bounds staging and releases admission" 
     try std.testing.expectEqual(limit, (try live.reclamationStatus()).totalBytes());
     try std.testing.expectError(error.FileBusy, live.reserveGenerationWorkspace());
     try std.testing.expectError(error.FileBusy, live.vacuum());
-    var staged = try Store.createWithOptions(a, staged_path, .{ .io = std.testing.io, .no_sync = true, .reclamation = workspace.options });
+    var staged = try Store.createWithOptions(a, staged_path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = false, .reclamation = workspace.options });
     defer staged.close();
     staged.maintenance_start_suppressed = true;
     const value = try a.alloc(u8, limit);
@@ -706,7 +706,7 @@ test "lite reclamation shrinking observes deletions without growth" {
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "shrink-activity.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .minimum_reclaim_bytes = 16 * 1024, .assessment_bytes = 64 * 1024 * 1024 } });
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = false, .reclamation = .{ .minimum_reclaim_bytes = 16 * 1024, .assessment_bytes = 64 * 1024 * 1024 } });
     defer store.close();
     store.maintenance_start_suppressed = true;
     const value = try a.alloc(u8, 128 * 1024);
@@ -736,7 +736,7 @@ test "lite reclamation shrinking observes partially live packed records" {
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "shrink-packed.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .minimum_reclaim_bytes = 32 * 1024, .assessment_bytes = 64 * 1024 * 1024 } });
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = false, .reclamation = .{ .minimum_reclaim_bytes = 32 * 1024, .assessment_bytes = 64 * 1024 * 1024 } });
     defer store.close();
     store.maintenance_start_suppressed = true;
     const value: [1536]u8 = @splat('v');
@@ -1020,7 +1020,7 @@ test "lite reclamation counts retired inodes until pinned readers release" {
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "reclamation-retained.aflite");
     defer alloc.free(path);
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .use_redo_log = false, .reclamation = .{ .enabled = false } });
     defer store.close();
     var write = try store.beginWrite();
     try write.put("doc", "old");
@@ -1070,6 +1070,7 @@ test "lite reclamation externally locked refresh defers debt to its maintenance 
     var initial = try Store.createWithOptions(alloc, path, .{
         .io = std.testing.io,
         .no_sync = true,
+        .use_redo_log = false,
         .externally_locked = true,
         .reclamation = policy,
     });
@@ -1162,7 +1163,7 @@ test "lite reclamation writable reopen services debt and read only reopen does n
         // Populate without a worker, representing a legacy/maintenance-disabled client.
         {
             var store = Store.openWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false } }) catch |err| switch (err) {
-                error.FileNotFound => try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false } }),
+                error.FileNotFound => try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .use_redo_log = false, .reclamation = .{ .page_reuse = false, .enabled = false } }),
                 else => return err,
             };
             defer store.close();
@@ -1341,7 +1342,7 @@ test "lite reclamation automatic worker bounds sustained overwrite history" {
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "reclamation-worker.aflite");
     defer alloc.free(path);
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .page_reuse = false, .assessment_bytes = 8 * 4096, .minimum_reclaim_bytes = 32 * 4096, .retry_ms = 1 } });
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .use_redo_log = false, .reclamation = .{ .page_reuse = false, .assessment_bytes = 8 * 4096, .minimum_reclaim_bytes = 32 * 4096, .retry_ms = 1 } });
     defer store.close();
     var peak: u64 = 0;
     for (0..4) |cycle| {
