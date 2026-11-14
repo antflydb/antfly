@@ -47,16 +47,17 @@ pub fn runtimeEntry(
 
     run(process.processInit(), command, &args) catch |err| {
         if (err == error.CliDiagnosticReported) return 1;
-        // Credential validation already emits an actionable operator diagnostic.
+        // Expected operator rejections need no internal stack trace.
         // Symbolizing an expected rejection can take seconds in a large Debug
         // image and obscures the normal, successfully unwound startup failure.
         switch (err) {
-            error.BootstrapAdminPasswordRequired, error.InvalidBootstrapAdminPassword => {},
+            error.BootstrapAdminPasswordRequired, error.InvalidBootstrapAdminPassword, error.VectorMigrationCatalogInUse => {},
             else => if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace),
         }
         const message = switch (err) {
             error.FileNotFound => "required file was not found; check the configured path",
             error.AddressInUse => "listen address is already in use",
+            error.VectorMigrationCatalogInUse => "catalog is in use; stop the owning standalone server before running an offline migration",
             error.InvalidCharacter, error.InvalidArguments => "invalid command-line value; run with --help",
             else => "startup failed; see the preceding diagnostic for details",
         };
