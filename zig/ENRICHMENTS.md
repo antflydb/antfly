@@ -15,6 +15,163 @@ The shared direction is:
 - serverless enrichment is asynchronous publication work, not a query-time
   dependency
 
+## Commit Requirements And Visibility Waits (proposed)
+
+Tracking: [#1681](https://github.com/antflydb/antfly/issues/1681).
+This section specifies the target contract; it does not claim that every engine
+already implements precommit enrichment admission.
+
+Write admission and visibility are independent axes:
+
+- `commit_requires: none` commits the source and leaves enrichment work to replay.
+- `commit_requires: direct_enrichments` requires eligible document-local producers
+  to succeed before admitting the mutation. The source, prepared artifacts,
+  provenance and coverage records commit atomically.
+- `sync_level` selects the acknowledgment/publication barrier. Its existing
+  values remain. It never changes which producer failures reject a write.
+
+For example, `commit_requires: direct_enrichments` with `sync_level: write`
+prepares required outputs, durably commits them with the source, and returns
+without waiting for downstream indexes. With `sync_level: propose`, preparation
+still finishes before proposal acknowledgment. Atomic artifact storage does not
+imply immediate search visibility or change read isolation.
+
+### Eligibility And Admission
+
+The pinned enrichment plan must classify eligible producers and explain excluded
+ones. Do not expose today's `shouldPrecomputeGeneratedRequest` helper as the
+public eligibility contract. Initially, required producers read the resolved
+source document directly and can execute without committed graph adjacency,
+artifact-source stages, PDF page-image rendering, or protected-table capabilities
+unavailable to preparation. Those excluded stages remain replay work.
+
+A table with no configured enrichments has an empty requirement. A table with
+configured enrichments but no eligible producers rejects `direct_enrichments`;
+it must not silently commit with an ineffective gate. Report gated and excluded
+producer identities and reasons using public names, never internal keys. An
+engine or mutation surface unable to enforce the requirement rejects it before
+admission. Conditional intentional no-output is a successful terminal coverage
+decision; an unavailable upstream input is not.
+
+The initial scope is deliberately narrow. A document-local extraction → chunk →
+embedding DAG can eventually execute against private intermediate outputs before
+commit. Such chains are not intrinsically impossible before commit; expanding
+the public scope requires a separately versioned contract.
+
+### Shared Preparation And Engine Adapters
+
+Use the same preparation/materialization primitives across embedded, standalone,
+Raft and serverless, with an immutable prepared mutation result:
+
+1. Resolve transforms and coalesce operations against a source snapshot.
+2. Pin table identity, schema/enrichment plan generation and producer settings.
+3. Prepare required outputs outside serialized write/apply sections.
+4. Revalidate source dependencies, catalog generations and ownership at admission.
+5. Atomically commit source writes/deletes, artifact writes/deletes, provenance,
+   coverage and the thin replay record.
+6. Wait independently for the requested visibility frontier.
+
+The result carries source digests, producer/configuration identity, available
+model revision, read/version predicates and admission fences. Never invent a
+model revision when a provider cannot supply one. Existing artifacts must be
+invalidated or replaced with the same source transition; readers must not see
+old artifacts attributed to the new source version.
+
+Raft leaders prepare before proposing. Followers and recovery apply recorded
+outputs without invoking producers or replanning against newer metadata.
+Serverless appends the prepared effects in the same atomic WAL mutation group.
+Embedded uses the same result in its primary transaction. Cross-shard writes
+retain the existing transaction atomicity: complete required preparation before
+acquiring durable participant intents where practical, and publish artifacts
+with their source intents. A producer failure rejects the entire transaction,
+including its other writes and deletes.
+
+Use bounded preparation workers, provider batching, per-tenant budgets, byte
+limits, deadlines and cancellation. Never hold Raft/apply locks across inference.
+Revalidate after inference rather than keeping a mutable catalog locked for a
+remote call. Cache reuse requires matching source and producer identities and
+must respect privacy boundaries. Background replay recognizes committed coverage
+instead of regenerating successful outputs.
+
+Initially inline bounded outputs and explicitly reject oversized prepared
+commands. Large immutable staged blobs are a later extension requiring durable
+availability before committing references, authenticated reads, and collection
+of abandoned uploads. Visibility waits join normal publication frontiers rather
+than forcing a flush per request.
+
+### Outcomes, Leadership And Retry Identity
+
+| Event | Outcome |
+| --- | --- |
+| Required producer fails before proposal | Rejected; no source/artifacts committed |
+| Commit succeeds, visibility wait expires | Committed/pending with reconciliation information |
+| Commit succeeds, downstream terminal failure | `committed_repair_required` |
+| Proposal outcome cannot be established | Unknown; reconcile before replay |
+
+Leadership terms fence admission but do not deduplicate retries. Bind a stable
+mutation identity to the request and record its outcome durably across terms.
+Reusing an identity with different request contents must fail. Retrying a stale
+prepared result must revalidate table/plan/source fences. External inference can
+run more than once after failure; exactly-once model invocation is not promised.
+Producer side effects and charges are outside database rollback.
+
+### Compatibility And Rollout
+
+Preserve omitted-field embedded behavior for a deprecation window, including
+both `enrichments` and `full_index`. Explicit `commit_requires: none` immediately
+selects wait-only semantics. Preserve omitted versus explicit `none` through
+decoders and SDKs; a default inserted by serialization would erase the migration
+boundary. Existing server requests without the field retain their behavior.
+
+Update the OpenAPI source, generated SDKs, handwritten wrappers, embedded/C ABI,
+HTTP forwarding, SQL and transaction surfaces together. Any temporarily unsupported
+surface must reject the gate explicitly before mutation. Mixed-version Raft
+admission must negotiate support before proposing the new effect-bearing format.
+
+Validation must cover failed-producer rollback (including deletes), atomic
+source/artifact visibility, replay without provider calls, concurrent transforms,
+schema changes during inference, leader changes, retry identity collisions,
+cross-shard abort/recovery, bounds and cancellation, all eligibility cases and
+omitted/explicit-field migration behavior. Benchmark asynchronous ingestion and
+gated batching separately, including unrelated-write latency during slow inference.
+
+### Implementation Boundary
+
+The initial implementation exposes the optional field through batch codecs and
+SDKs and implements explicit `none` and `direct_enrichments` for unreplicated local
+embedded batches. It reuses the existing immutable row plans, pre-lock producer
+preparation, provider memo/batching, source and catalog generation fences, and
+atomic artifact/coverage commit. Direct-output admission is bounded to 8 MiB and
+16,384 physical rows. Native owner ABI 92 prevents older decoders from ignoring
+these prerequisites.
+
+Server HTTP, Raft and serverless currently reject explicit requirements before
+admission. Local ordered-publication, replication, child-range dispatch and
+transaction-resolution paths reject the gate as well. These rejections are a
+capability boundary, not completion of the target engine adapters above.
+Outstanding work includes the immutable prepared-output effect language,
+ordered producer receipts, protocol negotiation, transaction intent transport,
+serverless WAL integration, durable request deduplication, gated/excluded response
+reporting, and the associated failure/leadership/performance qualification.
+Do not close #1681 or advertise all-engine gating until those are implemented.
+
+### Comparable Database Contracts
+
+- Elasticsearch separates ingest processing from
+  [`refresh=wait_for`](https://www.elastic.co/docs/reference/elasticsearch/rest-apis/refresh-parameter),
+  which normally waits for scheduled search publication rather than forcing it.
+- OpenSearch [pipeline failures](https://docs.opensearch.org/latest/ingest-pipelines/pipeline-failures/)
+  reject indexing on an unhandled producer failure.
+- MongoDB [write concern](https://www.mongodb.com/docs/manual/reference/write-concern/)
+  distinguishes acknowledgment failures from write failures; timeout does not
+  undo successful mutations.
+- PostgreSQL [generated columns](https://www.postgresql.org/docs/18/ddl-generated-columns.html)
+  restrict generation to immutable current-row expressions. Antfly's remote
+  inference instead requires replicated outputs and explicit provenance.
+
+These contracts motivate transactional ingest preparation plus independent
+publication waits, while preserving Antfly's asynchronous replay architecture.
+
 ## Artifact Identity And Lookup
 
 The [model-aware media chunking](../docs/plans/model-aware-media-chunking.md)

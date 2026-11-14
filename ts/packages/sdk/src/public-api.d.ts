@@ -9908,14 +9908,33 @@ export interface components {
         };
         ByteRange: string[];
         /**
-         * @description Synchronization level for batch operations:
+         * @description Admission prerequisite independent of sync_level. Explicit none commits the
+         *     source without precomputing enrichments. direct_enrichments requires eligible
+         *     document-local producers to succeed, committing their outputs and coverage
+         *     atomically with the source; producer failure rejects the whole batch.
+         *     Artifact-source stages, committed graph/neighbor context, grouped producers,
+         *     protected producers and PDF page-image embeddings remain asynchronous.
+         *     Configured producers with no eligible request reject the requirement.
+         *     Prepared outputs are bounded to 8 MiB and 16384 physical rows per batch.
+         *     Currently supported by local embedded batches. Server HTTP, Raft, serverless
+         *     and transaction-resolution surfaces reject explicit requirements before
+         *     admission until their prepared-output protocols are available.
+         *     Omission retains legacy embedded precomputation for enrichments/full_index
+         *     during the compatibility window; other surfaces retain their existing waits.
+         * @enum {string}
+         */
+        CommitRequires: "none" | "direct_enrichments";
+        /**
+         * @description Response acknowledgment/publication barrier, independent of commit_requires:
          *     - "propose": Wait for Raft proposal acceptance (fastest, default)
-         *     - "write": Wait for the write to be durably applied to the local key-value store
+         *     - "write": Wait for durable application to the local key-value store
          *     - "full_text": Wait for full-text index WAL write
-         *     - "enrichments": Precompute enrichments before committing the document. A synchronous
-         *       producer failure rejects the write; post-commit worker failures retain the document
-         *       and may return `committed_repair_required`.
-         *     - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
+         *     - "enrichments": Wait for this write's enrichment publication
+         *     - "full_index": Wait for full-text, enrichment and vector-index publication
+         *     A post-commit wait failure never rolls back the source. Terminal background
+         *     failures may return committed_repair_required. During the embedded migration
+         *     window, omitting commit_requires retains legacy precomputation for enrichments
+         *     and full_index; explicit none disables that implicit admission prerequisite.
          * @default propose
          * @enum {string}
          */
@@ -11320,6 +11339,7 @@ export interface components {
              *     ]
              */
             transforms?: components["schemas"]["Transform"][];
+            commit_requires?: components["schemas"]["CommitRequires"];
             sync_level?: components["schemas"]["SyncLevel"];
         };
         BatchResponse: {

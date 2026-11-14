@@ -14764,6 +14764,9 @@ pub const ApiHttpServer = struct {
         req: db_mod.types.BatchRequest,
         request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBatchError!void {
+        // Until this surface carries prepared outputs through its transaction
+        // protocol, reject before schema preparation, proposal or WAL admission.
+        if (req.commit_requires != null) return error.UnsupportedCommitRequirement;
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
         const source = self.table_writes orelse return error.NotFound;
@@ -29719,6 +29722,13 @@ test "httpx inference gateway authorization tells disabled public inference apar
         defer server.deinit();
         try std.testing.expectEqual(case.expected, try server.authorizeInferenceRequest(.{ .trusted_principal = token }, .write));
     }
+}
+
+test "api http commit requirements reject before coordinator admission" {
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    for ([_]db_mod.types.CommitRequires{ .none, .direct_enrichments }) |requirement|
+        try std.testing.expectError(error.UnsupportedCommitRequirement, ApiHttpServer.executePublicTableBatch(&server, std.testing.allocator, "docs", .{ .commit_requires = requirement }, .{}));
 }
 
 test "api http server validates dedicated internal service runtime credentials" {

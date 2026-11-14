@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.commit_requires import CommitRequires
 from ..models.sync_level import SyncLevel
 from ..types import UNSET, Unset
 
@@ -87,19 +88,36 @@ class BatchRequest:
                  Example: [{'key': 'article:123', 'operations': [{'op': '$inc', 'path': '$.views', 'value': 1}, {'op': '$set',
                 'path': '$.lastViewed', 'value': '2026-07-28T12:00:00Z'}]}, {'key': 'user:456', 'operations': [{'op':
                 '$addToSet', 'path': '$.tags', 'value': 'vip'}]}].
-            sync_level (SyncLevel | Unset): Synchronization level for batch operations:
+            commit_requires (CommitRequires | Unset): Admission prerequisite independent of sync_level. Explicit none
+                commits the
+                source without precomputing enrichments. direct_enrichments requires eligible
+                document-local producers to succeed, committing their outputs and coverage
+                atomically with the source; producer failure rejects the whole batch.
+                Artifact-source stages, committed graph/neighbor context, grouped producers,
+                protected producers and PDF page-image embeddings remain asynchronous.
+                Configured producers with no eligible request reject the requirement.
+                Prepared outputs are bounded to 8 MiB and 16384 physical rows per batch.
+                Currently supported by local embedded batches. Server HTTP, Raft, serverless
+                and transaction-resolution surfaces reject explicit requirements before
+                admission until their prepared-output protocols are available.
+                Omission retains legacy embedded precomputation for enrichments/full_index
+                during the compatibility window; other surfaces retain their existing waits.
+            sync_level (SyncLevel | Unset): Response acknowledgment/publication barrier, independent of commit_requires:
                 - "propose": Wait for Raft proposal acceptance (fastest, default)
-                - "write": Wait for the write to be durably applied to the local key-value store
+                - "write": Wait for durable application to the local key-value store
                 - "full_text": Wait for full-text index WAL write
-                - "enrichments": Precompute enrichments before committing the document. A synchronous
-                  producer failure rejects the write; post-commit worker failures retain the document
-                  and may return `committed_repair_required`.
-                - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
+                - "enrichments": Wait for this write's enrichment publication
+                - "full_index": Wait for full-text, enrichment and vector-index publication
+                A post-commit wait failure never rolls back the source. Terminal background
+                failures may return committed_repair_required. During the embedded migration
+                window, omitting commit_requires retains legacy precomputation for enrichments
+                and full_index; explicit none disables that implicit admission prerequisite.
     """
 
     inserts: BatchRequestInserts | Unset = UNSET
     deletes: list[str] | Unset = UNSET
     transforms: list[Transform] | Unset = UNSET
+    commit_requires: CommitRequires | Unset = UNSET
     sync_level: SyncLevel | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -119,6 +137,10 @@ class BatchRequest:
                 transforms_item = transforms_item_data.to_dict()
                 transforms.append(transforms_item)
 
+        commit_requires: str | Unset = UNSET
+        if not isinstance(self.commit_requires, Unset):
+            commit_requires = self.commit_requires.value
+
         sync_level: str | Unset = UNSET
         if not isinstance(self.sync_level, Unset):
             sync_level = self.sync_level.value
@@ -132,6 +154,8 @@ class BatchRequest:
             field_dict["deletes"] = deletes
         if transforms is not UNSET:
             field_dict["transforms"] = transforms
+        if commit_requires is not UNSET:
+            field_dict["commit_requires"] = commit_requires
         if sync_level is not UNSET:
             field_dict["sync_level"] = sync_level
 
@@ -161,6 +185,13 @@ class BatchRequest:
 
                 transforms.append(transforms_item)
 
+        _commit_requires = d.pop("commit_requires", UNSET)
+        commit_requires: CommitRequires | Unset
+        if isinstance(_commit_requires, Unset):
+            commit_requires = UNSET
+        else:
+            commit_requires = CommitRequires(_commit_requires)
+
         _sync_level = d.pop("sync_level", UNSET)
         sync_level: SyncLevel | Unset
         if isinstance(_sync_level, Unset):
@@ -172,6 +203,7 @@ class BatchRequest:
             inserts=inserts,
             deletes=deletes,
             transforms=transforms,
+            commit_requires=commit_requires,
             sync_level=sync_level,
         )
 

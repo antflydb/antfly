@@ -7840,6 +7840,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.text_memory_stats.",
             "storage.db.transform.",
             "storage.db.mutation_commit_disposition_test.",
+            "storage.db.commit_requirements.",
             "storage.db.mutation_plan.",
             "storage.db.transform_read_plan.",
             "storage.db.typed_doc_values_coverage.",

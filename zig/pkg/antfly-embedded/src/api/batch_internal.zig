@@ -639,6 +639,23 @@ pub const public_codec = @import("batch.zig");
 /// private field remains its default; public data cannot grant owner authority.
 pub const fromPublic = db_mod.types.fromPublicMutation;
 
+test "internal batch commit requirements survive native owner and forwarded codecs" {
+    const a = std.testing.allocator;
+    for ([_]?db_mod.types.CommitRequires{ null, .none, .direct_enrichments }) |requirement| {
+        const request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .sync_level = .write, .commit_requires = requirement };
+        const wire = try encodeBatchRequest(a, request);
+        defer a.free(wire);
+        var forwarded = try parseInternalBatchRequest(a, wire);
+        defer forwarded.deinit(a);
+        try std.testing.expectEqual(requirement, forwarded.req.commit_requires);
+        const native = try encodeOwnerBatchRequest(a, forwarded.req);
+        defer a.free(native);
+        var owner = try parseOwnerBatchRequest(a, native);
+        defer owner.deinit(a);
+        try std.testing.expectEqual(requirement, owner.req.commit_requires);
+    }
+}
+
 pub fn takePublic(owned: *public_codec.OwnedBatchRequest) OwnedBatchRequest {
     const result_value: OwnedBatchRequest = .{ .writes = owned.writes, .deletes = owned.deletes, .transforms = owned.transforms, .graph_writes = owned.graph_writes, .graph_deletes = owned.graph_deletes, .req = fromPublic(owned.req) };
     owned.* = .{};
@@ -1736,6 +1753,7 @@ fn parseBatchRequestWithOptions(
             .timestamp_ns = timestamp_ns,
             .document_version_scheme = document_version_scheme,
             .sync_level = sync_level,
+            .commit_requires = if (root.get("commit_requires")) |value| try @import("../storage/db/mutation_values.zig").parseCommitRequires(value) else null,
             .reject_graph_transform_projections = reject_graph_transform_projections,
             .split_checkpoint = split_checkpoint,
             .split_replication = split_replication,
@@ -2365,6 +2383,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         }
         try writer.writeByte('}');
     }
+    if (req.commit_requires) |requirement| try writer.print(",\"commit_requires\":\"{s}\"", .{@tagName(requirement)});
     try writer.print(",\"sync_level\":\"{s}\"}}", .{syncLevelName(req.sync_level)});
     if (versioned) try writer.writeByte(']');
     return try out.toOwnedSlice();

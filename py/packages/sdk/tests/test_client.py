@@ -1038,6 +1038,7 @@ class TestAntflyClient:
         def handler(request):
             body = json.loads(request.content)
             assert body["sync_level"] == "full_index"
+            assert body["commit_requires"] == "none"
             assert body["transforms"][0]["upsert"] is True
             return httpx.Response(
                 201,
@@ -1052,6 +1053,7 @@ class TestAntflyClient:
         result = client.batch(
             "users",
             sync_level="full_index",
+            commit_requires="none",
             transforms=[{"key": "u", "upsert": True, "operations": [{"op": "$set", "path": "$.name", "value": "Ada"}]}],
         )
         assert result.to_dict()["status"] == "committed_repair_required"

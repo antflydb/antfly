@@ -305,7 +305,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn generatedPrecomputeModeForSyncLevel(sync_level: types.SyncLevel) GeneratedPrecomputeMode {
-            return switch (sync_level) {
+            return generatedPrecomputeMode(.{ .sync_level = sync_level });
+        }
+
+        pub fn generatedPrecomputeMode(req: types.BatchRequest) GeneratedPrecomputeMode {
+            if (req.commit_requires) |requirement| return switch (requirement) {
+                .none => .none,
+                .direct_enrichments => .direct,
+            };
+            // Compatibility window: omission retains embedded's legacy behavior.
+            return switch (req.sync_level) {
                 .enrichments, .full_index => .all,
                 .propose, .write, .full_text => .none,
             };
@@ -868,7 +877,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 index_manager_mod.IndexManager.WritePlanSnapshot.BorrowedGeneratedRowPlan,
                 req.writes.len,
             );
-            var plan = GeneratedBatchWritePlan{ .alloc = alloc, .rows = rows };
+            var plan = GeneratedBatchWritePlan{ .alloc = alloc, .rows = rows, .direct_gate_supported = @import("commit_requirements.zig").catalogSupported(write_plan) };
             errdefer plan.deinit();
             for (req.writes, extracted) |write, row| {
                 if (!row.hasDocument()) {
@@ -909,7 +918,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             preplanned: ?*const GeneratedBatchWritePlan,
             generated_memo: ?*GeneratedEmbeddingMemo,
         ) !PrecomputedGeneratedBatch {
-            if (preplanned == null and !S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets()) return .{};
+            if (precompute_mode != .direct and preplanned == null and !S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets()) return .{};
             if (preplanned) |plan| if (plan.rows.len != req.writes.len) return error.InvalidArgument;
             var fallback_write_plan = if (preplanned == null)
                 try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot()
@@ -925,6 +934,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     request.reprocess_generation = try embeddingTargetGeneration(self, alloc, request.*, force_generated_artifact_names);
                 }
             };
+            if (precompute_mode == .direct) {
+                const supported = if (preplanned) |plan| plan.direct_gate_supported else @import("commit_requirements.zig").catalogSupported(fallback_write_plan.?.plan().*);
+                if (!supported) return error.UnsupportedCommitRequirement;
+            }
             var fallback_memo = GeneratedEmbeddingMemo.init(alloc);
             defer fallback_memo.deinit();
             const preparation_memo = generated_memo orelse &fallback_memo;
@@ -1040,13 +1053,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 var inline_embedding_cleanup = InlineChunkEmbeddingCleanup{};
                 defer inline_embedding_cleanup.deinit(alloc);
 
+                // Preserve bounded producer concurrency without dispatching an
+                // excluded producer as a side effect of constructing the DAG.
+                var direct_execution_requests = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+                defer direct_execution_requests.deinit(alloc);
+                if (precompute_mode == .direct) for (generated) |request| {
+                    if (@import("commit_requirements.zig").directEligibility(request) == .eligible)
+                        try direct_execution_requests.append(alloc, request);
+                };
+                const execution_requests = if (precompute_mode == .direct) direct_execution_requests.items else generated;
+                var direct_execution_index: usize = 0;
                 const document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution = if (S.ownerField(self, "enrichment_runtime").*) |runtime|
-                    if (precompute_mode == .all and enrichment_runtime_mod.PrecommitDocumentExecution.useful(generated)) try enrichment_runtime_mod.PrecommitDocumentExecution.create(runtime, generated, (try extracted[i].logicalJson()).?) else null
+                    if (precompute_mode != .none and enrichment_runtime_mod.PrecommitDocumentExecution.useful(execution_requests)) try enrichment_runtime_mod.PrecommitDocumentExecution.create(runtime, execution_requests, (try extracted[i].logicalJson()).?) else null
                 else
                     null;
                 defer if (document_execution) |execution| execution.destroy();
                 for (generated, 0..) |request, request_index| {
-                    if (document_execution) |execution| execution.select(request_index);
                     if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) {
                         if (request.kind == .asset and containsName(force_generated_artifact_names, requestArtifactName(request))) {
                             var producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, request.producer_json);
@@ -1074,6 +1096,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         try appendGeneratedEnrichmentRef(alloc, &planned, request);
                         continue;
                     }
+
+                    if (document_execution) |execution| execution.select(if (precompute_mode == .direct) direct_execution_index else request_index);
+                    direct_execution_index += 1;
 
                     // Templates may inspect arbitrary root data; document extraction
                     // also consumes configured source-metadata fields. Plain field
@@ -1153,6 +1178,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             const reuse_unchanged = !containsName(force_generated_artifact_names, requestArtifactName(request)) and !containsName(force_generated_artifact_names, requestEmbeddingName(request));
                             computeDenseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &dense_embeddings, &chunk_cache, preparation_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
                                 error.MissingDenseEmbedder => {
+                                    if (precompute_mode == .direct) return error.CommitRequirementUnavailable;
                                     try appendGeneratedEnrichmentRef(alloc, &planned, request);
                                     continue;
                                 },
@@ -1173,6 +1199,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             const reuse_unchanged = !containsName(force_generated_artifact_names, requestArtifactName(request)) and !containsName(force_generated_artifact_names, requestEmbeddingName(request));
                             computeSparseRequestDerived(alloc, self, cleaned, request, &artifact_writes, &pending_deletes.keys, &sparse_embeddings, &chunk_cache, preparation_memo, &pending_writes, reuse_unchanged) catch |err| switch (err) {
                                 error.MissingSparseEmbedder => {
+                                    if (precompute_mode == .direct) return error.CommitRequirementUnavailable;
                                     try appendGeneratedEnrichmentRef(alloc, &planned, request);
                                     continue;
                                 },
@@ -1230,6 +1257,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             result.sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc);
             result.generated_enrichment_refs = try planned.toOwnedSlice(alloc);
             result.coverage_outcomes = try coverage_outcomes.toOwnedSlice(alloc);
+            if (precompute_mode == .direct) try @import("commit_requirements.zig").validateOutputBounds(result.artifact_writes, result.artifact_delete_keys);
             return result;
         }
 
@@ -1627,6 +1655,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return switch (mode) {
                 .none => false,
                 .all => true,
+                .direct => @import("commit_requirements.zig").directEligibility(request) == .eligible,
             };
         }
 

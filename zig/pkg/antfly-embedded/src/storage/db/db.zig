@@ -85566,6 +85566,183 @@ test "db asset producer sync precompute fails closed on permanent item failure" 
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, bad_key));
 }
 
+test "db commit requirements missing provider cannot defer required work" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "no-provider" } });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic\"}}",
+    });
+    for ([_]types.SyncLevel{ .propose, .write }) |level| {
+        var committed = false;
+        try std.testing.expectError(error.CommitRequirementUnavailable, db.batchTracked(.{
+            .writes = &.{.{ .key = "rejected", .value = "{\"body\":\"must not be deferred\"}" }},
+            .sync_level = level,
+            .commit_requires = .direct_enrichments,
+        }, &committed));
+        try std.testing.expect(!committed);
+        try std.testing.expect((try db.get(a, "rejected")) == null);
+    }
+}
+
+test "db commit requirements explicit none waits for postcommit enrichment" {
+    const a = std.testing.allocator;
+    const Observer = struct {
+        db: ?*DB = null,
+        fn produce(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const source = (try self.db.?.get(out, "observed")) orelse return error.SourceMustCommitFirst;
+            defer out.free(source);
+            return out.dupe(u8, "published after source");
+        }
+    };
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var observer = Observer{};
+    var db = try DB.open(a, directory.path(), .{ .enrichment = .{
+        .owner_id = "commit-requirements",
+        .asset_producer = .{ .ptr = &observer, .vtable = &.{ .produce = Observer.produce, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } },
+    } });
+    defer db.close();
+    observer.db = &db;
+    try db.addEnrichment(.{
+        .name = "summary",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+    });
+    // If full_index still implicitly precomputed, the observer would fail
+    // before the source existed. The explicit prerequisite must win.
+    try db.batch(.{ .writes = &.{.{ .key = "observed", .value = "{\"body\":\"hello\"}" }}, .sync_level = .full_index, .commit_requires = .none });
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "observed", "asset", "summary");
+    defer a.free(key);
+    const artifact = try db.core.store.get(a, key);
+    defer a.free(artifact);
+    try std.testing.expectEqualStrings("published after source", artifact);
+}
+
+test "db commit requirements gate write before source and delete publication" {
+    const alloc = std.testing.allocator;
+
+    const FallbackProducer = struct {
+        batch_calls: usize = 0,
+        single_calls: usize = 0,
+
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .produce = produce,
+                    .produce_batch = produceBatch,
+                    .invocation_memory_for_requests = TestAssetProducer.invocationMemory,
+                },
+            };
+        }
+
+        fn produce(ptr: *anyopaque, alloc_inner: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.single_calls += 1;
+            if (std.mem.eql(u8, request.source_text, "bad")) return error.BadAssetInput;
+            return try std.fmt.allocPrint(alloc_inner, "ok:{s}", .{request.source_text});
+        }
+
+        fn produceBatch(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_calls += 1;
+            return error.BatchItemFailed;
+        }
+    };
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var fake = FallbackProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+        .execution = .{ .batch_items = 2, .batch_bytes = 1024 },
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:good", .value = "{\"body\":\"good\"}" },
+        },
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fake.batch_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.single_calls);
+
+    const good_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:good", "asset", "summary_v1");
+    defer alloc.free(good_key);
+    const good_value = try db.core.store.get(alloc, good_key);
+    defer alloc.free(good_value);
+    try std.testing.expectEqualStrings("ok:good", good_value);
+
+    try db.batch(.{ .writes = &.{.{ .key = "keep", .value = "{}" }}, .sync_level = .write, .commit_requires = .none });
+    try std.testing.expectError(error.BadAssetInput, db.batch(.{
+        .deletes = &.{"keep"},
+        .writes = &.{
+            .{ .key = "doc:good", .value = "{\"body\":\"bad\"}" },
+        },
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    }));
+
+    try std.testing.expectEqual(@as(usize, 2), fake.batch_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.single_calls);
+
+    const kept = (try db.get(alloc, "keep")) orelse return error.TestExpectedEqual;
+    defer alloc.free(kept);
+    const committed_doc = (try db.get(alloc, "doc:good")) orelse return error.TestExpectedEqual;
+    defer alloc.free(committed_doc);
+    try std.testing.expectEqualStrings("{\"body\":\"good\"}", committed_doc);
+
+    const unchanged_good_value = try db.core.store.get(alloc, good_key);
+    defer alloc.free(unchanged_good_value);
+    try std.testing.expectEqualStrings("ok:good", unchanged_good_value);
+
+    try db.batch(.{ .writes = &.{.{ .key = "keep", .value = "{}" }}, .sync_level = .write, .commit_requires = .none });
+    try std.testing.expectError(error.BadAssetInput, db.batch(.{
+        .deletes = &.{"keep"},
+        .writes = &.{
+            .{ .key = "doc:bad", .value = "{\"body\":\"bad\"}" },
+        },
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    }));
+
+    try std.testing.expectEqual(@as(usize, 3), fake.batch_calls);
+    try std.testing.expectEqual(@as(usize, 3), fake.single_calls);
+
+    const rejected_doc = try db.get(alloc, "doc:bad");
+    defer if (rejected_doc) |value| alloc.free(value);
+    try std.testing.expect(rejected_doc == null);
+
+    const bad_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:bad", "asset", "summary_v1");
+    defer alloc.free(bad_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, bad_key));
+}
+
 test "db document unit payload preserves pdf page provenance" {
     const alloc = std.testing.allocator;
     var text_regions = [_]document_extraction_mod.TextRegion{.{

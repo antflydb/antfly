@@ -23,14 +23,16 @@ class RelationalRowMutationRequest:
         Attributes:
             schema_version (int): Required active relational schema epoch, fenced during every participant prepare.
             mutations (list[RelationalRowMutation]):
-            sync_level (SyncLevel | Unset): Synchronization level for batch operations:
+            sync_level (SyncLevel | Unset): Response acknowledgment/publication barrier, independent of commit_requires:
                 - "propose": Wait for Raft proposal acceptance (fastest, default)
-                - "write": Wait for the write to be durably applied to the local key-value store
+                - "write": Wait for durable application to the local key-value store
                 - "full_text": Wait for full-text index WAL write
-                - "enrichments": Precompute enrichments before committing the document. A synchronous
-                  producer failure rejects the write; post-commit worker failures retain the document
-                  and may return `committed_repair_required`.
-                - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
+                - "enrichments": Wait for this write's enrichment publication
+                - "full_index": Wait for full-text, enrichment and vector-index publication
+                A post-commit wait failure never rolls back the source. Terminal background
+                failures may return committed_repair_required. During the embedded migration
+                window, omitting commit_requires retains legacy precomputation for enrichments
+                and full_index; explicit none disables that implicit admission prerequisite.
     """
 
     schema_version: int

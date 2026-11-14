@@ -5360,6 +5360,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("missing body");
         };
         var commit_req = transactions_api.parseMultiBatchRequest(alloc, body_data) catch |err| switch (err) {
+            error.UnsupportedCommitRequirement => {
+                _ = ctx.status(400);
+                return ctx.text("unsupported commit_requires on this transaction surface");
+            },
             error.OutOfMemory => return err,
             else => {
                 _ = ctx.status(400);
@@ -5383,6 +5387,10 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid transaction commit request");
         };
         var commit_req = transactions_api.parseCommitRequest(alloc, body_data) catch |err| switch (err) {
+            error.UnsupportedCommitRequirement => {
+                _ = ctx.status(400);
+                return ctx.text("unsupported commit_requires on this transaction surface");
+            },
             error.InvalidTransactionCommitRequest => {
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction commit request");
@@ -5767,6 +5775,10 @@ pub const AntflyApiHandler = struct {
         }
         const alloc = self.api_server.alloc;
         var stage_req = transactions_api.parseCommitRequest(alloc, body_data) catch |err| switch (err) {
+            error.UnsupportedCommitRequirement => {
+                _ = ctx.status(400);
+                return ctx.text("unsupported commit_requires on this transaction surface");
+            },
             error.InvalidTransactionCommitRequest => {
                 _ = ctx.status(400);
                 return ctx.text("invalid transaction stage request");
@@ -6147,6 +6159,10 @@ pub const AntflyApiHandler = struct {
         defer if (parsed_req) |*commit_req| commit_req.deinit(alloc);
         if (!transactions_api.isEmptySessionCommitBody(body_data)) {
             parsed_req = transactions_api.parseCommitRequest(alloc, body_data) catch |err| switch (err) {
+                error.UnsupportedCommitRequirement => {
+                    _ = ctx.status(400);
+                    return ctx.text("unsupported commit_requires on this transaction surface");
+                },
                 error.InvalidTransactionCommitRequest => {
                     _ = ctx.status(400);
                     return ctx.text("invalid transaction commit request");

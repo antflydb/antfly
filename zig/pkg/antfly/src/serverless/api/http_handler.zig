@@ -5940,6 +5940,9 @@ pub const HttpHandler = struct {
         req: db_types.BatchRequest,
         request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteBatchError!void {
+        // Until this surface carries prepared outputs through its transaction
+        // protocol, reject before schema preparation, proposal or WAL admission.
+        if (req.commit_requires != null) return error.UnsupportedCommitRequirement;
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         if (self.runtime_status.role == .query_only) return error.Unavailable;
@@ -13845,6 +13848,15 @@ test "http handler honors public serverless sync levels on table batch writes" {
     defer unsupported.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), unsupported.status);
     try std.testing.expect(std.mem.indexOf(u8, unsupported.body, "unsupported sync_level") != null);
+    try std.testing.expectEqual(@as(u64, 0), try wal_store.latestLsn("enriched"));
+    var gated = try handler.handle(.{
+        .method = .post,
+        .path = "/tables/enriched/batch",
+        .body = "{\"inserts\":{\"doc:gated\":{\"body\":\"must not commit\"}},\"commit_requires\":\"direct_enrichments\",\"sync_level\":\"write\"}",
+    });
+    defer gated.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), gated.status);
+    try std.testing.expect(std.mem.indexOf(u8, gated.body, "unsupported commit_requires") != null);
     try std.testing.expectEqual(@as(u64, 0), try wal_store.latestLsn("enriched"));
 }
 

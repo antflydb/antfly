@@ -110,6 +110,7 @@ pub const TableApi = struct {
         InvalidBatchRequest,
         Forbidden,
         UnsupportedSyncLevel,
+        UnsupportedCommitRequirement,
         GraphMetricFeatureNotEnabled,
         GraphMetricMaterializationRejected,
         NotFound,
@@ -1779,6 +1780,7 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         error.RelationalIndexKeyTooLarge => return .{ .status = 413, .json = true, .body = try alloc.dupe(u8, "{\"error\":\"RelationalIndexKeyTooLarge\",\"message\":\"encoded relational index keys, including the document ID, must not exceed 1048576 bytes\"}") },
         error.Forbidden => return .{ .status = 403, .body = try alloc.dupe(u8, "write permission required for every table affected by this mutation") },
         error.InvalidBatchRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid batch request") },
+        error.UnsupportedCommitRequirement => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported commit_requires on this mutation surface") },
         error.UnsupportedSyncLevel => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported sync_level") },
         error.GraphMetricFeatureNotEnabled => return .{
             .status = 422,

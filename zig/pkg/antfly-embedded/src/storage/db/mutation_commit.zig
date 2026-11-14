@@ -167,7 +167,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const encodeTimestampValue = S.encodeTimestampValue;
         const encodeDocumentTimestampValue = S.encodeDocumentTimestampValue;
         const freeOwnedKeySlice = S.freeOwnedKeySlice;
-        const generatedPrecomputeModeForSyncLevel = S.generatedPrecomputeModeForSyncLevel;
+        const generatedPrecomputeMode = S.generatedPrecomputeMode;
         const graphCleanupReplayWritesAlloc = S.graphCleanupReplayWritesAlloc;
         const graphEndpointCleanupDeletesAlloc = S.graphEndpointCleanupDeletesAlloc;
         const isMergeArtifactKey = S.isMergeArtifactKey;
@@ -512,6 +512,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .timestamp_ns = preparation_timestamp_ns,
                 .document_version_scheme = if (req.document_version_scheme != .admit_current) req.document_version_scheme else if (opts.ordered_apply_receipt != null) .legacy else .revision_v1,
                 .sync_level = req.sync_level,
+                .commit_requires = req.commit_requires,
                 .reject_graph_transform_projections = req.reject_graph_transform_projections,
                 .split_checkpoint = req.split_checkpoint,
                 .split_replication = req.split_replication,
@@ -626,7 +627,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
                 if (eligible) {
                     const requires_inline_generated =
-                        (req.sync_level == .full_text or req.sync_level == .enrichments or req.sync_level == .full_index) or
+                        (req.sync_level == .full_text or req.sync_level == .enrichments or req.sync_level == .full_index or req.commit_requires == .direct_enrichments) or
                         opts.force_generated_artifact_names.len != 0 or
                         splitShadowRequiresMaterializedDerivedBatch(self);
                     const rows = try preparation_alloc.alloc(?mapper.PreparedRelationalWrite, effective_req.writes.len);
@@ -757,7 +758,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             preparation_alloc,
                             effective_req,
                             extracted_rows,
-                            generatedPrecomputeModeForSyncLevel(req.sync_level),
+                            generatedPrecomputeMode(req),
                             opts.force_generated_artifact_names,
                             &preparation.generated_plan.?,
                             generated_memo,
@@ -789,7 +790,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 !(if (request_schema_view) |view| view.storageMode() == .relational else false))
             {
                 const requires_inline_generated =
-                    (effective_req.sync_level == .full_text or effective_req.sync_level == .enrichments or effective_req.sync_level == .full_index) or
+                    (effective_req.sync_level == .full_text or effective_req.sync_level == .enrichments or effective_req.sync_level == .full_index or effective_req.commit_requires == .direct_enrichments) or
                     opts.force_generated_artifact_names.len != 0 or
                     splitShadowRequiresMaterializedDerivedBatch(self);
                 if (requires_inline_generated and effective_req.writes.len > 0) {
@@ -846,7 +847,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         preparation_alloc,
                         effective_req,
                         extracted_rows[0..extracted_rows_initialized],
-                        generatedPrecomputeModeForSyncLevel(effective_req.sync_level),
+                        generatedPrecomputeMode(effective_req),
                         opts.force_generated_artifact_names,
                         null,
                         generated_memo,
@@ -2274,6 +2275,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.delete_artifacts_ns, delete_artifacts_start_ns);
 
             const use_thin_replay_fast_path =
+                effective_req.commit_requires != .direct_enrichments and
                 effective_req.sync_level != .full_text and
                 effective_req.sync_level != .enrichments and
                 effective_req.sync_level != .full_index and
@@ -2324,7 +2326,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         preparation_alloc,
                         effective_req,
                         extracted[0..extracted_initialized],
-                        generatedPrecomputeModeForSyncLevel(effective_req.sync_level),
+                        generatedPrecomputeMode(effective_req),
                         opts.force_generated_artifact_names,
                         null,
                         generated_memo,
@@ -3414,6 +3416,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             opts: BatchExecutionOptions,
             allocator_guard: *PreparedRowAllocator,
         ) anyerror!void {
+            if (req.commit_requires == .direct_enrichments and
+                (opts.ordered_apply_receipt != null or opts.replication_applied_lsn_marker != null or
+                    opts.bypass_replication_write_gate or opts.transaction_resolution != null or
+                    opts.document_child_range_dispatcher != null or
+                    S.ownerField(self, "local_execution").*.artifact_publication_dispatcher != null or
+                    S.ownerField(self, "local_execution").*.replication_async_batch_mirror != null or
+                    S.ownerField(self, "local_execution").*.replication_async_effect_mirror != null))
+                return error.UnsupportedCommitRequirement;
             try types.validateMergeArtifacts(req);
             const max_prepared_generation_retries = 2;
             var retry_count: usize = 0;

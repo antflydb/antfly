@@ -876,6 +876,9 @@ pub const Status = enum(u32) {
     system_fd_quota_exceeded = 916,
     persistent_descriptor_admission_exhausted = 917,
     storage_descriptor_pressure = 918,
+    unsupported_commit_requirement = 919,
+    commit_requirement_unavailable = 920,
+    commit_requirement_too_large = 921,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

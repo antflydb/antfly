@@ -382,6 +382,8 @@ fn classifyError(err: anyerror) ErrorCode {
         error.MemoryRetryExhausted => .stalled,
         error.MemoryEntitySuppressed => .not_found,
         error.MemorySecretDetected, error.InvalidResourceReference, error.InvalidMemoryRequest, error.InvalidMemoryAssertion, error.InvalidMemoryConfig, error.InvalidMemoryId, error.InvalidMemorySpan, error.InvalidMemoryCursor, error.MemoryIdempotencyKeyRequired, error.MemoryForgotten, error.MemoryEvidenceRequired, error.MemoryInvalidSupersession, error.MemoryUngroundedOutput, error.MemoryEmbeddingMismatch, error.MemoryEntityRequired, error.MemoryOntologyMismatch, error.MemoryDependencyMissing, error.MemoryDependencyCycle, error.MemoryDependencyStale, error.MemoryInputTooLarge, error.MemoryWorkLimit => .invalid_argument,
+        error.UnsupportedCommitRequirement, error.CommitRequirementUnavailable => .unsupported,
+        error.CommitRequirementTooLarge => .invalid_argument,
         error.StandaloneLiteCatalogRequiresApi, error.SqlFeatureNotSupported, error.UnsupportedOperation, error.UnsupportedResolverCatalogVersion, error.UnsupportedDatabaseReaderVersion => .unsupported,
         error.IntentConflict, error.DecisionConflict, error.SchemaInUse => .intent_conflict,
         error.TxnNotFound => .txn_not_found,

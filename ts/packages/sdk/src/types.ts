@@ -157,6 +157,7 @@ export interface BatchRequest {
   inserts?: Record<string, unknown>;
   deletes?: string[];
   transforms?: components["schemas"]["Transform"][];
+  commit_requires?: components["schemas"]["CommitRequires"];
   sync_level?: components["schemas"]["SyncLevel"];
 }
 export type BatchResult = components["schemas"]["BatchResponse"];

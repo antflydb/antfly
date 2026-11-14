@@ -17,6 +17,7 @@ from .client import (
     antfly_embedder,
 )
 from .client_generated.models import (
+    CommitRequires,
     CreateAlgebraicIndexRequest,
     CreateAlgebraicIndexRequestType,
     CreatedAlgebraicIndex,

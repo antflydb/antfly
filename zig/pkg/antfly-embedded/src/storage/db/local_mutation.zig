@@ -253,6 +253,7 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const flushDurableReplicationOutboxesLocked = commit.flushDurableReplicationOutboxesLocked;
         pub const flushTransactionReplicationOutbox = commit.flushTransactionReplicationOutbox;
         pub const generatedPrecomputeModeForSyncLevel = preparation.generatedPrecomputeModeForSyncLevel;
+        pub const generatedPrecomputeMode = preparation.generatedPrecomputeMode;
         pub const graphMutationIdentityEql = materialization.graphMutationIdentityEql;
         pub const hasConfiguredResolvers = materialization.hasConfiguredResolvers;
         pub const hasCoordinatedConstraints = commit.hasCoordinatedConstraints;

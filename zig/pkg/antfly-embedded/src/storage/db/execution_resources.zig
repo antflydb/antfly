@@ -1728,6 +1728,8 @@ pub const PrecomputedCoverageCandidate = struct {
 pub const GeneratedBatchWritePlan = struct {
     alloc: Allocator,
     rows: []index_manager_mod.IndexManager.WritePlanSnapshot.BorrowedGeneratedRowPlan,
+    /// Admission capability captured from the same pinned catalog as the rows.
+    direct_gate_supported: bool = true,
     initialized: usize = 0,
 
     pub fn deinit(self: *GeneratedBatchWritePlan) void {
@@ -1944,6 +1946,7 @@ pub const GeneratedEmbeddingMemo = struct {
 pub const GeneratedPrecomputeMode = enum {
     none,
     all,
+    direct,
 };
 
 pub const PrecomputedGeneratedBatch = struct {

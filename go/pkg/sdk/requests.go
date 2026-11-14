@@ -59,12 +59,12 @@ type BatchRequest struct {
 	// - Supports $set, $setOnInsert, $unset, $inc, $push, $pull, $addToSet, $min, and $max
 	Transforms []Transform `json:"transforms,omitempty"`
 
-	// SyncLevel Synchronization level for the batch operation:
-	// - "propose": Wait for Raft proposal acceptance (fastest, default)
-	// - "write": Wait for Pebble KV write
-	// - "full_text": Wait for full-text index WAL write
-	// - "enrichments": Pre-compute enrichments before Raft proposal
-	// - "full_index": Wait for all index writes to complete
+	// CommitRequires selects required precommit enrichment work. Leave empty to
+	// preserve the server or embedded compatibility default. Unsupported engines
+	// reject explicit requirements before committing.
+	CommitRequires CommitRequires `json:"commit_requires,omitempty"`
+
+	// SyncLevel selects the response acknowledgment/publication barrier.
 	SyncLevel SyncLevel `json:"sync_level,omitempty"`
 }
 
