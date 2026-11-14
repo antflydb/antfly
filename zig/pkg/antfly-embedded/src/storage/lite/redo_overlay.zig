@@ -645,7 +645,8 @@ pub const SharedRedoOverlay = struct {
                 // pin at exactly `floor` may still need it); drop
                 // everything strictly older than that one, which no live
                 // pin can ever resolve to instead.
-                var node: ?*VersionedOverlayEntry = kv.value_ptr.*;
+                const original_head = kv.value_ptr.*;
+                var node: ?*VersionedOverlayEntry = original_head;
                 var kept: ?*VersionedOverlayEntry = null;
                 while (node) |n| {
                     if (n.sequence <= floor) {
@@ -663,7 +664,38 @@ pub const SharedRedoOverlay = struct {
                         // shrinks, so mirror the count back out.
                         self.pending_retirement_versions -|= stale.destroyChain(allocator);
                     }
-                    if (min_pin == null) drop_keys.append(allocator, kv.key_ptr.*) catch continue;
+                    // Dropping the whole key (map pointer included) is only
+                    // safe when `keep_node` *is* the live head -- i.e. the
+                    // head itself is also `<= floor`, so the entire chain
+                    // is durable. When the walk had to step past the head
+                    // to find something `<= floor` (the head is still
+                    // ahead of `floor`: genuinely live, uncheckpointed
+                    // data no fold has written to a real page yet), the
+                    // map's own pointer (`kv.value_ptr.*`) still names that
+                    // live head, never `keep_node` -- dropping the key
+                    // here would call `destroyChain` on that live head
+                    // below (`removed.value` is always `kv.value_ptr.*`,
+                    // not `keep_node`), permanently destroying a committed
+                    // write no fold ever folded. Reproduced live: a
+                    // background `checkpointRedoLog` fold's own commit
+                    // bumps the shared `commit_sequence` counter the same
+                    // way every commit does, so a *second*, unrelated
+                    // write that lands after the fold started but before
+                    // it finished can end up chained on top of a key the
+                    // fold already folded -- its own `appendVersion` push
+                    // makes it the new head, newer than the fold's own
+                    // `durable_checkpoint_sequence`. A reader-pin release
+                    // racing in with `min_pin == null` at that exact
+                    // moment (any unpin opportunistically re-applies the
+                    // existing floor) then found `kept` at the older,
+                    // already-folded version and dropped the whole key --
+                    // erasing the newer, never-folded write with no way to
+                    // recover it (`storage.lite.conformance_test` and the
+                    // externally-locked reclaim test both hit this
+                    // through the full redo retirement signal starting
+                    // the background maintenance loop while a sibling
+                    // write was still in flight).
+                    if (min_pin == null and keep_node == original_head) drop_keys.append(allocator, kv.key_ptr.*) catch continue;
                 } else {
                     // Every version in this chain postdates the floor --
                     // nothing to drop (every version is still potentially
