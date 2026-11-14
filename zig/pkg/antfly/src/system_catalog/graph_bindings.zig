@@ -19,11 +19,14 @@ const indexes = @import("../api/indexes.zig");
 pub fn indexIdentity(a: std.mem.Allocator, indexes_json: []const u8, name: []const u8) !?@import("cypher").catalog.IndexIdentity {
     var parsed = try std.json.parseFromSlice(std.json.Value, a, if (indexes_json.len == 0) "{}" else indexes_json, .{});
     defer parsed.deinit();
-    const concrete = try @import("antfly_local_sources").api_index_metadata.aliases.resolve(parsed.value, name);
-    var lookup = (try indexes.lookupSingleIndexConfig(a, indexes_json, concrete)) orelse return null;
-    defer lookup.deinit();
-    if (indexes.inferIndexType(concrete, lookup.config) != .graph) return null;
-    const identity = (try indexes.indexRuntimeIdentity(a, concrete, lookup.config)) orelse return null;
+    return indexIdentityFromValue(a, parsed.value, name);
+}
+
+fn indexIdentityFromValue(a: std.mem.Allocator, root: std.json.Value, name: []const u8) !?@import("cypher").catalog.IndexIdentity {
+    const concrete = try @import("antfly_local_sources").api_index_metadata.aliases.resolve(root, name);
+    const config = root.object.get(concrete) orelse return null;
+    if (indexes.inferIndexType(concrete, config) != .graph) return null;
+    const identity = (try indexes.indexRuntimeIdentity(a, concrete, config)) orelse return null;
     return .{ .incarnation = identity.incarnation, .config_hash = identity.config_hash };
 }
 
@@ -37,18 +40,29 @@ pub fn resolveAliases(a: std.mem.Allocator, record: @import("antfly_local_source
     var result = record;
     var source = try std.json.parseFromSliceLeaky(std.json.Value, a, record.source_json, .{ .allocate = .alloc_always });
     var changed = false;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const Catalog = struct {
+        root: std.json.Value,
+        identities: std.StringHashMapUnmanaged(@import("cypher").catalog.IndexIdentity) = .empty,
+    };
+    var catalogs: std.AutoHashMapUnmanaged(u64, Catalog) = .empty;
     for (graph.relationships, 0..) |relationship, ordinal| {
         const label = graph.label(relationship.source_label) orelse return error.InvalidCatalogRecord;
         const table = for (tables) |candidate| {
             if (candidate.id == label.table_id) break candidate;
         } else return error.CatalogGenerationChanged;
-        const root = try std.json.parseFromSliceLeaky(std.json.Value, a, table.index_catalog_json, .{});
-        const concrete = try aliases.resolve(root, relationship.index);
+        const slot = try catalogs.getOrPut(sa, table.id);
+        if (!slot.found_existing) slot.value_ptr.* = .{ .root = try std.json.parseFromSliceLeaky(std.json.Value, sa, table.index_catalog_json, .{}) };
+        const catalog = slot.value_ptr;
+        const concrete = try aliases.resolve(catalog.root, relationship.index);
         if (std.mem.eql(u8, concrete, relationship.index)) continue;
         if (!changed) result.graph_indexes = try a.dupe(domain.GraphIndexBinding, record.graph_indexes);
         changed = true;
-        const identity = (try indexIdentity(a, table.index_catalog_json, concrete)) orelse return error.CatalogGenerationChanged;
-        @constCast(result.graph_indexes)[ordinal].identity = identity;
+        const identity = try catalog.identities.getOrPut(sa, concrete);
+        if (!identity.found_existing) identity.value_ptr.* = (try indexIdentityFromValue(sa, catalog.root, concrete)) orelse return error.CatalogGenerationChanged;
+        @constCast(result.graph_indexes)[ordinal].identity = identity.value_ptr.*;
         const mappings = source.object.getPtr("relationships") orelse return error.InvalidCatalogRecord;
         try mappings.array.items[ordinal].object.put(a, "index", .{ .string = try a.dupe(u8, concrete) });
     }
@@ -109,4 +123,49 @@ test "index alias SQL graph mappings bind names and incarnations per execution" 
     const graph_output: cypher.runtime.Result = .{ .arena = undefined, .budget = undefined, .columns = &.{}, .rows = &.{}, .stages = &.{}, .stats = .{}, .graph_incarnation = 7, .graph_revision = 1, .resolved_indexes = selected };
     const graph_json = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, graph_output, .{}), .{});
     try std.testing.expectEqualStrings("g2", graph_json.object.get("resolved_indexes").?.array.items[0].string);
+}
+
+test "index alias graph binding bounds catalog allocations across shared relationship mappings" {
+    const domain = @import("antfly_local_sources").system_catalog_domain;
+    const cypher = @import("cypher");
+    const a = std.testing.allocator;
+    var fixture = std.heap.ArenaAllocator.init(a);
+    defer fixture.deinit();
+    const fa = fixture.allocator();
+    const padding = try fa.alloc(u8, 128 * 1024);
+    @memset(padding, '\n');
+    const catalog = try std.json.Stringify.valueAlloc(fa, .{
+        .g1 = .{ .type = "graph", ._index_incarnation = 41 },
+        .unused = .{ .type = "embeddings", .embedder = .{ .model = padding } },
+        ._index_aliases = .{ .live = .{ .index = "g1" } },
+    }, .{});
+    const Mapping = @typeInfo(@FieldType(cypher.catalog.Definition, "relationships")).pointer.child;
+    const mappings = try fa.alloc(Mapping, 64);
+    const identities = try fa.alloc(domain.GraphIndexBinding, 64);
+    for (mappings, identities, 0..) |*mapping, *identity, i| {
+        const name = try std.fmt.allocPrint(fa, "EDGE{d}", .{i});
+        mapping.* = .{ .name = name, .index = "live", .source_label = "Person", .target_label = "Person", .stored_type = name };
+        identity.* = .{ .mapping_index = @intCast(i), .identity = .{ .incarnation = 1, .config_hash = 1 } };
+    }
+    const record: domain.Resource = .{
+        .kind = .graph,
+        .id = 7,
+        .name = "knowledge",
+        .source_json = try std.json.Stringify.valueAlloc(fa, cypher.catalog.Definition{ .labels = &.{.{ .name = "Person", .table = .{ .string = "docs" } }}, .relationships = mappings }, .{}),
+        .graph_tables = &.{.{ .label_index = 0, .table_id = 42, .storage_name = "physical" }},
+        .graph_indexes = identities,
+    };
+    var counter = std.testing.FailingAllocator.init(a, .{});
+    var execution = std.heap.ArenaAllocator.init(counter.allocator());
+    defer execution.deinit();
+    const Table = struct { id: u64 = 42, index_catalog_json: []const u8 };
+    const bound = try resolveAliases(execution.allocator(), record, &[_]Table{.{ .index_catalog_json = catalog }});
+    // Escaped catalog strings require owned parse allocations. Repeating the
+    // parse per mapping alone would retain over 8 MiB for this shared table.
+    try std.testing.expect(counter.allocated_bytes < 4 * 1024 * 1024);
+    const graph = try domain.graphForExecution(fa, bound);
+    for (graph.relationships) |mapping| {
+        try std.testing.expectEqualStrings("g1", mapping.index);
+        try std.testing.expectEqual(@as(u64, 41), mapping.identity.?.incarnation);
+    }
 }
