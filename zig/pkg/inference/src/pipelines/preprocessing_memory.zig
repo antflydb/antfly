@@ -60,6 +60,10 @@ pub const Scope = struct {
     started: bool = false,
     /// Synchronous ancestor preparation remains live while a child executes.
     parent: ?*const Scope = null,
+    /// External host output leases retained during synchronous post-processing.
+    /// Feasibility only: these bytes are already charged and never allocator
+    /// credit. Their owning tensors must outlive this borrowed residency.
+    required_host_bytes: usize = 0,
 
     pub fn init(backing: std.mem.Allocator, session: ?sessions.Session, credit: Credit, budget: ?*memory.RunBudget) @This() {
         return .{ .owner = .{ .backing = backing, .session = session, .prepaid_host_bytes = credit.process_bytes }, .budget = budget, .borrowed_budget_bytes = credit.budget_bytes };
@@ -74,7 +78,7 @@ pub const Scope = struct {
     pub fn ownedHostBytesFor(self: *const @This(), session: sessions.Session) !usize {
         const admission = session.run_admission orelse return 0;
         var owned: usize = if (self.owner.session) |source| if (source.run_admission) |source_admission|
-            if (source_admission.controller == admission.controller) try std.math.add(usize, self.owner.prepaid_host_bytes, self.owner.reserved_bytes) else 0
+            if (source_admission.controller == admission.controller) try std.math.add(usize, self.required_host_bytes, try std.math.add(usize, self.owner.prepaid_host_bytes, self.owner.reserved_bytes)) else 0
         else
             0 else 0;
         if (self.parent) |parent| owned = try std.math.add(usize, owned, try parent.ownedHostBytesFor(session));
@@ -127,8 +131,8 @@ pub const Scope = struct {
 
     fn acquire(raw: *anyopaque, amount: usize) !memory.AdmissionLease {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        const owned = try std.math.add(usize, self.owner.prepaid_host_bytes, self.owner.reserved_bytes);
-        const required_budget = (try std.math.add(usize, owned, amount)) -| self.borrowed_budget_bytes;
+        const owned = try std.math.add(usize, self.required_host_bytes, try std.math.add(usize, self.owner.prepaid_host_bytes, self.owner.reserved_bytes));
+        const required_budget = (try std.math.add(usize, owned - self.required_host_bytes, amount)) -| self.borrowed_budget_bytes;
         const budget_growth = required_budget -| self.budget_bytes;
         if (self.budget) |budget| try reserveBudget(budget, budget_growth);
         errdefer if (self.budget) |budget| budget.release(.{ .kind = .scratch, .tier = .host, .bytes = budget_growth });

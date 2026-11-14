@@ -94,8 +94,10 @@ Codec scratch is allocated lazily: solid-color, nearest and bilinear paths
 reserve no slab when they need no scratch. Sizing forecasts are advisory; denied
 headroom falls back to actual allocation demand. Capacity is reused across batch
 waves, with growth bounded by the aggregate physical cap. Speculative admission
-failures are discarded after a successful fallback. Admission
-failure precedes the backing allocation and retains its policy/pressure identity.
+failures are discarded after a successful fallback. Scratch admission refusals
+also narrow a concurrent batch after every worker joins. Each retry measures its
+own demand; a rejected wider wave cannot poison a serial retry. Backing-allocation
+OOM stays terminal. Admission failure precedes the backing allocation and retains its policy/pressure identity.
 
 Prepared model inputs borrow the allocation owner's proven payload range and
 stack-owned shape for the synchronous invocation. They do not clone pixels,
@@ -110,6 +112,15 @@ pixels and codec slab growth therefore cannot hide an intrinsically oversized
 request behind several individually valid leases. Slab growth includes both
 prior slab capacity and prepared pixels. A stable aggregate policy failure stays
 permanent; reservations held by an unrelated request remain retryable contention.
+Node-owned metadata and prompt-planning allocation growth follows the same rule:
+its retained capacity participates in feasibility, while only the delta is charged.
+
+Multi-stage post-processing borrows the live detector heatmap plane. Masks,
+connected-component maps, layout/order scratch, and accumulated region metadata
+use an admitted document scope. Model output leases participate in feasibility
+without becoming free allocator credit; shared output owners are counted once.
+Resized inputs retire before post-processing, scratch slack retires at stage
+boundaries, and only compact results are copied to the caller's output allocator.
 
 Boolean broker cancellation callbacks retain their first typed checkpoint
 failure atomically until the synchronous caller joins. The retained checkpoint

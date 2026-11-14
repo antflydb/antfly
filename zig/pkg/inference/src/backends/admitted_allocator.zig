@@ -26,6 +26,9 @@ pub const AdmittedAllocator = struct {
     /// Session-based callbacks must read this allocator's current session,
     /// which carries the attempt-local diagnostic sink during growth retries.
     admit: ?*const fn (*anyopaque, usize) anyerror!memory.AdmissionLease = null,
+    /// Custom process admission with cumulative owner residency, charged only
+    /// for the new delta. Mutually exclusive with the independent-ledger hook.
+    admit_owned: ?*const fn (*anyopaque, usize, usize) anyerror!memory.AdmissionLease = null,
     /// Refund auxiliary ledgers when a successful custom admission cannot be
     /// adopted because reservation metadata allocation fails.
     rollback_admission: ?*const fn (*anyopaque, usize) void = null,
@@ -70,6 +73,7 @@ pub const AdmittedAllocator = struct {
         }
         self.session = session;
         self.admit = null;
+        self.admit_owned = null;
         self.admission_context = null;
     }
 
@@ -77,7 +81,7 @@ pub const AdmittedAllocator = struct {
     /// foreign domains and custom rollback ledgers retain execution ownership.
     pub fn canBorrowRun(self: *const @This(), session: sessions.Session, request: sessions.RunRequest) !bool {
         const admission = session.run_admission orelse return false;
-        if (admission.backend_class != .cpu or self.admit != null or self.rollback_admission != null or self.prepaid_host_bytes != 0) return false;
+        if (admission.backend_class != .cpu or self.admit != null or self.admit_owned != null or self.rollback_admission != null or self.prepaid_host_bytes != 0) return false;
         var reservation = self.reservations;
         while (reservation) |node| : (reservation = node.next) {
             const lease = node.lease orelse return false;
@@ -103,9 +107,11 @@ pub const AdmittedAllocator = struct {
     }
 
     fn reserve(self: *@This(), amount: usize) !?memory.AdmissionLease {
+        std.debug.assert(self.admit == null or self.admit_owned == null);
+        const owned = std.math.add(usize, self.reserved_bytes, self.prepaid_host_bytes) catch return error.ResourceLimitExceeded;
+        if (self.admit_owned) |callback| return try callback(self.admission_context.?, amount, owned);
         if (self.admit) |callback| return try callback(self.admission_context.?, amount);
         const session = self.session orelse return error.ResourceLimitExceeded;
-        const owned = std.math.add(usize, self.reserved_bytes, self.prepaid_host_bytes) catch return error.ResourceLimitExceeded;
         return (try session.admitHostPreprocessOwned(amount, owned)).lease;
     }
 
@@ -137,7 +143,7 @@ pub const AdmittedAllocator = struct {
     pub fn admitRun(self: *@This(), request: sessions.RunRequest) !RunScope {
         const session = self.session orelse return error.InvalidAdmissionLeaseReduction;
         const admission = session.run_admission orelse return .{ .permit = try session.admit(request) };
-        if (self.admit != null or self.prepaid_host_bytes != 0 or admission.backend_class != .cpu) return error.InvalidAdmissionLeaseReduction;
+        if (self.admit != null or self.admit_owned != null or self.prepaid_host_bytes != 0 or admission.backend_class != .cpu) return error.InvalidAdmissionLeaseReduction;
         const amounts = try admission.estimateRequest(request, session.outputInfo());
         if (amounts.host_kv_bytes != 0) return error.InvalidAdmissionLeaseReduction;
         if (amounts.host_scratch_bytes < @sizeOf(Reservation)) return .{ .permit = try session.admit(request) };

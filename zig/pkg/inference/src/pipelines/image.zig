@@ -1276,7 +1276,7 @@ pub fn preprocessDecodedWithResampleIntoBounded(
     defer scope.deinit();
     while (true) {
         try options.control.check();
-        budget.limit_exceeded.store(false, .release);
+        budget.beginAttempt();
         preprocessDecodedWithResampleInto(budget.allocator(), img, output, target_size, mean, std_dev, resample) catch |allocation_err| {
             const err = budget.failure(allocation_err);
             std.debug.assert(budget.live_bytes.load(.acquire) == 0);
@@ -1972,6 +1972,42 @@ const SharedPreprocessBudget = struct {
         return true;
     }
 
+    fn beginAttempt(self: *@This()) void {
+        std.debug.assert(self.live_bytes.load(.acquire) == 0);
+        self.required_bytes = 0;
+        self.growth_failure = null;
+        self.limit_exceeded.store(false, .release);
+    }
+
+    fn admissionRefusal(err: anyerror) bool {
+        return switch (err) {
+            error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded => true,
+            else => false,
+        };
+    }
+
+    /// Retry optional concurrency only after every worker has joined. Backing
+    /// OOM is terminal; admission refusal may fit after narrowing the wave.
+    /// Demand from the rejected width is reset by the next beginAttempt().
+    fn recoverWave(self: *@This(), allocation_err: anyerror, wave_len: usize, workers: *usize) !bool {
+        std.debug.assert(self.live_bytes.load(.acquire) == 0);
+        const err = self.failure(allocation_err);
+        if (admissionRefusal(err)) {
+            if (wave_len <= 1) return err;
+        } else {
+            if (err != error.OutOfMemory or self.growth_failure != null or !self.limit_exceeded.load(.acquire)) return err;
+            const grown = self.growAfterExhaustion() catch |growth_err| {
+                if (!admissionRefusal(growth_err) or wave_len <= 1) return growth_err;
+                workers.* = reduceAdaptivePreprocessWorkers(workers.*, wave_len);
+                return true;
+            };
+            if (grown) return true;
+            if (wave_len <= 1) return false;
+        }
+        workers.* = reduceAdaptivePreprocessWorkers(workers.*, wave_len);
+        return true;
+    }
+
     pub fn deinit(self: *@This()) void {
         std.debug.assert(self.live_bytes.load(.acquire) == 0);
         if (self.slab.len > 0) self.backing.free(self.slab);
@@ -2276,7 +2312,7 @@ fn runBorrowedRasterPreprocessBatch(
     while (first < rasters.len) {
         try options.control.check();
         const wave_len = @min(adaptive_worker_limit, rasters.len - first);
-        scratch_budget.limit_exceeded.store(false, .release);
+        scratch_budget.beginAttempt();
         for (tasks[0..wave_len], 0..) |*task, offset| {
             const index = first + offset;
             task.* = .{
@@ -2302,16 +2338,8 @@ fn runBorrowedRasterPreprocessBatch(
         }
         std.debug.assert(scratch_budget.live_bytes.load(.acquire) == 0);
         if (first_error) |allocation_err| {
-            const err = scratch_budget.failure(allocation_err);
-            if (err == error.OutOfMemory and scratch_budget.growth_failure == null and scratch_budget.limit_exceeded.load(.acquire)) {
-                if (try scratch_budget.growAfterExhaustion()) continue;
-                if (wave_len > 1) {
-                    adaptive_worker_limit = reduceAdaptivePreprocessWorkers(adaptive_worker_limit, wave_len);
-                    continue;
-                }
-                return error.ImagePreprocessDecodedBytesExceeded;
-            }
-            return err;
+            if (try scratch_budget.recoverWave(allocation_err, wave_len, &adaptive_worker_limit)) continue;
+            return error.ImagePreprocessDecodedBytesExceeded;
         }
         first += wave_len;
         adaptive_worker_limit = recoverAdaptivePreprocessWorkers(adaptive_worker_limit, worker_limit);
@@ -2393,7 +2421,7 @@ fn runBoundedPreprocessBatch(
             wave_len,
             options.max_inflight_decoded_bytes,
         );
-        wave_budget.limit_exceeded.store(false, .release);
+        wave_budget.beginAttempt();
 
         for (tasks[0..wave_len], 0..) |*task, offset| {
             const index = first + offset;
@@ -2435,27 +2463,13 @@ fn runBoundedPreprocessBatch(
         }
         std.debug.assert(wave_budget.live_bytes.load(.acquire) == 0);
         if (first_error) |allocation_err| {
-            const err = wave_budget.failure(allocation_err);
-            if (err == error.OutOfMemory and wave_budget.growth_failure == null and wave_budget.limit_exceeded.load(.acquire)) {
-                // An intentionally small initial reservation is not evidence
-                // that concurrency is unsafe. Grow within the physical cap and
-                // retry this same wave before reducing worker width.
-                if (try wave_budget.growAfterExhaustion()) continue;
-                // A format may need substantially more scratch than its final
-                // RGBA buffer. Retry with less concurrency so a valid image is
-                // not rejected merely because peers occupied the shared cap.
-                if (wave_len > 1) {
-                    adaptive_worker_limit = reduceAdaptivePreprocessWorkers(adaptive_worker_limit, wave_len);
-                    continue;
-                }
-                if (options.item_errors) |errors| {
-                    errors[first] = error.ImagePreprocessDecodedBytesExceeded;
-                    first += 1;
-                    continue;
-                }
-                return error.ImagePreprocessDecodedBytesExceeded;
+            if (try wave_budget.recoverWave(allocation_err, wave_len, &adaptive_worker_limit)) continue;
+            if (options.item_errors) |errors| {
+                errors[first] = error.ImagePreprocessDecodedBytesExceeded;
+                first += 1;
+                continue;
             }
-            return err;
+            return error.ImagePreprocessDecodedBytesExceeded;
         }
         first += wave_len;
         adaptive_worker_limit = recoverAdaptivePreprocessWorkers(adaptive_worker_limit, worker_limit);
@@ -2839,4 +2853,47 @@ test "preprocessing lazy backing OOM stays terminal after earlier slab exhaustio
     try std.testing.expect(budget.limit_exceeded.load(.acquire));
     try std.testing.expectEqual(error.OutOfMemory, budget.growth_failure.?);
     try std.testing.expectEqual(@as(usize, 0), budget.slab.len);
+}
+
+test "preprocessing admission refuses concurrent scratch then retries a smaller wave" {
+    const Limit = struct {
+        ceiling: usize = 8 * 1024,
+        fn grow(ctx: *anyopaque, _: usize, target: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (target > self.ceiling) return error.ResourceLimitExceeded;
+        }
+    };
+    var limit = Limit{};
+    var budget = try SharedPreprocessBudget.initLazy(std.testing.allocator, 64 * 1024, 128 * 1024, .{ .context = &limit, .grow = Limit.grow });
+    defer budget.deinit();
+    const a = budget.allocator();
+    var workers: usize = 2;
+    budget.beginAttempt();
+    const first = try a.alloc(u8, 6000);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 6000));
+    a.free(first);
+    // Growing the simultaneous 12 KiB wave cannot fit. A serial 6 KiB wave can.
+    try std.testing.expect(try budget.recoverWave(error.OutOfMemory, 2, &workers));
+    try std.testing.expectEqual(@as(usize, 1), workers);
+    budget.beginAttempt();
+    try std.testing.expectEqual(@as(usize, 0), budget.required_bytes);
+    const serial = try a.alloc(u8, 6000);
+    a.free(serial);
+    // An allocation-time admission failure is also retried only at lower width.
+    limit.ceiling = budget.slab.len;
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 12000));
+    workers = 2;
+    try std.testing.expect(try budget.recoverWave(error.OutOfMemory, 2, &workers));
+    budget.beginAttempt();
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 12000));
+    try std.testing.expectError(error.ResourceLimitExceeded, budget.recoverWave(error.OutOfMemory, 1, &workers));
+}
+
+test "preprocessing backing OOM cannot trigger concurrency retries" {
+    var budget = try SharedPreprocessBudget.initLazy(std.testing.failing_allocator, 4096, 8192, null);
+    defer budget.deinit();
+    var workers: usize = 8;
+    try std.testing.expectError(error.OutOfMemory, budget.allocator().alloc(u8, 32));
+    try std.testing.expectError(error.OutOfMemory, budget.recoverWave(error.OutOfMemory, 8, &workers));
+    try std.testing.expectEqual(@as(usize, 8), workers);
 }

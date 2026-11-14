@@ -5954,14 +5954,27 @@ pub const ModelManager = struct {
     pub fn admitHostPreflight(self: *ModelManager, bytes: usize) !runtime.tier.memory.AdmissionLease {
         return self.admitHostPreflightChecked(bytes, true);
     }
+    pub fn admitHostPreflightOwned(self: *ModelManager, bytes: usize, owned_bytes: usize) !runtime.tier.memory.AdmissionLease {
+        return self.admitHostPreflightOwnedChecked(bytes, owned_bytes, true);
+    }
+
     fn admitHostPreflightChecked(self: *ModelManager, bytes: usize, check_live_memory: bool) !runtime.tier.memory.AdmissionLease {
+        return self.admitHostPreflightOwnedChecked(bytes, 0, check_live_memory);
+    }
+
+    fn admitHostPreflightOwnedChecked(self: *ModelManager, bytes: usize, owned_bytes: usize, check_live_memory: bool) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
         const domain = self.resource_domain.?;
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
-        const request = runtime.tier.memory.AdmissionRequest{ .backend_class = .cpu, .limits = domain.admission_limits, .amounts = .{ .host_scratch_bytes = bytes } };
-        return domain.admission.tryAcquireWithPressure(.cpu, request.limits, request.amounts, check_live_memory, &pressure) catch |err| {
+        const request = runtime.tier.memory.AdmissionRequest{
+            .backend_class = .cpu,
+            .limits = domain.admission_limits,
+            .amounts = .{ .host_scratch_bytes = bytes },
+            .required_residency = .fromAmounts(.cpu, .{ .host_scratch_bytes = owned_bytes }),
+        };
+        return domain.admission.tryAcquireRequestsWithPressure(&.{request}, check_live_memory, &pressure) catch |err| {
             if (err == error.ResourceTemporarilyUnavailable and self.reclaimHostCache(bytes) != 0) {
-                return domain.admission.tryAcquireWithPressure(.cpu, request.limits, request.amounts, check_live_memory, &pressure) catch |retry_err| {
+                return domain.admission.tryAcquireRequestsWithPressure(&.{request}, check_live_memory, &pressure) catch |retry_err| {
                     self.logRunAdmissionDenied(retry_err, pressure, &.{request});
                     return retry_err;
                 };

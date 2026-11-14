@@ -19,6 +19,7 @@ const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const image = @import("image.zig");
 const crop = @import("crop.zig");
+const Preparation = @import("preprocessing_memory.zig").Scope;
 const ctc_decode = @import("ctc_decode.zig");
 const connected_components = @import("connected_components.zig");
 const vision_reader = @import("../readers/vision_reader.zig");
@@ -79,6 +80,33 @@ pub const MultiStageOCRResult = struct {
     full_text: []u8,
     regions: []RecognizedRegion,
     layout: []LayoutRegion = &.{},
+
+    fn clone(self: MultiStageOCRResult, allocator: std.mem.Allocator) !MultiStageOCRResult {
+        const text = try allocator.dupe(u8, self.full_text);
+        errdefer allocator.free(text);
+        const regions = try allocator.alloc(RecognizedRegion, self.regions.len);
+        errdefer allocator.free(regions);
+        var count: usize = 0;
+        errdefer for (regions[0..count]) |*region| region.deinit(allocator);
+        for (self.regions, regions) |source, *target| {
+            const value = try allocator.dupe(u8, source.text);
+            errdefer allocator.free(value);
+            target.* = source;
+            target.text = value;
+            target.label = if (source.label) |label| try allocator.dupe(u8, label) else null;
+            count += 1;
+        }
+        const layout = try allocator.alloc(LayoutRegion, self.layout.len);
+        errdefer allocator.free(layout);
+        var layout_count: usize = 0;
+        errdefer for (layout[0..layout_count]) |*region| region.deinit(allocator);
+        for (self.layout, layout) |source, *target| {
+            target.* = source;
+            target.label = try allocator.dupe(u8, source.label);
+            layout_count += 1;
+        }
+        return .{ .allocator = allocator, .full_text = text, .regions = regions, .layout = layout };
+    }
 
     pub fn deinit(self: *MultiStageOCRResult) void {
         self.allocator.free(self.full_text);
@@ -545,36 +573,48 @@ pub const MultiStageOCRPipeline = struct {
     }
 
     pub fn runDecodedWithControl(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) !MultiStageOCRResult {
-        const regions = try self.detect(img, control);
-        defer if (regions.len > 0) self.allocator.free(regions);
+        var retained = Preparation.child(self.allocator, self.detector.withAdmissionControl(control), self.preparation_parent);
+        defer retained.deinit();
+        const result = self.runDecodedPrepared(img, control, &retained) catch |err| return retained.failure(err);
+        return result.clone(self.allocator);
+    }
+
+    fn runDecodedPrepared(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl, retained: *Preparation) !MultiStageOCRResult {
+        const result_allocator = try retained.allocator();
+        const regions = try self.detect(img, control, retained);
+        defer if (regions.len > 0) result_allocator.free(regions);
+        try retained.trim();
 
         var layout_regions: []LayoutRegion = &.{};
         errdefer {
-            for (layout_regions) |*region| region.deinit(self.allocator);
-            if (layout_regions.len > 0) self.allocator.free(layout_regions);
+            for (layout_regions) |*region| region.deinit(result_allocator);
+            if (layout_regions.len > 0) result_allocator.free(layout_regions);
         }
 
         if (self.layout != null) {
-            layout_regions = try self.analyzeLayout(img, control);
+            layout_regions = try self.analyzeLayout(img, control, retained);
+            try retained.trim();
         }
 
         if (self.order != null) {
-            try self.determineOrder(regions, control);
+            try self.determineOrder(regions, control, retained);
+            try retained.trim();
         } else {
             sortRegionsByReadingOrder(TextRegion, regions);
         }
 
         var recognized = std.ArrayListUnmanaged(RecognizedRegion).empty;
         errdefer {
-            for (recognized.items) |*region| region.deinit(self.allocator);
-            recognized.deinit(self.allocator);
+            for (recognized.items) |*region| region.deinit(result_allocator);
+            recognized.deinit(result_allocator);
         }
 
         if (self.recognizer) |*recognizer| {
             for (regions, 0..) |region, index| {
                 if (control) |active|
                     try active.update(.executing, @intCast(index), @intCast(regions.len));
-                var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.detector.withAdmissionControl(control), self.preparation_parent);
+                try retained.trim();
+                var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.detector.withAdmissionControl(control), retained);
                 defer preparation.deinit();
                 const work = try preparation.allocator();
                 const cropped = crop.cropBBox(work, img, region.bbox, self.recognition_crop_orientation) catch |err| return preparation.failure(err);
@@ -582,28 +622,29 @@ pub const MultiStageOCRPipeline = struct {
                 try preparation.trim();
 
                 const rec = try recognizer.recognizePrepared(cropped, control, &preparation);
+                defer self.allocator.free(rec.text);
                 if (rec.text.len == 0) {
-                    self.allocator.free(rec.text);
                     continue;
                 }
-                errdefer self.allocator.free(rec.text);
+                const text = try result_allocator.dupe(u8, rec.text);
+                errdefer result_allocator.free(text);
 
-                try recognized.append(self.allocator, .{
+                try recognized.append(result_allocator, .{
                     .bbox = region.bbox,
                     .polygon = region.polygon,
                     .confidence = region.confidence,
-                    .text = rec.text,
+                    .text = text,
                     .rec_confidence = rec.confidence,
                     .label = null,
                 });
             }
         } else {
             for (regions) |region| {
-                try recognized.append(self.allocator, .{
+                try recognized.append(result_allocator, .{
                     .bbox = region.bbox,
                     .polygon = region.polygon,
                     .confidence = region.confidence,
-                    .text = try self.allocator.dupe(u8, ""),
+                    .text = try result_allocator.dupe(u8, ""),
                     .rec_confidence = region.confidence,
                     .label = null,
                 });
@@ -611,126 +652,138 @@ pub const MultiStageOCRPipeline = struct {
         }
 
         if (layout_regions.len > 0) {
-            try attachLayoutLabels(self.allocator, recognized.items, layout_regions);
+            try attachLayoutLabels(result_allocator, recognized.items, layout_regions);
         }
 
         const full_text = if (recognized.items.len > 0)
-            try assembleFullText(self.allocator, recognized.items)
+            try assembleFullText(result_allocator, recognized.items)
         else
-            try self.allocator.dupe(u8, "");
+            try result_allocator.dupe(u8, "");
 
         return .{
-            .allocator = self.allocator,
+            .allocator = result_allocator,
             .full_text = full_text,
-            .regions = try recognized.toOwnedSlice(self.allocator),
+            .regions = try recognized.toOwnedSlice(result_allocator),
             .layout = layout_regions,
         };
     }
 
-    fn detect(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) ![]TextRegion {
+    fn detect(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl, retained: *Preparation) ![]TextRegion {
         const input_size = try detectionInputSize(self.detection_preprocess, img.width, img.height);
-        var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.detector.withAdmissionControl(control), self.preparation_parent);
-        defer preparation.deinit();
-        const work = try preparation.allocator();
-        const pixel_values = image.preprocessDecodedRectScaledWithResample(
-            work,
-            img,
-            input_size.width,
-            input_size.height,
-            self.detection_preprocess.mean,
-            self.detection_preprocess.std,
-            self.detection_preprocess.rescale_factor,
-            self.detection_preprocess.resample,
-        ) catch |err| return preparation.failure(err);
-        defer work.free(pixel_values);
-        try preparation.trim();
+        const outputs = blk: {
+            var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.detector.withAdmissionControl(control), retained);
+            defer preparation.deinit();
+            const work = try preparation.allocator();
+            const pixel_values = image.preprocessDecodedRectScaledWithResample(
+                work,
+                img,
+                input_size.width,
+                input_size.height,
+                self.detection_preprocess.mean,
+                self.detection_preprocess.std,
+                self.detection_preprocess.rescale_factor,
+                self.detection_preprocess.resample,
+            ) catch |err| return preparation.failure(err);
+            defer work.free(pixel_values);
+            try preparation.trim();
 
-        const input_name = if (self.detector.inputInfo().len > 0) self.detector.inputInfo()[0].name else "pixel_values";
-        const shape = [_]i64{
-            1,
-            3,
-            @intCast(input_size.height),
-            @intCast(input_size.width),
+            const input_name = if (self.detector.inputInfo().len > 0) self.detector.inputInfo()[0].name else "pixel_values";
+            const shape = [_]i64{
+                1,
+                3,
+                @intCast(input_size.height),
+                @intCast(input_size.width),
+            };
+            var input_tensor = try preparation.tensor(f32, input_name, &shape, pixel_values);
+            defer input_tensor.deinit();
+
+            break :blk try preparation.run(self.detector, &.{input_tensor}, self.allocator, control);
         };
-        var input_tensor = try preparation.tensor(f32, input_name, &shape, pixel_values);
-        defer input_tensor.deinit();
-
-        const outputs = try preparation.run(self.detector, &.{input_tensor}, self.allocator, control);
         defer freeTensorSlice(self.allocator, outputs);
-        if (outputs.len == 0) return self.allocator.dupe(TextRegion, &.{});
+        const previous_residency = retained.required_host_bytes;
+        retained.required_host_bytes = try std.math.add(usize, previous_residency, try self.detector.outputHostResidency(outputs));
+        defer retained.required_host_bytes = previous_residency;
+        const work = try retained.allocator();
+        if (outputs.len == 0) return work.dupe(TextRegion, &.{});
 
-        const heatmap = try extractDetectionHeatmap(self.allocator, &outputs[0], input_size.width, input_size.height);
-        defer self.allocator.free(heatmap.values);
+        const heatmap = try extractDetectionHeatmap(&outputs[0], input_size.width, input_size.height);
         traceDetectionHeatmap(&outputs[0], heatmap.values, heatmap.width, heatmap.height, self.post_processor);
-        return self.post_processor.process(self.allocator, heatmap.values, heatmap.width, heatmap.height, img.width, img.height);
+        return self.post_processor.process(work, heatmap.values, heatmap.width, heatmap.height, img.width, img.height);
     }
 
-    fn analyzeLayout(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) ![]LayoutRegion {
-        const layout = self.layout orelse return self.allocator.dupe(LayoutRegion, &.{});
+    fn analyzeLayout(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl, retained: *Preparation) ![]LayoutRegion {
+        const layout = self.layout orelse return (try retained.allocator()).dupe(LayoutRegion, &.{});
+        const outputs = blk: {
+            var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, layout.withAdmissionControl(control), retained);
+            defer preparation.deinit();
+            const work = try preparation.allocator();
+            const pixel_values = image.preprocessDecodedRectScaledWithResample(
+                work,
+                img,
+                self.detection_preprocess.width,
+                self.detection_preprocess.height,
+                self.detection_preprocess.mean,
+                self.detection_preprocess.std,
+                self.detection_preprocess.rescale_factor,
+                self.detection_preprocess.resample,
+            ) catch |err| return preparation.failure(err);
+            defer work.free(pixel_values);
+            try preparation.trim();
 
-        var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, layout.withAdmissionControl(control), self.preparation_parent);
-        defer preparation.deinit();
-        const work = try preparation.allocator();
-        const pixel_values = image.preprocessDecodedRectScaledWithResample(
-            work,
-            img,
-            self.detection_preprocess.width,
-            self.detection_preprocess.height,
-            self.detection_preprocess.mean,
-            self.detection_preprocess.std,
-            self.detection_preprocess.rescale_factor,
-            self.detection_preprocess.resample,
-        ) catch |err| return preparation.failure(err);
-        defer work.free(pixel_values);
-        try preparation.trim();
+            const input_name = if (layout.inputInfo().len > 0) layout.inputInfo()[0].name else "pixel_values";
+            const shape = [_]i64{
+                1,
+                3,
+                @intCast(self.detection_preprocess.height),
+                @intCast(self.detection_preprocess.width),
+            };
+            var input_tensor = try preparation.tensor(f32, input_name, &shape, pixel_values);
+            defer input_tensor.deinit();
 
-        const input_name = if (layout.inputInfo().len > 0) layout.inputInfo()[0].name else "pixel_values";
-        const shape = [_]i64{
-            1,
-            3,
-            @intCast(self.detection_preprocess.height),
-            @intCast(self.detection_preprocess.width),
+            break :blk try preparation.run(layout, &.{input_tensor}, self.allocator, control);
         };
-        var input_tensor = try preparation.tensor(f32, input_name, &shape, pixel_values);
-        defer input_tensor.deinit();
-
-        const outputs = try preparation.run(layout, &.{input_tensor}, self.allocator, control);
         defer freeTensorSlice(self.allocator, outputs);
-        if (outputs.len == 0) return self.allocator.dupe(LayoutRegion, &.{});
+        const previous_residency = retained.required_host_bytes;
+        retained.required_host_bytes = try std.math.add(usize, previous_residency, try layout.outputHostResidency(outputs));
+        defer retained.required_host_bytes = previous_residency;
+        const work = try retained.allocator();
+        if (outputs.len == 0) return (try retained.allocator()).dupe(LayoutRegion, &.{});
 
-        return parseLayoutOutput(self.allocator, &outputs[0], img.width, img.height);
+        return parseLayoutOutput(work, &outputs[0], img.width, img.height);
     }
 
-    fn determineOrder(self: *MultiStageOCRPipeline, regions: []TextRegion, control: ?InferenceExecutionControl) !void {
+    fn determineOrder(self: *MultiStageOCRPipeline, regions: []TextRegion, control: ?InferenceExecutionControl, retained: *Preparation) !void {
         if (regions.len <= 1) return;
         const order = self.order orelse {
             sortRegionsByReadingOrder(TextRegion, regions);
             return;
         };
 
-        var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, order.withAdmissionControl(control), self.preparation_parent);
-        defer preparation.deinit();
-        const work = try preparation.allocator();
-        const bbox_data = work.alloc(f32, regions.len * 4) catch |err| return preparation.failure(err);
-        defer work.free(bbox_data);
-        for (regions, 0..) |region, idx| {
-            bbox_data[idx * 4 + 0] = @floatCast(region.bbox[0]);
-            bbox_data[idx * 4 + 1] = @floatCast(region.bbox[1]);
-            bbox_data[idx * 4 + 2] = @floatCast(region.bbox[2]);
-            bbox_data[idx * 4 + 3] = @floatCast(region.bbox[3]);
-        }
+        const outputs = blk: {
+            var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, order.withAdmissionControl(control), retained);
+            defer preparation.deinit();
+            const work = try preparation.allocator();
+            const bbox_data = work.alloc(f32, regions.len * 4) catch |err| return preparation.failure(err);
+            defer work.free(bbox_data);
+            for (regions, 0..) |region, idx| {
+                bbox_data[idx * 4 + 0] = @floatCast(region.bbox[0]);
+                bbox_data[idx * 4 + 1] = @floatCast(region.bbox[1]);
+                bbox_data[idx * 4 + 2] = @floatCast(region.bbox[2]);
+                bbox_data[idx * 4 + 3] = @floatCast(region.bbox[3]);
+            }
 
-        const input_name = if (order.inputInfo().len > 0) order.inputInfo()[0].name else "boxes";
-        const shape = [_]i64{ 1, @intCast(regions.len), 4 };
-        var input_tensor = try preparation.tensor(f32, input_name, &shape, bbox_data);
-        defer input_tensor.deinit();
+            const input_name = if (order.inputInfo().len > 0) order.inputInfo()[0].name else "boxes";
+            const shape = [_]i64{ 1, @intCast(regions.len), 4 };
+            var input_tensor = try preparation.tensor(f32, input_name, &shape, bbox_data);
+            defer input_tensor.deinit();
 
-        const outputs = preparation.run(order, &.{input_tensor}, self.allocator, control) catch |err| switch (err) {
-            error.Cancelled, error.Timeout => return err,
-            else => {
-                sortRegionsByReadingOrder(TextRegion, regions);
-                return;
-            },
+            break :blk preparation.run(order, &.{input_tensor}, self.allocator, control) catch |err| switch (err) {
+                error.Cancelled, error.Timeout, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded, error.OutOfMemory => return err,
+                else => {
+                    sortRegionsByReadingOrder(TextRegion, regions);
+                    return;
+                },
+            };
         };
         defer freeTensorSlice(self.allocator, outputs);
         if (outputs.len == 0) {
@@ -743,12 +796,15 @@ pub const MultiStageOCRPipeline = struct {
             return;
         };
 
-        try sortRegionsByPredictedOrder(self.allocator, regions, order_data);
+        const previous_residency = retained.required_host_bytes;
+        retained.required_host_bytes = try std.math.add(usize, previous_residency, try order.outputHostResidency(outputs));
+        defer retained.required_host_bytes = previous_residency;
+        try sortRegionsByPredictedOrder(try retained.allocator(), regions, order_data);
     }
 };
 
 const DetectionHeatmap = struct {
-    values: []f32,
+    values: []const f32,
     width: usize,
     height: usize,
 };
@@ -937,16 +993,17 @@ fn sortRegionsByPredictedOrder(
 }
 
 fn extractDetectionHeatmap(
-    allocator: std.mem.Allocator,
     output: *const backends.Tensor,
     fallback_width: u32,
     fallback_height: u32,
 ) !DetectionHeatmap {
     if (output.dtype != .f32) return error.UnsupportedTensorType;
+    _ = try output.denseElementCount();
     const output_data = output.asFloat32IfAligned() orelse return error.UnalignedTensorData;
 
     switch (output.shape.len) {
         4 => {
+            if (output.shape[0] != 1 or output.shape[1] <= 0) return error.InvalidInputShape;
             const num_classes: usize = @intCast(output.shape[1]);
             const out_h: usize = @intCast(output.shape[2]);
             const out_w: usize = @intCast(output.shape[3]);
@@ -956,7 +1013,7 @@ fn extractDetectionHeatmap(
             else
                 output_data[0..plane_size];
             return .{
-                .values = try allocator.dupe(f32, plane),
+                .values = plane,
                 .width = out_w,
                 .height = out_h,
             };
@@ -966,13 +1023,13 @@ fn extractDetectionHeatmap(
             const out_w: usize = @intCast(output.shape[2]);
             const plane_size = out_h * out_w;
             return .{
-                .values = try allocator.dupe(f32, output_data[0..plane_size]),
+                .values = output_data[0..plane_size],
                 .width = out_w,
                 .height = out_h,
             };
         },
         else => return .{
-            .values = try allocator.dupe(f32, output_data),
+            .values = output_data,
             .width = fallback_width,
             .height = fallback_height,
         },
@@ -1160,9 +1217,9 @@ test "extractDetectionHeatmap selects foreground plane from multi-class output" 
     });
     defer tensor.deinit();
 
-    const heatmap = try extractDetectionHeatmap(allocator, &tensor, 2, 2);
-    defer allocator.free(heatmap.values);
+    const heatmap = try extractDetectionHeatmap(&tensor, 2, 2);
 
+    try std.testing.expect(heatmap.values.ptr == tensor.asFloat32().ptr + 4);
     try std.testing.expectEqual(@as(usize, 2), heatmap.width);
     try std.testing.expectEqual(@as(usize, 2), heatmap.height);
     try std.testing.expectEqualSlices(f32, &.{ 0.9, 0.8, 0.7, 0.6 }, heatmap.values);
@@ -1340,4 +1397,79 @@ test "multistage reader decoding and preprocessing deny before backing allocatio
     var recognizer = CTCRecognizer{ .allocator = std.testing.failing_allocator, .session = session, .char_dict = &.{}, .preprocess = .{ .width = 2, .height = 2 } };
     try std.testing.expectError(error.ResourceLimitExceeded, recognizer.recognize(img, null));
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}
+
+test "multistage postprocessing admits detector and layout component scratch" {
+    for ([_]bool{ false, true }) |layout| {
+        var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+        var detector = PostprocessFixture{ .empty = layout, .fragmented = true };
+        var layout_model = PostprocessFixture{ .empty = false, .fragmented = true };
+        const table = backends.Session.VTable{ .run = PostprocessFixture.run, .inputInfo = PostprocessFixture.inputInfo, .outputInfo = PostprocessFixture.outputInfo, .backend = PostprocessFixture.backend, .close = PostprocessFixture.close };
+        const session = backends.Session{ .ptr = &detector, .vtable = &table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 160 * 1024, .scratch_limit_bytes = 160 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+        var layout_session = session;
+        layout_session.ptr = &layout_model;
+        var pipeline = MultiStageOCRPipeline{ .allocator = std.testing.allocator, .detector = session, .layout = if (layout) layout_session else null, .detection_preprocess = .{ .width = 2, .height = 2 }, .post_processor = .{ .db = .{ .threshold = 0.3, .box_threshold = 0.5, .unclip_ratio = 1.5, .min_box_area = 1 } } };
+        var rgb: [12]u8 = @splat(255);
+        try std.testing.expectError(error.ResourceLimitExceeded, pipeline.runDecoded(.{ .data = &rgb, .width = 2, .height = 2, .channels = 3 }));
+        try std.testing.expectEqual(@as(usize, 1), detector.calls);
+        if (layout) try std.testing.expectEqual(@as(usize, 1), layout_model.calls);
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+    }
+}
+
+const PostprocessFixture = struct {
+    empty: bool,
+    dimension: usize = 64,
+    fragmented: bool = false,
+    calls: usize = 0,
+    fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+        return &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 1, 3, 2, 2 } }};
+    }
+    fn outputInfo(raw: *anyopaque) []const backends.TensorInfo {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return switch (self.dimension) {
+            2 => &.{.{ .name = "heatmap", .dtype = .f32, .shape = &.{ 1, 1, 2, 2 } }},
+            16 => &.{.{ .name = "heatmap", .dtype = .f32, .shape = &.{ 1, 1, 16, 16 } }},
+            else => &.{.{ .name = "heatmap", .dtype = .f32, .shape = &.{ 1, 1, 64, 64 } }},
+        };
+    }
+    fn backend(_: *anyopaque) backends.BackendType {
+        return .native;
+    }
+    fn close(_: *anyopaque) void {}
+    fn run(raw: *anyopaque, _: []const backends.Tensor, a: std.mem.Allocator) ![]backends.Tensor {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        if (self.empty) return a.alloc(backends.Tensor, 0);
+        const outputs = try a.alloc(backends.Tensor, 1);
+        errdefer a.free(outputs);
+        var values: [64 * 64]f32 = @splat(1);
+        if (self.fragmented) for (&values, 0..) |*value, index| {
+            value.* = if ((index / self.dimension + index % self.dimension) % 2 == 0) 1 else 0;
+        };
+        outputs[0] = try backends.Tensor.initFloat32(a, "heatmap", &.{ 1, 1, @intCast(self.dimension), @intCast(self.dimension) }, values[0 .. self.dimension * self.dimension]);
+        return outputs;
+    }
+};
+
+fn checkPostprocessOwnership(allocator: std.mem.Allocator) !void {
+    var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+    var fake = PostprocessFixture{ .empty = false, .dimension = 16 };
+    const session = backends.Session{ .ptr = &fake, .vtable = &.{ .run = PostprocessFixture.run, .inputInfo = PostprocessFixture.inputInfo, .outputInfo = PostprocessFixture.outputInfo, .backend = PostprocessFixture.backend, .close = PostprocessFixture.close }, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 * 1024, .scratch_limit_bytes = 64 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+    var pipeline = MultiStageOCRPipeline{ .allocator = allocator, .detector = session, .layout = session, .detection_preprocess = .{ .width = 2, .height = 2 }, .post_processor = .{ .db = .{ .threshold = 0.3, .box_threshold = 0.5, .unclip_ratio = 1, .min_box_area = 1 } } };
+    var rgb: [12]u8 = @splat(255);
+    defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
+    var result = try pipeline.runDecoded(.{ .data = &rgb, .width = 2, .height = 2, .channels = 3 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+    try std.testing.expectEqual(@as(usize, 1), result.regions.len);
+    try std.testing.expectEqualStrings("", result.regions[0].text);
+    try std.testing.expectEqual(@as(usize, 1), result.layout.len);
+    try std.testing.expectEqualStrings("Caption", result.layout[0].label);
+    try std.testing.expectEqualStrings("Caption", result.regions[0].label.?);
+}
+
+test "multistage postprocessing transfers compact results and unwinds every allocation failure" {
+    try checkPostprocessOwnership(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPostprocessOwnership, .{});
 }

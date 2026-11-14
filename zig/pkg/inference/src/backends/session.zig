@@ -1070,6 +1070,37 @@ pub const Session = struct {
         return bytes;
     }
 
+    /// Admission still retained by these outputs in this process domain.
+    /// Borrow only while all tensors remain live. Deduplicate the shared batch
+    /// owner; payload sizes alone omit shape storage and conservative headroom.
+    pub fn outputHostResidency(self: Session, outputs: []const Tensor) !usize {
+        const admission = self.run_admission orelse return 0;
+        var bytes: usize = 0;
+        for (outputs, 0..) |output, index| {
+            const lifetime = output.lifetime orelse continue;
+            if (lifetime.release != OutputAdmission.release) continue;
+            const entry: *const OutputAdmission.Entry = @ptrCast(@alignCast(lifetime.context));
+            const owner = entry.owner;
+            if (owner.lease.controller != admission.controller) continue;
+            var seen = false;
+            for (outputs[0..index]) |previous| {
+                const prior = previous.lifetime orelse continue;
+                if (prior.release != OutputAdmission.release) continue;
+                const other: *const OutputAdmission.Entry = @ptrCast(@alignCast(prior.context));
+                if (other.owner == owner) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            @import("antfly_platform").sync.lockYielding(&owner.mutex);
+            const retained = owner.lease.amounts.hostTotalBytes();
+            owner.mutex.unlock();
+            bytes = try addBytes(bytes, retained);
+        }
+        return bytes;
+    }
+
     /// Detach a lone surviving row from larger immutable host-cache columns.
     /// All candidates must be exclusive; reserve old/new overlap before copying
     /// and commit only after every copy and ownership descriptor succeeds.
@@ -2388,4 +2419,31 @@ test "session admission planning includes residency without reserving memory" {
     try std.testing.expect(try session.fitsRun(.{ .batch = 1, .sequence = 1, .input_bytes = 1, .output_bytes = 0, .workspace_bytes = 1, .workspace_planned = true }));
     try std.testing.expect(!try session.fitsRun(.{ .batch = 1, .sequence = 1, .input_bytes = 2, .output_bytes = 1, .workspace_bytes = 1, .workspace_planned = true }));
     try std.testing.expectEqualDeep(weights.amounts, controller.snapshot());
+}
+
+test "prepared postprocessing output residency deduplicates shared owners" {
+    const a = std.testing.allocator;
+    var controller = memory.AdmissionController{};
+    const Fake = struct {
+        fn info(_: *anyopaque) []const TensorInfo {
+            return &.{};
+        }
+    };
+    const session = Session{ .ptr = undefined, .vtable = &.{ .run = undefined, .inputInfo = Fake.info, .outputInfo = Fake.info, .backend = undefined, .close = undefined }, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 1024, .check_live_memory = false } };
+    var outputs = [_]Tensor{
+        try Tensor.initFloat32(a, "first", &.{2}, &.{ 1, 2 }),
+        try Tensor.initFloat32(a, "second", &.{2}, &.{ 3, 4 }),
+    };
+    var first_live = true;
+    defer {
+        if (first_live) outputs[0].deinit();
+        outputs[1].deinit();
+    }
+    var permit = try session.admit(.{ .output_bytes = 1024 });
+    defer permit.deinit();
+    _ = try Session.attachOutputAdmission(&outputs, a, &permit.lease);
+    try std.testing.expectEqual(controller.snapshot().hostTotalBytes(), try session.outputHostResidency(&outputs));
+    outputs[0].deinit();
+    first_live = false;
+    try std.testing.expectEqual(controller.snapshot().hostTotalBytes(), try session.outputHostResidency(outputs[1..]));
 }

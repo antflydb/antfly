@@ -6301,15 +6301,15 @@ pub const Node = struct {
 
     fn inferencePreparation(self: *Node) @import("../backends/admitted_allocator.zig").AdmittedAllocator {
         const Preparation = struct {
-            fn acquire(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
+            fn acquire(raw: *anyopaque, bytes: usize, owned_bytes: usize) !runtime.tier.memory.AdmissionLease {
                 const node: *Node = @ptrCast(@alignCast(raw));
-                return node.model_manager.admitHostPreflight(bytes);
+                return node.model_manager.admitHostPreflightOwned(bytes, owned_bytes);
             }
         };
         return @import("../backends/admitted_allocator.zig").AdmittedAllocator{
             .backing = std.heap.smp_allocator,
             .admission_context = self,
-            .admit = Preparation.acquire,
+            .admit_owned = Preparation.acquire,
             .trim_on_free = true,
         };
     }
@@ -52896,4 +52896,25 @@ test "reader worker prompt planning admits before execution and refunds denials"
     model.chat_tmpl = null;
     try std.testing.expectError(error.ResourceLimitExceeded, node.countAdmittedPromptTokens("unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1));
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().hostTotalBytes());
+}
+
+test "reader preparation cumulative owned allocations distinguish policy from peers" {
+    for ([_]bool{ false, true }) |contended| {
+        var node = try Node.init(std.testing.allocator, .{});
+        defer node.deinit();
+        var initial = try node.model_manager.admitHostPreflight(1);
+        initial.release();
+        node.model_manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = if (contended) 96 * 1024 else 48 * 1024, .scratch_limit_bytes = if (contended) 96 * 1024 else 48 * 1024 };
+        var peer = try node.model_manager.admitHostPreflight(if (contended) 48 * 1024 else 0);
+        defer peer.release();
+        var preparation = node.inferencePreparation();
+        defer preparation.deinit();
+        const a = preparation.allocator();
+        _ = try a.alloc(u8, 32 * 1024);
+        try preparation.trim();
+        // Each delta fits the policy alone. Together, this owner cannot fit in
+        // the first case; only unrelated peer occupancy prevents the second.
+        try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 24 * 1024));
+        try std.testing.expectEqual(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, preparation.admission_error.?);
+    }
 }
