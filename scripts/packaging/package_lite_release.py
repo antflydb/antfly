@@ -57,6 +57,8 @@ SOURCE_LICENSE_FILES = (
 )
 EMBEDDED_BUILD_CONTRACT_SCHEMAS = (2, 3, 4, 5, 6, 7)
 
+EMBEDDED_BUILD_CONTRACT_SCHEMAS = (2, 3, 4, 5, 6, 7)
+
 
 def archive_name(
     version: str, platform: Platform, build_contract_schema: int = 6

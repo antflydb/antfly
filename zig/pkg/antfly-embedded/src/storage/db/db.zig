@@ -30003,6 +30003,7 @@ pub const DB = struct {
             },
             .node_admission = node_admission,
             .work_budget = work_budget,
+            .max_intermediate_states = work_budget.max_intermediate_states,
             .owning_table = scope.owning_table,
         });
     }
@@ -30029,6 +30030,7 @@ pub const DB = struct {
             .evaluator = .{ .ctx = &filter_ctx, .func = patternNodeFilterEvaluator },
             .node_admission = node_admission,
             .work_budget = work_budget,
+            .max_intermediate_states = work_budget.max_intermediate_states,
             .owning_table = scope.owning_table,
         });
     }
@@ -30074,6 +30076,7 @@ pub const DB = struct {
                 .evaluator = .{ .ctx = &filter_ctx, .func = patternNodeFilterEvaluator },
                 .node_admission = node_admission,
                 .work_budget = budgets.work,
+                .max_intermediate_states = budgets.work.max_intermediate_states,
                 .distinct_budget = budgets.distinct,
                 .owning_table = scope.owning_table,
             },

@@ -44,7 +44,7 @@
     "test:workers": "vitest run --maxWorkers=1 test/workers.test.ts test/workers-upstream.test.ts"
   },
   "dependencies": {
-    "@antfly/sdk": "workspace:^0.2.2",
+    "@antfly/sdk": "workspace:^0.3.0",
     "@better-auth/core": "~1.7.14"
   },
   "peerDependencies": {

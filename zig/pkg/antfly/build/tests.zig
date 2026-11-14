@@ -1044,11 +1044,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "kernel JIT mode precedence is CLI then environment then config then default",
     };
     const provider_default_filters = &.{ "audio runtime", "bearer auth header cache provider defaults" };
-    const common_secrets_filters = &.{ "file secret store", "bearer auth header cache", "remote content runtime", "secret contract", "secret record" };
+    const common_secrets_filters = &.{ "common.secrets.test.", "file secret store", "bearer auth header cache", "remote content runtime", "secret contract", "secret record" };
     const lib_common_default_filters = [_][]const u8{ "provider registry", "std http listener", "std http executor", "threaded connector", "health server", "runtime lifecycle" };
     const lib_common_runtime_filters = selectTestFilters(b, &lib_common_default_filters);
     const lib_common_tests = b.addTest(.{
-        .name = "common-runtime-tests",
+        .name = @import("test_owner_names.zig").common_runtime,
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(
             b,
@@ -1920,6 +1920,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "shortest path retained payloads use the shared request budget",
         "consumed path state detaches its request-scoped release hook",
         "distributed bounded paths retain non-dominated cost and depth labels",
+        "distributed min-hop paths stream bounded pages and admit each vertex once",
+        "distributed min-hop pages preserve",
+        "distributed min-hop page ownership",
+        "api http graph operator limits",
         "distributed frontier reservations precede allocation and release on deinit",
         "anchor-only aggregate fails closed at the shared anchor scan ceiling",
         "k shortest paths preserve parallel typed edge identities",
@@ -5594,7 +5598,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     usermgr_storage_lib_standalone_runtime_test_mod.addImport("antfly_platform", platform_mod);
     lib_standalone_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_lib_standalone_runtime_test_mod);
     const lib_standalone_runtime_tests = b.addTest(.{
-        .name = "standalone-runtime-owner-tests",
+        .name = @import("test_owner_names.zig").standalone_runtime,
         .root_module = lib_standalone_runtime_test_mod,
         .filters = selectTestFilters(b, &.{
             "standalone runtime module compiles",

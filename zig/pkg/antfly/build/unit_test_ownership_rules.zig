@@ -25,6 +25,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = names.root_unit,
         .selection = "compiled CHECK",
         .skip = &.{
+            "api.tables.test.system catalog cached capabilities retain shorthand scalar source names",
             "api.runtime_status.consumerTests.Suite.test.",
             "api.http_server.test.authoritative catalog mutation boundaries reject orphaned semantic producers",
             "api.indexes.consumerTests.Suite.test.actionable repair remains visible while retained generation stays queryable",
@@ -88,12 +89,6 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "storage.db.enrichment.embedder.test.",
             "api.distributed_graph.test.distributed graph edges response round trips owned edges",
         },
-    },
-    .{
-        .source = "pkg/antfly/src/root.zig",
-        .artifact = "test",
-        .selection = "audio runtime",
-        .skip = &.{"common.secrets.test."},
     },
     .{
         .source = "pkg/antfly/src/api_derived_coverage_test_root.zig",
@@ -407,6 +402,12 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "storage-support-tests",
         .selection = "storage.",
         .skip = &.{
+            "storage.db.catalog.index_manager.test.logical query dynamic template projection upgrades only exact affected witnesses",
+            "storage.db.enrichment.document_extraction_completion.test.missing modality producers and transcription failures remain incomplete",
+            "storage.db.query.result_shape.test.native member ancestry ignores payload source and unit identities",
+            "storage.db.query.result_shape.test.native member value verification retains scan policy and work budgets",
+            "storage.db.query.result_shape.test.reshapeChunkBackedResult hydrates direct chunk ancestors",
+            "storage.db.query.search_exec.test.graph legacy ordinal batches bound resolver calls and preserve membership",
             "storage.db.query.projection.test.normalizeChunkArtifactForQuery strips private unit revision metadata",
             "storage.sim_runtime.test.",
         },
@@ -542,10 +543,10 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     },
     .{
         .source = "pkg/antfly/src/root.zig",
-        .artifact = "test",
+        .artifact = names.common_runtime,
         .selection = "file secret store",
         .skip = &.{
-            "common.secrets.test.",
+            "common.secrets.test.bearer auth header cache provider defaults",
         },
     },
     .{
@@ -563,10 +564,12 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     },
     .{
         .source = "pkg/antfly/src/root.zig",
-        .artifact = "test",
+        .artifact = names.common_runtime,
         .selection = "provider registry",
         .skip = &.{
             "common.config.test.",
+            "common.inference_tasks.test.provider registry gateway",
+            "common.provider_registry.test.provider registry gateway generated rewriting shares task execution and preserves batch order",
             "common.http.peer_disconnect_observer.test.",
             "common.http.std_http_executor.test.",
             "common.http.std_http_listener.test.",
@@ -654,11 +657,12 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     },
     .{
         .source = "pkg/antfly/src/standalone_runtime_test_root.zig",
-        .artifact = "test",
+        .artifact = names.standalone_runtime,
         .selection = "standalone runtime module compiles",
         .skip = &.{
             "common.config.test.",
             "system_catalog.domain.test.external lake",
+            "system_catalog.domain.test.graph catalog",
         },
     },
     .{
@@ -675,6 +679,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "common.http.std_http_executor.test.",
             "common.http.std_http_listener.test.",
             "common.secret_contract.test.",
+            "common.secrets.test.",
             "common.threaded_connect_io.test.",
             "common.threaded_io_limits.test.",
             "raft.transport.http_driver.test.",

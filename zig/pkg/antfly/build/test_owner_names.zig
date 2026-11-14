@@ -18,3 +18,5 @@
 pub const root_unit = "root-unit-tests";
 pub const capi_contract = "capi-contract-tests";
 pub const api_storage_authority = "api-storage-authority-tests";
+pub const common_runtime = "common-runtime-tests";
+pub const standalone_runtime = "standalone-runtime-owner-tests";

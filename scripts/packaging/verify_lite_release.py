@@ -135,8 +135,9 @@ def verify(
                 if Path(name).suffix == ".pc":
                     continue  # pkg-config is shipped in the native npm package.
                 require(
-                    wheel.read(f"antfly_embedded/_lib/{name}") == content,
-                    f"library mismatch: {wheel_path}: {name}",
+                    f"antfly_embedded/_lib/{name}" in wheel.namelist()
+                    and wheel.read(f"antfly_embedded/_lib/{name}") == content,
+                    f"{'Apple bridge mismatch' if name == 'libantfly-apple.dylib' else 'library mismatch'}: {wheel_path}: {name}",
                 )
             require(
                 wheel.read(f"antfly_embedded/_lib/{lib_name}") == library,
@@ -209,8 +210,9 @@ def verify(
 
             for name, content in libraries.items():
                 require(
-                    npm_bytes(f"lib/{name}") == content,
-                    f"library mismatch: {npm_path}: {name}",
+                    f"package/lib/{name}" in npm.getnames()
+                    and npm_bytes(f"lib/{name}") == content,
+                    f"{'Apple bridge mismatch' if name == 'libantfly-apple.dylib' else 'library mismatch'}: {npm_path}: {name}",
                 )
 
             manifest = json.loads(npm_bytes("package.json"))

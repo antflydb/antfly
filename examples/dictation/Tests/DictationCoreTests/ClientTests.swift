@@ -26,6 +26,36 @@ final class FixtureProtocol: URLProtocol, @unchecked Sendable {
 }
 
 @Suite(.serialized) struct ClientTests {
+  @Test func appleAssetCheckUsesGeneratedSilenceWithoutCleanup() async throws {
+    FixtureProtocol.reply = { request in
+      #expect(request.value(forHTTPHeaderField: "X-Antfly-Inference-Timeout-Ms") == "1800000")
+      #expect(request.timeoutInterval >= 1800)
+      let body = try fixtureBody(request)
+      let length = body.subdata(in: 8..<16).withUnsafeBytes {
+        $0.loadUnaligned(as: UInt64.self).littleEndian
+      }
+      let metadata =
+        try JSONSerialization.jsonObject(with: body.subdata(in: 40..<(40 + Int(length))))
+        as! [String: Any]
+      #expect(metadata["model"] as? String == "transcribers/apple-speech")
+      #expect(metadata["style"] as? String == "verbatim")
+      #expect(metadata["language"] as? String == "en-US")
+      #expect(metadata["cleanup_model"] == nil)
+      #expect(body.suffix(32000).allSatisfy { $0 == 0 })
+      return (
+        200, "text/event-stream",
+        "data: {\"type\":\"dictation.transcript\",\"transcript\":{\"text\":\"\"}}\n\ndata: {\"type\":\"dictation.completed\",\"text\":\"\"}\n\ndata: [DONE]\n\n"
+      )
+    }
+    try await client().checkAppleSpeechAssets()
+  }
+  @Test func appleAssetCheckDoesNotHideInstallationFailure() async throws {
+    FixtureProtocol.reply = { _ in
+      (503, "application/json", "{\"error\":\"AppleSpeechAssetsMissing\"}")
+    }
+    await #expect(throws: (any Error).self) { try await client().checkAppleSpeechAssets() }
+  }
+
   @Test func managedPasswordUsesBasicAuthWithoutForwardingExternalBearer() async throws {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [FixtureProtocol.self]
@@ -716,5 +746,80 @@ extension ClientTests {
       context: context)
     #expect(result.text == "We deploy to production new line")
     #expect(result.formatting?.pressEnter == false)
+  }
+}
+
+extension ClientTests {
+  @Test func processorValidationPrecedesNetworkOnEveryPublicDictationPath() async throws {
+    FixtureProtocol.reply = { _ in
+      Issue.record("Invalid output settings reached the server")
+      return (500, "application/json", "{}")
+    }
+    var preset = Configuration().presets[0]
+    preset.outputMode = .clean
+    let connection = try client()
+    await #expect(throws: DictationError.self) {
+      try await connection.dictate(
+        audio: Data([0]), preset: preset, dictionary: [], progress: { _ in })
+    }
+    do {
+      _ = try await connection.cleanupText(
+        "Keep my raw words", preset: preset, dictionary: [], formatting: .init())
+      Issue.record("Missing processor was accepted")
+    } catch let error as DictationError {
+      #expect(error.rawTranscript == "Keep my raw words")
+    }
+  }
+  @Test func ordinaryRequestsKeepTheirBudgetsAfterAssetSetup() async throws {
+    FixtureProtocol.reply = { request in
+      if request.url?.path.hasSuffix("dictate") == true {
+        #expect(request.value(forHTTPHeaderField: "X-Antfly-Inference-Timeout-Ms") == "1800000")
+        return (
+          200, "text/event-stream",
+          "data: {\"type\":\"dictation.transcript\",\"transcript\":{\"text\":\"\"}}\n\ndata: {\"type\":\"dictation.completed\",\"text\":\"\"}\n\ndata: [DONE]\n\n"
+        )
+      }
+      #expect(request.value(forHTTPHeaderField: "X-Antfly-Inference-Timeout-Ms") == nil)
+      #expect(request.timeoutInterval < AntflyClient.speechAssetTimeout)
+      return (200, "application/json", "{\"data\":[]}")
+    }
+    let connection = try client()
+    try await connection.checkAppleSpeechAssets()
+    _ = try await connection.models()
+  }
+}
+
+private actor AssetRequestSignal {
+  var signaled = false
+  var waiting: [CheckedContinuation<Void, Never>] = []
+  func send() {
+    signaled = true
+    let pending = waiting
+    waiting = []
+    pending.forEach { $0.resume() }
+  }
+  func wait() async { if !signaled { await withCheckedContinuation { waiting.append($0) } } }
+}
+private final class PendingAssetProtocol: URLProtocol, @unchecked Sendable {
+  static let started = AssetRequestSignal()
+  static let stopped = AssetRequestSignal()
+  override class func canInit(with request: URLRequest) -> Bool { true }
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+  override func startLoading() { Task { await Self.started.send() } }
+  override func stopLoading() { Task { await Self.stopped.send() } }
+}
+extension ClientTests {
+  @Test(.timeLimit(.minutes(1))) func assetInstallationCancellationCancelsTheUnderlyingRequest()
+    async throws
+  {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [PendingAssetProtocol.self]
+    let connection = try AntflyClient(
+      server: "http://localhost:8080", session: URLSession(configuration: configuration))
+    let pending = Task { try await connection.checkAppleSpeechAssets() }
+    await PendingAssetProtocol.started.wait()
+    pending.cancel()
+    await #expect(throws: CancellationError.self) { try await pending.value }
+    await PendingAssetProtocol.stopped.wait()
   }
 }

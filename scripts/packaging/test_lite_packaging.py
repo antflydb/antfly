@@ -102,9 +102,7 @@ class LitePackagingTests(unittest.TestCase):
                     "apache native library"
                 )
                 if platform.release_os == "Darwin":
-                    (stage / "lib/libantfly-apple.dylib").write_bytes(
-                        b"Apple provider bridge"
-                    )
+                    (stage / "lib/libantfly-apple.dylib").write_bytes(b"Apple bridge")
                 (stage / "include/antfly.h").write_text("/* ABI */")
                 (stage / "lib/pkgconfig").mkdir()
                 (stage / "lib/pkgconfig/libantfly.pc").write_text(
@@ -279,75 +277,82 @@ class LitePackagingTests(unittest.TestCase):
                 )
             with mock.patch.object(verifier, "ROOT", root):
                 verifier.verify("1.2.3", archives, root / "out/python", npm_dir)
-                verifier.verify("1.2.3", archives, root / "out/python", npm_dir, 7)
-                with mock.patch.object(
-                    sys,
-                    "argv",
-                    [
-                        "verify_lite_release.py",
-                        "--version",
-                        "1.2.3",
-                        "--archive-dir",
-                        str(archives),
-                        "--wheel-dir",
-                        str(root / "out/python"),
-                        "--npm-dir",
-                        str(npm_dir),
-                        "--build-contract-schema",
-                        "7",
-                    ],
-                ):
-                    self.assertEqual(verifier.main(), 0)
+            command = [
+                sys.executable,
+                str(ROOT / "scripts/packaging/verify_lite_release.py"),
+                "--version",
+                "1.2.3",
+                "--archive-dir",
+                str(archives),
+                "--wheel-dir",
+                str(root / "out/python"),
+                "--npm-dir",
+                str(npm_dir),
+                "--build-contract-schema",
+                "7",
+            ]
+            subprocess.run(command, check=True, capture_output=True)
+            unsupported = subprocess.run(
+                [*command[:-1], "8"], capture_output=True, text=True
+            )
+            self.assertEqual(unsupported.returncode, 2)
+            self.assertIn("invalid choice", unsupported.stderr)
 
-                # Sidecar equivalence matters independently of libantfly's
-                # bytes. The real builder must carry it into both channels.
-                darwin = next(
-                    p for p in package.PACKAGE_PLATFORMS if p.release_os == "Darwin"
-                )
-                wheel_path = (
-                    root
-                    / "out/python"
-                    / f"antfly_embedded-1.2.3-py3-none-{darwin.wheel_platform}.whl"
-                )
-                original_wheel = wheel_path.read_bytes()
-                with zipfile.ZipFile(wheel_path) as wheel:
-                    members = [(i, wheel.read(i)) for i in wheel.infolist()]
-                with zipfile.ZipFile(wheel_path, "w") as wheel:
-                    for info, content in members:
-                        wheel.writestr(
-                            info,
-                            b"tampered"
-                            if info.filename.endswith("/libantfly-apple.dylib")
-                            else content,
-                        )
-                with self.assertRaisesRegex(
-                    ValueError, "library mismatch:.*libantfly-apple"
-                ):
-                    verifier.verify("1.2.3", archives, root / "out/python", npm_dir, 7)
-                wheel_path.write_bytes(original_wheel)
+            # A schema-7 package must preserve the companion library as well
+            # as libantfly. Exercise missing and changed bytes in both formats.
+            darwin = next(
+                p for p in package.PACKAGE_PLATFORMS if p.release_os == "Darwin"
+            )
+            wheel = (
+                root
+                / "out/python"
+                / (f"antfly_embedded-1.2.3-py3-none-{darwin.wheel_platform}.whl")
+            )
+            npm = npm_dir / "antfly-embedded-darwin-arm64-1.2.3.tgz"
+            for path, member_name in (
+                (wheel, "antfly_embedded/_lib/libantfly-apple.dylib"),
+                (npm, "package/lib/libantfly-apple.dylib"),
+            ):
+                original = path.read_bytes()
+                for replacement in (None, b"wrong bridge"):
+                    with self.subTest(package=path.name, replacement=replacement):
+                        import io
 
-                npm_path = npm_dir / "antfly-embedded-darwin-arm64-1.2.3.tgz"
-                original_npm = npm_path.read_bytes()
-                import io
-
-                with tarfile.open(npm_path) as archive:
-                    members = [
-                        (i, archive.extractfile(i).read() if i.isfile() else None)
-                        for i in archive.getmembers()
-                    ]
-                with tarfile.open(npm_path, "w:gz") as archive:
-                    for info, content in members:
-                        if info.name.endswith("/libantfly-apple.dylib"):
-                            content = b"tampered"
-                            info.size = len(content)
-                        archive.addfile(
-                            info, io.BytesIO(content) if content is not None else None
-                        )
-                with self.assertRaisesRegex(
-                    ValueError, "library mismatch:.*libantfly-apple"
-                ):
-                    verifier.verify("1.2.3", archives, root / "out/python", npm_dir, 7)
-                npm_path.write_bytes(original_npm)
+                        if path == wheel:
+                            with (
+                                zipfile.ZipFile(io.BytesIO(original)) as source,
+                                zipfile.ZipFile(path, "w") as target,
+                            ):
+                                for member in source.infolist():
+                                    content = source.read(member)
+                                    if member.filename == member_name:
+                                        if replacement is None:
+                                            continue
+                                        content = replacement
+                                    target.writestr(member, content)
+                        else:
+                            with (
+                                tarfile.open(
+                                    fileobj=io.BytesIO(original), mode="r:gz"
+                                ) as source,
+                                tarfile.open(path, "w:gz") as target,
+                            ):
+                                for member in source.getmembers():
+                                    content = (
+                                        source.extractfile(member)
+                                        if member.isfile()
+                                        else None
+                                    )
+                                    if member.name == member_name:
+                                        if replacement is None:
+                                            continue
+                                        member.size = len(replacement)
+                                        content = io.BytesIO(replacement)
+                                    target.addfile(member, content)
+                        result = subprocess.run(command, capture_output=True, text=True)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("Apple bridge mismatch", result.stderr)
+                        path.write_bytes(original)
             # Older immutable requests still verify their split Lite archives;
             # schema 2 never requires the newly bundled public inference CLI.
             for platform in package.PACKAGE_PLATFORMS:

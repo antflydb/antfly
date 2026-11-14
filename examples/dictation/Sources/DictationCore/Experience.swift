@@ -5,7 +5,23 @@ import Foundation
 
 public enum DictationMode: String, Codable, CaseIterable, Sendable {
   case verbatim, clean, rewrite
-  public var label: String { rawValue.capitalized }
+  public var label: String { self == .clean ? "Clean up" : rawValue.capitalized }
+  public var description: String {
+    switch self {
+    case .verbatim:
+      return "Keep the recognized wording. Voice formatting can still add line breaks."
+    case .clean:
+      return
+        "Remove fillers, fix punctuation, and apply preferred spellings using a text processor."
+    case .rewrite: return "Use a text processor to apply your tone and rewrite instructions."
+    }
+  }
+  public func validateProcessor(_ model: String) throws {
+    if self != .verbatim && model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      throw DictationError.invalid(
+        "Choose a text processor for \(label) in Presets & dictionary, or select Verbatim.")
+    }
+  }
 }
 public enum ProcessingStrategy: String, Codable, CaseIterable, Sendable {
   case automatic, incremental, wholeUtterance
@@ -90,7 +106,7 @@ extension Preset {
   public var outputMode: DictationMode {
     get {
       mode
-        ?? (style == "verbatim"
+        ?? (style == "verbatim" || cleanupModel.isEmpty
           ? .verbatim : (style == "clean" && instructions.isEmpty ? .clean : .rewrite))
     }
     set { mode = newValue }

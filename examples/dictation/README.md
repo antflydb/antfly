@@ -287,11 +287,12 @@ Final clips use the binary AFATT001 attachment envelope, keeping audio out of
 JSON and avoiding base64 expansion and metadata allocation limits. A server can
 impose a smaller audio limit; shorten the recording if that limit is reached.
 
-**Clean** is the default. It fixes punctuation, filler words, and dictionary
-spellings when a generator is configured. **Rewrite** applies tone and custom
-instructions using the complete utterance. **Verbatim** skips generation. Without
-a cleanup generator, settings explain that only recognition runs. Existing JSON
-presets infer their mode from their style/instructions; explicit choices persist.
+**Verbatim** is the default when no text processor is configured. **Clean up**
+fixes punctuation, filler words, and dictionary spellings using a text processor.
+**Rewrite** applies tone and custom instructions using the complete utterance.
+Selecting Clean up or Rewrite requires a processor before recording. Existing JSON
+presets without an explicit mode infer Verbatim when no processor is configured;
+otherwise they infer their mode from style/instructions. Explicit choices persist.
 
 Automatic uses named Whisper transcribers advertising `stable_segments` and
 `text_cleanup`: final ASR segments are cleaned during recording, release commits
@@ -535,3 +536,98 @@ persistence to finish. Server and model updates remain independent.
 See [updates and release setup](UPDATES.md) for organization signing credentials,
 notarization, protected GitHub setup, independent release tags, recovery, and the
 optional managed-local-server design.
+
+## Getting ready and everyday use
+
+The Getting ready checklist separates microphone permission, Accessibility permission,
+shortcut registration, and speech model discovery. Recording from the window is a
+useful test without Accessibility; dictating into another app requires its text field
+to be focused before using the global shortcut. Permission status refreshes when you
+return from System Settings.
+
+Settings are grouped into General (updates and retention), Speech & text (engine and
+voice formatting), Shortcuts & permissions, and Advanced (server/storage details).
+Edits are held in memory for the current session. **Save settings** persists them
+and applies shortcut/retention changes; the footer shows unsaved changes. History shows **Off** in its tab when disabled. Enabling history explicitly saves
+settings; text history and local audio retention are independent.
+
+New installations start with Verbatim output. **Clean up** removes fillers and fixes
+punctuation; **Rewrite** also applies tone and instructions. Both require a text
+processor selected in the preset. Recording is blocked with an actionable
+configuration message rather than silently ignoring the selected output mode.
+The same validation also applies to retries; a configuration error preserves
+original-text recovery. Preferred spellings are vocabulary hints, not guaranteed
+recognition replacements.
+
+For the bundled engine, **Install / check … speech** explicitly permits Apple
+asset downloads, restarts the engine, and sends one second of generated silence to
+install and verify the active preset’s language (English when the language is
+empty). This does not record microphone audio, paste text, or create history. Setup displays its current stage and can be canceled;
+Apple controls the download and does not expose percentage progress through this
+released runtime. Installation uses a separate cancellable HTTP session and an
+explicit `X-Antfly-Inference-Timeout-Ms: 1800000` budget supported by the pinned
+rc.13 engine. The setup request allows 30 minutes, with a short client grace period
+for the server's final response. Normal dictation keeps its existing shorter
+request budgets; this does not change inference defaults globally. Select another
+preset before setup to install/check its language separately. Regional equivalence
+that the inventory cannot prove stays unverified until a successful dictation.
+External servers must enable `download_assets` on the server host themselves.
+
+Engine checks expose checking, current, and failed states. Failed checks discard
+cached model readiness. Apple speech readiness uses the native speech-availability
+flag and installed languages, not catalog presence alone. Missing or ambiguous
+regional language information stays unverified until dictation confirms it;
+external models with an unknown default language do not get a guessed green check.
+Automatic selection only chooses Apple when speech assets for the preset language
+are known ready and its text processor is compatible with shared cleanup.
+
+Switching bundled speech engines checks all configured text processors before
+starting setup. An incompatible raw model or missing generator blocks the switch
+and offers explicit choices: use Verbatim for affected presets, or use the bundled
+Apple processor if it exists. Compatible processors and rewrite instructions are
+preserved. The app commits the candidate preset selection only after setup succeeds.
+Apple text processing still requires Apple Intelligence and its generation assets,
+independently of Apple speech. Setup success, failure, and cancellation messages
+identify the engine being configured; failed/canceled setup does not trigger an
+automatic transcriber switch.
+
+The unsaved indicator is cached on configuration/credential edits. Shortcut-only
+setup updates only the saved shortcut baseline, so unrelated changes remain pending
+without serializing the full configuration during recording UI updates.
+
+Choosing **Automatic** in a preset is an explicit new selection and clears the
+suppression left by a completed, failed, or canceled setup. Automatic selection
+keeps an incremental Whisper preset on a compatible engine. An explicit switch
+to an engine without stable segments offers **Use Automatic processing for
+incompatible presets** before installation starts. Text-processor and processing
+resolutions compose, so resolving one conflict does not undo the other choice.
+
+Installation and preference saving are separate steps. New settings are written
+to a private staging file and atomically published before the app activates the
+candidate preset selection. If writing fails, the old selection stays active and
+the window offers **Retry saving settings** (without reinstalling) or **Keep
+previous selection**. Resolve that choice before editing configuration; installed
+speech assets remain available either way. Errors applying already-saved settings,
+such as shortcut permissions, are reported as warnings rather than pretending the
+settings write failed. Setup success messages retain the language actually checked,
+so changing the selected preset cannot relabel an earlier language verification.
+
+Setup retries start a stopped managed engine before waiting for readiness. External
+Apple speech recovery identifies the server and directs its administrator to install
+language assets or enable `download_assets`; it never offers a local-only button.
+
+Durable settings and shortcut writes run on a serialized filesystem worker, with a
+visible saving state. The final commit is drained rather than canceled halfway
+through; the app applies its known disk outcome before admitting another change.
+Quitting waits for these writes and their resulting retention work. Exports use a
+separate owned worker, so slow export storage does not hold up preference writes or
+recording admission. Import stages credentials for the imported origin and adopts them only after the
+settings write succeeds; failures preserve the active credential editor and unsaved
+edits. Replacing an external origin invalidates and refreshes model discovery even
+when the connection settings are not visible. Changing
+processing location reconciles the engine independently of the visible settings tab.
+
+Startup recovery only removes regular, UUID-named `.dictation-settings-*.tmp` files
+inside the app's support directory. A private directory lock coordinates cleanup
+with active writers across app instances; recovery skips a busy writer. It does not
+scan export destinations, follow symlinks, or remove unrelated files.

@@ -453,7 +453,7 @@ importers:
   packages/better-auth:
     dependencies:
       '@antfly/sdk':
-        specifier: workspace:^0.2.2
+        specifier: workspace:^0.3.0
         version: link:../sdk
       '@better-auth/core':
         specifier: ~1.7.14

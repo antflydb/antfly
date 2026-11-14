@@ -120,6 +120,45 @@ pub const Result = struct {
         if (self.unresolved or (self.text.len == 0 and !self.silent)) return error.DocumentUnresolved;
     }
 
+    /// Transfer only the transcript out of an execution workspace. Temporary
+    /// model tensors must not inherit the document/output allocation ceiling.
+    pub fn clone(self: *const Result, allocator: std.mem.Allocator) !Result {
+        var result = self.*;
+        result.allocator = allocator;
+        result.text = try allocator.dupe(u8, self.text);
+        errdefer allocator.free(result.text);
+        result.language = if (self.language) |language| try allocator.dupe(u8, language) else null;
+        errdefer if (result.language) |language| allocator.free(language);
+        result.segments = try allocator.alloc(Segment, self.segments.len);
+        var built: usize = 0;
+        errdefer {
+            for (result.segments[0..built]) |segment| {
+                allocator.free(segment.text);
+                for (segment.words) |word| allocator.free(word.word);
+                allocator.free(segment.words);
+            }
+            allocator.free(result.segments);
+        }
+        for (self.segments, result.segments) |source, *target| {
+            target.* = source;
+            target.text = try allocator.dupe(u8, source.text);
+            errdefer allocator.free(target.text);
+            target.words = try allocator.alloc(Word, source.words.len);
+            var words_built: usize = 0;
+            errdefer {
+                for (target.words[0..words_built]) |word| allocator.free(word.word);
+                allocator.free(target.words);
+            }
+            for (source.words, target.words) |word, *owned| {
+                owned.* = word;
+                owned.word = try allocator.dupe(u8, word.word);
+                words_built += 1;
+            }
+            built += 1;
+        }
+        return result;
+    }
+
     pub fn deinit(self: *Result) void {
         freeSegments(self.allocator, self.segments);
         self.allocator.free(self.text);
@@ -660,4 +699,50 @@ test "long transcription preserves unresolved active windows after a recognized 
     var silent_tail = try transcribeLong(a, &complete, samples, 16000, .{});
     defer silent_tail.deinit();
     try std.testing.expect(!silent_tail.unresolved);
+}
+
+fn exerciseTranscriptClone(allocator: std.mem.Allocator) !void {
+    // Source strings live outside the destination allocator. Every nested
+    // allocation and every scalar completion/timing field must be preserved.
+    var words = [_]Word{
+        .{ .word = @constCast("hello"), .start_ms = 12, .end_ms = 25 },
+        .{ .word = @constCast("again"), .start_ms = 26, .end_ms = 45 },
+    };
+    var segments = [_]Segment{
+        .{ .text = @constCast("hello again"), .words = &words, .start_ms = 10, .end_ms = 50, .speaker_index = 2, .granularity = .phrase },
+        .{ .text = @constCast("hello again"), .words = &words, .start_ms = 60, .end_ms = 90 },
+    };
+    const source = Result{
+        .allocator = std.testing.allocator,
+        .text = @constCast("hello"),
+        .language = @constCast("en"),
+        .segments = &segments,
+        .duration_ms = 100,
+        .windows = 3,
+        .silent = false,
+        .truncated = true,
+        .unresolved = true,
+        .output_tokens = 7,
+        .timing = .{ .mel_ns = 1, .encoder_ns = 2, .prefill_ns = 3, .decode_ns = 4, .decode_steps = 5, .kv_cached = true },
+    };
+    var copy = try source.clone(allocator);
+    defer copy.deinit();
+    try std.testing.expectEqualStrings("hello", copy.text);
+    try std.testing.expectEqualStrings("en", copy.language.?);
+    try std.testing.expectEqualStrings("hello", copy.segments[0].words[0].word);
+    try std.testing.expect(copy.text.ptr != source.text.ptr);
+    try std.testing.expect(copy.segments[0].text.ptr != source.segments[0].text.ptr);
+    try std.testing.expect(copy.segments[0].words[0].word.ptr != source.segments[0].words[0].word.ptr);
+    try std.testing.expectEqualDeep(source.segments[0], copy.segments[0]);
+    try std.testing.expectEqual(source.timing, copy.timing);
+    try std.testing.expectEqual(@as(u64, 100), copy.duration_ms);
+    try std.testing.expectEqual(@as(usize, 3), copy.windows);
+    try std.testing.expectEqual(@as(usize, 7), copy.output_tokens);
+    try std.testing.expect(!copy.silent and copy.truncated and copy.unresolved);
+    try std.testing.expectError(error.ReadOutputTruncated, copy.requireComplete());
+}
+
+test "long transcription clones workspace results with allocation failure cleanup" {
+    try exerciseTranscriptClone(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseTranscriptClone, .{});
 }
