@@ -1821,11 +1821,32 @@ fn reclamationExternallyLockedRefreshDefersDebtToItsMaintenanceOwnerImpl(alloc: 
         defer read.abort();
         try std.testing.expectEqualStrings("version-31", try read.get("doc"));
     }
+    // The owner's own reclamation options need a real `max_storage_bytes`
+    // budget, unlike `initial`/`connection`'s shared `policy` above:
+    // `reclaimPagesImpl`'s redo-fold gate (native.zig, `reserve_retirement_capacity
+    // and self.max_file_bytes != null`) only ever runs `checkpointRedoLog`
+    // for an *unbudgeted* caller's own ride-along pass when there is
+    // nothing to lose by skipping it -- "lite reclamation ride-along
+    // passes force no sync before the next durable write" and "lite
+    // artifact leases defer allocator proof until an authored write"
+    // both rely on exactly that deferral for an unbudgeted `maintainOnce`,
+    // the second of those also externally-locked, so this gate cannot be
+    // relaxed for `externally_locked` generally without forcing an
+    // unwanted fold there too (confirmed live: it folds the lease's own
+    // incidental churn, the sole source of retirement debt on that
+    // store, into a real page the instant any `externally_locked`
+    // special-case is added here). An externally-locked owner that
+    // actually wants its maintenance calls to fold accumulated debt --
+    // this test's own "maintenance owner" -- configures a real budget,
+    // the same as any other owner relying on `reclaimPagesImpl`'s
+    // capacity-pressure fold; without one, there is no other signal that
+    // distinguishes deliberate, substantial debt (32 overwrites of the
+    // same key) from incidental bookkeeping (one lease acquire/release).
     var owner = try Store.openWithOptions(alloc, path, .{
         .io = std.testing.io,
         .no_sync = true,
         .externally_locked = true,
-        .reclamation = policy,
+        .reclamation = .{ .enabled = false, .retirement_work_pages = 1, .max_storage_bytes = 64 * 1024 * 1024 },
     });
     defer owner.close();
     const before = owner.file.activeCheckpoint().commit_sequence;
@@ -1835,7 +1856,11 @@ fn reclamationExternallyLockedRefreshDefersDebtToItsMaintenanceOwnerImpl(alloc: 
     // switching back to the full signal, which itself depended on fixing
     // the background-loop/live-redo-commit race that switch used to
     // expose (§9.7d; `RedoCommitState.appendRecord`'s own doc comment).
-    // Both now land together.
+    // Both now land together -- plus a real `max_storage_bytes` budget
+    // on `owner` (own comment above), without which `reclaimPagesImpl`'s
+    // redo-fold gate always defers, matching "ride-along"/"artifact
+    // leases"'s own unbudgeted expectations and leaving nothing for this
+    // assertion to ever observe.
     try std.testing.expect(owner.file.activeCheckpoint().commit_sequence > before);
     try std.testing.expect((try owner.checkWithCancel(null)).valid);
 }
