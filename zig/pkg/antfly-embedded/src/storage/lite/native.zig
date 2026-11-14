@@ -31643,7 +31643,7 @@ test "lite redo log catalog cursor pinned to an older mark skips a key created o
     }
 }
 
-test "lite redo log vacuum captures uncheckpointed overlay and demotes the file rather than corrupting it" {
+test "lite redo log vacuum captures uncheckpointed overlay and keeps the file a redo-log file" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -31651,6 +31651,7 @@ test "lite redo log vacuum captures uncheckpointed overlay and demotes the file 
     defer a.free(path);
 
     var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    const original_redo_log_capacity = file.header.redo_log_capacity;
 
     try file.beginTransaction();
     try file.putDocument("doc:live", "small");
@@ -31670,16 +31671,17 @@ test "lite redo log vacuum captures uncheckpointed overlay and demotes the file 
     const vacuumed = try file.vacuum();
     _ = vacuumed;
 
-    // §9.4a: `prepareVacuum`'s compacted file never reserves a redo-log
-    // region, so a live handle's stale `redo.writer` (still pointing at
-    // the *old* file's fd/offsets after the swap) must not survive --
-    // otherwise the next commit would divert into a log region that
-    // does not exist in the new file, corrupting whatever bytes happen
-    // to sit at that offset instead. Confirm the demotion is complete
-    // and consistent, not just that nothing crashed.
-    try std.testing.expect(file.redo == null);
-    try std.testing.expectEqual(@as(u64, 0), file.header.redo_log_capacity);
-    try std.testing.expect(file.manifest_commits_enabled);
+    // §9 (vacuum redo-log retention, 0de1ef453d): vacuum used to always
+    // rebuild a plain, non-redo compacted image, permanently reverting a
+    // redo-log store to the legacy manifest-commit path the moment
+    // maintenance first ran. `prepareVacuum`/`replaceWithPreparedGeneration`
+    // now reserve a log region of the same capacity the source file
+    // already had and attach fresh redo state to it once the swap
+    // settles, so the vacuumed generation comes out as a redo-log file
+    // too -- confirm that directly, not a demotion.
+    try std.testing.expect(file.redo != null);
+    try std.testing.expectEqual(original_redo_log_capacity, file.header.redo_log_capacity);
+    try std.testing.expect(!file.manifest_commits_enabled);
 
     // The vacuum's own copy loop (`LiveRecordCursor`/`OverlayScanState`)
     // must have already merged that uncheckpointed overlay into the
@@ -31690,25 +31692,28 @@ test "lite redo log vacuum captures uncheckpointed overlay and demotes the file 
     try std.testing.expectEqualStrings("small", live);
     try std.testing.expectEqual(@as(?[]u8, null), try file.getDocumentAlloc(a, "doc:gone"));
 
-    // A plain commit on the now-demoted (non-redo) file must work
-    // through the ordinary copy-on-write path, not the diversion logic.
+    // A plain commit on the still-redo-log file must work through the
+    // ordinary diversion path, not fall back to manifest commits, and
+    // must not corrupt anything.
     try file.beginTransaction();
     try file.putDocument("doc:after", "fresh");
     try file.commitTransaction();
     const after = (try file.getDocumentAlloc(a, "doc:after")).?;
     defer a.free(after);
     try std.testing.expectEqualStrings("fresh", after);
+    try std.testing.expect((try file.check()).valid);
 
     file.close();
     var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
     defer reopened.close();
-    try std.testing.expect(reopened.redo == null);
+    try std.testing.expect(reopened.redo != null);
     const live_reopened = (try reopened.getDocumentAlloc(a, "doc:live")).?;
     defer a.free(live_reopened);
     try std.testing.expectEqualStrings("small", live_reopened);
     const after_reopened = (try reopened.getDocumentAlloc(a, "doc:after")).?;
     defer a.free(after_reopened);
     try std.testing.expectEqualStrings("fresh", after_reopened);
+    try std.testing.expect((try reopened.check()).valid);
 }
 
 test "lite redo log openIndexValue (artifact lease resolution) sees an uncheckpointed overlay entry" {
