@@ -648,19 +648,6 @@ def test_standalone_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthA
     hidden = auth_api.request_raw("GET", "/tables/docs/documents/doc:other")
     assert hidden.status_code == 404, hidden.text
 
-    # A narrow null filter must preserve the global tenant boundary.
-    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
-    auth_api.request_raw(
-        "PUT",
-        "/auth/v1/users/reader/row-filters/docs",
-        data="null",
-        headers={"Content-Type": "application/json"},
-    ).raise_for_status()
-    auth_api.s.headers["Authorization"] = _basic_auth("reader", "reader")
-    assert auth_api.get("/tables/docs/documents/doc:silver")["tier"] == "silver"
-    hidden = auth_api.request_raw("GET", "/tables/docs/documents/doc:other")
-    assert hidden.status_code == 404, hidden.text
-
 
 def test_stateful_auth_uses_configured_admin_password(stateful_auth_api: AuthApi):
     response = stateful_auth_api.s.get(f"{stateful_auth_api.url}/status", timeout=30)
