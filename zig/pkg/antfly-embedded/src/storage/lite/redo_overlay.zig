@@ -525,6 +525,71 @@ pub const SharedRedoOverlay = struct {
         return try list.toOwnedSlice(allocator);
     }
 
+    /// One version `NativeFile.checkpointRedoLog`'s fold finds superseded
+    /// (not the current head) within its own window -- see that
+    /// function's `redo_fold_retire_pending` field (native.zig) for the
+    /// orphaned-page-retention bug this exists to fix: a diverting
+    /// commit's page-shaped exception (an external value chain, or a
+    /// catalog value's direct-written one) was retained once the next
+    /// fold ran, but never associated with the key/version that actually
+    /// owned it, so a page belonging to a version superseded or deleted
+    /// before that fold ever ran was retained forever instead of being
+    /// retired. Carries only what `NativeFile.retainUnretainedValueChainPages`
+    /// needs to walk and retire the chain; the version's own key/value
+    /// bytes are irrelevant here -- nothing ever applies a superseded
+    /// version to the real tree.
+    pub const SupersededChain = struct {
+        external_value_root_page: u64,
+        external_value_len: usize,
+    };
+
+    /// A snapshot of every version under `root` that this same fold's own
+    /// `snapshotHeadsAlloc(root, min_sequence_exclusive)` call will *not*
+    /// return as a head -- i.e. every node strictly newer than
+    /// `min_sequence_exclusive` in a key's chain except the newest one --
+    /// that still carries its own page-shaped external value chain
+    /// (`external_value_root_page != 0`). Each one is a version a later
+    /// write in this same uncheckpointed window already superseded or
+    /// deleted before any fold ever applied it to the real tree, so
+    /// nothing else will ever retire its chain -- see `SupersededChain`'s
+    /// own doc comment and `NativeFile.checkpointRedoLog`'s "page-shaped
+    /// exception" doc comment.
+    ///
+    /// Walking a chain stops the moment a node's own `sequence` drops to
+    /// `min_sequence_exclusive` or below: everything from there down was
+    /// already folded (and, if page-shaped, already retired) by an
+    /// earlier `checkpointRedoLog` call -- the same boundary
+    /// `snapshotHeadsAlloc` itself uses to skip an already-folded head
+    /// (see its own doc comment), so a version is never discovered as
+    /// "superseded" by more than one fold.
+    ///
+    /// The caller frees the returned slice -- no per-element allocation,
+    /// since `SupersededChain` is a plain value, unlike `OwnedHead`.
+    pub fn snapshotSupersededChainsAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, min_sequence_exclusive: u64) ![]SupersededChain {
+        std.debug.assert(root < 3);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        var list: std.ArrayListUnmanaged(SupersededChain) = .empty;
+        errdefer list.deinit(allocator);
+        var it = self.maps[root].iterator();
+        while (it.next()) |kv| {
+            var node: ?*VersionedOverlayEntry = kv.value_ptr.*;
+            var is_head = true;
+            while (node) |n| {
+                if (n.sequence <= min_sequence_exclusive) break;
+                if (!is_head and n.external_value_root_page != 0) {
+                    try list.append(allocator, .{
+                        .external_value_root_page = n.external_value_root_page,
+                        .external_value_len = n.external_value_len,
+                    });
+                }
+                is_head = false;
+                node = n.older;
+            }
+        }
+        return try list.toOwnedSlice(allocator);
+    }
+
     /// Removes exactly one live pin at `sequence` (the one `pin` added),
     /// not every pin that happens to share that value.
     pub fn unpin(self: *SharedRedoOverlay, io: std.Io, sequence: u64) void {
