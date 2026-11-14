@@ -90,7 +90,16 @@ def populate(db, count):
 @pytest.fixture(scope="module", params=[af.Storage.LITE, af.Storage.DIRECTORY])
 def ranked_graph_db(require_native, tmp_path_factory, request):
     """Query-only planner consumers share the same complete indexed corpus."""
-    storage = request.param
+    yield from _ranked_graph_fixture(tmp_path_factory, request.param)
+
+
+@pytest.fixture(scope="module", params=[af.Storage.LITE, af.Storage.DIRECTORY])
+def selective_ranked_graph_db(require_native, tmp_path_factory, request):
+    """Keep the additional ID index isolated from the other planner fixtures."""
+    yield from _ranked_graph_fixture(tmp_path_factory, request.param, index_id=True)
+
+
+def _ranked_graph_fixture(tmp_path_factory, storage, *, index_id=False):
     root = tmp_path_factory.mktemp("ranked-graph")
     path = root / ("graph.aflite" if storage == af.Storage.LITE else "graph")
     opener = af.create_with_options if storage == af.Storage.LITE else af.open_with_options
@@ -102,6 +111,9 @@ def ranked_graph_db(require_native, tmp_path_factory, request):
         populate(db, 13000)
         db.sql("CREATE INDEX ranked ON docs(score DESC)")
         db.run_until_idle()
+        if index_id:
+            db.sql("CREATE INDEX by_id ON docs(id)")
+            db.run_until_idle()
         # Retain the owner: indexed Lite reads currently need the serving
         # owner's statement leases. These consumers issue queries only; every
         # mutation/rebuild regression continues using the private graph_db.
@@ -7640,13 +7652,8 @@ def test_empty_indexed_order_preserves_a_zero_anchor_budget(graph_db):
         ("n.id='n0'", [0], 1),
     ],
 )
-def test_ordered_node_reads_preserve_selective_access_paths(graph_db, predicate, expected, budget):
-    populate(graph_db, 13000)
-    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
-    graph_db.run_until_idle()
-    graph_db.sql("CREATE INDEX by_id ON docs(id)")
-    graph_db.run_until_idle()
-    result = graph_db.cypher_json(
+def test_ordered_node_reads_preserve_selective_access_paths(selective_ranked_graph_db, predicate, expected, budget):
+    result = selective_ranked_graph_db.cypher_json(
         "g",
         {
             "query": f"MATCH (n:D) WHERE {predicate} RETURN n.score ORDER BY n.score DESC LIMIT {len(expected)}",
