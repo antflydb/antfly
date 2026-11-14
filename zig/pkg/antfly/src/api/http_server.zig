@@ -32335,7 +32335,7 @@ test "auth row filter validator rejects malformed auth node" {
     );
 }
 
-test "effective resolved row filter prefers table filter before wildcard" {
+test "effective resolved row filter combines table and wildcard" {
     const alloc = std.testing.allocator;
     var row_filters = [_]usermgr.RowFilterEntry{
         try usermgr.RowFilterEntry.initOwned(alloc, "*", "{\"term\":{\"visibility\":\"public\"}}"),
@@ -32353,7 +32353,7 @@ test "effective resolved row filter prefers table filter before wildcard" {
     const resolved = (try resolveEffectiveRowFilterJson(alloc, identity, "docs")) orelse return error.TestExpectedEqual;
     defer alloc.free(resolved);
 
-    try std.testing.expectEqualStrings("{\"term\":{\"owner\":\"bob\"}}", resolved);
+    try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"visibility\":\"public\"}},{\"term\":{\"owner\":\"bob\"}}]}", resolved);
 }
 
 test "artifact operations apply source document row filter visibility" {
@@ -63434,18 +63434,16 @@ test "system catalog projection is idempotent and failure atomic" {
 }
 
 test "system catalog signed trusted principal combines all filter scopes" {
-    const Fake = struct {
-        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{ .metadata_group_id = 77, .metrics = .{} };
-        }
-    };
     const a = std.testing.allocator;
     const secret = "scoped-trusted-principal-test-secret";
     const payload = "{\"iss\":\"trusted-upstream\",\"sub\":\"reader\",\"tables\":[\"*\"],\"operations\":[\"read\"],\"metadata\":{\"tenant\":\"a\"},\"row_filter\":{\"*\":{\"term\":{\"tenant\":{\"$auth\":\"metadata.tenant\"}}},\"\\u0000catalog:7:default6:public*\":{\"term\":{\"region\":\"us\"}},\"docs\":{\"term\":{\"status\":\"open\"}},\"\\u0000catalog:7:default6:public4:docs\":null},\"exp\":4102444800}";
     const token = try encodeTrustedPrincipalToken(a, secret, payload);
     defer a.free(token);
-    var server = ApiHttpServer.init(a, .{ .trusted_principal_secret = secret, .trusted_principal_issuer = "trusted-upstream" }, .{ .ptr = undefined, .vtable = &.{ .status = Fake.status } }, null, null);
-    defer server.deinit();
+    // Credential decoding borrows only configuration and an allocator. Keep
+    // unrelated serving capabilities poisoned rather than starting a runtime.
+    var server: ApiHttpServer = undefined;
+    server.alloc = a;
+    server.cfg = .{ .trusted_principal_secret = secret, .trusted_principal_issuer = "trusted-upstream" };
     var identity = try server.authenticateRequest(.{ .trusted_principal = token });
     defer identity.deinit(a);
     const logical = "\x00catalog:7:default6:public4:docs";

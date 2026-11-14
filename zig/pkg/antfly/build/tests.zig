@@ -524,9 +524,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-system-catalog-report-bench", "Run opt-in report apply, repair and selected admission workloads").dependOn(&run_admission_bench.step);
     // Keep credential-scope regressions inexpensive to repeat independently
     // of the broader catalog, DDL and linked runtime suites.
+    const row_filter_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_row_filter_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, row_filter_test_mod, true, true);
+    row_filter_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const row_filter_tests = b.addTest(.{
-        .root_module = api_http_runtime_test_mod,
-        .filters = selectTestFilters(b, &.{ "row filter", "row-filter", "system catalog projection is idempotent", "system catalog signed trusted principal", "system catalog SQL pgwire retained policies" }),
+        .root_module = row_filter_test_mod,
+        .filters = selectTestFilters(b, &.{ "auth row filter", "effective resolved row filter", "system catalog row filter", "system catalog projects only matching", "system catalog projection is idempotent", "system catalog signed trusted principal", "system catalog SQL pgwire retained policies" }),
     });
     b.step("antfly-row-filter-test", "Run credential row-filter scope, projection and retained-policy contracts")
         .dependOn(&b.addRunArtifact(row_filter_tests).step);
@@ -2202,6 +2209,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL JSON null",
         "SQL staged",
         "SQL retained native scan",
+        "auth row filter",
+        "effective resolved row filter",
         "system catalog",
         "backup heartbeat ",
         "table storage creation intent survives",
