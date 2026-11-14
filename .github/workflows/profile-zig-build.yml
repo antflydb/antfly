@@ -149,6 +149,7 @@ jobs:
             printf 'step=%s\noptimize=%s\ncli_optimize=%s\ntarget=%s\nstrip=%s\ncpu=baseline\nmetal=false\ncuda=false\nsystem_blas=false\nshared_pdf_templates=%s\nshared_pdf_sessions=%s\n' "$BUILD_STEP" "$BUILD_OPTIMIZE" "$CLI_OPTIMIZE" "$BUILD_TARGET" "$BUILD_STRIP" "$SHARED_PDF_TEMPLATES" "$SHARED_PDF_SESSIONS"
             printf 'shared_image_operations=%s\nshared_lake_execution=%s\n' "$SHARED_IMAGE_OPERATIONS" "$SHARED_LAKE_EXECUTION"
             printf 'test_filter=%s\n' "$ANTFLY_PROFILE_TEST_FILTER"
+            printf 'merge_recovery_case=%s\n' "$ANTFLY_PROFILE_MERGE_RECOVERY_CASE"
             cat /proc/meminfo
             cat /proc/self/cgroup
             zig env
