@@ -59,6 +59,15 @@
 //! scenario) is meant for routine runs; `exhaustive` mode (every barrier,
 //! every before/after, with and without power loss) is for qualifying a
 //! rewritten commit path and can take several minutes.
+//!
+//! The "crash sweep exhaustive: ..." tests below opt into `exhaustive` mode
+//! only when `ANTFLY_CRASH_SWEEP_EXHAUSTIVE=1` is set (see
+//! `resolveExhaustiveMode`); unset, they still run, but with the same
+//! sampled barrier selection as every plain "crash sweep: ..." test, so a
+//! routine or CI run never pays `exhaustive`'s O(total_barriers^2) replay
+//! cost and the test name still means something whenever it does run. Qualify
+//! a rewritten commit path with `ANTFLY_CRASH_SWEEP_EXHAUSTIVE=1 zig build
+//! antfly-storage-test -- --test-filter "crash sweep exhaustive"`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -161,8 +170,10 @@ pub const Scenario = struct {
     custom_check: ?*const fn (allocator: Allocator, path: []const u8, outcome: ?CrashOutcome, checkpoints: []const Checkpoint) anyerror!void = null,
 };
 
+pub const SweepMode = enum { quick, exhaustive };
+
 pub const SweepOptions = struct {
-    mode: enum { quick, exhaustive } = .quick,
+    mode: SweepMode = .quick,
     quick_sample: usize = 16,
     power_loss: []const PowerLoss = &.{ .drop_unsynced, .none },
     whens: []const When = &.{ .before, .after },
@@ -311,6 +322,32 @@ pub fn runCrashSweep(allocator: Allocator, scenario: Scenario, opts: SweepOption
 
     try runCombosConcurrently(allocator, scenario, combos, jobs, &report);
     return report;
+}
+
+/// The mode a "crash sweep exhaustive: ..." test actually runs with.
+/// `ANTFLY_CRASH_SWEEP_EXHAUSTIVE=1` (any value `std.fmt.parseInt`'s as a
+/// nonzero `u1`) reproduces today's behavior exactly: every barrier, every
+/// before/after, with and without power loss -- for qualifying a rewritten
+/// commit path, where the O(total_barriers^2) cost (every one of
+/// `total_barriers` replays itself costs up to `total_barriers` steps) is
+/// the point. Unset (the default, including routine runs and CI): the same
+/// sampled selection `selectBarriers` already gives every plain "crash
+/// sweep: ..." test, so these tests keep running -- the exhaustive test
+/// *name* still means "this scenario's crash family, including the
+/// post-rewrite-qualification bar" -- without routine runs ever paying the
+/// quadratic cost. The discovery pass (which establishes `total_barriers`)
+/// always runs exhaustively regardless of this; only the replay selection
+/// changes. See this file's own module doc comment ("`exhaustive` mode ...
+/// is for qualifying a rewritten commit path") and
+/// docs/design/lite-performance/lite-single-commit-write-path.md's testing
+/// notes.
+fn resolveExhaustiveMode() SweepMode {
+    if (std.process.Environ.getPosix(std.testing.environ, "ANTFLY_CRASH_SWEEP_EXHAUSTIVE")) |raw| {
+        if (std.fmt.parseInt(u1, raw, 10)) |n| {
+            if (n == 1) return .exhaustive;
+        } else |_| {}
+    }
+    return .quick;
 }
 
 /// Reads `ANTFLY_CRASH_SWEEP_JOBS` (any positive integer; `1` reproduces
@@ -2959,25 +2996,25 @@ test "crash sweep: graph metric build and compaction mid-scenario" {
 }
 
 test "crash sweep exhaustive: primary single doc" {
-    var report = try runCrashSweep(std.testing.allocator, .{ .name = "primary-single-doc", .run = runPrimarySingleDoc }, .{ .mode = .exhaustive });
+    var report = try runCrashSweep(std.testing.allocator, .{ .name = "primary-single-doc", .run = runPrimarySingleDoc }, .{ .mode = resolveExhaustiveMode() });
     defer report.deinit();
     try reportFailures(&report);
 }
 
 test "crash sweep exhaustive: primary batch" {
-    var report = try runCrashSweep(std.testing.allocator, .{ .name = "primary-batch", .run = runPrimaryBatch }, .{ .mode = .exhaustive });
+    var report = try runCrashSweep(std.testing.allocator, .{ .name = "primary-batch", .run = runPrimaryBatch }, .{ .mode = resolveExhaustiveMode() });
     defer report.deinit();
     try reportFailures(&report);
 }
 
 test "crash sweep exhaustive: primary update then delete" {
-    var report = try runCrashSweep(std.testing.allocator, .{ .name = "primary-update-delete", .run = runPrimaryUpdateDelete }, .{ .mode = .exhaustive });
+    var report = try runCrashSweep(std.testing.allocator, .{ .name = "primary-update-delete", .run = runPrimaryUpdateDelete }, .{ .mode = resolveExhaustiveMode() });
     defer report.deinit();
     try reportFailures(&report);
 }
 
 test "crash sweep exhaustive: deterministic concurrent writers" {
-    var report = try runCrashSweep(std.testing.allocator, .{ .name = "deterministic-concurrent-writers", .run = runDeterministicConcurrentWriters }, .{ .mode = .exhaustive });
+    var report = try runCrashSweep(std.testing.allocator, .{ .name = "deterministic-concurrent-writers", .run = runDeterministicConcurrentWriters }, .{ .mode = resolveExhaustiveMode() });
     defer report.deinit();
     try reportFailures(&report);
 }
@@ -2989,7 +3026,7 @@ test "crash sweep exhaustive: full text synchronous visibility" {
         .via_db = true,
         .search_index = "body_text",
         .search_field = "body",
-    }, .{ .mode = .exhaustive });
+    }, .{ .mode = resolveExhaustiveMode() });
     defer report.deinit();
     try reportFailures(&report);
 }
@@ -3001,7 +3038,7 @@ test "crash sweep exhaustive: full text with non-durable commit" {
         .via_db = true,
         .search_index = "body_text",
         .search_field = "body",
-    }, .{ .mode = .exhaustive });
+    }, .{ .mode = resolveExhaustiveMode() });
     defer report.deinit();
     try reportFailures(&report);
 }

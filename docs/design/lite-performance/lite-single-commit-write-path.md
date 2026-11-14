@@ -3193,3 +3193,69 @@ scenarios in §9.7; (g) the cross-process WAL index (§9.3b) in
 `shared_lock_region.zig`, landing after §8's steps 1-3; (h) the mmap
 read path (§9.6), optional, evaluated first against real numbers from
 (b)-(g).
+
+## 10. Crash-sweep test performance (`perf/lwa-sweep-fast`)
+
+Status: in progress. The crash family (`crash_consistency_test.zig`'s
+`runCrashSweep`/`runOneCrash`/`checkInvariants`/`selectBarriers`, backed
+by `crash_sim_io.zig`'s `SimIo`) replays each scenario once per selected
+barrier, from scratch, and costs 40-80s per sweep in Debug; the full
+family takes 20+ minutes.
+
+**Exhaustive variants are opt-in (landed).** The six "crash sweep
+exhaustive: ..." tests used to always run `SweepOptions{ .mode =
+.exhaustive }` -- every barrier, both `when`s, both `power_loss`
+settings -- which is the O(total_barriers^2) cost (each of
+`total_barriers` replays itself costs up to `total_barriers` steps) the
+module doc comment already called out as being "for qualifying a
+rewritten commit path," not routine runs. `resolveExhaustiveMode()`
+(`crash_consistency_test.zig`) now reads `ANTFLY_CRASH_SWEEP_EXHAUSTIVE`:
+set to `1`, these tests run exactly as before; unset (the default,
+including CI), they run with the same sampled `selectBarriers` selection
+as every plain "crash sweep: ..." test, so the exhaustive test *name*
+still means something whenever a rewrite qualification run opts in, but
+a routine run never pays the quadratic cost. The discovery pass (which
+establishes `total_barriers` and is always exhaustive, by construction)
+is unaffected either way. Qualify a rewrite with
+`ANTFLY_CRASH_SWEEP_EXHAUSTIVE=1 zig build antfly-storage-test --
+--test-filter "crash sweep exhaustive"`.
+
+**Dominant real-time cost found, not yet fixed, outside this file
+pair's scope.** Timing individual sweeps (Debug, `ANTFLY_CRASH_SWEEP_JOBS`
+default concurrency) found two scenarios -- "full text with retirement
+turn" (≈317s) and "graph metric build and compaction mid-scenario"
+(≈327s) -- whose cost is dominated not by replay-from-scratch repetition
+but by a real-wall-clock retry storm: once a replay's injected fault
+reaches a `db_mod.DB` background derived worker (`storage/db/derived/
+io_threaded_runtime.zig`'s `scheduleRecoverableCatchUpRetry`, backed by
+`catch_up_policy.RecoverableRetryBackoff`'s 10ms->250ms exponential
+backoff), `DB.close()`'s drain waits out that backoff for real -- via
+`storage/common/maintenance_scheduler.zig`'s `Scheduler`, whose dispatch
+wait (`Condition.waitTimeout` -> `Io.futexWaitTimeout`) is a real OS
+futex wait with a deadline from `platform_time.monotonicNs()`, not a
+call through `SimIo`'s overridden `Io.VTable` entries (`fileSync`/
+`dirRename`/etc.) and so cannot be made instant by anything in
+`crash_sim_io.zig` alone. One retry storm runs per replay that crashes
+with pending derived work, independent of whether that replay is a full
+replay-from-scratch or (future) a prefix-reuse replay -- so §10's item 1
+(prefix reuse) will not shrink this cost; only a change to the backoff/
+drain policy itself (outside `crash_consistency_test.zig`/
+`crash_sim_io.zig`, and outside this workstream's assigned files) would.
+Flagged for the derived-worker/maintenance-scheduler owners rather than
+fixed here, per this effort's own scoping rule (fix root causes inside
+owned files; report shared-root-cause findings instead of reaching
+outside scope).
+
+**Prefix reuse (item 1), determinism (item 3), and scenario sizing (item
+4): not yet landed.** Every scenario's `run` opens its `NativeFile`/`DB`
+exactly once and never reopens mid-run, so there is no existing point
+`SimIo` could snapshot filesystem state at and resume from without
+first restructuring each scenario into explicit, reopen-at-boundary
+steps (option (b) in this effort's brief) -- and that restructuring must
+be proven barrier-count-neutral (a clean close/reopen of an already-
+fully-synced store adds no new `fileSync`/rename calls) before a
+prefix-reuse replay's barrier numbering can be asserted identical to
+today's full-replay-from-scratch numbering, scenario by scenario,
+including every `via_db` scenario's background derived-worker
+interaction. That proof-then-migrate work, across the crash family's 20+
+scenarios, remains open.
