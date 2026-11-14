@@ -1117,7 +1117,22 @@ fn removeReplicaIntentCatalogLocked(
     } });
 }
 
+// These background/admission plans intentionally keep asynchronous proposal
+// semantics. A successful prefix can still commit if a later command fails;
+// only a rejection before that prefix proves the whole request is unapplied.
 fn applyReconciliationPlanMode(service: anytype, plan: *const metadata_reconciler.ReconciliationPlan, comptime catalog_locked: bool) !void {
+    var possible_admission = false;
+    applyReconciliationPlanSequential(service, plan, catalog_locked, &possible_admission) catch |err| {
+        if (!possible_admission) return err;
+        // A failed suffix does not roll back an admitted prefix. Match the
+        // receipt-backed path: all failures after admission have an unknown
+        // request outcome, including validation and cancellation failures.
+        std.log.warn("metadata reconciliation plan outcome became ambiguous after a successful prefix err={s}", .{@errorName(err)});
+        return error.MetadataMutationOutcomeUnknown;
+    };
+}
+
+fn applyReconciliationPlanSequential(service: anytype, plan: *const metadata_reconciler.ReconciliationPlan, comptime catalog_locked: bool, possible_admission: *bool) !void {
     std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
     for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
         if (comptime catalog_locked) {
@@ -1129,12 +1144,28 @@ fn applyReconciliationPlanMode(service: anytype, plan: *const metadata_reconcile
         } else {
             try service.upsertReplicaIntent(intent, precondition.expected_metadata_version, precondition.expected_version_fence, precondition.expected_target_drain_requested);
         }
+        possible_admission.* = true;
     }
-    for (plan.table_upserts) |record| try service.upsertTable(record);
-    for (plan.split_admissions) |admission| try service.admitSplitTransition(admission);
-    for (plan.range_upserts) |record| try service.upsertRange(record);
-    for (plan.split_upserts) |record| try service.upsertSplitTransition(record);
-    for (plan.merge_upserts) |record| try service.upsertMergeTransition(record);
+    for (plan.table_upserts) |record| {
+        try service.upsertTable(record);
+        possible_admission.* = true;
+    }
+    for (plan.split_admissions) |admission| {
+        try service.admitSplitTransition(admission);
+        possible_admission.* = true;
+    }
+    for (plan.range_upserts) |record| {
+        try service.upsertRange(record);
+        possible_admission.* = true;
+    }
+    for (plan.split_upserts) |record| {
+        try service.upsertSplitTransition(record);
+        possible_admission.* = true;
+    }
+    for (plan.merge_upserts) |record| {
+        try service.upsertMergeTransition(record);
+        possible_admission.* = true;
+    }
     for (plan.placement_removals) |record| {
         if (comptime catalog_locked) {
             const preflight = try cachedInitialPlacementProof(service, record.group_id);
@@ -1142,12 +1173,28 @@ fn applyReconciliationPlanMode(service: anytype, plan: *const metadata_reconcile
         } else {
             try service.removeReplicaIntent(record.group_id, record.local_node_id, record.expected_metadata_version);
         }
+        possible_admission.* = true;
     }
-    for (plan.table_removals) |table_id| try service.removeTable(table_id);
-    for (plan.range_removals) |group_id| try service.removeRange(group_id);
-    for (plan.split_removals) |transition_id| try service.removeSplitTransition(transition_id);
-    for (plan.merge_removals) |transition_id| try service.removeMergeTransition(transition_id);
-    if (plan.clear_reallocation_request) |expected| try service.clearReallocationRequest(expected);
+    for (plan.table_removals) |table_id| {
+        try service.removeTable(table_id);
+        possible_admission.* = true;
+    }
+    for (plan.range_removals) |group_id| {
+        try service.removeRange(group_id);
+        possible_admission.* = true;
+    }
+    for (plan.split_removals) |transition_id| {
+        try service.removeSplitTransition(transition_id);
+        possible_admission.* = true;
+    }
+    for (plan.merge_removals) |transition_id| {
+        try service.removeMergeTransition(transition_id);
+        possible_admission.* = true;
+    }
+    if (plan.clear_reallocation_request) |expected| {
+        try service.clearReallocationRequest(expected);
+        possible_admission.* = true;
+    }
 }
 
 /// Materialize a multi-command catalog plan before admitting any part of it,
@@ -1402,6 +1449,59 @@ test "metadata service node lifecycle proposal distinguishes rejection from ambi
         .{ .finalize_node_shutdown = .{ .node_id = 9 } },
     );
     try std.testing.expectEqual(@as(usize, 1), committed.wait_calls);
+}
+
+test "metadata reconciliation sequential plans fence rejection proofs after a transition" {
+    const FakeService = struct {
+        fail_at: usize,
+        failure: anyerror,
+        calls: usize = 0,
+        admitted: usize = 0,
+        fn record(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls == self.fail_at) return self.failure;
+            self.admitted += 1;
+        }
+        fn one(self: *@This(), _: anytype) !void {
+            try self.record();
+        }
+        pub const upsertTable = one;
+        pub const admitSplitTransition = one;
+        pub const upsertRange = one;
+        pub const upsertSplitTransition = one;
+        pub const upsertMergeTransition = one;
+        pub const removeTable = one;
+        pub const removeRange = one;
+        pub const removeSplitTransition = one;
+        pub const removeMergeTransition = one;
+        pub const clearReallocationRequest = one;
+        pub fn upsertReplicaIntent(self: *@This(), _: anytype, _: anytype, _: anytype, _: anytype) !void {
+            try self.record();
+        }
+        pub fn removeReplicaIntent(self: *@This(), _: u64, _: u64, _: u64) !void {
+            try self.record();
+        }
+    };
+    const splits = [_]metadata_reconciler.SplitAdmission{.{ .expected_source_epoch = 0, .record = .{ .transition_id = 19, .attempt_epoch = 1, .source_group_id = 71, .destination_group_id = 72 } }};
+    const merges = [_]transition_state.MergeTransitionRecord{.{ .transition_id = 29, .donor_group_id = 71, .receiver_group_id = 72 }};
+    const removals = [_]u64{99};
+    for ([_]bool{ false, true }) |split| {
+        var plan = metadata_reconciler.ReconciliationPlan.empty();
+        if (split) plan.split_admissions = @constCast(&splits) else plan.merge_upserts = @constCast(&merges);
+        // A transition can be admitted before cleanup of an unrelated group.
+        plan.range_removals = @constCast(&removals);
+        for ([_]anyerror{ error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataMutationNotApplied, error.InvalidArguments, error.OutOfMemory, error.Canceled, error.DeadlineExceeded }) |failure| {
+            for (1..3) |fail_at| {
+                var fake: FakeService = .{ .fail_at = fail_at, .failure = failure };
+                try std.testing.expectError(if (fail_at == 1) failure else error.MetadataMutationOutcomeUnknown, applyReconciliationPlanMode(&fake, &plan, false));
+                try std.testing.expectEqual(fail_at, fake.calls);
+                try std.testing.expectEqual(fail_at - 1, fake.admitted);
+            }
+        }
+        var ready: FakeService = .{ .fail_at = 0, .failure = error.NotLeader };
+        try applyReconciliationPlanMode(&ready, &plan, false);
+        try std.testing.expectEqual(@as(usize, 2), ready.admitted);
+    }
 }
 
 test "metadata reconciliation plan uses one terminal receipt for ordered apply" {
@@ -6129,6 +6229,14 @@ pub const MetadataService = struct {
         _ = try self.raft.stepTransitions();
     }
 
+    pub fn localMetadataLeadershipTerm(self: *MetadataService) ?u64 {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const leadership_status = self.raft.host.host.raftStatus(self.metadata_group_id) orelse return null;
+        if (leadership_status.soft.role != .leader or leadership_status.soft.leader_id == null or leadership_status.soft.leader_id.? != leadership_status.id) return null;
+        return leadership_status.hard.current_term;
+    }
+
     fn isLocalMetadataLeader(self: *MetadataService) bool {
         self.lockRuntime();
         defer self.unlockRuntime();
@@ -8575,17 +8683,20 @@ pub const MetadataService = struct {
 
     fn ensureReconcileLeaseLocked(self: *MetadataService) !bool {
         const now_ms = self.reconcile_lease.nowMs();
-        const is_local_leader = self.isLocalMetadataLeader();
+        const term = self.localMetadataLeadershipTerm();
+        const is_local_leader = term != null;
         const projected = self.getCachedProjectedReconcileLease(now_ms, is_local_leader) catch |err| switch (err) {
             error.MissingMetadataStore => null,
             else => return err,
         };
         const has_lease = self.reconcile_lease.observe(is_local_leader, projected, now_ms);
-        if (self.reconcile_lease.shouldRenew(is_local_leader, projected, now_ms)) {
-            self.upsertReconcileLease(self.reconcile_lease.desiredRecord(now_ms)) catch |err| {
+        if (self.reconcile_lease.shouldProposeRenewal(term, projected, now_ms)) {
+            const desired = self.reconcile_lease.desiredRecord(now_ms);
+            self.upsertReconcileLease(desired) catch |err| {
                 self.reconcile_lease.noteAcquireFailure();
                 return err;
             };
+            self.reconcile_lease.noteRenewalProposed(term.?, desired);
         }
         return has_lease;
     }
@@ -13449,17 +13560,20 @@ pub const MetadataHttpService = struct {
 
     fn ensureReconcileLeaseLocked(self: *MetadataHttpService) !bool {
         const now_ms = self.reconcile_lease.nowMs();
-        const is_local_leader = self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id);
+        const term = self.localMetadataLeadershipTerm();
+        const is_local_leader = term != null;
         const projected = self.getCachedProjectedReconcileLease(now_ms, is_local_leader) catch |err| switch (err) {
             error.MissingMetadataStore => null,
             else => return err,
         };
         const has_lease = self.reconcile_lease.observe(is_local_leader, projected, now_ms);
-        if (self.reconcile_lease.shouldRenew(is_local_leader, projected, now_ms)) {
-            self.upsertReconcileLease(self.reconcile_lease.desiredRecord(now_ms)) catch |err| {
+        if (self.reconcile_lease.shouldProposeRenewal(term, projected, now_ms)) {
+            const desired = self.reconcile_lease.desiredRecord(now_ms);
+            self.upsertReconcileLease(desired) catch |err| {
                 self.reconcile_lease.noteAcquireFailure();
                 return err;
             };
+            self.reconcile_lease.noteRenewalProposed(term.?, desired);
         }
         return has_lease;
     }
@@ -15132,10 +15246,9 @@ fn ensureCdcWorkPermit(service: anytype) !void {
         service.reconcile_lease.config.lease_ttl_ms *| std.time.ns_per_ms,
     );
     const deadline_ns = platform_time.monotonicNs() +| renew_timeout_ns;
-    var proposed_expires_at_ms: u64 = 0;
     while (platform_time.monotonicNs() < deadline_ns) {
         if (service.cdc_shutdown.load(.acquire)) return error.CdcWorkShuttingDown;
-        if (!cdcLocalMetadataLeader(service)) return error.CdcWorkLeaseLost;
+        const term = service.localMetadataLeadershipTerm() orelse return error.CdcWorkLeaseLost;
 
         const now_ms = service.reconcile_lease.nowMs();
         const projected = try service.getProjectedReconcileLease();
@@ -15160,12 +15273,12 @@ fn ensureCdcWorkPermit(service: anytype) !void {
         }
 
         const desired = service.reconcile_lease.desiredRecord(now_ms);
-        if (desired.expires_at_ms > proposed_expires_at_ms) {
+        if (service.reconcile_lease.shouldProposeRenewal(term, projected, now_ms)) {
             service.upsertReconcileLease(desired) catch |err| {
                 service.reconcile_lease.noteAcquireFailure();
                 return err;
             };
-            proposed_expires_at_ms = desired.expires_at_ms;
+            service.reconcile_lease.noteRenewalProposed(term, desired);
         }
         try advanceCdcLeaseRaft(service);
         platform_clock.Clock.real().sleepMs(1);
