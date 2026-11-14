@@ -17863,8 +17863,21 @@ pub const NativeFile = struct {
     /// `previous` by every caller before this runs). `evictCacheForPagesReusedSince`
     /// (see its own doc comment) closes the gap that leaves for a page this
     /// failed attempt *reused* rather than appended.
+    ///
+    /// perf/lwa-rollback-clobber (#1216): `self.header` is the correctness-
+    /// bearing input here, restored by `publishCheckpoint`'s own matching
+    /// fix whenever a failure unwinds through its `durable_header` swap --
+    /// but `self.durable_header`, when still set, is this file's own
+    /// record of the last page_count a ride-along commit durably-enough
+    /// (physically written, if not yet synced) reached, and is never
+    /// smaller than this rollback's rightful boundary. Clamping against it
+    /// is a backstop, not the fix: never truncate below the one boundary
+    /// this instance itself already remembers as "already written," no
+    /// matter which caller's own bug might otherwise hand `first_page` a
+    /// stale, too-small value.
     fn discardTransactionTail(self: *NativeFile) void {
-        const first_page = self.activeCheckpoint().page_count;
+        const durable_floor = if (self.durable_header) |durable| durable.checkpoints[durable.active_checkpoint].page_count else 0;
+        const first_page = @max(self.activeCheckpoint().page_count, durable_floor);
         self.page_cache.discardFrom(self.allocator, first_page);
         self.evictCacheForPagesReusedSince(first_page);
         const size = first_page * @as(u64, self.header.page_size);
@@ -18584,10 +18597,37 @@ pub const NativeFile = struct {
         const previous_tip = self.headerFingerprint();
         defer if (self.reader_coordinator) |coordinator| coordinator.published(publication_inode.?, previous_tip, self.headerFingerprint(), self.checkpoint_publication_uncertain);
         defer self.notifyPublication();
+        // perf/lwa-rollback-clobber (#1216): capture what this swap is
+        // about to discard so a failure anywhere below (a redo append/
+        // sync failure, the v8/v9 slot write, the republish branch) can
+        // restore it, instead of leaving `self.header` pinned at the
+        // stale pre-ride-along `durable` snapshot while the file on disk
+        // -- and `self.header` a moment ago -- already reflects every
+        // ride-along commit's own, already-physically-written pages.
+        // Reproduced live: a background reclaim's non-durable ride-along
+        // commit grows the file to a new page_count (its own real pages,
+        // written synchronously, just never fsynced -- §9.3's existing
+        // ride-along discipline) and leaves `self.durable_header` holding
+        // the *older* snapshot it superseded; a *different*, later
+        // commit's own redo-log append then fails its sync, and without
+        // this restore, this swap had already pointed `self.header` back
+        // at that older, smaller snapshot with nothing to undo it --
+        // `commitTransactionWithDurability`'s own `discardTransactionTail`
+        // then truncates the file down to that stale, too-small page_count,
+        // physically destroying the reclaim's already-written pages even
+        // though they were never this failing transaction's own.
+        var pre_durable_swap_header: ?Header = null;
+        var pre_durable_swap_durable: ?Header = null;
         if (self.durable_header) |durable| {
+            pre_durable_swap_header = self.header;
+            pre_durable_swap_durable = durable;
             self.header = durable;
             self.durable_header = null;
         }
+        errdefer if (pre_durable_swap_header) |header| {
+            self.header = header;
+            self.durable_header = pre_durable_swap_durable;
+        };
         var redo_fell_back_to_slot = false;
         if (self.redo != null and !self.redo.?.checkpointing) {
             const redo = &self.redo.?;
@@ -31997,6 +32037,95 @@ test "lite redo log a sync failure right after a successful bare (page-shaped) a
     const third_reopened = (try reopened.getIndexCatalogRecordAlloc(a, "third")).?;
     defer a.free(third_reopened);
     try std.testing.expectEqualStrings("value-three", third_reopened);
+    try std.testing.expect((try reopened.check()).valid);
+}
+
+// Regression for perf/lwa-rollback-clobber (#1216): a *different* commit's
+// own non-durable ride-along (durable=false, §9.3's existing discipline --
+// its own real, page-shaped content is physically written, just never
+// synced, with `self.durable_header` left holding the pre-growth snapshot)
+// lands durably-enough on disk *before* this test's own failing commit even
+// opens its transaction. That failing commit's own redo append succeeds but
+// its sync fails (`test_fail_redo_sync`, same injection the two tests above
+// use) -- and `publishCheckpoint`'s own `durable_header` swap used to point
+// `self.header` straight at that stale, pre-ride-along snapshot with
+// nothing to undo it on this failure, so `commitTransactionWithDurability`'s
+// own `discardTransactionTail` then truncated the file down to the
+// ride-along's own *pre*-growth page_count -- destroying its already-
+// physically-written pages even though they were never this failing
+// transaction's own. Reproduced end-to-end via `crash sweep: dense
+// native-catalog dimension replacement delete (#1216)` (a background
+// reclaim's own ride-along commit racing a foreground commit's own
+// injected sync failure, sequentially on one `NativeFile`, not two
+// concurrent ones -- see docs/design/lite-performance/
+// lite-single-commit-write-path.md §9.7d's own "not fully closed" note).
+test "lite redo log rollback after a sync failure never truncates another commit's own already-written ride-along pages (#1216)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-rollback-clobber.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+
+    // An ordinary durable commit first (mirrors every other ride-along
+    // test in this file): establishes the catalog/index roots a bare
+    // `beginTransaction` on a brand-new file has not built yet.
+    try file.beginTransaction();
+    try file.putDocument("seed", "kept");
+    try file.commitTransaction();
+
+    // Large enough to force a real, page-shaped external value chain
+    // (the "page-shaped exception" `pageAllocatorForDivertingCommit`'s own
+    // doc comment names) -- not just a logical overlay entry.
+    const large_value = try a.alloc(u8, 9000);
+    defer a.free(large_value);
+    @memset(large_value, 'x');
+
+    try file.beginTransaction();
+    try file.putDocument("grown", large_value);
+    // Non-durable: this commit's own pages are physically written above,
+    // but durability is deferred to a later commit's own sync --
+    // `durable_header` now holds the pre-growth snapshot.
+    try file.commitTransactionWithDurability(false, null);
+    try std.testing.expect(file.durable_header != null);
+    const page_count_after_ride_along = file.activeCheckpoint().page_count;
+
+    // A different, later, durable commit whose own redo append succeeds
+    // but whose sync fails.
+    file.test_fail_redo_sync = error.TestInjectedFailure;
+    try file.beginTransaction();
+    try file.putDocument("beta", "two");
+    try std.testing.expectError(error.OutcomeUnknown, file.commitTransaction());
+    try std.testing.expectEqual(@as(?anyerror, null), file.test_fail_redo_sync);
+
+    // The regression itself: this rollback must never retreat `self.header`
+    // below the ride-along commit's own, already-published page_count --
+    // it owns none of those pages.
+    try std.testing.expect(file.activeCheckpoint().page_count >= page_count_after_ride_along);
+    try std.testing.expect((try file.checkWithCancel(null)).valid);
+
+    // An ordinary durable commit right after must still succeed and must
+    // flush the ride-along's own pending `durable_header`.
+    try file.beginTransaction();
+    try file.putDocument("gamma", "three");
+    try file.commitTransaction();
+    try std.testing.expect(file.durable_header == null);
+
+    const grown = (try file.getDocumentAlloc(a, "grown")).?;
+    defer a.free(grown);
+    try std.testing.expectEqualStrings(large_value, grown);
+    try std.testing.expect((try file.getDocumentAlloc(a, "beta")) == null);
+
+    // A cold reopen must also recover cleanly, with the ride-along's own
+    // content intact and the rolled-back commit absent.
+    file.close();
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    defer reopened.close();
+    const grown_reopened = (try reopened.getDocumentAlloc(a, "grown")).?;
+    defer a.free(grown_reopened);
+    try std.testing.expectEqualStrings(large_value, grown_reopened);
+    try std.testing.expect((try reopened.getDocumentAlloc(a, "beta")) == null);
     try std.testing.expect((try reopened.check()).valid);
 }
 
