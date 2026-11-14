@@ -2485,6 +2485,22 @@ test "lite artifact leases survive owner close and do not pin document retiremen
     var docs_open = true;
     defer if (docs_open) docs.close();
     docs.maintenance_start_suppressed = true;
+    // This store's own debt (the lease's artifact and the loop's own
+    // "/other" churn below) is pure logical redo-overlay content -- a
+    // catalog-direct external value, never page-shaped -- so nothing
+    // here ever crosses `maybeAutoCheckpointRedoLog`'s own byte
+    // threshold. The only thing that ever folds it is the ride-along
+    // idle-flush timer's own `maybeCheckpointRedoLogOnIdleTurn`, gated
+    // on real idleness (never on busy wakes, see that function's own
+    // doc comment), debounced against both the last commit and the
+    // last fold -- deliberately left at its production default
+    // (50ms), not shrunk: shrinking it below the time consecutive
+    // writes in the loop below actually take (under load, that can
+    // exceed a few ms) would let the timer catch "idle" *between*
+    // individual writes and fold once per write instead of batching
+    // the whole loop's debt into one fold on the explicit idle wait
+    // after it -- exactly the write-amplification regression this
+    // same idle gate exists to avoid.
     var store = Store.init(a, &docs);
     const storage = store.storage();
     const payload = try a.alloc(u8, 256 * 1024);
@@ -2500,6 +2516,15 @@ test "lite artifact leases survive owner close and do not pin document retiremen
         try storage.deleteFileAbsolute("/other");
         try docs.maintainOnce(false);
     }
+    // Past the loop, wait for the background idle-flush timer to fold
+    // everything the loop queued in one pass. Poll the ledger's own
+    // "nothing left superseded" signal (`docstore.waitForRedoFold`, the
+    // same deadline+yield pattern "lite ride-along idle-flush timer
+    // alone makes N ride-alongs durable with exactly 1 sync" uses for
+    // its own background commit) rather than a fixed sleep: under heavy
+    // concurrent load on this box, a fixed window flakes on whether the
+    // fold actually ran before the assertion below reads the numbers.
+    try docstore.waitForRedoFold(&docs);
     try std.testing.expect((try docs.reclamationStatus()).reused_pages > 0);
     var out: [137]u8 = undefined;
     try source.readInto(12345, &out);

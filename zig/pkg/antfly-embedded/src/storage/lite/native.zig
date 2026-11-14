@@ -10265,11 +10265,30 @@ pub const NativeFile = struct {
     /// that a backlog never grows unbounded between maintenance turns.
     const foreground_retirement_cap_pages: usize = 16;
 
-    fn drainRetirement(self: *NativeFile, state: *allocator_v4.State, checkpoint: CheckpointSlot, budget: usize) !usize {
+    fn drainRetirement(self: *NativeFile, state: *allocator_v4.State, checkpoint: CheckpointSlot, budget: usize, fence_held: bool) !usize {
         // A registering reader may still hold its shared inode lock before
-        // publishing its epoch. Without the exclusive scan fence, even logical
-        // promotion would let a later writer consume that reader's old pages.
-        if (budget == 0 or self.epoch_window == null) return 0;
+        // publishing its epoch. Without the exclusive scan fence, even
+        // logical promotion would let a later writer consume that reader's
+        // old pages. `fence_held` (not `self.epoch_window != null`) is the
+        // right test for that: `epoch_window` only reflects *cross-process*
+        // readers (via a shared `regionForInode()`), so it stays null
+        // whenever no `reader_coordinator` is configured -- the common,
+        // single-process case -- even though the caller's own exclusive
+        // inode lock (`acquireEpochReuseLock`, unconditional whether or not
+        // a region exists) already fences every other writer, and
+        // in-process readers are tracked unconditionally by `reuseFrontier`/
+        // `metadataReuseFrontier` themselves (reader pins, `ReadView`s),
+        // not by `epoch_window`. Treating "no region" as "fence not held"
+        // made this a permanent no-op for any store without a configured
+        // `reader_coordinator`: `state.heap`/`metadata_heap`/`chains_heap`
+        // items were never completed/released on that path (confirmed live
+        // as "lite reclamation writable reopen services debt and read only
+        // reopen does not (redo)" never reaching a bounded steady state --
+        // this file's own ledger bookkeeping pages, retired every fold,
+        // never promoted back to reusable). Not redo-specific: this gate
+        // has no legacy/redo branch, so it was equally dead for legacy
+        // `page_reuse = true` stores with no reader_coordinator.
+        if (budget == 0 or !fence_held) return 0;
         const frontier = self.reuseFrontier();
         const metadata_frontier = self.metadataReuseFrontier();
         // Completed data/chain pages use the metadata fence too: recovery can
@@ -10836,7 +10855,15 @@ pub const NativeFile = struct {
             const advances = 2 *| allocator_v4.serviceJournalPages(self.maxPagePayloadBytes(), 1);
             while (work > 1 and allocator_v4.serviceJournalPages(self.maxPagePayloadBytes(), work) +| advances > available) work = work / 2 + work % 2;
         }
-        const count = try self.drainRetirement(pages.ledger.?, before, work);
+        // Same `fence_held` condition as `pageAllocatorFromFreeMapWithProof`'s
+        // own `drainRetirement` call (that function's own doc comment):
+        // `pages` was already built by this transaction's one call into
+        // it above, so its `data_lock_file`/`coordinated_reader_window`
+        // report whether this transaction actually holds the exclusive
+        // scan fence, independent of whether `self.epoch_window` ended up
+        // populated (cross-process readers only).
+        const fence_held = pages.data_lock_file != null or pages.coordinated_reader_window;
+        const count = try self.drainRetirement(pages.ledger.?, before, work, fence_held);
         const state = pages.ledger.?;
         if (state.checkpointDue()) {
             // Bound metadata construction independently of the physical ledger
@@ -16559,8 +16586,25 @@ pub const NativeFile = struct {
             // bounding the normal (128-budget) case to a few pages per
             // commit; drainRetirement's own heaps already carry the cursor
             // forward between calls; nothing here re-scans from the start.
-            _ = try self.drainRetirement(state, checkpoint, @min(self.retirement_work_pages, foreground_retirement_cap_pages));
-            const can_reuse = self.free_pages_verified and (lock != null or (coordinated and self.reader_window_lock != null));
+            // perf/lwa-lease-fold: "fence held" -- the exclusive scan fence
+            // this drain's own comment (above `has_retirement_backlog`)
+            // requires before touching retirement data structures -- is
+            // `lock != null or coordinated`, the same condition `can_reuse`
+            // below already uses for the identical reason. It is not the
+            // same thing as `self.epoch_window != null`: a direct
+            // `acquireEpochReuseLock` (the `lock` branch) always takes the
+            // exclusive inode lock first, regardless of whether
+            // `regionForInode()` finds a shared region to populate
+            // `epoch_window` from -- no `reader_coordinator` configured
+            // (the common, single-process case) means no cross-process
+            // readers to fence, not "fence not held" or "readers unknown":
+            // in-process readers stay tracked unconditionally (`reuseFrontier`/
+            // `metadataReuseFrontier`'s own reader-pin terms, unrelated to
+            // `epoch_window`), so the frontier `drainRetirement` compares
+            // against is already correct either way.
+            const fence_held = lock != null or (coordinated and self.reader_window_lock != null);
+            _ = try self.drainRetirement(state, checkpoint, @min(self.retirement_work_pages, foreground_retirement_cap_pages), fence_held);
+            const can_reuse = self.free_pages_verified and fence_held;
             return .{ .file = self, .free_pages = &.{}, .next_page_id = self.manifestSafeNextPageId(checkpoint.page_count), .ledger = state, .can_reuse = can_reuse, .reuse_retry_enabled = self.free_pages_verified and !can_reuse, .coordinated_reader_window = coordinated, .data_lock_file = lock };
         }
         var free_pages = try self.readFreePagesAlloc(checkpoint);

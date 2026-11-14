@@ -1982,8 +1982,277 @@ test "lite reclamation writable reopen services debt and read only reopen does n
     try reclamationWritableReopenServicesDebtAndReadOnlyReopenDoesNotImpl(std.testing.allocator, false);
 }
 
+// perf/lwa-lease-fold: the shared Impl above exercises the *legacy*
+// rewrite/vacuum contract specifically (`page_reuse = false`, no ledger
+// at all -- "with the ledger or reuse showing it" has nothing to show
+// under that configuration). Under redo, "writable reopen services
+// debt, read-only reopen does not" is a different, ledger-based
+// contract: `maybeCheckpointRedoLogOnIdleTurn` folds genuine
+// `pendingRetirementVersions` debt once idle (never on a read-only
+// file, which that function refuses outright), and `reclaimPagesImpl`'s
+// own indexed retirement queue then makes the folded chain's pages
+// reusable. `page_reuse = true` here, not `false`, so that ledger
+// actually exists to observe.
 test "lite reclamation writable reopen services debt and read only reopen does not (redo)" {
-    try reclamationWritableReopenServicesDebtAndReadOnlyReopenDoesNotImpl(std.testing.allocator, true);
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "reclamation-reopen-redo.aflite");
+    defer alloc.free(path);
+    const value: [32]u8 = @splat('v');
+    {
+        var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .page_reuse = true, .enabled = false } });
+        defer store.close();
+        store.maintenance_start_suppressed = true;
+        for (0..64) |_| {
+            var write = try store.beginWrite();
+            errdefer write.abort();
+            try write.put("doc", &value);
+            try write.commit();
+        }
+        // Read-only: `maybeCheckpointRedoLogOnIdleTurn` refuses outright
+        // (`self.read_only`), so even given idle time, none of this
+        // debt is serviced -- the ledger shows exactly what it showed
+        // the moment this file was opened.
+        var reader = try Store.openWithOptions(alloc, path, .{ .read_only = true, .io = std.testing.io, .reclamation = .{ .page_reuse = true, .enabled = false } });
+        const before_read_only_idle = try reader.reclamationStatus();
+        try std.testing.io.sleep(.fromMilliseconds(60), .awake);
+        const after_read_only_idle = try reader.reclamationStatus();
+        reader.close();
+        try std.testing.expectEqual(before_read_only_idle.reusable_pages, after_read_only_idle.reusable_pages);
+        try std.testing.expectEqual(@as(u64, 0), after_read_only_idle.reusable_pages);
+    }
+    // Writable reopen: the same debt (every superseded version of "doc"
+    // across those 64 overwrites) is still there -- give the idle-flush
+    // timer a chance to fold it. Waiting on a fixed sleep and hoping the
+    // background task got scheduled in time is flaky under heavy
+    // concurrent load (many other worktrees' own test/build processes on
+    // this box can preempt it past any reasonable fixed window); instead,
+    // poll the one ledger-level signal the fold itself retires --
+    // `pendingRetirementVersions()` dropping to 0 -- the same
+    // deadline+yield pattern "lite ride-along idle-flush timer alone
+    // makes N ride-alongs durable with exactly 1 sync" uses to wait for
+    // its own background commit.
+    var owner = try Store.openWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .page_reuse = true, .enabled = false } });
+    defer owner.close();
+    owner.maintenance_start_suppressed = true;
+    // The idle-flush timer is a background task started lazily, on this
+    // `owner` instance's own first commit (`Store.ensureRideAlongFlushStarted`'s
+    // own doc comment) -- reopening alone never commits anything, so
+    // without one, there would be no task running to ever notice the
+    // debt below.
+    {
+        var kick = try owner.beginWrite();
+        errdefer kick.abort();
+        try kick.put("doc", &value);
+        try kick.commit();
+    }
+    try waitForRedoFold(&owner);
+    // The idle fold's own build already retires every superseded "doc"
+    // version and, within that same commit, reuses what it frees for
+    // the live version's own fresh page -- for a workload this small
+    // (64 tiny, inline overwrites of one key, several packed per
+    // physical page) that nets out to "nothing left sitting idle as
+    // `reusable_pages`", not "nothing was ever retired": `reused_pages`
+    // is what actually witnesses the debt being serviced here. Drain
+    // directly (a separate, ordinary step any later commit's own inline
+    // drain, `pageAllocatorFromFreeMapWithProof`, would also take)
+    // before reading the final numbers, catching whatever incidental
+    // ledger bookkeeping the fold's own commit did not already absorb
+    // inline, rather than asserting a specific split between the two.
+    try reclaimPagesRetrying(&owner, 4096);
+    const serviced = try owner.reclamationStatus();
+    try std.testing.expect(serviced.reused_pages > 0);
+    try std.testing.expect((try owner.checkWithCancel(null)).valid);
+    var read = try owner.beginRead();
+    try std.testing.expectEqualStrings(&value, try read.get("doc"));
+    read.abort();
+    // This first fold is the ledger's first look at *any* real, physical
+    // "doc" page at all (every prior version lived only as a logical
+    // redo-overlay entry, never a page) -- it has nothing of its own to
+    // retire yet, so it pays none of the allocator_v4 ledger's own
+    // first-ever retirement-queue structural cost (the pending/snapshot
+    // bookkeeping pages that only come into existence once the ledger
+    // ever has a real page to track). A second round of 64 overwrites
+    // gives the *next* fold a real page to retire (this one's), which is
+    // where that one-time structural cost actually lands. Measuring the
+    // fixed baseline here, after round one, would misattribute that cost
+    // to "growth" in round two; measure it after round two instead, same
+    // as the legacy Impl above measures its own fixed `overhead` once,
+    // after whatever the file format's own fixed cost is has already
+    // been paid.
+    for (0..64) |_| {
+        var write = try owner.beginWrite();
+        errdefer write.abort();
+        try write.put("doc", &value);
+        try write.commit();
+    }
+    try waitForRedoFold(&owner);
+    try reclaimPagesRetrying(&owner, 4096);
+    const baseline = try owner.reclamationStatus();
+    // `reused_pages` is a cumulative, all-time counter (`state.allocations`),
+    // not a per-round one -- `> 0` alone would already hold from round
+    // one's own reuse. Comparing against round one's own count confirms
+    // this second round *also* reused at least one page of its own,
+    // rather than silently allocating fresh ones while round one's
+    // stale count carries the assertion.
+    try std.testing.expect(baseline.reused_pages > serviced.reused_pages);
+    // Steady state: three more rounds of the same 64 overwrites, each
+    // followed by the same idle fold, must reuse the pages the previous
+    // round's fold just retired rather than growing the file without
+    // bound -- the whole point of the ledger this configuration enables,
+    // and the one-time structural cost above is already paid by
+    // `baseline`. Byte-exact, not a widened tolerance: before
+    // `drainRetirement`'s `fence_held` fix (native.zig), this file's own
+    // ledger bookkeeping pages (added to `chains_heap`/`metadata_heap`
+    // by each fold's own persist rotation) were never completed/released
+    // on a no-`reader_coordinator` store like this one, since that gate
+    // keyed off `self.epoch_window != null` (cross-process readers only)
+    // rather than whether the exclusive scan fence was actually held --
+    // confirmed via a 5-round probe that grew by a constant ~2 pages
+    // every round, forever, before that fix. Checking three full rounds
+    // past `baseline`, not just one, confirms convergence rather than a
+    // lucky single data point.
+    var previous = baseline;
+    for (0..3) |_| {
+        for (0..64) |_| {
+            var write = try owner.beginWrite();
+            errdefer write.abort();
+            try write.put("doc", &value);
+            try write.commit();
+        }
+        try waitForRedoFold(&owner);
+        try reclaimPagesRetrying(&owner, 4096);
+        const round = try owner.reclamationStatus();
+        try std.testing.expect(round.reused_pages > previous.reused_pages);
+        try std.testing.expectEqual(previous.current_file_bytes, round.current_file_bytes);
+        previous = round;
+    }
+    try std.testing.expect((try owner.checkWithCancel(null)).valid);
+}
+
+// perf/lwa-lease-fold: direct regression test for `drainRetirement`'s
+// `fence_held` fix (native.zig). No `reader_coordinator` is configured
+// (the overwhelming majority of callers never configure one), so
+// `self.epoch_window` stays null for this whole test by construction --
+// before the fix, that alone made `drainRetirement` a permanent no-op,
+// leaving every ledger bookkeeping page (`metadata_heap`/`chains_heap`)
+// each persist rotation retires un-promoted and un-reusable forever. Runs
+// both modes: legacy builds a real page per commit directly, so no
+// idle-fold wait is needed between rounds; redo needs one (its own
+// commits only divert until something folds), reusing the same
+// `waitForRedoFold` helper the dual-mode test above does.
+fn reclamationLedgerBookkeepingReleasedWithoutReaderCoordinatorImpl(alloc: Allocator, use_redo_log: bool) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "ledger-bookkeeping-no-coordinator.aflite");
+    defer alloc.free(path);
+    const value: [32]u8 = @splat('v');
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .use_redo_log = use_redo_log, .reclamation = .{ .page_reuse = true, .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    std.debug.assert(store.file.reader_coordinator == null);
+    for (0..64) |_| {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("doc", &value);
+        try write.commit();
+    }
+    if (use_redo_log) try waitForRedoFold(&store);
+    try reclaimPagesRetrying(&store, 4096);
+    // One more warmup round before the baseline, matching the dual-mode
+    // redo test above: the very first retirement this file's ledger ever
+    // sees has nothing of its own (no prior real page/ledger generation)
+    // to retire yet, so it pays none of the ledger's own one-time
+    // generational-rotation structural cost -- the second round is where
+    // that lands. Comparing straight off round one would misattribute it
+    // as "growth."
+    for (0..64) |_| {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put("doc", &value);
+        try write.commit();
+    }
+    if (use_redo_log) try waitForRedoFold(&store);
+    try reclaimPagesRetrying(&store, 4096);
+    var previous = try store.reclamationStatus();
+    for (0..4) |_| {
+        for (0..64) |_| {
+            var write = try store.beginWrite();
+            errdefer write.abort();
+            try write.put("doc", &value);
+            try write.commit();
+        }
+        if (use_redo_log) try waitForRedoFold(&store);
+        try reclaimPagesRetrying(&store, 4096);
+        const round = try store.reclamationStatus();
+        // The fix: ledger bookkeeping pages (not just "doc"'s own content
+        // page) actually get promoted and reused round over round, rather
+        // than `drainRetirement` silently doing nothing because no shared
+        // region ever populated `epoch_window`.
+        try std.testing.expect(round.reused_pages > previous.reused_pages);
+        try std.testing.expectEqual(previous.current_file_bytes, round.current_file_bytes);
+        previous = round;
+    }
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite reclamation ledger bookkeeping pages are released and reused without a reader_coordinator (legacy)" {
+    try reclamationLedgerBookkeepingReleasedWithoutReaderCoordinatorImpl(std.testing.allocator, false);
+}
+
+test "lite reclamation ledger bookkeeping pages are released and reused without a reader_coordinator (redo)" {
+    try reclamationLedgerBookkeepingReleasedWithoutReaderCoordinatorImpl(std.testing.allocator, true);
+}
+
+// Polls (deadline + yield, the same pattern "lite ride-along idle-flush
+// timer alone makes N ride-alongs durable with exactly 1 sync" uses for
+// its own background commit) until the ride-along idle-flush timer's
+// `maybeCheckpointRedoLogOnIdleTurn` has folded every version it
+// superseded so far -- rather than sleeping a fixed duration and hoping
+// the background task got scheduled in time, which flakes under heavy
+// concurrent load on a shared box.
+pub fn waitForRedoFold(store: *Store) !void {
+    const redo = store.file.redo orelse return error.TestExpectedRedoLog;
+    const deadline_ns = antfly_platform.time.monotonicNs() +| (10 * std.time.ns_per_s);
+    while (redo.shared.pendingRetirementVersions(std.testing.io) != 0) {
+        if (antfly_platform.time.monotonicNs() >= deadline_ns) return error.RedoFoldNeverFired;
+        std.Thread.yield() catch {};
+    }
+}
+
+// `NativeFile.reclaimPages` takes the same exclusive inode lock the
+// background ride-along flush loop's own fold/commit does
+// (`acquireEpochReuseLock`); if that loop is mid-transaction right when
+// this call lands, it gets `error.WouldBlock` internally and returns 0
+// (no work done) rather than blocking -- correct, deadlock-avoiding
+// behavior for a real caller, but it means a single call from a test can
+// occasionally do nothing for a reason that has nothing to do with
+// whether there was work to do. Retry briefly instead of asserting on
+// one call's result.
+// A single successful (nonzero) call is not necessarily a *complete*
+// drain either: `drainRetirement`'s own per-call budgets (`state.pending`
+// headroom in particular) can leave a partial backlog for a still-busy
+// ledger to finish on a later call. Call until two consecutive successful
+// calls agree on `current_file_bytes` (true convergence this round), not
+// just until one call does something.
+pub fn reclaimPagesRetrying(store: *Store, budget: usize) !void {
+    const deadline_ns = antfly_platform.time.monotonicNs() +| (10 * std.time.ns_per_s);
+    var previous_bytes: ?u64 = null;
+    var stable_calls: usize = 0;
+    while (true) {
+        _ = try store.file.reclaimPages(budget);
+        const bytes = (try store.reclamationStatus()).current_file_bytes;
+        if (previous_bytes != null and previous_bytes.? == bytes) {
+            stable_calls += 1;
+            if (stable_calls >= 3) return;
+        } else {
+            stable_calls = 0;
+        }
+        previous_bytes = bytes;
+        if (antfly_platform.time.monotonicNs() >= deadline_ns) return;
+        std.Thread.yield() catch {};
+    }
 }
 
 test "lite reclamation budget rejects a mutation before exhausting capacity" {
@@ -5410,6 +5679,20 @@ pub const Store = struct {
         // byte-heavy-but-entry-light backlog the entry count alone would
         // not flag.
         const threshold_due = redo.writer.remaining() < redo.writer.capacity / 2;
+        // perf/lwa-lease-fold: genuine retirement debt (`pendingRetirementVersions`)
+        // also needs a periodic, idle-gated fold -- an unbudgeted redo store
+        // otherwise never reclaims superseded space, since `reclaimPagesImpl`'s
+        // own unbudgeted ride-along stays correctly deferred forever by design
+        // (see its own doc comment), and an artifact lease's own catalog-direct
+        // writes never divert page-shaped bytes at all, so `threshold_due` never
+        // trips for that workload either. That trigger is intentionally *not*
+        // added here: perf/lwa-wamp-regress owns the one checkpoint/maintenance
+        // trigger policy for this file (fold or maintain on log fill, or after
+        // the longer `redo_idle_checkpoint_ns` idle window, batching all
+        // outstanding debt into one fold) to avoid two independent idle
+        // triggers compounding into the write-amplification regression that
+        // policy exists to fix. Once that policy lands, it is expected to
+        // service this same retirement debt on its own idle pass.
         if (!has_overlay_work and !threshold_due) return;
         // AssumeLocked: this whole function runs under `lockStoreExclusive`
         // above, which locks the same `self.mutex` `recordMaintenanceError`
