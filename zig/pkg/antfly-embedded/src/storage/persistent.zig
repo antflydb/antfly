@@ -4414,9 +4414,6 @@ test "native segment publication admits writer and mmap before creating output" 
     // Two lifetime descriptors leave no safe two-slot publication window.
     // Admission must fail before the atomic writer creates the segment file.
     try std.testing.expectError(
-        error.StorageDescriptorPressure,
-        error.ProcessFdQuotaExceeded,
-        error.SystemFdQuotaExceeded,
         error.PersistentDescriptorAdmissionExhausted,
         store.publish(1, "not published"),
     );
@@ -4508,9 +4505,6 @@ test "native sink publication admits writer and mmap before invoking builder" {
     var calls: usize = 0;
     var builder = CopyBuilder{ .bytes = segment, .calls = &calls };
     try std.testing.expectError(
-        error.StorageDescriptorPressure,
-        error.ProcessFdQuotaExceeded,
-        error.SystemFdQuotaExceeded,
         error.PersistentDescriptorAdmissionExhausted,
         pi.indexSegmentFromSinkBuilder(&builder, CopyBuilder.build),
     );

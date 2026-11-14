@@ -2017,6 +2017,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "provisioned named index repair keeps group queued for aggregate debt audit",
             "dirty table tracking stays bounded to writer cache ownership",
             "writer cache eviction retires dirty ownership after the last cache owner",
+            "persistent descriptor exhaustion is a retryable writer-open conflict",
             "prepared writer open evicts an inactive sibling group before retrying descriptor pressure",
             "prepared writer open reclaims descriptor capacity from startup cache",
             "forwarded write sources use the local writer owner dirty lifecycle",
