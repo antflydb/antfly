@@ -53,7 +53,7 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def decoded_weights(path):
+def decoded_weights(path, device="cuda"):
     """Decode GGUF F32/Q8_0 without expanding the entire bundle on the host."""
     import numpy as np
     import torch
@@ -137,7 +137,7 @@ def decoded_weights(path):
                 raise ValueError(f"unsupported GGUF tensor {name}: {kind}")
             if not np.isfinite(decoded).all():
                 raise ValueError(f"non-finite GGUF tensor {name}")
-            yield name, torch.from_numpy(decoded.reshape(shape)).to("cuda")
+            yield name, torch.from_numpy(decoded.reshape(shape)).to(device)
 
 
 def python_worker(args):

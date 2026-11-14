@@ -35,12 +35,21 @@ pub fn main(init: std.process.Init) !void {
     var cases_path: ?[]const u8 = null;
     var case_index: usize = 0;
     var all_cases = false;
+    var controlled = false;
+    var microbatch: usize = 64;
+    var batch_tokens: usize = 16384;
     var worker = false;
     var precision: factory.GlinerCudaPrecision = .fp32;
     while (args.next()) |arg| {
         const value = args.next() orelse return error.MissingArgument;
-        if (std.mem.eql(u8, arg, "--model-dir")) model_dir = value else if (std.mem.eql(u8, arg, "--backend")) backend = value else if (std.mem.eql(u8, arg, "--warmup")) warmup = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--reps")) reps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--cases")) cases_path = value else if (std.mem.eql(u8, arg, "--case")) case_index = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--worker")) worker = (try std.fmt.parseInt(u8, value, 10)) == 1 else if (std.mem.eql(u8, arg, "--all-cases")) all_cases = (try std.fmt.parseInt(u8, value, 10)) == 1 else if (std.mem.eql(u8, arg, "--precision")) precision = std.meta.stringToEnum(factory.GlinerCudaPrecision, value) orelse return error.InvalidArgument else return error.InvalidArgument;
+        if (std.mem.eql(u8, arg, "--batch-tokens")) {
+            batch_tokens = try std.fmt.parseInt(usize, value, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--model-dir")) model_dir = value else if (std.mem.eql(u8, arg, "--backend")) backend = value else if (std.mem.eql(u8, arg, "--warmup")) warmup = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--reps")) reps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--cases")) cases_path = value else if (std.mem.eql(u8, arg, "--case")) case_index = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--worker")) worker = (try std.fmt.parseInt(u8, value, 10)) == 1 else if (std.mem.eql(u8, arg, "--all-cases")) all_cases = (try std.fmt.parseInt(u8, value, 10)) == 1 else if (std.mem.eql(u8, arg, "--controlled")) controlled = (try std.fmt.parseInt(u8, value, 10)) == 1 else if (std.mem.eql(u8, arg, "--microbatch")) microbatch = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--precision")) precision = std.meta.stringToEnum(factory.GlinerCudaPrecision, value) orelse return error.InvalidArgument else return error.InvalidArgument;
     }
+    if (microbatch == 0 or microbatch > 64) return error.InvalidArgument;
+    if (batch_tokens == 0) return error.InvalidArgument;
     if (warmup > 100 or reps < 3 or reps > 1000) return error.InvalidArgument;
     const path = model_dir orelse return error.MissingArgument;
     const selected = backend orelse return error.MissingArgument;
@@ -55,16 +64,32 @@ pub fn main(init: std.process.Init) !void {
     defer tok.deinitTokenizer();
     const session = if (std.mem.eql(u8, selected, "cuda"))
         try factory.createGlinerCudaSessionWithPrecision(a, path, precision)
+    else if (std.mem.eql(u8, selected, "metal"))
+        try factory.createMetalSession(a, path)
     else if (std.mem.eql(u8, selected, "native"))
         try factory.createNativeSession(a, path)
     else
         return error.InvalidBackend;
     defer session.close();
+    if (std.mem.eql(u8, selected, "metal") and session.backend() != .metal) return error.InvalidBackend;
+    if (std.mem.eql(u8, selected, "metal"))
+        try factory.sealGlinerDecisionTokenizerDigest(session, inference.models.gliner_decide_qualification.Digest.of(tokenizer_bytes));
+    if (factory.getGlinerDecideMetalExecutionPolicy(session)) |policy| {
+        microbatch = @min(microbatch, policy.batch_items);
+        batch_tokens = @min(batch_tokens, policy.padded_batch_tokens);
+    }
+    const watchdog = if (controlled) try inference.HardCancellationWatchdog.create(a) else null;
+    defer if (watchdog) |owner| owner.destroy();
+    if (watchdog) |owner| try owner.start(init.io);
     var pipeline = gliner.GlinerPipeline{
         .allocator = a,
         .session = session,
         .tok = tok,
+        .execution_control = if (watchdog) |owner| .{ .io = init.io, .hard_cancellation = owner.boundary() } else null,
         .config = .{
+            .decision_batch_size = microbatch,
+            .decision_batch_tokens = batch_tokens,
+            .decision_reuse_batch_padding = if (factory.getGlinerDecideMetalExecutionPolicy(session)) |policy| policy.reuse_batch_padding else false,
             .model_type = manifest.gliner_model_type,
             .classification_head = .label_marker_mlp,
             .max_length = manifest.max_position_embeddings,
@@ -137,6 +162,7 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
     defer a.free(samples);
     const stats_before = factory.getCudaRuntimeStats(pipeline.session);
     for (0..warmup + reps) |i| {
+        if (pipeline.execution_control) |*control| control.deadline_ns = inference.platform.time.monotonicNs() + 120 * std.time.ns_per_s;
         const start = inference.platform.time.monotonicNs();
         const result = try pipeline.decideBatch(requests);
         const elapsed_ns = inference.platform.time.monotonicNs() - start;
@@ -170,14 +196,22 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
     }.less);
     const median = if (reps % 2 == 0) (samples[reps / 2 - 1] + samples[reps / 2]) / 2 else samples[reps / 2];
     const p95 = samples[@min(reps - 1, (reps * 95 + 99) / 100 - 1)];
+    const identity: ?inference.models.gliner_decide_qualification.Identity = factory.getGlinerDecisionIdentity(pipeline.session) catch null;
     const output = try std.json.Stringify.valueAlloc(a, .{
         .implementation = "antfly_gliner25_decide",
         .request_id = request_id,
         .duration_ns = @as(u64, @intFromFloat(median * std.time.ns_per_ms)),
         .backend = selected,
         .precision = if (precision == .auto) "fp32" else @tagName(precision),
+        .model_variant = if (identity) |loaded| inference.models.gliner_decide_qualification.qualifiedVariant(loaded) else null,
         .case_index = case_index,
         .batch_size = requests.len,
+        .physical_batch_limit = pipeline.config.decision_batch_size,
+        .physical_batch_token_limit = pipeline.config.decision_batch_tokens,
+        .physical_reuse_batch_padding = pipeline.config.decision_reuse_batch_padding,
+        .controlled = pipeline.execution_control != null,
+        .metal_model_policy = factory.getGlinerDecideMetalExecutionPolicy(pipeline.session),
+        .metal_runtime_stats = factory.getGlinerMetalRuntimeStats(pipeline.session),
         .prepared_input_ids = token_rows,
         .decisions = captured.?,
         .cuda_transfers = cuda_transfers,

@@ -1440,6 +1440,8 @@ pub const DebertaEncoderFramePlanRequest = struct {
     max_position_embeddings: usize,
     norm_eps: f32,
     layers: []const DebertaEncoderLayerSpec,
+    packed_qkv_cache_bytes: ?usize = null,
+    attention_scratch_bytes: ?usize = null,
 };
 
 pub const DebertaEncoderLayerRequest = struct {

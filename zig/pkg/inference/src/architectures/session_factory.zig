@@ -614,6 +614,37 @@ fn applyQualifiedGlinerSpecialtyExecutionPolicy(arch_config: *ArchConfig, profil
     arch_config.gliner.metal_require_f32_weight_mirrors = true;
 }
 
+fn applyGlinerDecideMetalExecutionPolicy(arch_config: *ArchConfig, backend: BackendType, identity: ?gliner_decide_qualification.Identity) !void {
+    if (backend != .metal) return;
+    _ = gliner_decide_qualification.metalExecutionPolicy(identity orelse return) orelse return;
+    if (arch_config.* != .gliner) return error.UnsupportedGlinerDecisionArtifact;
+    arch_config.gliner.metal_require_f32_weight_mirrors = true;
+    arch_config.gliner.metal_decide_execution_policy = true;
+}
+
+test "GLiNER Decide Metal policy leaves native CUDA and changed artifacts untouched" {
+    const identity = gliner_decide_qualification.pinned_legacy_fp32_identity;
+    inline for (.{ BackendType.native, BackendType.cuda }) |backend| {
+        var config = ArchConfig{ .gliner = .{} };
+        try applyGlinerDecideMetalExecutionPolicy(&config, backend, identity);
+        try std.testing.expect(!config.gliner.metal_require_f32_weight_mirrors);
+        try std.testing.expect(!config.gliner.metal_decide_execution_policy);
+    }
+    var config = ArchConfig{ .gliner = .{} };
+    try applyGlinerDecideMetalExecutionPolicy(&config, .metal, identity);
+    try std.testing.expect(config.gliner.metal_require_f32_weight_mirrors);
+    try std.testing.expect(config.gliner.metal_decide_execution_policy);
+    var changed = identity;
+    changed.inventory.count -= 1;
+    config = .{ .gliner = .{} };
+    try applyGlinerDecideMetalExecutionPolicy(&config, .metal, changed);
+    try std.testing.expect(!config.gliner.metal_decide_execution_policy);
+    config = .{ .gliner = .{} };
+    try applyGlinerDecideMetalExecutionPolicy(&config, .metal, gliner_decide_qualification.pinned_legacy_q8_identity);
+    try std.testing.expect(config.gliner.metal_require_f32_weight_mirrors);
+    try std.testing.expect(config.gliner.metal_decide_execution_policy);
+}
+
 test "qualified PII specialty requires DeBERTa F32 mirrors without changing GLiGuard" {
     var pii = ArchConfig{ .gliner = .{} };
     try applyQualifiedGlinerSpecialtyExecutionPolicy(&pii, .pii);
@@ -644,6 +675,9 @@ pub fn metalDebertaFastPathAdmissionAmounts(mf: manifest_mod.ModelManifest) runt
     const unknown_reranker = mf.model_type == .reranker and mf.config_model_arch.len == 0;
     if (!gliner_deberta and !direct_deberta and !unknown_reranker) return .{};
 
+    const decide_policy_hint = mf.gliner_classification_head == .label_marker_mlp and
+        (mf.safetensors_path != null or mf.gliner_head_gguf_path != null) and
+        gliner_decide_qualification.metalPolicySidecarHint(mf.gliner_span_config_digest, mf.gliner_span_encoder_digest);
     const reservation = deberta_arch.metalFastPathReservationBytes(.{
         .hidden_size = mf.hidden_size,
         .num_hidden_layers = mf.num_hidden_layers,
@@ -652,12 +686,51 @@ pub fn metalDebertaFastPathAdmissionAmounts(mf: manifest_mod.ModelManifest) runt
         .vocab_size = mf.bert_vocab_size,
         .max_position_embeddings = mf.max_position_embeddings,
         .num_labels = mf.num_labels,
-        .metal_require_f32_weight_mirrors = mf.gliner_specialty_profile == .pii,
+        .metal_require_f32_weight_mirrors = mf.gliner_specialty_profile == .pii or decide_policy_hint,
+        .metal_decide_execution_policy = decide_policy_hint,
     }, gliner_deberta or mf.model_type == .reranker);
     return .{
         .backend_weight_bytes = reservation.persistent_bytes,
         .backend_scratch_bytes = reservation.scratch_bytes,
     };
+}
+
+test "GLiNER Decide Metal admission covers the authenticated execution policy" {
+    const identity = gliner_decide_qualification.pinned_legacy_fp32_identity;
+    var mf = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .safetensors_path = "model.safetensors",
+        .gliner_model_type = "gliner2",
+        .gliner_span_encoder_family = .deberta,
+        .gliner_classification_head = .label_marker_mlp,
+        .gliner_span_config_digest = identity.sidecars.config,
+        .gliner_span_encoder_digest = identity.sidecars.encoder_config,
+        .hidden_size = 1024,
+        .intermediate_size = 4096,
+        .num_hidden_layers = 24,
+        .num_attention_heads = 16,
+        .bert_vocab_size = 128011,
+        .max_position_embeddings = 512,
+    };
+    const actual = metalDebertaFastPathAdmissionAmounts(mf);
+    const expected = deberta_arch.metalFastPathReservationBytes(.{
+        .hidden_size = 1024,
+        .intermediate_size = 4096,
+        .num_hidden_layers = 24,
+        .num_attention_heads = 16,
+        .metal_require_f32_weight_mirrors = true,
+        .metal_decide_execution_policy = true,
+    }, true);
+    try std.testing.expectEqual(expected.persistent_bytes, actual.backend_weight_bytes);
+    try std.testing.expectEqual(expected.scratch_bytes, actual.backend_scratch_bytes);
+    mf.safetensors_path = null;
+    mf.gliner_head_gguf_path = "gliner2-head.Q8_0.gguf";
+    const q8 = metalDebertaFastPathAdmissionAmounts(mf);
+    try std.testing.expectEqual(actual.backend_weight_bytes, q8.backend_weight_bytes);
+    try std.testing.expectEqual(actual.backend_scratch_bytes, q8.backend_scratch_bytes);
+    mf.gliner_span_config_digest = null;
+    const ordinary = metalDebertaFastPathAdmissionAmounts(mf);
+    try std.testing.expect(actual.backend_weight_bytes > ordinary.backend_weight_bytes);
 }
 
 test "PII specialty Metal admission reserves required DeBERTa F32 mirrors" {
@@ -2760,6 +2833,7 @@ fn createGpuHostedSessionWithTaskOverride(
         }
         if (arch_config == .embedding_gemma2) try embedding_gemma2_arch.validateWeights(allocator, tensor_store.?, arch_config.embedding_gemma2);
         gliner_decision_identity = try captureGlinerDecisionIdentity(&mf, tensor_store.?);
+        try applyGlinerDecideMetalExecutionPolicy(&arch_config, backend_type, gliner_decision_identity);
         try validateSpecialtyWeightConfig(&mf, tensor_store.?, gliner_decision_identity);
         if (mf.gliner_specialty_profile) |profile| {
             const identity = gliner_decision_identity orelse return error.UnsupportedGlinerSpecialtyArtifact;
@@ -9796,6 +9870,55 @@ pub fn getGlinerDecisionIdentity(session: Session) !gliner_decide_qualification.
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     if (!self.gliner_decision_identity_sealed) return error.MissingGlinerDecisionIdentity;
     return self.gliner_decision_identity orelse error.MissingGlinerDecisionIdentity;
+}
+
+pub fn getGlinerDecideMetalExecutionPolicy(session: Session) ?gliner_decide_qualification.MetalExecutionPolicy {
+    if (session.backend() != .metal) return null;
+    const identity = getGlinerDecisionIdentity(session) catch return null;
+    return gliner_decide_qualification.metalExecutionPolicy(identity);
+}
+
+pub const GlinerMetalRuntimeStats = struct {
+    allocated_bytes: u64,
+    dense_f32_weight_bytes: u64,
+    dense_f16_weight_bytes: u64,
+    packed_qkv_bytes: u64,
+    graph_plan_bytes: u64,
+    scratch_pool_bytes: u64,
+    mps_linear_calls: u64,
+    linear_plan_builds: u64,
+    packed_qkv_calls: u64,
+    packed_qkv_fallbacks: u64,
+    fused_ffn_calls: u64,
+    fused_ffn_fallbacks: u64,
+    flash_attention_calls: u64,
+    gemm_attention_calls: u64,
+};
+
+/// Read only after synchronous execution while holding the model execution gate.
+pub fn getGlinerMetalRuntimeStats(session: Session) ?GlinerMetalRuntimeStats {
+    if (comptime !build_options.enable_metal) return null;
+    if (session.vtable != &arch_vtable or session.backend() != .metal) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const provider = gpuBackendData(self).shared_metal_native_provider orelse return null;
+    const raw = provider.raw_decode_runtime orelse return null;
+    const stats = metal_runtime.runtimeMemorySnapshot(raw);
+    return .{
+        .allocated_bytes = stats.total_bytes,
+        .dense_f32_weight_bytes = stats.dense_linear_f32_weight_bytes,
+        .dense_f16_weight_bytes = stats.dense_linear_f16_weight_bytes,
+        .packed_qkv_bytes = stats.dense_qkv_packed_bytes,
+        .graph_plan_bytes = stats.graph_plan_bytes,
+        .scratch_pool_bytes = stats.scratch_pool_bytes,
+        .mps_linear_calls = stats.mps_dense_linear_active_frame_calls + stats.mps_dense_linear_standalone_calls,
+        .linear_plan_builds = metal_runtime.antfly_metal_linear_plan_builds(raw),
+        .packed_qkv_calls = stats.dense_qkv_packed_calls,
+        .packed_qkv_fallbacks = stats.dense_qkv_packed_fallbacks,
+        .fused_ffn_calls = stats.deberta_ffn_fused_calls,
+        .fused_ffn_fallbacks = stats.deberta_ffn_fused_fallbacks,
+        .flash_attention_calls = stats.deberta_attention_flash_calls,
+        .gemm_attention_calls = stats.deberta_attention_gemm_calls,
+    };
 }
 
 /// Specialty serving uses the same immutable snapshot and tokenizer seal as
