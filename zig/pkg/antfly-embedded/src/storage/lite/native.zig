@@ -14074,10 +14074,29 @@ pub const NativeFile = struct {
                     if (cancel) |token| try token.check();
                     const key = keys[position];
                     if (root == 0 and std.mem.startsWith(u8, key, artifact_lease_key_prefix)) continue;
-                    const page = if (root == 2) try self.lookupDocumentIndexPage(checkpoint, key) else try self.lookupCatalogPage(checkpoint, if (root == 0) .metadata else .index, key);
+                    const root_kind: TransactionWrites.Root = switch (root) {
+                        0 => .metadata,
+                        1 => .index,
+                        else => .documents,
+                    };
                     const old_size = try destination.liveRecordSize(root, key);
                     var record: ?CatalogEntry = null;
-                    if (page) |id| {
+                    // §9.3a/§9.7c: a key captured while this source snapshot
+                    // was live may be committed but not yet checkpointed --
+                    // present only in the redo-log overlay, never in the
+                    // physical tree `lookupDocumentIndexPage`/
+                    // `lookupCatalogPage` walk below. Check the overlay
+                    // first, exactly like `getDocumentAtCheckpointAlloc`,
+                    // or an online vacuum silently drops every write that
+                    // landed after the last checkpoint but before this
+                    // catch-up round copied it (`entry.value` is owned by
+                    // `self.allocator` per `redoOverlayEntry`'s own doc
+                    // comment and must be freed once `copied` is built).
+                    const overlay_entry = try self.redoOverlayEntry(root_kind, checkpoint, key);
+                    defer if (overlay_entry) |entry| self.allocator.free(entry.value);
+                    if (overlay_entry) |entry| {
+                        if (!entry.is_delete) record = entry;
+                    } else if (if (root == 2) try self.lookupDocumentIndexPage(checkpoint, key) else try self.lookupCatalogPage(checkpoint, if (root == 0) .metadata else .index, key)) |id| {
                         const payload = try reader.read(self, self.allocator, checkpoint, id, if (root == 2) .document else .catalog);
                         if (root == 2) {
                             const doc = try decodeDocumentEntry(payload);

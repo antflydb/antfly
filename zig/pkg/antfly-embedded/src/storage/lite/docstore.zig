@@ -3084,7 +3084,19 @@ pub const Store = struct {
         var source = blk: {
             if (self.writer_admission) |admission| try admission.enter(admission.ptr, .reclamation);
             defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
-            lockStore(self);
+            // Exclusive, not plain lockStore: `captureFullReadSnapshot`
+            // compares `self.header` against a fresh reopen of the same
+            // path and refuses (`EnrichmentWaitCanceled`) on any
+            // disagreement. A foreground group's `syncIfRequired` writes
+            // its durability barrier before releasing `self.mutex` for the
+            // sync itself (`commit_in_sync`), so a plain `lockStore` here
+            // could land inside that released window, see the new bytes
+            // already on disk, and spuriously refuse the very first
+            // snapshot a vacuum ever takes against a live, concurrently
+            // written file -- the same race `applyResidualVacuumChanges`'s
+            // own `takeResidualVacuumChangesAssumeLocked` already guards
+            // against with `lockStoreExclusive`, just not yet here.
+            lockStoreExclusive(self);
             defer self.mutex.unlock();
             if (cancel) |token| try token.check();
             if (self.generation_workspace_active or self.file.change_capture != null or (self.maintenance_running and !automatic)) {
