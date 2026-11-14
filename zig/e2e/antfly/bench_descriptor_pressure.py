@@ -41,6 +41,7 @@ import time
 from pathlib import Path
 
 import requests
+from urllib3.exceptions import ReadTimeoutError
 
 from conftest import ANTFLY_PUBLIC_API_ROOT, StandaloneAntflyServer, find_free_port
 from test_grep_indexed import logical_process_reader
@@ -447,7 +448,14 @@ def wait_visible(session, url, count, *, check_health, failure_event):
                 "/tables/documents/indexes/vec",
                 timeout=min(5, remaining),
             ).get("status", {})
-        except requests.Timeout:
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            # Requests wraps urllib3 body-read timeouts in ConnectionError
+            # while consuming a non-streamed response. Recognize that specific
+            # wrapper without retrying resets, TLS failures or refused sockets.
+            if not isinstance(exc, requests.Timeout) and not (
+                len(exc.args) == 1 and isinstance(exc.args[0], ReadTimeoutError)
+            ):
+                raise
             # A slow read-only observation can be repeated within the outer
             # budget. Never retry writes, queries, or explicit HTTP failures.
             check_health()

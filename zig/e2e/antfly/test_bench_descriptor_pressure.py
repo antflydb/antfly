@@ -779,3 +779,120 @@ def test_visibility_status_timeouts_cannot_extend_overall_deadline(monkeypatch):
             failure_event=SimpleNamespace(wait=lambda _: None),
         )
     assert len(calls) == 1
+
+
+@pytest.fixture
+def body_timeout_session():
+    """Exercise Requests' real response consumption and exception wrapping."""
+    import requests
+    from urllib3.exceptions import ReadTimeoutError
+
+    class TimedOutBody:
+        def stream(self, *_args, **_kwargs):
+            yield b'{"status":'
+            raise ReadTimeoutError(None, "/indexes/vec", "body read stalled")
+
+    class Adapter(requests.adapters.BaseAdapter):
+        calls = 0
+
+        def send(self, request, **_kwargs):
+            self.calls += 1
+            response = requests.Response()
+            response.status_code = 200
+            response.request = request
+            response.url = request.url
+            if self.calls == 1:
+                response.raw = TimedOutBody()
+            else:
+                response._content = (
+                    b'{"status":{"total_indexed":256,"query_visible_doc_count":256}}'
+                )
+            return response
+
+        def close(self):
+            pass
+
+    with requests.Session() as session:
+        session.trust_env = False
+        adapter = Adapter()
+        session.mount("http://", adapter)
+        yield session, adapter
+
+
+@pytest.mark.parametrize("failure", [None, "health", "deadline"])
+def test_visibility_retries_real_requests_body_timeout_with_health_and_deadline(
+    monkeypatch, body_timeout_session, failure
+):
+    import bench_descriptor_pressure as bench
+
+    session, adapter = body_timeout_session
+    now, waits = [0], []
+    monkeypatch.setattr(bench.time, "monotonic", lambda: now[0])
+
+    def health():
+        if adapter.calls == 1:
+            if failure == "health":
+                raise RuntimeError("sampler failed during body read")
+            if failure == "deadline":
+                now[0] = 301
+
+    kwargs = dict(check_health=health, failure_event=SimpleNamespace(wait=waits.append))
+    if failure:
+        message = (
+            "sampler failed" if failure == "health" else "visibility did not reach"
+        )
+        with pytest.raises(RuntimeError, match=message):
+            bench.wait_visible(session, "http://unused", 256, **kwargs)
+        assert adapter.calls == 1
+    else:
+        assert (
+            bench.wait_visible(session, "http://unused", 256, **kwargs)["total_indexed"]
+            == 256
+        )
+        assert adapter.calls == 2
+        assert len(waits) == 1
+
+
+@pytest.mark.parametrize("operation", ["batch", "query"])
+def test_body_timeout_does_not_retry_writes_or_queries(body_timeout_session, operation):
+    import bench_descriptor_pressure as bench
+    import requests
+    from urllib3.exceptions import ReadTimeoutError
+
+    session, adapter = body_timeout_session
+    with pytest.raises(requests.ConnectionError) as caught:
+        if operation == "batch":
+            bench.call(session, "http://unused", "POST", "/batch", {})
+        else:
+            bench.query(session, "http://unused", [1, 0])
+    assert isinstance(caught.value.args[0], ReadTimeoutError)
+    assert adapter.calls == 1
+
+
+@pytest.mark.parametrize("kind", ["reset", "refused", "tls", "plain_timeout_text"])
+def test_visibility_does_not_retry_other_connection_failures(kind):
+    import bench_descriptor_pressure as bench
+    import requests
+
+    error = {
+        "reset": requests.ConnectionError(ConnectionResetError("reset")),
+        "refused": requests.ConnectionError(ConnectionRefusedError("refused")),
+        "tls": requests.exceptions.SSLError("TLS failure"),
+        "plain_timeout_text": requests.ConnectionError("read timed out"),
+    }[kind]
+    calls = []
+
+    def request(*_args, **_kwargs):
+        calls.append(True)
+        raise error
+
+    with pytest.raises(type(error)) as caught:
+        bench.wait_visible(
+            SimpleNamespace(request=request),
+            "http://unused",
+            256,
+            check_health=lambda: None,
+            failure_event=None,
+        )
+    assert caught.value is error
+    assert len(calls) == 1

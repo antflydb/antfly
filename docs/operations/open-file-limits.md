@@ -72,7 +72,8 @@ temporary-root cleanup, and diagnostic errors remain secondary to the startup
 exception. Visibility polling checks monitor and query health before and after
 each status request, uses a five-second HTTP timeout, and uses interruptible waits within its overall
 five-minute deadline. Only timed-out read-only status observations are repeated
-within that deadline; commit, query and explicit HTTP failures remain failures. Diagnostic-copy and cleanup errors
+within that deadline, including response-body read timeouts wrapped by Requests
+as connection errors. Other connection and TLS failures propagate; commit, query and explicit HTTP failures remain failures. Diagnostic-copy and cleanup errors
 cannot skip server termination or other cleanup, and the primary failure is
 preserved. Failed thread startup never joins an unstarted worker; on an operation
 failure, cleanup stops the server before its bounded query-worker join. The low-FD CI lane
