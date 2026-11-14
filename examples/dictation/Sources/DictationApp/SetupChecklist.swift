@@ -48,7 +48,7 @@ struct SetupChecklist: View {
     } label: {
       HStack {
         Label(
-          store.setupComplete ? "Ready to dictate" : "Setup & permissions",
+          store.setupComplete ? "Permissions & speech ready" : "Setup & permissions",
           systemImage: store.setupComplete ? "checkmark.circle" : "checklist")
         if store.setupComplete {
           Text("· " + store.config.effectiveShortcut.label).foregroundStyle(.secondary)

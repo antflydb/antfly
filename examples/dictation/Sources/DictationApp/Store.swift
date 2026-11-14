@@ -175,8 +175,9 @@ struct PreparedModelSetup: Sendable {
     state == .idle && !isBusy && retryRecording != nil && retryPreset != nil
   }
   var setupComplete: Bool {
+    // The checklist tracks permissions, shortcut, and speech readiness only.
+    // Preset text processing has its own actionable warning outside this group.
     microphoneAllowed && accessibilityAllowed && shortcutReady && engineReadiness.isReady
-      && !selectedPresetNeedsProcessor
   }
   private func loadCredential(for origin: String) {
     loadingCredential = true
