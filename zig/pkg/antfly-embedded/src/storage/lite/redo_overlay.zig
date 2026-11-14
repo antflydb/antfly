@@ -429,11 +429,35 @@ pub const SharedRedoOverlay = struct {
         external_value_len: usize,
     };
 
-    /// A snapshot of every key's current head version under `root`,
+    /// A snapshot of every key's current head version under `root` whose
+    /// own `sequence` is strictly newer than `min_sequence_exclusive`,
     /// fully owned (both key and value duped) so the caller can use it
     /// after this call's own lock releases. The caller frees each
     /// `.key`/`.value` and the returned slice.
-    pub fn snapshotHeadsAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8) ![]OwnedHead {
+    ///
+    /// `min_sequence_exclusive` matters whenever `reclaim` has been unable
+    /// to drop a key's entry after an earlier `checkpointRedoLog` fold
+    /// already applied it: `reclaim`'s own floor is the *oldest live pin*,
+    /// not "has this version already been folded" -- a pin older than a
+    /// key's entire chain (predating that key's first write in this
+    /// window entirely) leaves the chain's every node newer than the
+    /// floor, so `reclaim` finds nothing `<= floor` to collapse onto and
+    /// never removes the key at all, even though `durable_checkpoint_
+    /// sequence` already covers it. Without this filter, a *later*
+    /// `checkpointRedoLog` call (an explicit checkpoint, or the ride-along
+    /// idle turn) would see that same already-folded head again and
+    /// re-apply it -- for an external value chain specifically, handing
+    /// its already-referenced `external_value_root_page` to a *second*,
+    /// newly built real record for the same key, so two distinct document/
+    /// catalog records end up referencing the same chain. `check()`'s
+    /// reachability walk (`markReachablePage`'s own duplicate detection)
+    /// catches the result as `invalid_page_chain`; the indexed-ledger path
+    /// double-books the same page's ownership, surfacing as a reopen that
+    /// cannot find a page the ledger still expects. The caller passes its
+    /// own `RedoCommitState.checkpoint_sequence` as captured *before* this
+    /// fold publishes a new one -- exactly the boundary every version at
+    /// or below it was already batched into.
+    pub fn snapshotHeadsAlloc(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, min_sequence_exclusive: u64) ![]OwnedHead {
         std.debug.assert(root < 3);
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -448,6 +472,7 @@ pub const SharedRedoOverlay = struct {
         var it = self.maps[root].iterator();
         while (it.next()) |kv| {
             const head = kv.value_ptr.*;
+            if (head.sequence <= min_sequence_exclusive) continue;
             list.appendAssumeCapacity(.{
                 .key = try allocator.dupe(u8, kv.key_ptr.*),
                 .value = try allocator.dupe(u8, head.value),
