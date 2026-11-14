@@ -103,6 +103,15 @@ whole-document fixture small or provide a prepared one-page PDF; a token-limited
 prefix does not count as a complete read. Use a separately rendered page to
 isolate OCR throughput from native document orchestration.
 
+The HTTP timeout header narrows the document model's declared deadline; it does
+not increase it. For a slow CPU PDF check, use an existing named document model
+with an explicit bounded `budget.deadline_ms` and `read.native_text: "always_ocr"`.
+Set the case's `model` to that name, `preload_model` to its underlying OCR model,
+and `model_definition` to the local definition JSON. The report hashes that
+definition independently of the checkpoint. This exercises forced OCR rather
+than accidentally passing on a PDF's existing text layer. Require both header
+and footer text, complete document/item status and untruncated output.
+
 ```sh
 ANTFLY_OPENBLAS_LIBRARY=/libraries/libopenblas.so.0 \
 LD_LIBRARY_PATH=/libraries \
@@ -131,6 +140,38 @@ flush a shared host's caches to manufacture a cold-I/O result. Report concurrent
 GPU/CPU/memory-bandwidth workloads and do not extrapolate a tiny image into
 full-corpus throughput. Full-page correctness and long-audio tail coverage are
 separate checks from warm latency.
+
+### Spark measurement receipt
+
+Runtime sources at `7747043d74395f9f8f0ae91ad2818a86878237f7` were verified
+by per-file SHA-256 against the built source copy. The CPU-only Arm64 GNU
+executable hash was
+`0df7344d4f1f7346bf9d6261e6a5612ac6fe0c29989775f443c5344fb5f788ad`.
+Four threads were pinned to performance cores 5–8, with a 32 GiB process limit,
+4 GiB explicit scratch, one logical request and prompt caching disabled.
+OpenBLAS was Ubuntu LP64 pthread 0.3.26 (`armv8sve`), hash
+`4f04c974ceb53b9bad6b6dc5d606881450e3a8835837ad07c4636d10c8acfe81`.
+The host had a concurrent GPU training workload; additional CPU qualification
+also overlapped. Page cache was uncontrolled. These are functional fixture
+measurements, not isolated cold-storage benchmarks or corpus throughput.
+
+| Model | Startup through first complete read | Two warm reads | Peak PSS |
+| --- | ---: | ---: | ---: |
+| LightOnOCR-3-4B | 58.88 s | 38.83–41.02 s | 9.90 GiB |
+| LightOnOCR-3-0.8B | 13.67 s | 8.86–9.09 s | 2.05 GiB |
+| Whisper-small | 6.38 s | 4.51–4.80 s | 1.08 GiB |
+| Whisper-large-v3 | 38.41 s | 26.82–27.26 s | 6.80 GiB |
+
+The OCR fixture was 760×160, expected `ANTFLY TEST 123`; speech was 2.496625 s,
+expected `The quick brown fox jumps over the lazy dog.` Every model also
+returned the expected 504 deadline identity and completed a subsequent recovery
+read. The original 4B baseline had no result within 600 s; this receipt verifies
+complete CPU execution but does not establish practical full-page fallback.
+A separate 37.58 s, 98-word recording crossed Whisper's window boundary and
+retained its final phrase and timestamp (37.29 s), with zero normalized word
+errors. That longer recording used the earlier namespace-fix binary, identical
+Whisper implementation, and four efficiency cores while compilation overlapped;
+its 172.20 s startup is a functional check, not a matched performance result.
 
 ## Adoption
 

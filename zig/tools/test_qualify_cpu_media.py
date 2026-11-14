@@ -50,6 +50,14 @@ class CompletionAssertions(unittest.TestCase):
                 ]
             },
             {"data": [{"status": "complete", "text": "first window only"}]},
+            {
+                "document": {"status": "unresolved"},
+                "data": [{"status": "complete", "text": "last phrase"}],
+            },
+            {
+                "truncated": True,
+                "data": [{"status": "complete", "text": "last phrase"}],
+            },
         ):
             with self.subTest(response=response), self.assertRaises(ValueError):
                 validate_read(response, ["last phrase"])

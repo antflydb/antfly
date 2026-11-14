@@ -50,6 +50,11 @@ def normalize(value):
 
 
 def validate_read(response, expected):
+    document = response.get("document")
+    if document is not None and document.get("status") != "complete":
+        raise ValueError("document orchestration was incomplete")
+    if response.get("truncated"):
+        raise ValueError("read output was truncated")
     items = response.get("data")
     if not isinstance(items, list) or not items:
         raise ValueError("read returned no items")
@@ -152,6 +157,9 @@ def run_case(args, case, index):
         fixture_sha256=sha256(fixture),
         trials=[],
     )
+    result["preload_model"] = case.get("preload_model", case["model"])
+    if case.get("model_definition"):
+        result["model_definition_sha256"] = sha256(case["model_definition"])
     result["weights"] = (
         [
             {"name": path.name, "bytes": path.stat().st_size, "sha256": sha256(path)}
@@ -253,7 +261,7 @@ def run_case(args, case, index):
                 port,
                 "/models/instances",
                 {
-                    "model": case["model"],
+                    "model": result["preload_model"],
                     "task": "transcriber" if kind == "audio" else "generator",
                 },
                 args.timeout,
