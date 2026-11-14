@@ -776,6 +776,81 @@ test "lite reclamation restore workspace bounds staging and releases admission (
     try reclamationRestoreWorkspaceBoundsStagingAndReleasesAdmissionImpl(std.testing.allocator, true);
 }
 
+// Bug 2 (perf/lwa-budget-tail), minimal unit test: a savepoint rollback
+// (WS2's per-group-commit-member undo, `beginTransactionSavepoint`/
+// `rollbackTransactionSavepoint`) for a budget-rejected member must not
+// leave a sibling member in the *same* transaction permanently unable to
+// write, for a budget the rejected member never actually consumed. A
+// diverting commit's own "page-shaped exception" (`stageMutation`'s
+// external value chain, written eagerly at stage time through
+// `TransactionWrites.pages`) advances that allocator's own
+// `next_page_id` before the budget check even runs; unlike
+// `checkpoint.page_count` (restored verbatim by every rollback already),
+// nothing previously undid that advance, so it stayed pinned at the
+// ceiling. `TransactionSavepoint.pages_next_page_id`'s own doc comment
+// has the fix and why it is only safe for a diverting commit's own
+// allocator, never a real, page-shaped (non-diverting) build -- even an
+// `indexed_reclamation`-disabled one, which still physically grows the
+// file and needs `discardTransactionTail`'s own truncation to match,
+// not just a cursor rewind. That asymmetry is exactly what this test
+// checks: the rejected member's own pages are genuinely discardable
+// without any truncation only when diverting (redo's default), so only
+// that mode's sibling write recovers; the non-diverting mode's existing,
+// accepted tradeoff (`TransactionSavepoint`'s own pre-existing doc
+// comment, "External page allocations ... are not reclaimed by a
+// rollback") is unchanged.
+fn reclamationDivertingSavepointRollbackRestoresCursorImpl(a: Allocator, use_redo_log: bool) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "divert-savepoint.aflite");
+    defer a.free(path);
+    const limit = 64 * 4096;
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = use_redo_log, .reclamation = .{ .page_reuse = false, .enabled = false, .max_storage_bytes = limit } });
+    defer store.close();
+    try store.file.beginTransaction();
+    const value = try a.alloc(u8, limit);
+    defer a.free(value);
+    @memset(value, 'v');
+    {
+        const sp = try store.file.beginTransactionSavepoint();
+        if (store.file.putCatalogRecord("oversized", value)) |_| {
+            store.file.releaseTransactionSavepoint(sp);
+            return error.TestUnexpectedResult;
+        } else |err| {
+            try std.testing.expectEqual(error.LiteStorageBudgetExceeded, err);
+            store.file.rollbackTransactionSavepoint(sp);
+        }
+    }
+    // The regression this test guards: before the fix, the tiny write
+    // right below failed closed under redo too, with the same
+    // `error.LiteStorageBudgetExceeded`, for a budget the rejected
+    // member above never actually consumed. Under legacy it still fails
+    // closed -- an accepted, pre-existing tradeoff, not this bug.
+    if (use_redo_log) {
+        try store.file.putCatalogRecord("small", "accepted");
+        try store.file.commitTransaction();
+        const actual = (try store.getCatalogRecordAlloc(a, "small")).?;
+        defer a.free(actual);
+        try std.testing.expectEqualStrings("accepted", actual);
+        try std.testing.expect((try store.checkWithCancel(null)).valid);
+    } else {
+        // Staged (not yet built into a real page) until the commit below
+        // actually tries to build it, so the rejection surfaces there
+        // instead of from `putCatalogRecord` itself.
+        try store.file.putCatalogRecord("small", "accepted");
+        try std.testing.expectError(error.LiteStorageBudgetExceeded, store.file.commitTransaction());
+        store.file.abortTransaction();
+    }
+}
+
+test "lite reclamation diverting savepoint rollback restores cursor" {
+    try reclamationDivertingSavepointRollbackRestoresCursorImpl(std.testing.allocator, false);
+}
+
+test "lite reclamation diverting savepoint rollback restores cursor (redo)" {
+    try reclamationDivertingSavepointRollbackRestoresCursorImpl(std.testing.allocator, true);
+}
+
 test "lite reclamation restore rechecks disk capacity at publication" {
     const Probe = struct {
         fn available(context: *anyopaque, _: []const u8) !u64 {
@@ -1208,36 +1283,31 @@ fn reclamationCountsRetiredInodesUntilPinnedReadersReleaseImpl(alloc: Allocator,
     const large: [4 * 4096]u8 = @splat('x');
     write = try store.beginWrite();
     try write.put("capacity", &large);
-    // KNOWN REDO-MODE BUG (same orphaned-page-retention family as "lite
-    // reclamation vacuum preserves collector capacity with retained
-    // readers"'s own comment): retirementReserveBytes() scales with the
-    // ledger's own tracked page/pending counts (allocator_v4
-    // .retirementReservePages), which the same leak that test documents
-    // can inflate -- here that inflates the *budget* this line adds the
-    // reserve into, instead of the requirement a budget is checked
-    // against, so the 16KiB "capacity" write below gets more headroom
-    // than intended and wrongly succeeds instead of failing closed.
-    // Skipped under redo until that leak is fixed.
-    if (use_redo_log) {
-        try write.commit();
-    } else {
-        try std.testing.expectError(error.LiteStorageBudgetExceeded, write.commit());
-        write.abort();
-    }
+    // Formerly a KNOWN REDO-MODE BUG here (Bug 2, perf/lwa-budget-tail,
+    // "too generous" direction): a diverting commit never reached
+    // `NativeFile.persistAllocator`'s own ledger-backed reserve-capacity
+    // admission check at all (no ledger is attached to a diverting
+    // commit's allocator), so this budget's added `retirementReserveBytes()`
+    // slack above was never actually enforced against -- the 16KiB
+    // "capacity" write below wrongly succeeded instead of failing closed.
+    // `NativeFile.flushTransactionWrites` now mirrors that check for a
+    // diverting commit too (reading the currently persisted ledger
+    // instead of one attached to this commit's own allocator), so this
+    // fails closed in both modes.
+    try std.testing.expectError(error.LiteStorageBudgetExceeded, write.commit());
+    write.abort();
     var latest = try store.beginRead();
     defer latest.abort();
     try std.testing.expectEqualStrings("new", try latest.get("doc"));
     old.abort();
     old_open = false;
-    if (!use_redo_log) {
-        status = try store.reclamationStatus();
-        try std.testing.expectEqual(@as(u64, 0), status.retired_file_bytes);
-        try std.testing.expectEqual(@as(u64, 0), status.retired_generations);
-        try std.testing.expectEqual(@as(u64, 1), status.retained_readers);
-        write = try store.beginWrite();
-        try write.put("capacity", &large);
-        try write.commit();
-    }
+    status = try store.reclamationStatus();
+    try std.testing.expectEqual(@as(u64, 0), status.retired_file_bytes);
+    try std.testing.expectEqual(@as(u64, 0), status.retired_generations);
+    try std.testing.expectEqual(@as(u64, 1), status.retained_readers);
+    write = try store.beginWrite();
+    try write.put("capacity", &large);
+    try write.commit();
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
