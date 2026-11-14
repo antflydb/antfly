@@ -715,10 +715,22 @@ fn vtFileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
     // with none configured -- most importantly every scenario's discovery
     // pass, which exists purely to enumerate barriers and prove the
     // scenario well-formed uncrashed -- has no use for a durable snapshot
-    // at all. `crash_plan` is set once, single-threaded, before any
-    // concurrent activity begins, so caching it here (still under the lock,
-    // alongside the barrier bookkeeping above) is safe.
-    const needs_snapshot = self.crash_plan != null and !self.directories.contains(path);
+    // at all. Likewise, `applyPowerLoss` is only ever invoked when
+    // `crash_plan.power_loss == .drop_unsynced` (see `runOneCrash`'s
+    // `if (power_loss == .drop_unsynced) sim.applyPowerLoss()`): a
+    // `.none` run stops the call sequence on crash but never rolls any
+    // file back to its last durable image, so it never reads `self.durable`
+    // either. Skipping the capture for both cases avoids an O(file-size)
+    // read on every `fileSync` whose result would never be consulted --
+    // half of every sweep's (barrier, when, power_loss) combinations by
+    // default (`SweepOptions.power_loss` is `.{ .drop_unsynced, .none }`).
+    // `crash_plan` is set once, single-threaded, before any concurrent
+    // activity begins, so caching it here (still under the lock, alongside
+    // the barrier bookkeeping above) is safe.
+    const needs_snapshot = if (self.crash_plan) |plan|
+        plan.power_loss == .drop_unsynced and !self.directories.contains(path)
+    else
+        false;
     const delay_ns = self.sync_delay_ns;
     self.mutex.unlock();
     defer self.allocator.free(path);

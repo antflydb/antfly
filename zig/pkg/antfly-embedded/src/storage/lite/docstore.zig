@@ -1918,6 +1918,120 @@ test "lite reclamation automatic worker bounds sustained overwrite history (redo
     try reclamationAutomaticWorkerBoundsSustainedOverwriteHistoryImpl(std.testing.allocator, true);
 }
 
+// Regression (liveness): `performVacuum`'s round loop took the writer slot
+// only through the bare, nonblocking `reserveWriterSlot` -- on every round,
+// the final one included. A sustained foreground writer that keeps
+// re-queuing through the fair, ticketed `reserveWriterSlotYielding` every
+// ordinary `beginWriteYielding` commit already uses can win every one of
+// those bare attempts indefinitely (nothing about a probe that never takes
+// a ticket of its own ever forces `writer_active`/`next_writer_ticket` to
+// line up for it), so online vacuum could starve forever under sustained
+// write load instead of making bounded progress -- observed live via "lite
+// reclamation automatic worker bounds sustained overwrite history" failing
+// with `error.FileBusy` roughly 1 in 5 runs. This test exercises
+// `performVacuum`'s own round loop directly (it is private, but reachable
+// from a test in this same file) against a writer that never stops
+// re-queuing for the whole call, which -- before the fix -- reliably lost
+// every bare attempt across all `max_rounds` and gave up.
+//
+// `automatic: true`: the one caller this fix actually changes (the
+// maintenance worker's own dedicated background task, which can never be
+// the same thread that already holds this store's writer slot). A manual
+// `vacuum()` call deliberately keeps the old give-up behavior instead --
+// see "lite native docstore reserves one writer until abort or commit",
+// which blocking here would deadlock.
+test "lite vacuum completes under a sustained competing writer via a fair final round" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const Writer = struct {
+        store: *Store,
+        stop: std.atomic.Value(bool) = .init(false),
+        max_stall_ns: std.atomic.Value(u64) = .init(0),
+        writes: std.atomic.Value(u64) = .init(0),
+        started: std.Io.Event = .unset,
+
+        fn run(self: *@This()) !void {
+            self.started.set(std.testing.io);
+            var buf: [24]u8 = undefined;
+            while (!self.stop.load(.acquire)) {
+                const before = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+                var write = try self.store.beginWriteYielding();
+                const reserved_at = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+                var committed = false;
+                errdefer if (!committed) write.abort();
+                try write.put("doc", try std.fmt.bufPrint(&buf, "{d}", .{self.writes.load(.monotonic)}));
+                try write.commit();
+                committed = true;
+                const stall: u64 = @intCast(reserved_at - before);
+                var observed = self.max_stall_ns.load(.monotonic);
+                while (stall > observed) {
+                    observed = self.max_stall_ns.cmpxchgWeak(observed, stall, .monotonic, .monotonic) orelse break;
+                }
+                _ = self.writes.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "vacuum-fair-final-round.aflite");
+    defer a.free(path);
+
+    // `.reclamation = .{ .enabled = false }` plus `maintenance_start_suppressed`:
+    // this test drives `performVacuum` itself, deterministically, rather
+    // than waiting on the policy's own `due()` timing to decide when the
+    // real background worker would have called it.
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+
+    // Seed real, reclaimable overwrite garbage -- the same "sustained
+    // overwrite history" shape, not an empty file vacuum would no-op on.
+    for (0..64) |i| {
+        var seed = try store.beginWriteYielding();
+        errdefer seed.abort();
+        var buf: [16]u8 = undefined;
+        try seed.put("seed", try std.fmt.bufPrint(&buf, "{d}", .{i}));
+        try seed.commit();
+    }
+
+    var writer: Writer = .{ .store = &store };
+    var task = try std.testing.io.concurrent(Writer.run, .{&writer});
+    defer {
+        writer.stop.store(true, .release);
+        task.await(std.testing.io) catch {};
+    }
+    writer.started.waitUncancelable(std.testing.io);
+    // Let the sustained writer actually get into its tight re-queuing
+    // rhythm before vacuum ever asks for the slot -- the exact shape that
+    // starved it before this fix.
+    try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+
+    const writes_before = writer.writes.load(.monotonic);
+    const vacuum_started_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    _ = try store.performVacuum(null, true);
+    const vacuum_ns: u64 = @intCast(std.Io.Clock.awake.now(std.testing.io).nanoseconds - vacuum_started_ns);
+
+    writer.stop.store(true, .release);
+    try task.await(std.testing.io);
+
+    // Liveness proof: vacuum returned (no `error.FileBusy` give-up) while
+    // the writer was genuinely still active and making progress throughout
+    // its call, not merely idle while vacuum ran uncontested.
+    try std.testing.expect(writer.writes.load(.monotonic) > writes_before);
+    // Bounded foreground latency: the escalation only ever blocks a writer
+    // for whichever single write was already in flight when vacuum's own
+    // ticket was taken, never for vacuum's whole call -- so no write's own
+    // wait for its slot should approach `vacuum_ns`.
+    const max_stall_ms = writer.max_stall_ns.load(.monotonic) / std.time.ns_per_ms;
+    try std.testing.expect(max_stall_ms < 2000);
+    std.debug.print("lite vacuum fair final round: vacuum_ms={d} writes_during_vacuum={d} max_writer_stall_ms={d}\n", .{
+        vacuum_ns / std.time.ns_per_ms,
+        writer.writes.load(.monotonic) - writes_before,
+        max_stall_ms,
+    });
+}
+
 test "lite reclamation staged generation joins maintenance before owner adoption" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3797,7 +3911,32 @@ pub const Store = struct {
         // not that fence -- the x86_64 CI runner saw one index publication
         // land after every slot-held catch-up and gave up busy on all eight
         // rounds -- and waiting on the slot without bound deadlocked the
-        // caller that holds a writer and expects FileBusy.
+        // caller that holds a writer and expects FileBusy ("lite native
+        // docstore reserves one writer until abort or commit": a thread
+        // that already holds this same writer slot calls `vacuum()`
+        // expecting an immediate `FileBusy`, never a block on itself).
+        //
+        // That reentrancy case is exactly why every round above still uses
+        // the bare, nonblocking `reserveWriterSlot` -- but it is also why
+        // giving up after the *final* round's own bare attempt failed was
+        // wrong for the one caller that can never be the reentrant one:
+        // `automatic` (the maintenance worker's own dedicated background
+        // task, never a thread that could already hold this store's writer
+        // slot itself). A sustained foreground writer that keeps re-queuing
+        // through the fair, ticketed `reserveWriterSlotYielding` every
+        // ordinary commit already uses can win every one of this loop's
+        // bare nonblocking attempts indefinitely -- `writer_active`/
+        // `next_writer_ticket` just never line up for a probe that never
+        // takes a ticket of its own -- so online vacuum could lose forever
+        // under sustained write load (observed live: "lite reclamation
+        // automatic worker bounds sustained overwrite history", 1-in-5ish).
+        // For `automatic` only, the last round escalates to that same fair
+        // queue instead of probing: it takes a real ticket, so it is
+        // guaranteed to be served once every writer *already* queued ahead
+        // of it (never an unbounded or growing set -- new writers queue
+        // behind this ticket, not ahead of it) finishes, the standard
+        // bounded-handoff shape every other fair acquisition in this file
+        // already uses.
         const max_rounds = 8;
         var backoff_ms: u64 = 1;
         for (0..max_rounds) |round| {
@@ -3805,6 +3944,10 @@ pub const Store = struct {
             const final_round = round + 1 == max_rounds;
             if (!self.file.no_sync) try image.prepared.file.sync(io);
             const reserved = blk: {
+                if (final_round and automatic) {
+                    try self.reserveWriterSlotYielding();
+                    break :blk true;
+                }
                 self.reserveWriterSlot() catch |err| switch (err) {
                     error.FileBusy => break :blk false,
                     else => return err,

@@ -180,6 +180,12 @@ pub const SweepReport = struct {
     total_barriers: u64 = 0,
     runs: u64 = 0,
     failures: std.ArrayListUnmanaged(SweepFailure) = .empty,
+    /// The largest number of replays `runCrashSweep` ever held open (each
+    /// with its own store) at once. `1` for the sequential path (today's
+    /// behavior, and whenever `ANTFLY_CRASH_SWEEP_JOBS=1`); bounded by
+    /// `resolveSweepJobs()` otherwise. A rough proxy for this sweep's peak
+    /// memory multiplier over one replay's own footprint, not a byte count.
+    peak_concurrent_replays: u64 = 1,
 
     pub fn deinit(self: *SweepReport) void {
         for (self.failures.items) |f| {
@@ -199,23 +205,66 @@ pub const SweepReport = struct {
     /// has been) torn down, so the path strings are duplicated here rather
     /// than borrowed; `deinit` frees them.
     fn fail(self: *SweepReport, barrier: Barrier, when: When, power_loss: PowerLoss, comptime fmt: []const u8, args: anytype) !void {
-        const detail = try std.fmt.allocPrint(self.allocator, fmt, args);
-        errdefer self.allocator.free(detail);
-        const owned_path = try self.allocator.dupe(u8, barrier.path);
-        errdefer self.allocator.free(owned_path);
-        const owned_old = if (barrier.old_path) |p| try self.allocator.dupe(u8, p) else null;
-        errdefer if (owned_old) |p| self.allocator.free(p);
-        try self.failures.append(self.allocator, .{
-            .barrier = .{ .sequence = barrier.sequence, .kind = barrier.kind, .path = owned_path, .old_path = owned_old },
-            .when = when,
-            .power_loss = power_loss,
-            .detail = detail,
-        });
+        const failure = try makeFailure(self.allocator, barrier, when, power_loss, fmt, args);
+        try self.failures.append(self.allocator, failure);
     }
 };
 
+/// Builds one owned `SweepFailure` record without appending it anywhere.
+/// Pulled out of `SweepReport.fail` so a concurrent replay (which has no
+/// shared `SweepReport` to append into while other replays are still in
+/// flight) can build its own result the same way; the caller is always
+/// the only one touching `allocator` for this one record, so no locking is
+/// needed here even when several of these run at once against the same
+/// (thread-safe) `std.testing.allocator`. See `fail`'s own doc comment for
+/// why the strings are duplicated rather than borrowed.
+fn makeFailure(allocator: Allocator, barrier: Barrier, when: When, power_loss: PowerLoss, comptime fmt: []const u8, args: anytype) !SweepFailure {
+    const detail = try std.fmt.allocPrint(allocator, fmt, args);
+    errdefer allocator.free(detail);
+    const owned_path = try allocator.dupe(u8, barrier.path);
+    errdefer allocator.free(owned_path);
+    const owned_old = if (barrier.old_path) |p| try allocator.dupe(u8, p) else null;
+    errdefer if (owned_old) |p| allocator.free(p);
+    return .{
+        .barrier = .{ .sequence = barrier.sequence, .kind = barrier.kind, .path = owned_path, .old_path = owned_old },
+        .when = when,
+        .power_loss = power_loss,
+        .detail = detail,
+    };
+}
+
+/// One selected (barrier, when, power_loss) replay, in the exact order
+/// `runCrashSweep`'s nested loops would visit it sequentially. Built once,
+/// up front, so both the sequential and concurrent executors below walk
+/// identical, deterministic work lists -- and so failures can always be
+/// reported back in this same order regardless of which executor ran them
+/// or in what order they actually finished.
+const Combo = struct { barrier_seq: u64, when: When, power_loss: PowerLoss };
+
+fn buildCombos(allocator: Allocator, selected: []const u64, opts: SweepOptions) ![]Combo {
+    var combos = std.ArrayListUnmanaged(Combo).empty;
+    errdefer combos.deinit(allocator);
+    for (selected) |barrier_seq| {
+        for (opts.whens) |when| {
+            for (opts.power_loss) |power_loss| {
+                try combos.append(allocator, .{ .barrier_seq = barrier_seq, .when = when, .power_loss = power_loss });
+            }
+        }
+    }
+    return combos.toOwnedSlice(allocator);
+}
+
 /// Runs the full enumerate-then-sweep cycle for `scenario`. Caller owns the
 /// returned report (`deinit` it).
+///
+/// The discovery pass always runs sequentially, once, against plain
+/// `std.testing.io` -- it alone establishes `total_barriers` and must
+/// finish before any replay's barrier selection can even be computed, so
+/// there is nothing to parallelize there. Every selected (barrier, when,
+/// power_loss) replay after that is independent (see `runOneCrash`'s own
+/// doc comment) and, when `resolveSweepJobs()` allows more than one, runs
+/// concurrently via `runCombosConcurrently`; `ANTFLY_CRASH_SWEEP_JOBS=1`
+/// (or a single-core host) keeps today's exact sequential loop.
 pub fn runCrashSweep(allocator: Allocator, scenario: Scenario, opts: SweepOptions) !SweepReport {
     var report = SweepReport{ .allocator = allocator };
     errdefer report.deinit();
@@ -235,7 +284,7 @@ pub fn runCrashSweep(allocator: Allocator, scenario: Scenario, opts: SweepOption
         defer checkpoints.deinit(allocator);
         try scenario.run(allocator, path, sim.io(), &checkpoints);
         report.total_barriers = sim.barrierCount();
-        try checkInvariants(allocator, scenario, path, null, checkpoints.items, &report);
+        if (try checkInvariants(allocator, scenario, path, null, checkpoints.items)) |f| try report.failures.append(allocator, f);
     }
 
     if (report.total_barriers == 0) return report;
@@ -243,27 +292,170 @@ pub fn runCrashSweep(allocator: Allocator, scenario: Scenario, opts: SweepOption
     const selected = try selectBarriers(allocator, report.total_barriers, opts);
     defer allocator.free(selected);
 
-    for (selected) |barrier_seq| {
-        for (opts.whens) |when| {
-            for (opts.power_loss) |power_loss| {
-                report.runs += 1;
-                runOneCrash(allocator, scenario, barrier_seq, when, power_loss, &report) catch |err| {
-                    const placeholder = Barrier{ .sequence = barrier_seq, .kind = .file_sync, .path = "" };
-                    try report.fail(placeholder, when, power_loss, "scenario={s} harness error: {s}", .{ scenario.name, @errorName(err) });
-                };
-            }
+    const combos = try buildCombos(allocator, selected, opts);
+    defer allocator.free(combos);
+
+    const jobs = resolveSweepJobs();
+    if (jobs <= 1 or combos.len <= 1) {
+        for (combos) |combo| {
+            report.runs += 1;
+            const maybe_failure = runOneCrash(allocator, scenario, std.testing.io, combo.barrier_seq, combo.when, combo.power_loss) catch |err| blk: {
+                const placeholder = Barrier{ .sequence = combo.barrier_seq, .kind = .file_sync, .path = "" };
+                break :blk try makeFailure(allocator, placeholder, combo.when, combo.power_loss, "scenario={s} harness error: {s}", .{ scenario.name, @errorName(err) });
+            };
+            if (maybe_failure) |f| try report.failures.append(allocator, f);
         }
+        report.peak_concurrent_replays = 1;
+        return report;
     }
+
+    try runCombosConcurrently(allocator, scenario, combos, jobs, &report);
     return report;
 }
 
-fn runOneCrash(allocator: Allocator, scenario: Scenario, barrier_seq: u64, when: When, power_loss: PowerLoss, report: *SweepReport) !void {
+/// Reads `ANTFLY_CRASH_SWEEP_JOBS` (any positive integer; `1` reproduces
+/// today's sequential sweep exactly) or falls back to `min(4, cpu count)`.
+/// `std.testing.environ` is this test's own environment, populated by the
+/// test runner before any test function runs.
+fn resolveSweepJobs() usize {
+    if (std.process.Environ.getPosix(std.testing.environ, "ANTFLY_CRASH_SWEEP_JOBS")) |raw| {
+        if (std.fmt.parseInt(usize, raw, 10)) |n| {
+            if (n >= 1) return n;
+        } else |_| {}
+    }
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    return @max(@as(usize, 1), @min(@as(usize, 4), cpu_count));
+}
+
+/// Runs every one of `combos` independently and, once all have finished,
+/// appends any failures to `report` in `combos`' own order -- never
+/// completion order, so a sweep's failure list reads identically to the
+/// sequential path regardless of scheduling. Bounds how many replays are
+/// ever concurrently open (each holding its own store) to `jobs` via a
+/// semaphore; `Io.Group.async` may dispatch more tasks than that onto
+/// `std.testing.io`'s own thread pool, but each one blocks on the
+/// semaphore before doing any real work, so actual concurrency never
+/// exceeds `jobs`.
+fn runCombosConcurrently(allocator: Allocator, scenario: Scenario, combos: []const Combo, jobs: usize, report: *SweepReport) !void {
+    const driver_io = std.testing.io;
+    const effective_jobs = @max(@as(usize, 1), @min(jobs, combos.len));
+
+    const results = try allocator.alloc(ComboResult, combos.len);
+    defer allocator.free(results);
+    for (results) |*r| r.* = .{};
+
+    const tasks = try allocator.alloc(ReplayTask, combos.len);
+    defer allocator.free(tasks);
+
+    var sem = std.Io.Semaphore{ .permits = effective_jobs };
+    var inflight: std.atomic.Value(usize) = .init(0);
+    var peak: std.atomic.Value(usize) = .init(0);
+
+    for (combos, tasks, results) |combo, *task, *result| {
+        task.* = .{
+            .allocator = allocator,
+            .scenario = scenario,
+            .combo = combo,
+            .result = result,
+            .sem = &sem,
+            .driver_io = driver_io,
+            .inflight = &inflight,
+            .peak = &peak,
+        };
+    }
+
+    var group: std.Io.Group = .init;
+    defer group.cancel(driver_io);
+    for (tasks) |*task| group.async(driver_io, ReplayTask.run, .{task});
+    try group.await(driver_io);
+
+    report.peak_concurrent_replays = peak.load(.monotonic);
+    report.runs += combos.len;
+    for (combos, results) |combo, result| {
+        if (result.harness_err) |err| {
+            const placeholder = Barrier{ .sequence = combo.barrier_seq, .kind = .file_sync, .path = "" };
+            const failure = try makeFailure(allocator, placeholder, combo.when, combo.power_loss, "scenario={s} harness error: {s}", .{ scenario.name, @errorName(err) });
+            try report.failures.append(allocator, failure);
+        } else if (result.failure) |f| {
+            try report.failures.append(allocator, f);
+        }
+    }
+    if (report.peak_concurrent_replays > 1) {
+        std.debug.print("crash sweep: scenario={s} runs={d} jobs={d} peak_concurrent_replays={d}\n", .{ scenario.name, combos.len, effective_jobs, report.peak_concurrent_replays });
+    }
+}
+
+const ComboResult = struct {
+    failure: ?SweepFailure = null,
+    harness_err: ?anyerror = null,
+};
+
+/// One concurrently-scheduled replay. Owns nothing shared with any other
+/// `ReplayTask`: `allocator` is `std.testing.allocator` (thread-safe, see
+/// its own doc comment), `scenario` is read-only, and `result` is this
+/// task's own exclusive slot in `runCombosConcurrently`'s `results` array
+/// (one array entry per task, no two tasks ever touch the same one).
+const ReplayTask = struct {
+    allocator: Allocator,
+    scenario: Scenario,
+    combo: Combo,
+    result: *ComboResult,
+    sem: *std.Io.Semaphore,
+    driver_io: std.Io,
+    inflight: *std.atomic.Value(usize),
+    peak: *std.atomic.Value(usize),
+
+    /// Must be safe to run concurrently with every other `ReplayTask.run`:
+    /// see `runOneCrash`'s own doc comment for why giving each one its own
+    /// `std.Io.Threaded` -- not `std.testing.io` -- is what actually makes
+    /// that true (`crash_sim_io.zig`'s `SimIo` registry allows only one
+    /// live instance per real `Io`'s `userdata`, and every `SimIo` wrapping
+    /// `std.testing.io` shares the same one).
+    fn run(self: *ReplayTask) void {
+        self.sem.waitUncancelable(self.driver_io);
+        defer self.sem.post(self.driver_io);
+
+        const now = self.inflight.fetchAdd(1, .monotonic) + 1;
+        defer _ = self.inflight.fetchSub(1, .monotonic);
+        updatePeak(self.peak, now);
+
+        var threaded: std.Io.Threaded = .init(self.allocator, .{});
+        defer threaded.deinit();
+
+        self.result.failure = runOneCrash(self.allocator, self.scenario, threaded.io(), self.combo.barrier_seq, self.combo.when, self.combo.power_loss) catch |err| {
+            self.result.harness_err = err;
+            return;
+        };
+    }
+};
+
+fn updatePeak(peak: *std.atomic.Value(usize), candidate: usize) void {
+    var current = peak.load(.monotonic);
+    while (candidate > current) {
+        current = peak.cmpxchgWeak(current, candidate, .monotonic, .monotonic) orelse return;
+    }
+}
+
+/// Runs one (barrier, when, power_loss) replay to completion and returns
+/// the single failure it found, if any. Fully self-contained: its own
+/// `std.testing.tmpDir` (a fresh directory and `.aflite` path), its own
+/// `SimIo` wrapping `real_io`, and -- through `scenario.run` -- its own
+/// `NativeFile`/`DB`/store opened against that path. Nothing here reaches
+/// outside those, so many calls can run at once as long as each gets a
+/// `real_io` with its own, distinct identity: `real_io` is only ever
+/// `std.testing.io` itself (the sequential path, one live `SimIo` at a
+/// time, exactly as before) or one call's own private `std.Io.Threaded`
+/// (the concurrent path's `ReplayTask.run`) -- never the same `real_io`
+/// shared between two calls in flight together, which `SimIo.init` would
+/// reject outright (`StaleSimIoRegistration`) since its registry keys on
+/// `real_io`'s own `userdata`.
+fn runOneCrash(allocator: Allocator, scenario: Scenario, real_io: std.Io, barrier_seq: u64, when: When, power_loss: PowerLoss) !?SweepFailure {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testAflitePath(allocator, tmp);
     defer allocator.free(path);
 
-    const sim = try sim_io.SimIo.init(allocator, std.testing.io);
+    const sim = try sim_io.SimIo.init(allocator, real_io);
     const label = try std.fmt.allocPrint(allocator, "{s} barrier={d} when={s} power_loss={s}", .{ scenario.name, barrier_seq, @tagName(when), @tagName(power_loss) });
     // `label` must outlive every use of `sim.run_label`, including the one
     // inside `sim.deinit()` itself -- free it only after `deinit` runs.
@@ -282,20 +474,18 @@ fn runOneCrash(allocator: Allocator, scenario: Scenario, barrier_seq: u64, when:
         // crashed the scenario (e.g. it has fewer barriers under this
         // path than the full discovery run). Nothing in flight; check the
         // fully-completed state.
-        try checkInvariants(allocator, scenario, path, null, checkpoints.items, report);
-        return;
+        return try checkInvariants(allocator, scenario, path, null, checkpoints.items);
     } else |err| {
         if (!sim.crashed) return err; // a real, non-injected failure: surface it.
         if (power_loss == .drop_unsynced) {
             sim.applyPowerLoss() catch |pl_err| {
                 const barrier = sim.crash_barrier orelse Barrier{ .sequence = barrier_seq, .kind = .file_sync, .path = "" };
-                try report.fail(barrier, when, power_loss, "scenario={s} barrier_thread={d} applyPowerLoss failed: {s}", .{ scenario.name, barrier.thread_id, @errorName(pl_err) });
-                return;
+                return try makeFailure(allocator, barrier, when, power_loss, "scenario={s} barrier_thread={d} applyPowerLoss failed: {s}", .{ scenario.name, barrier.thread_id, @errorName(pl_err) });
             };
         }
         const barrier = sim.crash_barrier orelse Barrier{ .sequence = barrier_seq, .kind = .file_sync, .path = "" };
         const outcome = CrashOutcome{ .barrier = barrier, .when = when, .power_loss = power_loss, .run_err = err };
-        try checkInvariants(allocator, scenario, path, outcome, checkpoints.items, report);
+        return try checkInvariants(allocator, scenario, path, outcome, checkpoints.items);
     }
 }
 
@@ -305,8 +495,7 @@ fn checkInvariants(
     path: []const u8,
     outcome: ?CrashOutcome,
     checkpoints: []const Checkpoint,
-    report: *SweepReport,
-) !void {
+) !?SweepFailure {
     // `std.math.maxInt(u64)` and `.rename`/empty-path flag "no crash fired
     // in this run" in a failure report -- distinct from a real barrier 0 --
     // so a failure found with no crash at all (the uncrashed discovery
@@ -319,17 +508,18 @@ fn checkInvariants(
 
     if (scenario.custom_check) |check_fn| {
         check_fn(allocator, path, outcome, checkpoints) catch |err| {
-            try report.fail(placeholder, when, power_loss, "custom invariant check failed: {s}{s}", .{ @errorName(err), crash_note });
+            return try makeFailure(allocator, placeholder, when, power_loss, "custom invariant check failed: {s}{s}", .{ @errorName(err), crash_note });
         };
     } else if (scenario.via_db) {
         checkCheckpointsViaDb(allocator, path, outcome, checkpoints, scenario.search_index, scenario.search_field, scenario.retirement) catch |err| {
-            try report.fail(placeholder, when, power_loss, "scenario={s} barrier_thread={d} db invariant check failed: {s}{s}", .{ scenario.name, placeholder.thread_id, @errorName(err), crash_note });
+            return try makeFailure(allocator, placeholder, when, power_loss, "scenario={s} barrier_thread={d} db invariant check failed: {s}{s}", .{ scenario.name, placeholder.thread_id, @errorName(err), crash_note });
         };
     } else {
         checkCheckpointsViaNative(allocator, path, outcome, checkpoints) catch |err| {
-            try report.fail(placeholder, when, power_loss, "scenario={s} barrier_thread={d} native invariant check failed: {s}{s}", .{ scenario.name, placeholder.thread_id, @errorName(err), crash_note });
+            return try makeFailure(allocator, placeholder, when, power_loss, "scenario={s} barrier_thread={d} native invariant check failed: {s}{s}", .{ scenario.name, placeholder.thread_id, @errorName(err), crash_note });
         };
     }
+    return null;
 }
 
 /// Splits a run's own checkpoint list into the prefix that is fully
