@@ -115,7 +115,10 @@ pub const Stage = struct {
         // The source phase uses exactly the serving binding, including its native
         // implementation epoch. No generated vector or expression bypasses it.
         self.binding.index_config_hash = try std.fmt.allocPrint(ca, "native-dense-checkpoint-v2:{s}", .{self.binding.index_config_hash});
-        self.tracker = try state.Tracker.init(a, ca, &self.plan, store, token);
+        self.tracker = try state.Tracker.init(self.budget.allocator(), ca, &self.plan, store, token);
+        // Use the reader-compatible maximum only for this fresh bulk owner.
+        // Pending bytes and publication scratch share the native 256 MiB quota.
+        self.tracker.chunk_target_bytes = state.bulk_identity_chunk_target_bytes;
         errdefer self.tracker.deinit();
         self.tracker.output_bytes = allowance;
         self.tracker.directory_bytes = allowance;
@@ -183,24 +186,42 @@ pub const Stage = struct {
                 try stores.chargeReadBudget(&self.left, @as(u64, self.dims) * 4 + 128);
                 const ref = batch.rowRef(row);
                 const key = try self.plan.privateKey(a, ref);
-                try self.tracker.append(ref, key);
+                self.tracker.append(ref, key) catch |err| {
+                    probe.failure("identity_chunk_upload", err, null);
+                    return err;
+                };
                 try self.fresh.append("exact_vectors", key, try @import("antfly_vector").codec.encodePackedF32BytesAlloc(a, vector));
-                if (self.fresh.bytes >= 16 * 1024 * 1024) try self.fresh.flush(&self.vectors);
-                try self.output.?.append(dense.vectorId(key), key, self.index.transformVector(vector, transformed));
+                if (self.fresh.bytes >= 16 * 1024 * 1024) self.fresh.flush(&self.vectors) catch |err| {
+                    probe.failure("exact_vector_flush", err, null);
+                    return err;
+                };
+                self.output.?.append(dense.vectorId(key), key, self.index.transformVector(vector, transformed)) catch |err| {
+                    probe.failure("spool_append", err, self.output.?.writer.err);
+                    return err;
+                };
             }
         }
     }
     pub fn finish(self: *Stage, provider: *Provider) !void {
         const started = probe.start();
         defer probe.finish("bulk_receipt", started);
-        const partition = self.output.?.finish(self.io) catch |err| return if (err == error.DuplicateVectorId) error.NativeLakeVectorIdentityCollision else err;
+        const partition = self.output.?.finish(self.io) catch |err| {
+            probe.failure("spool_finish", err, self.output.?.writer.err);
+            return if (err == error.DuplicateVectorId) error.NativeLakeVectorIdentityCollision else err;
+        };
         self.output = null;
-        try self.fresh.flush(&self.vectors);
-        try self.vectors.finishBulkIngestSessionWithOptions(.{ .compact = false });
+        self.fresh.flush(&self.vectors) catch |err| {
+            probe.failure("exact_vector_flush", err, null);
+            return err;
+        };
+        try probe.call("source_seal", local.storage_lsm_backend.Backend.finishBulkIngestSessionWithOptions, .{ &self.vectors, @as(local.storage_lsm_backend.Backend.BulkIngestFinishOptions, .{ .compact = false }) });
         self.source_session = false;
-        try self.vectors.checkpointRecoveryManifest();
-        try self.tracker.finish();
-        var checkpoint = try self.vectors.pinNativeCheckpoint();
+        try probe.call("source_recovery_manifest", local.storage_lsm_backend.Backend.checkpointRecoveryManifest, .{&self.vectors});
+        self.tracker.finish() catch |err| {
+            probe.failure("identity_chunk_finish", err, null);
+            return err;
+        };
+        var checkpoint = try probe.call("source_pin_checkpoint", local.storage_lsm_backend.Backend.pinNativeCheckpoint, .{&self.vectors});
         var checkpoint_open = true;
         defer if (checkpoint_open) checkpoint.deinit();
         var bytes: u64 = self.allowance *| 3;
@@ -215,11 +236,11 @@ pub const Stage = struct {
         publication_io.install(&self.store.io_phase, self.io, if (provider.source.scanner.shared_reader) |reader| reader.scheduler else local.sql_parallel_scheduler.global(), .{ .ptr = self, .check = checkCensus });
         defer publication_io.deinit();
         if (provider.bulk_checkpoints) {
-            generation = try files.publishCheckpointPaged(self.a, &checkpoint, generation, "vectors/", self.store, self.token, budget, null);
-            generation = try work.publishPartition(self.a, self.store, checkpoint.storage, generation, self.spool_path, partition, self.token, budget, true);
+            generation = try probe.call("source_checkpoint_publish", files.publishCheckpointPaged, .{ self.a, &checkpoint, generation, "vectors/", self.store, self.token, budget, @as(?files.Reuse, null) });
+            generation = try probe.call("source_sample_publish", work.publishPartition, .{ self.a, self.store, checkpoint.storage, generation, self.spool_path, partition, self.token, budget, true });
         }
-        const root: work.Root = .{ .spool_from_exact = true, .binding = self.binding, .recipe = self.recipe, .dims = self.dims, .algorithm = self.algorithm, .input_allowance = self.allowance, .generation = generation, .partition = partition, .file_directory = try self.plan.publishDirectory(self.a, self.store, generation.domain, self.token), .rng_hi = self.index.rng.hi, .rng_lo = self.index.rng.lo };
-        if (provider.bulk_checkpoints) try work.save(self.a, provider, self.store, self.name, root, self.token);
+        const root: work.Root = .{ .spool_from_exact = true, .binding = self.binding, .recipe = self.recipe, .dims = self.dims, .algorithm = self.algorithm, .input_allowance = self.allowance, .generation = generation, .partition = partition, .file_directory = try probe.call("source_identity_directory", state.Plan.publishDirectory, .{ &self.plan, self.a, self.store, generation.domain, self.token }), .rng_hi = self.index.rng.hi, .rng_lo = self.index.rng.lo };
+        if (provider.bulk_checkpoints) try probe.call("source_receipt_save", work.save, .{ self.a, provider, self.store, self.name, root, self.token });
         self.finished = root;
         checkpoint.deinit();
         checkpoint_open = false;

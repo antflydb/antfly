@@ -112,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
         std.mem.doNotOptimizeAway(residuals.ptr);
     }
 
-    const query_norm = vector.norm(query);
+    const query_norm = vector.projectionQueryNormUpper(query);
     var legacy_query_ns: u64 = 0;
     var metadata_query_ns: u64 = 0;
     var exact_decode_ns: u64 = 0;
@@ -137,10 +137,15 @@ pub fn main(init: std.process.Init) !void {
         start = platform_time.monotonicNs();
         for (0..cfg.vectors) |i| {
             const offset = i * cfg.dims;
-            const distance = vector.distanceToQueryF16(query, 0, encoded[offset..][0..cfg.dims], scales[i], .inner_product);
-            const bounded = vector.boundedDistanceFromProjectionMetadata(
-                distance,
+            // Compare equally certified paths: deriving reconstruction bounds
+            // from the payload versus consuming the persisted metadata used
+            // by production. Both include the SIMD arithmetic certificate.
+            const bounded = vector.certifiedDistanceToQueryF16(
+                query,
+                0,
                 query_norm,
+                encoded[offset..][0..cfg.dims],
+                scales[i],
                 stats[i].error_norm,
                 stats[i].decoded_norm_lower_bound,
                 .inner_product,

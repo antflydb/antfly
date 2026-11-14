@@ -8497,7 +8497,8 @@ fn makeComputeBackend(
             // weights, but use the same f32 activation arithmetic as Metal.
             if (self.arch_config == .gliner_boundary or self.arch_config == .bert)
                 compute.quantized_activation_policy = .strict_f32;
-            compute.borrow_bf16_linear_weights = self.arch_config == .gpt and self.arch_config.gpt.family == .qwen3;
+            compute.borrow_bf16_linear_weights = self.arch_config == .gpt and (self.arch_config.gpt.family == .qwen3 or self.arch_config.gpt.family == .qwen3_5);
+            if (self.arch_config == .gpt) compute.decoder_weight_prefix = self.arch_config.gpt.weight_prefix;
             compute.cache_embeddinggemma2_bf16_weights = self.arch_config == .embedding_gemma2;
             break :blk compute.computeBackend();
         },

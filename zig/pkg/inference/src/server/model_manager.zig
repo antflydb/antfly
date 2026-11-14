@@ -5957,9 +5957,17 @@ pub const ModelManager = struct {
     fn admitHostPreflightChecked(self: *ModelManager, bytes: usize, check_live_memory: bool) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
         const domain = self.resource_domain.?;
-        return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory) catch |err| {
-            if (err != error.ResourceTemporarilyUnavailable or self.reclaimHostCache(bytes) == 0) return err;
-            return domain.admission.tryAcquire(.cpu, domain.admission_limits, .{ .host_scratch_bytes = bytes }, check_live_memory);
+        var pressure: ?runtime.tier.memory.AdmissionPressure = null;
+        const request = runtime.tier.memory.AdmissionRequest{ .backend_class = .cpu, .limits = domain.admission_limits, .amounts = .{ .host_scratch_bytes = bytes } };
+        return domain.admission.tryAcquireWithPressure(.cpu, request.limits, request.amounts, check_live_memory, &pressure) catch |err| {
+            if (err == error.ResourceTemporarilyUnavailable and self.reclaimHostCache(bytes) != 0) {
+                return domain.admission.tryAcquireWithPressure(.cpu, request.limits, request.amounts, check_live_memory, &pressure) catch |retry_err| {
+                    self.logRunAdmissionDenied(retry_err, pressure, &.{request});
+                    return retry_err;
+                };
+            }
+            self.logRunAdmissionDenied(err, pressure, &.{request});
+            return err;
         };
     }
 
@@ -20571,5 +20579,27 @@ test "lazy component load admission retains its blocking budget and required byt
     try std.testing.expect(exceeded.limit == .host);
     try std.testing.expectEqual(@as(usize, 1), exceeded.limit_bytes);
     try std.testing.expect(exceeded.requested_bytes > exceeded.limit_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
+}
+
+test "host preflight records policy denials and temporary contention" {
+    var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = 100, .scratch_limit_bytes = 100 };
+    try std.testing.expectError(error.ResourceLimitExceeded, manager.admitHostPreflightChecked(101, false));
+    var diagnostic = manager.memoryAdmissionDiagnostic();
+    try std.testing.expectEqualStrings("ResourceLimitExceeded", diagnostic.error_code);
+    try std.testing.expect(!diagnostic.retryable);
+    try std.testing.expectEqual(@as(u64, 101), diagnostic.requested_scratch_bytes);
+    var held = try manager.admitHostPreflightChecked(80, false);
+    defer held.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.admitHostPreflightChecked(30, false));
+    diagnostic = manager.memoryAdmissionDiagnostic();
+    try std.testing.expect(diagnostic.retryable);
+    try std.testing.expectEqual(@as(u64, 30), diagnostic.requested_scratch_bytes);
+    held.release();
+    var recovered = try manager.admitHostPreflightChecked(30, false);
+    recovered.release();
     try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
 }

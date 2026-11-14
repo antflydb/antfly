@@ -795,6 +795,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     model_chunk_step.dependOn(&chunk_error_run.step);
     const error_identity_step = b.step("runtime-error-identities-test", "Validate native error names and model-aware chunk failure transport");
     error_identity_step.dependOn(&chunk_error_run.step);
+    const owner_error_identity_tests = b.addTest(.{ .root_module = production_antfly_imports.storage_boundary.identity });
+    error_identity_step.dependOn(&b.addRunArtifact(owner_error_identity_tests).step);
     const error_provider = b.addLibrary(.{ .name = "chunk-error-test-provider", .root_module = b.createModule(.{
         .root_source_file = b.path("lib/runtime/src/runtime_chunk_error_roundtrip_test.zig"),
         .target = target,

@@ -42,6 +42,9 @@ private final class Invocation: @unchecked Sendable {
     }
 }
 private let gate = NSLock()
+// Prefix caching is opt-in until an operator has measured its workload. Small
+// dictations can spend more on session preparation than they save on prefill.
+private let generationPrewarmingEnabled = ProcessInfo.processInfo.environment["ANTFLY_APPLE_PREFIX_PREWARM"] == "1"
 
 @_cdecl("antfly_apple_bridge_abi_version")
 public func bridgeABIVersion() -> UInt32 { 2 }
@@ -70,6 +73,50 @@ private func generationByteLimit(_ budget: Int?, _ responseLimit: Int) throws ->
     guard responseLimit >= 0 else { throw BridgeError.status(1) }
     let (bytes, overflow) = (budget ?? 1024).multipliedReportingOverflow(by: 8)
     return overflow ? responseLimit : min(responseLimit, bytes)
+}
+
+// Keep one unused, instruction-only session warm. Never return a session after
+// respond/streamResponse has appended a user's prompt or generated transcript.
+// Exact prefix matching, a byte ceiling, and expiry bound both memory and scope.
+@available(macOS 26.0, *)
+private actor PreparedGeneration {
+    static let shared = PreparedGeneration()
+    private var idle: (key: String, session: LanguageModelSession, expires: ContinuousClock.Instant)?
+    private var eviction: Task<Void, Never>?
+    private var revision = UUID()
+    private var hits = 0
+    private var preparations = 0
+    func statistics() -> (Bool, Int, Int) {
+        (idle.map { $0.expires > .now } ?? false, hits, preparations)
+    }
+    func take(key: String, entries: [Transcript.Entry], reusable: Bool) -> LanguageModelSession {
+        if reusable, let cached = idle, cached.key == key, cached.expires > .now {
+            idle = nil
+            eviction?.cancel()
+            hits += 1
+            return cached.session
+        }
+        return LanguageModelSession(model: .default, transcript: Transcript(entries: entries))
+    }
+    func prepare(key: String, entries: [Transcript.Entry]) {
+        guard key.utf8.count <= 16384 else { return }
+        eviction?.cancel()
+        let session = LanguageModelSession(model: .default, transcript: Transcript(entries: entries))
+        session.prewarm(promptPrefix: Prompt("Transcript:\n"))
+        preparations += 1
+        let token = UUID()
+        revision = token
+        idle = (key, session, .now.advanced(by: .seconds(60)))
+        eviction = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(60)) } catch { return }
+            await self?.expire(token)
+        }
+    }
+    private func expire(_ token: UUID) {
+        guard revision == token else { return }
+        idle = nil
+        eviction = nil
+    }
 }
 
 @available(macOS 26.0, *)
@@ -104,7 +151,11 @@ private func generate(_ request: [String: Any], _ invocation: Invocation) async 
         else { entries.append(.response(.init(assetIDs: [], segments: segments))) }
     }
     guard history.count % 2 == 0 else { throw BridgeError.status(1) }
-    let session = LanguageModelSession(model: .default, transcript: Transcript(entries: entries))
+    let key = instructions.joined(separator: "\n")
+    let reusable = generationPrewarmingEnabled && history.isEmpty && prompt.hasPrefix("Transcript:\n")
+    let session = reusable
+        ? await PreparedGeneration.shared.take(key: key, entries: entries, reusable: true)
+        : LanguageModelSession(model: .default, transcript: Transcript(entries: entries))
     // Apple silently truncates at maximumResponseTokens. Strict text consumers
     // must instead let the model stop naturally, rejecting an over-budget result.
     // Streaming bounds retained bytes even on macOS 26, which has no usage API.
@@ -124,6 +175,9 @@ private func generate(_ request: [String: Any], _ invocation: Invocation) async 
            response.usage.output.totalTokenCount > tokenBudget { throw BridgeError.status(16) }
     }
     try invocation.emit(Data(content.utf8))
+    if reusable {
+        await PreparedGeneration.shared.prepare(key: key, entries: entries)
+    }
 }
 
 @available(macOS 26.0, *)
@@ -209,7 +263,9 @@ public func invoke(_ operation: Int32, _ json: UnsafePointer<UInt8>, _ jsonLengt
             case 1: try await generate(request, invocation)
             case 2: try await transcribe(request, audioData, invocation)
             case 3:
+                let (prepared, hits, preparations) = await PreparedGeneration.shared.statistics()
                 try invocation.emit(JSONSerialization.data(withJSONObject: ["generation_status": modelStatus(),
+                    "generation_prewarm": ["enabled": generationPrewarmingEnabled, "ready": prepared, "hits": hits, "preparations": preparations],
                     "speech_available": SpeechTranscriber.isAvailable,
                     "speech_installed_locales": await SpeechTranscriber.installedLocales.map { $0.identifier }]))
             default: throw BridgeError.status(1)

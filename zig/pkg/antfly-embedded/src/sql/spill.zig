@@ -6263,6 +6263,17 @@ pub const Sort = struct {
         var bytes: usize = 0;
         const logical_rows = @max(1, byte_limit / @max(1, self.max_payload_bytes));
         while (count < @min(@min(maximum, logical_rows), keys.len)) {
+            // Prefetched keys may outlive a shortened payload window. Reserve
+            // their unread-reference backlog before consuming more input,
+            // rather than spending the first row's decode headroom on keys.
+            // Always allow the first reference: an already resident payload
+            // can still make progress below a conservative cold-page estimate.
+            if (count != 0) if (@import("memory_budget.zig").headroom(self.manager.alloc)) |available| {
+                const pending = count + 1 + self.deferred_count - self.deferred_index;
+                const backlog = if (pending > self.deferred_references.len) pending * @sizeOf(?RowLease) else 0;
+                const delivery = (count + 1) * @sizeOf(RowLease) + @sizeOf(PageView);
+                if (bytes +| backlog +| delivery > available) break;
+            };
             // Crossing a physical key boundary must leave room to hydrate the
             // already collected payload prefix. Within a resident key block,
             // only descriptor growth needs admission.

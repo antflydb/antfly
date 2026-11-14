@@ -719,3 +719,212 @@ before construction; vectorless files cannot silently alter identity work while
 preserving embedding count and recall. Receipt checks bind the exact interrupted
 manifest and require skipped input replay/clustering after restart. These testing
 contracts are separate from production catalog CAS, Raft and power-loss recovery.
+
+### Conditional upload recovery and request memory
+
+Identity ingestion can publish row-key chunks before it saves a source receipt.
+Those writes need the same bounded recovery behavior as final artifact uploads.
+GCS implements create-only media uploads with POST and `ifGenerationMatch=0`.
+The object-store caller explicitly admits replay only for that conditional media
+request. HTTPx retains its ordinary method safety defaults, retry ceiling,
+backoff, cancellation and request-wide deadline; it does not propagate this
+admission through a redirect. Authentication and transport consume the captured
+request deadline. Unconditional POST and resumable-session initiation do not
+inherit the new replay admission.
+
+A lost successful response may turn the retry into a precondition conflict.
+The GCS client returns that conflict. The artifact layer then reads the existing
+object under its immutable provider revision and verifies its length and digest
+before accepting it. A different object at the expected content address fails
+closed. Retrying a request never grants publication authority to private work.
+
+GCS transport borrows the immutable request body through synchronous completion
+of every attempt, removing a second payload-sized allocation and copy. The
+owner must keep the bytes alive and immutable until the call returns. A focused
+8 MiB request-setup comparison measured 8,388,855 allocated bytes with an owned
+body versus 247 with the borrowed body; this excludes network execution and is
+an allocation result, not an ingest throughput or RSS claim. Clustering, native
+SST formats and normal database insertion are unaffected by this change.
+
+Qualification emits fixed operation/error tags at source-read, identity spill
+and chunk publication, exact-vector flush, and spool append/finish failures.
+Spool failures retain the file writer's underlying error when available. The
+diagnostic does not log object URLs, credentials, source values or scratch paths,
+and compiles away in production. The controller treats SIGHUP and SIGTERM as
+cancellation, drains its owned worker group and persists a terminal status.
+SIGKILL cannot run cleanup; long suites still require a durable supervisor and
+retained exit records.
+
+The final 1M WAN attempt failed during identity ingestion and remains
+unqualified. Its generic `WriteFailed` log cannot establish which operation
+failed. The [failure investigation](../../../zig/bench/vectors/GCS_BULK_FAILURE_INVESTIGATION.md)
+separates that historical uncertainty from reproduced recovery and lifecycle
+defects. Planned range reads already skip metadata probes, so removing an
+assumed extra HEAD is not a performance opportunity on that path. Further
+upload batching, range coalescing or concurrency changes need attributed phase
+and request measurements plus a successful publication/reopen/recall check
+before another paired performance comparison.
+
+### Qualification process ownership
+
+The controller and worker install one cancellation scope before starting work.
+SIGTERM, SIGHUP and SIGINT record the first stop request; handlers do not raise
+inside process creation or teardown. Every helper command, upload and native
+child acquires an owner before `Popen`. Cancellable waits poll that scope, while
+teardown drains and reaps the owned process without a second signal interrupting
+cleanup. Frozen-controller re-exec blocks these signals across exec and installs
+handlers before unblocking them in the new image, preserving pending requests.
+
+The controller owns the worker's process group. Native children remain in that
+group, so controller escalation still reaches them if worker cleanup stalls.
+The worker additionally owns and reaps its native child with `wait4`, preserving
+CPU/RSS observations when available. Failed process creation is explicitly
+distinguished from a started child; missing resource usage is unavailable rather
+than zero. Source hashing checks cancellation between reads of a reused 1 MiB
+buffer. Upload writes and captured helper output also have cancellable waits.
+
+One reporting boundary covers admission, worker execution and post-build source
+and input verification. Any exception leaves a terminal failed/cancelled report,
+including post-build verification after worker exit zero. Disk sampling writes
+an independent checkpoint every two seconds and finalizes on success, failure or
+catchable cancellation. Reports retain minimum host free space, case-directory
+nominal lengths, sampling errors and whether its thread stopped. Native `/tmp`
+scratch remains outside that directory total, and host free space includes
+unrelated workloads. SIGKILL cannot run finalization; the periodic checkpoint and
+external supervisor's exit record remain the available evidence.
+
+Shutdown persists the last complete observations before waiting for the sampler.
+Cancelled and failed attempts skip final collection. Successful attempts request
+one final scan in the sampling daemon, with a two-second cooperative deadline
+and a three-second join ceiling. Filesystem calls can block beyond that deadline;
+the reporting thread still persists terminal failure with
+`final_sample_complete=false` and `sampler_stopped=false`. A successful case
+requires completed final collection. Scan loops check cancellation and deadlines
+between filesystem operations. No final scan runs in the reporting thread.
+
+Real-GCS qualification rejects inherited storage endpoint overrides. ADC mode
+also rejects `GCS_BEARER_TOKEN` and `GOOGLE_OAUTH_ACCESS_TOKEN`, which otherwise
+take precedence over refreshable ADC in the native default credential resolver.
+Rejections list names only. Explicit ADC-file selection and ordinary proxy
+settings remain supported. The worker records its admitted credential mode and
+canonical storage/upload endpoints without copying credentials into evidence.
+
+### Bounded identity publication chunks
+
+Fresh fused bulk construction uses a 262,037-byte identity chunk target. The
+last append can add a 108-byte key, keeping every payload within the existing
+256 KiB reader limit. Both 96-byte parent keys and 108-byte enrichment keys retain
+their existing paged-reference representation. Oversized targets are rejected
+before appending. The tracker's pending buffer and publication scratch are
+charged to the native bulk owner's 256 MiB private allocator. Other tracker
+callers retain their 192 KiB target.
+
+Paged-reference publication also borrows an operation-local copy of the artifact
+store with the tracker allocator. This includes page packing and backend upload
+scratch without changing the shared capability's allocator. The publication
+fixture checks allocator identity for every identity and reference-page upload.
+
+The `lake-identity-publication-test` fixture publishes one million real keys for
+each target/key-width pair through `FsStore`, then reads every persisted chunk
+through the established paged reader and requires equal corpus count, order and
+BLAKE3 digest. For 96-byte keys, chunk puts decreased from 489 to 367 and all
+artifact puts from 524 to 395, with the same 519,243-byte tracker allocation peak.
+For 108-byte keys, chunk puts decreased from 550 to 413 and all puts from 590 to
+441; the measured peak increased from 454,327 to 552,489 bytes. Every fixture is
+admitted under an 8 MiB tracker limit. These are measured artifact API counts and
+filesystem allocation observations, not measured GCS HTTP counts or a WAN/full
+build speedup. Raw observations are in
+[`bulk_identity_publication_results.json`](../../../zig/bench/vectors/bulk_identity_publication_results.json).
+
+A proposed 1 MiB identity chunk failed existing reader validation and was not
+enabled. Raising the shared SST chunk size would change persisted-file offset
+interpretation and is not part of this optimization. Additional asynchronous
+publication queues need separate latency, ordering, cancellation and scheduler
+admission evidence before adoption.
+
+
+### Cloud upload retry, admission and bounded generation journals
+
+Socket read/write idle expiry preserves the `Timeout` tag through TLS. It is a
+transient attempt failure when the complete request still has time remaining.
+The HTTP retry loop checks cancellation and the total deadline before admitting
+replay, then applies method/precondition safety and the configured retry ceiling.
+An exhausted total deadline, an unsafe POST, a single-use streamed body or a
+partially delivered writer response cannot acquire replay permission from this
+classification. GCS create-only uploads retain `ifGenerationMatch=0`; an
+ambiguous commit can become 412, whose existing generation and content must be
+authenticated by the artifact caller before accepting it.
+
+Allocation ownership follows resource lifetime. Native attempts admit the
+artifact store, object clients and their shared HTTP/TLS resources beneath a
+128 MiB transport budget. Per-call keys and object-result metadata use the
+caller's allocator through a local client copy. The vector producer retains its
+256 MiB private budget; generation-map mutable ownership retains a separate
+64 MiB budget. These budgets are backed by the existing full-build working-set
+allocator (1 GiB by default), rather than being additional unaccounted heaps.
+A private budget denial is classified where that owner is available as
+`LakeSidecarBuildLimitExceeded`, including denials that never reach its parent.
+These are allocation-domain limits, not a process RSS limit: process-shared
+navigation caches, runtime stacks and external-library state have separate
+owners. The qualifier records and checks each build, transport and map owner.
+
+Durable generation-map leaves still hold at most 128 records. Mutation batching
+is independent of that representation. Only after an actual fresh fused bulk
+stage has been admitted does its attempt select up to 4,096 journal records or
+1 MiB of accounted record payload before a flush. Ordinary fresh indexes,
+incremental publications and receipt resumes retain 128-record mutation batches.
+The identity-fusion optimization flag alone does not constitute bulk admission.
+No persisted format, version selector, retention proof or publication fence
+changes with this policy.
+
+Pending records have a bounded hash index. A detached flushing batch retains its
+index until the replacement root is installed, so generation lookups can still
+resolve already-captured uploads during asynchronous map publication. Parallel
+captures apply backpressure at twice the mutation threshold; a single record can
+cross the byte threshold, and the active flushing batch remains independently
+owned. The map's allocator admits containers and publication scratch as well as
+record strings. Flush failures drain children, retain the preceding root and
+invalidate completeness; orphan immutable objects never grant serving authority.
+
+The `lake-generation-publication-test` fixture compares both policies over
+16,384 deterministic scoped identities, publishes the real encoded radix maps,
+and reopens every captured payload generation and length. It measures metadata
+puts/gets, encoded bytes, flushes, journal payload and allocation peaks. Raw
+observations live in
+[`bulk_generation_publication_results.json`](../../../zig/bench/vectors/bulk_generation_publication_results.json).
+The paired observation reduced metadata puts from 13,625 to 1,092 (92.0%),
+reads from 13,352 to 7,822, and encoded writes from 122,272,584 to 10,892,012
+bytes. Flushes decreased from 128 to four. Observed writer allocation peaks were
+6,266,396 and 5,556,343 bytes respectively, both below 64 MiB.
+This measures metadata amplification with a scripted immutable provider; elapsed
+times are local shared-host observations, not GCS or whole-build speedups.
+
+Qualification emits successful timings once at the seven source-receipt
+boundaries: seal, recovery manifest, checkpoint pin, checkpoint publication,
+sample publication, identity-directory publication and receipt save. Fresh fused
+cases require that exact ordered successful sequence; resumes and verification
+reopens cannot claim repeated source construction. Lower-level map flush,
+map publication and artifact creation report failures with elapsed time. HTTP
+transport failures retain method, body length, attempt count and elapsed time;
+terminal HTTP response statuses retain the same attribution even when transport
+itself succeeded. Expected 412 recovery remains a status observation, not a
+failed build. An explicit diagnostic observer is installed on the provider-owned GCS client
+before dispatch; library modules do not depend on application-root declarations.
+It composes with the existing attempt/delivery observer rather than replacing its
+admission semantics. Status diagnostics have separate 64-record allowances for expected 404/412
+responses and other statuses per probe attempt and never include object URLs, credentials or payload values.
+
+Generation-map lookup scratch and traversal/root reference snapshots use the
+admitted owner allocator. Cold lookups retain their individual 8 MiB cap inside
+the aggregate 64 MiB map and 1 GiB build limits. Shared navigation caches retain
+their independent process-owned lifetime and budget.
+
+Provider generation selectors use the caller's admitted reclaiming allocator,
+including lookup results and the returned selector copy. Arena-backed callers
+refund this transient capacity after each request. Private-budget OOM
+classification distinguishes policy denial from failed backing allocation.
+Mixed recovered failure histories conservatively preserve `OutOfMemory`; a
+historical optional quota denial cannot turn a physical allocation failure
+into a claimed configured-limit failure. The native attempt also records
+backing allocation failure across all private owners, using an atomic marker
+set only on failed allocation (ordinary resize refusal is not OOM evidence).

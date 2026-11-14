@@ -198,9 +198,7 @@ final class SpeechAudioBuffer: @unchecked Sendable {
     if previewOverflow {
       previewOverflow = false
       pending.removeAll(keepingCapacity: true)
-      throw DictationError.invalid(
-        "Live audio processing fell behind. The complete recording remains available for clip processing."
-      )
+      throw LiveAudioOverflow()
     }
     let result = pending
     pending.removeAll(keepingCapacity: true)
@@ -218,7 +216,7 @@ final class SpeechAudioBuffer: @unchecked Sendable {
 /// One synchronous AVAudioConverter input request owns its buffer and consumption
 /// state. The lock also serializes requests if the converter invokes its input
 /// block from another thread; no mutable local or native buffer crosses a closure.
-private final class ConversionInput: @unchecked Sendable {
+final class ConversionInput: @unchecked Sendable {
   private let lock = NSLock()
   private var buffer: AVAudioPCMBuffer?
   init(_ buffer: AVAudioPCMBuffer) { self.buffer = buffer }

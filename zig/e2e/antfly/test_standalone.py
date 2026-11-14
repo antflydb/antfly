@@ -21,6 +21,7 @@ import json
 import math
 import os
 import signal
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -34,7 +35,7 @@ import pytest
 import requests
 
 from conftest import antfly_public_api_url, inference_public_api_url, wait_for_server
-from helpers import assert_created_index, wait_until
+from helpers import PhaseTimings, assert_created_index, wait_until
 from port_reservations import LoopbackPortReservations
 
 
@@ -295,8 +296,16 @@ class EmbeddedInferenceStandaloneServer:
             self.returncode = self.proc.returncode
         self.proc = None
         self.final_logs = self.debug_logs()
-        self.log_file.close()
-        self.tempdir.cleanup()
+        try:
+            if log_dir := os.environ.get("ANTFLY_INFERENCE_SERVER_LOG_DIR"):
+                destination = Path(log_dir)
+                destination.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(
+                    self.log_path, destination / f"standalone-{self.public_port}.log"
+                )
+        finally:
+            self.log_file.close()
+            self.tempdir.cleanup()
 
 
 def _warm_inference_generator(
@@ -420,6 +429,7 @@ def embedded_standalone_runtime():
         DEFAULT_INFERENCE_STANDALONE_FIRST_USE_REQUEST_TIMEOUT,
     )
 
+    timings = PhaseTimings("standalone-inference-initialization")
     server = EmbeddedInferenceStandaloneServer(
         binary,
         models_dir,
@@ -427,6 +437,7 @@ def embedded_standalone_runtime():
         inference_budget_mb=inference_budget_mb,
         process_memory_budget_mb=process_memory_budget_mb,
     )
+    timings.mark("server-startup")
     warmup_performed = False
     primary_failure: BaseException | None = None
     try:
@@ -445,6 +456,7 @@ def embedded_standalone_runtime():
                     f"server logs:\n{server.debug_logs()}"
                 ) from exc
             warmup_performed = True
+        timings.mark("generator-first-use")
         yield {
             "base_url": server.url,
             "public_url": server.public_url,

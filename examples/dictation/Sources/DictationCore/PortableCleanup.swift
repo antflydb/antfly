@@ -32,7 +32,7 @@ extension AntflyClient {
       rules += "\nWrite in the transcript language: " + preset.language
     }
     if !preset.context.isEmpty { rules += "\nDestination context: " + preset.context }
-    let terms = dictionary + preset.dictionary
+    let terms = CleanupVocabulary.relevant(dictionary + preset.dictionary, to: text)
     if !terms.isEmpty {
       rules +=
         "\nPreferred spellings for sound-alike words:\n"

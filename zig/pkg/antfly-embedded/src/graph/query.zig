@@ -2736,6 +2736,7 @@ pub const GraphQueryEngine = struct {
             .deduplicate = params.deduplicate,
             .include_paths = params.include_paths,
             .node_admission = self.node_admission,
+            .max_intermediate_states = if (self.work_budget) |budget| budget.max_intermediate_states else work_budget_mod.default_max_intermediate_states,
             .work_budget = self.work_budget,
             .ttl_now_ns = self.ttl_now_ns,
             .owning_table = self.scope.owning_table,
@@ -2888,6 +2889,7 @@ pub const GraphQueryEngine = struct {
             .min_weight = gq.params.min_weight,
             .max_weight = gq.params.max_weight,
             .node_admission = self.node_admission,
+            .max_intermediate_states = if (self.work_budget) |budget| budget.max_intermediate_states else work_budget_mod.default_max_intermediate_states,
             .work_budget = self.work_budget,
             .owning_table = self.scope.owning_table,
             .expand_cross_table_local = self.scope.expand_cross_table_local,
@@ -3016,6 +3018,7 @@ pub const GraphQueryEngine = struct {
             .min_weight = gq.params.min_weight,
             .max_weight = gq.params.max_weight,
             .node_admission = self.node_admission,
+            .max_intermediate_states = if (self.work_budget) |budget| budget.max_intermediate_states else work_budget_mod.default_max_intermediate_states,
             .work_budget = self.work_budget,
             .owning_table = self.scope.owning_table,
             .expand_cross_table_local = self.scope.expand_cross_table_local,
@@ -3086,6 +3089,7 @@ pub const GraphQueryEngine = struct {
                 .max_results = gq.params.max_results,
                 .return_aliases = gq.return_aliases,
                 .node_admission = self.node_admission,
+                .max_intermediate_states = if (self.work_budget) |budget| budget.max_intermediate_states else work_budget_mod.default_max_intermediate_states,
                 .work_budget = self.work_budget,
                 .ttl_now_ns = self.ttl_now_ns,
                 .owning_table = self.scope.owning_table,
@@ -3980,7 +3984,7 @@ fn collectAlgebraicReachabilityEdges(
     });
     if (work_budget) |budget| {
         try budget.consumeNode();
-        try budget.checkIntermediateStates(queue.items.len, work_budget_mod.default_max_intermediate_states);
+        try budget.checkIntermediateStates(queue.items.len, budget.max_intermediate_states);
     }
     try visited.put(alloc, try alloc.dupe(u8, start_key), {});
 
@@ -4055,7 +4059,7 @@ fn collectAlgebraicReachabilityEdges(
                     .depth = current.depth + 1,
                 });
                 if (work_budget) |budget| {
-                    try budget.checkIntermediateStates(queue.items.len, work_budget_mod.default_max_intermediate_states);
+                    try budget.checkIntermediateStates(queue.items.len, budget.max_intermediate_states);
                 }
             }
         }

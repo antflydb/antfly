@@ -49,6 +49,9 @@ peak: usize = 0,
 monotonic: bool = false,
 spent: usize = 0,
 exhausted: bool = false,
+/// Backing allocation failures are distinct from policy denials. A recovered
+/// optional denial must never conceal a later physical allocation failure.
+backing_allocation_failed: bool = false,
 mutex: std.atomic.Mutex = .unlocked,
 /// Optional shared admission for the live allocations of an active operation.
 /// Reservations grow with actual allocator capacity, never a size estimate.
@@ -91,6 +94,13 @@ pub fn isLocallyExhausted(self: *Budget) bool {
     const pressure = self.pressure;
     self.mutex.unlock();
     return exhausted or if (pressure) |owner| owner.exhausted(owner.ptr) else false;
+}
+/// Conservative operation-level attribution: mixed recovered failures cannot
+/// establish that the escaping OOM was caused by this owner's admission.
+pub fn allocationFailureIsLocal(self: *Budget) bool {
+    self.lock();
+    defer self.mutex.unlock();
+    return (self.exhausted or self.admission_exhausted) and !self.backing_allocation_failed;
 }
 /// Temporary owners may bypass standard arenas without bypassing this budget
 /// or any enclosing budget/failure allocator. Returned objects must be freed
@@ -310,6 +320,7 @@ fn allocate(comptime scratch: bool, ptr: *anyopaque, len: usize, alignment: std.
         return null;
     }
     const result = backing.rawAlloc(len, alignment, ra) orelse {
+        self.backing_allocation_failed = true;
         self.releaseAdmission(len);
         return null;
     };

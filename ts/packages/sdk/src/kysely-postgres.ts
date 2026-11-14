@@ -1,13 +1,13 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 import process from "node:process";
-import { CompiledQuery, Kysely, type PostgresPool } from "kysely";
+import { CompiledQuery, type DatabaseIntrospector, Kysely, type PostgresPool } from "kysely";
 import { type MigrationResultSet, Migrator, type MigratorProps } from "kysely/migration";
 import {
   type AntflyMigrationLockSettings,
   AntflyPersistentMigrationLock,
 } from "./kysely-migration-lock.js";
-import { prepareKyselyMigrationTables } from "./kysely-migrations.js";
+import { createMigrationBootstrap, prepareKyselyMigrationTables } from "./kysely-migrations.js";
 import { type AntflyMigrationLock, AntflyPostgresDialect } from "./kysely-postgres-dialect.js";
 import { createManagedPostgresTypes } from "./kysely-postgres-policy.js";
 import {
@@ -158,12 +158,13 @@ export function createAntflyPostgres<DB>(
     options: pool.options,
   };
   const makeDb = (
-    lock: AntflyMigrationLock = new AntflyPersistentMigrationLock({ namespace: lockNamespace })
+    lock: AntflyMigrationLock = new AntflyPersistentMigrationLock({ namespace: lockNamespace }),
+    metadata: DatabaseIntrospector = introspector
   ) =>
     new Kysely<DB>({
       dialect: new AntflyPostgresDialect({
         pool: borrowed,
-        introspector,
+        introspector: metadata,
         migrationLock: lock,
         ...(options.cursor ? { cursor: createAntflyPostgresCursor(options.cursor, types) } : {}),
       }),
@@ -201,14 +202,25 @@ export function createAntflyPostgres<DB>(
       });
       // The outer claim covers bootstrap and Kysely's pre-lock bookkeeping too.
       // This private adapter is used only inside the already-locked connection.
-      const migrationDb = makeDb({ acquire: async () => {}, release: async () => {} });
+      let migrationMetadata = introspector;
+      const migrationDb = makeDb(
+        { acquire: async () => {}, release: async () => {} },
+        {
+          getSchemas: () => migrationMetadata.getSchemas(),
+          getTables: (options) => migrationMetadata.getTables(options),
+        }
+      );
       try {
         return await migrationDb.connection().execute(async (connection) => {
           await runLock.acquire(connection as Kysely<unknown>);
           let result: MigrationResultSet;
           try {
             await prepareKyselyMigrationTables(connection, props);
-            result = await action(new Migrator({ db: connection, ...props }));
+            const bootstrap = createMigrationBootstrap(introspector, connection, props);
+            migrationMetadata = bootstrap.introspector;
+            result = await action(
+              new Migrator({ db: connection, ...props, provider: bootstrap.provider })
+            );
           } catch (error) {
             result = { error };
           }

@@ -69,6 +69,17 @@ var store_ns: std.atomic.Value(u64) = .init(0);
 var source_ns: std.atomic.Value(u64) = .init(0);
 var physical_ns: std.atomic.Value(u64) = .init(0);
 var quota_peak: std.atomic.Value(u64) = .init(0);
+var http_status_records: @import("api/lake_http_diagnostic_budget.zig").Budget = .{};
+pub fn lakeExecutionProbeHttpStatus(method: []const u8, bytes: usize, attempts: usize, elapsed: u64, status: u16) void {
+    if (!http_status_records.admit(status)) return;
+    std.debug.print("PARQUET_BULK_HTTP_STATUS {{\"method\":\"{s}\",\"body_bytes\":{},\"attempts\":{},\"elapsed_ns\":{},\"status\":{}}}\n", .{ method, bytes, attempts, elapsed, status });
+}
+pub fn lakeExecutionProbeHttpFailure(method: []const u8, bytes: usize, attempts: usize, elapsed: u64, err: anyerror) void {
+    std.debug.print("PARQUET_BULK_HTTP_FAILURE {{\"method\":\"{s}\",\"body_bytes\":{},\"attempts\":{},\"elapsed_ns\":{},\"error_name\":\"{s}\"}}\n", .{ method, bytes, attempts, elapsed, @errorName(err) });
+}
+pub fn lakeExecutionProbeMemory(comptime role: []const u8, peak: usize, limit: usize) void {
+    std.debug.print("PARQUET_BULK_OWNER_MEMORY {{\"role\":\"{s}\",\"peak_bytes\":{},\"limit_bytes\":{}}}\n", .{ role, peak, limit });
+}
 pub fn lakeExecutionProbeQuota(peak: usize) void {
     quota_peak.store(peak, .monotonic);
 }
@@ -86,6 +97,7 @@ pub fn lakeExecutionProbeStage(comptime name: []const u8, elapsed: u64) void {
     _ = target.fetchAdd(elapsed, .monotonic);
 }
 fn probeReset() callconv(.c) void {
+    http_status_records.reset();
     families.reset();
     cache_decoded_hits.store(0, .monotonic);
     io_calls.store(0, .monotonic);

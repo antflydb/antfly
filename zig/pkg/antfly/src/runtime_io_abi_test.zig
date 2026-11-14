@@ -242,6 +242,7 @@ test "executor archive boundary remote snapshot failures retain stable identitie
     var runtime: RemoteConfig.RemoteContentRuntime = undefined;
     runtime_io_abi_test_remote_snapshot(&runtime, 0);
     var snapshot = try runtime.acquire();
+    try std.testing.expectEqual(@as([32]u8, @splat(42)), snapshot.revision.?);
     snapshot.deinit();
     for ([_]anyerror{ error.OutOfMemory, error.Timeout, error.Canceled, error.ResourceTemporarilyUnavailable }, 1..) |expected, code| {
         runtime_io_abi_test_remote_snapshot(&runtime, @intCast(code));

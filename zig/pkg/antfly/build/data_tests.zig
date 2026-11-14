@@ -147,7 +147,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "remote metadata source shares backend runtime io across a bounded executor pool",
         "remote routing cache entries retain immutable snapshots outside the cache lock",
         "remote routing never publishes a cache entry after its deadline",
-        "remote routing normalizes every timeout class at the source boundary",
+        "remote routing preserves cancellation while normalizing timeout classes",
         "remote await route plan cloning preserves its absolute deadline",
         "remote metadata catalog source provides compact routing",
         "remote metadata routing negotiation upgrades the N-1 adapter",

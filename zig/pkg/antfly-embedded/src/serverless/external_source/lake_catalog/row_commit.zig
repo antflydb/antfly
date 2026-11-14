@@ -608,7 +608,7 @@ test "external lake immutable file reads use one bounded GCS request" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.expired) return error.DeadlineExceeded;
         }
-        fn request(raw: ?*anyopaque, alloc: A, method: gcs.HttpMethod, url: []const u8, _: []const gcs.HeaderPair, _: ?[]const u8, _: ?[]const u8, max_response: ?usize, _: ?objectstore.CancellationToken) !gcs.TransportResponse {
+        fn request(raw: ?*anyopaque, alloc: A, method: gcs.HttpMethod, url: []const u8, _: []const gcs.HeaderPair, _: ?[]const u8, _: ?[]const u8, max_response: ?usize, _: ?objectstore.CancellationToken, _: gcs.TransportOptions) !gcs.TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             try std.testing.expectEqual(gcs.HttpMethod.GET, method);
             if (std.mem.indexOf(u8, url, "alt=media") != null) {

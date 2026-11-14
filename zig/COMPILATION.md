@@ -302,7 +302,7 @@ python3 zig/tools/check_query_owner_cache.py --report .benchmark-results/compile
 |---|---|---|
 | Physical storage | Table/shard lifetime, DB/LSM/index loops, local plans, batches, transactions, snapshots, restore, maintenance, Lite and public CAPI exports | HTTP, auth, cluster routing, remote topology, model execution |
 | Server storage adapter | Server/Raft adaptation over the physical owner, live DB ownership and admission | Complete local-query code generation |
-| Local query owner | Complete search/graph/text/algebraic/preflight operations, parsing, read-generation leases, aggregations and response ownership | DB lifetime, per-record cross-owner callbacks, a second index implementation |
+| Local query dispatcher | Checked whole-operation dispatch through the opaque query ABI | Physical query implementations, storage layouts, DB lifetime or per-record cross-owner callbacks |
 | Distributed/standalone | Table routing, topology, leadership, fanout, merge, distributed transactions, HA control, standalone startup/shutdown | Physical DB, index-manager, LSM, enrichment implementation or a second inference implementation |
 | API kernel | HTTP, auth, public validation, request translation and protocol handlers | Provisioned DB ownership, physical query execution or Raft apply |
 | Serverless | Published-artifact orchestration and serverless requests | Provisioned storage ownership, physical index execution or cluster Raft apply |
@@ -385,13 +385,13 @@ warm builds, then verifies these source changes:
 
 | Changed source | Required rebuild | Required reuse |
 |---|---|---|
-| Read coordination | Distributed and local-query archives, affected consumer objects/links | Storage adapter and unrelated runtime/test objects |
+| Read coordination | `antfly-storage-kernel` and distributed archives, affected consumer objects/links | Opaque local-query dispatcher and unrelated runtime/test objects |
 | Write coordination | Distributed runtime and affected consumer objects/links | Other runtime archives and unrelated test objects |
-| Query-provider implementation | Local-query archive and final links | Storage adapter and consumer objects |
+| Opaque query dispatcher | Local-query archive and final links | Storage adapter, physical storage and consumer objects |
 | Storage-adapter implementation | Storage adapter and final links | Local-query archive and consumer objects |
-| Physical DB/local query | Storage and local-query archives and final test links | Unrelated runtime archives and consumer/owner test objects |
+| Physical DB/query implementation | `antfly-storage-kernel` archive and final test links | Opaque local-query dispatcher, unrelated runtime archives and consumer/owner test objects |
 | Owner or consumer test root | Its test object and final link | Every runtime archive and unrelated test objects |
-| Storage ABI contract | Storage, distributed runtime, owner tests | CLI, inference, enrichment |
+| Storage ABI contract | Storage, distributed runtime, owner tests | Opaque local-query dispatcher, CLI, inference, enrichment |
 
 This expensive check runs with `zig-full / build-cache`. The lightweight
 configuration fixtures remain useful for option and generator dependencies.

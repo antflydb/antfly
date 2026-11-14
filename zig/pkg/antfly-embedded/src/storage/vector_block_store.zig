@@ -79,10 +79,7 @@ pub fn checkpointWalPathAlloc(alloc: Allocator, root_dir: []const u8, generation
 pub const RetainedBlock = struct {
     shared: *Shared,
 
-    const MappedPayload = struct {
-        bytes: []align(std.heap.page_size_min) u8,
-        fd: std.posix.fd_t,
-    };
+    const MappedPayload = @import("../segment_source.zig").MappedArtifact;
 
     const Payload = union(enum) {
         mapped: MappedPayload,
@@ -122,25 +119,7 @@ pub const RetainedBlock = struct {
                 if (offset > bytes_value.len or out.len > bytes_value.len - offset) return error.EndOfStream;
                 @memcpy(out, bytes_value[offset..][0..out.len]);
             },
-            .mapped => |value| {
-                if (comptime builtin.os.tag == .freestanding) {
-                    return error.UnsupportedPlatform;
-                } else {
-                    var read_len: usize = 0;
-                    while (read_len < out.len) {
-                        const rc = std.posix.system.pread(value.fd, out.ptr + read_len, out.len - read_len, @intCast(offset + read_len));
-                        switch (std.posix.errno(rc)) {
-                            .SUCCESS => {
-                                const n: usize = @intCast(rc);
-                                if (n == 0) return error.EndOfStream;
-                                read_len += n;
-                            },
-                            .INTR => continue,
-                            else => |err| return std.posix.unexpectedErrno(err),
-                        }
-                    }
-                }
-            },
+            .mapped => |value| try value.readAllAt(out, offset),
         }
     }
 
@@ -166,8 +145,8 @@ pub const RetainedBlock = struct {
                 if (comptime builtin.os.tag == .freestanding) {
                     unreachable;
                 } else {
-                    std.posix.munmap(mapped.bytes);
-                    _ = std.posix.system.close(mapped.fd);
+                    var owned = mapped;
+                    owned.deinit();
                 }
             },
             .heap => |heap| shared.alloc.free(heap),
@@ -4220,7 +4199,8 @@ test "storage.vector_block_store governed read workers release permits on comple
 /// oversized value/residual pair, independent of the vectors in a shard.
 const CompactionMerge = struct {
     // Read-ahead is bounded across all selected inputs and allocated only for
-    // winning payloads. Retained inode descriptors require no new fd permits.
+    // winning payloads. Mapped reads use nonblocking descriptor admission and
+    // fall back to the pinned mapping, so output permits cannot deadlock reads.
     const ReadWindow = struct {
         bytes: []u8 = &.{},
         identity: u64 = 0,
@@ -4967,25 +4947,21 @@ pub fn validateStagedBlock(store: *const Store, staged: StagedBlock) !ValidatedB
 fn readBlockValidated(store: *const Store, descriptor: vector_manifest.Segment) !ValidatedBlock {
     const path = try store.blockPathAlloc(descriptor.generation, descriptor.shard_id);
     defer store.alloc.free(path);
-    if (comptime builtin.os.tag != .freestanding) {
-        if (mapBlockFile(path)) |mapped| {
-            if (mapped.bytes.len == descriptor.bytes) {
-                if (vector_block.Reader.init(mapped.bytes)) |reader| {
-                    if (reader.generation == descriptor.generation and reader.shard_id == descriptor.shard_id and
-                        reader.covered_source_sequence == descriptor.covered_source_sequence and reader.admissionChecksum() == descriptor.admission_checksum)
-                    {
-                        const retained = RetainedBlock.init(store.alloc, .{ .mapped = mapped }) catch |err| {
-                            std.posix.munmap(mapped.bytes);
-                            _ = std.posix.system.close(mapped.fd);
-                            return err;
-                        };
-                        return .{ .block = retained, .reader = reader };
-                    }
-                } else |_| {}
-            }
-            std.posix.munmap(mapped.bytes);
-            _ = std.posix.system.close(mapped.fd);
-        } else |_| {}
+    const mapped = store.storage.mapImmutableArtifact(store.alloc, path) catch |err| switch (err) {
+        error.MappedArtifactUnsupported, error.MappedArtifactUnavailable => null,
+        error.FileNotFound => return error.MissingVectorBlock,
+        error.EmptySegment => return error.VectorBlockDescriptorMismatch,
+        else => return err,
+    };
+    if (mapped) |artifact| {
+        var owned = artifact;
+        errdefer owned.deinit();
+        if (artifact.bytes.len != descriptor.bytes) return error.VectorBlockDescriptorMismatch;
+        const reader = try vector_block.Reader.init(artifact.bytes);
+        if (reader.generation != descriptor.generation or reader.shard_id != descriptor.shard_id or
+            reader.covered_source_sequence != descriptor.covered_source_sequence or reader.admissionChecksum() != descriptor.admission_checksum)
+            return error.VectorBlockDescriptorMismatch;
+        return .{ .block = try RetainedBlock.init(store.alloc, .{ .mapped = artifact }), .reader = reader };
     }
     const bytes = store.storage.readFileAlloc(store.alloc, path, boundedReadLimit(max_block_bytes)) catch |err| switch (err) {
         error.FileNotFound => return error.MissingVectorBlock,
@@ -5000,24 +4976,6 @@ fn readBlockValidated(store: *const Store, descriptor: vector_manifest.Segment) 
         return error.VectorBlockDescriptorMismatch;
     }
     return .{ .block = try RetainedBlock.init(store.alloc, .{ .heap = bytes }), .reader = reader };
-}
-
-fn mapBlockFile(path: []const u8) !RetainedBlock.MappedPayload {
-    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
-        return error.UnsupportedPlatform;
-    } else {
-        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-        errdefer _ = std.posix.system.close(fd);
-        const size_raw = std.posix.system.lseek(fd, 0, std.posix.SEEK.END);
-        if (size_raw <= 0) return error.EmptyVectorBlock;
-        const size = std.math.cast(usize, size_raw) orelse return error.VectorBlockTooLarge;
-        const mapped = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
-        // Vector point reads are physically sorted within a request but sparse
-        // across the corpus. Disable broad kernel read-ahead so a recall-parity
-        // workload does not pull the complete multi-GiB projection into RSS.
-        std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.RANDOM) catch {};
-        return .{ .bytes = mapped, .fd = fd };
-    }
 }
 
 fn boundedReadLimit(max_bytes: usize) usize {
@@ -5270,7 +5228,7 @@ test "grouped projection queue includes oversized fallbacks and unavailable help
     }
 }
 
-test "vector block positional lookup reads mmap payload through retained descriptor" {
+test "vector block positional lookup reads mmap payload through admitted descriptor cache" {
     if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi)
         return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -6853,4 +6811,223 @@ test "vector block scopes separate dimensions through rebuild and compaction" {
             try std.testing.expectEqual(@as(u64, if (round == 0) 2 else 1), compacted.baseOnlyCoverage(new_scope.coverageHash()).?.vector_count);
         }
     }
+}
+
+// Keep this test runnable as an isolated child at RLIMIT_NOFILE=256/1024.
+fn descriptorCountForTest() !?usize {
+    if (comptime builtin.os.tag != .linux) return null;
+    var dir = try std.Io.Dir.openDirAbsolute(std.testing.io, "/proc/self/fd", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var iterator = dir.iterate();
+    var count: usize = 0;
+    while (try iterator.next(std.testing.io)) |_| count += 1;
+    return count;
+}
+
+test "vector block mapped descriptors stay bounded through publication reopen and active generations" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const baseline = try descriptorCountForTest();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var native = try lsm_backend.NativeStorage.init(a, .threaded);
+    var native_active = true;
+    defer if (native_active) native.deinit();
+    {
+        var store = try Store.open(a, native.storage(), root);
+        defer store.deinit();
+        const shard_count = 1024;
+        const blocks = try a.alloc(ShardBlock, shard_count);
+        defer a.free(blocks);
+        var built: usize = 0;
+        defer for (blocks[0..built]) |block| a.free(block.bytes);
+        const vector: [768]f32 = @splat(0.25);
+        for (blocks, 0..) |*block, i| {
+            var key_buf: [80]u8 = undefined;
+            var nonce: u64 = 0;
+            const key = while (true) : (nonce += 1) {
+                const candidate = try std.fmt.bufPrint(&key_buf, "vector-{d}-{d}", .{ i, nonce });
+                if (try vector_block.shardForKey(candidate, shard_count) == i) break candidate;
+            };
+            var writer = try vector_block.Writer.init(a, 1, @intCast(i), shard_count, 0);
+            defer writer.deinit();
+            try writer.appendVector(key, 0, 1, &vector);
+            block.* = .{ .shard_id = @intCast(i), .bytes = try writer.build() };
+            built += 1;
+        }
+        try store.publishGeneration(1, 0, blocks, true);
+        var first = try Store.openWithBlocks(a, native.storage(), root);
+        defer first.deinit();
+        var reopened = try Store.openWithBlocks(a, native.storage(), root);
+        defer reopened.deinit();
+        try std.testing.expectEqual(@as(usize, shard_count), first.blocks.len);
+        try std.testing.expectEqual(@as(usize, shard_count), reopened.blocks.len);
+        const Query = struct {
+            block: RetainedBlock,
+            expected: []const u8,
+            stop: std.atomic.Value(bool) = .init(false),
+            reads: std.atomic.Value(usize) = .init(0),
+            started: std.Io.Event = .unset,
+            failure: ?anyerror = null,
+            fn run(query_io: std.Io, self: *@This()) void {
+                defer self.started.set(query_io);
+                while (!self.stop.load(.acquire)) {
+                    var bytes: [64]u8 = undefined;
+                    self.block.readAllAt(&bytes, 0) catch |err| {
+                        self.failure = err;
+                        return;
+                    };
+                    if (!std.mem.eql(u8, self.expected, &bytes)) {
+                        self.failure = error.VectorBlockDescriptorMismatch;
+                        return;
+                    }
+                    _ = self.reads.fetchAdd(1, .monotonic);
+                    self.started.set(query_io);
+                    query_io.sleep(.fromMilliseconds(1), .awake) catch return;
+                }
+            }
+        };
+        var query = Query{ .block = first.blocks[0].retain(), .expected = blocks[0].bytes[0..64] };
+        defer query.block.deinit(a);
+        var query_runtime = std.Io.Threaded.init(a, .{ .concurrent_limit = .limited(2) });
+        defer query_runtime.deinit();
+        const query_io = query_runtime.io();
+        var task = try query_io.concurrent(Query.run, .{ query_io, &query });
+        var task_active = true;
+        defer if (task_active) {
+            query.stop.store(true, .release);
+            task.await(query_io);
+        };
+        query.started.waitUncancelable(query_io);
+        const stats = native.snapshotStats();
+        try std.testing.expect(stats.fd_cache_entries > 0);
+        try std.testing.expect(stats.fd_admitted_descriptors <= stats.fd_admission_capacity);
+        if (try descriptorCountForTest()) |count| {
+            try std.testing.expect(count <= baseline.? + stats.fd_admission_capacity + 8);
+            std.debug.print("vector FD qualification blocks={d} mappings={d} process_fds={d} storage_fds={d} capacity={d}\n", .{ shard_count, first.blocks.len + reopened.blocks.len, count, stats.fd_admitted_descriptors, stats.fd_admission_capacity });
+        }
+        // Publish a replacement while both old query generations remain live.
+        var replacement_writer = try vector_block.Writer.init(a, 2, 0, 1, 0);
+        defer replacement_writer.deinit();
+        try replacement_writer.appendVector("new-vector", 0, 2, &vector);
+        const replacement = try replacement_writer.build();
+        defer a.free(replacement);
+        try store.publishGeneration(2, 0, &.{.{ .shard_id = 0, .bytes = replacement }}, true);
+        var latest = try Store.openWithBlocks(a, native.storage(), root);
+        defer latest.deinit();
+        try std.testing.expectEqual(@as(u64, 2), latest.readers[0].generation);
+        const old_path = try store.blockPathAlloc(1, 0);
+        defer a.free(old_path);
+        native.storage().deleteFileAbsolute(old_path) catch |err| switch (err) {
+            error.FileNotFound => {}, // Publication may already retire the name.
+            else => return err,
+        };
+        var read_buf: [64]u8 = undefined;
+        try first.blocks[0].readAllAt(&read_buf, 0);
+        try std.testing.expectEqualSlices(u8, blocks[0].bytes[0..64], &read_buf);
+        // A different inode at the same name must never supply old-query bytes.
+        try native.storage().writeFileAbsolute(old_path, replacement);
+        try reopened.blocks[0].readAllAt(&read_buf, 0);
+        try std.testing.expectEqualSlices(u8, blocks[0].bytes[0..64], &read_buf);
+        const completed_before = query.reads.load(.acquire);
+        var attempts: usize = 0;
+        while (query.reads.load(.acquire) <= completed_before and attempts < 5000) : (attempts += 1)
+            try query_io.sleep(.fromMilliseconds(1), .awake);
+        try std.testing.expect(query.reads.load(.acquire) > completed_before);
+        query.stop.store(true, .release);
+        task.await(query_io);
+        task_active = false;
+        if (query.failure) |err| return err;
+        try std.testing.expect(query.reads.load(.acquire) > 0);
+    }
+    native.deinit();
+    native_active = false;
+    if (try descriptorCountForTest()) |count| try std.testing.expect(count <= baseline.? + 2);
+    // A fresh runtime must recover the replacement generation after shutdown.
+    var recovered_native = try lsm_backend.NativeStorage.init(a, .threaded);
+    defer recovered_native.deinit();
+    var recovered = try Store.openWithBlocks(a, recovered_native.storage(), root);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(u64, 2), recovered.readers[0].generation);
+}
+
+test "vector block mapped descriptors preserve reads under combined pool pressure and owner shutdown" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "immutable" });
+    defer a.free(path);
+    const storage_io = @import("lsm_backend/storage_io.zig");
+    var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 2);
+    defer pool.deinit();
+    var native = try lsm_backend.NativeStorage.initWithPool(a, .threaded, &pool);
+    var native_active = true;
+    defer if (native_active) native.deinit();
+    try native.storage().writeFileAbsolute(path, "pinned inode bytes");
+    var mapped = try native.storage().mapImmutableArtifact(a, path);
+    var mapped_active = true;
+    defer if (mapped_active) mapped.deinit();
+    var buffer: [6]u8 = undefined;
+    try std.testing.expect(try mapped.try_read_into.?(mapped.context.?, 0, &buffer));
+    try std.testing.expectEqualStrings("pinned", &buffer);
+    // Evict the mapping's idle descriptor and occupy every transient permit.
+    // Positional reads must fall back rather than waiting on these permits.
+    var permits = try native.acquireFdPermits(2);
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+    try std.testing.expect(!(try mapped.try_read_into.?(mapped.context.?, 0, &buffer)));
+    try mapped.readAllAt(&buffer, 0);
+    try std.testing.expectEqualStrings("pinned", &buffer);
+    permits.release();
+    try mapped.readAllAt(&buffer, 0);
+    try std.testing.expectEqualStrings("pinned", &buffer);
+    native.deinit();
+    native_active = false;
+    try mapped.readAllAt(&buffer, 0);
+    try std.testing.expectEqualStrings("pinned", &buffer);
+    try std.testing.expectError(error.EndOfStream, mapped.readAllAt(&buffer, mapped.bytes.len));
+    mapped.deinit();
+    mapped_active = false;
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+}
+
+test "vector block mapped descriptors share process admission with foreign artifact files" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const storage_io = @import("lsm_backend/storage_io.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var native = try lsm_backend.NativeStorage.init(a, .threaded);
+    defer native.deinit();
+    var pool = storage_io.NativeStoragePool.init(a);
+    defer pool.deinit();
+    const before = pool.snapshotStats();
+    var occupying = try native.acquireFdPermits(before.fd_admission_capacity - before.fd_persistent_reserve);
+    defer occupying.release();
+    try std.testing.expectError(error.StorageDescriptorPressure, storage_io.ProcessNativeFdPermit.acquire(io));
+    occupying.release();
+    var foreign = try storage_io.ProcessNativeFdPermit.acquire(io);
+    defer foreign.release();
+    try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_admitted_descriptors);
+    foreign.release();
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+}
+
+test "vector block mapped descriptors propagate positional IO errors without mmap fallback" {
+    const Fault = struct {
+        fn read(_: *anyopaque, _: usize, _: []u8) !bool {
+            return error.InputOutput;
+        }
+    };
+    var bytes: [64]u8 align(std.heap.page_size_min) = @splat('m');
+    var context: u8 = 0;
+    const artifact = RetainedBlock.MappedPayload{ .bytes = &bytes, .context = &context, .try_read_into = Fault.read };
+    var out: [4]u8 = @splat('o');
+    try std.testing.expectError(error.InputOutput, artifact.readAllAt(&out, 0));
+    try std.testing.expectEqualStrings("oooo", &out);
 }

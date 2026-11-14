@@ -625,6 +625,7 @@ def partition_cases(cases):
         "physical local query": 411,
         "consumer test root": 78,
         "owner integration test": 51,
+        "opaque query dispatcher": 30,
     }
     groups = [[], []]
     loads = [0, 0]
@@ -689,14 +690,11 @@ def main() -> None:
             (
                 "read coordination",
                 "api/table_reads.zig",
-                # A retained multi-range cut leases its DB generations inside
-                # the physical owner and reuses the canonical read merger.
-                # The query and distributed owners invalidate this shared source.
-                {"antfly-runtime-distributed", "antfly-runtime-local_query"},
-                (
-                    ARCHIVES
-                    - {"antfly-runtime-distributed", "antfly-runtime-local_query"}
-                )
+                # The physical kernel owns retained-read execution; distributed
+                # coordination imports this source too. The opaque query
+                # dispatcher must remain independent of both implementations.
+                {"antfly-runtime-distributed", "antfly-storage-kernel"},
+                (ARCHIVES - {"antfly-runtime-distributed", "antfly-storage-kernel"})
                 | {"storage-owner-tests", "storage-owner-enrichment-tests"},
             ),
             (
@@ -709,8 +707,8 @@ def main() -> None:
             (
                 "physical DB",
                 "storage/db/db.zig",
-                {"antfly-storage-kernel", "antfly-runtime-local_query"},
-                (ARCHIVES - {"antfly-storage-kernel", "antfly-runtime-local_query"})
+                {"antfly-storage-kernel"},
+                (ARCHIVES - {"antfly-storage-kernel"})
                 | {
                     "storage-owner-tests",
                     "storage-owner-source-tests",
@@ -721,14 +719,26 @@ def main() -> None:
             (
                 "physical local query",
                 "storage/query.zig",
-                {"antfly-storage-kernel", "antfly-runtime-local_query"},
-                (ARCHIVES - {"antfly-storage-kernel", "antfly-runtime-local_query"})
+                {"antfly-storage-kernel"},
+                (ARCHIVES - {"antfly-storage-kernel"})
                 | {
                     "storage-owner-tests",
                     "storage-owner-source-tests",
                     "storage-owner-enrichment-tests",
                 }
                 | CONSUMERS,
+            ),
+            (
+                "opaque query dispatcher",
+                "storage/local_query_dispatch.zig",
+                {"antfly-runtime-local_query"},
+                (ARCHIVES - {"antfly-runtime-local_query"})
+                | CONSUMERS
+                | {
+                    "storage-owner-tests",
+                    "storage-owner-source-tests",
+                    "storage-owner-enrichment-tests",
+                },
             ),
             (
                 "owner integration test",
@@ -747,12 +757,12 @@ def main() -> None:
                 "storage/kernel_owner_abi.zig",
                 {
                     "antfly-storage-kernel",
-                    "antfly-runtime-local_query",
                     "antfly-runtime-distributed",
                     "storage-owner-tests",
                 },
                 {
                     "antfly-runtime-cli",
+                    "antfly-runtime-local_query",
                     "antfly-runtime-enrichment_compute",
                     "antfly-runtime-inference",
                     "storage-owner-enrichment-tests",
@@ -847,12 +857,12 @@ def main() -> None:
                         "ZIG_LOCAL_CACHE_DIR": ".zig-cache",
                         "ZIG_GLOBAL_CACHE_DIR": ".zig-global-cache",
                     },
-                    # The cold graph has several independent archives and
-                    # owner/consumer executables. A newly started compiler is
-                    # not stalled because earlier units consumed 30 minutes.
-                    # Keep the original bound per compiler/idle period, plus
-                    # an absolute one-hour bound for the complete cold graph.
-                    timeout_seconds=3600 if label.endswith("cold") else 1800,
+                    # Contract mutations can rebuild several independent
+                    # archives and consumer executables, just like a cold
+                    # graph. Bound each compiler/idle period separately: a
+                    # six-minute final compiler is not stalled because earlier
+                    # units consumed the graph's first 24 minutes.
+                    timeout_seconds=3600,
                     compiler_timeout_seconds=1800,
                 )
             except BaseException as err:

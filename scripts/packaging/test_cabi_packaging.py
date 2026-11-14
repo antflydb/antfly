@@ -149,6 +149,7 @@ class CAbiPackagingTests(unittest.TestCase):
         self.assertIn("nix-build '<nixpkgs>' -A " + '"$ZIG_NIX_ATTRIBUTE"', bootstrap)
         self.assertIn('echo "$zig_path/bin" >> "$GITHUB_PATH"', bootstrap)
         self.assertIn("grep -q 'dynamically linked'", bootstrap)
+        self.assertRegex(bootstrap, r"apt-get install[^\n]*\bgcc\b[^\n]*\blibc6-dev\b")
 
     def test_linux_abi_release_contract_stays_consistent(self) -> None:
         installer = (REPO_ROOT / "scripts" / "install.sh").read_text()

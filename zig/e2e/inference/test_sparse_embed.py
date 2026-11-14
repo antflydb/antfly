@@ -22,7 +22,10 @@ Requires a model with "sparse" capability.
 import pytest
 from .helpers import sparse_dot_product
 
-pytestmark = pytest.mark.model_integration
+pytestmark = [
+    pytest.mark.model_integration,
+    pytest.mark.inference_models("sparse-encoder-testing/splade-bert-tiny-nq-onnx"),
+]
 
 SPARSE_MODEL = "sparse-encoder-testing/splade-bert-tiny-nq-onnx"
 

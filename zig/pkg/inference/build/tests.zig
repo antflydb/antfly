@@ -14,6 +14,11 @@
 // limitations under the License.
 
 const std = @import("std");
+
+// Keep default execution disjoint from the focused ownership roots.
+const execution_batch_filters = [_][]const u8{ "ops.execution_scope.test.", "ops.execution_batch.test.execution batch", "pipelines.generation.test.cooperative decode publication", "pipelines.generation.test.execution batch", "ops.cuda.cuda_compute.test.cooperative decode batches", "runtime.scheduler.native_generate.test." };
+const cuda_lifecycle_filters = [_][]const u8{ "ops.cuda.buffer.test.CUDA physical OOM", "ops.cuda.buffer.test.CUDA quarantine", "ops.cuda.allocation_ledger.test.CUDA ", "ops.cuda.allocation_budget.test.CUDA boundary physical allocation budget", "test_cuda_allocation_lifecycle.test.CUDA quarantine" };
+const executor_microbatch_filters = [_][]const u8{ "gliner microbatch", "executor microbatch", "executor_microbatch.test.", "embedding text batch", "gliner span v2 batch admission", "tensor microbatch" };
 const Context = @import("context.zig").Context;
 const runtime_build = @import("runtime.zig");
 const build_test_filters = @import("test_filters.zig");
@@ -239,6 +244,8 @@ pub fn create(ctx: Context) Suite {
     if (selected_test_filters.len == 0) {
         for (@import("finetune/tests.zig").inference_overlap_filters) |filter|
             run_tests.addArgs(&.{ "--skip-test-filter", filter });
+        for (execution_batch_filters ++ cuda_lifecycle_filters ++ executor_microbatch_filters) |filter|
+            run_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
     return .{
         .tests = tests,
@@ -280,9 +287,12 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
             .link_libc = true,
         }) });
         callbacks.root_module.addCSourceFile(.{ .file = ctx.path("tests/video_decode_test.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-UNDEBUG" } });
-        media_step.dependOn(&ctx.addRunArtifact(callbacks).step);
+        const run_callbacks = ctx.addRunArtifact(callbacks);
+        media_step.dependOn(&run_callbacks.step);
+        test_step.dependOn(&run_callbacks.step);
     }
-    test_step.dependOn(media_step);
+    // Shared container/source tests run once through lib-test's test-media.
+    // test-video-media retains the complete focused suite, including callbacks.
     const cooperative_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cooperative_admission.zig"), .target = ctx.target, .optimize = ctx.optimize });
     var cooperative_imports = suite.tests.root_module.import_table.iterator();
     while (cooperative_imports.next()) |entry| cooperative_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
@@ -304,7 +314,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
         ctx.backend.enable_metal and !ctx.backend.enable_cuda and !ctx.backend.enable_pjrt;
     const native_debug_cpu_batch = b.graph.host.result.os.tag == .macos and b.graph.host.result.cpu.arch == .aarch64 and
         ctx.target.result.os.tag == .macos and ctx.target.result.cpu.arch == .aarch64 and ctx.optimize == .debug and !ctx.hasAccelerator();
-    const batch_tests = b.addTest(.{ .max_rss = @as(usize, if (native_debug_metal_batch) 4_352 else if (native_debug_cpu_batch) 3_072 else 2_048) * 1024 * 1024, .root_module = batch_root, .filters = &.{ "execution scope", "execution owner transitions", "execution resource release", "execution batch", "cooperative decode batches", "cooperative decode publication", "runtime.scheduler.native_generate", "test_0" } });
+    const batch_tests = b.addTest(.{ .max_rss = @as(usize, if (native_debug_metal_batch) 4_352 else if (native_debug_cpu_batch) 3_072 else 2_048) * 1024 * 1024, .root_module = batch_root, .filters = &(execution_batch_filters ++ [_][]const u8{"test_0"}) });
     const run_batch_tests = ctx.addRunArtifact(batch_tests);
     test_step.dependOn(&run_batch_tests.step);
     ctx.step("test-execution-batch", "Verify cohort budgets, scope retirement and decode arithmetic without a GPU").dependOn(&run_batch_tests.step);
@@ -312,7 +322,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     var lifecycle_imports = suite.tests.root_module.import_table.iterator();
     while (lifecycle_imports.next()) |entry| lifecycle_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
     lifecycle_root.link_libc = true;
-    const lifecycle_tests = b.addTest(.{ .root_module = lifecycle_root, .filters = &.{ "CUDA quarantine", "CUDA allocation", "CUDA retired", "CUDA physical OOM", "CUDA boundary", "test_0" } });
+    const lifecycle_tests = b.addTest(.{ .root_module = lifecycle_root, .filters = &(cuda_lifecycle_filters ++ [_][]const u8{"test_0"}) });
     const run_lifecycle_tests = ctx.addRunArtifact(lifecycle_tests);
     test_step.dependOn(&run_lifecycle_tests.step);
     ctx.step("test-cuda-allocation-lifecycle", "Verify failed-free quarantine across primary-context lifetimes without a GPU").dependOn(&run_lifecycle_tests.step);
@@ -320,7 +330,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     var microbatch_imports = suite.tests.root_module.import_table.iterator();
     while (microbatch_imports.next()) |entry| microbatch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
     microbatch_root.link_libc = true;
-    const microbatch_tests = b.addTest(.{ .max_rss = 4 * 1024 * 1024 * 1024, .root_module = microbatch_root, .filters = &.{ "gliner microbatch", "executor microbatch", "executor_microbatch.test.", "embedding text batch", "gliner span v2 batch admission", "tensor microbatch", "test_0" } });
+    const microbatch_tests = b.addTest(.{ .max_rss = 4 * 1024 * 1024 * 1024, .root_module = microbatch_root, .filters = &(executor_microbatch_filters ++ [_][]const u8{"test_0"}) });
     const run_microbatch_tests = ctx.addRunArtifact(microbatch_tests);
     test_step.dependOn(&run_microbatch_tests.step);
     ctx.step("test-executor-microbatch", "Verify executor batching, GLiNER adapters, row ownership, capacity and cancellation").dependOn(&run_microbatch_tests.step);

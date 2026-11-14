@@ -1296,6 +1296,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "public table batch handler preserves ambiguous write outcomes",
             "public table batch handler maps HA write gate errors",
             "public table batch handler returns concise dense repair backpressure",
+            "public table batch handler returns actionable descriptor pressure",
             "public table api carries borrowed cancellation into batch execution",
             "public create index exposes retryable storage descriptor exhaustion",
             "public create index exposes unsupported deployment capability",
@@ -1368,6 +1369,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "canonical relationship predicates",
             "projected graph endpoint routing recognizes every source form",
             "distributed graph edge reader finds fact owners outside the source endpoint shard",
+            "distributed min-hop paths stream bounded pages and admit each vertex once",
+            "distributed min-hop pages preserve",
+            "distributed min-hop page ownership",
+            "api http graph operator limits",
             "distributed graph edges response round trips owned edges",
             "internal batch parser owns and round trips graph mutations",
             "internal batch graph endpoint cleanup command",
@@ -1404,6 +1409,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_api_graph_snapshot_tests = addFilteredTestRunArtifact(b, lib_api_graph_snapshot_tests);
     const lib_api_graph_snapshot_test_step = b.step("antfly-api-graph-snapshot-test", "Run distributed graph snapshot-vector regression tests");
     lib_api_graph_snapshot_test_step.dependOn(&run_lib_api_graph_snapshot_tests.step);
+    const shortest_path_scale_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, &.{"shortest path production reader scans 122K"}),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-shortest-path-scale-test", "Run the real-reader 10K-node shortest-path budget regression")
+        .dependOn(&addFilteredTestRunArtifact(b, shortest_path_scale_tests).step);
     const lib_api_graph_wire_runtime_filters = &.{"graph hydrate response wire flattens index identity"};
     const lib_api_graph_wire_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -2005,6 +2017,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "provisioned named index repair keeps group queued for aggregate debt audit",
             "dirty table tracking stays bounded to writer cache ownership",
             "writer cache eviction retires dirty ownership after the last cache owner",
+            "persistent descriptor exhaustion is a retryable writer-open conflict",
             "prepared writer open evicts an inactive sibling group before retrying descriptor pressure",
             "prepared writer open reclaims descriptor capacity from startup cache",
             "forwarded write sources use the local writer owner dirty lifecycle",
