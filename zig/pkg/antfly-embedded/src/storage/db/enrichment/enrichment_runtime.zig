@@ -18189,6 +18189,25 @@ fn recordAssetProducerFailure(runtime: *EnrichmentRuntime, window: *GeneratedRep
     try storePutPrivateBatchWithRetry(runtime, &runtime.store, &.{.{ .key = item.state_key, .value = marker }}, &.{});
 }
 
+/// Publication progress never consumes the slot for a genuine provider retry.
+/// Capture that retry at the failing item, before later siblings change scope.
+/// Control/fatal failures remain immediate at each caller.
+const AssetBatchOutcome = struct {
+    retry_error: ?anyerror = null,
+    publication_pending: bool = false,
+
+    fn deferRetry(self: *@This(), scope: *FailureScope, err: anyerror) void {
+        if (self.retry_error != null) return;
+        self.retry_error = err;
+        scope.deferRetry(err);
+    }
+
+    fn finish(self: @This()) !void {
+        if (self.retry_error) |err| return err;
+        if (self.publication_pending) return error.ArtifactPublicationPending;
+    }
+};
+
 fn flushAssetProducerBatchItems(
     runtime: *EnrichmentRuntime,
     items: []AssetProducerBatchItem,
@@ -18211,15 +18230,78 @@ fn flushAssetProducerBatchItems(
     defer producer_lease_guard.stop();
 
     const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
+    const text_count = try partitionAssetProducerBatchByTransport(runtime.alloc, items);
+    var outcome: AssetBatchOutcome = .{};
+    if (text_count > 0) {
+        flushTextAssetProducerBatchItems(runtime, producer, items[0..text_count], window, scope) catch |err| {
+            if (scope.publication_failed) return err;
+            if (err == error.ArtifactPublicationPending) {
+                // Ordered acceptance is independent per source. Submit the
+                // document siblings before yielding for publication progress.
+                outcome.publication_pending = true;
+            } else {
+                if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) return err;
+                outcome.deferRetry(scope, err);
+            }
+        };
+    }
+    if (text_count < items.len) {
+        const documents = items[text_count..];
+        scope.enterOwned(assetProducerBatchFailureFingerprint(documents), .{ .assets = documents });
+        flushIndexDocumentBatch(runtime, producer, documents, window, scope) catch |err| {
+            if (scope.publication_failed) return err;
+            if (err == error.ArtifactPublicationPending) {
+                outcome.publication_pending = true;
+            } else {
+                if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) != .retryable_request) return err;
+                outcome.deferRetry(scope, err);
+            }
+        };
+    }
+    return outcome.finish();
+}
+
+/// Stable, bounded partition of borrowed item descriptors. Homogeneous cohorts
+/// allocate no scratch space; mixed cohorts never copy or retain source bodies.
+/// Reorder the owning slice itself so failure scopes cannot outlive scratch.
+fn partitionAssetProducerBatchByTransport(a: Allocator, items: []AssetProducerBatchItem) !usize {
+    std.debug.assert(items.len > 0);
+    const first_document = try indexDocumentProducerRequired(a, items[0]);
+    var boundary: usize = 1;
+    while (boundary < items.len and (try indexDocumentProducerRequired(a, items[boundary])) == first_document) : (boundary += 1) {}
+    if (boundary == items.len) return if (first_document) 0 else items.len;
+
+    const ordered = try a.alloc(AssetProducerBatchItem, items.len);
+    defer a.free(ordered);
+    var texts: usize = 0;
+    var documents = items.len;
+    for (items, 0..) |item, index| {
+        const document = if (index < boundary) first_document else if (index == boundary) !first_document else try indexDocumentProducerRequired(a, item);
+        if (document) {
+            documents -= 1;
+            ordered[documents] = item;
+        } else {
+            ordered[texts] = item;
+            texts += 1;
+        }
+    }
+    std.debug.assert(texts == documents);
+    std.mem.reverse(AssetProducerBatchItem, ordered[documents..]);
+    @memcpy(items, ordered);
+    return texts;
+}
+
+fn flushTextAssetProducerBatchItems(
+    runtime: *EnrichmentRuntime,
+    producer: asset_producer_mod.Producer,
+    items: []AssetProducerBatchItem,
+    window: *GeneratedReplayWindow,
+    scope: *FailureScope,
+) !void {
+    scope.enterOwned(assetProducerBatchFailureFingerprint(items), .{ .assets = items });
     const requests = try runtime.alloc.alloc(asset_producer_mod.Request, items.len);
     defer runtime.alloc.free(requests);
     for (items, 0..) |*item, idx| requests[idx] = item.asRequest();
-
-    // One producer configuration can mix literal text and document locators.
-    // A later document must retain its checkpoint owner even when the first
-    // item is text; each invocation still selects its own transport.
-    for (items) |item| if (try indexDocumentProducerRequired(runtime.alloc, item))
-        return flushIndexDocumentBatch(runtime, producer, items, window, scope);
 
     const can_batch = assetProducerCanBatchGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
         if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
@@ -18238,7 +18320,7 @@ fn flushAssetProducerBatchItems(
     };
     defer produced_batch.deinit(runtime.alloc);
 
-    var retry_error: ?anyerror = null;
+    var outcome: AssetBatchOutcome = .{};
     for (items, produced_batch.items) |*item, *produced| {
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         scope.enterAsset(item);
@@ -18251,24 +18333,18 @@ fn flushAssetProducerBatchItems(
                 // sibling still needs another attempt.
                 setRetryAfterHintFor(runtime, scope.fingerprint, failure.retry_after_ms);
                 if (failure.retryable and try scope.shouldYield(runtime, failure.cause)) {
-                    if (retry_error == null) {
-                        retry_error = failure.cause;
-                        scope.deferRetry(failure.cause);
-                    }
+                    outcome.deferRetry(scope, failure.cause);
                 } else try recordAssetProducerFailure(runtime, window, item.*, failure.cause, scope.attemptNumber(runtime));
             },
             .value => |output| {
                 applyAssetProducerBatchOutput(runtime, item, output, window) catch |err| {
                     if (err == error.ArtifactPublicationPending) {
-                        if (retry_error == null) retry_error = err;
+                        outcome.publication_pending = true;
                         continue;
                     }
                     if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
                     if (try scope.shouldYield(runtime, err)) {
-                        if (retry_error == null) {
-                            retry_error = err;
-                            scope.deferRetry(err);
-                        }
+                        outcome.deferRetry(scope, err);
                     } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime));
                     continue;
                 };
@@ -18277,7 +18353,7 @@ fn flushAssetProducerBatchItems(
             },
         }
     }
-    if (retry_error) |err| return err;
+    return outcome.finish();
 }
 
 fn indexDocumentProducerRequired(a: Allocator, item: AssetProducerBatchItem) !bool {
@@ -18313,7 +18389,7 @@ fn flushIndexDocumentBatch(runtime: *EnrichmentRuntime, producer: asset_producer
         }
     };
     const io = runtime.config.io orelse runtime.io_impl.?.io();
-    var retry_error: ?anyerror = null;
+    var outcome: AssetBatchOutcome = .{};
     var offset: usize = 0;
     while (offset < items.len) {
         const count = @min(@as(usize, 4), items.len - offset);
@@ -18337,30 +18413,24 @@ fn flushIndexDocumentBatch(runtime: *EnrichmentRuntime, producer: asset_producer
             const bytes = result catch |err| {
                 if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
                 if (try scope.shouldYield(runtime, err)) {
-                    if (retry_error == null) {
-                        retry_error = err;
-                        scope.deferRetry(err);
-                    }
+                    outcome.deferRetry(scope, err);
                 } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime));
                 continue;
             };
             applyAssetProducerBatchOutput(runtime, item, bytes, window) catch |err| {
                 if (err == error.ArtifactPublicationPending) {
-                    if (retry_error == null) retry_error = err;
+                    outcome.publication_pending = true;
                     continue;
                 }
                 if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
                 if (try scope.shouldYield(runtime, err)) {
-                    if (retry_error == null) {
-                        retry_error = err;
-                        scope.deferRetry(err);
-                    }
+                    outcome.deferRetry(scope, err);
                 } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime));
             };
         }
         offset += count;
     }
-    if (retry_error) |err| return err;
+    return outcome.finish();
 }
 
 fn flushAssetProducerBatchSequential(
@@ -18370,7 +18440,7 @@ fn flushAssetProducerBatchSequential(
     window: *GeneratedReplayWindow,
     scope: *FailureScope,
 ) !void {
-    var retry_error: ?anyerror = null;
+    var outcome: AssetBatchOutcome = .{};
     for (items) |*item| {
         if (runtimeShuttingDown(runtime)) return error.EnrichmentRetryAborted;
         scope.enterAsset(item);
@@ -18378,29 +18448,23 @@ fn flushAssetProducerBatchSequential(
         const produced = assetProducerProduceGuarded(runtime, producer, runtime.alloc, request) catch |err| {
             if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
             if (try scope.shouldYield(runtime, err)) {
-                if (retry_error == null) {
-                    retry_error = err;
-                    scope.deferRetry(err);
-                }
+                outcome.deferRetry(scope, err);
             } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime));
             continue;
         };
         defer runtime.alloc.free(produced);
         applyAssetProducerBatchOutput(runtime, item, produced, window) catch |err| {
             if (err == error.ArtifactPublicationPending) {
-                if (retry_error == null) retry_error = err;
+                outcome.publication_pending = true;
                 continue;
             }
             if (isEnrichmentControlError(err) or enrichmentErrorDisposition(err) == .fatal_worker) return err;
             if (try scope.shouldYield(runtime, err)) {
-                if (retry_error == null) {
-                    retry_error = err;
-                    scope.deferRetry(err);
-                }
+                outcome.deferRetry(scope, err);
             } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime));
         };
     }
-    if (retry_error) |err| return err;
+    return outcome.finish();
 }
 
 fn prepareVectorLabelPrompts(runtime: *EnrichmentRuntime, provider: embedder_mod.DenseEmbedder, embedding_name: []const u8, prompts: []const []const u8, dims: u32) ![][]const f32 {
@@ -43033,6 +43097,250 @@ test "ordered artifact inventory deferred asset callback completes graph without
 fn testOrderedAssetCallback(generated: bool, graph: bool) !void {
     try testOrderedAssetLifecycle(generated, graph, false);
     try testOrderedAssetLifecycle(generated, graph, true);
+}
+
+const OrderedMixedAction = enum { pending, retry_document, retry_text, serial_retry_text, cancel_text, stale_text };
+
+test "ordered artifact inventory mixed transport publication does not block document siblings" {
+    for ([_]OrderedMixedAction{ .pending, .retry_document, .cancel_text, .stale_text }) |action| {
+        for (0..3) |document_position| {
+            try testOrderedMixedOutcomes(3, @as(u8, 1) << @intCast(document_position), action, if (action == .retry_document) document_position else null);
+        }
+    }
+}
+
+test "ordered artifact inventory mixed item outcomes preserve retries across publication waits" {
+    // Six documents cross the four-call concurrency boundary. Move the failed
+    // item through every position to cover failure before/after pending output.
+    for ([_]u8{ 0b11111100, 0b00111111, 0b10101010 }) |documents| {
+        try testOrderedMixedOutcomes(8, documents, .pending, null);
+        for (0..8) |index| {
+            if (documents & (@as(u8, 1) << @intCast(index)) != 0) {
+                try testOrderedMixedOutcomes(8, documents, .retry_document, index);
+            } else {
+                try testOrderedMixedOutcomes(8, documents, .retry_text, index);
+                try testOrderedMixedOutcomes(8, documents, .serial_retry_text, index);
+            }
+        }
+    }
+}
+
+fn testOrderedMixedOutcomes(source_count: usize, document_mask: u8, action: OrderedMixedAction, failing_index: ?usize) !void {
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const a = std.testing.allocator;
+    const Harness = struct {
+        action: OrderedMixedAction,
+        serial_text: bool,
+        recovering: bool = false,
+        text_count: usize,
+        failed_source: []const u8 = "",
+        commands: std.ArrayList([]u8) = .empty,
+        text_batches: usize = 0,
+        document_calls: std.atomic.Value(usize) = .init(0),
+        text_single_calls: usize = 0,
+        fn output(alloc: Allocator, text: []const u8) ![]u8 {
+            return std.fmt.allocPrint(alloc, "{{\"source\":{f}}}", .{std.json.fmt(text, .{})});
+        }
+        fn plain(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            return error.TestMissingInvocationContext;
+        }
+        fn document(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request, context: asset_producer_mod.InvocationContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.endsWith(u8, request.source_text, ".pdf")) {
+                if (context.document_checkpoints == null) return error.TestMissingDocumentCheckpoint;
+                _ = self.document_calls.fetchAdd(1, .monotonic);
+                if (self.action == .retry_document and std.mem.eql(u8, request.source_text, self.failed_source)) return error.InferenceTransportUnavailable;
+            } else {
+                if (!self.serial_text or context.document_checkpoints != null) return error.TestUnexpectedTextSingleton;
+                self.text_single_calls += 1;
+                if (self.action == .serial_retry_text and std.mem.eql(u8, request.source_text, self.failed_source)) return error.InferenceTransportUnavailable;
+            }
+            return output(alloc, request.source_text);
+        }
+        fn texts(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer_mod.Request, context: asset_producer_mod.InvocationContext) !asset_producer_mod.ProducedBatch {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (context.document_checkpoints != null) return error.TestUnexpectedTextCheckpoint;
+            self.text_batches += 1;
+            switch (self.action) {
+                .cancel_text => return error.EnrichmentRetryAborted,
+                .stale_text => return error.EnrichmentSourceChanged,
+                else => {},
+            }
+            try std.testing.expectEqual(if (self.recovering) @as(usize, 1) else self.text_count, requests.len);
+            const items = try alloc.alloc(asset_producer_mod.ProducedItem, requests.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (items[0..initialized]) |item| if (item.result == .value) alloc.free(item.result.value);
+                alloc.free(items);
+            }
+            for (requests, items) |request, *item| {
+                item.* = .{
+                    .identity = .{ .item_id = request.item_id, .source_fingerprint = request.source_fingerprint, .page_number = request.page_number },
+                    .result = if (self.action == .retry_text and std.mem.eql(u8, request.source_text, self.failed_source))
+                        .{ .item_error = .{ .cause = error.InferenceTransportUnavailable, .code = .upstream_failure, .retryable = true } }
+                    else
+                        .{ .value = try output(alloc, request.source_text) },
+                };
+                initialized += 1;
+            }
+            return .{ .items = items, .execution = inference_work.ExecutionReport.native(requests.len) };
+        }
+        fn batchMode(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) !inference_work.BatchMode {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (self.serial_text) .none else .native;
+        }
+        fn enqueue(ptr: *anyopaque, _: ordered_publication.Namespace, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const copy = try std.testing.allocator.dupe(u8, bytes);
+            errdefer std.testing.allocator.free(copy);
+            try self.commands.append(std.testing.allocator, copy);
+        }
+        fn provider(self: *@This()) asset_producer_mod.Producer {
+            return .{ .ptr = self, .vtable = &.{ .produce = plain, .produce_with_context = document, .produce_batch_reported_with_context = texts, .batch_mode = batchMode, .foreground_bounded = true, .invocation_memory_for_requests = testInvocationMemoryForRequests } };
+        }
+    };
+    std.debug.assert(source_count <= 8 and source_count > 0);
+    const document_count: usize = @popCount(document_mask);
+    const text_count = source_count - document_count;
+    const has_failure = action == .retry_document or action == .retry_text or action == .serial_retry_text;
+    var harness: Harness = .{ .action = action, .serial_text = action == .serial_retry_text, .text_count = text_count };
+    errdefer std.debug.print("ordered mixed outcomes: action={s}, documents={b}, failed={?d}\n", .{ @tagName(action), document_mask, failing_index });
+    defer {
+        for (harness.commands.items) |bytes| a.free(bytes);
+        harness.commands.deinit(a);
+    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/mixed-publication", .{tmp.sub_path});
+    defer a.free(path);
+    var db = try db_mod.DB.open(a, path, .{
+        .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 },
+        .online_source_authority = .raft,
+        .primary_backend = .{ .lsm = .{} },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .artifact_publication_dispatcher = .{ .ptr = &harness, .enqueue = Harness.enqueue },
+    });
+    defer db.close();
+    try db.setSchemaJson(a, "{}");
+    try db.addEnrichment(.{ .name = "inspection", .kind = .asset, .field = "body", .content_type = "application/json", .producer_json = "{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\",\"model\":\"fixture\"}}", .execution = .{ .batch_items = 8, .batch_bytes = 1024 * 1024 } });
+    const all_keys = [_][]const u8{ "doc:a", "doc:b", "doc:c", "doc:d", "doc:e", "doc:f", "doc:g", "doc:h" };
+    const keys = all_keys[0..source_count];
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const sources = try scratch.alloc([]const u8, source_count);
+    const writes = try scratch.alloc(@import("../mutation_values.zig").BatchWrite, source_count);
+    for (sources, writes, keys, 0..) |*source, *write, key, index| {
+        source.* = if (document_mask & (@as(u8, 1) << @intCast(index)) != 0) try std.fmt.allocPrint(scratch, "https://example.test/input-{d}.pdf", .{index}) else key;
+        write.* = .{ .key = key, .value = try std.fmt.allocPrint(scratch, "{{\"body\":{f}}}", .{std.json.fmt(source.*, .{})}) };
+    }
+    harness.failed_source = if (failing_index) |index| sources[index] else "";
+    try server_test_adapter.applyOrdered(&db, .{ .writes = writes, .timestamp_ns = 100 }, .{ .term = 1, .index = 1 });
+    var catalog = try db.artifactInventoryCommand(a);
+    defer catalog.catalogs.deinit(a);
+    catalog.binding.effect_protocol = 15;
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 2 });
+    var activation: ordered_publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    activation.publication_digest = activation.digest();
+    try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .asset_producer = harness.provider(), .inline_retry_max_attempts = 1 });
+    const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    const request_template = for (plan.plan().generated_templates) |candidate| {
+        if (std.mem.eql(u8, candidate.artifact_name, "inspection")) break candidate;
+    } else return error.TestUnexpectedResult;
+    var window: GeneratedReplayWindow = .{ .alloc = runtime.alloc };
+    defer window.deinit();
+    var batch: PreparedAssetBatch = .{};
+    defer batch.deinit(runtime.alloc);
+    var prepared = PreparedDocumentSourceCache.init(runtime);
+    defer prepared.deinit();
+    var scope: FailureScope = .{};
+    for (keys) |key| {
+        var request = request_template;
+        request.doc_key = key;
+        try processAsset(runtime, request, &batch, &prepared, &window, &scope);
+    }
+    const errors = runtime.error_count;
+    const attempts = runtime.retry_failure_count;
+    switch (action) {
+        .cancel_text, .stale_text => {
+            try std.testing.expectError(if (action == .cancel_text) error.EnrichmentRetryAborted else error.EnrichmentSourceChanged, batch.flush(runtime, &window, &scope));
+            try std.testing.expectEqual(@as(usize, 0), harness.document_calls.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), harness.commands.items.len);
+            return;
+        },
+        .pending => {
+            try std.testing.expectError(error.ArtifactPublicationPending, batch.flush(runtime, &window, &scope));
+            try std.testing.expect(scope.retry_error == null);
+            try std.testing.expect(batch.retry_error == null);
+            try std.testing.expectEqual(errors, runtime.error_count);
+            try std.testing.expectEqual(attempts, runtime.retry_failure_count);
+        },
+        .retry_document, .retry_text, .serial_retry_text => {
+            try batch.flush(runtime, &window, &scope);
+            try std.testing.expectEqual(error.InferenceTransportUnavailable, batch.retry_error.?);
+            var request = request_template;
+            request.doc_key = keys[failing_index.?];
+            try std.testing.expectEqual(requestFailureFingerprint(request), scope.retry_fingerprint);
+        },
+    }
+    try std.testing.expectEqual(@as(usize, if (harness.serial_text) 0 else 1), harness.text_batches);
+    try std.testing.expectEqual(document_count, harness.document_calls.load(.acquire));
+    try std.testing.expectEqual(source_count - @as(usize, if (has_failure) 1 else 0), harness.commands.items.len);
+    // Nothing is accepted yet, even though both transports have run.
+    for (keys) |key| {
+        const artifact = try internal_keys.artifactNamedPrefixAlloc(a, key, "asset", "inspection");
+        defer a.free(artifact);
+        try std.testing.expectError(error.NotFound, db.core.store.get(a, artifact));
+    }
+    var applied: usize = 0;
+    while (applied < harness.commands.items.len) : (applied += 1) {
+        var command = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(a, harness.commands.items[applied]);
+        defer command.deinit();
+        try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = command.command }, .{ .term = 1, .index = 4 + applied });
+    }
+    harness.action = .pending;
+    harness.recovering = true;
+    if (has_failure) {
+        var recovery: PreparedAssetBatch = .{};
+        defer recovery.deinit(runtime.alloc);
+        var recovery_scope: FailureScope = .{};
+        for (keys) |key| {
+            var request = request_template;
+            request.doc_key = key;
+            try processAsset(runtime, request, &recovery, &prepared, &window, &recovery_scope);
+        }
+        try std.testing.expectError(error.ArtifactPublicationPending, recovery.flush(runtime, &window, &recovery_scope));
+        while (applied < harness.commands.items.len) : (applied += 1) {
+            var command = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(a, harness.commands.items[applied]);
+            defer command.deinit();
+            try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = command.command }, .{ .term = 1, .index = 4 + applied });
+        }
+    }
+    var completed: PreparedAssetBatch = .{};
+    defer completed.deinit(runtime.alloc);
+    var completed_scope: FailureScope = .{};
+    for (keys, sources) |key, source| {
+        var request = request_template;
+        request.doc_key = key;
+        try processAsset(runtime, request, &completed, &prepared, &window, &completed_scope);
+        const artifact = try internal_keys.artifactNamedPrefixAlloc(a, key, "asset", "inspection");
+        defer a.free(artifact);
+        const stored = try db.core.store.get(a, artifact);
+        defer a.free(stored);
+        const expected = try Harness.output(a, source);
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, stored);
+    }
+    try completed.flush(runtime, &window, &completed_scope);
+    try std.testing.expectEqual(@as(usize, if (harness.serial_text) 0 else if (action == .retry_text) 2 else 1), harness.text_batches);
+    try std.testing.expectEqual(document_count + @as(usize, if (action == .retry_document) 1 else 0), harness.document_calls.load(.acquire));
+    try std.testing.expectEqual(if (harness.serial_text) text_count + 1 else 0, harness.text_single_calls);
+    try std.testing.expectEqual(source_count, harness.commands.items.len);
 }
 
 fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !void {

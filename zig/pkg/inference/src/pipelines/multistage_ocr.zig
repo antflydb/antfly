@@ -483,6 +483,10 @@ pub const Vision2SeqRecognizer = struct {
         var result = try reader.readDecodedRaw(img, .{ .execution_control = control });
         defer result.deinit();
 
+        if (target) |output| if (try result.takeTrimmedTextInto(output)) |text| return .{
+            .text = text,
+            .confidence = if (text.len > 0) 1.0 else 0.0,
+        };
         const trimmed = std.mem.trim(u8, result.text, " \t\r\n");
         return .{
             .text = try (if (target) |output| try output.allocator() else self.allocator).dupe(u8, trimmed),
