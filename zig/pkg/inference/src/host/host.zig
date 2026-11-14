@@ -66,13 +66,14 @@ pub const LinkedInferenceState = struct {
     read_encoded_images_override: ?ReadEncodedImagesHandler = null,
     read_raster_images_override: ?ReadRasterImagesHandler = null,
     /// Observe the fully decoded request at its dispatch site. This field and
-    /// both probes disappear from production builds.
+    /// all probes disappear from production builds.
     chunk_request_probe: if (@import("builtin").is_test) ?ChunkRequestProbe else void = if (@import("builtin").is_test) null else {},
 };
 
 const ChunkRequestProbe = struct {
+    const Dispatch = enum { input, page, replay };
     context: *anyopaque,
-    inspect: *const fn (*anyopaque, inference.server.chunk_response.Request, chunking_types.Config) anyerror!void,
+    inspect: *const fn (*anyopaque, inference.server.chunk_response.Request, Dispatch, ?chunking_types.Replay) anyerror!void,
 };
 
 /// Stable, ref-counted copy of the standalone resource-owner capability. The
@@ -1656,7 +1657,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 defer if (cursor) |value| alloc.free(value);
                 var request = try nativeModelChunkRequest(state.node.config.chunking_limits, input, cfg, if (output_config) |value| value.value else null, target.execute orelse true);
                 request.continuation = cursor;
-                if (@import("builtin").is_test) if (state.chunk_request_probe) |probe| try probe.inspect(probe.context, request, cfg);
+                if (@import("builtin").is_test) if (state.chunk_request_probe) |probe| try probe.inspect(probe.context, request, .page, cfg.replay);
                 var page = try state.node.chunkModelPageDirect(alloc, state.io, execution_control, request, .{ .model = target.model, .model_identity = target.model_identity, .task_type = target.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (target.dimensions) |d| std.math.cast(usize, d) orelse return error.InvalidArguments else null });
                 defer page.deinit(alloc);
                 if (cfg.replay) |position| if (!std.mem.eql(u8, position.plan_id, page.plan_id) or !std.mem.eql(u8, position.source_fingerprint, page.source_fingerprint) or !std.mem.eql(u8, position.source_version, page.source_version)) return error.StaleChunkContinuation;
@@ -1665,11 +1666,12 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             const result = if (selected_target) |target| aware: {
                 const wire = inference.server.chunk_response;
                 const model_request = try nativeModelChunkRequest(state.node.config.chunking_limits, input, cfg, if (output_config) |value| value.value else null, target.execute orelse true);
-                if (@import("builtin").is_test) if (state.chunk_request_probe) |probe| try probe.inspect(probe.context, model_request, cfg);
                 const model_target = wire.Target{ .model = target.model, .model_identity = target.model_identity, .task_type = target.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (target.dimensions) |d| std.math.cast(usize, d) orelse return error.InvalidArguments else null };
                 if (cfg.replay) |replay| {
+                    if (@import("builtin").is_test) if (state.chunk_request_probe) |probe| try probe.inspect(probe.context, model_request, .replay, replay);
                     break :aware try state.node.replayModelChunkDirect(alloc, state.io, execution_control, model_request, model_target, replay.plan_id, replay.source_fingerprint, replay.ordinal);
                 }
+                if (@import("builtin").is_test) if (state.chunk_request_probe) |probe| try probe.inspect(probe.context, model_request, .input, null);
                 break :aware try state.node.chunkModelInputDirect(alloc, state.io, execution_control, model_request, model_target);
             } else legacy: {
                 const chunk_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .chunk);
@@ -4385,22 +4387,41 @@ test "native model chunk configured ceilings survive the real provider ABI" {
     const Probe = struct {
         state: *LinkedInferenceState,
         calls: usize = 0,
-        fn inspect(raw: *anyopaque, request: inference.server.chunk_response.Request, cfg: chunking_types.Config) !void {
+        input_calls: usize = 0,
+        page_calls: usize = 0,
+        replay_calls: usize = 0,
+        expected: struct { page: bool, replay: bool, execute: bool, observe_only: bool } = undefined,
+        fn inspect(raw: *anyopaque, request: inference.server.chunk_response.Request, dispatch: ChunkRequestProbe.Dispatch, replay: ?chunking_types.Replay) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
+            const expected = self.expected;
+            const expected_dispatch: ChunkRequestProbe.Dispatch = if (expected.page) .page else if (expected.replay) .replay else .input;
+            try std.testing.expectEqual(expected_dispatch, dispatch);
+            switch (dispatch) {
+                .input => self.input_calls += 1,
+                .page => self.page_calls += 1,
+                .replay => self.replay_calls += 1,
+            }
+            try std.testing.expectEqual(expected.replay, replay != null);
+            if (replay) |position| {
+                try std.testing.expectEqualStrings("plan", position.plan_id);
+                try std.testing.expectEqualStrings("source", position.source_fingerprint);
+                try std.testing.expectEqualStrings("source-version", position.source_version);
+                try std.testing.expectEqual(@as(u64, 7), position.ordinal);
+            }
             try std.testing.expectEqualDeep(self.state.node.config.chunking_limits, request.limits);
             try std.testing.expectEqual(self.state.node.config.chunking_limits.max_working_bytes, request.max_working_bytes);
-            try std.testing.expectEqual(cfg.max_chunks, request.max_chunks);
-            try std.testing.expectEqual(cfg.page, request.allow_partial);
-            try std.testing.expectEqual(cfg.page and cfg.observe_only, request.observe_only);
-            try std.testing.expectEqual(cfg.embedding.?.execute.?, request.execute);
+            try std.testing.expectEqual(@as(usize, 2), request.max_chunks);
+            try std.testing.expectEqual(expected.page, request.allow_partial);
+            try std.testing.expectEqual(expected.observe_only, request.observe_only);
+            try std.testing.expectEqual(expected.execute, request.execute);
             try std.testing.expectEqual(request.execute, request.execute_outputs);
             try std.testing.expect(request.native_content and !request.include_content);
             try std.testing.expectEqual(@as(i64, 8 * std.time.ns_per_s), request.policy.window_ns);
             try std.testing.expectEqualStrings("file:///unused/fixture.mp4", request.input.source.uri);
             try std.testing.expectEqualStrings("source-version", request.input.source.version);
-            try std.testing.expectEqualStrings(if (cfg.replay != null) "source-version" else "", request.source_version);
-            if (cfg.page and cfg.replay != null) {
+            try std.testing.expectEqualStrings(if (expected.replay) "source-version" else "", request.source_version);
+            if (expected.page and expected.replay) {
                 try std.testing.expectEqualStrings("plan:7", request.continuation.?);
             } else try std.testing.expect(request.continuation == null);
             try std.testing.expectEqualStrings("embedding", request.outputs.?.boundary_model);
@@ -4446,6 +4467,9 @@ test "native model chunk configured ceilings survive the real provider ABI" {
                     defer a.free(request);
                     var response: ?*anyopaque = null;
                     var json: inference_bridge.String = undefined;
+                    // Keep the oracle outside JSON decoding: dropped input flags
+                    // must not change both the request and its expectations.
+                    probe.expected = .{ .page = page, .replay = replay, .execute = execute, .observe_only = page and !replay and !execute };
                     const before = probe.calls;
                     try std.testing.expectError(error.ChunkRequestObserved, linkedInferenceInvokeProvider(&.{
                         .abi_version = inference_bridge.abi_version,
@@ -4465,6 +4489,9 @@ test "native model chunk configured ceilings survive the real provider ABI" {
         }
     }
     try std.testing.expectEqual(@as(usize, 24), probe.calls);
+    try std.testing.expectEqual(@as(usize, 6), probe.input_calls);
+    try std.testing.expectEqual(@as(usize, 12), probe.page_calls);
+    try std.testing.expectEqual(@as(usize, 6), probe.replay_calls);
 }
 
 test "standalone chunk minimum content survives the real provider ABI" {
