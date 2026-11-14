@@ -18215,7 +18215,10 @@ fn flushAssetProducerBatchItems(
     defer runtime.alloc.free(requests);
     for (items, 0..) |*item, idx| requests[idx] = item.asRequest();
 
-    if (try indexDocumentProducerRequired(runtime.alloc, items[0]))
+    // One producer configuration can mix literal text and document locators.
+    // A later document must retain its checkpoint owner even when the first
+    // item is text; each invocation still selects its own transport.
+    for (items) |item| if (try indexDocumentProducerRequired(runtime.alloc, item))
         return flushIndexDocumentBatch(runtime, producer, items, window, scope);
 
     const can_batch = assetProducerCanBatchGuarded(runtime, producer, runtime.alloc, requests) catch |err| {
