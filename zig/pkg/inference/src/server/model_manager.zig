@@ -5955,14 +5955,18 @@ pub const ModelManager = struct {
         return self.admitHostPreflightChecked(bytes, true);
     }
     pub fn admitHostPreflightOwned(self: *ModelManager, bytes: usize, owned_bytes: usize) !runtime.tier.memory.AdmissionLease {
-        return self.admitHostPreflightOwnedChecked(bytes, owned_bytes, true);
+        return self.admitHostPreflightOwnedWithResidency(bytes, owned_bytes, .{});
+    }
+
+    pub fn admitHostPreflightOwnedWithResidency(self: *ModelManager, bytes: usize, owned_bytes: usize, required: runtime.tier.memory.Residency) !runtime.tier.memory.AdmissionLease {
+        return self.admitHostPreflightOwnedChecked(bytes, owned_bytes, required, true);
     }
 
     fn admitHostPreflightChecked(self: *ModelManager, bytes: usize, check_live_memory: bool) !runtime.tier.memory.AdmissionLease {
-        return self.admitHostPreflightOwnedChecked(bytes, 0, check_live_memory);
+        return self.admitHostPreflightOwnedChecked(bytes, 0, .{}, check_live_memory);
     }
 
-    fn admitHostPreflightOwnedChecked(self: *ModelManager, bytes: usize, owned_bytes: usize, check_live_memory: bool) !runtime.tier.memory.AdmissionLease {
+    fn admitHostPreflightOwnedChecked(self: *ModelManager, bytes: usize, owned_bytes: usize, required: runtime.tier.memory.Residency, check_live_memory: bool) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
         const domain = self.resource_domain.?;
         var pressure: ?runtime.tier.memory.AdmissionPressure = null;
@@ -5970,7 +5974,7 @@ pub const ModelManager = struct {
             .backend_class = .cpu,
             .limits = domain.admission_limits,
             .amounts = .{ .host_scratch_bytes = bytes },
-            .required_residency = .fromAmounts(.cpu, .{ .host_scratch_bytes = owned_bytes }),
+            .required_residency = try required.merge(.fromAmounts(.cpu, .{ .host_scratch_bytes = owned_bytes })),
         };
         return domain.admission.tryAcquireRequestsWithPressure(&.{request}, check_live_memory, &pressure) catch |err| {
             if (err == error.ResourceTemporarilyUnavailable and self.reclaimHostCache(bytes) != 0) {

@@ -37,6 +37,13 @@ pub const AdmittedAllocator = struct {
     trim_on_free: bool = false,
     live_bytes: usize = 0,
     reserved_bytes: usize = 0,
+    /// Reservations in an owner belong to one ledger. This makes ancestry
+    /// queries constant-time even after hundreds of regional result transfers.
+    reservation_controller: ?*memory.AdmissionController = null,
+    residency_domain: ?*memory.AdmissionController = null,
+    required_residency: memory.Residency = .{},
+    residency_bindings: usize = 0,
+    unbound_residency_domain: ?*memory.AdmissionController = null,
     /// Borrowed from a live execution permit. Its owner must outlive every
     /// allocation and must not reduce the permit while this credit is bound.
     prepaid_host_bytes: usize = 0,
@@ -105,18 +112,47 @@ pub const AdmittedAllocator = struct {
     }
 
     pub fn ownedHostBytesFor(self: *const @This(), controller: *memory.AdmissionController) !usize {
-        var bytes: usize = 0;
-        var reservation = self.reservations;
-        while (reservation) |node| : (reservation = node.next) {
-            if (node.lease) |lease| if (lease.controller == controller) {
-                bytes = try std.math.add(usize, bytes, lease.amounts.hostTotalBytes());
-            };
-        }
+        var bytes: usize = if (self.reservation_controller == controller) self.reserved_bytes else 0;
         if (self.session) |session| if (session.run_admission) |admission| if (admission.controller == controller) {
             bytes = try std.math.add(usize, bytes, self.prepaid_host_bytes);
         };
         if (self.parent) |parent| bytes = try std.math.add(usize, bytes, try parent.ownedHostBytesFor(controller));
         return bytes;
+    }
+
+    pub fn requiredResidencyFor(self: *const @This(), controller: *memory.AdmissionController) !memory.Residency {
+        const own = if (self.residency_domain == controller) self.required_residency else memory.Residency{};
+        return if (self.parent) |parent| try own.merge(try parent.requiredResidencyFor(controller)) else own;
+    }
+
+    pub const ResidencyBinding = struct {
+        owner: ?*AdmittedAllocator,
+        addition: memory.Residency,
+        pub fn deinit(self: *@This()) void {
+            const owner = self.owner orelse return;
+            for (&owner.required_residency.by_backend, self.addition.by_backend) |*held, amount| {
+                inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |name| {
+                    std.debug.assert(@field(held, name) >= @field(amount, name));
+                    @field(held, name) -= @field(amount, name);
+                }
+            }
+            owner.residency_bindings -= 1;
+            if (owner.residency_bindings == 0) owner.residency_domain = owner.unbound_residency_domain;
+            self.owner = null;
+        }
+    };
+
+    /// Borrow pinned resources for synchronous allocation feasibility. Bindings
+    /// subtract only their own contribution and may be released in any order.
+    pub fn requireResidency(self: *@This(), controller: *memory.AdmissionController, residency: memory.Residency) !ResidencyBinding {
+        if (self.residency_domain != null and self.residency_domain != controller) return error.InvalidAdmissionLeaseReduction;
+        const total = try self.required_residency.merge(residency);
+        const count = try std.math.add(usize, self.residency_bindings, 1);
+        if (self.residency_bindings == 0) self.unbound_residency_domain = self.residency_domain;
+        self.required_residency = total;
+        self.residency_bindings = count;
+        self.residency_domain = controller;
+        return .{ .owner = self, .addition = residency };
     }
 
     /// Move proven allocations and leases between synchronous owners sharing
@@ -125,13 +161,12 @@ pub const AdmittedAllocator = struct {
         if (self == source or self.backing.ptr != source.backing.ptr or self.backing.vtable != source.backing.vtable or self.prepaid_host_bytes != 0 or source.prepaid_host_bytes != 0)
             return error.InvalidAdmissionLeaseReduction;
         const controller = if (self.session) |session| if (session.run_admission) |admission| admission.controller else null else null;
-        var check = source.reservations;
-        while (check) |entry| : (check = entry.next) if (entry.lease) |lease| {
-            if (controller != null and lease.controller != controller.?) return error.InvalidAdmissionLeaseReduction;
-        };
+        if (source.reservations != null and controller != null and source.reservation_controller != controller) return error.InvalidAdmissionLeaseReduction;
+        if (self.reservations != null and source.reservations != null and self.reservation_controller != source.reservation_controller) return error.InvalidAdmissionLeaseReduction;
         const live = try std.math.add(usize, self.live_bytes, source.live_bytes);
         const reserved = try std.math.add(usize, self.reserved_bytes, source.reserved_bytes);
         const metadata = try std.math.add(usize, self.metadata_bytes, source.metadata_bytes);
+        if (self.reservations == null) self.reservation_controller = source.reservation_controller;
         if (source.blocks) |head| {
             var tail = head;
             while (tail.next) |next| tail = next;
@@ -152,6 +187,7 @@ pub const AdmittedAllocator = struct {
         source.reservations = null;
         source.live_bytes = 0;
         source.reserved_bytes = 0;
+        source.reservation_controller = null;
         source.metadata_bytes = 0;
     }
 
@@ -166,7 +202,7 @@ pub const AdmittedAllocator = struct {
         if (self.admit) |callback| return try callback(self.admission_context.?, amount);
         const session = self.session orelse return error.ResourceLimitExceeded;
         const inherited = if (self.parent) |parent| if (session.run_admission) |admission| try parent.ownedHostBytesFor(admission.controller) else 0 else 0;
-        return (try session.admitHostPreprocessOwned(amount, try std.math.add(usize, owned, inherited))).lease;
+        return (try session.admitHostPreprocessOwnedWithResidency(amount, try std.math.add(usize, owned, inherited), if (session.run_admission) |admission| try self.requiredResidencyFor(admission.controller) else .{})).lease;
     }
 
     /// Execution borrows this permit's workspace. On exit, adopt its lease
@@ -176,15 +212,13 @@ pub const AdmittedAllocator = struct {
         permit: sessions.RunPermit,
         owner: ?*AdmittedAllocator = null,
         reservation: ?*Reservation = null,
-        host_only_transfer: bool = false,
 
         pub fn deinit(self: *@This()) void {
             if (self.owner) |owner| {
                 const node = self.reservation.?;
-                if (self.host_only_transfer) if (self.permit.lease) |*lease|
-                    lease.retain(.{ .host_scratch_bytes = owner.prepaid_host_bytes }) catch {};
                 node.* = .{ .next = owner.reservations, .lease = self.permit.lease, .bytes = owner.prepaid_host_bytes };
                 owner.reservations = node;
+                owner.reservation_controller = if (self.permit.lease) |lease| lease.controller else null;
                 owner.reserved_bytes += owner.prepaid_host_bytes;
                 owner.prepaid_host_bytes = 0;
                 self.permit.lease = null;
@@ -197,28 +231,10 @@ pub const AdmittedAllocator = struct {
         }
     };
 
-    /// The caller supplies this allocator to the forward and every subsequent
-    /// host post-processing allocation. The run's existing host reservation is
-    /// credit, and any actual growth beyond it is admitted normally.
-    pub fn borrowExecution(self: *@This(), permit: sessions.RunPermit) !RunScope {
-        if (self.prepaid_host_bytes != 0 or permit.execution_yielded) return error.InvalidAdmissionLeaseReduction;
-        const lease = permit.lease orelse return .{ .permit = permit };
-        if (lease.amounts.host_kv_bytes != 0) return error.InvalidAdmissionLeaseReduction;
-        const bytes = lease.amounts.host_scratch_bytes;
-        // Allocation bookkeeping must be covered too. A zero-credit run uses
-        // ordinary admission, with no allocation or ownership transfer here.
-        if (bytes < @sizeOf(Reservation)) return .{ .permit = permit };
-        const node = try self.backing.create(Reservation);
-        self.metadata_bytes += @sizeOf(Reservation);
-        self.prepaid_host_bytes = bytes;
-        var bound = permit;
-        bound.allocation_credit_bound = true;
-        return .{ .permit = bound, .owner = self, .reservation = node, .host_only_transfer = true };
-    }
-
     pub fn admitRun(self: *@This(), request: sessions.RunRequest) !RunScope {
         const session = self.session orelse return error.InvalidAdmissionLeaseReduction;
         const admission = session.run_admission orelse return .{ .permit = try session.admit(request) };
+        if (self.reservations != null and self.reservation_controller != admission.controller) return error.InvalidAdmissionLeaseReduction;
         if (self.admit != null or self.admit_owned != null or self.prepaid_host_bytes != 0 or admission.backend_class != .cpu) return error.InvalidAdmissionLeaseReduction;
         const amounts = try admission.estimateRequest(request, session.outputInfo());
         if (amounts.host_kv_bytes != 0) return error.InvalidAdmissionLeaseReduction;
@@ -261,7 +277,13 @@ pub const AdmittedAllocator = struct {
             if (lease) |*active| active.release();
             if (self.rollback_admission) |rollback| rollback(self.admission_context.?, amount);
         }
+        // This allocator owns host scratch only. A callback cannot offer a
+        // smaller or differently classified lease as allocation credit.
+        if (lease) |active| if (active.amounts.host_scratch_bytes != amount or active.amounts.hostTotalBytes() != amount or active.amounts.backendTotalBytes() != 0) return error.InvalidAdmissionLeaseReduction;
+        const domain = if (lease) |active| active.controller else null;
+        if (self.reservations != null and self.reservation_controller != domain) return error.InvalidAdmissionLeaseReduction;
         const reservation = try self.backing.create(Reservation);
+        self.reservation_controller = domain;
         reservation.* = .{ .next = self.reservations, .lease = lease, .bytes = amount };
         self.reservations = reservation;
         self.metadata_bytes += @sizeOf(Reservation);
@@ -279,11 +301,13 @@ pub const AdmittedAllocator = struct {
                 self.metadata_bytes -= @sizeOf(Reservation);
                 self.backing.destroy(reservation);
             }
+            self.reservation_controller = null;
             return;
         }
         var link = &self.reservations;
         while (link.*) |reservation| {
             const spare = (self.reserved_bytes + self.prepaid_host_bytes) -| (self.live_bytes + self.metadata_bytes);
+            if (spare == 0) break;
             const reduction = @min(spare, reservation.bytes);
             if (reduction != 0) {
                 if (reservation.lease) |*lease| try lease.retain(.{ .host_scratch_bytes = reservation.bytes - reduction });
@@ -313,6 +337,7 @@ pub const AdmittedAllocator = struct {
         }
         self.live_bytes = 0;
         self.reserved_bytes = 0;
+        self.reservation_controller = null;
         self.metadata_bytes = 0;
     }
 
@@ -662,4 +687,63 @@ test "CPU media workspace binds only its own ledger and returns encoder credit b
     a.free(output);
     try workspace.trim();
     try std.testing.expect(provider.controller.snapshot().host_scratch_bytes < 4096);
+}
+
+test "reader admitted owner caches domain totals across regional transfers and trimming" {
+    var controller = memory.AdmissionController{};
+    var foreign = memory.AdmissionController{};
+    const session = sessions.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 1, .check_live_memory = false } };
+    var target = AdmittedAllocator{ .backing = std.testing.allocator, .session = session };
+    defer target.deinit();
+    var pointers: [128][]u8 = undefined;
+    for (&pointers) |*bytes| {
+        var source = AdmittedAllocator{ .backing = std.testing.allocator, .session = session };
+        defer source.deinit();
+        bytes.* = try source.allocator().alloc(u8, 16);
+        try source.trim();
+        try target.absorb(&source);
+        try std.testing.expectEqual(target.reserved_bytes, try target.ownedHostBytesFor(&controller));
+        try std.testing.expectEqual(@as(usize, 0), try target.ownedHostBytesFor(&foreign));
+        try target.trim();
+    }
+    for (pointers) |bytes| target.allocator().free(bytes);
+    try target.trim();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+    try std.testing.expect(target.reservation_controller == null);
+}
+
+test "reader pinned residency binding restores nested ownership and rejects foreign domains" {
+    var controller = memory.AdmissionController{};
+    var foreign = memory.AdmissionController{};
+    const session = sessions.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 16 * 1024, .scratch_limit_bytes = 16 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+    var weights = try controller.tryAcquire(.cpu, .{}, .{ .host_weight_bytes = 12 * 1024 }, false);
+    defer weights.release();
+    var owner = AdmittedAllocator{ .backing = std.testing.allocator, .session = session };
+    defer owner.deinit();
+    var binding = try owner.requireResidency(&controller, .fromLease(weights));
+    try std.testing.expectError(error.OutOfMemory, owner.allocator().alloc(u8, 8 * 1024));
+    try std.testing.expectEqual(error.ResourceLimitExceeded, owner.admission_error.?);
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, owner.requireResidency(&foreign, .{}));
+    var sibling = try owner.requireResidency(&controller, .fromAmounts(.cpu, .{ .host_weight_bytes = 1 }));
+    binding.deinit();
+    try std.testing.expectEqual(@as(usize, 1), (try owner.required_residency.total()).host_weight_bytes);
+    sibling.deinit();
+    try std.testing.expect(owner.residency_domain == null);
+    try std.testing.expectEqualDeep(memory.Residency{}, owner.required_residency);
+}
+
+test "reader admitted owner rejects malformed callback credit before backing allocation" {
+    const Provider = struct {
+        controller: memory.AdmissionController = .{},
+        fn acquire(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = bytes / 2 }, false);
+        }
+    };
+    var provider = Provider{};
+    var owner = AdmittedAllocator{ .backing = std.testing.failing_allocator, .admission_context = &provider, .admit = Provider.acquire };
+    defer owner.deinit();
+    try std.testing.expectError(error.OutOfMemory, owner.allocator().alloc(u8, 1));
+    try std.testing.expectEqual(error.InvalidAdmissionLeaseReduction, owner.admission_error.?);
+    try std.testing.expectEqual(@as(usize, 0), provider.controller.snapshot().hostTotalBytes());
 }

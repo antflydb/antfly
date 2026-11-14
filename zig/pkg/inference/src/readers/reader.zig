@@ -125,10 +125,7 @@ const VisionLoadedReader = struct {
         var raw = try self.core.readRaw(image_data, forwarded);
         defer raw.deinit();
 
-        var parsed = try parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
-        parsed.completion = raw.completion;
-        parsed.completion_tokens = raw.completion_tokens;
-        return parsed;
+        return self.parseRaw(&raw, normalized_prompt);
     }
 
     pub fn readBatch(self: *VisionLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
@@ -158,6 +155,21 @@ const VisionLoadedReader = struct {
         return self.parseRawBatch(raw_batch, normalized_prompt);
     }
 
+    fn parseRaw(self: *VisionLoadedReader, raw: *@import("../pipelines/reading.zig").ReadResult, normalized_prompt: ?[]const u8) !Result {
+        const allocator = if (raw.storage != null) raw.allocator else self.allocator;
+        var parsed = parseOutput(allocator, self.parser_kind, raw.text, normalized_prompt) catch |err| return if (raw.storage) |storage| storage.scope.failure(err) else err;
+        parsed.completion = raw.completion;
+        parsed.completion_tokens = raw.completion_tokens;
+        if (raw.storage) |storage| {
+            const Owned = @import("../pipelines/preprocessing_memory.zig").Owned;
+            allocator.free(raw.text);
+            raw.text = &.{};
+            raw.storage = null;
+            parsed.lifetime = .{ .context = storage, .release = Owned.release, .detach_preparation = Owned.detachPreparation };
+        }
+        return parsed;
+    }
+
     fn parseRawBatch(
         self: *VisionLoadedReader,
         raw_batch: @import("../pipelines/reading.zig").ReadBatchResult,
@@ -179,10 +191,8 @@ const VisionLoadedReader = struct {
             self.allocator.free(out);
         }
 
-        for (raw_results, 0..) |raw, i| {
-            out[i] = try parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
-            out[i].completion = raw.completion;
-            out[i].completion_tokens = raw.completion_tokens;
+        for (raw_results, 0..) |*raw, i| {
+            out[i] = try self.parseRaw(raw, normalized_prompt);
             filled += 1;
         }
         return .{
@@ -242,7 +252,11 @@ const native_moondream = struct {
         const weight_bytes = std.math.cast(usize, try file.length(io)) orelse return error.ResourceLimitExceeded;
         var lease = try model_manager.admitHostWeights(weight_bytes);
         errdefer lease.release();
+        const owner = @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(allocator);
+        var binding = if (owner) |o| if (lease.controller) |controller| try o.requireResidency(controller, .fromLease(lease)) else null else null;
+        errdefer if (binding) |*held| held.deinit();
         var reader = try NativeMoondreamLoadedReader.loadFromDirWithControl(allocator, model_path, control, io);
+        reader.preparation_residency = binding;
         reader.weight_lease = lease;
         return .{ .moondream = reader };
     }
@@ -252,6 +266,7 @@ const NativeMoondreamLoadedReader = struct {
     allocator: std.mem.Allocator,
     core: moondream_reader_mod.LoadedMoondreamReader,
     weight_lease: ?@import("../runtime/tier/memory.zig").AdmissionLease = null,
+    preparation_residency: ?@import("../backends/admitted_allocator.zig").AdmittedAllocator.ResidencyBinding = null,
 
     pub fn loadFromDirWithControl(
         allocator: std.mem.Allocator,
@@ -267,6 +282,7 @@ const NativeMoondreamLoadedReader = struct {
 
     pub fn deinit(self: *NativeMoondreamLoadedReader) void {
         self.core.deinit();
+        if (self.preparation_residency) |*binding| binding.deinit();
         if (self.weight_lease) |*lease| lease.release();
     }
 
@@ -526,7 +542,10 @@ pub const LoadedReader = union(enum) {
             allocator.free(batch.results);
         }
         if (batch.results.len != rasters.len) return error.InvalidReadResultCount;
-        for (batch.results) |*result| try sanitizeResultUtf8(result);
+        for (batch.results) |*result| {
+            try sanitizeResultUtf8(result);
+            result.detachPreparation();
+        }
         return batch;
     }
 
@@ -1411,4 +1430,28 @@ test "reader sanitation preserves admitted result policy failure" {
     defer result.deinit();
     try std.testing.expectError(error.ResourceLimitExceeded, sanitizeResultUtf8(&result));
     try std.testing.expect(result.text.ptr == text.ptr);
+}
+
+fn checkVisionOwnedParsing(a: std.mem.Allocator) !void {
+    const Preparation = @import("../pipelines/preprocessing_memory.zig");
+    var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+    defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
+    const session = backends.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 * 1024, .scratch_limit_bytes = 64 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+    const storage = try Preparation.Owned.create(a, session, null, null);
+    var raw = @import("../pipelines/reading.zig").ReadResult{ .allocator = try storage.scope.allocator(), .text = &.{}, .storage = storage };
+    defer raw.deinit();
+    raw.text = try raw.allocator.dupe(u8, "hello");
+    try storage.publish();
+    var reader = VisionLoadedReader{ .allocator = a, .parser_kind = .pix2struct, .core = undefined };
+    var result = try reader.parseRaw(&raw, null);
+    defer result.deinit();
+    result.detachPreparation();
+    try std.testing.expect(raw.storage == null);
+    try std.testing.expect(result.lifetime != null);
+    try std.testing.expectEqualStrings("hello", result.text);
+}
+
+test "reader vision parsing transfers admitted output storage and unwinds all failures" {
+    try checkVisionOwnedParsing(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkVisionOwnedParsing, .{});
 }

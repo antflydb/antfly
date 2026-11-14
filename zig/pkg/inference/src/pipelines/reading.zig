@@ -93,7 +93,15 @@ pub const ReadResult = struct {
     text: []const u8,
     allocator: std.mem.Allocator,
 
+    storage: ?*@import("preprocessing_memory.zig").Owned = null,
+
     pub fn deinit(self: *ReadResult) void {
+        if (self.storage) |storage| {
+            @import("preprocessing_memory.zig").Owned.release(storage);
+            self.storage = null;
+            self.text = &.{};
+            return;
+        }
         self.allocator.free(self.text);
     }
 };
@@ -1260,7 +1268,7 @@ pub const ReadingPipeline = struct {
         logTensorStatsF32("encoder_hidden(session)", encoder_outputs[0].asFloat32());
         if (debug_cuda_session) std.log.info("reading: decode from encoder outputs start", .{});
         const decode_start = nowNs();
-        const result = try self.decodeFromEncoderOutputs(encoder_outputs, null);
+        const result = try self.decodeFromEncoderOutputs(encoder_outputs, null, preparation);
         logReadProfile("decode_from_encoder", decode_start);
         return result;
     }
@@ -1838,26 +1846,43 @@ pub const ReadingPipeline = struct {
         }
         if (encoder_outputs.len == 0) return error.NoEncoderOutput;
 
-        return self.decodeFromEncoderOutputs(encoder_outputs, patches.attention_mask);
+        return self.decodeFromEncoderOutputs(encoder_outputs, patches.attention_mask, &preparation);
     }
 
     fn decodeFromEncoderOutputs(
         self: *ReadingPipeline,
         encoder_outputs: []const backends.Tensor,
         encoder_attention_mask_opt: ?[]const i64,
+        parent: *const @import("preprocessing_memory.zig").Scope,
     ) !ReadResult {
-        const allocator = self.allocator;
+        const Owned = @import("preprocessing_memory.zig").Owned;
+        const owned = try Owned.create(self.allocator, self.decoder.withAdmissionControl(self.execution_control), parent, self.preparation_owner);
+        errdefer Owned.release(owned);
+        owned.scope.required_host_bytes = try std.math.add(usize, owned.scope.required_host_bytes, try self.decoder.outputHostResidency(encoder_outputs));
+        var result = self.decodeFromEncoderOutputsPrepared(encoder_outputs, encoder_attention_mask_opt, &owned.scope) catch |err| return owned.scope.failure(err);
+        try owned.publish();
+        result.storage = owned;
+        return result;
+    }
+
+    fn decodeFromEncoderOutputsPrepared(
+        self: *ReadingPipeline,
+        encoder_outputs: []const backends.Tensor,
+        encoder_attention_mask_opt: ?[]const i64,
+        preparation: *@import("preprocessing_memory.zig").Scope,
+    ) !ReadResult {
+        const allocator = try preparation.allocator();
         const encoder_hidden = &encoder_outputs[0];
 
         const enc_seq_len: usize = if (encoder_hidden.shape.len >= 2) @intCast(encoder_hidden.shape[1]) else 1;
         const encoder_attention_mask = if (encoder_attention_mask_opt) |mask|
-            mask
+            try allocator.dupe(i64, mask)
         else blk: {
             const all_ones = try allocator.alloc(i64, enc_seq_len);
             @memset(all_ones, 1);
             break :blk all_ones;
         };
-        defer if (encoder_attention_mask_opt == null) allocator.free(encoder_attention_mask);
+        defer allocator.free(encoder_attention_mask);
 
         // 3. Autoregressive decode
         const max_len = self.config.max_length;
@@ -1873,6 +1898,10 @@ pub const ReadingPipeline = struct {
             }
         }
 
+        const decoder_attention_mask = if (hasInput(self.decoder, "decoder_attention_mask")) try allocator.alloc(i64, max_len) else null;
+        defer if (decoder_attention_mask) |mask| allocator.free(mask);
+        if (decoder_attention_mask) |mask| @memset(mask, 1);
+        const enc_mask_shape = [_]i64{ 1, @intCast(enc_seq_len) };
         const decode_loop_start = nowNs();
         var decoder_run_total_ns: u64 = 0;
         var decoder_steps: usize = 0;
@@ -1881,44 +1910,27 @@ pub const ReadingPipeline = struct {
             const dec_seq: i64 = @intCast(dec_len);
             const dec_shape = [_]i64{ 1, dec_seq };
 
-            var decoder_inputs = std.ArrayListUnmanaged(backends.Tensor).empty;
-            defer {
-                for (decoder_inputs.items) |*tensor| tensor.deinit();
-                decoder_inputs.deinit(allocator);
-            }
-
-            try decoder_inputs.append(
-                allocator,
-                try backends.Tensor.initInt64(allocator, "input_ids", &dec_shape, dec_ids[0..dec_len]),
-            );
-
+            // Every tensor borrows storage through this synchronous forward.
+            // Keep masks and shapes outside conditional scopes, and reuse the
+            // maximum mask instead of allocating/copying it for every token.
+            var decoder_inputs: [4]backends.Tensor = undefined;
+            var input_count: usize = 0;
+            decoder_inputs[input_count] = try preparation.tensor(i64, "input_ids", &dec_shape, dec_ids[0..dec_len]);
+            input_count += 1;
             if (hasInput(self.decoder, "encoder_attention_mask")) {
-                const enc_mask_shape = [_]i64{ 1, @intCast(enc_seq_len) };
-                try decoder_inputs.append(
-                    allocator,
-                    try backends.Tensor.initInt64(allocator, "encoder_attention_mask", &enc_mask_shape, encoder_attention_mask),
-                );
+                decoder_inputs[input_count] = try preparation.tensor(i64, "encoder_attention_mask", &enc_mask_shape, encoder_attention_mask);
+                input_count += 1;
             }
-            if (hasInput(self.decoder, "decoder_attention_mask")) {
-                const dec_mask = try allocator.alloc(i64, dec_len);
-                defer allocator.free(dec_mask);
-                @memset(dec_mask, 1);
-                try decoder_inputs.append(
-                    allocator,
-                    try backends.Tensor.initInt64(allocator, "decoder_attention_mask", &dec_shape, dec_mask),
-                );
+            if (decoder_attention_mask) |mask| {
+                decoder_inputs[input_count] = try preparation.tensor(i64, "decoder_attention_mask", &dec_shape, mask[0..dec_len]);
+                input_count += 1;
             }
-
-            const enc_hidden = encoder_outputs[0].borrowedView("encoder_hidden_states");
-            try decoder_inputs.append(allocator, enc_hidden);
+            decoder_inputs[input_count] = encoder_outputs[0].borrowedView("encoder_hidden_states");
+            input_count += 1;
 
             const decoder_run_start = nowNs();
             if (self.execution_control) |control| try control.update(.executing, @intCast(dec_len), @intCast(max_len));
-            const dec_outputs = try self.decoder.runWithControl(
-                decoder_inputs.items,
-                allocator,
-                self.execution_control,
-            );
+            const dec_outputs = try preparation.run(self.decoder, decoder_inputs[0..input_count], self.allocator, self.execution_control);
             const decoder_run_ns = nowNs() - decoder_run_start;
             decoder_run_total_ns += decoder_run_ns;
             decoder_steps += 1;
@@ -1928,7 +1940,7 @@ pub const ReadingPipeline = struct {
                     var mt = t.*;
                     mt.deinit();
                 }
-                allocator.free(dec_outputs);
+                self.allocator.free(dec_outputs);
             }
 
             if (dec_outputs.len == 0) return error.NoDecoderOutput;
@@ -1956,7 +1968,9 @@ pub const ReadingPipeline = struct {
         logReadProfileStep("decoder_total", decoder_steps, dec_len, nowNs() - decode_loop_start);
         logReadProfileStep("decoder_run_total", decoder_steps, dec_len, decoder_run_total_ns);
 
-        return try self.decodeGeneratedIds(dec_ids[0..dec_len], dec_len);
+        var output = self.*;
+        output.allocator = allocator;
+        return try output.decodeGeneratedIds(dec_ids[0..dec_len], dec_len);
     }
 
     fn decodeGeneratedIds(self: *ReadingPipeline, dec_ids: []const i64, dec_len: usize) !ReadResult {
@@ -3562,4 +3576,72 @@ test "reading codec forecast fallback clears speculative policy diagnostics" {
     try std.testing.expect(failure.snapshot() == null);
     // Only the parent pixels remain after codec permits are retired.
     try std.testing.expectEqual(try parent.ownedHostBytesFor(session), controller.snapshot().hostTotalBytes());
+}
+
+test "reading decoder preparation is admitted before dispatch and cleans partial buffers" {
+    var controller = admission_memory.AdmissionController{};
+    const session = backends.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 * 1024, .scratch_limit_bytes = 64 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+    var pipeline = ReadingPipeline.init(std.testing.allocator, session, session, undefined, .{ .max_length = 8192 }, null);
+    var parent = @import("preprocessing_memory.zig").Scope.child(std.testing.allocator, session, null);
+    defer parent.deinit();
+    const values = try std.testing.allocator.alloc(f32, 4096);
+    defer std.testing.allocator.free(values);
+    var output = try backends.Tensor.initFloat32(std.testing.allocator, "encoder_hidden", &.{ 1, 4096, 1 }, values);
+    defer output.deinit();
+    try std.testing.expectError(error.ResourceLimitExceeded, pipeline.decodeFromEncoderOutputs(&.{output}, null, &parent));
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}
+
+fn checkPreparedDecoder(a: std.mem.Allocator) !void {
+    const Fixture = struct {
+        calls: usize = 0,
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{ .{ .name = "encoder_attention_mask", .dtype = .i64, .shape = &.{ 1, 2 } }, .{ .name = "decoder_attention_mask", .dtype = .i64, .shape = &.{ 1, -1 } } };
+        }
+        fn out(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ 1, -1, 3 } }};
+        }
+        fn run(raw: *anyopaque, inputs: []const backends.Tensor, heap: std.mem.Allocator) ![]backends.Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const n = inputs[0].shape[1];
+            const values = try heap.alloc(f32, @as(usize, @intCast(n)) * 3);
+            defer heap.free(values);
+            @memset(values, 0);
+            values[values.len - 3 + @as(usize, if (n == 1) 1 else 2)] = 1;
+            const output = try heap.alloc(backends.Tensor, 1);
+            errdefer heap.free(output);
+            output[0] = try backends.Tensor.initFloat32(heap, "logits", &.{ 1, n, 3 }, values);
+            return output;
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        fn decode(_: *anyopaque, heap: std.mem.Allocator, ids: []const i32) ![]u8 {
+            try std.testing.expectEqualSlices(i32, &.{1}, ids);
+            return heap.dupe(u8, "hello");
+        }
+    };
+    var fixture = Fixture{};
+    var controller = admission_memory.AdmissionController{};
+    defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
+    const session = backends.Session{ .ptr = &fixture, .vtable = &.{ .run = Fixture.run, .inputInfo = Fixture.info, .outputInfo = Fixture.out, .backend = Fixture.backend, .close = Fixture.close }, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1024 * 1024, .scratch_limit_bytes = 1024 * 1024 }, .static_workspace_bytes = 4096, .check_live_memory = false } };
+    var tokenizer_table: tokenizer_mod.Tokenizer.VTable = undefined;
+    tokenizer_table.decode = Fixture.decode;
+    var pipeline = ReadingPipeline.init(a, session, session, .{ .ptr = undefined, .vtable = &tokenizer_table }, .{ .max_length = 4, .decoder_start_token_id = 0 }, null);
+    var parent = @import("preprocessing_memory.zig").Scope.child(a, session, null);
+    defer parent.deinit();
+    var encoder = try backends.Tensor.initFloat32(a, "encoder_hidden_states", &.{ 1, 2, 1 }, &.{ 1, 2 });
+    defer encoder.deinit();
+    var result = try pipeline.decodeFromEncoderOutputs(&.{encoder}, null, &parent);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectEqualStrings("hello", result.text);
+    try std.testing.expect(result.storage != null);
+}
+
+test "reading prepared decoder executes masks and tokens with owned output and complete rollback" {
+    try checkPreparedDecoder(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPreparedDecoder, .{});
 }

@@ -6295,6 +6295,8 @@ pub const Node = struct {
     fn countAdmittedPromptTokens(self: *Node, model_dir: []const u8, model: *model_manager_mod.LoadedModel, cfg: gpt_model_mod.Config, messages: []const generation.Message, max_tokens: i32) !NativePromptTokenCount {
         var preparation = try self.inferencePreparation();
         defer preparation.deinit();
+        var binding = if (model.session.run_admission) |admission| try preparation.requireResidency(admission.controller, admission.requiredResidency()) else null;
+        defer if (binding) |*held| held.deinit();
         return countPromptTokens(preparation.allocator(), model_dir, model, cfg, messages, max_tokens, false, false) catch |err|
             if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
     }
@@ -6304,7 +6306,8 @@ pub const Node = struct {
         const Preparation = struct {
             fn acquire(owner: *const @import("../backends/admitted_allocator.zig").AdmittedAllocator, bytes: usize) !runtime.tier.memory.AdmissionLease {
                 const node: *Node = @ptrCast(@alignCast(owner.admission_context.?));
-                return node.model_manager.admitHostPreflightOwned(bytes, try owner.ownedHostBytesFor(&node.model_manager.resource_domain.?.admission));
+                const controller = &node.model_manager.resource_domain.?.admission;
+                return node.model_manager.admitHostPreflightOwnedWithResidency(bytes, try owner.ownedHostBytesFor(controller), try owner.requiredResidencyFor(controller));
             }
         };
         return @import("../backends/admitted_allocator.zig").AdmittedAllocator{
@@ -52896,6 +52899,7 @@ test "reader worker prompt planning admits before execution and refunds denials"
     // execution state. Both cohort and continuous paths use this same owner.
     var model: model_manager_mod.LoadedModel = undefined;
     model.chat_tmpl = null;
+    model.session = .{ .ptr = undefined, .vtable = undefined };
     try std.testing.expectError(error.ResourceLimitExceeded, node.countAdmittedPromptTokens("unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1));
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.resource_domain.?.admission.snapshot().hostTotalBytes());
 }
@@ -52948,5 +52952,28 @@ test "reader metadata ancestry remains intrinsic during execution admission" {
         try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 64 * 1024));
         try std.testing.expectEqual(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, preparation.failure(error.OutOfMemory));
         try std.testing.expect(node.model_manager.resource_domain.?.admission.snapshot().host_scratch_bytes > 0);
+    }
+}
+
+test "reader prompt planning includes pinned model residency before formatting" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |contended| {
+        var node = try Node.init(a, .{});
+        defer node.deinit();
+        var preparation = try node.inferencePreparation();
+        defer preparation.deinit();
+        const domain = node.model_manager.resource_domain.?;
+        domain.admission_limits = .{ .host_limit_bytes = if (contended) 48 * 1024 else 24 * 1024, .scratch_limit_bytes = 48 * 1024 };
+        var weights = try domain.admission.tryAcquire(.cpu, .{}, .{ .host_weight_bytes = 16 * 1024 }, false);
+        defer weights.release();
+        var peer = try domain.admission.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = if (contended) 24 * 1024 else 0 }, false);
+        defer peer.release();
+        var model: model_manager_mod.LoadedModel = undefined;
+        model.chat_tmpl = null;
+        model.session = .{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &domain.admission, .backend_class = .cpu, .limits = domain.admission_limits, .required_residency = weights.amounts, .static_workspace_bytes = 1, .check_live_memory = false } };
+        const content = try a.alloc(u8, 16 * 1024);
+        defer a.free(content);
+        @memset(content, 'x');
+        try std.testing.expectError(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, node.countAdmittedPromptTokens("unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1));
     }
 }

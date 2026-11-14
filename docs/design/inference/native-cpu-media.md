@@ -343,18 +343,30 @@ once; carrying ancestry into each model forward distinguishes an intrinsically
 oversized request from contention with other requests. Different admission
 domains never lend capacity to each other.
 
-CTC forwards and decoding allocate through an admitted execution owner. The
-forward's existing host reservation supplies allocation credit; actual growth,
-including expansion through long dictionary entries, must acquire additional
-capacity before allocating. Device workspace remains part of combined-memory
-feasibility until the backend is destroyed. Borrowed execution envelopes cannot
-be narrowed or yielded while allocator credit is live.
+CTC forwards retain an opaque execution reservation until resident outputs and
+backend buffers are destroyed. Post-processing has a separate admitted owner:
+resident logits may belong to an imported backend's persistent allocator, so
+forward capacity is never loaned to text decoding. Additional host allocations
+include the full live host/device execution residency in feasibility. Exported
+logits borrow their tensor view instead of making another copy.
 
 Completed multistage OCR transfers its allocation owner and text to the reader.
 The reader builds its final region array once, retaining text and label pointers.
 Result cleanup releases storage and leases together, independently of model
 lifetime. The final wrapper severs synchronous loader ancestry after conversion
 and UTF-8 sanitation; subsequent result allocations use a frozen host policy.
+
+Ordinary encoder/decoder readers admit decoder masks, token buffers, and output
+text, borrowing prepared tensors instead of cloning them every token. Result
+parsing transfers the output owner and retains typed allocation failures.
+Prompt planning includes pinned model residency, and Moondream's mapped-weight
+lease participates in preparation feasibility until reader teardown. Ordering
+fallback applies only to explicit unsupported-operation errors; arbitrary
+checkpoint failures propagate through direct pipeline APIs too.
+
+Allocation owners enforce a single reservation domain and cache their retained
+host total. Regional result transfers and ancestor queries do not repeatedly
+walk all earlier leases; trimming stops after available slack is exhausted.
 
 Preprocessing remembers a geometry-weighted concurrency ceiling after a failed
 wave. Equal-size pages retain the proven width instead of repeatedly doubling

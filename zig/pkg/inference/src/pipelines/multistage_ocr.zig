@@ -351,18 +351,14 @@ pub const CTCRecognizer = struct {
 
         var execution = Preparation.child(self.allocator, self.session.withAdmissionControl(control), &preparation);
         defer execution.deinit();
-        const a = try execution.allocator();
         var permit = try preparation.admitRun(self.session.withAdmissionControl(control), try self.session.planRun(&.{input_tensor}, null));
-        var run = execution.borrowExecution(permit) catch |err| {
-            permit.deinit();
-            return err;
-        };
-        var run_live = true;
-        defer if (run_live) run.deinit();
-        const decoded = self.forwardAndDecode(&run.permit, a, &.{input_tensor}, control) catch |err| return execution.failure(err);
-        run.deinit();
-        run_live = false;
+        var permit_live = true;
+        defer if (permit_live) permit.deinit();
+        const decoded = self.forwardAndDecode(&permit, &execution, &.{input_tensor}, control) catch |err| return execution.failure(err);
+        permit.deinit();
+        permit_live = false;
         execution.execution_residency = .{};
+        try execution.trim();
         if (target) |output| {
             try output.absorb(&execution);
             return decoded;
@@ -370,10 +366,15 @@ pub const CTCRecognizer = struct {
         return .{ .text = try self.allocator.dupe(u8, decoded.text), .confidence = decoded.confidence };
     }
 
-    fn forwardAndDecode(self: *CTCRecognizer, permit: *@import("../backends/session.zig").RunPermit, a: std.mem.Allocator, inputs: []const backends.Tensor, control: ?InferenceExecutionControl) !RecognitionResult {
-        if (try permit.runResidentWithControl(inputs, a, control)) |resident_outputs| {
+    fn forwardAndDecode(self: *CTCRecognizer, permit: *@import("../backends/session.zig").RunPermit, execution: *Preparation, inputs: []const backends.Tensor, control: ?InferenceExecutionControl) !RecognitionResult {
+        const a = try execution.allocator();
+        // Forward buffers may be owned by a persistent imported backend. Never
+        // lend that opaque reservation to the post-processing allocator.
+        if (try permit.runResidentWithControl(inputs, self.allocator, control)) |resident_outputs| {
             var resident = resident_outputs;
             defer resident.deinit();
+            const lease = resident.resource_lease orelse permit.lease;
+            execution.execution_residency = if (lease) |held| .fromLease(held) else .{};
             if (resident.outputs.len == 0) return error.NoRecognitionOutput;
             if (try ctc_decode.decodeResident(a, resident.backend, resident.outputs[0], self.char_dict)) |decoded| {
                 return .{ .text = decoded.text, .confidence = decoded.confidence };
@@ -389,8 +390,10 @@ pub const CTCRecognizer = struct {
             const decoded = try ctc_decode.decodeFromTensor(a, &host_output, self.char_dict);
             return .{ .text = decoded.text, .confidence = decoded.confidence };
         }
-        const outputs = try permit.runWithControl(inputs, a, control);
-        defer freeTensorSlice(a, outputs);
+        const outputs = try permit.runWithControl(inputs, self.allocator, control);
+        defer freeTensorSlice(self.allocator, outputs);
+        execution.execution_residency = if (permit.lease) |held| .fromLease(held) else .{};
+        if (permit.execution_yielded) execution.required_host_bytes = try self.session.outputHostResidency(outputs);
         if (outputs.len == 0) return error.NoRecognitionOutput;
 
         const decoded = try ctc_decode.decodeFromTensor(a, &outputs[0], self.char_dict);
@@ -783,11 +786,11 @@ pub const MultiStageOCRPipeline = struct {
             defer input_tensor.deinit();
 
             break :blk preparation.run(order, &.{input_tensor}, self.allocator, control) catch |err| switch (err) {
-                error.Cancelled, error.Timeout, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded, error.OutOfMemory => return err,
-                else => {
+                error.UnsupportedOperation, error.UnsupportedOperator, error.UnsupportedOnnxOperator => {
                     sortRegionsByReadingOrder(TextRegion, regions);
                     return;
                 },
+                else => return err,
             };
         };
         defer freeTensorSlice(self.allocator, outputs);
@@ -1482,6 +1485,7 @@ test "multistage postprocessing transfers compact results and unwinds every allo
 const CtcWorkspaceFixture = struct {
     resident: bool,
     reduction: bool,
+    opaque_bytes: usize = 0,
     fn info(_: *anyopaque) []const backends.TensorInfo {
         return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ 1, 64, 3 } }};
     }
@@ -1509,10 +1513,12 @@ const CtcWorkspaceFixture = struct {
         compute: Native.NativeCompute,
         table: Ops.ComputeBackend.VTable,
         cb: Ops.ComputeBackend,
+        opaque_storage: []u8 = &.{},
         fn destroy(raw: *anyopaque, _: std.mem.Allocator) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.compute.deinit();
             self.weights.deinitOwned();
+            self.allocator.free(self.opaque_storage);
             self.allocator.destroy(self);
         }
     };
@@ -1521,19 +1527,25 @@ const CtcWorkspaceFixture = struct {
         if (!self.resident) return null;
         const owner = try a.create(Owner);
         owner.allocator = a;
+        owner.opaque_storage = &.{};
         owner.weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
         owner.compute = Native.NativeCompute.init(a, &owner.weights, null);
         owner.table = owner.compute.computeBackend().vtable.*;
         if (!self.reduction) owner.table.takeRows = null;
         owner.cb = .{ .ptr = &owner.compute, .vtable = &owner.table };
         errdefer Owner.destroy(owner, a);
+        owner.opaque_storage = try a.alloc(u8, self.opaque_bytes);
         const outputs = try a.alloc(Ops.CT, 1);
         errdefer a.free(outputs);
         const data = values();
         outputs[0] = try owner.cb.fromFloat32Shape(&data, &.{ 1, 64, 3 });
         return .{ .outputs = outputs, .backend = &owner.cb, .allocator = a, .backend_owner = owner, .deinit_backend_owner = Owner.destroy };
     }
-    const table = backends.Session.VTable{ .run = run, .runResident = residentRun, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+    fn geometry(raw: *anyopaque, _: @import("../backends/session.zig").ShapeInputs, _: usize) !?@import("../backends/session.zig").RunGeometry {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return .{ .sequence = 1, .output_bytes = 64 * 3 * 4, .workspace_bytes = self.opaque_bytes };
+    }
+    const table = backends.Session.VTable{ .runGeometry = geometry, .run = run, .runResident = residentRun, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
 };
 
 fn checkCtcWorkspace(a: std.mem.Allocator) !void {
@@ -1578,4 +1590,51 @@ test "multistage CTC rejects long dictionary text expansion before backing growt
         try std.testing.expectError(error.ResourceLimitExceeded, recognizer.recognizePrepared(.{ .data = &pixels, .width = 2, .height = 2, .channels = 3 }, null, null, &target));
         try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
     }
+}
+
+test "multistage CTC cannot spend opaque resident workspace on expanded text" {
+    var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+    var fixture = CtcWorkspaceFixture{ .resident = true, .reduction = true, .opaque_bytes = 96 * 1024 };
+    const session = backends.Session{ .ptr = &fixture, .vtable = &CtcWorkspaceFixture.table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 128 * 1024, .scratch_limit_bytes = 128 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+    var first: [1024]u8 = @splat('A');
+    var second: [1024]u8 = @splat('B');
+    var dictionary = [_][]u8{ &first, &second };
+    var recognizer = CTCRecognizer{ .allocator = std.testing.allocator, .session = session, .char_dict = &dictionary, .preprocess = .{ .width = 2, .height = 2 } };
+    var pixels: [12]u8 = @splat(255);
+    try std.testing.expectError(error.ResourceLimitExceeded, recognizer.recognize(.{ .data = &pixels, .width = 2, .height = 2, .channels = 3 }, null));
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}
+
+test "multistage ordering propagates one shot checkpoints and only falls back for unsupported operations" {
+    const Fixture = struct {
+        failure: anyerror,
+        calls: usize = 0,
+        fn run(raw: *anyopaque, _: []const backends.Tensor, _: std.mem.Allocator) ![]backends.Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.failure;
+        }
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 1) return error.CheckpointRevisionUnavailable;
+        }
+    };
+    var fixture = Fixture{ .failure = error.UnsupportedOperation };
+    const session = backends.Session{ .ptr = &fixture, .vtable = &.{ .run = Fixture.run, .inputInfo = Fixture.info, .outputInfo = Fixture.info, .backend = Fixture.backend, .close = Fixture.close } };
+    var pipeline = MultiStageOCRPipeline{ .allocator = std.testing.allocator, .detector = session, .order = session, .detection_preprocess = .{ .width = 2, .height = 2 }, .post_processor = .{ .heatmap = .{ .threshold = 0.5, .min_area = 1 } } };
+    var regions = [_]TextRegion{ .{ .bbox = .{ 0, 10, 1, 11 }, .confidence = 1 }, .{ .bbox = .{ 0, 0, 1, 1 }, .confidence = 1 } };
+    var retained = Preparation.child(std.testing.allocator, session, null);
+    defer retained.deinit();
+    try std.testing.expectError(error.CheckpointRevisionUnavailable, pipeline.determineOrder(&regions, .{ .ptr = &fixture, .check_fn = Fixture.check }, &retained));
+    try pipeline.determineOrder(&regions, null, &retained);
+    try std.testing.expectEqual(@as(f64, 0), regions[0].bbox[1]);
+    fixture.failure = error.OrderExecutionFailed;
+    try std.testing.expectError(error.OrderExecutionFailed, pipeline.determineOrder(&regions, null, &retained));
 }
