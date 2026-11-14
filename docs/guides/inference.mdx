@@ -226,7 +226,8 @@ concurrent request. A reproducible fixed policy can set a 4 GiB scratch cap:
   "resources": {
     "memory": {"max_bytes": 34359738368},
     "inference": {
-      "admission": {"max_concurrent_requests": 1},
+      "admission": {"max_concurrent_requests": 1, "max_work_units": 64},
+      "request_limits": {"max_decoded_pixels_per_batch": 4000000},
       "memory": {"max_scratch_bytes": 4294967296}
     }
   }

@@ -199,7 +199,7 @@ fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExec
     return .{
         .admission_failure = httpAdmissionFailure(ctx),
         .content_security_json = if (ctx.getData("antfly.content_security_json")) |raw| @as(*const []const u8, @ptrCast(@alignCast(raw))).* else null,
-        .http_request_admitted = true,
+        .request_slot_admitted = true,
         .document_store = if (ctx.getData("antfly.document_store")) |raw| @as(*const @import("antfly_runtime_abi").document_abi.View, @ptrCast(@alignCast(raw))).* else .{},
         .io = ctx.io,
         .native_call_policy = node.session_manager.native_call_policy,
@@ -6305,8 +6305,11 @@ pub const Node = struct {
         prompt_cache_key: ?[]const u8,
         supplied_control: InferenceExecutionControl,
     ) !DirectGenerateOutput {
-        var synchronized = executor_microbatch.SynchronizedAllocator{ .child = caller_allocator };
-        const allocator = synchronized.allocator();
+        // Model execution is owned by the generation resource lease below.
+        // A caller's document/source/output quota must not become a second
+        // tensor-workspace limit or retain logically freed intermediates.
+        // Only the compact returned text is allocated through caller_allocator.
+        const allocator = std.heap.smp_allocator;
         var execution_control = self.bindExecutionControl(null, supplied_control);
         try execution_control.update(.loading_model, 0, 1);
         const started_at_ns = embedTimingNowNs();
@@ -10113,9 +10116,11 @@ pub const Node = struct {
             inline_source_bytes = try addReadInlineSourceBytes(inline_source_bytes, url, inline_source_cap);
         }
         const admission = readRequestAdmission(self, request.images.len, inline_source_bytes, max_tokens);
-        try self.acquireAdmissionUnits(admission.units);
+        var request_slot = try ReadRequestSlot.acquire(self, &control);
+        defer request_slot.deinit();
+        try self.reserveAdmissionUnits(admission.units);
         var reserved_units = admission.units;
-        defer self.releaseAdmissionUnits(reserved_units);
+        defer self.releaseSlotUnits(reserved_units);
         self.metrics.incRequest("read.local");
         defer self.metrics.decActive();
 
@@ -10256,6 +10261,25 @@ pub const Node = struct {
         return out;
     }
 
+    /// Logical requests retain their permit while a physical batch is queued
+    /// or running. A batch reserves weighted work only, never another request.
+    const ReadRequestSlot = struct {
+        node: *Node,
+        owned: bool,
+
+        fn acquire(node: *Node, control: *InferenceExecutionControl) !ReadRequestSlot {
+            if (control.request_slot_admitted) return .{ .node = node, .owned = false };
+            if (!node.tryAcquireRequestSlot()) return error.QueueFull;
+            control.request_slot_admitted = true;
+            return .{ .node = node, .owned = true };
+        }
+
+        fn deinit(self: *ReadRequestSlot) void {
+            if (self.owned) self.node.releaseRequestSlot();
+            self.owned = false;
+        }
+    };
+
     pub fn readEncodedImagesDirect(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -10288,6 +10312,47 @@ pub const Node = struct {
         deadline_ns: ?u64,
         cancellation: ExecutorCancellation,
     ) !readers_api.BatchResult {
+        var probe = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
+        return self.readEncodedImagesReportedDirectWithControl(allocator, model_name, request, .{ .deadline_ns = deadline_ns, .ptr = &probe, .check_fn = BorrowedReadControl.check });
+    }
+
+    /// Preserve deadline, cancellation, diagnostics and the caller's logical
+    /// request permit through document leaf and page-batcher dispatch.
+    pub fn readEncodedImagesReportedDirectWithControl(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: readers_api.EncodedRequest,
+        supplied_control: InferenceExecutionControl,
+    ) !readers_api.BatchResult {
+        // Reader/generator execution owns process admission. Keep its tensors
+        // off document source/output quotas and copy only bounded results back.
+        const work = std.heap.smp_allocator;
+        var result = try self.readEncodedImagesReportedInWorkspace(work, model_name, request, supplied_control);
+        defer result.deinit(work);
+        return cloneReaderBatchResult(allocator, result);
+    }
+
+    fn readEncodedImagesReportedInWorkspace(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        request: readers_api.EncodedRequest,
+        supplied_control: InferenceExecutionControl,
+    ) !readers_api.BatchResult {
+        var execution_control = self.bindExecutionControl(null, supplied_control);
+        try execution_control.check();
+        var request_slot = try ReadRequestSlot.acquire(self, &execution_control);
+        defer request_slot.deinit();
+        const deadline_ns = execution_control.deadline_ns;
+        const Cancel = struct {
+            fn cancelled(raw: *const anyopaque) bool {
+                const active: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+                active.check() catch return true;
+                return false;
+            }
+        };
+        const cancellation = ExecutorCancellation{ .ptr = &execution_control, .is_cancelled_fn = Cancel.cancelled };
         if (cancellation.isCancelled()) return error.Canceled;
         try ensureDirectEmbeddingDeadline(deadline_ns);
         if (request.images.len == 0) return error.ReadBatchTooLarge;
@@ -10298,9 +10363,7 @@ pub const Node = struct {
             const definition = try self.documentDefinition(allocator, model_name, .read);
             defer if (definition) |bytes| allocator.free(bytes);
             if (definition != null or std.mem.eql(u8, model_name, "antfly/native-document")) {
-                var probe = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
-                const control = self.bindExecutionControl(null, .{ .deadline_ns = deadline_ns, .ptr = &probe, .check_fn = BorrowedReadControl.check });
-                const result = try self.documentOperationJson(allocator, model_name, control, .read, .{ .images = request });
+                const result = try self.documentOperationJson(allocator, model_name, execution_control, .read, .{ .images = request });
                 defer allocator.free(result);
                 if (request.max_response_bytes) |limit| if (result.len > limit) return error.ResponseTooLarge;
                 const batch = try readers_api.documentBatchResult(allocator, result);
@@ -10350,10 +10413,9 @@ pub const Node = struct {
 
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
-        const io = self.inferenceIo(allocator, null, &owned_io);
+        const io = self.inferenceIo(allocator, execution_control.io, &owned_io);
         const broker_deadline = try directExecutorDeadline(io, deadline_ns);
-        var read_control = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
-        var execution_control = self.bindExecutionControl(io, .{ .ptr = &read_control, .check_fn = BorrowedReadControl.check });
+        execution_control = self.bindExecutionControl(io, execution_control);
         const model_path_selection = try self.resolveReadModelSelection(io, if (model_name.len > 0) model_name else null);
         const model_path = model_path_selection.path;
         execution_control = model_path_selection.bind(execution_control);
@@ -10390,8 +10452,8 @@ pub const Node = struct {
                     1,
                     @intCast(output_tokens),
                 )));
-                try self.acquireAdmissionUnits(reserved_units);
-                defer self.releaseAdmissionUnits(reserved_units);
+                try self.reserveAdmissionUnits(reserved_units);
+                defer self.releaseSlotUnits(reserved_units);
                 const results = try self.readQwen3VlImagesWithAdmission(
                     allocator,
                     model_path,
@@ -10430,8 +10492,8 @@ pub const Node = struct {
         // native-batch candidates above are admitted once by the broker leader
         // for the fused group, rather than each follower pinning a full model
         // lease while it waits for compatible work.
-        try self.acquireAdmissionUnits(required_units);
-        defer self.releaseAdmissionUnits(required_units);
+        try self.reserveAdmissionUnits(required_units);
+        defer self.releaseSlotUnits(required_units);
         const image_datas = try allocator.alloc([]const u8, request.images.len);
         defer allocator.free(image_datas);
         for (request.images, 0..) |image, i| image_datas[i] = image.bytes;
@@ -10570,6 +10632,20 @@ pub const Node = struct {
         );
     }
 
+    fn cloneReaderBatchResult(allocator: std.mem.Allocator, source: readers_api.BatchResult) !readers_api.BatchResult {
+        const items = try allocator.alloc(readers_api.Result, source.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (items[0..initialized]) |*item| readers_api.deinitResult(allocator, item);
+            allocator.free(items);
+        }
+        for (source.items, items) |item, *output| {
+            output.* = try cloneReaderApiResult(allocator, item);
+            initialized += 1;
+        }
+        return .{ .items = items, .usage = source.usage, .execution = source.execution };
+    }
+
     fn cloneReaderApiResult(allocator: std.mem.Allocator, source: readers_api.Result) !readers_api.Result {
         const text = try allocator.dupe(u8, source.text);
         errdefer allocator.free(text);
@@ -10672,6 +10748,8 @@ pub const Node = struct {
         const broker_deadline = try directExecutorDeadline(io, deadline_ns);
         var read_control = BorrowedReadControl{ .deadline_ns = deadline_ns, .cancellation = cancellation };
         var execution_control = self.bindExecutionControl(io, .{ .ptr = &read_control, .check_fn = BorrowedReadControl.check });
+        var request_slot = try ReadRequestSlot.acquire(self, &execution_control);
+        defer request_slot.deinit();
         const model_path_selection = try self.resolveReadModelSelection(io, if (model_name.len > 0) model_name else null);
         const model_path = model_path_selection.path;
         execution_control = model_path_selection.bind(execution_control);
@@ -10693,8 +10771,8 @@ pub const Node = struct {
             execution_control,
         )) |broker_batch| return broker_batch;
 
-        try self.acquireAdmissionUnits(required_units);
-        defer self.releaseAdmissionUnits(required_units);
+        try self.reserveAdmissionUnits(required_units);
+        defer self.releaseSlotUnits(required_units);
         var batch = try self.runReadRasterBatchReportedDirect(
             allocator,
             model_path,
@@ -10928,11 +11006,11 @@ pub const Node = struct {
         defer if (lane) |lease| lease.release();
 
         const required_units = @max(admission.units, decoded_budget.requiredUnits());
-        self.acquireAdmissionUnits(required_units) catch |err| {
+        self.reserveAdmissionUnits(required_units) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
-        defer self.releaseAdmissionUnits(required_units);
+        defer self.releaseSlotUnits(required_units);
 
         const batch = self.runReadImageBatchReportedDirect(
             allocator,
@@ -11055,11 +11133,11 @@ pub const Node = struct {
         defer if (lane) |lease| lease.release();
 
         const required_units = @max(admission.units, decoded_budget.requiredUnits());
-        self.acquireAdmissionUnits(required_units) catch |err| {
+        self.reserveAdmissionUnits(required_units) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
-        defer self.releaseAdmissionUnits(required_units);
+        defer self.releaseSlotUnits(required_units);
 
         const batch = self.runReadRasterBatchReportedDirect(
             allocator,
@@ -11816,7 +11894,7 @@ pub const Node = struct {
             defer allocator.free(json);
             return .{ .allocator = allocator, .json = try self.extractDocumentsJsonWithControl(allocator, json, control) };
         }
-        return self.extractWithAdmission(allocator, model_name, request, if (control.http_request_admitted) .http_route else .direct, control);
+        return self.extractWithAdmission(allocator, model_name, request, if (control.request_slot_admitted) .http_route else .direct, control);
     }
 
     const ExtractionAdmissionOwner = enum { direct, http_route };
@@ -11859,7 +11937,7 @@ pub const Node = struct {
             .json = try self.extractDocumentsJsonWithControl(allocator, request_json, control orelse .{}),
         };
         var failure = extraction_v2.FailureContext{};
-        return self.extractV2WithAdmission(allocator, .{ .json = request_json }, if (control != null and control.?.http_request_admitted) .http_route else .direct, control, &failure, null, "extract");
+        return self.extractV2WithAdmission(allocator, .{ .json = request_json }, if (control != null and control.?.request_slot_admitted) .http_route else .direct, control, &failure, null, "extract");
     }
 
     fn extractV2WithAdmission(
@@ -22390,9 +22468,9 @@ pub const Node = struct {
         defer manifest.deinit();
         const whisper = manifest.model_type == .transcriber;
         const audio_admission = audioDecodeAdmission(self, bytes.len);
-        if (control.http_request_admitted) try self.reserveAdmissionUnits(audio_admission.units) else try self.acquireAdmissionUnits(audio_admission.units);
+        if (control.request_slot_admitted) try self.reserveAdmissionUnits(audio_admission.units) else try self.acquireAdmissionUnits(audio_admission.units);
         var reserved_units = audio_admission.units;
-        defer if (control.http_request_admitted) self.releaseSlotUnits(reserved_units) else self.releaseAdmissionUnits(reserved_units);
+        defer if (control.request_slot_admitted) self.releaseSlotUnits(reserved_units) else self.releaseAdmissionUnits(reserved_units);
         self.metrics.incRequest("read.local");
         defer self.metrics.decActive();
         const DecodeControl = struct {
@@ -28032,9 +28110,9 @@ test "document extraction reuses HTTP request admission and releases nested work
     const json = "{\"schema_version\":2,\"model\":\"missing\",\"schema\":{\"entities\":[\"person\"]},\"inputs\":[{\"content\":\"John\"}]}";
     for (0..2) |entry| {
         const result = if (entry == 0)
-            node.extractDirectWithControl(a, "missing", direct, .{ .http_request_admitted = true })
+            node.extractDirectWithControl(a, "missing", direct, .{ .request_slot_admitted = true })
         else
-            node.extractV2DirectJsonWithControl(a, json, .{ .http_request_admitted = true });
+            node.extractV2DirectJsonWithControl(a, json, .{ .request_slot_admitted = true });
         if (result) |response| {
             var owned = response;
             owned.deinit();
@@ -47085,6 +47163,7 @@ test "audio read digital silence preserves quiet speech and rejects invalid samp
 }
 
 fn documentFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (err == error.QueueFull) return transientCapacityFailureResponse(ctx, "SERVICE_UNAVAILABLE", "server at capacity for expanded request workload, try again later", "inference_admission");
     if (err == error.AudioTooLong) return audioDurationLimitResponse(ctx);
     if (err == error.SpeakerModelUnavailable) return ctx.status(422).json(.{ .@"error" = "SpeakerModelUnavailable", .message = "The selected audio reader requires the local speaker embedding model for diarization" });
     if (remoteContentRequestFailure(err)) |_| return remoteContentErrorResponse(ctx, err);
@@ -50358,7 +50437,7 @@ test "audio read HTTP leaf shares request admission and releases work on decode 
     var run = document_contract.Run{ .limits = .{} };
     defer run.deinit();
     for (0..4) |_| {
-        if (node.documentReadAudio(a, path, "not an audio container", null, null, .{}, .{ .http_request_admitted = true }, &run)) |result| {
+        if (node.documentReadAudio(a, path, "not an audio container", null, null, .{}, .{ .request_slot_admitted = true }, &run)) |result| {
             a.free(result.text);
             if (result.audio_json) |json| a.free(json);
             return error.TestUnexpectedResult;
@@ -52422,4 +52501,62 @@ test "streaming admission emits structured terminal budget details without alloc
     capture.bytes.clearRetainingCapacity();
     writeGenerationStreamError(&ctx, &writer, error.PromptTooLong);
     try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "prompt exceeds") != null);
+}
+
+test "document reader borrows one logical request slot and bounds physical work" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .max_concurrent_requests = 1, .max_work_units = 64 });
+    defer node.deinit();
+    var control = InferenceExecutionControl{};
+    var owner = try Node.ReadRequestSlot.acquire(&node, &control);
+    defer owner.deinit();
+    try std.testing.expect(control.request_slot_admitted);
+    try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightRequests());
+    var peer_control = InferenceExecutionControl{};
+    try std.testing.expectError(error.QueueFull, Node.ReadRequestSlot.acquire(&node, &peer_control));
+    try std.testing.expect(!peer_control.request_slot_admitted);
+    var nested = try Node.ReadRequestSlot.acquire(&node, &control);
+    try node.reserveAdmissionUnits(64);
+    try std.testing.expectError(error.QueueFull, node.reserveAdmissionUnits(1));
+    node.releaseSlotUnits(64);
+    nested.deinit();
+    try std.testing.expectEqual(@as(usize, 1), node.inference_admission.inFlightRequests());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    owner.deinit();
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+}
+
+test "document work admission exhaustion preserves retryable identity" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/read");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try documentFailureResponse(&ctx, error.QueueFull);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 503), response.status.code);
+    try std.testing.expectEqualStrings("1", response.headers.get("Retry-After").?);
+    var body = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer body.deinit();
+    try std.testing.expect(body.value.object.get("retryable").?.bool);
+    try std.testing.expectEqualStrings("inference_admission", body.value.object.get("reason").?.string);
+}
+
+fn checkReaderWorkspaceOutputClone(a: std.mem.Allocator) !void {
+    var text = [_]u8{ 'o', 'c', 'r' };
+    var source_items = [_]readers_api.Result{ .{ .text = &text, .item_id = "page-1", .source_fingerprint = "source", .page_number = 2, .regions_json = "[]", .fields_json = "{}", .document_json = "{}" }, .{ .text = &text, .item_id = "page-2", .completion = .length } };
+    const source = readers_api.BatchResult{ .items = &source_items, .execution = .{ .requested_items = 2, .serial_items = 2 }, .usage = .{ .prompt_tokens = 4, .completion_tokens = 2, .total_tokens = 6 } };
+    var copy = try Node.cloneReaderBatchResult(a, source);
+    defer copy.deinit(a);
+    @memset(&text, 'x');
+    try std.testing.expectEqualStrings("ocr", copy.items[0].text);
+    try std.testing.expectEqualStrings("page-1", copy.items[0].item_id);
+    try std.testing.expectEqualStrings("source", copy.items[0].source_fingerprint.?);
+    try std.testing.expectEqual(readers_api.Completion.length, copy.items[1].completion);
+    try std.testing.expectEqual(@as(i64, 6), copy.usage.?.total_tokens);
+    try copy.execution.validate(2);
+}
+
+test "reader workspace output transfer preserves ownership and every OOM cleanup" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkReaderWorkspaceOutputClone, .{});
 }

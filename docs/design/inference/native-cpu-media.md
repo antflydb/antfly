@@ -27,7 +27,27 @@ encoder's process ledger. Binding rejects a different ledger or an active borrow
 permit. The execution estimate becomes credit for actual allocations; allocations
 grow only the deficit. After encoding, surviving tensors retain credit through
 their allocator while unused encoder workspace is released before decoding.
-Queued/batched and accelerator executors keep their separate ownership rules.
+Queued/batched and accelerator executors keep their separate memory ownership.
+Document leaves preserve the complete execution control, including the logical
+request permit. Direct reader callers acquire that permit before queueing;
+physical encoded/raster batches reserve weighted work without acquiring another
+logical request. A one-request worker can therefore process a document without
+rejecting its own nested OCR call. Expanded work saturation remains a retryable
+503 with the admission reason and Retry-After.
+
+Configure request concurrency separately from weighted work capacity. The CPU
+profile uses one logical request, 64 work units and a 4-million-pixel request
+ceiling. Omitting work capacity makes it follow concurrency and can reject a
+normal full-page raster before model execution.
+
+Generative execution uses a reclaiming, thread-safe heap under its existing
+model generation resource lease. The caller allocator owns returned text, not
+model tensors. Encoded document readers follow the same boundary: execution
+retains its own owned buffers, then copies only the compact result into the
+caller's bounded output allocator. This prevents a document's 512 MiB
+source/metadata/output quota from rejecting legal vision or decoder workspace,
+and avoids charging the execution lease again through the document allocator.
+Output-copy allocation failures roll back every completed result item.
 
 CPU automatic scratch is a fraction of the safe process pool. Explicit caps,
 total host/combined budgets and live memory pressure still apply. Preflight
