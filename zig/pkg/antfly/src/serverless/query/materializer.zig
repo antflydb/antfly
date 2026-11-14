@@ -115,6 +115,7 @@ pub fn materializeWithBodiesAlloc(alloc: Allocator, base_docs: []const Document,
     }
 
     for (mutations) |mutation| {
+        if (mutation.kind == .catalog) continue;
         const existing_index = index_by_doc.get(mutation.doc_id);
         const idx = existing_index orelse blk: {
             try slots.ensureUnusedCapacity(alloc, 1);
@@ -130,6 +131,7 @@ pub fn materializeWithBodiesAlloc(alloc: Allocator, base_docs: []const Document,
         slot.last_lsn = mutation.lsn;
         slot.last_timestamp_ns = mutation.timestamp_ns;
         switch (mutation.kind) {
+            .catalog => unreachable,
             .upsert, .checkpoint, .enriched, .prepared => {
                 const raw = mutation.body orelse "";
                 if (mutation.kind == .upsert and facts.isInternalBody(raw)) return error.InvalidDocumentBody;

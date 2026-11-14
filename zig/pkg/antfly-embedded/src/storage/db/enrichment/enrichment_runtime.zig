@@ -20722,6 +20722,11 @@ pub const PrecommitDocumentExecution = struct {
     }
 
     pub fn create(parent: *EnrichmentRuntime, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8) !*@This() {
+        return createWithContext(parent, requests, raw, null);
+    }
+
+    pub fn createWithContext(parent: *EnrichmentRuntime, requests: []const enrichment_types.GeneratedEnrichmentRequest, raw: []const u8, context: ?inference_request_context.RequestContext) !*@This() {
+        if (context) |control| try control.check();
         if (builtin.os.tag == .freestanding) return error.UnsupportedPrecommitDocumentExecution;
         const alloc = parent.alloc;
         const self = try alloc.create(@This());
@@ -20749,6 +20754,15 @@ pub const PrecommitDocumentExecution = struct {
             .scheduler = undefined,
         };
         errdefer self.runtime.ownership.deinit(alloc);
+        if (context) |control| {
+            self.runtime.config.io = control.io;
+            self.runtime.config.cancellation = control.cancellation orelse .none;
+            const deadline = if (control.deadline_ns) |value|
+                self.runtime.deadline_clock.nowRealtimeNs() +| (value -| platform_time.monotonicNs())
+            else
+                null;
+            self.runtime.active_provider_guard = ForegroundCatchUpGuard.boundedBy(self.runtime.deadline_clock, self.runtime.config, control.cancellation orelse .none, deadline);
+        }
         const manager = parent.config.resource_manager orelse parent.index_manager.resource_manager;
         try self.results.init(alloc, manager);
         self.scheduler = SharedPdfWindowScheduler.init(&self.runtime, requests, 0);

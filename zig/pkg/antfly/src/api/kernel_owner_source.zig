@@ -5402,12 +5402,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         return self.batchGroupLocalWithDescriptor(alloc, group_id, table_name, req, null);
     }
 
-    pub fn prepareEnrichments(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest) ![]u8 {
+    pub fn prepareEnrichments(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_types.BatchRequest, deadline: ?u64, cancellation: db_types.CancellationToken) ![]u8 {
+        try cancellation.check();
         const json = try table_writes.encodeStorageKernelBatchRequest(alloc, req);
         defer alloc.free(json);
-        var lease = try self.acquire(group_id, table_name);
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = deadline, .cancellation = cancellation });
         defer lease.deinit();
-        var response = try lease.owner().prepareEnrichments(table_name, json);
+        var response = try lease.owner().prepareEnrichments(table_name, json, deadline, cancellation);
         defer response.deinit();
         return alloc.dupe(u8, response.bytes());
     }

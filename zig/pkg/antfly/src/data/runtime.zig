@@ -13464,7 +13464,7 @@ pub const DataServer = struct {
                         protocol_activation_lock_owned = false;
                     }
                     if (comptime linked_storage) {
-                        prepared_json = try (try self.ensureKernelOwnerSource()).prepareEnrichments(alloc, group_id, table_name, req);
+                        prepared_json = try (try self.ensureKernelOwnerSource()).prepareEnrichments(alloc, group_id, table_name, req, deadline_ns, if (route.cancellation) |signal| signal.token() else .none);
                         req.prepared_enrichments_json = prepared_json;
                     } else return error.CommitRequirementUnavailable;
                     try ensureDataRaftBatchRouteActive(route);

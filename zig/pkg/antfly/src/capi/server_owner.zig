@@ -4107,7 +4107,13 @@ pub fn storageOwnerPrepareEnrichments(owner: ?*anyopaque, request: *const kernel
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
     var owned = batch_api.parseOwnerBatchRequest(handle.alloc, request.request_json.slice()) catch |err| return storageOwnerStatusFromError(err);
     defer owned.deinit(handle.alloc);
-    const command = handle.db.prepareDirectEnrichments(handle.alloc, owned.req) catch |err| return storageOwnerStatusFromError(err);
+    const Adapter = struct {
+        fn canceled(ptr: *const anyopaque) bool {
+            const input: *const kernel_owner_abi.WriteAdmissionRequest = @ptrCast(@alignCast(ptr));
+            return if (input.cancellation_fn) |callback| callback(input.cancellation_ctx) != 0 else false;
+        }
+    };
+    const command = handle.db.prepareDirectEnrichmentsWithContext(handle.alloc, owned.req, .{ .io = handle.db.backend_runtime.io() orelse return storageOwnerStatusFromError(error.BackendRuntimeIoUnavailable), .deadline_ns = if (request.has_execution_deadline != 0) request.execution_deadline_ns else null, .cancellation = .{ .ptr = request, .is_cancelled_fn = Adapter.canceled } }) catch |err| return storageOwnerStatusFromError(err);
     out_command.* = .{ .ptr = command.ptr, .len = @intCast(command.len) };
     return .ok;
 }

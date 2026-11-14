@@ -373,6 +373,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             generated_memo: *GeneratedEmbeddingMemo,
             prepared_row_allocator: *PreparedRowAllocator,
         ) anyerror!void {
+            self.preparation_context = opts.preparation_context;
+            if (opts.preparation_context) |context| try context.check();
             var decoded_prepared = if (incoming_req.prepared_enrichments_json) |json|
                 try std.json.parseFromSlice(execution_resources.PreparedEnrichments, S.ownerField(self, "alloc").*, json, .{ .allocate = .alloc_always })
             else
@@ -941,6 +943,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 );
             }
 
+            if (opts.preparation_context) |context| try context.check();
             if (opts.preparation_capture) |capture| {
                 if (req.commit_requires != .direct_enrichments) return error.InvalidBatchRequest;
                 if (preparation.write_plan == null) preparation.write_plan = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
@@ -3522,6 +3525,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // Unrelated catalog churn reuses valid work; a new target cannot
             // relabel the preceding attempt's result.
             var generated_memo = GeneratedEmbeddingMemo.init(allocator_guard.allocator());
+            generated_memo.context = opts.preparation_context;
             // Cache restoration is an internal preservation operation. Ordinary
             // writes and explicit regeneration retain their provider semantics.
             generated_memo.reuse_stored_artifacts = if (opts.restore_staging) |admission| !admission.rewrite else false;

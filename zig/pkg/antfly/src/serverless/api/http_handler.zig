@@ -5944,6 +5944,18 @@ pub const HttpHandler = struct {
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         if (self.runtime_status.role == .query_only) return error.Unavailable;
 
+        const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch |err| switch (err) {
+            error.NamespaceNotFound => return error.NotFound,
+            else => {
+                std.log.err("serverless public table batch resolve failed table={s} err={}", .{ table_name, err });
+                return error.InternalFailure;
+            },
+        };
+        defer self.alloc.free(namespace);
+
+        const gated = req.commit_requires == .direct_enrichments;
+        if (gated and !self.api.wal.supportsCatalogFences()) return error.Unavailable;
+        const catalog_fence = if (gated) self.catalog.directCatalogFence(namespace) catch return error.Unavailable else @import("../wal/types.zig").CatalogFence{};
         self.catalog.ensureTableWritesAllowed(table_name) catch |err| switch (err) {
             error.NamespaceNotFound => return error.NotFound,
             error.RelationalStorageUnavailable => return error.MethodNotAllowed,
@@ -5966,18 +5978,6 @@ pub const HttpHandler = struct {
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
         try self.preflightPublicTableBatchSyncLevel(req.sync_level, status);
 
-        const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch |err| switch (err) {
-            error.NamespaceNotFound => return error.NotFound,
-            else => {
-                std.log.err("serverless public table batch resolve failed table={s} err={}", .{ table_name, err });
-                return error.InternalFailure;
-            },
-        };
-        defer self.alloc.free(namespace);
-
-        const gated = req.commit_requires == .direct_enrichments;
-        if (gated and !self.api.wal.supportsConditionalBatchAppend()) return error.Unavailable;
-        const expected_latest = if (gated) self.api.wal.latestLsn(namespace) catch return error.Unavailable else 0;
         const mutations = self.resolveTableBatchMutationsAlloc(namespace, req, request.cancellation) catch |err| switch (err) {
             error.InvalidArgument => return error.InvalidBatchRequest,
             error.Canceled => return error.Canceled,
@@ -5996,7 +5996,7 @@ pub const HttpHandler = struct {
         defer if (operation_id) |id| self.alloc.free(id);
         const prepared = if (gated) blk: {
             const runtime = self.runtime_metrics orelse return error.Unavailable;
-            break :blk runtime.prepareDirectMutations(namespace, mutations, request.cancellation) catch |err| switch (err) {
+            break :blk runtime.prepareDirectMutationsWithContext(namespace, mutations, .{ .io = self.io orelse runtime.io, .deadline_ns = (request.platformDeadline() catch return error.InternalFailure).deadline_ns, .cancellation = request.cancellation }) catch |err| switch (err) {
                 error.UnsupportedCommitRequirement => return error.UnsupportedCommitRequirement,
                 error.CommitRequirementTooLarge, error.InvalidDocumentBody, error.InvalidDocumentMutation => return error.InvalidBatchRequest,
                 error.Canceled, error.Cancelled => return error.Canceled,
@@ -6006,7 +6006,7 @@ pub const HttpHandler = struct {
         defer if (prepared) |values| freeDocumentMutations(self.alloc, values);
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else error.Canceled;
         var result = (if (prepared) |values|
-            self.api.ingestPreparedBatch(.{ .namespace = namespace, .timestamp_ns = timestamp, .operation_id = operation_id, .mutations = values }, expected_latest)
+            self.api.ingestPreparedBatch(.{ .namespace = namespace, .timestamp_ns = timestamp, .operation_id = operation_id, .mutations = values }, catalog_fence)
         else
             self.api.ingestBatch(.{ .namespace = namespace, .timestamp_ns = timestamp, .mutations = mutations })) catch |err| {
             if (err == error.VersionConflict) return error.Conflict;
@@ -7069,6 +7069,7 @@ const PublicGraphRequestCache = struct {
                     break :resolved .{ .owned = try @import("../build/document_facts.zig").resolveCheckpointBodyAlloc(self.handler.alloc, &pages, mutation.body orelse return error.InvalidDocumentBody) };
                 },
                 .upsert => .{ .owned = try self.handler.alloc.dupe(u8, mutation.body orelse "") },
+                .catalog => continue,
                 .enriched, .prepared => .{ .owned = try self.handler.alloc.dupe(u8, (try @import("../build/document_facts.zig").parseEnrichedBody(mutation.body orelse return error.InvalidDocumentBody)).body) },
                 .delete => .deleted,
             };
@@ -9062,7 +9063,7 @@ fn lowerTableIngestMutationsAlloc(
     errdefer alloc.free(mutations);
     for (input_mutations, 0..) |mutation, idx| {
         mutations[idx] = switch (mutation.kind) {
-            .checkpoint, .enriched, .prepared => return error.InvalidDocumentMutation,
+            .checkpoint, .enriched, .prepared, .catalog => return error.InvalidDocumentMutation,
             .upsert => switch (mutation.document) {
                 .object => |document| .{
                     .kind = .upsert,

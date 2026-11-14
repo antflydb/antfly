@@ -699,7 +699,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (jobs.items.len == 0) return;
             defer clearGeneratedDenseMemoJobs(memo.alloc, jobs);
             const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
-            const embedder = runtime.config.dense_embedder orelse return;
+            const embedder = (runtime.config.dense_embedder orelse return).withRequestContext(memo.context);
             const texts = try memo.alloc.alloc([]const u8, jobs.items.len);
             defer memo.alloc.free(texts);
             for (jobs.items, texts) |job, *text| text.* = job.text;
@@ -810,7 +810,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (jobs.items.len == 0) return;
             defer clearGeneratedSparseMemoJobs(memo.alloc, jobs);
             const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
-            const embedder = runtime.config.sparse_embedder orelse return;
+            const embedder = (runtime.config.sparse_embedder orelse return).withRequestContext(memo.context);
             const texts = try memo.alloc.alloc([]const u8, jobs.items.len);
             defer memo.alloc.free(texts);
             for (jobs.items, texts) |job, *text| text.* = job.text;
@@ -1156,6 +1156,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var fallback_memo = GeneratedEmbeddingMemo.init(alloc);
             defer fallback_memo.deinit();
             const preparation_memo = generated_memo orelse &fallback_memo;
+            if (preparation_memo.context) |context| try context.check();
             // Legacy preparation retains its ordinary batching; direct gates
             // dispatch bounded windows and account effects between windows.
             if (precompute_mode != .direct) if (resolved_plan) |plan| if (generated_memo) |memo| {
@@ -1180,7 +1181,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 for (req.deletes) |key| try output_budget.reserve(key.len, 1);
             }
-            var artifact_writes = execution_resources.PreparedArtifactWrites{ .budget = if (precompute_mode == .direct) &output_budget else null };
+            var artifact_writes = execution_resources.PreparedArtifactWrites{ .context = preparation_memo.context, .budget = if (precompute_mode == .direct) &output_budget else null };
             errdefer {
                 for (artifact_writes.items) |write| {
                     alloc.free(@constCast(write.key));
@@ -1240,6 +1241,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             var window_end: usize = 0;
             for (req.writes, 0..) |_, i| {
+                if (preparation_memo.context) |context| try context.check();
                 if (precompute_mode == .direct and i == window_end) {
                     flushPrecomputeAssetProducerBatch(alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents, &coverage_outcomes) catch |err| {
                         if (err == error.InferenceResultTooLarge) return error.CommitRequirementTooLarge;
@@ -1330,8 +1332,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
                 const execution_requests = if (precompute_mode == .direct) direct_execution_requests.items else generated;
                 var direct_execution_index: usize = 0;
+                const controlled_asset = preparation_memo.context != null and for (execution_requests) |request| {
+                    if (request.kind == .asset) break true;
+                } else false;
                 const document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution = if (S.ownerField(self, "enrichment_runtime").*) |runtime|
-                    if (precompute_mode != .none and enrichment_runtime_mod.PrecommitDocumentExecution.useful(execution_requests)) try enrichment_runtime_mod.PrecommitDocumentExecution.create(runtime, execution_requests, (try extracted[i].logicalJson()).?) else null
+                    if (precompute_mode != .none and (controlled_asset or enrichment_runtime_mod.PrecommitDocumentExecution.useful(execution_requests))) try enrichment_runtime_mod.PrecommitDocumentExecution.createWithContext(runtime, execution_requests, (try extracted[i].logicalJson()).?, preparation_memo.context) else null
                 else
                     null;
                 defer if (document_execution) |execution| execution.destroy();
@@ -1626,7 +1631,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             force_names: []const []const u8,
         ) !void {
             const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
-            const embedder = runtime.config.dense_embedder orelse return;
+            const embedder = (runtime.config.dense_embedder orelse return).withRequestContext(memo.context);
             var jobs = std.ArrayListUnmanaged(GeneratedDenseMemoJob).empty;
             defer {
                 clearGeneratedDenseMemoJobs(memo.alloc, &jobs);
@@ -1769,7 +1774,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             force_names: []const []const u8,
         ) !void {
             const runtime = S.ownerField(self, "enrichment_runtime").* orelse return;
-            const embedder = runtime.config.sparse_embedder orelse return;
+            const embedder = (runtime.config.sparse_embedder orelse return).withRequestContext(memo.context);
             var jobs = std.ArrayListUnmanaged(GeneratedSparseMemoJob).empty;
             defer {
                 clearGeneratedSparseMemoJobs(memo.alloc, &jobs);

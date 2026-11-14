@@ -22410,7 +22410,7 @@ pub const ProvisionedTableWriteSource = struct {
             error.MultipleGroups => return null,
             else => return err,
         };
-        if (group_id_opt == null) return .{ .committed = .{ .participant_count = 0 } };
+        if (group_id_opt == null) return if (table_req.commit_requires == .direct_enrichments) null else .{ .committed = .{ .participant_count = 0 } };
 
         // The outer table request prevents a topology publication between the
         // one-participant proof above and the ordinary atomic batch admission.
@@ -22484,7 +22484,10 @@ pub const ProvisionedTableWriteSource = struct {
             error.MultipleGroups => return null,
             else => return err,
         };
-        const route = selected_route orelse return .{ .committed = .{ .participant_count = 0 } };
+        const route = selected_route orelse if (table_req.commit_requires == .direct_enrichments)
+            routing.resolveRouteForKey("") orelse return error.NotFound
+        else
+            return .{ .committed = .{ .participant_count = 0 } };
 
         const batcher = self.raft_batcher orelse return null;
         const req: db_mod.types.BatchRequest = .{
@@ -34011,6 +34014,13 @@ fn consumerTests() type {
                 }}, .write, .none);
                 try std.testing.expectEqual(requirement, capture.requirement.?);
             }
+            const before_empty = capture.calls;
+            _ = try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{.{
+                .table_name = "docs",
+                .commit_requires = .direct_enrichments,
+            }}, .write, .none);
+            try std.testing.expectEqual(before_empty + 1, capture.calls);
+            try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, capture.requirement.?);
         }
 
         test "provisioned stateless batch retries definite aborts to the production bound" {

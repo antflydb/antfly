@@ -151,7 +151,8 @@ submitted source envelope is checked before inference. Source mutations,
 artifacts, deletes, metadata and replay have an 8 MiB / 16,384-row physical budget.
 Provider result contracts and incremental output accounting stop oversized work.
 Transaction preparation additionally reserves a conservative bound for commit
-metadata, index effects, read guards and retained-source output before voting yes;
+metadata, index effects, read guards, retained-source output and existing artifact
+retirement before voting yes;
 that bound can reject a request below the final physical limit. Prepared primary
 intents fence background artifact publication, so the retirement footprint cannot
 expand after reservation. Workers defer that conflict without terminal failure.
@@ -163,7 +164,10 @@ revisions. It references each immutable catalog definition instead of repeating
 provider configuration for every document. Binary artifact values round-trip
 without UTF-8 conversion. Capture has no primary side effects. Receivers validate
 the complete eligible producer set and its physical output scopes without model
-calls. Native owner ABI 93 and storage engine ABI 39 fence the added interfaces.
+calls. Native owner ABI 94, storage engine ABI 40 and media compute ABI 5
+fence the added interfaces. Request deadlines and cancellation cross the native
+owner and extraction boundaries into request-owned provider calls. Acceptance
+shares one immutable source image and digest across producers for each document.
 
 Raft leaders prepare before acquiring routed admission or the proposal lock.
 The all-member durable protocol-30 barrier precedes prepared-effect entries;
@@ -187,9 +191,18 @@ and replay receives the work hint. Obsolete outputs never certify the new plan.
 Serverless uses private WAL mutation kind 5 for a self-contained primary postimage
 and its direct pipeline outputs, preserving logical source-byte accounting. One
 conditional atomic WAL batch admits all writes and deletes against the captured
-namespace cut, with an operation receipt for exact replay and collision checks.
+namespace cut and catalog epoch, with an operation receipt for exact replay and
+collision checks. WAL HEAD format 8 and private mutation kind 6 publish a durable
+catalog-change intent before metadata changes. Pending intents block fresh gated
+admission and recover on the next catalog read; per-record epochs make delayed
+recovery harmless. Clearing the intent and admitting prepared sources use HEAD
+CAS, so catalog changes during inference cannot admit stale effects.
 It is limited to 1,024 mutations and 8 MiB including framing. Legacy backends
-without conditional batch append reject before inference or source admission.
+without atomic source/catalog fencing reject before inference or source admission.
+Each document uses a 64 MiB scratch allocation quota; remaining output limits are
+checked between stages and predictable vector amplification is rejected before
+inference. Preparation removes old derived chunk inputs before transforming a
+source. Empty gated requests still reach catalog capability validation.
 Request-owned provider handles avoid the background runtime's configuration and
 publication locks. Media/model-source stages requiring artifact context remain
 asynchronous. Prepared completion markers bind the canonical producer catalog;

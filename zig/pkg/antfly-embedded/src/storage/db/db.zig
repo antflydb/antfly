@@ -7688,6 +7688,11 @@ pub const DB = struct {
     pub const validatePreparedEnrichments = local_mutation.validatePreparedEnrichments;
 
     pub fn prepareDirectEnrichments(self: *DB, alloc: Allocator, req: types.BatchRequest) ![]u8 {
+        return self.prepareDirectEnrichmentsWithContext(alloc, req, null);
+    }
+
+    pub fn prepareDirectEnrichmentsWithContext(self: *DB, alloc: Allocator, req: types.BatchRequest, context: ?@import("antfly_inference_execution_context").RequestContext) ![]u8 {
+        if (context) |control| try control.check();
         if (req.commit_requires != .direct_enrichments or req.prepared_enrichments_json != null) return error.InvalidBatchRequest;
         const digest = try execution_resources.PreparedEnrichments.requestDigest(alloc, req);
         if (req.transaction) |control| if (control == .prepare) {
@@ -7710,7 +7715,7 @@ pub const DB = struct {
             } else if (try @import("../source_authority.zig").maintenanceMode(&read) == .ordered and self.core.hasGeneratedEnrichmentTargets()) return error.CommitRequirementUnavailable;
         }
         var output = execution_resources.PreparationCapture{ .alloc = alloc, .request_digest = digest };
-        try self.batchInternal(req, null, .{ .preparation_capture = &output, .wait_for_sync_level = false });
+        try self.batchInternal(req, null, .{ .preparation_capture = &output, .preparation_context = context, .wait_for_sync_level = false });
         return output.json orelse error.InvalidBatchRequest;
     }
 
@@ -9109,7 +9114,12 @@ pub const DB = struct {
         const graph_cleanup_maintenance = req.graph_endpoint_cleanup or req.activate_range_tracking;
         if (!graph_cleanup_maintenance or req.row_policy_principal_proof.len != 0)
             try self.maybeFinalizePendingRowPolicyPublication();
-        if (req.row_policy_principal_proof.len != 0) {
+        if (opts.row_policy_lease) |lease| {
+            // Internal capture may borrow the already verified transaction
+            // authority. Replicated votes retain their admission-time proof.
+            if (opts.row_policy_principal == null and req.row_policy_principal_proof.len != 0) return error.RowPolicyAuthenticationRequired;
+            try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+        } else if (req.row_policy_principal_proof.len != 0) {
             // Followers do not receive the coordinator's receipt probe. A
             // committed serving intent must become active before checking the
             // next signed mutation against its generation. Defer apply while
@@ -25828,6 +25838,9 @@ pub const DB = struct {
 
     fn transactionPreparationRequest(req: types.TransactionIntentRequest) types.BatchRequest {
         return .{
+            .row_policy_principal_proof = req.row_policy_principal_proof,
+            .row_policy_database = req.row_policy_database,
+            .row_policy_admitted_at_seconds = req.row_policy_admitted_at_seconds,
             .commit_requires = req.commit_requires,
             .writes = @ptrCast(req.writes),
             .deletes = req.deletes,
@@ -25983,7 +25996,9 @@ pub const DB = struct {
             // closed producer set and physical key scopes without inference.
             var capture: execution_resources.PreparationCapture = .{ .alloc = preparation_alloc };
             defer if (capture.json) |bytes| preparation_alloc.free(bytes);
-            try self.batchInternal(.{ .writes = value.value.writes, .deletes = value.value.deletes, .graph_writes = value.value.graph_writes, .graph_deletes = value.value.graph_deletes, .commit_requires = .direct_enrichments, .prepared_enrichments_json = req.prepared_enrichments_json }, null, .{ .preparation_capture = &capture, .wait_for_sync_level = false });
+            var capture_req = transactionPreparationRequest(req);
+            capture_req.prepared_enrichments_json = req.prepared_enrichments_json;
+            try self.batchInternal(capture_req, null, .{ .preparation_capture = &capture, .wait_for_sync_level = false, .row_policy_principal = row_policy_principal, .row_policy_lease = row_policy_lease });
         }
         defer if (packet != null) preparation_alloc.free(req.writes);
         if (req.relational_index_maintenance != null and
@@ -26326,7 +26341,7 @@ pub const DB = struct {
             var reservation_plan = self.core.relational_indexes.acquire();
             defer if (reservation_plan) |*plan| plan.deinit();
             const indexes = if (reservation_plan) |plan| plan.plan.boundIndexes().len else 0;
-            try @import("commit_requirements.zig").validateTransactionReservation(value.value, intents.items, predicates.items, indexes);
+            try @import("commit_requirements.zig").validateTransactionReservation(value.value, intents.items, predicates.items, indexes, try self.directRetirementReservation(preparation_alloc, intents.items, indexes));
         }
         if (packet) |value| if (value.value.artifact_writes.len != 0 or value.value.artifact_deletes.len != 0) {
             // The retained-source reservation covers generated effects before
@@ -26480,6 +26495,32 @@ pub const DB = struct {
     /// Compute server-owned conservative bounds before voting prepared; the
     /// persisted replacement-aware ledger also counts artifact keys so commit
     /// cannot exceed the retained frame's independent key-count limit.
+    /// Count borrowed physical keys before a yes vote. The intent owner fence
+    /// then prevents background publishers from growing this footprint.
+    fn directRetirementReservation(self: *DB, alloc: Allocator, intents: []const transactions_mod.WriteIntent, indexes: usize) !@import("commit_requirements.zig").OutputBudget {
+        var budget = @import("commit_requirements.zig").OutputBudget{};
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        var cursor = try read.openPhysicalCursorAdapter();
+        defer cursor.close();
+        for (intents) |intent| {
+            if (intent.value != null or isMetadataKey(intent.key)) continue;
+            const prefix = try internal_keys.documentExactPrefixAlloc(alloc, intent.key);
+            defer alloc.free(prefix);
+            var entry = try cursor.seekAtOrAfter(prefix);
+            while (entry) |record| : (entry = try cursor.next()) {
+                if (!std.mem.startsWith(u8, record.key, prefix)) break;
+                // Includes retirement stamps, revision clocks, provenance and
+                // replay references, including replacement/delete metadata.
+                try budget.reserve(2048 + 12 * record.key.len, 12);
+                if (internal_keys.isStoredSourceRowKey(record.key)) {
+                    for (0..indexes) |_| try budget.reserve(1024 + 4 * record.value.len + 8 * record.key.len, 8);
+                }
+            }
+        }
+        return budget;
+    }
+
     fn prepareOnlineVectorIntentBoundsLocked(self: *DB, alloc: Allocator, intents: []transactions_mod.WriteIntent, schema_view: ?schema_registry_mod.SchemaView) !void {
         for (intents) |*intent| {
             intent.retained_artifact_bytes = 0;
@@ -50827,6 +50868,19 @@ fn remoteRenderConfig(
             config.io = runtime.inferenceIo() orelse runtime.io();
         }
     }
+    if (comptime @hasField(Receiver, "preparation_context")) if (maybe_db) |db| if (db.preparation_context) |context| {
+        config.io = context.io;
+        config.deadline_ns = context.deadline_ns;
+        if (comptime @hasField(template_remote.RenderConfig, "cancellation")) {
+            config.cancellation = .{ .ptr = &db.preparation_context.?, .is_cancelled_fn = struct {
+                fn check(ptr: *const anyopaque) bool {
+                    const control: *const @import("antfly_inference_execution_context").RequestContext = @ptrCast(@alignCast(ptr));
+                    control.check() catch return true;
+                    return false;
+                }
+            }.check };
+        }
+    };
     if (comptime @hasField(template_remote.RenderConfig, "max_media_parts")) {
         config.max_media_parts = max_media_parts;
     }
@@ -154290,4 +154344,59 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
         count += 1;
     }
     try std.testing.expect(count > 3);
+}
+
+test "db commit requirements reserves existing artifact retirement before a prepared vote" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-retirement-reservation");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "chunks", .kind = .chunk, .field = "body", .chunk_size = 8 });
+    try db.batch(.{ .writes = &.{.{ .key = "large", .value = "{\"body\":\"source\"}" }}, .commit_requires = .none });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const writes = try arena.allocator().alloc(docstore_mod.KVPair, 6000);
+    for (writes, 0..) |*write, ordinal| write.* = .{ .key = try internal_keys.chunkArtifactKeyAlloc(arena.allocator(), "large", "chunks", @intCast(ordinal)), .value = "old output" };
+    try db.core.store.putBatch(writes, &.{});
+    const transaction = try db.beginTransaction(100);
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.writeTransaction(transaction, .{ .deletes = &.{"large"}, .commit_requires = .direct_enrichments }));
+    // No yes vote or lock escaped; ordinary writes can still update the source.
+    try db.batch(.{ .writes = &.{.{ .key = "large", .value = "{}" }}, .commit_requires = .none });
+    try db.abortTransaction(transaction, 200);
+}
+
+test "db commit requirements preparation carries transaction policy authority" {
+    const request = DB.transactionPreparationRequest(.{ .commit_requires = .direct_enrichments, .row_policy_principal_proof = "signed", .row_policy_database = "main", .row_policy_admitted_at_seconds = 123 });
+    try std.testing.expectEqualStrings("signed", request.row_policy_principal_proof);
+    try std.testing.expectEqualStrings("main", request.row_policy_database);
+    try std.testing.expectEqual(@as(i64, 123), request.row_policy_admitted_at_seconds);
+}
+
+test "db commit requirements canceled owner preparation dispatches no producers" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-cancel-context");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, db.prepareDirectEnrichmentsWithContext(a, .{ .writes = &.{.{ .key = "source", .value = "{}" }}, .commit_requires = .direct_enrichments }, .{ .io = std.testing.io, .deadline_ns = null, .cancellation = types.CancellationToken.fromAtomic(&canceled) }));
+    try std.testing.expect((try db.get(a, "source")) == null);
+}
+
+test "db commit requirements capture borrows an authenticated policy lease without replay-time reauthentication" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("direct-policy-capture");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    db.local_execution.row_policy_gate = row_policy_gate_mod.Gate.init(.{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1, .row_policy_phase = .active, .row_policy_generation = 7, .row_policy_catalog_epoch = 9 });
+    const principal: row_policy_authority_mod.Payload = .{ .principal = "alice", .roles = &.{}, .auth_revision = 1, .table_id = 1, .table = "docs", .database = "main", .policy_generation = 7, .catalog_epoch = 9, .access = .write, .expires = 1 };
+    var lease = try db.local_execution.row_policy_gate.enterReplicatedPrincipal(&principal);
+    defer lease.release();
+    var capture: execution_resources.PreparationCapture = .{ .alloc = a };
+    defer if (capture.json) |bytes| a.free(bytes);
+    try db.batchInternal(.{ .commit_requires = .direct_enrichments, .row_policy_principal_proof = "already verified before Raft proposal", .row_policy_database = "main", .row_policy_admitted_at_seconds = 1 }, null, .{ .preparation_capture = &capture, .wait_for_sync_level = false, .row_policy_principal = &principal, .row_policy_lease = &lease });
+    try std.testing.expect(capture.json != null);
+    try lease.checkAt(1000);
 }

@@ -558,8 +558,28 @@ pub const ObjectStore = struct {
         value.append_batch = erasedUnkeyedBatch;
         value.append_batch_idempotent = erasedBatch;
         value.append_batch_idempotent_if_latest = erasedConditionalBatch;
+        value.catalog_fence = erasedCatalogFence;
+        value.begin_catalog_update = erasedBeginCatalog;
+        value.complete_catalog_update = erasedCompleteCatalog;
+        value.append_prepared = erasedPrepared;
         break :blk value;
     };
+    fn erasedCatalogFence(ptr: *anyopaque, a: std.mem.Allocator, ns: []const u8) !wal_types.CatalogTransition {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.catalogFence(a, ns);
+    }
+    fn erasedBeginCatalog(ptr: *anyopaque, ns: []const u8, payload: []const u8, epoch: u64) !u64 {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.beginCatalogUpdate(ns, payload, epoch);
+    }
+    fn erasedCompleteCatalog(ptr: *anyopaque, ns: []const u8, epoch: u64) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.completeCatalogUpdate(ns, epoch);
+    }
+    fn erasedPrepared(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, fence: wal_types.CatalogFence) !wal_types.BatchResult {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.appendPrepared(ns, timestamp, payloads, id, fence);
+    }
     fn erasedMaterialize(ptr: *anyopaque, ns: []const u8, cancellation: ?objectstore.CancellationToken) !bool {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return self.indexed.?.materializePendingWithCancellation(ns, cancellation);

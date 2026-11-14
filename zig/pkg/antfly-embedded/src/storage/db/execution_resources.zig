@@ -1092,6 +1092,7 @@ pub const PreparationCapture = struct {
 };
 
 pub const BatchExecutionOptions = struct {
+    preparation_context: ?@import("antfly_inference_execution_context").RequestContext = null,
     preparation_capture: ?*PreparationCapture = null,
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
@@ -1772,6 +1773,7 @@ pub const GeneratedEmbeddingMemo = struct {
 
     alloc: Allocator,
     reuse_stored_artifacts: bool = false,
+    context: ?@import("antfly_inference_execution_context").RequestContext = null,
     dense: std.AutoHashMapUnmanaged(Key, []f32) = .empty,
     generations: std.StringHashMapUnmanaged(embedder_mod.DenseEmbedder.TextGeneration) = .empty,
     sparse: std.AutoHashMapUnmanaged(Key, SparseValue) = .empty,
@@ -1866,7 +1868,7 @@ pub const GeneratedEmbeddingMemo = struct {
     /// One immutable provider lease per model per synchronous preparation.
     pub fn generation(self: *@This(), provider: embedder_mod.DenseEmbedder, name: []const u8) !embedder_mod.DenseEmbedder.TextGeneration {
         if (self.generations.get(name)) |captured| return captured;
-        const captured = try provider.captureTextGeneration(self.alloc, name);
+        const captured = try provider.withRequestContext(self.context).captureTextGeneration(self.alloc, name);
         const owned = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(owned);
         try self.generations.put(self.alloc, owned, captured);
@@ -1875,7 +1877,7 @@ pub const GeneratedEmbeddingMemo = struct {
 
     pub fn sparseRevision(self: *@This(), provider: embedder_mod.SparseEmbedder, name: []const u8) !?[32]u8 {
         if (self.sparse_revisions.get(name)) |revision| return revision;
-        const revision = try provider.captureRevision(self.alloc, name);
+        const revision = try provider.withRequestContext(self.context).captureRevision(self.alloc, name);
         const owned = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(owned);
         try self.sparse_revisions.put(self.alloc, owned, revision);
@@ -1889,12 +1891,12 @@ pub const GeneratedEmbeddingMemo = struct {
         var dense_generations = self.generations.iterator();
         while (dense_generations.next()) |entry| {
             const provider = dense_provider orelse return error.MissingDenseEmbedder;
-            try provider.requireTextGeneration(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
+            try provider.withRequestContext(self.context).requireTextGeneration(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
         }
         var sparse_generations = self.sparse_revisions.iterator();
         while (sparse_generations.next()) |entry| {
             const provider = sparse_provider orelse return error.MissingSparseEmbedder;
-            try provider.requireRevision(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
+            try provider.withRequestContext(self.context).requireRevision(self.alloc, entry.key_ptr.*, entry.value_ptr.*);
         }
     }
 
@@ -1960,6 +1962,7 @@ pub const GeneratedPrecomputeMode = enum {
 /// Owns prepared artifact bytes and reserves durable output before retaining
 /// each row. The budget is shared with deletion accounting and survives flushes.
 pub const PreparedArtifactWrites = struct {
+    context: ?@import("antfly_inference_execution_context").RequestContext = null,
     list: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
     items: []types.BatchWrite = &.{},
     budget: ?*@import("commit_requirements.zig").OutputBudget = null,

@@ -384,7 +384,7 @@ pub const ManagedRuntime = struct {
         };
         try self.chargeWork(.wal_collection, 1);
         const result = collector.step(namespace, .{ .ptr = &bridge, .is_cancelled_fn = ObjectsBridge.canceled }) catch |err| switch (err) {
-            error.ImmutableLogFenced, error.CollectionSuperseded, error.CollectionBusy, error.CollectionConflict, error.CollectionStepExpired, error.WalSnapshotExpired, error.WalCommitContended, error.PreconditionFailed => {
+            error.CatalogUpdateInProgress, error.ImmutableLogFenced, error.CollectionSuperseded, error.CollectionBusy, error.CollectionConflict, error.CollectionStepExpired, error.WalSnapshotExpired, error.WalCommitContended, error.PreconditionFailed => {
                 stats.wal_collection_deferred += 1;
                 return;
             },
@@ -451,6 +451,13 @@ pub const ManagedRuntime = struct {
     /// Request-owned provider handles keep admission independent of the
     /// background worker's mutable provider selection and publication lock.
     pub fn prepareDirectMutations(self: *ManagedRuntime, namespace: []const u8, mutations: []const api_mod.DocumentMutation, cancellation: CancellationToken) ![]api_mod.DocumentMutation {
+        return self.prepareDirectMutationsWithContext(namespace, mutations, .{ .io = self.io, .deadline_ns = null, .cancellation = cancellation });
+    }
+
+    pub fn prepareDirectMutationsWithContext(self: *ManagedRuntime, namespace: []const u8, mutations: []const api_mod.DocumentMutation, context: @import("antfly_inference_execution_context").RequestContext) ![]api_mod.DocumentMutation {
+        try context.check();
+        var provider_options = self.cfg.embedder_options;
+        provider_options.setup_context = context;
         if (mutations.len > 1024) return error.CommitRequirementTooLarge;
         var source_bytes: usize = 0;
         for (mutations) |mutation| {
@@ -479,13 +486,13 @@ pub const ManagedRuntime = struct {
             digest = try @import("../build/document_facts_builder.zig").fingerprint(self.alloc, policy, table.indexes_json);
             exclude_model_sources = try @import("../build/document_facts_builder.zig").hasModelSources(self.alloc, table.indexes_json);
             if (policy.enrichment_enabled and policy.lexical_sparse_model_preference != .deterministic_only) {
-                if (try managed_embedder.ManagedEmbedder.createSparseEmbedderFromIndexValueWithOptions(self.alloc, indexes.value, self.cfg.embedder_options)) |handle| {
+                if (try managed_embedder.ManagedEmbedder.createSparseEmbedderFromIndexValueWithOptions(self.alloc, indexes.value, provider_options)) |handle| {
                     errdefer handle.deinit(self.alloc);
                     try enricher.?.setSparseEmbedder(handle, firstSparseIndexNameFromIndexesJson(indexes.value) orelse "serverless_sparse");
                 }
             }
             if (policy.chunk_embeddings_enabled and policy.chunk_embeddings_model_preference != .deterministic_only and !exclude_model_sources) {
-                if (try managed_embedder.ManagedEmbedder.createDenseEmbedderFromIndexValueWithOptions(self.alloc, indexes.value, self.cfg.embedder_options)) |handle| {
+                if (try managed_embedder.ManagedEmbedder.createDenseEmbedderFromIndexValueWithOptions(self.alloc, indexes.value, provider_options)) |handle| {
                     errdefer handle.deinit(self.alloc);
                     try enricher.?.setChunkEmbedder(handle, firstDenseIndexNameFromIndexesJson(indexes.value) orelse "serverless_dense", denseDimsFromIndexesJson(indexes.value) orelse 8);
                 }
@@ -493,6 +500,9 @@ pub const ManagedRuntime = struct {
         }
         if (enricher) |*value| {
             value.prepared_catalog = digest;
+            value.execution_context = context;
+            if (value.chunk_embedder) |provider| value.chunk_embedder = provider.withRequestContext(context);
+            if (value.sparse_embedder) |provider| value.sparse_embedder = provider.withRequestContext(context);
             if (value.chunk_embedder) |provider| value.prepared_dense_generation = try provider.captureTextGeneration(self.alloc, value.chunk_embedding_name.?);
             if (value.sparse_embedder) |provider| value.prepared_sparse_revision = try provider.captureRevision(self.alloc, value.sparse_embedding_name.?);
         }
@@ -508,12 +518,13 @@ pub const ManagedRuntime = struct {
         errdefer for (output[0..initialized]) |*mutation| mutation.deinit(self.alloc);
         var bytes: usize = 0;
         for (mutations, output) |mutation, *out| {
-            try cancellation.check();
+            try context.check();
             const id = try self.alloc.dupe(u8, mutation.doc_id);
             errdefer self.alloc.free(id);
             const body = if (mutation.kind == .upsert) blk: {
                 const source = mutation.body orelse return error.InvalidDocumentBody;
                 if (source.len > 8 * 1024 * 1024 -| bytes) return error.CommitRequirementTooLarge;
+                if (enricher) |*value| value.direct_output_limit = 8 * 1024 * 1024 -| bytes -| id.len -| 64;
                 const prepared = if (enricher) |*value| try value.prepareDirectBody(source, policy, exclude_model_sources) else try self.alloc.dupe(u8, source);
                 defer self.alloc.free(prepared);
                 break :blk try @import("../build/document_facts.zig").encodeEnrichedBodyAlloc(self.alloc, prepared, source.len);
@@ -528,7 +539,7 @@ pub const ManagedRuntime = struct {
             if (value.chunk_embedder) |provider| if (value.prepared_dense_generation) |generation| try provider.requireTextGeneration(self.alloc, value.chunk_embedding_name.?, generation);
             if (value.sparse_embedder) |provider| try provider.requireRevision(self.alloc, value.sparse_embedding_name.?, value.prepared_sparse_revision);
         }
-        try cancellation.check();
+        try context.check();
         return output;
     }
 

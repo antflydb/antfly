@@ -1449,6 +1449,12 @@ fn executeMultiTableCommitOnce(
             if (participant.relational_index_maintenance != null) return error.InvalidTxnRequest;
             participant.relational_index_maintenance = command;
         }
+        if (table.commit_requires == .direct_enrichments) {
+            const present = for (participants.items) |participant| {
+                if (std.mem.eql(u8, participant.table_name, table.table_name)) break true;
+            } else false;
+            if (!present) _ = try ensureParticipantTxn(alloc, &participants, table.table_name, routing.resolveGroupForKey("") orelse return error.UnknownGroup, topology_epoch);
+        }
         for (participants.items) |*participant| {
             if (!std.mem.eql(u8, participant.table_name, table.table_name)) continue;
             if (participant.row_policy_principal_proof.len != 0 and

@@ -317,6 +317,7 @@ pub fn publishAlloc(
         }
     } else {
         for (mutations.?) |mutation| {
+            if (mutation.kind == .catalog) continue;
             try pages.cancellation.check();
             const entry = try seen.getOrPut(alloc, mutation.doc_id);
             if (entry.found_existing) continue;

@@ -101,8 +101,8 @@ pub const OutputBudget = struct {
 /// replacement, artifact revisions, scope clocks and acceptance certificates.
 /// These deliberately cover replacement's delete-and-put paths together; phase
 /// two must never turn an irrevocable decision into a size rejection.
-pub fn validateTransactionReservation(packet: anytype, intents: anytype, predicates: anytype, relational_indexes: usize) !void {
-    var budget = OutputBudget{};
+pub fn validateTransactionReservation(packet: anytype, intents: anytype, predicates: anytype, relational_indexes: usize, retirement: OutputBudget) !void {
+    var budget = retirement;
     // Transaction record, admission/read manifests, watermark and replay head.
     try budget.reserve(4096, 32);
     for (intents) |intent| {

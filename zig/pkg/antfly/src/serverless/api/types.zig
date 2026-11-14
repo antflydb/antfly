@@ -29,6 +29,8 @@ pub const MutationKind = enum(u8) {
     enriched = 4,
     /// Atomic primary postimage plus direct outputs; private WAL format v5.
     prepared = 5,
+    /// Durable catalog transition intent; private HEAD format 8.
+    catalog = 6,
 };
 
 pub const DocumentMutation = struct {

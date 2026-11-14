@@ -188,6 +188,17 @@ pub fn read(a: std.mem.Allocator, txn: anytype, root: u128, document: []const u8
     return .{ .arena = arena, .root = root, .requirement = requirement, .observation = observation, .document = try owned.dupe(u8, document), .receipt_key = key, .receipt = try owned.dupe(u8, raw) };
 }
 
+const SourceImage = struct { bytes: []const u8, digest: [32]u8, ttl: []const u8 };
+fn internSource(a: std.mem.Allocator, images: *std.StringHashMapUnmanaged(SourceImage), document: []const u8, source: []const u8, ttl: []const u8) !SourceImage {
+    const entry = try images.getOrPut(a, document);
+    if (!entry.found_existing) {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
+        entry.value_ptr.* = .{ .bytes = try a.dupe(u8, source), .digest = digest, .ttl = try a.dupe(u8, ttl) };
+    }
+    return entry.value_ptr.*;
+}
+
 pub const Prepared = struct {
     arena: std.heap.ArenaAllocator,
     root: u128,
@@ -233,6 +244,7 @@ pub const Prepared = struct {
             }
             var definitions: std.AutoHashMapUnmanaged([32]u8, requests.GeneratedEnrichmentRequest) = .empty;
             for (plan.generated_templates) |request| try definitions.put(owned, @import("artifact_producer_input.zig").definitionDigest(request), request);
+            var images: std.StringHashMapUnmanaged(SourceImage) = .empty;
             for (producers) |produced| {
                 var request = definitions.get(produced.definition) orelse return error.ArtifactCatalogDrift;
                 request.doc_key = produced.doc_key;
@@ -246,8 +258,8 @@ pub const Prepared = struct {
                 const ttl_key = try keys.ttlKeyAlloc(owned, request.doc_key);
                 const ttl_bytes = if (final.get(ttl_key)) |bytes| bytes else txn.get(ttl_key) catch return error.EnrichmentSourceChanged;
                 const timestamp = @import("../ttl.zig").writeVersion(ttl_bytes) orelse return error.InvalidBatchRequest;
-                var source_digest: [32]u8 = undefined;
-                std.crypto.hash.sha2.Sha256.hash(source, &source_digest, .{});
+                const image = try internSource(owned, &images, request.doc_key, source, ttl_bytes);
+                const source_digest = image.digest;
                 const source_record = try owned.create(publication.Source);
                 source_record.* = .{ .document_key = request.doc_key, .content_digest = source_digest, .timestamp = timestamp, .input_position = null };
                 const name = if (request.kind == .dense_embedding or request.kind == .sparse_embedding) requests.requestEmbeddingName(request) else requests.requestArtifactName(request);
@@ -258,7 +270,7 @@ pub const Prepared = struct {
                     }
                 }.less);
                 const is_index = request.kind == .dense_embedding or request.kind == .sparse_embedding;
-                try records.append(owned, .{ .requirement = binding.requirement.id, .primary = primary, .source_bytes = try owned.dupe(u8, source), .ttl = try owned.dupe(u8, ttl_bytes), .command = .{
+                try records.append(owned, .{ .requirement = binding.requirement.id, .primary = primary, .source_bytes = image.bytes, .ttl = image.ttl, .command = .{
                     .execution_identity = revision,
                     .namespace = authority.namespace,
                     .authority_epoch = authority.epoch,
@@ -356,4 +368,23 @@ fn scopeIdentity(document: []const u8, stream: []const u8) [32]u8 {
 fn familyFor(key: []const u8) ?publication.Family {
     inline for (std.meta.tags(publication.Family)) |family| if (publication.validFamilyKey(family, key)) return family;
     return null;
+}
+
+test "commit requirements acceptance interns one source image across producer scopes" {
+    const a = std.testing.allocator;
+    const source = try a.alloc(u8, 1024 * 1024);
+    defer a.free(source);
+    @memset(source, 'x');
+    var quota = @import("antfly_platform").allocator.reclamation.Quota.init(a, 3 * 1024 * 1024);
+    defer quota.deinit();
+    var arena = std.heap.ArenaAllocator.init(quota.allocator());
+    defer arena.deinit();
+    var images: std.StringHashMapUnmanaged(SourceImage) = .empty;
+    const first = try internSource(arena.allocator(), &images, "doc", source, "ttl");
+    for (0..64) |_| {
+        const next = try internSource(arena.allocator(), &images, "doc", source, "ttl");
+        try std.testing.expectEqual(first.bytes.ptr, next.bytes.ptr);
+        try std.testing.expectEqual(first.ttl.ptr, next.ttl.ptr);
+        try std.testing.expectEqual(first.digest, next.digest);
+    }
 }

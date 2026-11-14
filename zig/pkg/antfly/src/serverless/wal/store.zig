@@ -23,6 +23,10 @@ pub const WalStore = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        catalog_fence: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!wal_types.CatalogTransition = null,
+        begin_catalog_update: ?*const fn (*anyopaque, []const u8, []const u8, u64) anyerror!u64 = null,
+        complete_catalog_update: ?*const fn (*anyopaque, []const u8, u64) anyerror!void = null,
+        append_prepared: ?*const fn (*anyopaque, []const u8, u64, []const []const u8, []const u8, wal_types.CatalogFence) anyerror!wal_types.BatchResult = null,
         deinit: *const fn (Allocator, *anyopaque) void,
         append: *const fn (*anyopaque, []const u8, u64, []const u8) anyerror!u64,
         append_batch: ?*const fn (*anyopaque, []const u8, u64, []const []const u8) anyerror!wal_types.BatchResult = null,
@@ -96,6 +100,22 @@ pub const WalStore = struct {
 
     /// An atomic batch requires a store-provided commit primitive. Never
     /// emulate it with independently acknowledged per-record appends.
+    pub fn supportsCatalogFences(self: *const WalStore) bool {
+        return self.vtable.catalog_fence != null and self.vtable.begin_catalog_update != null and self.vtable.complete_catalog_update != null and self.vtable.append_prepared != null;
+    }
+    pub fn catalogFence(self: *WalStore, namespace: []const u8) !wal_types.CatalogTransition {
+        return (self.vtable.catalog_fence orelse return error.AtomicCatalogAdmissionUnsupported)(self.ptr, self.allocator, namespace);
+    }
+    pub fn beginCatalogUpdate(self: *WalStore, namespace: []const u8, payload: []const u8, expected_epoch: u64) !u64 {
+        return (self.vtable.begin_catalog_update orelse return error.AtomicCatalogAdmissionUnsupported)(self.ptr, namespace, payload, expected_epoch);
+    }
+    pub fn completeCatalogUpdate(self: *WalStore, namespace: []const u8, epoch: u64) !void {
+        return (self.vtable.complete_catalog_update orelse return error.AtomicCatalogAdmissionUnsupported)(self.ptr, namespace, epoch);
+    }
+    pub fn appendPrepared(self: *WalStore, namespace: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, fence: wal_types.CatalogFence) !wal_types.BatchResult {
+        return (self.vtable.append_prepared orelse return error.AtomicCatalogAdmissionUnsupported)(self.ptr, namespace, timestamp, payloads, id, fence);
+    }
+
     pub fn supportsConditionalBatchAppend(self: *const WalStore) bool {
         return self.vtable.append_batch_idempotent_if_latest != null;
     }

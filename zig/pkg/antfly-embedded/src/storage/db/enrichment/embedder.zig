@@ -101,6 +101,12 @@ pub const TextDispatchAccounting = struct {
 };
 
 pub const DenseEmbedder = struct {
+    pub fn withRequestContext(self: DenseEmbedder, context: ?RequestContext) DenseEmbedder {
+        var copy = self;
+        if (context) |value| copy.part_request_context = value;
+        return copy;
+    }
+
     /// Reconstruct from a retained catalog while sharing external services.
     clone_for_indexes_fn: ?*const fn (*anyopaque, Allocator, []const u8, RequestContext) anyerror!DenseEmbedder = null,
     ptr: *anyopaque,
@@ -203,6 +209,7 @@ pub const DenseEmbedder = struct {
     }
 
     pub fn embedDense(self: DenseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
+        if (self.part_request_context) |context| return self.embedDenseWithContext(alloc, embedding_name, text, dims, context);
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "dense embedder");
         defer sanitized.deinit(alloc);
         return try self.dense_embed_fn(self.ptr, alloc, embedding_name, sanitized.text, dims);
@@ -466,6 +473,7 @@ pub const DenseEmbedder = struct {
         parts: []const template_mod.ContentPart,
         dims: u32,
     ) ![]f32 {
+        if (self.part_request_context) |context| return self.embedDensePartsWithContext(alloc, embedding_name, parts, dims, context);
         if (parts.len == 1 and parts[0] == .text and self.textPartsEquivalent(embedding_name)) {
             const vectors = try self.embedDenseBatch(alloc, embedding_name, &.{parts[0].text}, dims);
             return takeSingleDenseVector(alloc, vectors);
@@ -777,6 +785,13 @@ fn contentPartPreparationBytes(parts: []const template_mod.ContentPart) !usize {
 }
 
 pub const SparseEmbedder = struct {
+    pub fn withRequestContext(self: SparseEmbedder, context: ?RequestContext) SparseEmbedder {
+        var copy = self;
+        if (context) |value| copy.request_context = value;
+        return copy;
+    }
+
+    request_context: ?RequestContext = null,
     ptr: *anyopaque,
     sparse_embed_fn: SparseEmbedFn,
     sparse_embed_batch_fn: ?SparseEmbedBatchFn = null,
@@ -791,8 +806,11 @@ pub const SparseEmbedder = struct {
 
     /// The provider generation behind this name, when it can report one.
     pub fn captureRevision(self: SparseEmbedder, a: Allocator, name: []const u8) !?[32]u8 {
+        if (self.request_context) |context| try context.check();
         const resolve = self.cache_revision_fn orelse return null;
-        return resolve(self.ptr, a, name);
+        const revision = try resolve(self.ptr, a, name);
+        if (self.request_context) |context| try context.check();
+        return revision;
     }
 
     pub fn requireRevision(self: SparseEmbedder, a: Allocator, name: []const u8, revision: ?[32]u8) !void {
@@ -800,6 +818,7 @@ pub const SparseEmbedder = struct {
     }
 
     pub fn embedSparse(self: SparseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8) !SparseEmbedding {
+        if (self.request_context) |context| return self.embedSparseWithContext(alloc, embedding_name, text, context);
         var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "sparse embedder");
         defer sanitized.deinit(alloc);
         return try self.sparse_embed_fn(self.ptr, alloc, embedding_name, sanitized.text);
@@ -811,6 +830,7 @@ pub const SparseEmbedder = struct {
         embedding_name: []const u8,
         texts: []const []const u8,
     ) ![]SparseEmbedding {
+        if (self.request_context) |context| return self.embedSparseBatchWithContext(alloc, embedding_name, texts, context);
         var sanitized = try sanitizeUtf8BatchForEmbeddingAlloc(alloc, texts);
         defer sanitized.deinit(alloc);
         const safe_texts = sanitized.texts();

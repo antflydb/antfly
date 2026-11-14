@@ -100,8 +100,8 @@ pub const Service = struct {
 
     /// The complete primary and direct-output postimages cross one durable
     /// visibility boundary. A stale optimistic read set publishes no prefix.
-    pub fn ingestPreparedBatch(self: *Service, req: api_types.IngestBatchRequest, expected_latest: u64) !api_types.IngestBatchResult {
-        if (!self.wal.supportsConditionalBatchAppend()) return error.CommitRequirementUnavailable;
+    pub fn ingestPreparedBatch(self: *Service, req: api_types.IngestBatchRequest, fence: wal_mod.types.CatalogFence) !api_types.IngestBatchResult {
+        if (!self.wal.supportsCatalogFences()) return error.CommitRequirementUnavailable;
         const operation = req.operation_id orelse return error.InvalidWalOperationId;
         if (req.mutations.len == 0) return .{ .namespace = try self.alloc.dupe(u8, req.namespace), .mutation_count = 0, .start_lsn = 0, .end_lsn = 0 };
         if (req.mutations.len > 1024) return error.CommitRequirementTooLarge;
@@ -120,7 +120,7 @@ pub const Service = struct {
         }
         const namespace = try self.alloc.dupe(u8, req.namespace);
         errdefer self.alloc.free(namespace);
-        const result = try self.wal.appendBatchIdempotentIfLatest(req.namespace, req.timestamp_ns, payloads, operation, expected_latest);
+        const result = try self.wal.appendPrepared(req.namespace, req.timestamp_ns, payloads, operation, fence);
         return .{ .namespace = namespace, .mutation_count = req.mutations.len, .start_lsn = result.start_lsn, .end_lsn = result.end_lsn };
     }
 
@@ -368,6 +368,7 @@ fn cleanupTmp(path: [*:0]const u8) void {
 test "model aware media serverless public ingestion rejects internal checkpoint payloads before any WAL append" {
     var service = Service{ .alloc = std.testing.allocator, .wal = undefined, .builder = undefined };
     for ([_]api_types.DocumentMutation{
+        .{ .kind = .catalog, .doc_id = "private", .body = "{}" },
         .{ .kind = .checkpoint, .doc_id = "private", .body = "AFDCP001{}" },
         .{ .kind = .enriched, .doc_id = "private", .body = "{}" },
         .{ .kind = .upsert, .doc_id = "private", .body = "AFDEN001" },
@@ -380,7 +381,7 @@ test "model aware media serverless public ingestion rejects internal checkpoint 
 }
 
 pub fn validatePublicMutation(alloc: Allocator, mutation: api_types.DocumentMutation) !void {
-    if (mutation.kind == .checkpoint or (mutation.kind == .enriched or mutation.kind == .prepared)) return error.InvalidDocumentMutation;
+    if (mutation.kind != .upsert and mutation.kind != .delete) return error.InvalidDocumentMutation;
     if (mutation.body) |bytes| {
         if (@import("../build/document_facts.zig").isInternalBody(bytes)) return error.InvalidDocumentMutation;
         // Check the whole batch before appending any mutation. JSON
@@ -409,13 +410,13 @@ test "commit requirements serverless prepared batch commits source outputs and d
     const prepared = try @import("../build/document_facts.zig").encodeEnrichedBodyAlloc(a, body, 6);
     defer a.free(prepared);
     const request: api_types.IngestBatchRequest = .{ .namespace = "docs", .timestamp_ns = 2, .operation_id = "gate", .mutations = &.{ .{ .kind = .prepared, .doc_id = "new", .body = prepared }, .{ .kind = .delete, .doc_id = "victim" } } };
-    try std.testing.expectError(error.VersionConflict, service.ingestPreparedBatch(request, 0));
+    try std.testing.expectError(error.VersionConflict, service.ingestPreparedBatch(request, .{ .latest_lsn = 0 }));
     try std.testing.expectEqual(@as(u64, 1), try wal.latestLsn("docs"));
-    var result = try service.ingestPreparedBatch(request, 1);
+    var result = try service.ingestPreparedBatch(request, .{ .latest_lsn = 1 });
     defer result.deinit(a);
     try std.testing.expectEqual(@as(u64, 2), result.start_lsn);
     try std.testing.expectEqual(@as(u64, 3), result.end_lsn);
-    var replay = try service.ingestPreparedBatch(request, 1);
+    var replay = try service.ingestPreparedBatch(request, .{ .latest_lsn = 1 });
     defer replay.deinit(a);
     try std.testing.expectEqual(result.start_lsn, replay.start_lsn);
     try std.testing.expectEqual(result.end_lsn, replay.end_lsn);

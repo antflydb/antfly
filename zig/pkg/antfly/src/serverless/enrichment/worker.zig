@@ -195,6 +195,8 @@ pub const SparseEnricher = struct {
     generation_snapshot: ?*MediaGenerationSnapshot = null,
     checkpoint_context: ?media_checkpoint.Context = null,
     prepared_catalog: ?[32]u8 = null,
+    direct_output_limit: usize = 8 * 1024 * 1024,
+    execution_context: ?@import("antfly_inference_execution_context").RequestContext = null,
     prepared_dense_generation: ?embedder_mod.DenseEmbedder.TextGeneration = null,
     prepared_sparse_revision: ?[32]u8 = null,
 
@@ -226,11 +228,28 @@ pub const SparseEnricher = struct {
     /// Execute only source-local stages against an uncommitted postimage.
     /// This request-owned enricher never appends WAL or publishes artifacts.
     pub fn prepareDirectBody(self: *SparseEnricher, body: []const u8, policy: catalog_mod.NamespacePolicy, exclude_model_sources: bool) ![]u8 {
+        var quota = @import("antfly_platform").allocator.reclamation.Quota.init(self.alloc, 64 * 1024 * 1024);
+        defer quota.deinit();
+        var scoped = self.*;
+        scoped.alloc = quota.allocator();
+        const prepared = scoped.prepareDirectBodyBounded(body, policy, exclude_model_sources) catch |err| {
+            if (quota.limit_exceeded) return error.CommitRequirementTooLarge;
+            return err;
+        };
+        defer scoped.alloc.free(prepared);
+        if (prepared.len > self.direct_output_limit) return error.CommitRequirementTooLarge;
+        return self.alloc.dupe(u8, prepared);
+    }
+
+    fn prepareDirectBodyBounded(self: *SparseEnricher, body: []const u8, policy: catalog_mod.NamespacePolicy, exclude_model_sources: bool) ![]u8 {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, body, .{});
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidDocumentBody;
         // Client-supplied completion markers cannot satisfy a commit gate.
         _ = parsed.value.object.swapRemove("_enrichment");
+        // Derived inputs from a previous postimage are never producer inputs.
+        // Each direct stage starts from submitted source fields alone.
+        for ([_][]const u8{ "chunk_preview", "chunk_embeddings", "sparse_embedding", "rerank_terms", "media_outputs", "transcript", "transcript_spans" }) |name| _ = parsed.value.object.swapRemove(name);
         var current = try std.json.Stringify.valueAlloc(self.alloc, parsed.value, .{});
         errdefer self.alloc.free(current);
         const source = try self.alloc.dupe(u8, current);
@@ -238,6 +257,7 @@ pub const SparseEnricher = struct {
         const pipeline = @import("pipeline.zig").builtinPipelineForPolicy(policy);
         var eligible: usize = 0;
         for (pipeline.slice()) |spec| {
+            if (self.execution_context) |context| try context.check();
             if (exclude_model_sources and spec.stage == .chunk_embeddings) continue;
             eligible += 1;
             const preference: catalog_mod.EnrichmentModelPreference = if (spec.model_preference != .deterministic_only and ((spec.stage == .lexical_sparse and self.sparse_embedder != null) or (spec.stage == .chunk_embeddings and self.chunk_embedder != null))) .require_model else spec.model_preference;
@@ -248,7 +268,7 @@ pub const SparseEnricher = struct {
                 self.alloc.free(current);
                 current = merged;
             }
-            if (current.len > 8 * 1024 * 1024) return error.CommitRequirementTooLarge;
+            if (current.len > self.direct_output_limit) return error.CommitRequirementTooLarge;
         }
         if (pipeline.len != 0 and eligible == 0) return error.UnsupportedCommitRequirement;
         if (self.prepared_catalog) |digest| {
@@ -1490,6 +1510,14 @@ fn buildDerivedChunkEmbeddingsBodyAlloc(
         alloc.free(value);
     };
     if (chunks.len == 0) return .{};
+    if (self.prepared_catalog != null) {
+        var minimum: usize = body.len;
+        for (chunks) |chunk| {
+            minimum = std.math.add(usize, minimum, std.math.mul(usize, self.chunk_embedding_dims, 2) catch return error.CommitRequirementTooLarge) catch return error.CommitRequirementTooLarge;
+            minimum = std.math.add(usize, minimum, chunk.len + 64) catch return error.CommitRequirementTooLarge;
+            if (minimum > self.direct_output_limit) return error.CommitRequirementTooLarge;
+        }
+    }
 
     const chunk_embedding_result = try buildChunkEmbeddingsAlloc(
         self,
@@ -4653,4 +4681,27 @@ test "commit requirements serverless catalog changes reopen prepared coverage" {
     var parsed = try std.json.parseFromSlice(std.json.Value, a, next, .{});
     defer parsed.deinit();
     try std.testing.expect(!parsed.value.object.get("_enrichment").?.object.contains("commit_catalog"));
+}
+
+test "commit requirements serverless direct transforms cannot reuse old chunk inputs" {
+    const a = std.testing.allocator;
+    var enricher = SparseEnricher.init(a, undefined, undefined, undefined, undefined);
+    defer enricher.deinit();
+    const body = try enricher.prepareDirectBody("{\"text\":\"new words\",\"chunk_preview\":[\"old words\"],\"chunk_embeddings\":[],\"_enrichment\":{\"chunk_embeddings_version\":999}}", .{ .chunk_embeddings_enabled = true, .chunk_embeddings_model_preference = .deterministic_only }, false);
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    const chunks = parsed.value.object.get("chunk_embeddings").?.array.items;
+    try std.testing.expect(chunks.len != 0);
+    try std.testing.expectEqualStrings("new words", chunks[0].object.get("chunk").?.string);
+}
+
+test "commit requirements serverless rejects predictable vector amplification before inference" {
+    const a = std.testing.allocator;
+    var enricher = SparseEnricher.init(a, undefined, undefined, undefined, undefined);
+    defer enricher.deinit();
+    enricher.prepared_catalog = @splat(1);
+    enricher.chunk_embedding_dims = 8192;
+    enricher.direct_output_limit = 1024;
+    try std.testing.expectError(error.CommitRequirementTooLarge, enricher.prepareDirectBody("{\"text\":\"some source words\"}", .{ .chunk_embeddings_enabled = true, .chunk_embeddings_model_preference = .require_model }, false));
 }

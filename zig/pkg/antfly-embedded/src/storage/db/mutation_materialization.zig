@@ -92,6 +92,10 @@ const transactions_mod = @import("../transactions.zig");
 const transform_mod = @import("transform.zig");
 const types = @import("types.zig");
 
+fn requestContext(writes: anytype) ?@import("antfly_inference_execution_context").RequestContext {
+    return if (@hasField(@TypeOf(writes.*), "context")) writes.context else null;
+}
+
 pub fn ImplementationFor(comptime S: type, comptime D: type) type {
     return struct {
         const Implementation = S;
@@ -6017,14 +6021,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const value = if (producer_cfg.type == .copy) source_text.? else blk: {
                 const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingAssetProducer;
-                const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
-                break :blk try producer.produce(alloc, .{
+                var producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
+                if (requestContext(artifact_writes)) |context| producer = producer.withInvocationContext(@import("enrichment/asset_producer.zig").InvocationContext.fromRequestContext(context));
+                const input: asset_producer_mod.Request = .{
                     .producer_type = producer_cfg.type,
                     .config_json = producer_cfg.config_json,
                     .source_text = source_text.?,
                     .source_parts_json = source_parts_json,
                     .content_type = request.content_type,
-                });
+                };
+                if (requestContext(artifact_writes)) |context| {
+                    try context.check();
+                    if (!try producer.foregroundBoundedForRequests(alloc, &.{input})) return error.UnboundedEnrichmentProvider;
+                    try context.check();
+                }
+                break :blk try producer.produce(alloc, input);
             };
             defer if (producer_cfg.type != .copy) alloc.free(value);
             const privacy_output = try @import("../../privacy/materialize.zig").output(alloc, source_text.?, request.producer_json, value);
@@ -6221,7 +6232,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             };
             const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingDenseEmbedder;
-            const dense_embedder = runtime.config.dense_embedder orelse return error.MissingDenseEmbedder;
+            const dense_embedder = (runtime.config.dense_embedder orelse return error.MissingDenseEmbedder).withRequestContext(requestContext(artifact_writes));
 
             const embedding_name = requestEmbeddingName(request);
             const consumer_indexes: []const []const u8 = request.consumer_indexes;
@@ -6520,9 +6531,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // digest, if any, did not already prove this extraction
             // unnecessary.
             std.log.info("document extraction fetching source: doc_key={s} artifact={s}", .{ request.doc_key, artifact_name });
+            var source_control = remoteRenderConfig(db, null);
+            if (preparation_memo.context) |context| {
+                source_control.io = context.io;
+                source_control.deadline_ns = context.deadline_ns;
+                if (comptime @hasField(@TypeOf(source_control), "cancellation")) {
+                    source_control.cancellation = .{ .ptr = &preparation_memo.context.?, .is_cancelled_fn = struct {
+                        fn check(ptr: *const anyopaque) bool {
+                            const control: *const @import("antfly_inference_execution_context").RequestContext = @ptrCast(@alignCast(ptr));
+                            control.check() catch return true;
+                            return false;
+                        }
+                    }.check };
+                }
+                try context.check();
+            }
             const fetched = template_remote.downloadRemoteContentOutcomeAllocWithRenderConfig(
                 extraction_alloc,
-                remoteRenderConfig(db, null),
+                source_control,
                 source_url,
                 if (config.credentials.len > 0) config.credentials else null,
             ) catch |raw_err| {
@@ -6590,7 +6616,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 extraction_config.pdf_decode_limits.max_decoded_stream_bytes = @min(extraction_config.pdf_decode_limits.max_decoded_stream_bytes, pdf_inspection_bytes);
             }
             var extraction_failure: runtime_failure_abi.FailureIdentity = .{};
-            var extraction = extractDocumentDownloadedAlloc(document_extraction_alloc, downloaded_mut, source_url, extraction_config, config_json, doc_value, &extraction_failure) catch |raw_err| {
+            var extraction = extractDocumentDownloadedAlloc(document_extraction_alloc, downloaded_mut, source_url, extraction_config, config_json, doc_value, &extraction_failure, preparation_memo.context) catch |raw_err| {
                 const err = if (raw_err != error.OutOfMemory)
                     raw_err
                 else if (pdf_inspection_reservation.limit_exceeded)
@@ -6945,7 +6971,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             };
             const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingSparseEmbedder;
-            const sparse_embedder = runtime.config.sparse_embedder orelse return error.MissingSparseEmbedder;
+            const sparse_embedder = (runtime.config.sparse_embedder orelse return error.MissingSparseEmbedder).withRequestContext(requestContext(artifact_writes));
 
             const embedding_name = requestEmbeddingName(request);
             const revision = if (memo) |cache_memo| try cache_memo.sparseRevision(sparse_embedder, embedding_name) else try sparse_embedder.captureRevision(alloc, embedding_name);
@@ -8485,10 +8511,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             config_json: []const u8,
             raw_document_json: []const u8,
             out_failure: *runtime_failure_abi.FailureIdentity,
+            context: ?@import("antfly_inference_execution_context").RequestContext,
         ) !document_extraction_mod.Result {
             out_failure.* = .{};
             if (comptime !builtin.is_test and build_options.linked_storage) {
-                return document_extraction_client.extractDownloadedAllocWithLimitsWithFailure(
+                return document_extraction_client.extractDownloadedControlledAlloc(
                     alloc,
                     downloaded,
                     source_url,
@@ -8496,8 +8523,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     raw_document_json,
                     config.pdf_decode_limits,
                     out_failure,
+                    context,
                 );
             }
+            if (context) |control| try control.check();
             return document_extraction_mod.extractDownloadedAlloc(alloc, downloaded, source_url, config);
         }
 
@@ -8843,6 +8872,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             const runtime = S.ownerField(db, "enrichment_runtime").* orelse return error.MissingAssetProducer;
             var producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
+            if (requestContext(artifact_writes)) |context| producer = producer.withInvocationContext(@import("enrichment/asset_producer.zig").InvocationContext.fromRequestContext(context));
             if (comptime @hasField(@TypeOf(artifact_writes.*), "budget")) if (artifact_writes.budget) |budget| {
                 var context = producer.invocation_context;
                 const remaining = @import("commit_requirements.zig").max_output_bytes - budget.bytes;
@@ -8852,6 +8882,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const requests = try alloc.alloc(asset_producer_mod.Request, items.items.len);
             defer alloc.free(requests);
             for (items.items, 0..) |*item, idx| requests[idx] = item.asRequest();
+            if (requestContext(artifact_writes)) |context| {
+                try context.check();
+                if (!try producer.foregroundBoundedForRequests(alloc, requests)) return error.UnboundedEnrichmentProvider;
+                try context.check();
+            }
 
             const can_batch = producer.canProduceBatch(alloc, requests) catch |err| {
                 if (err == error.OutOfMemory or err == error.InferenceResultTooLarge) return err;
@@ -8904,6 +8939,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
         ) !void {
             for (items) |item| {
+                if (requestContext(artifact_writes)) |context| try context.check();
                 var item_producer = producer;
                 if (comptime @hasField(@TypeOf(artifact_writes.*), "budget")) if (artifact_writes.budget) |budget| {
                     var context = producer.invocation_context;
@@ -9004,8 +9040,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             defer alloc.free(source_text.?);
 
+            const context = if (@hasField(@TypeOf(db.*), "preparation_context")) db.preparation_context else null;
+            if (context) |control| try control.check();
             const chunks = if (request.chunker_json.len > 0)
-                try chunker_mod.chunkTextWithConfigJson(alloc, source_text.?, request.chunker_json)
+                try chunker_mod.chunkTextWithConfigJsonControlled(alloc, source_text.?, request.chunker_json, context)
             else
                 try chunker_mod.chunkText(alloc, source_text.?, request.chunk_size, request.chunk_overlap);
             errdefer chunker_mod.freeChunks(alloc, chunks);
