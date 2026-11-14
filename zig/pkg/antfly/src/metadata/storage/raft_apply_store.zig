@@ -28064,7 +28064,7 @@ fn admitIndexAliasStoreTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, g
     var entry = try cursor.seekAtOrAfter(prefix);
     while (entry) |kv| : (entry = try cursor.next()) {
         if (!std.mem.startsWith(u8, kv.key, prefix)) break;
-        const table = try borrowTableProjection(kv.value, .query);
+        const table = try borrowTableProjection(kv.value, .admission);
         if (topology_protocol.usesIndexAliases(table.query_definition.?.indexes_json)) return false;
     }
     return true;
@@ -28468,7 +28468,7 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         },
         .upsert_table => |record| {
             try out.append(alloc, @backingInt(TransitionTag.upsert_table));
-            try appendTableRecord(alloc, &out, record);
+            try appendTableRecord(alloc, &out, record, false);
         },
         .compare_and_replace_table => |replacement| {
             try out.append(alloc, @backingInt(if (replacement.relation_guard != null) TransitionTag.compare_and_replace_relation_table else TransitionTag.compare_and_replace_table));
@@ -29499,7 +29499,7 @@ fn encodeStoreRecord(alloc: std.mem.Allocator, record: metadata.StoreRecord) ![]
 fn encodeTableRecord(alloc: std.mem.Allocator, record: metadata.TableRecord) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
-    try appendTableRecord(alloc, &out, record);
+    try appendTableRecord(alloc, &out, record, true);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -29605,7 +29605,7 @@ fn decodeTableQueryProjection(alloc: std.mem.Allocator, encoded: []const u8, inc
     return decodeTableProjection(alloc, encoded, if (include_definition) .query else .identity);
 }
 
-const TableProjectionMode = enum { identity, schema, query };
+const TableProjectionMode = enum { identity, schema, query, admission };
 const BorrowedTableProjection = struct {
     table_id: u64,
     name: []const u8,
@@ -29652,6 +29652,7 @@ fn borrowTableProjection(encoded: []const u8, mode: TableProjectionMode) !Borrow
         storage = extension.storage;
         object_storage_generation = extension.object_storage_generation;
     }
+    const query_indexes = try readQueryIndexesExtension(encoded, &pos);
     // Legacy, read-schema, and restore-intent records respectively. Borrow all
     // framed fields to validate the encoding, but copy only query-owned data.
     if (count != 5 and count != 6 and count != 8) return error.InvalidMetadataTransitionEncoding;
@@ -29661,7 +29662,7 @@ fn borrowTableProjection(encoded: []const u8, mode: TableProjectionMode) !Borrow
         .object_storage_generation = object_storage_generation,
         .schema_json = fields[1],
         .read_schema_json = if (mode == .schema or count == 5) "" else fields[2],
-        .indexes_json = if (mode == .schema) "" else fields[if (count == 5) 2 else 3],
+        .indexes_json = if (mode == .schema) "" else if (mode == .query and query_indexes.len != 0) query_indexes else fields[if (count == 5) 2 else 3],
         .lake_index_catalog_json = if (mode == .query) lake_index_catalog_json else "",
     } else null };
 }
@@ -31230,6 +31231,7 @@ fn appendTableRecord(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     record: metadata.TableRecord,
+    materialize_query_projection: bool,
 ) !void {
     try appendInt(alloc, out, u64, record.table_id);
     try appendInt(alloc, out, u16, record.desired_replica_count);
@@ -31290,6 +31292,12 @@ fn appendTableRecord(
             try appendInt(alloc, out, u64, migration.request.budget.disk_reserve_bytes);
         }
     }
+    if (materialize_query_projection and topology_protocol.usesIndexAliases(record.indexes_json)) {
+        const projection = try @import("antfly_local_sources").api_index_metadata.aliases.queryProjection(alloc, record.indexes_json);
+        defer alloc.free(projection);
+        try appendInt(alloc, out, u32, 0x31514149); // IAQ1
+        try appendRequiredString(alloc, out, projection);
+    }
 }
 
 fn appendFramedTableRecord(
@@ -31299,7 +31307,7 @@ fn appendFramedTableRecord(
 ) !void {
     var encoded = std.ArrayListUnmanaged(u8).empty;
     defer encoded.deinit(alloc);
-    try appendTableRecord(alloc, &encoded, record);
+    try appendTableRecord(alloc, &encoded, record, false);
     try appendInt(alloc, out, u32, @intCast(encoded.items.len));
     try out.appendSlice(alloc, encoded.items);
 }
@@ -31713,9 +31721,21 @@ fn readLakeIndexCatalogExtension(encoded: []const u8, pos: *usize) ![]const u8 {
     return result;
 }
 
+fn readQueryIndexesExtension(encoded: []const u8, pos: *usize) ![]const u8 {
+    if (pos.* == encoded.len) return "";
+    if (try readInt(encoded, pos, u32) != 0x31514149) return error.InvalidMetadataTransitionEncoding;
+    const length = try readInt(encoded, pos, u32);
+    if (length > encoded.len - pos.*) return error.InvalidMetadataTransitionEncoding;
+    const result = encoded[pos.*..][0..length];
+    pos.* += length;
+    if (pos.* != encoded.len) return error.InvalidMetadataTransitionEncoding;
+    return result;
+}
+
 fn readTableStorageExtension(encoded: []const u8, pos: *usize) !BorrowedTableStorage {
     var result: BorrowedTableStorage = .{};
     if (pos.* == encoded.len) return result;
+    if (encoded.len - pos.* >= 4 and std.mem.readInt(u32, encoded[pos.*..][0..4], .little) == 0x31514149) return result;
     if (try readInt(encoded, pos, u32) != table_storage_metadata_magic) return error.InvalidMetadataTransitionEncoding;
     const version = try readInt(encoded, pos, u16);
     if (version != table_storage_metadata_version and version != 2) return error.InvalidMetadataTransitionEncoding;
@@ -31752,7 +31772,7 @@ fn readTableStorageExtension(encoded: []const u8, pos: *usize) !BorrowedTableSto
         },
         else => return error.InvalidMetadataTransitionEncoding,
     }
-    if (pos.* != encoded.len or (result.storage.engine == .local and result.storage.dense_embeddings == .primary_lsm and result.migration == null)) return error.InvalidMetadataTransitionEncoding;
+    if ((pos.* != encoded.len and (encoded.len - pos.* < 4 or std.mem.readInt(u32, encoded[pos.*..][0..4], .little) != 0x31514149)) or (result.storage.engine == .local and result.storage.dense_embeddings == .primary_lsm and result.migration == null)) return error.InvalidMetadataTransitionEncoding;
     if (result.storage.engine == .object and (result.storage.dense_embeddings != .primary_lsm or result.migration != null)) return error.InvalidMetadataTransitionEncoding;
     return result;
 }
@@ -31791,6 +31811,8 @@ fn readTableRecordWithRestoreIntent(
     const lake_index_catalog_json = try alloc.dupe(u8, try readLakeIndexCatalogExtension(encoded, pos));
     errdefer alloc.free(lake_index_catalog_json);
     var extension = try readTableStorageExtension(encoded, pos);
+    const query_indexes = try alloc.dupe(u8, try readQueryIndexesExtension(encoded, pos));
+    errdefer alloc.free(query_indexes);
     if (extension.migration) |*migration| migration.request.job_id = try alloc.dupe(u8, migration.request.job_id);
     return .{
         .storage = extension.storage,
@@ -31805,6 +31827,7 @@ fn readTableRecordWithRestoreIntent(
         .schema_json = schema_json,
         .read_schema_json = read_schema_json,
         .indexes_json = indexes_json,
+        .query_indexes_json = query_indexes,
         .replication_sources_json = replication_sources_json,
         .placement_role = placement_role,
         .restore_backup_id = restore_backup_id,
@@ -45256,4 +45279,28 @@ test "selected owner readiness durable transition index rebuilds and retires act
     defer a.free(retired);
     try std.testing.expectEqual(@as(usize, 0), retired.len);
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.ownerReadinessTransitions(a, 21, request, .{ .deadline_ns = 0 }));
+}
+
+test "index alias query projection is persisted and borrowed without retry evidence" {
+    const a = std.testing.allocator;
+    const catalog = @import("antfly_local_sources").api_index_metadata.aliases;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const proof = try scratch.alloc(u8, 64 * 1024);
+    @memset(proof, 'x');
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, scratch, try std.json.Stringify.valueAlloc(scratch, .{ .complete = true, .evidence = proof }, .{}), .{});
+    const indexes = try catalog.put(scratch, "{\"text\":{\"type\":\"full_text\",\"_index_incarnation\":41}}", "live", .{ .index = "text", .idempotency_key = "1" }, ready, 1);
+    const record = try encodeTableRecord(a, .{ .table_id = 7, .name = "docs", .indexes_json = indexes });
+    defer a.free(record);
+    const view = try borrowTableProjection(record, .query);
+    const query_indexes = view.query_definition.?.indexes_json;
+    try std.testing.expect(query_indexes.len < 256);
+    try std.testing.expect(std.mem.indexOf(u8, query_indexes, "evidence") == null);
+    try std.testing.expect(std.mem.indexOf(u8, query_indexes, catalog.receipts_key) == null);
+    try std.testing.expect(@intFromPtr(query_indexes.ptr) >= @intFromPtr(record.ptr));
+    const restored = try decodeTableRecord(a, record);
+    defer metadata_table_manager.freeTable(a, restored);
+    try std.testing.expectEqualStrings(indexes, restored.indexes_json);
+    try std.testing.expectEqualStrings(query_indexes, restored.query_indexes_json);
 }

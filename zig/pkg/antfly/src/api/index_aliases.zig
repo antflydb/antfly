@@ -115,7 +115,7 @@ test "index alias query pins routing before embedding across a concurrent swap" 
     const Resolver = struct {
         current: []const u8,
         next: []const u8,
-        pub fn bind(ptr: *anyopaque, a: A, _: []const u8, body: []const u8) !?[]u8 {
+        pub fn bind(ptr: *anyopaque, a: A, _: []const u8, body: []const u8) !?query_api.BoundIndexAliases {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
@@ -123,7 +123,7 @@ test "index alias query pins routing before embedding across a concurrent swap" 
             const root = try std.json.parseFromSliceLeaky(std.json.Value, scratch, self.current, .{});
             var query = try std.json.parseFromSliceLeaky(std.json.Value, scratch, body, .{});
             try catalog.bindQuery(scratch, root, &query);
-            return try std.json.Stringify.valueAlloc(a, query, .{});
+            return .{ .body = try std.json.Stringify.valueAlloc(a, query, .{}) };
         }
         pub fn embed(ptr: *anyopaque, a: A, _: []const u8, index: []const u8, _: []const u8, _: ?[]const u8, k: u32) !types.DenseKnnQuery {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -137,7 +137,7 @@ test "index alias query pins routing before embedding across a concurrent swap" 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const base = "{\"a\":{\"type\":\"embeddings\"},\"b\":{\"type\":\"embeddings\"}}";
+    const base = "{\"a\":{\"type\":\"embeddings\",\"_index_incarnation\":41},\"b\":{\"type\":\"embeddings\",\"_index_incarnation\":42}}";
     const ready = try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"complete\":true}", .{});
     const first = try catalog.put(scratch, base, "live", .{ .index = "a", .idempotency_key = "1" }, ready, 1);
     const second = try catalog.put(scratch, first, "live", .{ .index = "b", .expected_index = "a", .idempotency_key = "2" }, ready, 2);
@@ -151,6 +151,13 @@ test "index alias query pins routing before embedding across a concurrent swap" 
     try std.testing.expectEqualStrings("b", new.req.dense_queries[0].index_name);
     try std.testing.expectEqual(@as(f32, 1), old.req.dense_queries[0].query.vector[0]);
     try std.testing.expectEqual(@as(f32, 1), new.req.dense_queries[0].query.vector[1]);
+    try std.testing.expectEqual(@as(u64, 41), old.req.index_alias_fences[0].incarnation);
+    const forwarded = try local.api_local_query_contract.encodeQueryRequest(a, old.req);
+    defer a.free(forwarded);
+    var decoded = try query_api.parseQueryRequest(a, null, "docs", forwarded);
+    defer decoded.deinit(a);
+    try std.testing.expectEqual(@as(u64, 41), decoded.req.index_alias_fences[0].incarnation);
+    try std.testing.expectEqualStrings("a", decoded.req.index_alias_fences[0].name);
     var response = try query_api.encodeQueryResponses(a, "docs", old.req, .{}, .{ .alloc = a, .hits = &.{}, .total_hits = 0 });
     defer response.deinit(a);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, response.json, .{});

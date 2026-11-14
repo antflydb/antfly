@@ -161,11 +161,7 @@ pub fn withIncarnationIfMissingAlloc(alloc: std.mem.Allocator, value: std.json.V
 }
 
 pub fn incarnation(value: std.json.Value) ?u64 {
-    if (value != .object) return null;
-    const raw = value.object.get(incarnation_field) orelse
-        value.object.get(legacy_coverage_incarnation_field) orelse return null;
-    if (raw != .integer or raw.integer <= 0) return null;
-    return @intCast(raw.integer);
+    return @import("index_incarnation.zig").get(value);
 }
 
 pub fn withMissingIncarnationsAlloc(alloc: std.mem.Allocator, indexes_json: []const u8) ![]u8 {

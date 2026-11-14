@@ -219,7 +219,9 @@ pub const Mutation = union(enum) {
 /// remain valid through execution. Read callbacks enforce row/field policies
 /// and share the statement's pinned visibility cut. A missing authorized node
 /// is null; hidden nodes are not legal intermediate traversal endpoints.
+pub const IndexObserver = struct { ptr: *anyopaque, record: *const fn (*anyopaque, []const u8) anyerror!void };
 pub const Backend = struct {
+    index_attribution: ?struct { ptr: *anyopaque, snapshot: *const fn (*anyopaque, std.mem.Allocator) anyerror![]const []const u8 } = null,
     ptr: *anyopaque,
     vtable: *const VTable,
     pub const VTable = struct {

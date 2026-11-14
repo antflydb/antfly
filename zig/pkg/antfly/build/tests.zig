@@ -7485,6 +7485,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const db_merge_cutover_step = b.step("antfly-storage-db-merge-cutover-test", "Run the merge cutover enrichment reopen DB test");
     db_merge_cutover_step.dependOn(&run_db_merge_cutover_tests.step);
 
+    const alias_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"index alias storage fences"} });
+    b.step("antfly-index-alias-storage-test", "Verify alias generation assertions under real storage read leases").dependOn(&addFilteredTestRunArtifact(b, alias_storage_tests).step);
     const index_document_native_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"index document checkpoint native storage"} });
     b.step("antfly-index-document-native-test", "Verify indexed document source guards, cleanup and native lease takeover").dependOn(&addFilteredTestRunArtifact(b, index_document_native_tests).step);
     const db_shared_embedding_tests = b.addTest(.{

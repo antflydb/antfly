@@ -10383,7 +10383,7 @@ pub const AntflyApiHandler = struct {
             return jsonErrorResponse(ctx, switch (err) {
                 error.TableNotFound, error.IndexNotFound, error.IndexAliasNotFound, error.NotFound => 404,
                 error.InvalidIndexAliasRequest => 400,
-                error.IndexAliasNameConflict, error.IndexAliasExpectedIndexMismatch, error.IndexAliasIdempotencyConflict, error.IncompatibleIndexAliasTarget, error.IndexAliasTargetNotReady, error.IndexAliasReceiptCapacity, error.TableGenerationChanged, error.TableTransitionActive, error.VectorMigrationActive, error.Conflict => 409,
+                error.MetadataTopologyCommandTooLarge, error.IndexAliasNameConflict, error.IndexAliasExpectedIndexMismatch, error.IndexAliasIdempotencyConflict, error.IncompatibleIndexAliasTarget, error.IndexAliasTargetNotReady, error.IndexAliasReceiptCapacity, error.TableGenerationChanged, error.TableTransitionActive, error.VectorMigrationActive, error.Conflict => 409,
                 error.UnsupportedOperation, error.IndexAliasProtocolUpgradeRequired, error.TableTopologyProtocolUpgradeRequired => 501,
                 error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.MetadataLinearizableReadTimeout, error.MetadataMutationOutcomeUnknown => 503,
                 error.Canceled, error.Cancelled => 499,

@@ -8052,6 +8052,7 @@ fn batchFrontierByGroup(
 }
 
 pub const IncomingProbeOptions = struct {
+    index_identity: ?GraphIndexIdentity = null,
     ttl_now_ns: u64 = 0,
     work_budget: ?*graph_pattern_mod.WorkBudget = null,
 };
@@ -9745,8 +9746,7 @@ pub fn probeIncomingEdgesForKeysWithOptions(
     }
     @memset(physical_routes, null);
 
-    const index_identity = (try catalogGraphIndexIdentity(alloc, catalog, table_name, index_name)) orelse
-        return error.IndexNotFound;
+    const index_identity = options.index_identity orelse (try catalogGraphIndexIdentity(alloc, catalog, table_name, index_name)) orelse return error.IndexNotFound;
     const group_ids = try table_catalog.resolveGroupsForSpanPinnedUntil(
         alloc,
         catalog,

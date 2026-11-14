@@ -1473,7 +1473,7 @@ pub const TableManager = struct {
     }
 
     pub fn upsertTable(self: *TableManager, record: TableRecord) !void {
-        if (std.mem.indexOf(u8, record.indexes_json, "_index_aliases") != null) {
+        if (@import("antfly_local_sources").api_index_metadata.aliases.uses(record.indexes_json)) {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, record.indexes_json, .{});
             defer parsed.deinit();
             try @import("antfly_local_sources").api_index_metadata.aliases.validateReferences(parsed.value);

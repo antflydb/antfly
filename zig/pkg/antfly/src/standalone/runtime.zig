@@ -16824,3 +16824,38 @@ test "privacy standalone compact bindings refresh on policy publication and surv
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null));
     metadata.catalog_durability_failed = false;
 }
+
+test "index alias standalone snapshot install preserves swaps receipts and stale CAS fences" {
+    const a = std.testing.allocator;
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/alias-snapshot", .{tmp.sub_path});
+    var source = try antfly.metadata.RaftApplyStore.init(a, .{ .root_dir = root });
+    defer source.deinit();
+    const group: u64 = 21;
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"complete\":true}", .{});
+    const request: aliases.Request = .{ .index = "a", .idempotency_key = "first" };
+    const first: antfly.metadata.TableRecord = .{ .table_id = 42, .name = "docs", .indexes_json = try aliases.put(scratch, "{\"a\":{\"type\":\"full_text\"},\"b\":{\"type\":\"full_text\"}}", "live", request, ready, 1) };
+    try source.applyStandaloneCommand(group, .{ .upsert_table = first });
+    var second = first;
+    second.indexes_json = try aliases.put(scratch, first.indexes_json, "live", .{ .index = "b", .expected_index = "a", .idempotency_key = "second" }, ready, 2);
+    try source.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = first, .replacement = second } });
+    const snapshot = try source.snapshotBuilder().buildSnapshot(scratch, group);
+    var restored = try antfly.metadata.RaftApplyStore.init(a, .{ .root_dir = try std.fmt.allocPrint(scratch, "{s}-restored", .{root}) });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(scratch, group, 100, snapshot));
+    const current = (try restored.tableByName(a, group, "docs")).?;
+    defer antfly.metadata.table_manager.freeTable(a, current);
+    const decoded = try std.json.parseFromSliceLeaky(std.json.Value, scratch, current.indexes_json, .{});
+    try std.testing.expectEqualStrings("b", try aliases.resolve(decoded, "live"));
+    try std.testing.expectEqualStrings("a", (try aliases.replay(scratch, decoded, "live", request)).?.index);
+    try std.testing.expect(current.query_indexes_json.len != 0);
+    try restored.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = first, .replacement = first } });
+    const after = (try restored.tableByName(a, group, "docs")).?;
+    defer antfly.metadata.table_manager.freeTable(a, after);
+    try std.testing.expectEqualStrings(second.indexes_json, after.indexes_json);
+}

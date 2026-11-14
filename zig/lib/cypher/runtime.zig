@@ -1805,7 +1805,15 @@ fn executeBudget(budget: *Budget, backend: backend_mod.Backend, graph: catalog.G
     const columns = try engine.a.alloc([]const u8, engine.columns.len);
     for (engine.columns, columns) |name, *out| out.* = try engine.a.dupe(u8, name);
     const stages = try engine.stages.toOwnedSlice(engine.a);
-    const resolved_indexes = try @import("dependencies.zig").selectedIndexes(engine.a, compiled.query, graph);
+    var selected_indexes: std.ArrayList([]const u8) = .empty;
+    try selected_indexes.appendSlice(engine.a, try @import("dependencies.zig").selectedIndexes(engine.a, compiled.query, graph));
+    if (backend.index_attribution) |attribution| for (try attribution.snapshot(attribution.ptr, engine.a)) |name| {
+        const duplicate = for (selected_indexes.items) |prior| {
+            if (std.mem.eql(u8, prior, name)) break true;
+        } else false;
+        if (!duplicate) try selected_indexes.append(engine.a, name);
+    };
+    const resolved_indexes = selected_indexes.items;
     engine.stats.memory_bytes = budget.peak;
     var result: Result = .{ .arena = arena, .budget = budget, .columns = columns, .rows = output, .stages = stages, .stats = engine.stats, .read_only = !writes, .graph_incarnation = graph.incarnation, .graph_revision = graph.revision, .resolved_indexes = if (resolved_indexes.len == 0) null else resolved_indexes, .statement_byte_pool = engine.statement_byte_pool };
     var checkpoint_backend = backend;

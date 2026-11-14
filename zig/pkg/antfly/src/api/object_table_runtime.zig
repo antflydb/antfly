@@ -50,7 +50,7 @@ const Entry = struct {
         try context.ensureActive();
         self.schema = try a.dupe(u8, table.schema_json);
         errdefer a.free(self.schema);
-        self.indexes = try a.dupe(u8, table.indexes_json);
+        self.indexes = try local.api_index_metadata.aliases.physicalProjection(a, table.indexes_json);
         errdefer a.free(self.indexes);
         self.store = try Store.openNative(a, options.config, options.secrets, false, options.deployment, options.local_base_dir);
         errdefer self.store.deinit();
@@ -76,11 +76,11 @@ const Entry = struct {
         }, io);
         errdefer self.stack.deinit();
         try context.ensureActive();
-        _ = try self.stack.catalog.ensureTableWithDefinition("data", 0, .{}, table.schema_json, table.read_schema_json, table.indexes_json);
+        _ = try self.stack.catalog.ensureTableWithDefinition("data", 0, .{}, table.schema_json, table.read_schema_json, self.indexes);
         try context.ensureActive();
         var recorded = (try self.stack.catalog.getTableAlloc(a, "data")) orelse return error.ObjectTableDefinitionConflict;
         defer recorded.deinit(a);
-        if (!std.mem.eql(u8, recorded.schema_json, table.schema_json) or !std.mem.eql(u8, recorded.indexes_json, table.indexes_json)) return error.ObjectTableDefinitionConflict;
+        if (!std.mem.eql(u8, recorded.schema_json, table.schema_json) or !try local.api_index_metadata.aliases.configurationEqual(a, recorded.indexes_json, self.indexes)) return error.ObjectTableDefinitionConflict;
         try context.ensureActive();
         try self.stack.runtime.start();
     }
@@ -114,7 +114,7 @@ pub const Manager = struct {
         try context.ensureActive();
         const key = [2]u64{ table.table_id, table.object_storage_generation };
         if (self.entries.get(key)) |entry| {
-            if (!std.mem.eql(u8, entry.schema, table.schema_json) or !std.mem.eql(u8, entry.indexes, table.indexes_json)) return error.ObjectTableDefinitionConflict;
+            if (!std.mem.eql(u8, entry.schema, table.schema_json) or !try local.api_index_metadata.aliases.configurationEqual(a, entry.indexes, if (table.query_indexes_json.len != 0) table.query_indexes_json else table.indexes_json)) return error.ObjectTableDefinitionConflict;
             return entry;
         }
         if (self.entries.count() >= max_tables) return error.ObjectTableRuntimeCapacityExceeded;
@@ -165,7 +165,25 @@ pub const Manager = struct {
         }
         const path = try std.fmt.allocPrint(a, "/tables/data/{s}", .{suffix});
         defer a.free(path);
-        var response = entry.stack.handler.handle(.{ .method = method, .path = path, .body = body, .cancellation = context.cancellation, .deadline_ns = guard.context.deadline_ns }) catch |err| {
+        var bound_body: ?[]u8 = null;
+        defer if (bound_body) |bytes| a.free(bytes);
+        if (std.mem.eql(u8, suffix, "query") and std.mem.indexOf(u8, body, "_index_alias_fences") != null) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+            defer parsed.deinit();
+            if (parsed.value.object.get("_index_alias_fences")) |fences| {
+                var catalog = try std.json.parseFromSlice(std.json.Value, a, table.indexes_json, .{});
+                defer catalog.deinit();
+                for (fences.array.items) |fence| {
+                    const name = fence.object.get("name").?.string;
+                    const config = catalog.value.object.get(name) orelse return error.TableGenerationChanged;
+                    const identity = (try @import("indexes.zig").indexRuntimeIdentity(a, name, config)) orelse return error.TableGenerationChanged;
+                    if (identity.incarnation != @as(u64, @intCast(fence.object.get("incarnation").?.integer))) return error.TableGenerationChanged;
+                }
+                _ = parsed.value.object.orderedRemove("_index_alias_fences");
+                bound_body = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+            }
+        }
+        var response = entry.stack.handler.handle(.{ .method = method, .path = path, .body = bound_body orelse body, .cancellation = context.cancellation, .deadline_ns = guard.context.deadline_ns }) catch |err| {
             // Transport-only cancellation adapters may report Canceled when
             // the request deadline expired. Preserve the native error kind.
             if (method == .get or std.mem.eql(u8, suffix, "query")) try guard.context.ensureActive();

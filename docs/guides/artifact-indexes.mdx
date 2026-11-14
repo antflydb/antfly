@@ -333,7 +333,10 @@ concrete indexes, refer to another alias, or use reserved metadata names.
 
 Use the alias in `full_text_index`, `indexes`, embedding map keys, canonical `graph_queries`
 `index` fields, or graph metric requests. Resolution happens before embedding
-and shard dispatch. Native query results include `resolved_indexes` with the
+and shard dispatch. Native requests carry the selected index incarnation into
+storage admission; a retired target that is reconfigured or recreated cannot
+serve an older model’s query vector. Such a query fails with a catalog conflict
+and can be retried as a new query. Native query results include `resolved_indexes` with the
 concrete names used. Filters, documents, and prompts are never rewritten.
 `GET /db/v1/tables/docs/index-aliases/chunk_vectors` returns the current and
 previous targets, swap timestamp, and the recorded readiness proof. Mutations
@@ -346,7 +349,9 @@ catalog rejects older data-store registrations once aliases are present.
 Retry an ambiguous mutation with the identical body and idempotency key. The
 recorded response is returned even after another swap or rollback; a retry does
 not reactivate its original target. Receipts are retained for at least 24 hours,
-with at most 128 retained receipts per alias. Admission returns a conflict if
+with at most 128 retained receipts per alias, 64 aliases per table, and a
+512 KiB table-wide budget for alias resources and retry receipts. Each mutation
+reclaims expired receipts across the table. Admission returns a conflict if
 that window is full, rather than evicting a receipt that a caller may still
 need. Do not reuse keys for new operations. Read the alias to inspect the live
 target independently of an older operation's receipt.

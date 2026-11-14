@@ -71,6 +71,8 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     errdefer alloc.free(read_schema_json);
     const indexes_json = try alloc.dupe(u8, record.indexes_json);
     errdefer alloc.free(indexes_json);
+    const query_indexes_json = if (@import("../api/index_aliases.zig").uses(record.indexes_json)) try @import("../api/index_aliases.zig").queryProjection(alloc, record.indexes_json) else try alloc.dupe(u8, "");
+    errdefer alloc.free(query_indexes_json);
     const replication_sources_json = try alloc.dupe(u8, record.replication_sources_json);
     errdefer alloc.free(replication_sources_json);
     const placement_role = try alloc.dupe(u8, record.placement_role);
@@ -92,6 +94,7 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
         .schema_json = schema_json,
         .read_schema_json = read_schema_json,
         .indexes_json = indexes_json,
+        .query_indexes_json = query_indexes_json,
         .replication_sources_json = replication_sources_json,
         .placement_role = placement_role,
         .restore_backup_id = restore_backup_id,

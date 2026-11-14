@@ -22,6 +22,75 @@ pub const key = "_index_aliases";
 pub const receipts_key = "_index_alias_receipts";
 pub const receipt_lifetime_ms: u64 = 24 * 60 * 60 * 1000;
 pub const max_receipts_per_alias = 128;
+pub const max_aliases_per_table = 64;
+pub const max_control_bytes = 512 * 1024;
+
+/// Structural detection, including escaped JSON member names. Invalid input
+/// fails closed at protocol admission; configuration validation reports it.
+pub fn uses(bytes: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, bytes, '\\') == null and std.mem.indexOf(u8, bytes, "_index_alias") == null) return false;
+    var parsed = std.json.parseFromSlice(V, std.heap.page_allocator, bytes, .{}) catch return true;
+    defer parsed.deinit();
+    return parsed.value == .object and (parsed.value.object.contains(key) or parsed.value.object.contains(receipts_key));
+}
+
+/// Transition envelopes contain TableRecord.indexes_json as an escaped string.
+/// Inspect that structural field, never arbitrary prompt/document strings.
+pub fn usesEnvelope(bytes: []const u8) bool {
+    var parsed = std.json.parseFromSlice(V, std.heap.page_allocator, bytes, .{}) catch return true;
+    defer parsed.deinit();
+    return envelopeValue(parsed.value);
+}
+fn envelopeValue(value: V) bool {
+    switch (value) {
+        .object => |object| {
+            if (object.contains(key) or object.contains(receipts_key)) return true;
+            var entries = object.iterator();
+            while (entries.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "indexes_json") and entry.value_ptr.* == .string) {
+                    if (uses(entry.value_ptr.string)) return true;
+                } else if (envelopeValue(entry.value_ptr.*)) return true;
+            }
+        },
+        .array => |array| for (array.items) |item| {
+            if (envelopeValue(item)) return true;
+        },
+        else => {},
+    }
+    return false;
+}
+
+pub fn physicalProjection(out: A, bytes: []const u8) ![]u8 {
+    if (!uses(bytes)) return out.dupe(u8, bytes);
+    var arena = std.heap.ArenaAllocator.init(out);
+    defer arena.deinit();
+    var root = try std.json.parseFromSliceLeaky(V, arena.allocator(), bytes, .{});
+    _ = root.object.orderedRemove(key);
+    _ = root.object.orderedRemove(receipts_key);
+    return std.json.Stringify.valueAlloc(out, root, .{});
+}
+
+/// Materialize at catalog publication, never on the query hot path.
+pub fn queryProjection(out: A, bytes: []const u8) ![]u8 {
+    if (!uses(bytes)) return out.dupe(u8, bytes);
+    var arena = std.heap.ArenaAllocator.init(out);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root = try std.json.parseFromSliceLeaky(V, a, bytes, .{});
+    if (root != .object) return error.InvalidTableIndexMetadata;
+    _ = root.object.orderedRemove(receipts_key);
+    if (root.object.getPtr(key)) |declarations| {
+        if (declarations.* != .object) return error.InvalidTableIndexMetadata;
+        for (declarations.object.values()) |*resource| {
+            if (resource.* != .object) return error.InvalidTableIndexMetadata;
+            const target = resource.object.get("index") orelse return error.InvalidTableIndexMetadata;
+            resource.* = .{ .object = .empty };
+            try resource.object.put(a, "index", target);
+        }
+    }
+    return std.json.Stringify.valueAlloc(out, root, .{});
+}
+
 pub const Requirement = enum { queryable, complete };
 pub const Request = struct {
     index: []const u8,
@@ -149,6 +218,7 @@ pub fn put(a: A, bytes: []const u8, name: []const u8, request: Request, readines
     const target_shape = try shape(target);
     var aliases = root.object.get(key) orelse V{ .object = std.json.ObjectMap{} };
     const current = aliases.object.get(name);
+    if (current == null and aliases.object.count() >= max_aliases_per_table) return error.IndexAliasReceiptCapacity;
     var previous: ?[]const u8 = null;
     if (current) |value| {
         const resource = try std.json.parseFromValueLeaky(Resource, scratch, value, .{});
@@ -179,14 +249,18 @@ pub fn put(a: A, bytes: []const u8, name: []const u8, request: Request, readines
     try root.object.put(scratch, key, aliases);
     var ledger = root.object.get(receipts_key) orelse V{ .object = .{} };
     if (ledger != .object) return error.InvalidTableIndexMetadata;
-    var entries = V{ .array = std.array_list.Managed(V).init(scratch) };
-    if (ledger.object.get(name)) |old| {
-        if (old != .array) return error.InvalidTableIndexMetadata;
+    // Reclaim expired receipts for every alias on every mutation. Fresh
+    // receipts are never evicted to admit another operation.
+    for (ledger.object.values()) |*old| {
+        if (old.* != .array) return error.InvalidTableIndexMetadata;
+        var retained = V{ .array = std.array_list.Managed(V).init(scratch) };
         for (old.array.items) |entry| {
             const receipt = try std.json.parseFromValueLeaky(Receipt, scratch, entry, .{});
-            if (now_ms -| receipt.response.swapped_at_ms <= receipt_lifetime_ms) try entries.array.append(entry);
+            if (now_ms -| receipt.response.swapped_at_ms <= receipt_lifetime_ms) try retained.array.append(entry);
         }
+        old.* = retained;
     }
+    var entries = ledger.object.get(name) orelse V{ .array = std.array_list.Managed(V).init(scratch) };
     if (entries.array.items.len >= max_receipts_per_alias) return error.IndexAliasReceiptCapacity;
     const receipt = try std.json.Stringify.valueAlloc(scratch, Receipt{
         .request = request,
@@ -195,6 +269,11 @@ pub fn put(a: A, bytes: []const u8, name: []const u8, request: Request, readines
     try entries.array.append(try std.json.parseFromSliceLeaky(V, scratch, receipt, .{}));
     try ledger.object.put(scratch, name, entries);
     try root.object.put(scratch, receipts_key, ledger);
+    var control_root: V = .{ .object = .empty };
+    try control_root.object.put(scratch, key, aliases);
+    try control_root.object.put(scratch, receipts_key, ledger);
+    const control = try std.json.Stringify.valueAlloc(scratch, control_root, .{});
+    if (control.len > max_control_bytes) return error.IndexAliasReceiptCapacity;
     return std.json.Stringify.valueAlloc(a, root.*, .{});
 }
 
@@ -207,17 +286,25 @@ fn optionalEqual(left: ?[]const u8, right: ?[]const u8) bool {
 /// prompts, or embedding values, which may contain arbitrary user keys.
 pub fn bindQuery(a: A, root: V, query: *V) !void {
     if (query.* != .object) return error.InvalidQueryRequest;
+    var fences = query.object.get("_index_alias_fences") orelse V{ .array = std.array_list.Managed(V).init(a) };
+    if (fences != .array or fences.array.items.len > max_aliases_per_table) return error.InvalidQueryRequest;
+    for (fences.array.items) |fence| {
+        if (fence != .object) return error.InvalidQueryRequest;
+        const name = fence.object.get("name") orelse return error.InvalidQueryRequest;
+        const incarnation = fence.object.get("incarnation") orelse return error.InvalidQueryRequest;
+        if (name != .string or incarnation != .integer or incarnation.integer < 0) return error.InvalidQueryRequest;
+    }
     if (query.object.getPtr("full_text_index")) |name| {
         if (name.* != .null) {
             if (name.* != .string) return error.InvalidQueryRequest;
-            name.* = .{ .string = try a.dupe(u8, try resolve(root, name.string)) };
+            name.* = .{ .string = try a.dupe(u8, try bindName(a, root, name.string, &fences)) };
         }
     }
     if (query.object.getPtr("indexes")) |names| if (names.* != .null) {
         if (names.* != .array) return error.InvalidQueryRequest;
         for (names.array.items) |*name| {
             if (name.* != .string) return error.InvalidQueryRequest;
-            name.* = .{ .string = try a.dupe(u8, try resolve(root, name.string)) };
+            name.* = .{ .string = try a.dupe(u8, try bindName(a, root, name.string, &fences)) };
         }
     };
     for ([_][]const u8{ "embeddings", "sparse_embeddings" }) |field| {
@@ -227,7 +314,7 @@ pub fn bindQuery(a: A, root: V, query: *V) !void {
             var replacement = std.json.ObjectMap{};
             var it = values.object.iterator();
             while (it.next()) |entry| {
-                const name = try resolve(root, entry.key_ptr.*);
+                const name = try bindName(a, root, entry.key_ptr.*, &fences);
                 if (replacement.contains(name)) return error.InvalidQueryRequest;
                 try replacement.put(a, try a.dupe(u8, name), entry.value_ptr.*);
             }
@@ -241,7 +328,7 @@ pub fn bindQuery(a: A, root: V, query: *V) !void {
             var replacement: std.json.ObjectMap = .{};
             var it = weights.object.iterator();
             while (it.next()) |entry| {
-                const name = try resolve(root, entry.key_ptr.*);
+                const name = try bindName(a, root, entry.key_ptr.*, &fences);
                 if (replacement.contains(name)) return error.InvalidQueryRequest;
                 try replacement.put(a, try a.dupe(u8, name), entry.value_ptr.*);
             }
@@ -252,21 +339,32 @@ pub fn bindQuery(a: A, root: V, query: *V) !void {
         if (query.object.getPtr(field)) |graphs| {
             if (graphs.* == .null) continue;
             if (graphs.* != .object) return error.InvalidQueryRequest;
-            for (graphs.object.values()) |*graph| try bindIndexFields(a, root, graph);
+            for (graphs.object.values()) |*graph| try bindIndexFields(a, root, graph, &fences);
         }
     }
     for ([_][]const u8{ "graph_metric_rerank", "graph_metric" }) |field| {
-        if (query.object.getPtr(field)) |metric| try bindIndexFields(a, root, metric);
+        if (query.object.getPtr(field)) |metric| try bindIndexFields(a, root, metric, &fences);
     }
+    if (fences.array.items.len != 0) try query.object.put(a, "_index_alias_fences", fences);
 }
 
-fn bindIndexFields(a: A, root: V, value: *V) !void {
+fn bindName(a: A, root: V, name: []const u8, fences: *V) ![]const u8 {
+    const target = try resolve(root, name);
+    if (std.mem.eql(u8, name, target)) return target;
+    for (fences.array.items) |fence| if (std.mem.eql(u8, fence.object.get("name").?.string, target)) return target;
+    const generation = @import("index_incarnation.zig").get(root.object.get(target).?) orelse 0;
+    const encoded = try std.json.Stringify.valueAlloc(a, .{ .name = target, .incarnation = generation }, .{});
+    try fences.array.append(try std.json.parseFromSliceLeaky(V, a, encoded, .{}));
+    return target;
+}
+
+fn bindIndexFields(a: A, root: V, value: *V, fences: *V) !void {
     if (value.* == .null) return;
     if (value.* != .object) return error.InvalidQueryRequest;
     for ([_][]const u8{ "index", "index_name" }) |field| {
         if (value.object.getPtr(field)) |name| {
             if (name.* != .string) return error.InvalidQueryRequest;
-            name.* = .{ .string = try a.dupe(u8, try resolve(root, name.string)) };
+            name.* = .{ .string = try a.dupe(u8, try bindName(a, root, name.string, fences)) };
         }
     }
 }
@@ -360,4 +458,30 @@ test "full text aliases and nullable optional query fields preserve public seman
     try bindQuery(a, root, &query);
     try std.testing.expectEqualStrings("text2", query.object.get("full_text_index").?.string);
     try std.testing.expect(query.object.get("indexes").? == .null);
+}
+
+test "index alias structural detection handles escaped keys and ignores user values" {
+    try std.testing.expect(uses("{\"\\u005findex_aliases\":{}}"));
+    try std.testing.expect(uses("{\"\\u005findex_alias_receipts\":{}}"));
+    try std.testing.expect(!uses("{\"description\":\"_index_aliases\"}"));
+    const a = std.testing.allocator;
+    const compact = try queryProjection(a, "{\"a\":{\"type\":\"graph\"},\"_index_aliases\":{\"live\":{\"index\":\"a\",\"readiness\":{\"complete\":true}}},\"_index_alias_receipts\":{\"live\":[]}}");
+    defer a.free(compact);
+    try std.testing.expect(std.mem.indexOf(u8, compact, "readiness") == null);
+    try std.testing.expect(std.mem.indexOf(u8, compact, receipts_key) == null);
+}
+
+test "index alias admission globally reclaims expired history and bounds retained bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ready = try std.json.parseFromSliceLeaky(V, a, "{\"complete\":true}", .{});
+    const first = try put(a, "{\"a\":{\"type\":\"full_text\"}}", "old", .{ .index = "a", .idempotency_key = "old" }, ready, 1);
+    const second = try put(a, first, "new", .{ .index = "a", .idempotency_key = "new" }, ready, receipt_lifetime_ms + 2);
+    const root = try std.json.parseFromSliceLeaky(V, a, second, .{});
+    try std.testing.expectEqual(@as(usize, 0), root.object.get(receipts_key).?.object.get("old").?.array.items.len);
+    var huge = ready;
+    try huge.object.put(a, "evidence", .{ .string = try a.alloc(u8, max_control_bytes) });
+    @memset(@constCast(huge.object.get("evidence").?.string), 'x');
+    try std.testing.expectError(error.IndexAliasReceiptCapacity, put(a, "{\"a\":{\"type\":\"full_text\"}}", "live", .{ .index = "a", .idempotency_key = "1" }, huge, 1));
 }

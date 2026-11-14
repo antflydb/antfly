@@ -43771,6 +43771,12 @@ pub const DB = struct {
 
     pub fn searchRequestAtCurrentIdentityGeneration(self: *DB, req: types.SearchRequest) !types.SearchRequest {
         if (comptime storage_engine.enabled) return storage_engine.call("searchRequestAtCurrentIdentityGeneration", .{ self, req });
+        // Caller owns apply-shared or a published catalog lease. Validation
+        // and lookup therefore observe the same incarnation as execution.
+        for (req.index_alias_fences) |fence| {
+            const incarnation = self.core.index_manager.coverageGenerationForIndex(fence.name) orelse return error.CatalogGenerationChanged;
+            if (incarnation != fence.incarnation) return error.CatalogGenerationChanged;
+        }
         var snapshot_req = req;
         snapshot_req.identity_read_generation = try self.currentIdentityReadGenerationForRequest(snapshot_req.identity_read_generation);
         try self.validateResolvedDocFilterWireContext(snapshot_req);
@@ -47583,7 +47589,7 @@ pub const DB = struct {
         // composed queries keep their existing synchronization.
         var remaining = req;
         const defaults: types.SearchRequest = .{};
-        inline for (.{ "query", "dense", "index_name", "primary_text_index_name", "profile", "limit", "offset", "include_stored", "include_all_fields", "defer_stored_projection", "search_effort", "identity_read_generation", "execution_deadline_ns", "cancellation", "document_authority_mode", "document_authority_group" }) |field| {
+        inline for (.{ "index_alias_fences", "query", "dense", "index_name", "primary_text_index_name", "profile", "limit", "offset", "include_stored", "include_all_fields", "defer_stored_projection", "search_effort", "identity_read_generation", "execution_deadline_ns", "cancellation", "document_authority_mode", "document_authority_group" }) |field| {
             @field(remaining, field) = @field(defaults, field);
         }
         // Empty slices from a decoded wire envelope need not share the
@@ -153401,4 +153407,25 @@ fn testDocumentGenerationPreparation(sparse: bool, sync_level: types.SyncLevel, 
         count += 1;
     }
     try std.testing.expect(count > 3);
+}
+
+test "index alias storage fences reject same-name replacement and survive query leases" {
+    const a = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("alias-fence");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(a, std.mem.span(path), .{ .primary_backend = .{ .mem = .{} } });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}", .coverage_generation = 41 });
+    const request: types.SearchRequest = .{ .index_alias_fences = &.{.{ .name = "text", .incarnation = 41 }} };
+    var lease = try db.beginQueryReadLease();
+    _ = try db.searchRequestAtCurrentIdentityGeneration(request);
+    lease.release();
+    _ = try db.deleteIndex("text");
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}", .coverage_generation = 42 });
+    lease = try db.beginQueryReadLease();
+    defer lease.release();
+    try std.testing.expectError(error.CatalogGenerationChanged, db.searchRequestAtCurrentIdentityGeneration(request));
+    _ = try db.searchRequestAtCurrentIdentityGeneration(.{ .index_alias_fences = &.{.{ .name = "text", .incarnation = 42 }} });
 }

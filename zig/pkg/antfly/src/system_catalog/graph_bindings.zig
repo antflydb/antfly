@@ -92,6 +92,17 @@ test "index alias SQL graph mappings bind names and incarnations per execution" 
     const selected = try cypher.dependencies.selectedIndexes(a, compiled.query, new_graph);
     try std.testing.expectEqual(@as(usize, 1), selected.len);
     try std.testing.expectEqualStrings("g2", selected[0]);
+    const sql_catalog = local.sql_catalog;
+    const graph_binding: sql_catalog.graph_relation.Binding = .{ .definition = .{ .name = .{ .table = "knowledge" }, .query = compiled.query, .parameters = &.{} }, .graph = new_graph, .catalog_json = "", .dependencies = &.{} };
+    const table: sql_catalog.Table = .{ .id = 7, .physical_name = "knowledge", .schema_version = 1, .columns = &.{}, .graph = &graph_binding };
+    const relation: local.sql_relation_binding.Bound = .{ .root = undefined, .scans = &.{.{ .table = table, .request = .{ .fields = &.{}, .limit = 1 } }}, .table = table, .statement = undefined };
+    const child: local.sql_describe.BoundStatement = .{ .table = null, .action = .read, .columns = &.{}, .parameter_types = &.{}, .json_literals = .empty, .relation = &relation };
+    const parent: local.sql_describe.BoundStatement = .{ .table = null, .action = .write, .columns = &.{}, .parameter_types = &.{}, .json_literals = .empty, .insert_source = &child };
+    var attribution = try local.sql_runtime.IndexAttribution.init(a, parent);
+    const observer = attribution.observer();
+    try observer.record(observer.ptr, "dense_search_target");
+    try observer.record(observer.ptr, "dense_search_target");
+    try std.testing.expectEqual(@as(usize, 2), attribution.value().?.len);
     const sql_output: local.sql_runtime.Output = .{ .command_tag = "SELECT", .resolved_indexes = selected };
     const sql_json = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, sql_output, .{ .emit_null_optional_fields = false }), .{});
     try std.testing.expectEqualStrings("g2", sql_json.object.get("resolved_indexes").?.array.items[0].string);

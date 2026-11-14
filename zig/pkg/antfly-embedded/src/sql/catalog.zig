@@ -992,6 +992,7 @@ pub const AggregatePartialCursor = struct {
 };
 
 pub const Backend = struct {
+    index_attribution: ?struct { ptr: *anyopaque, bind: *const fn (*anyopaque, ?@import("cypher").backend.IndexObserver) void } = null,
     distributed_join: ?DistributedJoin = null,
     distributed_context: @import("../api/operation.zig").RequestContext = .{},
     error_context: ?*@import("errors.zig").Context = null,

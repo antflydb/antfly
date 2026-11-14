@@ -296,6 +296,9 @@ fn runWithBinding(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: c
     if (backend.spill_manager == null and limits.spill_bytes != 0) if (backend.execution_io) |io| {
         manager = .{ .alloc = alloc, .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = limits.retained_bytes };
     };
+    var attribution = try IndexAttribution.init(arena, binding);
+    if (backend.index_attribution) |host| host.bind(host.ptr, attribution.observer());
+    defer if (backend.index_attribution) |host| host.bind(host.ptr, null);
     const context = Context{ .alloc = alloc, .arena = arena, .backend = statement_backend, .binding = binding, .parameters = prepared_parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null, .sink = sink };
     const stage = if (limits.profile) |profile| try profile.registerStage(@tagName(compiled.statement), if (binding.table) |table| table.physical_name else null) else null;
     const started = if (limits.profile) |profile| profile.now() else null;
@@ -307,12 +310,36 @@ fn runWithBinding(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: c
     if (limits.profile) |profile| {
         if (context.spill) |spill| profile.spill_written_bytes = spill.written_bytes;
     }
-    output.resolved_indexes = try resolvedGraphIndexNames(arena, binding);
+    output.resolved_indexes = attribution.value();
     return output;
 }
 
+pub const IndexAttribution = struct {
+    a: std.mem.Allocator,
+    names: std.ArrayList([]const u8) = .empty,
+    pub fn init(a: std.mem.Allocator, bound: describe.BoundStatement) !@This() {
+        var self: @This() = .{ .a = a };
+        if (try resolvedGraphIndexNames(a, bound)) |names| try self.names.appendSlice(a, names);
+        return self;
+    }
+    pub fn observer(self: *@This()) @import("cypher").backend.IndexObserver {
+        return .{ .ptr = self, .record = record };
+    }
+    fn record(ptr: *anyopaque, name: []const u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        for (self.names.items) |prior| if (std.mem.eql(u8, prior, name)) return;
+        const owned = try self.a.dupe(u8, name);
+        errdefer self.a.free(owned);
+        try self.names.append(self.a, owned);
+    }
+    pub fn value(self: @This()) ?[]const []const u8 {
+        return if (self.names.items.len == 0) null else self.names.items;
+    }
+};
+
 pub fn resolvedGraphIndexNames(a: std.mem.Allocator, bound: describe.BoundStatement) !?[]const []const u8 {
-    const relation = bound.relation orelse return null;
+    const relation = bound.relation;
+
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
     var names: std.ArrayList([]const u8) = .empty;
@@ -320,13 +347,25 @@ pub fn resolvedGraphIndexNames(a: std.mem.Allocator, bound: describe.BoundStatem
         for (names.items) |name| a.free(name);
         names.deinit(a);
     }
-    for (relation.scans) |scan| if (scan.table.graph) |graph| {
+    if (relation) |relations| for (relations.scans) |scan| if (scan.table.graph) |graph| {
         const selected = try @import("cypher").dependencies.selectedIndexes(scratch.allocator(), graph.definition.query, graph.graph);
         for (selected) |name| {
             const found = for (names.items) |prior| {
                 if (std.mem.eql(u8, prior, name)) break true;
             } else false;
             if (!found) {
+                const owned = try a.dupe(u8, name);
+                errdefer a.free(owned);
+                try names.append(a, owned);
+            }
+        }
+    };
+    for ([_]?*const describe.BoundStatement{ bound.insert_source, bound.returning, if (bound.joined_mutation) |joined| joined.input else null, if (bound.joined_mutation) |joined| joined.returning_binding else null, if (bound.merge_mutation) |merge| merge.input else null }) |child| if (child) |nested| {
+        for (try resolvedGraphIndexNames(scratch.allocator(), nested.*) orelse &.{}) |name| {
+            const duplicate = for (names.items) |prior| {
+                if (std.mem.eql(u8, prior, name)) break true;
+            } else false;
+            if (!duplicate) {
                 const owned = try a.dupe(u8, name);
                 errdefer a.free(owned);
                 try names.append(a, owned);

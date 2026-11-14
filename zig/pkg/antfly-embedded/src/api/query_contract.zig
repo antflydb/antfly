@@ -2405,6 +2405,7 @@ pub const OwnedQueryRequest = struct {
     projection_plan: ?*field_projection.Plan = null,
     fields: [][]const u8 = &.{},
     req: db_mod.types.SearchRequest = .{},
+    alias_fences: ?std.json.Parsed([]const db_mod.types.IndexAliasFence) = null,
     native_cut: ?std.json.Parsed(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child) = null,
 
     /// Physical preparation for a consumer borrowing encoded native sources.
@@ -2424,6 +2425,7 @@ pub const OwnedQueryRequest = struct {
         }
         freeSearchRequest(alloc, &self.req);
         if (self.native_cut) |*cut| cut.deinit();
+        if (self.alias_fences) |*fences| fences.deinit();
         self.* = undefined;
     }
 };
@@ -2464,13 +2466,22 @@ const NamedVectorQueries = struct {
     }
 };
 
+pub const BoundIndexAliases = struct {
+    body: []u8,
+    indexes_json: ?[]u8 = null,
+    pub fn deinit(self: @This(), a: std.mem.Allocator) void {
+        a.free(self.body);
+        if (self.indexes_json) |bytes| a.free(bytes);
+    }
+};
+
 pub const SemanticResolver = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
         /// Coordinator-only catalog binding, before parsing or embedding.
-        bind_index_aliases: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!?[]u8 = null,
+        bind_index_aliases: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!?BoundIndexAliases = null,
         resolve_dense_query: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -3027,9 +3038,20 @@ pub fn parseQueryRequestWithDeadline(
     execution_deadline_ns: ?u64,
 ) !OwnedQueryRequest {
     const bound = if (semantic_resolver) |resolver| if (resolver.vtable.bind_index_aliases) |bind| try bind(resolver.ptr, alloc, table_name, body) else null else null;
-    defer if (bound) |bytes| alloc.free(bytes);
-    var owned = try parseQueryRequestWithDeadlineCore(alloc, semantic_resolver, table_name, bound orelse body, execution_deadline_ns);
+    defer if (bound) |value| value.deinit(alloc);
+    var owned = try parseQueryRequestWithDeadlineCore(alloc, semantic_resolver, table_name, if (bound) |value| value.body else body, execution_deadline_ns);
     errdefer owned.deinit(alloc);
+    const effective_body = if (bound) |value| value.body else body;
+    if (std.mem.indexOf(u8, effective_body, "_index_alias_fences") != null) {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, effective_body, .{});
+        defer raw.deinit();
+        if (raw.value.object.get("_index_alias_fences")) |value| {
+            owned.alias_fences = try std.json.parseFromValue([]const db_mod.types.IndexAliasFence, alloc, value, .{ .allocate = .alloc_always });
+            if (owned.alias_fences.?.value.len > 64) return error.InvalidQueryRequest;
+            owned.req.index_alias_fences = owned.alias_fences.?.value;
+        }
+    }
+
     // Internal HTTP hops must retain the authenticated physical cut when the
     // generated public contract strips private shard fields. Public admission
     // rejects this control before entering the shared parser. Escaped member
@@ -4161,7 +4183,7 @@ fn preparedComputedOutput(a: std.mem.Allocator, req: db_mod.types.SearchRequest,
 fn hasNamedProjection(projection: ?*const field_projection.Plan) bool {
     return if (projection) |plan| plan.bindings.len != 0 else false;
 }
-fn resolvedIndexNames(a: std.mem.Allocator, req: db_mod.types.SearchRequest) !?[]const []const u8 {
+pub fn resolvedIndexNames(a: std.mem.Allocator, req: db_mod.types.SearchRequest) !?[]const []const u8 {
     var names = std.ArrayListUnmanaged([]const u8).empty;
     if (req.index_name) |name| try appendUniqueOwnedString(a, &names, name);
     if (req.primary_text_index_name) |name| try appendUniqueOwnedString(a, &names, name);
@@ -12823,6 +12845,7 @@ fn isInternalShardFieldName(name: []const u8) bool {
         "_exclusion_query_json",
         "_identity_read_generation",
         "_native_cut",
+        "_index_alias_fences",
         "_response_live_read",
         "_document_authority",
         "_privacy_policy_version",
@@ -13204,6 +13227,7 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_exclusion_query_json",
         "_identity_read_generation",
         "_native_cut",
+        "_index_alias_fences",
         "_response_live_read",
         "_document_authority",
         "_privacy_policy_version",

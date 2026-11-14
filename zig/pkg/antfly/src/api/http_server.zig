@@ -1919,6 +1919,7 @@ pub const SemanticStatusResolver = struct {
     server: ?*ApiHttpServer = null,
     catalog_resolver: ?*ApiHttpServer.CatalogQueryResolver = null,
     pinned_indexes_json: ?[]const u8 = null,
+    statement_indexes_json: ?[]const u8 = null,
     source: StatusSource,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     io: ?std.Io = null,
@@ -1944,28 +1945,41 @@ pub const SemanticStatusResolver = struct {
         };
     }
 
-    fn bindIndexAliases(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, body: []const u8) !?[]u8 {
+    fn bindIndexAliases(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, body: []const u8) !?query_contract.BoundIndexAliases {
         const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
         self.pinned_indexes_json = null;
         const server = self.server orelse return null;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const owner = if (self.catalog_resolver) |resolver| resolver.arena else a;
-        const table = (try server.queryTableDefinition(owner, self.catalog_resolver, table_name, .{
-            .deadline_ns = self.query_embedding_deadline_ns,
-            .cancellation = self.query_cancellation orelse .none,
-        })) orelse return null;
-        // Catalogs without aliases keep the original body and avoid JSON work.
-        if (std.mem.indexOf(u8, table.indexes_json, "_index_aliases") == null and std.mem.indexOfScalar(u8, table.indexes_json, '\\') == null) return null;
+        const owner = if (self.catalog_resolver) |resolver| resolver.arena else alloc;
+        const indexes_json = self.statement_indexes_json orelse table_indexes: {
+            const table = (try server.queryTableDefinition(if (self.catalog_resolver) |resolver| resolver.arena else a, self.catalog_resolver, table_name, .{
+                .deadline_ns = self.query_embedding_deadline_ns,
+                .cancellation = self.query_cancellation orelse .none,
+            })) orelse return null;
+            break :table_indexes table.indexes_json;
+        };
         const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
-        const compact = try server.index_alias_cache.project(server.alloc, owner, table.indexes_json);
+        if (std.mem.indexOf(u8, indexes_json, "_index_aliases") == null and std.mem.indexOfScalar(u8, indexes_json, '\\') == null) return null;
+        const compact = try server.index_alias_cache.project(server.alloc, owner, indexes_json);
+        const owned_compact = self.catalog_resolver == null;
+        errdefer if (owned_compact) alloc.free(compact);
         const catalog = try std.json.parseFromSliceLeaky(std.json.Value, a, compact, .{});
-        if (!catalog.object.contains(aliases.key)) return null;
-        if (self.catalog_resolver != null) self.pinned_indexes_json = compact;
+        if (!catalog.object.contains(aliases.key)) {
+            if (owned_compact) alloc.free(compact);
+            return null;
+        }
+        self.pinned_indexes_json = compact;
         var query = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{ .allocate = .alloc_always });
         try aliases.bindQuery(a, catalog, &query);
-        return try std.json.Stringify.valueAlloc(alloc, query, .{});
+        if (query.object.getPtr("_index_alias_fences")) |fences| for (fences.array.items) |*fence| {
+            if (fence.object.get("incarnation").?.integer != 0) continue;
+            const name = fence.object.get("name").?.string;
+            const identity = (try indexes_api.indexRuntimeIdentity(a, name, catalog.object.get(name) orelse return error.InvalidTableIndexMetadata)) orelse return error.InvalidTableIndexMetadata;
+            try fence.object.put(a, "incarnation", .{ .integer = @intCast(identity.incarnation) });
+        };
+        return .{ .body = try std.json.Stringify.valueAlloc(alloc, query, .{}), .indexes_json = if (owned_compact) compact else null };
     }
 
     fn resolveDenseQuery(
@@ -10970,10 +10984,15 @@ pub const ApiHttpServer = struct {
         defer alias_arena.deinit();
         const scratch = alias_arena.allocator();
         var concrete_index = index_name;
+        var selected_identity: ?distributed_graph.GraphIndexIdentity = null;
         if (try self.queryTableDefinition(scratch, null, table_name, .{})) |table| {
             const compact = try self.index_alias_cache.project(self.alloc, scratch, table.indexes_json);
             const alias_catalog = try std.json.parseFromSliceLeaky(std.json.Value, scratch, compact, .{});
             concrete_index = try @import("antfly_local_sources").api_index_metadata.aliases.resolve(alias_catalog, index_name);
+            if (!std.mem.eql(u8, concrete_index, index_name)) {
+                const identity = (try indexes_api.indexRuntimeIdentity(scratch, concrete_index, alias_catalog.object.get(concrete_index).?)) orelse return error.IndexNotFound;
+                selected_identity = .{ .incarnation = identity.incarnation, .config_hash = identity.config_hash };
+            }
         }
         const SourceWorker = struct {
             server: *ApiHttpServer,
@@ -11059,7 +11078,7 @@ pub const ApiHttpServer = struct {
             .server = self,
             .source = source,
         };
-        return try distributed_graph.probeIncomingEdgesForKeys(
+        return try distributed_graph.probeIncomingEdgesForKeysWithOptions(
             alloc,
             catalog,
             worker.iface(),
@@ -11069,6 +11088,7 @@ pub const ApiHttpServer = struct {
             concrete_index,
             keys,
             .read_index,
+            .{ .index_identity = selected_identity },
         );
     }
 
@@ -17083,6 +17103,18 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn indexAliasTargetResource(self: *ApiHttpServer, alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, index: []const u8, request: api_operation.RequestContext) ![]u8 {
+        if (table.storage.engine == .object) {
+            var schema = try schema_mod.parseValidatedTableSchema(alloc, table.schema_json);
+            defer schema.deinit(alloc);
+            if (schema.external_base_source == null) {
+                const suffix = try std.fmt.allocPrint(alloc, "indexes/{s}", .{index});
+                defer alloc.free(suffix);
+                var response = (try self.tryObjectTableRequestWithOptions(table.name, .get, suffix, "", null, request, .{ .incarnation = .{ .table_id = table.table_id, .generation = table.object_storage_generation } })) orelse return error.UnsupportedOperation;
+                defer response.deinit(self.alloc);
+                if (response.status != 200) return error.IndexAliasTargetNotReady;
+                return alloc.dupe(u8, response.body);
+            }
+        }
         return getIndexResourceWithExpected(self, alloc, table.name, index, request, table);
     }
 
@@ -23526,8 +23558,8 @@ pub const ApiHttpServer = struct {
         alias_resolver.query_embedding_deadline_ns = request_context.deadline_ns;
         alias_resolver.query_cancellation = request_context.cancellation;
         const alias_body = if (self.source.vtable.supports_object_tables) try SemanticStatusResolver.bindIndexAliases(&alias_resolver, self.alloc, table_name, body) else null;
-        defer if (alias_body) |bytes| self.alloc.free(bytes);
-        if (try self.tryObjectTableRequestWithOptions(table_name, .post, "query", alias_body orelse body, authenticated_identity, request_context, .{ .has_join = bound_join != null, .resolver = catalog_resolver, .incarnation = if (bound_dispatch) |binding| binding.incarnation else null })) |response| {
+        defer if (alias_body) |value| value.deinit(self.alloc);
+        if (try self.tryObjectTableRequestWithOptions(table_name, .post, "query", if (alias_body) |value| value.body else body, authenticated_identity, request_context, .{ .has_join = bound_join != null, .resolver = catalog_resolver, .incarnation = if (bound_dispatch) |binding| binding.incarnation else null })) |response| {
             var owned = response;
             errdefer owned.deinit(self.alloc);
             if (owned.status == 200) {
@@ -23821,7 +23853,7 @@ pub const ApiHttpServer = struct {
         return switch (err) {
             error.ObjectTableJoinUnsupported => try contextual_operations.textAlloc(self.alloc, 400, "object table joins are not supported"),
             error.Forbidden => try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden"),
-            error.CatalogGenerationChanged, error.TableGenerationChanged, error.LakeSourceOwnerRequired => try contextual_operations.jsonErrorAlloc(self.alloc, 409, "catalog changed during query binding"),
+            error.PreparedGenerationChanged, error.CatalogGenerationChanged, error.TableGenerationChanged, error.LakeSourceOwnerRequired => try contextual_operations.jsonErrorAlloc(self.alloc, 409, "catalog changed during query binding"),
             error.InvalidCatalogName => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid table target"),
             error.InvalidComposedGraphIdentity, error.InvalidQueryRequest => if (db_mod.peekLastSortRejectionDiagnostic() != null)
                 try contextualUnsupportedExactSortResponse(self.alloc)
@@ -63435,4 +63467,40 @@ test "system catalog graph physical endpoints recheck logical grants and binding
     try std.testing.expectEqual(@as(usize, 1), fake.forward_reads);
     fake.revision += 1;
     try std.testing.expectError(error.CatalogGenerationChanged, ApiHttpServer.CatalogGraphReadContext.authorize(&context, a, "table:another"));
+}
+
+test "index alias production resolver owns its producer cut without a catalog resolver" {
+    const alias_catalog = @import("antfly_local_sources").api_index_metadata.aliases;
+    const Fake = struct {
+        table: metadata_table_manager.TableRecord,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 0 };
+        }
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = @as(*[1]metadata_table_manager.TableRecord, @ptrCast(&self.table)), .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"complete\":true}", .{});
+    const base = "{\"a\":{\"type\":\"embeddings\",\"_index_incarnation\":41},\"b\":{\"type\":\"embeddings\",\"_index_incarnation\":42}}";
+    const first = try alias_catalog.put(scratch, base, "live", .{ .index = "a", .idempotency_key = "1" }, ready, 1);
+    const second = try alias_catalog.put(scratch, first, "live", .{ .index = "b", .expected_index = "a", .idempotency_key = "2" }, ready, 2);
+    var fake: Fake = .{ .table = .{ .table_id = 1, .name = "docs", .indexes_json = first } };
+    var server = ApiHttpServer.init(a, .{ .deployment_mode = .standalone }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free } }, null, null);
+    defer server.deinit();
+    var resolver = server.semanticStatusResolver(.internal, "");
+    const iface = resolver.iface();
+    const bound = (try iface.vtable.bind_index_aliases.?(iface.ptr, a, "docs", "{\"indexes\":[\"live\"],\"semantic_search\":\"hello\"}")).?;
+    defer bound.deinit(a);
+    fake.table.indexes_json = second;
+    var document = try std.json.parseFromSlice(std.json.Value, a, bound.body, .{});
+    defer document.deinit();
+    try std.testing.expectEqualStrings("a", document.value.object.get("indexes").?.array.items[0].string);
+    try std.testing.expectEqual(@as(i64, 41), document.value.object.get("_index_alias_fences").?.array.items[0].object.get("incarnation").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, resolver.pinned_indexes_json.?, "\"index\":\"a\"") != null);
 }

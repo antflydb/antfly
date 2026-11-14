@@ -744,6 +744,7 @@ pub const Stream = struct {
     settings: ?*@import("setting_catalog.zig").View = null,
     parameter_invocation: ?*@import("parameter_binding.zig").Invocation = null,
     context: runtime.Context,
+    attribution: runtime.IndexAttribution = undefined,
     cursor: ?catalog.Cursor = null,
     spool: ?*Spool = null,
     stream_manager: ?*@import("spill.zig").Manager = null,
@@ -839,6 +840,9 @@ pub const Stream = struct {
         execution_limits.parameter_cells = null;
         execution_limits.parameter_owner = null;
         self.context = .{ .alloc = self.budget.allocator(), .arena = arena, .backend = @import("decision_eval.zig").scopedBackend(statement_backend, binding), .binding = binding, .parameters = &.{}, .limits = execution_limits, .typed_output = true };
+        self.attribution = try runtime.IndexAttribution.init(arena, binding);
+        if (backend.index_attribution) |host| host.bind(host.ptr, self.attribution.observer());
+        errdefer if (backend.index_attribution) |host| host.bind(host.ptr, null);
         const params = if (self.parameter_invocation) |invocation| try invocation.compatibilityValues(arena) else try arena.dupe(Json, parameters);
         self.context.parameters = params;
         try @import("decision_eval.zig").validateStatement(arena, self.context.backend.decision_provider, binding, params);
@@ -992,6 +996,7 @@ pub const Stream = struct {
     }
 
     pub fn close(self: *Stream) void {
+        if (self.context.backend.index_attribution) |host| host.bind(host.ptr, null);
         const owner = self.owner;
         if (self.parallel) |pipeline| pipeline.close();
         if (self.pending_columns) |page| page.deinit();
@@ -1127,7 +1132,7 @@ pub const Stream = struct {
         }
         self.emitted += read;
         self.exhausted = spool.index == spool.count();
-        return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .resolved_indexes = try runtime.resolvedGraphIndexNames(arena.allocator(), self.context.binding), .columns = self.context.binding.columns, .rows = rows[0..read], .sql_nulls = flags[0..read], .command_tag = "SELECT" } };
+        return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .resolved_indexes = self.attribution.value(), .columns = self.context.binding.columns, .rows = rows[0..read], .sql_nulls = flags[0..read], .command_tag = "SELECT" } };
     }
     fn columnProgram(self: *Stream, a: std.mem.Allocator, program: *const @import("scalar.zig").Program, page: catalog.ColumnPage) ![]const @import("scalar.zig").Datum {
         if (try @import("vector_eval.zig").evaluateDictionaryColumns(a, program, page, self.context.binding.scalars.columns, self.context.parameters)) |encoded| {
@@ -1468,7 +1473,7 @@ pub const Stream = struct {
             }
             if (bytes >= self.context.limits.page_bytes) break;
         }
-        return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .resolved_indexes = try runtime.resolvedGraphIndexNames(arena.allocator(), self.context.binding), .columns = self.context.binding.columns, .rows = rows.items, .sql_nulls = flags.items, .command_tag = "SELECT" } };
+        return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .resolved_indexes = self.attribution.value(), .columns = self.context.binding.columns, .rows = rows.items, .sql_nulls = flags.items, .command_tag = "SELECT" } };
     }
     fn columnsEligible(self: *Stream) bool {
         const cursor = self.cursor orelse return false;
@@ -1598,7 +1603,7 @@ pub const Stream = struct {
             self.cursor = null;
         }
         return .{ .arena = arena, .exhausted = self.exhausted, .output = .{
-            .resolved_indexes = try runtime.resolvedGraphIndexNames(arena.allocator(), self.context.binding),
+            .resolved_indexes = self.attribution.value(),
             .columns = self.context.binding.columns,
             .rows = rows.items,
             .sql_nulls = flags.items,

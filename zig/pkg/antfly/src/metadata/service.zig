@@ -3578,6 +3578,9 @@ test "index alias decoder floor composes with table features and preserves CAS h
     const plain: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs" };
     const floor = metadata_topology_protocol.index_aliases_version;
     try std.testing.expectEqual(floor, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = aliases }));
+    const envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .topology = .{ .create = .{ .table = aliases } } }, .{});
+    defer std.testing.allocator.free(envelope);
+    try std.testing.expectEqual(floor, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = envelope }));
     try std.testing.expectEqual(floor, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = aliases, .replacement = plain } }));
     try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(0, 3));
     try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(7, 2));
@@ -3597,7 +3600,7 @@ fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16
         },
         else => "",
     };
-    if (metadata_topology_protocol.usesIndexAliases(namespace_indexes)) return metadata_topology_protocol.index_aliases_version;
+    if (namespace_indexes.len != 0 and @import("antfly_local_sources").api_index_metadata.aliases.usesEnvelope(namespace_indexes)) return metadata_topology_protocol.index_aliases_version;
     if (metadata_topology_protocol.usesPrivacy(namespace_indexes)) return metadata_topology_protocol.privacy_version;
     if (metadata_topology_protocol.usesResolverRecords(namespace_indexes)) return metadata_topology_protocol.resolver_records_version;
     if (metadata_topology_protocol.usesResolverNamespaces(namespace_indexes)) return metadata_topology_protocol.resolver_namespaces_version;

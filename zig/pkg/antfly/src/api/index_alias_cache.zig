@@ -22,50 +22,73 @@ const A = std.mem.Allocator;
 const V = std.json.Value;
 
 pub const Cache = struct {
-    const Entry = struct { digest: [32]u8, bytes: []u8 };
+    const Entry = struct {
+        digest: [32]u8,
+        bytes: []u8,
+        references: std.atomic.Value(usize) = .init(1),
+        fn release(self: *@This(), a: A) void {
+            if (self.references.fetchSub(1, .acq_rel) == 1) {
+                a.free(self.bytes);
+                a.destroy(self);
+            }
+        }
+    };
     const max_bytes = 1024 * 1024;
     mutex: std.atomic.Mutex = .unlocked,
-    entries: [32]?Entry = @splat(null),
+    entries: [32]?*Entry = @splat(null),
     next: usize = 0,
     retained_bytes: usize = 0,
 
     pub fn deinit(self: *Cache, a: A) void {
-        for (self.entries) |entry| if (entry) |value| a.free(value.bytes);
+        for (self.entries) |entry| if (entry) |value| value.release(a);
         self.* = .{};
     }
 
     pub fn project(self: *Cache, cache_allocator: A, out: A, bytes: []const u8) ![]u8 {
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-        {
+        const hit: ?*Entry = found: {
             sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
             for (self.entries) |entry| if (entry) |value| {
-                if (std.mem.eql(u8, &value.digest, &digest)) return out.dupe(u8, value.bytes);
+                if (std.mem.eql(u8, &value.digest, &digest)) {
+                    _ = value.references.fetchAdd(1, .monotonic);
+                    break :found value;
+                }
             };
+            break :found null;
+        };
+        if (hit) |value| {
+            defer value.release(cache_allocator);
+            return out.dupe(u8, value.bytes);
         }
         const compact = try projection(out, bytes);
         // Admission failure affects only the cache, never query availability.
         if (compact.len > max_bytes) return compact;
         const retained = cache_allocator.dupe(u8, compact) catch return compact;
+        const new_entry = cache_allocator.create(Entry) catch {
+            cache_allocator.free(retained);
+            return compact;
+        };
+        new_entry.* = .{ .digest = digest, .bytes = retained };
         sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         for (self.entries) |entry| if (entry) |value| {
             if (std.mem.eql(u8, &value.digest, &digest)) {
-                cache_allocator.free(retained);
+                new_entry.release(cache_allocator);
                 return compact;
             }
         };
         while (true) {
             if (self.entries[self.next]) |entry| {
                 self.retained_bytes -= entry.bytes.len;
-                cache_allocator.free(entry.bytes);
+                entry.release(cache_allocator);
                 self.entries[self.next] = null;
             }
             if (self.retained_bytes + retained.len <= max_bytes) break;
             self.next = (self.next + 1) % self.entries.len;
         }
-        self.entries[self.next] = .{ .digest = digest, .bytes = retained };
+        self.entries[self.next] = new_entry;
         self.retained_bytes += retained.len;
         self.next = (self.next + 1) % self.entries.len;
         return compact;

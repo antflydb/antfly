@@ -17763,13 +17763,11 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "409":
           description: Stale expected target, incompatible kind, unready target, or catalog conflict
-        "501":
-          description: This index kind or runtime does not support alias mutations
     put:
       tags: [index_management]
       operationId: putTableIndexAlias
       summary: Atomically create or swap an index alias
-      description: Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias; a full retention window rejects new mutations with HTTP 409.
+      description: Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias, 64 aliases per table, and 512 KiB of retained alias control state per table. Every mutation reclaims expired receipts across the table; capacity exhaustion rejects new mutations with HTTP 409.
       requestBody:
         required: true
         content:
@@ -17789,6 +17787,8 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "409":
           description: Stale expected target, incompatible kind, unready target, or catalog conflict
+        "501":
+          description: This index kind or runtime does not support alias mutations
   /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}:
     parameters:
       - name: databaseName
@@ -17825,13 +17825,11 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "409":
           description: Stale expected target, incompatible kind, unready target, or catalog conflict
-        "501":
-          description: This index kind or runtime does not support alias mutations
     put:
       tags: [index_management]
       operationId: putNamespaceTableIndexAlias
       summary: Atomically create or swap an index alias
-      description: Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias; a full retention window rejects new mutations with HTTP 409.
+      description: Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias, 64 aliases per table, and 512 KiB of retained alias control state per table. Every mutation reclaims expired receipts across the table; capacity exhaustion rejects new mutations with HTTP 409.
       requestBody:
         required: true
         content:
@@ -17851,6 +17849,8 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "409":
           description: Stale expected target, incompatible kind, unready target, or catalog conflict
+        "501":
+          description: This index kind or runtime does not support alias mutations
   /tables/{tableName}/indexes:
     parameters:
       - name: tableName

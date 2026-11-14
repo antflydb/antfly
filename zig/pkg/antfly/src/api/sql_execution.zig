@@ -197,6 +197,7 @@ pub const Adapter = struct {
     dynamic_table: ?[]const u8 = null,
     ranges_staged: bool = false,
     inserting: bool = false,
+    index_attribution_sink: ?@import("cypher").backend.IndexObserver = null,
     prepared_bindings: ?[]const @import("sql_prepared.zig").Binding = null,
     setting_overlay: []const setting_catalog.OverlayEntry = &.{},
     /// Pgwire supplies its own connection-owned overlay. HTTP attached
@@ -230,6 +231,10 @@ pub const Adapter = struct {
         return self.graph_parameters[index - 1];
     }
 
+    fn bindIndexAttribution(ptr: *anyopaque, sink: ?@import("cypher").backend.IndexObserver) void {
+        const self: *Adapter = @ptrCast(@alignCast(ptr));
+        self.index_attribution_sink = sink;
+    }
     pub fn decisionRuntime(self: *Adapter) !?@import("antfly_local_sources").functions_runtime.Runtime {
         if (self.server.cfg.node_config) |config| {
             if (config.registry.decider_configs.count() > 0) {
@@ -635,7 +640,7 @@ pub const Adapter = struct {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
-        return .{ .distributed_join = self.server.cfg.distributed_sql_join, .distributed_context = self.context, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .estimate_scans = estimateScans, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .index_attribution = .{ .ptr = self, .bind = bindIndexAttribution }, .distributed_join = self.server.cfg.distributed_sql_join, .distributed_context = self.context, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .resolve_graph = resolveGraph, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .estimate_scans = estimateScans, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -808,7 +813,7 @@ pub const Adapter = struct {
         const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
         if (table.table_id == 0 or definition.table_id != table.table_id) return error.InvalidSqlBackendResponse;
         var binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), alloc, definition.schema_json, table.table_id, table.name);
-        binding.index_catalog_json = if (std.mem.indexOf(u8, definition.indexes_json, "_index_aliases") != null)
+        binding.index_catalog_json = if ((std.mem.indexOf(u8, definition.indexes_json, "_index_aliases") != null or std.mem.indexOfScalar(u8, definition.indexes_json, '\\') != null))
             try self.server.index_alias_cache.project(self.server.alloc, alloc, definition.indexes_json)
         else
             "{}";
@@ -2306,7 +2311,7 @@ pub const Adapter = struct {
         }
         owner.* = .{ .a = a, .adapter = self, .guard_tables = guard_tables.items, .arena = arena, .read = read, .cursors = try owned.alloc(catalog.Cursor, requests.len) };
         errdefer for (owner.cursors[0..owner.opened]) |cursor| cursor.close(cursor.ptr);
-        owner.authority = .{ .server = self.server, .identity = self.identity, .context = self.context, .name = graph.graph.name, .record_id = graph.graph.incarnation, .tables = inputs, .writes = false, .read = &owner.read, .role_revision = role_revision };
+        owner.authority = .{ .server = self.server, .identity = self.identity, .context = self.context, .name = graph.graph.name, .record_id = graph.graph.incarnation, .index_catalogs = tables.items, .attribution_sink = self.index_attribution_sink, .attribution_allocator = owned, .tables = inputs, .writes = false, .read = &owner.read, .role_revision = role_revision };
         owner.authority.catalog_guard = .{ .ptr = owner, .call = GraphStatement.validateCatalog };
         const authority = &owner.authority;
         var client: cypher.rpc.Client = .{ .channel = authority.rpcChannel(), .incarnation = graph.graph.incarnation, .revision = graph.graph.revision };

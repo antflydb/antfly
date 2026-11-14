@@ -36,6 +36,8 @@ pub const TableRecord = struct {
     schema_json: []const u8 = "",
     read_schema_json: []const u8 = "",
     indexes_json: []const u8 = "{}",
+    /// Derived, owned query projection; never part of authoritative JSON/CAS.
+    query_indexes_json: []const u8 = "",
     replication_sources_json: []const u8 = "[]",
     placement_role: []const u8 = "data",
     restore_backup_id: []const u8 = "",
@@ -46,6 +48,7 @@ pub const TableRecord = struct {
     pub fn jsonStringify(self: TableRecord, jw: anytype) !void {
         try jw.beginObject();
         inline for (@typeInfo(TableRecord).@"struct".field_names) |field_name| {
+            if (comptime std.mem.eql(u8, field_name, "query_indexes_json")) continue;
             const object_field = comptime std.mem.eql(u8, field_name, "object_storage_generation") or std.mem.eql(u8, field_name, "object_storage_identity");
             if ((!object_field or self.storage.engine == .object) and (!std.mem.eql(u8, field_name, "lake_index_catalog_json") or self.lake_index_catalog_json.len != 0)) {
                 try jw.objectField(field_name);

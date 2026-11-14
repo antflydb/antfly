@@ -7978,8 +7978,6 @@ paths:
           $ref: '#/components/responses/InternalServerError'
         '409':
           description: Stale expected target, incompatible kind, unready target, or catalog conflict
-        '501':
-          description: This index kind or runtime does not support alias mutations
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -8015,6 +8013,8 @@ paths:
           $ref: '#/components/responses/InternalServerError'
         '409':
           description: Stale expected target, incompatible kind, unready target, or catalog conflict
+        '501':
+          description: This index kind or runtime does not support alias mutations
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -8061,8 +8061,6 @@ paths:
           $ref: '#/components/responses/InternalServerError'
         '409':
           description: Stale expected target, incompatible kind, unready target, or catalog conflict
-        '501':
-          description: This index kind or runtime does not support alias mutations
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -8098,6 +8096,8 @@ paths:
           $ref: '#/components/responses/InternalServerError'
         '409':
           description: Stale expected target, incompatible kind, unready target, or catalog conflict
+        '501':
+          description: This index kind or runtime does not support alias mutations
       security:
         - BasicAuth: []
         - ApiKeyAuth: []

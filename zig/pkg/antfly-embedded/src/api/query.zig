@@ -10001,3 +10001,6 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
     };
     return &result;
 }
+
+pub const BoundIndexAliases = query_contract.BoundIndexAliases;
+pub const resolvedIndexNames = query_contract.resolvedIndexNames;

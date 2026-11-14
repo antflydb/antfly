@@ -37514,13 +37514,6 @@ export interface operations {
                 content?: never;
             };
             500: components["responses"]["InternalServerError"];
-            /** @description This index kind or runtime does not support alias mutations */
-            501: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
         };
     };
     putTableIndexAlias: {
@@ -37558,6 +37551,13 @@ export interface operations {
                 content?: never;
             };
             500: components["responses"]["InternalServerError"];
+            /** @description This index kind or runtime does not support alias mutations */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     getNamespaceTableIndexAlias: {
@@ -37593,13 +37593,6 @@ export interface operations {
                 content?: never;
             };
             500: components["responses"]["InternalServerError"];
-            /** @description This index kind or runtime does not support alias mutations */
-            501: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
         };
     };
     putNamespaceTableIndexAlias: {
@@ -37639,6 +37632,13 @@ export interface operations {
                 content?: never;
             };
             500: components["responses"]["InternalServerError"];
+            /** @description This index kind or runtime does not support alias mutations */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     listIndexes: {
