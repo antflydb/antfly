@@ -742,6 +742,47 @@ fn runSweep(allocator: Allocator, seed_count: u64, steps: usize, page_reuse: boo
     }
 }
 
+// perf/lwa-reuse-loss (Bug 2 of the reclamation sweep): a durable commit
+// that falls back to a bare checkpoint-slot publish (the redo log too full
+// even for its own minimal tracking entry) used to check only *this*
+// commit's own `redo.logical_pending`, not whether `redo.shared` still held
+// *any* unfolded logical head from an earlier commit. Publishing the slot
+// in that state claims `checkpoint.commit_sequence` covers every version at
+// or below it, when an earlier, still-only-logical key is not actually in
+// real pages yet -- `recoverRedoLog`'s replay then skips that key as
+// "already in the checkpoint" on the next reopen, losing it outright.
+// Minimal direct repro (`page_reuse = true`, the product default).
+test "storage.lite. redo differential oracle: direct repro seed=5 steps=44 reuse=1dce (orphaned pre-fold head lost across a log-full bare-slot publish)" {
+    const allocator = std.testing.allocator;
+    try runSeed(allocator, 5, 44, true);
+}
+
+// perf/lwa-reuse-loss (Bug 2 of the reclamation sweep): `Store.openWithOptions`
+// runs `maintainOnce(false)` unconditionally on every open of a writable,
+// non-externally-locked store. Under redo, once `retirementNeedsService()`
+// sees overlay retirement debt (any key superseded/overwritten since the
+// last fold -- common after a run of overwrites/deletes), that call reaches
+// `reclaimPagesImpl`'s ledger/free-map body, which sets `redo.checkpointing
+// = true` to get a real, physically-published commit for its own
+// bookkeeping (`next.commit_sequence += 1`) -- the same real-publish branch
+// of `publishCheckpoint` `checkpointRedoLog`'s own fold uses. Unlike that
+// fold, this commit never touches `redo.shared` at all: it folds no
+// document/catalog head and never advances `redo.checkpoint_sequence` (the
+// true boundary below which content is actually in the real tree). The
+// freshly-consumed `commit_sequence` is still written to the real,
+// physical checkpoint slot, though -- so on the *next* reopen,
+// `recoverRedoLog`'s replay treats that higher number as "already in the
+// checkpoint" and skips every still-unfolded log record at or below it,
+// even ones that were never folded. Reproduces deterministically: open,
+// write and delete/overwrite enough keys to leave the overlay with
+// superseded chains, reopen (consumes the stray sequence), reopen again
+// with no write in between (now replays with the stale cutoff and loses
+// whatever was still only logical).
+test "storage.lite. redo differential oracle: direct repro seed=1 steps=130 reuse=1dce (maintainOnce's bookkeeping-only commit advances commit_sequence past the true fold boundary)" {
+    const allocator = std.testing.allocator;
+    try runSeed(allocator, 1, 130, true);
+}
+
 test "storage.lite. redo differential oracle: redo log vs legacy commit path" {
     const allocator = std.testing.allocator;
     const seed_count = envUsize("ANTFLY_LITE_REDO_ORACLE_SEEDS", default_seed_count);
