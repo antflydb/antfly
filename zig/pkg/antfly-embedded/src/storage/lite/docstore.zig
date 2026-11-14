@@ -3004,10 +3004,7 @@ pub const Store = struct {
         // of the budget, floored at 64 KiB so there is still a usable log
         // -- rather than the flat default; an unbounded (`0`) budget, the
         // common/production case, keeps the full default untouched.
-        const redo_log_capacity_bytes = if (opts.reclamation.max_storage_bytes != 0)
-            @min(native.NativeFile.default_redo_log_capacity_bytes, @max(opts.reclamation.max_storage_bytes / 4, 64 * 1024))
-        else
-            native.NativeFile.default_redo_log_capacity_bytes;
+        const redo_log_capacity_bytes = native.NativeFile.redoLogCapacityForBudget(opts.reclamation.max_storage_bytes);
         const minimum = native.NativeFile.minimumOwnerStorageBytes(opts.reclamation.page_reuse) +| (if (use_redo_log) redo_log_capacity_bytes else 0);
         if (opts.reclamation.max_storage_bytes != 0 and minimum > opts.reclamation.max_storage_bytes) return error.LiteStorageBudgetExceeded;
         const available = if (opts.reclamation.capacity_probe) |probe|
@@ -3030,6 +3027,7 @@ pub const Store = struct {
         file.externally_locked = opts.externally_locked;
         file.reserve_retirement_capacity = true;
         if (opts.reclamation.max_storage_bytes != 0) file.max_file_bytes = opts.reclamation.max_storage_bytes;
+        file.redo_log_budget_bytes = opts.reclamation.max_storage_bytes;
         file.vacuum_target_indexed = opts.reclamation.page_reuse;
         var result: Store = .{
             .score_cache_owner = next_score_cache_owner.fetchAdd(1, .monotonic),
@@ -4072,6 +4070,12 @@ pub const Store = struct {
     /// Called by serialized adapters before direct native publication.
     pub fn refreshAdmissionAssumeLocked(self: *Store) !void {
         const options = self.maintenance_policy.options;
+        // §9.7f: the *configured* budget, deliberately not the
+        // disk/workspace-adjusted `max_file_bytes` computed below --
+        // `checkpointRedoLog`'s own `maybeShrinkRedoLogCapacity` must
+        // track a budget the caller actually set, never a transient dip
+        // in available disk space.
+        self.file.redo_log_budget_bytes = options.max_storage_bytes;
         self.maintenance_policy.status.artifact_file_bytes = self.artifactBytes();
         const budget_limit: ?u64 = if (options.max_storage_bytes == 0) null else options.max_storage_bytes -| self.totalRetiredFileBytes() -| self.maintenance_policy.status.temporary_bytes -| self.artifactBytes();
         const size = self.file.activeCheckpoint().page_count *| self.file.header.page_size;
@@ -5361,7 +5365,35 @@ pub const Store = struct {
 
     fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool) !void {
         const ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
-        return ticket.wait();
+        ticket.wait() catch |err| {
+            // §9.7f: a redo-log file's own fixed log-capacity reservation
+            // can go stale -- frozen at whatever it was sized to when
+            // `max_storage_bytes` was last this large -- after the
+            // caller lowers the budget well below it
+            // (`refreshAdmissionAssumeLocked` updates
+            // `self.file.redo_log_budget_bytes` on every commit, but
+            // nothing previously ever re-sized the reservation itself
+            // to match). Rejected only for that reason, a fold
+            // (`checkpointRedoLog`, whose own epilogue shrinks the
+            // reservation to what the *current* budget implies,
+            // `NativeFile.maybeShrinkRedoLogCapacity`) can free enough
+            // of it for this exact write to go on to succeed. Retried at
+            // most once, and only when there is a real, currently
+            // oversized reservation to shrink -- never for an ordinary,
+            // already-right-sized budget rejection (every other
+            // existing "budget correctly rejects this write" test's own
+            // behavior is unaffected: for those, this condition is
+            // false and the original error returns unchanged).
+            if (err == error.LiteStorageBudgetExceeded and self.file.redo != null and
+                native.NativeFile.redoLogCapacityForBudget(self.file.redo_log_budget_bytes) < self.file.header.redo_log_capacity)
+            {
+                if (self.file.checkpointRedoLog()) |_| {
+                    const retry_ticket = try self.stage(.{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease });
+                    return retry_ticket.wait();
+                } else |_| {}
+            }
+            return err;
+        };
     }
 
     /// Apply every member of one bounded group inside a single native

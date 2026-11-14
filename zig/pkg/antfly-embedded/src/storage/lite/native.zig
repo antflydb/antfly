@@ -6991,6 +6991,16 @@ pub const NativeFile = struct {
     /// gap's exact window (see that function's own doc comment) instead
     /// of a hand-rolled approximation of it.
     test_skip_redo_log_zero: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    /// §9.7f: the caller's own *configured* `reclamation.max_storage_bytes`
+    /// (`0` meaning unbounded) -- deliberately not `max_file_bytes`, which
+    /// also folds in transient disk-headroom/workspace adjustments
+    /// (`docstore.Store.refreshAdmissionAssumeLocked`) that should never
+    /// drive a log-capacity resize. Set once at creation
+    /// (`docstore.Store.createWithOptions`) and refreshed on every commit
+    /// alongside `max_file_bytes`, so `checkpointRedoLog`'s own fold
+    /// (`maybeShrinkRedoLogCapacity`) always sees the budget as the caller
+    /// most recently configured it, not just the one in effect at creation.
+    redo_log_budget_bytes: u64 = 0,
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !NativeFile {
         return try openWithOptions(allocator, path, .{ .read_only = read_only });
@@ -7211,6 +7221,21 @@ pub const NativeFile = struct {
     /// no prior sizing precedent exists in this codebase to inherit, so
     /// this is a deliberately modest default, not a measured optimum.
     pub const default_redo_log_capacity_bytes: u64 = 512 * 1024;
+
+    /// §9.7a/§9.7f: the redo-log capacity reservation a given configured
+    /// `reclamation.max_storage_bytes` implies (`0` meaning unbounded).
+    /// Shared by `docstore.Store.createWithOptions` (the reservation a
+    /// newly-created file starts with) and `checkpointRedoLog`'s own
+    /// fold (`maybeShrinkRedoLogCapacity`, which re-derives this on every
+    /// fold so an *existing* file's reservation tracks a budget the
+    /// caller lowers after creation too, not just the one in effect
+    /// when the file was first created).
+    pub fn redoLogCapacityForBudget(max_storage_bytes: u64) u64 {
+        return if (max_storage_bytes != 0)
+            @min(default_redo_log_capacity_bytes, @max(max_storage_bytes / 4, 64 * 1024))
+        else
+            default_redo_log_capacity_bytes;
+    }
 
     /// §9.7f: the floor below which `docstore.Store.createWithOptions`
     /// defaults a newly-created file's `use_redo_log` to `false` (legacy
@@ -7914,6 +7939,12 @@ pub const NativeFile = struct {
                 try self.file.writePositionalAll(io, zeros, self.header.redo_log_offset);
                 try self.file.sync(io);
             }
+            // §9.7f: the same "no cross-process reader pinned below the
+            // checkpoint this fold just published" gate this branch
+            // already establishes is also the right one for shrinking
+            // the log's own capacity reservation -- see
+            // `maybeShrinkRedoLogCapacity`'s own doc comment.
+            try self.maybeShrinkRedoLogCapacity();
             redo.writer = redo_log.Writer.init(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity);
         } else {
             // Deferred: `old_tail`/the bytes already in the log are left
@@ -7933,6 +7964,130 @@ pub const NativeFile = struct {
             redo.writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, old_tail, new_checkpoint_sequence);
         }
         self.publishRedoLogState();
+    }
+
+    /// §9.7f: shrinks this file's redo-log capacity reservation to
+    /// `NativeFile.redoLogCapacityForBudget(self.redo_log_budget_bytes)`,
+    /// when that is smaller than the current `header.redo_log_capacity`
+    /// -- the gap that left a store's reservation frozen at its
+    /// creation-time size even after `maintenance_policy.options
+    /// .max_storage_bytes` (and therefore `redo_log_budget_bytes`,
+    /// refreshed every commit by `docstore.Store
+    /// .refreshAdmissionAssumeLocked`) was lowered well below it.
+    ///
+    /// Growing back is not attempted here: once a shrunk range's pages
+    /// are released to the free map (the indexed branch below), any
+    /// later write may claim one of them for ordinary content, so
+    /// safely re-reserving the same contiguous range for a larger log
+    /// again would need to relocate whatever has since claimed it --
+    /// the same class of gap §9.7f's own "growing the reservation from a
+    /// small floor ... instead of reserving the maximum eagerly" already
+    /// defers as future work for the unbounded case. A budget raised
+    /// back up after being lowered keeps whatever smaller capacity the
+    /// most recent shrink left it at; a dedicated vacuum/rewrite is the
+    /// existing mechanism for enlarging it again.
+    ///
+    /// Called only from `checkpointRedoLog`'s own epilogue, inside the
+    /// same `!pinned_below` branch that already gates resetting the log
+    /// at all: no cross-process reader is pinned below the checkpoint
+    /// this fold just published. That is the gate that matters here too
+    /// -- not the general content-retirement reader-pin frontier
+    /// (`allocator_v4.State.eligible`'s own `data_frontier`/
+    /// `metadata_frontier`), which these specific pages were never
+    /// subject to in the first place: they were reserved directly by
+    /// `enableRedoLog`'s own `allocateFresh` loop, at reference count 0,
+    /// and held only log bytes -- no checkpoint, old or new, ever
+    /// exposed one of them through any content-reading API, so no
+    /// pinned reader's content view can ever legitimately depend on one
+    /// still reading as reserved. A cross-process reader's own *log
+    /// replay*, not its content view, is what `pinned_below` protects.
+    ///
+    /// Crash safety: the new, smaller `header.redo_log_capacity` is
+    /// written and synced to disk *before* the pages it frees are
+    /// released in the ledger and that release is published as a real
+    /// checkpoint. A crash in between leaves the header already showing
+    /// the smaller capacity (safe: a recovered writer re-opens bounded
+    /// to it, never appending past where the shrink intended) with
+    /// those specific pages still shown reserved in the ledger (safe:
+    /// merely not yet reclaimed, retried on a later fold) -- never the
+    /// reverse (pages already free while the header still claims the
+    /// old, larger capacity), which would let an ordinary write claim
+    /// one of them for real content while a crash-recovered writer
+    /// still believed it owned that exact byte range for the log.
+    fn maybeShrinkRedoLogCapacity(self: *NativeFile) !void {
+        const target_raw = redoLogCapacityForBudget(self.redo_log_budget_bytes);
+        const page_size: u64 = self.header.page_size;
+        const target_pages = std.math.divCeil(u64, @max(target_raw, 1), page_size) catch unreachable;
+        const target_capacity = target_pages * page_size;
+        const old_capacity = self.header.redo_log_capacity;
+        if (target_capacity >= old_capacity) return;
+        const old_capacity_pages = old_capacity / page_size;
+        const offset_page = self.header.redo_log_offset / page_size;
+
+        // Durable on its own, first -- see this function's own doc
+        // comment for why this exact order is the safe one.
+        var next_header = self.header;
+        next_header.redo_log_capacity = target_capacity;
+        var encoded: [header_size]u8 = undefined;
+        encodeHeader(&encoded, next_header);
+        const io = self.runtimeIo();
+        try self.file.writePositionalAll(io, &encoded, 0);
+        try self.file.sync(io);
+        self.header.redo_log_capacity = target_capacity;
+        self.last_synced_header = self.header;
+
+        if (!self.header.indexed_reclamation) {
+            // No free-map/ledger to release into at all for a
+            // non-reusing file -- page ids there are a one-way,
+            // append-only counter, never a reusable pool (the same
+            // reason vacuum for a non-indexed file works by rewriting a
+            // whole new, smaller file, never by freeing pages in
+            // place). The physical bytes stay reserved for the file's
+            // lifetime; only the accounted/active capacity above
+            // shrinks, which is still real: `header.redo_log_capacity`
+            // is exactly the `fixed_overhead` Bug 3 (perf/lwa-budget-tail)
+            // already nets out of every proportional reclamation ratio,
+            // and `pageAllocatorForDivertingCommit`'s own admission
+            // check reads it directly too.
+            return;
+        }
+
+        // Release the now-excess pages into the free map, through the
+        // exact same ledger-only commit shape `reclaimPagesImpl` already
+        // uses on a redo-log file (`redo.checkpointing` is already
+        // `true` for this whole call, set by `checkpointRedoLog`'s own
+        // entry; a dedicated transaction; `persistAllocator`;
+        // `publishCheckpoint`; then the same post-commit redo
+        // sequence/durable-watermark resync that function's own comment
+        // explains). `releaseMetadata` (not `retire`/`complete`): these
+        // pages were reserved at reference count 0, never `retain`ed --
+        // exactly the page-state class `releaseMetadata` already exists
+        // for, not a retained, content-bearing page that needs the
+        // general retire/eligible/complete lifecycle at all.
+        try self.beginTransaction();
+        errdefer self.abortTransaction();
+        const before = self.activeCheckpoint();
+        var pages = try self.pageAllocatorFromFreeMap(before);
+        defer pages.deinit();
+        const state = pages.ledger orelse return error.InvalidNativeAllocator;
+        var p = target_pages;
+        while (p < old_capacity_pages) : (p += 1) try state.releaseMetadata(offset_page + p);
+        const previous_maintenance = self.maintenance_publication;
+        self.maintenance_publication = true;
+        defer self.maintenance_publication = previous_maintenance;
+        var next = before;
+        next.commit_sequence += 1;
+        next.free_map_root_page = try pages.allocate();
+        try self.persistAllocator(&pages, &next);
+        try self.syncIfRequired(null);
+        try self.publishCheckpoint(next, false, null);
+        try self.commitTransactionWithDurability(true, null);
+        if (self.redo) |*redo| {
+            const new_sequence = self.activeCheckpoint().commit_sequence;
+            redo.checkpoint_sequence = new_sequence;
+            redo.durable_sequence = new_sequence;
+            redo.writer.last_sequence = new_sequence;
+        }
     }
 
     /// §9.3b/step (g): catches this process's own redo-log overlay up to
@@ -17183,10 +17338,41 @@ pub const NativeFile = struct {
             // allocator -- a diverting commit never touches the real
             // ledger at all, so nothing this commit did needs to be
             // reflected in it first.
+            // §9.7f: also credit already-free, reusable pages toward
+            // `available_pages`, exactly like `persistAllocator`'s own
+            // check does (`available = (limit/page_size - next_page_id)
+            // +| (can_reuse ? free_pages : 0)`), rather than only
+            // `limit/page_size - next.page_count`. Without this, a
+            // diverting commit's own admission (this branch) was
+            // strictly more conservative than a real commit's, for no
+            // reason tied to the budget itself: `pageAllocatorForDivertingCommit`'s
+            // own allocator is deliberately `append_only`/never reuses
+            // anything (so *this* commit's own page-shaped exception, if
+            // any, never consumes a free page), but that is a reason
+            // this *specific* commit cannot reuse a page, not a reason
+            // the file overall has no usable headroom -- free pages
+            // already released by prior retirement (ordinary
+            // superseded-chain cleanup) or by `checkpointRedoLog`'s own
+            // `maybeShrinkRedoLogCapacity` are exactly the headroom this
+            // check exists to recognize. Gated on `free_pages_verified`
+            // the same way `PageAllocator.can_reuse` already requires a
+            // verified free map before any instance may credit it.
             if (self.max_file_bytes) |limit| {
                 const page_size = self.header.page_size;
-                const available_pages = limit / page_size -| next.page_count;
-                const reserve_bytes = try self.retirementReserveBytesWithCancel(self.allocator_cancel_token);
+                // `retirementReserveBytesWithCancel`'s own early return:
+                // this whole check (both the reserve cost and the
+                // free-pages credit) is meaningless without a real
+                // ledger -- a non-indexed (`page_reuse = false`) file has
+                // none at all, and `loadLedgerWithCancel` is not safe to
+                // call on one.
+                var reusable: u64 = 0;
+                var reserve_bytes: u64 = 0;
+                if (self.header.indexed_reclamation) {
+                    const state = try self.loadLedgerWithCancel(self.activeCheckpoint(), self.allocator_cancel_token);
+                    if (self.free_pages_verified) reusable = state.free_pages;
+                    reserve_bytes = allocator_v4.retirementReservePages(self.maxPagePayloadBytes(), state.counts.items.len, state.pending.count()) *| self.header.page_size;
+                }
+                const available_pages = (limit / page_size -| next.page_count) +| reusable;
                 if (available_pages *| page_size < reserve_bytes) return error.LiteStorageBudgetExceeded;
             }
         }
