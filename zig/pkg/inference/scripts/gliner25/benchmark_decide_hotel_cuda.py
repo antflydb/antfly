@@ -104,14 +104,41 @@ def confidences(arm, result):
             for row in result["outputs"]]
 
 
+def gpu_inventory(nvml):
+    """NVML indices are physical indices, independent of CUDA_VISIBLE_DEVICES."""
+    devices = []
+    for i in range(nvml.nvmlDeviceGetCount()):
+        handle = nvml.nvmlDeviceGetHandleByIndex(i)
+        devices.append((handle, dict(uuid=nvml.nvmlDeviceGetUUID(handle),
+                                    name=nvml.nvmlDeviceGetName(handle),
+                                    total_bytes=nvml.nvmlDeviceGetMemoryInfo(handle).total)))
+    return devices
+
+
+def process_gpu_bytes(nvml, devices, pids):
+    """Attribute memory by PID across physical GPUs, never by CUDA ordinal."""
+    usage = {}
+    for handle, info in devices:
+        for process in nvml.nvmlDeviceGetComputeRunningProcesses(handle):
+            if process.pid not in pids:
+                continue
+            value = process.usedGpuMemory
+            # pynvml converts the C NVML_VALUE_NOT_AVAILABLE sentinel to None
+            # in some versions and exposes the unsigned integer in others.
+            if value is None or value == 2**64 - 1 or value < 0:
+                raise RuntimeError(f"GPU memory unavailable for PID {process.pid} on {info['uuid']}")
+            usage[info["uuid"]] = usage.get(info["uuid"], 0) + value
+    return usage
+
+
 def run_arm(args, arm, lc, fixture, selected):
     import pynvml as nvml
     import psutil
     nvml.nvmlInit()
-    gpu = nvml.nvmlDeviceGetHandleByIndex(0)
-    hardware = dict(gpu=nvml.nvmlDeviceGetName(gpu), driver=nvml.nvmlSystemGetDriverVersion(),
-                    cpu_count=os.cpu_count(), gpu_total_bytes=nvml.nvmlDeviceGetMemoryInfo(gpu).total)
-    command = ([str(args.native), "--model-dir", str(args.model), "--backend", "cuda", "--cases", str(fixture), "--worker", "1"]
+    devices = gpu_inventory(nvml)
+    hardware = dict(driver=nvml.nvmlSystemGetDriverVersion(), cpu_count=os.cpu_count(),
+                    gpu_inventory=[info for _, info in devices])
+    command = ([str(args.native), "--model-dir", str(args.native_model), "--backend", "cuda", "--cases", str(fixture), "--worker", "1"]
                if arm == "native" else [sys.executable, __file__, "--worker", "--model", str(args.model), "--threads", str(args.threads)])
     http_mode = arm == "native" and args.http
     if http_mode:
@@ -119,7 +146,7 @@ def run_arm(args, arm, lc, fixture, selected):
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
         command = [str(args.native), "run", "--host", "127.0.0.1", "--port", str(port),
-                   "--models-dir", str(args.model.parent), "--ml-dir", str(args.out / f"{lc}-state"), "--max-loaded-models", "1"]
+                   "--models-dir", str(args.native_model.parent), "--ml-dir", str(args.out / f"{lc}-state"), "--max-loaded-models", "1"]
         client = http.client.HTTPConnection("127.0.0.1", port, timeout=300)
     log = (args.out / f"{lc}-{arm}.stderr").open("w")
     proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=log if http_mode else subprocess.PIPE, stderr=log, text=True,
@@ -128,6 +155,7 @@ def run_arm(args, arm, lc, fixture, selected):
     peak = {"host_pss_bytes": 0, "gpu_bytes": 0, "combined_bytes": 0}
     stop = threading.Event()
     monitor_errors = []
+    observed_gpus = set()
     def monitor():
         while not stop.is_set():
             try:
@@ -139,7 +167,9 @@ def run_arm(args, arm, lc, fixture, selected):
                         host += int(next(l for l in lines if l.startswith("Pss:")).split()[1]) * 1024
                     except (FileNotFoundError, ProcessLookupError):
                         pass
-                device = sum(p.usedGpuMemory for p in nvml.nvmlDeviceGetComputeRunningProcesses(gpu) if p.pid in pids)
+                usage = process_gpu_bytes(nvml, devices, pids)
+                observed_gpus.update(usage)
+                device = sum(usage.values())
                 for key, value in zip(peak, [host, device, host + device]):
                     peak[key] = max(peak[key], value)
             except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
@@ -167,7 +197,7 @@ def run_arm(args, arm, lc, fixture, selected):
             case = all_cases[index]
             schema = {"classifications": [dict(name=k, labels=v["labels"],
                       **({"multi_label": True, "threshold": v["cls_threshold"]} if v.get("multi_label") else {})) for k, v in TASKS.items()]}
-            body = dict(schema_version=2, model=args.model.name, schema=schema,
+            body = dict(schema_version=2, model=args.native_model.name, schema=schema,
                         inputs=[dict(content=t) for t in case["texts"]], options=dict(include_spans=True, include_confidence=True))
             client.request("POST", "/ai/v1/extract", json.dumps(body), {"Content-Type": "application/json"})
             response = client.getresponse()
@@ -246,6 +276,12 @@ def run_arm(args, arm, lc, fixture, selected):
         nvml.nvmlShutdown()
     if monitor_errors:
         raise RuntimeError(monitor_errors)
+    if not observed_gpus or peak["gpu_bytes"] == 0:
+        raise RuntimeError("No process GPU memory observed; refusing an unverified CUDA memory result")
+    used_devices = [info for _, info in devices if info["uuid"] in observed_gpus]
+    hardware.update(gpu=", ".join(info["name"] for info in used_devices),
+                    gpu_uuids=[info["uuid"] for info in used_devices],
+                    gpu_total_bytes=sum(info["total_bytes"] for info in used_devices))
     (args.out / f"{lc}-{arm}-metadata.json").write_text(json.dumps(dict(command=command, ready=ready, hardware=hardware, peak=peak), indent=2))
     return rows
 
@@ -254,6 +290,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", type=Path, required=True)
     p.add_argument("--native", type=Path)
+    p.add_argument("--native-model", type=Path, help="Native artifact directory; defaults to --model (Python reference)")
+    p.add_argument("--allow-label-differences", action="store_true", help="Report quantization disagreements without treating them as exact-parity failures")
     p.add_argument("--out", type=Path)
     p.add_argument("--worker", action="store_true")
     p.add_argument("--http", action="store_true", help="Native binary is the production antfly-inference-http-server")
@@ -267,6 +305,7 @@ def main():
     if args.lifecycles < 1 or args.warmup < 0 or args.limit < 0 or not args.batches or any(b not in (1, 8, 32) for b in args.batches):
         p.error("positive lifecycles, nonnegative warmup/limit and batches 1, 8, 32 required")
     args.model = args.model.resolve()
+    args.native_model = (args.native_model or args.model).resolve()
     if args.worker:
         python_worker(args)
         return
@@ -287,9 +326,12 @@ def main():
         harness_sha256=sha(Path(__file__)),
         native_sha256=sha(args.native) if args.native else None,
         model_sha256=sha(args.model / "model.safetensors"),
+        native_model_sha256={path.name: sha(path) for path in sorted(args.native_model.iterdir())
+                             if path.suffix in (".safetensors", ".gguf")},
         timing_boundary="native_http_python_loaded_model_api" if args.http else "loaded_model_public_api_without_http",
         memory="20ms sampled process-tree PSS plus per-process NVML; includes startup",
-        controls={k: v for k, v in os.environ.items() if k.startswith(("ANTFLY_CUDA_", "ANTFLY_INFERENCE_CUDA_", "OMP_", "MKL_"))},
+        controls={k: v for k, v in os.environ.items() if k.startswith(("ANTFLY_CUDA_", "ANTFLY_INFERENCE_CUDA_", "TERMITE_CUDA_", "CUBLAS_", "NVIDIA_TF32_", "OMP_", "MKL_"))},
+        cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
         arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
     )
     (args.out / "provenance.json").write_text(json.dumps(provenance, indent=2))
@@ -319,6 +361,11 @@ def main():
             python = {(r["lifecycle"], r["index"]): r["labels"] for r in rows if r["arm"] == "python" and r["batch"] == b}
             cell["identical_documents"] = sum(a == c for i in native for a, c in zip(native[i], python[i], strict=True))
             cell["documents"] = sum(len(v) for v in native.values())
+            cell["task_comparisons"] = cell["documents"] * len(TASKS)
+            cell["task_disagreements"] = [dict(lifecycle=i[0], case_index=i[1], row=j, task=task,
+                                                native=a[task], python=c[task])
+                                            for i in native for j, (a, c) in enumerate(zip(native[i], python[i], strict=True))
+                                            for task in TASKS if a[task] != c[task]]
             cell["speedup"] = cell["python"]["median_ms"] / cell["native"]["median_ms"]
             scored = {arm: {(r["lifecycle"], r["index"]): confidences(arm, r["response"])
                             for r in rows if r["arm"] == arm and r["batch"] == b} for arm in args.arms}
@@ -329,7 +376,7 @@ def main():
         summary[b] = cell
     (args.out / "summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
-    if any(cell.get("identical_documents") != cell.get("documents") for cell in summary.values()):
+    if not args.allow_label_differences and any(cell.get("identical_documents") != cell.get("documents") for cell in summary.values()):
         raise RuntimeError("native and Python classification labels differ; inspect retained outputs")
 
 

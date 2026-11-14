@@ -437,8 +437,7 @@ fn batchPool(node: *Node, transport: *Loopback, directory: []const u8, cases: []
     var handle = node.model_manager.acquireLoadedModel(directory) orelse return error.MissingLoadedModel;
     defer handle.release();
     const decide_policy = @import("../models/gliner_decide_qualification.zig");
-    const fp32_decide = decide and (try decide_policy.require(try factory.getGlinerDecisionIdentity(handle.get().session))) == .decide_deberta;
-    const max_items: usize = if (fp32_decide) decide_policy.cuda_fp32_request_items else 8;
+    const max_items: usize = if (decide) decide_policy.cuda_request_items else 8;
     for ([_]usize{ 2, 4, 8, 9, 16, 32 }) |n| {
         if (n > max_items) continue;
         for ([_]bool{ false, true }) |reverse| {
@@ -610,7 +609,8 @@ fn distinctInputBatches(environment: [*:0]const u8, comptime role: enum { base, 
         var loaded = node.model_manager.acquireLoadedModel(directory) orelse return error.MissingLoadedModel;
         defer loaded.release();
         const policy = @import("../models/gliner_decide_qualification.zig");
-        break :cap if (try policy.require(try factory.getGlinerDecisionIdentity(loaded.get().session)) == .decide_deberta) policy.cuda_fp32_request_items else policy.cuda_batch_items;
+        _ = try policy.require(try factory.getGlinerDecisionIdentity(loaded.get().session));
+        break :cap policy.cuda_request_items;
     } else 8;
     const body = try batchBody(a, std.fs.path.basename(directory), selected, cancel_items, false);
     defer a.free(body);
@@ -628,6 +628,12 @@ test "GLiNER production CUDA distinct input batches multi" {
 }
 test "GLiNER production CUDA distinct input batches Decide FP32" {
     try distinctInputBatches("ANTFLY_GLINER_DECIDE_MODEL", .decide);
+}
+test "Decide CUDA serving required artifact" {
+    if (!platform.env.getenvBool("ANTFLY_GLINER_DECIDE_REQUIRE_SERVING_TESTS")) return error.SkipZigTest;
+    if (!build_options.enable_cuda) return error.CudaRequired;
+    _ = platform.env.getenv("ANTFLY_GLINER_DECIDE_MODEL") orelse return error.DecideModelRequired;
+    _ = platform.env.getenv("ANTFLY_GLINER_DECIDE_Q8_MODEL") orelse return error.DecideQ8ModelRequired;
 }
 test "GLiNER production CUDA distinct input batches Decide Q8" {
     try distinctInputBatches("ANTFLY_GLINER_DECIDE_Q8_MODEL", .decide);

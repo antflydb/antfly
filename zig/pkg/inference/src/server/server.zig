@@ -7970,7 +7970,7 @@ pub const Node = struct {
         var longest: usize = 0;
         for (items) |item| longest = @max(longest, item.payloadAs(DecideClassifyTicket).sample.input_ids.len);
         const variant = try gliner_decide_qualification.require(try session_factory.getGlinerDecisionIdentity(first.model.session));
-        const workspace_bytes: usize = if (variant == .decide_deberta) gliner_specialty.cuda_matmul_workspace_bytes else 0;
+        const workspace_bytes: usize = if (variant == .decide_deberta or variant == .decide_deberta_q8) gliner_specialty.cuda_matmul_workspace_bytes else 0;
         var budget = gliner_microbatch.classificationBudget(first.limits, first.config, longest, items.len, workspace_bytes) catch |err| {
             if (err == error.MemoryBudgetExceeded) return error.ClassificationMicrobatchCapacity;
             return err;
@@ -12719,7 +12719,7 @@ pub const Node = struct {
                 try std.math.add(
                     usize,
                     try std.math.mul(usize, try span_v2_executor.deviceScratchUpperBound(config, longest), span_v2_executor.classificationBatchItems(request, &request_plan, options)),
-                    if (backend == .cuda and qualified_variant == .decide_deberta) gliner_specialty.cuda_matmul_workspace_bytes else 0,
+                    if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) gliner_specialty.cuda_matmul_workspace_bytes else 0,
                 );
             const device_limits = try runtime.tier.memory.withAutomaticScratchFloor(
                 self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(if (gpu) .gpu else .cpu)),
@@ -30787,14 +30787,14 @@ fn resolvedInferenceExecutorContract(
         manifest.gliner_classification_head == .label_marker_mlp and manifest.gliner_span_encoder_family == .deberta)
     {
         // Metal preserves the existing public request cardinality and chunks
-        // physical forwards at eight rows. CUDA FP32 requests also compose
-        // eight-row forwards, up to 32 inputs; Q8 retains its eight-input cap.
+        // physical forwards at eight rows. Both pinned CUDA artifacts compose
+        // eight-row forwards, up to 32 inputs.
         // Boundary discovery stays conservative because
         // its long-document profiles still require one input per request.
         implementation = .{
             .mode = .native,
             .preferred_items = if (metal_decide_batch) gliner_decide_qualification.metal_batch_items else gliner_decide_qualification.cuda_batch_items,
-            .max_items = if (metal_decide_batch) resolvedTaskMaxItems(resolved_task) else if (manifest.nativeWeightArtifactKind() == .safetensors) gliner_decide_qualification.cuda_fp32_request_items else gliner_decide_qualification.cuda_batch_items,
+            .max_items = if (metal_decide_batch) resolvedTaskMaxItems(resolved_task) else gliner_decide_qualification.cuda_request_items,
             .per_item_failures = false,
         };
     }

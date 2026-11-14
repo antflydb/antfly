@@ -187,10 +187,11 @@ pub const RequestLimits = struct {
     sequence_tokens: usize = 198,
 };
 pub const cuda_batch_items: usize = 8;
-// Larger FP32 requests are executed as bounded eight-row physical batches.
-pub const cuda_fp32_request_items: usize = 32;
-const legacy_cuda_limits = RequestLimits{ .request_items = cuda_batch_items, .prepared_sequences = cuda_batch_items, .sequence_tokens = 512 };
-const legacy_fp32_cuda_limits = RequestLimits{ .request_items = cuda_fp32_request_items, .prepared_sequences = cuda_fp32_request_items, .sequence_tokens = 512 };
+// Both pinned artifacts compose larger requests from eight-row physical batches.
+pub const cuda_request_items: usize = 32;
+// Six square attention projections and two FFN projections in each layer.
+pub const cuda_q8_projection_mirror_bytes: usize = 24 * (6 * 1024 * 1024 + 2 * 1024 * 4096) * @sizeOf(f16);
+const legacy_cuda_limits = RequestLimits{ .request_items = cuda_request_items, .prepared_sequences = cuda_request_items, .sequence_tokens = 512 };
 pub const metal_batch_items: usize = 8;
 
 /// Variant-specific limits supplement the legacy native policy. CUDA FP32
@@ -215,7 +216,7 @@ pub fn requireRequestIdentity(identity: Identity, backend: Backend, items: usize
     if (variant == .decide_deberta_q8) {
         if (backend != .cuda) return error.UnsupportedGlinerDecisionBackend;
     } else if (variant == .decide_1b and backend != .native and backend != .metal) return error.UnsupportedGlinerDecisionBackend;
-    const limits = if (variant == .decide_deberta) legacy_fp32_cuda_limits else (try requestLimits(identity)).?;
+    const limits = if (variant == .decide_deberta) legacy_cuda_limits else (try requestLimits(identity)).?;
     if ((backend == .cuda and variant != .decide_1b and sequences != items) or items == 0 or items > limits.request_items or sequences == 0 or sequences > limits.prepared_sequences or tokens == 0 or tokens > limits.sequence_tokens)
         return error.UnsupportedGlinerDecisionGeometry;
 }
@@ -332,10 +333,10 @@ test "GLiNER Decide Q8 CUDA qualification binds both exact files and bounded req
     identity.weight = digestFromPin(legacy_q8_encoder);
     identity.weight_companion = digestFromPin(legacy_q8_head);
     try std.testing.expectEqual(QualifiedVariant.decide_deberta_q8, try require(identity));
-    for ([_]usize{ 1, 2, 4, 8 }) |n| try requireRequestIdentity(identity, .cuda, n, n, 512);
+    for ([_]usize{ 1, 2, 4, 8, 9, 16, 32 }) |n| try requireRequestIdentity(identity, .cuda, n, n, 512);
     for ([_]Backend{ .native, .metal, .other }) |backend|
         try std.testing.expectError(error.UnsupportedGlinerDecisionBackend, requireRequestIdentity(identity, backend, 1, 1, 64));
-    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 9, 9, 64));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 33, 33, 64));
     try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 1, 2, 64));
     try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, requireRequestIdentity(identity, .cuda, 1, 1, 513));
     try std.testing.expect(!supportsSpanExtraction(identity));

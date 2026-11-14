@@ -1036,10 +1036,17 @@ fn createNativeSessionForCudaUpload(
         // the generic native direct-quant representation.
         direct_quant_enabled = false;
     }
-    const keep_gliner_q8 = retain_gliner_q8 and requiresModernBertSpanClassifier(mf) and ggufEncoderHasQuantizedTensors(store);
+    // CUDA uploads original Q8 storage directly. Avoid materializing a whole
+    // FP32 host copy of the pinned DeBERTa bundle only to discard it at upload.
+    const keep_legacy_decide_q8 = retain_gliner_q8 and if (gliner_decision_identity) |identity|
+        gliner_decide_qualification.qualifiedVariant(identity) == .decide_deberta_q8
+    else
+        false;
+    const keep_gliner_q8 = keep_legacy_decide_q8 or (retain_gliner_q8 and requiresModernBertSpanClassifier(mf) and ggufEncoderHasQuantizedTensors(store));
     if (keep_gliner_q8) {
         const identity = gliner_decision_identity orelse return error.UnsupportedGlinerDecisionArtifact;
-        if (try gliner_decide_qualification.require(identity) != .decide_1b) return error.UnsupportedGlinerDecisionArtifact;
+        const variant = try gliner_decide_qualification.require(identity);
+        if (variant != .decide_1b and variant != .decide_deberta_q8) return error.UnsupportedGlinerDecisionArtifact;
         direct_quant_enabled = true;
     }
     if (mf.usesGgufWeights()) {
@@ -2073,15 +2080,21 @@ fn createCudaSessionWithRequiredProfile(
     cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert or model_manifest.gliner_specialty_profile != null or decide_fp32;
     cuda_compute.qualified_span_fp32 = model_manifest.gliner_specialty_profile != null;
     cuda_compute.qualified_decide_fp32 = decide_fp32;
+    cuda_compute.qualified_decide_q8 = if (native_impl.gliner_decision_identity) |identity|
+        gliner_decide_qualification.qualifiedVariant(identity) == .decide_deberta_q8
+    else
+        false;
+    if (cuda_compute.qualified_decide_q8)
+        cuda_compute.runtime_policy.workspace_bytes = @import("../models/gliner_specialty_qualification.zig").cuda_matmul_workspace_bytes;
     if (model_manifest.gliner_specialty_profile) |profile| {
         std.log.info("gliner_specialty_cuda_policy profile={s} weights=f32 attention=f32 diagnostic_overrides=ignored", .{@tagName(profile)});
     }
     cuda_compute.gliner_encoder_attention = cuda_profile == .gliner25_modern_bert;
     cuda_compute.gliner_boundary_inference = cuda_profile == .gliner25_boundary;
     cuda_compute.gliner_mixed_attention = cuda_compute.gliner_encoder_attention and (gliner_precision == .fp16 or gliner_precision == .bf16);
-    cuda_compute.gliner_q8_f16_mirrors = cuda_compute.gliner_encoder_attention and
+    cuda_compute.gliner_q8_f16_mirrors = cuda_compute.qualified_decide_q8 or (cuda_compute.gliner_encoder_attention and
         native_impl.gliner_decision_identity != null and !native_impl.gliner_decision_identity.?.inventory.all_f32 and
-        platform.env.getenvBool("ANTFLY_CUDA_GLINER_1B_Q8_F16_MIRRORS");
+        platform.env.getenvBool("ANTFLY_CUDA_GLINER_1B_Q8_F16_MIRRORS"));
     cuda_compute.gliner_q8_f16_attention = cuda_compute.gliner_q8_f16_mirrors and
         platform.env.getenvBoolDefault("ANTFLY_CUDA_GLINER_1B_Q8_F16_ATTENTION", true);
     cuda_compute.laya_optimizations = (cuda_profile == .laya or cuda_profile == .gliner25_modern_bert) and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_OPTIMIZATIONS", true);
@@ -2155,7 +2168,7 @@ fn createCudaSessionWithRequiredProfile(
     }
     if (debug_cuda_session) std.log.info("cuda-session: uploaded resident weights count={d}", .{resident_uploads.items.len});
     if (cuda_compute.gliner_q8_f16_mirrors) {
-        std.log.info("cuda: attached {d} decoded Q8 FP16 projection mirrors; raw Q8 and F32 heads retained; ANTFLY_CUDA_GLINER_1B_Q8_F16_MIRRORS=0 disables", .{cuda_compute.gliner_boundary_f16_mirrors.count()});
+        std.log.info("cuda: attached {d} decoded Q8 FP16 projection mirrors; raw Q8 and F32 heads retained; original_decide={any}", .{ cuda_compute.gliner_boundary_f16_mirrors.count(), cuda_compute.qualified_decide_q8 });
     }
     const upload_stats = cuda_compute.snapshotStats();
     if (upload_stats.bf16_mirror_weight_count > 0) {

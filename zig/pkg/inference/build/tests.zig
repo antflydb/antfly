@@ -408,6 +408,24 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
         "GLiNER production CUDA extraction through concurrent HTTP",
         "pinned CUDA extraction direct and HTTP",
     };
+    // Keep the original Decide batch/cancellation gate runnable on smaller
+    // hosts without admitting the complete 24 GiB family compiler closure.
+    const decide_serving_tests = b.addTest(.{
+        .name = "gliner25-decide-cuda-serving-tests",
+        .max_rss = 11 * 1024 * 1024 * 1024,
+        .root_module = suite.tests.root_module,
+        .filters = &.{ "Decide CUDA serving required artifact", "GLiNER production CUDA distinct input batches Decide", "qualified FP32 attention policy", "Decide Q8 CUDA qualification binds", "Decide CUDA legacy geometry", "Decide Q8 projection mirrors", "Decide Q8 mirror admission", "GLiNER Decide CUDA Q8 half staging", "GLiNER Decide CUDA Q8 execution mirror" },
+        .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple },
+    });
+    ctx.step("gliner25-decide-cuda-serving-test-build", "Build focused original Decide CUDA batch and cancellation tests").dependOn(&b.addInstallArtifact(decide_serving_tests, .{}).step);
+    const run_decide_serving_tests = ctx.addRunArtifact(decide_serving_tests);
+    run_decide_serving_tests.setEnvironmentVariable("ANTFLY_GLINER_DECIDE_REQUIRE_SERVING_TESTS", "1");
+    const decide_serving_step = ctx.step("test-gliner25-decide-cuda-serving", "Require original Decide CUDA batch-32 ordering, admission and queued cancellation");
+    if (ctx.backend.enable_cuda) {
+        decide_serving_step.dependOn(&run_decide_serving_tests.step);
+    } else {
+        decide_serving_step.dependOn(&b.addFail("Decide CUDA serving tests require -Dcuda=true").step);
+    }
     const gliner25_production_cuda_tests = b.addTest(.{
         .name = "gliner25-production-cuda-tests",
         .max_rss = 24 * 1024 * 1024 * 1024,

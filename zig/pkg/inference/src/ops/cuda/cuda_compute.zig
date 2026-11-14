@@ -4076,6 +4076,7 @@ pub const CudaCompute = struct {
     qualified_span_fp32: bool = false,
     /// Exact original Decide identity; independent of other GLiNER profiles.
     qualified_decide_fp32: bool = false,
+    qualified_decide_q8: bool = false,
     laya_optimizations: bool = false,
     gliner_encoder_attention: bool = false,
     gliner_mixed_attention: bool = false,
@@ -6564,7 +6565,8 @@ pub const CudaCompute = struct {
             errdefer device.free(&self.ctx);
             try copyFromHostTracked(self, device, storage.raw_bytes);
             const gliner_f16 = self.gliner_q8_f16_mirrors and canUseF16TensorCoreWeights(self) and
-                glinerQ8ProjectionWeight(self.gliner_encoder_attention, owned_key, loaded);
+                (glinerQ8ProjectionWeight(self.gliner_encoder_attention, owned_key, loaded) or
+                    decideDebertaQ8ProjectionWeight(self.qualified_decide_q8, owned_key, loaded));
             var tc_quant = if (gliner_f16) null else try self.prepareTensorCoreQuantOnUpload(storage.tensor_type, storage.shape, device, storage.raw_bytes);
             errdefer if (tc_quant) |*packed_quant| releaseDeviceBuffer(self, &packed_quant.buffer);
             var gliner_mirror = buffer_mod.DeviceBuffer{};
@@ -8508,6 +8510,43 @@ fn glinerQ8EncoderWeight(enabled: bool, name: []const u8, loaded: *const weight_
 
 fn glinerQ8ProjectionWeight(enabled: bool, name: []const u8, loaded: *const weight_source_mod.LoadedWeight) bool {
     return std.mem.startsWith(u8, name, "model.layers.") and glinerQ8EncoderWeight(enabled, name, loaded);
+}
+
+fn decideDebertaQ8ProjectionWeight(enabled: bool, name: []const u8, loaded: *const weight_source_mod.LoadedWeight) bool {
+    if (!enabled) return false;
+    const storage = loaded.quantized_storage orelse return false;
+    if (knownQuantTensorType(storage.tensor_type) != .Q8_0 or storage.shape.len != 2) return false;
+    const prefix = "encoder.layer.";
+    if (!std.mem.startsWith(u8, name, prefix)) return false;
+    const suffix_start = std.mem.indexOfScalarPos(u8, name, prefix.len, '.') orelse return false;
+    const layer = std.fmt.parseInt(u32, name[prefix.len..suffix_start], 10) catch return false;
+    if (layer >= 24) return false;
+    const suffix = name[suffix_start..];
+    const shape: []const i64 = if (std.mem.eql(u8, suffix, ".intermediate.dense.weight")) &.{ 4096, 1024 } else if (std.mem.eql(u8, suffix, ".output.dense.weight")) &.{ 1024, 4096 } else if (std.mem.eql(u8, suffix, ".attention.self.query_proj.weight") or
+        std.mem.eql(u8, suffix, ".attention.self.key_proj.weight") or
+        std.mem.eql(u8, suffix, ".attention.self.value_proj.weight") or
+        std.mem.eql(u8, suffix, ".attention.self.pos_query_proj.weight") or
+        std.mem.eql(u8, suffix, ".attention.self.pos_key_proj.weight") or
+        std.mem.eql(u8, suffix, ".attention.output.dense.weight")) &.{ 1024, 1024 } else return false;
+    return std.mem.eql(i64, storage.shape, shape);
+}
+
+test "Decide Q8 projection mirrors bind exact encoder roles" {
+    var loaded = weight_source_mod.LoadedWeight{
+        .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = "", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false },
+        .quantized = true,
+        .quantized_storage = .{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = &.{}, .shape = &.{ 1024, 1024 }, .allocator = std.testing.allocator },
+    };
+    try std.testing.expect(decideDebertaQ8ProjectionWeight(true, "encoder.layer.23.attention.self.query_proj.weight", &loaded));
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(false, "encoder.layer.0.attention.self.query_proj.weight", &loaded));
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "encoder.layer.24.attention.self.query_proj.weight", &loaded));
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "embeddings.word_embeddings.weight", &loaded));
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "classifier.0.weight", &loaded));
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "encoder.layer.0.output.dense.weight", &loaded));
+    loaded.quantized_storage.?.shape = &.{ 1024, 4096 };
+    try std.testing.expect(decideDebertaQ8ProjectionWeight(true, "encoder.layer.0.output.dense.weight", &loaded));
+    loaded.quantized_storage.?.tensor_type = .{ .known = .Q4_0 };
+    try std.testing.expect(!decideDebertaQ8ProjectionWeight(true, "encoder.layer.0.output.dense.weight", &loaded));
 }
 
 /// Bounded host staging: the largest 1B projection needs 26.25 MiB of half
@@ -18243,18 +18282,20 @@ const CudaDebertaInvalidModeWarning = struct {
     var emitted = std.atomic.Value(bool).init(false);
 };
 
-fn debertaAttentionExecutionMode(qualified_span_fp32: bool, requested: CudaDebertaAttentionMode) CudaDebertaAttentionMode {
-    return if (qualified_span_fp32) .fused_f32 else requested;
+fn debertaAttentionExecutionMode(qualified_span_fp32: bool, qualified_decide_fp32: bool, requested: CudaDebertaAttentionMode) CudaDebertaAttentionMode {
+    return if (qualified_span_fp32 or qualified_decide_fp32) .fused_f32 else requested;
 }
 
-test "specialty FP32 attention policy cannot be overridden by reduced precision diagnostics" {
+test "qualified FP32 attention policy cannot be overridden by reduced precision diagnostics" {
     inline for (std.meta.tags(CudaDebertaAttentionMode)) |mode| {
-        try std.testing.expectEqual(CudaDebertaAttentionMode.fused_f32, debertaAttentionExecutionMode(true, mode));
-        try std.testing.expectEqual(mode, debertaAttentionExecutionMode(false, mode));
+        try std.testing.expectEqual(CudaDebertaAttentionMode.fused_f32, debertaAttentionExecutionMode(true, false, mode));
+        try std.testing.expectEqual(CudaDebertaAttentionMode.fused_f32, debertaAttentionExecutionMode(false, true, mode));
+        try std.testing.expectEqual(mode, debertaAttentionExecutionMode(false, false, mode));
     }
     // The generated-auto path additionally requires .auto; the qualified
     // effective mode is never .auto even if its environment flag is enabled.
-    try std.testing.expect(debertaAttentionExecutionMode(true, .auto) != .auto);
+    try std.testing.expect(debertaAttentionExecutionMode(true, false, .auto) != .auto);
+    try std.testing.expect(debertaAttentionExecutionMode(false, true, .auto) != .auto);
     try std.testing.expect(debertaFusedF32Default(true, 12, 1));
     // General encoders keep main's compiled-artifact policy on every target;
     // specialty's GB10 exception must not depend on a BF16 tensor-core image.
@@ -19150,7 +19191,7 @@ fn simtQMatmulFallbackVariant(variant: kernels_mod.QMatmulVariant) kernels_mod.Q
 // resident tensor used by identity checks, embeddings or task heads.
 fn boundaryMixedWeight(self: *CudaCompute, weight: *const CudaTensor) ?CudaTensor {
     const boundary = self.gliner_boundary_inference and self.gliner_mixed_attention and weight.dtype == .f32;
-    const q8 = self.gliner_q8_f16_mirrors and self.gliner_encoder_attention and isKnownQuant(weight, .Q8_0);
+    const q8 = self.gliner_q8_f16_mirrors and (self.gliner_encoder_attention or self.qualified_decide_q8) and isKnownQuant(weight, .Q8_0);
     if (!boundary and !q8) return null;
     const mirror = self.gliner_boundary_f16_mirrors.get(weight.buffer.ptr) orelse return null;
     var view = weight.*;
@@ -19191,6 +19232,7 @@ test "GLiNER Decide CUDA Q8 execution mirror is a borrowed dense view" {
     compute.gliner_boundary_inference = false;
     compute.gliner_mixed_attention = false;
     compute.gliner_encoder_attention = true;
+    compute.qualified_decide_q8 = false;
     compute.gliner_q8_f16_mirrors = true;
     compute.gliner_boundary_f16_mirrors = .{};
     defer compute.gliner_boundary_f16_mirrors.deinit(std.testing.allocator);
@@ -26787,7 +26829,9 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    const attention_mode = debertaAttentionExecutionMode(self.qualified_span_fp32, cudaDebertaAttentionMode());
+    // Both immutable FP32 profiles must bypass automatic half-precision
+    // attention: the 128-token transition can change Decide classifications.
+    const attention_mode = debertaAttentionExecutionMode(self.qualified_span_fp32, self.qualified_decide_fp32 or self.qualified_decide_q8, cudaDebertaAttentionMode());
     if ((attention_mode == .generated_tc or (attention_mode == .auto and cudaDebertaGeneratedTcAutoEnabled())) and seq_len <= 256 and head_dim == 64) {
         const requested_variant = cudaDebertaGeneratedTcVariant();
         const launched_m32 = if (requested_variant != .m16)
@@ -26891,7 +26935,7 @@ fn debertaDisentangledAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, q
     }
     // The L4-qualified original Decide route keeps attention entirely FP32.
     // Missing symbols in older CUDA images retain the existing fused fallback.
-    if (self.qualified_decide_fp32 and self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9 and
+    if ((self.qualified_decide_fp32 or self.qualified_decide_q8) and self.ctx.info.compute_major == 8 and self.ctx.info.compute_minor == 9 and
         (attention_mode == .auto or attention_mode == .fused_f32) and head_dim == 64 and seq_len <= 512)
     {
         const launched = self.kernels.launchDebertaAttentionStreamF32(
