@@ -18576,7 +18576,38 @@ pub const NativeFile = struct {
         // where they get it instead. Harmless to reapply when that
         // branch already ran (same value, `next.commit_sequence` is
         // unchanged by this line too in that case).
-        if (changed and (self.redo == null or self.redo.?.checkpointing)) next.redo_folded_through = next.commit_sequence;
+        //
+        // perf/lwa-read-audit: `!deferred_publication` added -- missing
+        // here (unlike the certify-on-commit branch above, which already
+        // requires it). `redo.checkpointing` means "this commit certifies
+        // no unfolded logical work remains" (`reclaimPagesImpl`'s own
+        // ledger-only commit, gated on exactly that), which makes the
+        // stamp semantically correct even then -- but a *deferred*
+        // publish (`durable=false`'s ride-along path, a few lines below)
+        // never reaches `publishCheckpoint`'s real slot-write tail at
+        // all: it only appends a redo-log record (`CompactCheckpoint`,
+        // which carries no `redo_folded_through` of its own by design)
+        // and stages `next` into `self.header` directly. Stamping here
+        // regardless left `self.header`'s in-memory active checkpoint
+        // slot permanently ahead of what the physical slot page (last
+        // written by the previous real fold) actually holds, with
+        // nothing short of the *next* real fold ever reconciling the
+        // two -- confirmed live: `captureFullReadSnapshot`'s fresh,
+        // by-path reopen recovered a `redo_folded_through` two behind
+        // the live `self.header`'s, with every other field of the same
+        // active slot byte-identical. Same shape as 6c82ab8a0e
+        // (`stageAllocatorCertificate` stamping a value never reaching
+        // the publish it was sealed against) -- a stamp applied somewhere
+        // that does not control (or, here, does not even reach) the
+        // actual serialized bytes. Skipping the stamp on the deferred
+        // path is always safe (`redo_folded_through` simply carries
+        // forward unchanged, same as any ordinary diverted commit),
+        // and keeps `self.header` from ever running ahead of the
+        // physical slot for this field: the next commit that actually
+        // reaches this same site with `deferred_publication == false`
+        // (or a real fold) applies it for real, serialized together
+        // with everything else in that commit's own slot write.
+        if (changed and !deferred_publication and (self.redo == null or self.redo.?.checkpointing)) next.redo_folded_through = next.commit_sequence;
         if (deferred_publication) {
             defer self.notifyPublication();
             // Keep the last durable checkpoint slots intact until an explicit
@@ -19607,6 +19638,26 @@ pub const NativeFile = struct {
 
         self.header.checkpoints[next_slot] = checkpoint;
         self.header.active_checkpoint = next_slot;
+        // perf/lwa-read-audit: a durable publish must leave the active
+        // slot's on-disk bytes and `self.header`'s own in-memory copy
+        // byte-identical, `redo_folded_through` included -- the whole
+        // point of this slot write being one atomic page, not a
+        // separately-tracked field. Decoding what was *actually* just
+        // written (not re-deriving it from `checkpoint`, which would only
+        // catch an encode bug, not a mismatched assignment) and comparing
+        // against `self.header.checkpoints[next_slot]` catches a stamp
+        // applied somewhere that does not control these exact bytes --
+        // the same shape of bug as 6c82ab8a0e (`stageAllocatorCertificate`
+        // fingerprinting a value the real publish never actually wrote)
+        // and the `!deferred_publication` gap this branch's own caller,
+        // `commitTransactionWithDurability`, just closed for the general
+        // `redo_folded_through` stamp. Debug-only: a real decode plus a
+        // full-struct comparison on every durable publish is not free.
+        if (builtin.mode == .debug) {
+            const written = decodeCheckpointSlotPage(slot_page) catch |err|
+                std.debug.panic("lite: durable publish wrote an undecodable checkpoint slot: {s}", .{@errorName(err)});
+            std.debug.assert(std.meta.eql(written, self.header.checkpoints[next_slot]));
+        }
         self.checkpoint_publication_uncertain = false;
         self.uncertain_checkpoint = null;
         self.uncertain_slot = null;

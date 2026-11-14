@@ -9781,6 +9781,76 @@ test "lite native docstore disk index survives out-of-band catalog commits and v
     try expectIndexCursorMatchesDiskRebuild(&store);
 }
 
+// perf/lwa-read-audit: the write-side half of the fix above --
+// `captureFullReadSnapshot`'s own comparison now tolerates a
+// `redo_folded_through` divergence between `self.header` and a fresh
+// reopen (that function's own doc comment), but this test pins the
+// structural fix that stops the divergence from happening at all:
+// `commitTransactionWithDurability`'s general `redo_folded_through`
+// stamp used to fire even on a *deferred* (ride-along, non-durable)
+// publish, which never reaches `publishCheckpoint`'s real slot-write
+// tail at all (it only appends a redo-log record -- `CompactCheckpoint`
+// carries no `redo_folded_through` of its own -- and stages `next`
+// straight into `self.header`). That left `self.header`'s in-memory
+// active checkpoint slot permanently ahead of the physical slot page
+// until the next real fold, with nothing short of a crash+reopen (or
+// `captureFullReadSnapshot`'s own fresh-by-path reopen) ever revealing
+// the gap. Same shape as 6c82ab8a0e (`stageAllocatorCertificate`
+// sealing a fingerprint the real publish never actually wrote).
+//
+// Reproduces the exact sequence `Store.openWithOptions`'s own
+// unconditional `maintainOnce(false)` reaches in the wild (a fresh
+// open's idle-retirement pass, gated on `retirementNeedsService`'s
+// overlay-debt signal from repeated overwrites of the same key under
+// redo), then asserts the fixed invariant directly: a NativeFile's own
+// live `redo_folded_through` for the active checkpoint must never run
+// ahead of what an independent, fresh-by-path reopen recovers for the
+// exact same on-disk bytes.
+test "lite redo log maintainOnce's ride-along reclaim commit never advances redo_folded_through ahead of a fresh reopen" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-docstore-ride-along-fold-boundary.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.createWithOptions(allocator, path, .{ .use_redo_log = true, .reclamation = .{ .page_reuse = true } });
+    defer store.close();
+
+    {
+        var batch = try store.beginWrite();
+        try batch.put("doc:churn", "v0");
+        try batch.commit();
+    }
+    // Overwrite the same key repeatedly, under redo, with no explicit
+    // checkpoint: `retirementNeedsService`'s own overlay-debt signal
+    // (`redoCheckpointWouldRetire`) fires once a later write has
+    // superseded an earlier one, which is exactly what
+    // `Store.openWithOptions`'s unconditional `maintainOnce(false)` on
+    // *every* open reacts to in the wild.
+    var round: usize = 0;
+    while (round < 20) : (round += 1) {
+        var value_buf: [32]u8 = undefined;
+        const value = try std.fmt.bufPrint(&value_buf, "churn-{d}", .{round});
+        var batch = try store.beginWrite();
+        try batch.put("doc:churn", value);
+        try batch.commit();
+    }
+    // The same non-durable, ledger-only reclaim pass a background/open-
+    // time maintenance turn runs -- `durable = false`, the ride-along
+    // path this fix closed.
+    try store.maintainOnce(false);
+
+    const live = store.file.activeCheckpoint();
+    var reader = try native.NativeFile.openWithIo(allocator, std.testing.io, path, .{ .read_only = true });
+    defer reader.close();
+    const recovered = reader.activeCheckpoint();
+
+    try std.testing.expectEqual(live.redo_folded_through, recovered.redo_folded_through);
+    try std.testing.expectEqual(live.commit_sequence, recovered.commit_sequence);
+}
+
 test "lite native docstore cold writes and large disk-index cursors stay bounded" {
     const allocator = std.testing.allocator;
 
