@@ -9779,6 +9779,9 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(503);
                     return ctx.text("standby read unavailable");
                 },
+                error.StorageDescriptorPressure,
+                error.ProcessFdQuotaExceeded,
+                error.SystemFdQuotaExceeded,
                 error.PersistentDescriptorAdmissionExhausted,
                 error.ResourceBudgetExceeded,
                 error.StorageBusy,
@@ -10004,6 +10007,9 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(503);
                 return ctx.text("group leader unavailable");
             },
+            error.StorageDescriptorPressure,
+            error.ProcessFdQuotaExceeded,
+            error.SystemFdQuotaExceeded,
             error.PersistentDescriptorAdmissionExhausted,
             error.ResourceBudgetExceeded,
             error.StorageBusy,
