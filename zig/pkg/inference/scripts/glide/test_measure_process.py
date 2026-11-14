@@ -18,11 +18,13 @@
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from contextlib import redirect_stdout
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -113,22 +115,32 @@ class GpuMemoryTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
-    def run_measure(self, code, sample, **kwargs):
+    def run_measure(self, code=None, sample=None, *, prepare=None, **kwargs):
         nvml = GpuMemoryTests().nvml([[], []])
         nvml.nvmlInit = lambda: None
         nvml.nvmlShutdown = lambda: None
         nvml.nvmlSystemGetDriverVersion = lambda: "test-driver"
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "receipt"
-            result = measure(
-                [sys.executable, "-c", code],
-                output,
-                nvml,
-                sample,
-                interval=0.005,
-                grace=0.1,
-                **kwargs,
-            )
+            child = {}
+            if prepare is not None:
+                code, sample = prepare(output, child)
+            real_popen = subprocess.Popen
+
+            def launch(*args, **launch_kwargs):
+                child["process"] = real_popen(*args, **launch_kwargs)
+                return child["process"]
+
+            with patch("measure_process.subprocess.Popen", side_effect=launch):
+                result = measure(
+                    [sys.executable, "-c", code],
+                    output,
+                    nvml,
+                    sample,
+                    interval=0.005,
+                    grace=0.1,
+                    **kwargs,
+                )
             self.assertEqual(
                 result, json.loads(output.with_suffix(".json").read_text())
             )
@@ -138,54 +150,129 @@ class LifecycleTests(unittest.TestCase):
     def gpu_sample(_devices, _pid):
         return 100, 80, {"GPU-first": 64}
 
+    @staticmethod
+    def phase_case(
+        output,
+        child,
+        *,
+        inference_gpu=True,
+        empty_inference=False,
+        marker=True,
+        exit_code=0,
+        sample_delay=0,
+    ):
+        """A child advances only after the sampler acknowledges each phase.
+
+        The flushed log proves that measure() has consumed each marker before
+        the sample callback releases the corresponding acknowledgement.
+        """
+        startup_ack = output.parent / "startup.ack"
+        inference_ack = output.parent / "inference.ack"
+        log = output.with_suffix(".log")
+        load_marker = "loaded backend=cuda" if marker else "inference-ready"
+        code = f"""
+import pathlib, sys, time
+
+def wait_for(path):
+    deadline = time.monotonic() + 10
+    while not pathlib.Path(path).exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("sampler acknowledgement missing: " + path)
+        time.sleep(0.001)
+
+print("startup-ready", flush=True)
+wait_for({str(startup_ack)!r})
+print({load_marker!r}, flush=True)
+"""
+        if not empty_inference:
+            code += f"wait_for({str(inference_ack)!r})\n"
+        code += f"sys.exit({exit_code})\n"
+        inference_samples = 0
+        delayed = False
+
+        def sample(_devices, _pid):
+            nonlocal inference_samples, delayed
+            # Deliberately pause the parent beyond the old timing windows.
+            # Correctness comes from acknowledgements, not the pause duration.
+            if sample_delay and not delayed:
+                delayed = True
+                time.sleep(sample_delay)
+            text = log.read_text()
+            usage = {"GPU-first": 64}
+            if load_marker in text:
+                inference_samples += 1
+                if not inference_gpu:
+                    usage = {}
+                if inference_samples >= 2:
+                    inference_ack.touch()
+            elif "startup-ready" in text:
+                startup_ack.touch()
+                if empty_inference:
+                    # The child exits before this startup sample returns.
+                    # measure() must then drain the marker without inventing
+                    # an inference sample; wait() observes exit without a race.
+                    child["process"].wait(timeout=10)
+            return 100, 80, usage
+
+        return code, sample
+
     def test_success_and_actual_cadence(self):
-        result, log = self.run_measure(
-            'import time; print("loaded backend=cuda", flush=True); time.sleep(0.1)',
-            self.gpu_sample,
-        )
-        self.assertTrue(result["passed"])
-        self.assertGreater(result["peaks_bytes"]["inference"]["gpu_samples"], 0)
-        self.assertGreater(result["sampling_actual_interval_s"]["mean"], 0)
-        self.assertIn("loaded backend=cuda", log)
+        for delay in (0, 0.2):
+            with self.subTest(parent_delay=delay):
+                result, log = self.run_measure(
+                    prepare=partial(self.phase_case, sample_delay=delay)
+                )
+                self.assertTrue(result["passed"])
+                self.assertGreaterEqual(
+                    result["peaks_bytes"]["inference"]["gpu_samples"], 2
+                )
+                self.assertGreater(result["sampling_actual_interval_s"]["mean"], 0)
+                self.assertIn("loaded backend=cuda", log)
 
     def test_startup_gpu_does_not_validate_missing_inference_gpu(self):
-        def sample(_devices, _pid):
-            return 100, 80, {"GPU-first": 64} if not marker.exists() else {}
-
-        with tempfile.TemporaryDirectory() as directory:
-            marker = Path(directory) / "loaded"
-            code = (
-                "import time,pathlib; time.sleep(0.08); "
-                f"pathlib.Path({str(marker)!r}).touch(); "
-                'print("loaded backend=cuda",flush=True); time.sleep(0.08)'
-            )
-            result, _ = self.run_measure(code, sample)
-        self.assertFalse(result["passed"])
-        self.assertEqual(result["exit_code"], 0)
-        self.assertGreater(result["peaks_bytes"]["startup"]["gpu_samples"], 0)
-        self.assertIsNone(result["peaks_bytes"]["inference"]["gpu"])
-        self.assertIn("No inference GPU memory", result["measurement_error"])
+        for delay in (0, 0.2):
+            with self.subTest(parent_delay=delay):
+                result, _ = self.run_measure(
+                    prepare=partial(
+                        self.phase_case, inference_gpu=False, sample_delay=delay
+                    )
+                )
+                self.assertFalse(result["passed"])
+                self.assertEqual(result["exit_code"], 0)
+                self.assertGreater(result["peaks_bytes"]["startup"]["gpu_samples"], 0)
+                self.assertGreaterEqual(
+                    result["peaks_bytes"]["inference"]["samples"], 2
+                )
+                self.assertIsNone(result["peaks_bytes"]["inference"]["gpu"])
+                self.assertIn("No inference GPU memory", result["measurement_error"])
 
     def test_missing_marker_and_child_failure_are_invalid(self):
-        for code in (
-            "import time; time.sleep(0.05)",
-            'import sys; print("loaded backend=cuda",flush=True); sys.exit(7)',
-        ):
-            with self.subTest(code=code):
-                result, _ = self.run_measure(code, self.gpu_sample)
+        for marker, exit_code in ((False, 0), (True, 7)):
+            with self.subTest(marker=marker, exit_code=exit_code):
+                result, _ = self.run_measure(
+                    prepare=partial(self.phase_case, marker=marker, exit_code=exit_code)
+                )
                 self.assertFalse(result["passed"])
+                self.assertEqual(result["exit_code"], exit_code)
+                if not marker:
+                    self.assertIn("Missing load marker", result["measurement_error"])
+                else:
+                    self.assertNotIn("measurement_error", result)
 
     def test_empty_inference_sample_window_is_invalid(self):
-        def slow_startup(_devices, _pid):
-            time.sleep(0.08)
-            return 100, 80, {"GPU-first": 64}
-
-        result, _ = self.run_measure(
-            'import time; time.sleep(0.02); print("loaded backend=cuda",flush=True)',
-            slow_startup,
-        )
-        self.assertFalse(result["passed"])
-        self.assertEqual(result["peaks_bytes"]["inference"]["gpu_samples"], 0)
+        for delay in (0, 0.2):
+            with self.subTest(parent_delay=delay):
+                result, _ = self.run_measure(
+                    prepare=partial(
+                        self.phase_case, empty_inference=True, sample_delay=delay
+                    )
+                )
+                self.assertFalse(result["passed"])
+                self.assertEqual(result["exit_code"], 0)
+                self.assertGreater(result["peaks_bytes"]["startup"]["gpu_samples"], 0)
+                self.assertIsNotNone(result["load_s"])
+                self.assertEqual(result["peaks_bytes"]["inference"]["samples"], 0)
+                self.assertIn("No inference GPU memory", result["measurement_error"])
 
     def test_sampling_failure_kills_worker_and_retains_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -264,13 +351,16 @@ class LifecycleTests(unittest.TestCase):
         nvml.nvmlShutdown = lambda: None
         nvml.nvmlSystemGetDriverVersion = lambda: "test"
         psutil = SimpleNamespace(NoSuchProcess=ProcessLookupError)
-        code = 'import time; print("loaded backend=cuda",flush=True); time.sleep(0.05)'
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "cli"
+            code, sample = self.phase_case(output, {}, inference_gpu=False)
             with (
                 patch.dict(sys.modules, {"psutil": psutil, "pynvml": nvml}),
                 patch(
-                    "measure_process.sample_process_tree", return_value=(100, 80, {})
+                    "measure_process.sample_process_tree",
+                    side_effect=lambda _psutil, _nvml, devices, pid: sample(
+                        devices, pid
+                    ),
                 ),
                 patch.object(
                     sys,
