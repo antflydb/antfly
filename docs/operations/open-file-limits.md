@@ -57,7 +57,17 @@ sampling is every 50 ms; Linux additionally samples resident `.afvb` mapping byt
 (including deleted generations) about once a second. Sampled peaks are lower
 bounds, not quotas. macOS reports process RSS/footprint; per-vector-mapping RSS is
 explicitly unavailable there. Query latencies are separated into ingestion and
-steady phases. Logs and partial reports survive failures. The low-FD CI lane
+steady phases. Schema 2 assigns requests spanning a phase boundary to a separate
+`transition` bucket; those requests never enter either phase's percentiles. A
+phase with no fully contained requests is reported as `null`, including valid
+single-batch runs with no ingestion-query observations. `phase_measurements`
+retains the full `initial` and `recovery` process lifetimes, from launch before
+readiness through shutdown, with FD/RSS and mapping-RSS samples and per-lifetime
+peaks. Top-level peaks cover both lifetimes. Sampling failures while a process is
+alive fail qualification; process disappearance after exit ends sampling normally.
+Logs and partial reports survive failures. Diagnostic-copy and cleanup errors
+cannot skip server termination or other cleanup, and the primary failure is
+preserved. The low-FD CI lane
 runs a smaller 1,024-document correctness qualification and retains its reports.
 
 The runner also accepts `--data PATH` for the paper runner's prepared

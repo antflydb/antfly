@@ -1481,12 +1481,14 @@ class StandaloneAntflyServer:
         config_path: Path | None = None,
         storage_engine: str | None = None,
         inference_host_budget_mb: int | None = None,
+        on_process_started: Callable[[subprocess.Popen], None] | None = None,
     ):
         self.binary = resolve_binary_path(binary)
         self.host = host
         self.config_path = config_path
         self.storage_engine = storage_engine
         self.inference_host_budget_mb = inference_host_budget_mb
+        self.on_process_started = on_process_started
         with ExitStack() as setup:
             self.port_reservations = LoopbackPortReservations(host)
             setup.callback(self.port_reservations.close)
@@ -1561,6 +1563,8 @@ class StandaloneAntflyServer:
                 cwd=self.root,
             ),
         )
+        if self.on_process_started is not None:
+            self.on_process_started(self.proc)
         if not wait_for_server(
             self.api_url,
             allow_unauthorized=self.pgwire_port is not None,

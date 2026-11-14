@@ -1290,3 +1290,55 @@ def test_root_enrollment_does_not_retry_permanent_rejection(status):
             {"identity": {}},
         )
     assert len(writes) == 1
+
+
+def test_standalone_process_observer_runs_before_initial_and_recovery_readiness(
+    tmp_path, monkeypatch
+):
+    events = []
+    processes = []
+    server = object.__new__(e2e_conftest.StandaloneAntflyServer)
+    server.binary = "/unused/antfly"
+    server.host, server.port = "127.0.0.1", 12345
+    server.root = tmp_path
+    server.config_path = None
+    server.inference_host_budget_mb = None
+    server.storage_engine = None
+    server.pgwire_port = server.health_port = None
+    server.url = server.api_url = "http://127.0.0.1:12345"
+    server.log_path = tmp_path / "server.log"
+    server.log_path.touch()
+    server.port_reservations = SimpleNamespace(
+        handoff_to=lambda _ports, launch: launch()
+    )
+    server._poll_metadata_admin_url = lambda: ""
+    server.on_process_started = lambda proc: events.append((proc.pid, "observe"))
+
+    def launch(*_args, **_kwargs):
+        process = SimpleNamespace(pid=len(processes) + 1)
+        processes.append(process)
+        events.append((process.pid, "launch"))
+        return process
+
+    def ready(*_args, **_kwargs):
+        assert events[-1] == (server.proc.pid, "observe")
+        events.append((server.proc.pid, "ready"))
+        return True
+
+    monkeypatch.setattr(
+        e2e_conftest, "_standalone_stateful_command", lambda *_args, **_kwargs: []
+    )
+    monkeypatch.setattr(e2e_conftest.subprocess, "Popen", launch)
+    monkeypatch.setattr(e2e_conftest, "wait_for_server", ready)
+    with server.log_path.open("w") as log:
+        server.log_file = log
+        server._start_process(truncate_logs=False)
+        server._start_process(truncate_logs=False)
+    assert events == [
+        (1, "launch"),
+        (1, "observe"),
+        (1, "ready"),
+        (2, "launch"),
+        (2, "observe"),
+        (2, "ready"),
+    ]
