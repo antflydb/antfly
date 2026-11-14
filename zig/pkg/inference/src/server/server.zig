@@ -6293,12 +6293,17 @@ pub const Node = struct {
             try self.loadBoundManifest(allocator, path, false, control);
     }
 
+    fn bindPreparationModelResidency(preparation: *@import("../backends/admitted_allocator.zig").AdmittedAllocator, model: *model_manager_mod.LoadedModel) !?@import("../backends/admitted_allocator.zig").AdmittedAllocator.ResidencyBinding {
+        const admission = model.session.run_admission orelse return null;
+        return try preparation.requireResidency(admission.controller, admission.requiredResidency());
+    }
+
     /// Planning runs before the execution lease, including on independent
     /// cohort/continuous workers. Its temporary allocations need their own owner.
     fn countAdmittedPromptTokens(self: *Node, model_dir: []const u8, model: *model_manager_mod.LoadedModel, cfg: gpt_model_mod.Config, messages: []const generation.Message, max_tokens: i32) !NativePromptTokenCount {
         var preparation = try self.inferencePreparation();
         defer preparation.deinit();
-        var binding = if (model.session.run_admission) |admission| try preparation.requireResidency(admission.controller, admission.requiredResidency()) else null;
+        var binding = try bindPreparationModelResidency(&preparation, model);
         defer if (binding) |*held| held.deinit();
         return countPromptTokens(preparation.allocator(), model_dir, model, cfg, messages, max_tokens, false, false) catch |err|
             if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
@@ -6399,6 +6404,8 @@ pub const Node = struct {
             try self.model_manager.acquireFromDirWithControl(model_path, self.bindModelSelection(model_path_selection, execution_control));
         defer model_handle.release();
         const model = model_handle.get();
+        var preparation_residency = try bindPreparationModelResidency(&preparation, model);
+        defer if (preparation_residency) |*binding| binding.deinit();
         if (preflight.expected_model_revision) |expected| {
             const actual = model.resolution_revision orelse return error.CheckpointRevisionUnavailable;
             if (!std.mem.eql(u8, &expected, &actual)) return error.StaleCheckpoint;
@@ -53137,5 +53144,34 @@ test "reader prompt planning includes pinned model residency before formatting" 
         defer a.free(content);
         @memset(content, 'x');
         try std.testing.expectError(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, node.countAdmittedPromptTokens("unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1));
+    }
+}
+
+test "reader direct prompt preparation includes metadata and pinned model in rejection classification" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |contended| {
+        var node = try Node.init(a, .{});
+        defer node.deinit();
+        var preparation = try node.inferencePreparation();
+        defer preparation.deinit();
+        const domain = node.model_manager.resource_domain.?;
+        domain.admission_limits = .{ .host_limit_bytes = if (contended) 64 * 1024 else 32 * 1024, .scratch_limit_bytes = 64 * 1024 };
+        _ = try preparation.allocator().alloc(u8, 4 * 1024);
+        try preparation.trim();
+        var weights = try domain.admission.tryAcquire(.cpu, .{}, .{ .host_weight_bytes = 16 * 1024 }, false);
+        defer weights.release();
+        var peer = try domain.admission.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = if (contended) 32 * 1024 else 0 }, false);
+        defer peer.release();
+        var model: model_manager_mod.LoadedModel = undefined;
+        model.chat_tmpl = null;
+        model.session = .{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &domain.admission, .backend_class = .cpu, .limits = domain.admission_limits, .required_residency = weights.amounts, .static_workspace_bytes = 1, .check_live_memory = false } };
+        // The direct path reuses an owner already holding manifest metadata.
+        var binding = try Node.bindPreparationModelResidency(&preparation, &model);
+        defer if (binding) |*held| held.deinit();
+        const content = try a.alloc(u8, 16 * 1024);
+        defer a.free(content);
+        @memset(content, 'x');
+        try std.testing.expectError(error.OutOfMemory, Node.countPromptTokens(preparation.allocator(), "unused", &model, .{}, &.{.{ .role = "user", .content = content }}, 1, false, false));
+        try std.testing.expectEqual(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, preparation.admission_error.?);
     }
 }

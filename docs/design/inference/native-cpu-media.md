@@ -364,6 +364,23 @@ lease participates in preparation feasibility until reader teardown. Ordering
 fallback applies only to explicit unsupported-operation errors; arbitrary
 checkpoint failures propagate through direct pipeline APIs too.
 
+Direct generation binds pinned model residency to its existing preparation owner
+as soon as it acquires the model, including manifest metadata retained earlier.
+Cohort workers use the same binding contract. A request that cannot fit beside
+its own model is a permanent limit failure; unrelated occupancy remains retryable.
+
+Moondream prepares packed QKV and reusable flash-attention workspaces through
+the admitted caller allocator before starting host worker threads. Worker
+execution allocates nothing through that allocator, preserving head parallelism
+without sharing a non-thread-safe request ledger. Allocation failure before
+launch releases all prepared worker storage.
+
+Encoder/decoder recognizers move their owned text allocations and leases into
+the document owner. Whitespace trimming compacts in place at the allocation
+base. Empty outputs retain their process domain after publication, and offline
+transfers rehome local leases before destroying the source frame. Native results
+without an allocation owner still copy into the document scope.
+
 Allocation owners enforce a single reservation domain and cache their retained
 host total. Regional result transfers and ancestor queries do not repeatedly
 walk all earlier leases; trimming stops after available slack is exhausted.
