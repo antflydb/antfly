@@ -139,19 +139,11 @@ pub const Scope = struct {
         const target_controller = self.processController();
         const source_controller = source.processController();
         if (target_controller != source_controller) return error.InvalidAdmissionLeaseReduction;
-        // Offline scopes use embedded ledgers. Rehome those leases before the
-        // source's stack frame disappears; process-domain leases stay intact.
         if (target_controller == null) {
-            var reservation = source.owner.reservations;
-            while (reservation) |node| : (reservation = node.next) {
-                var replacement = try self.local_controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = node.bytes }, false);
-                errdefer replacement.release();
-                if (node.lease) |*lease| lease.release();
-                node.lease = replacement;
-            }
+            try self.owner.absorbLocal(&source.owner, &self.local_controller, &source.local_controller);
+        } else {
+            try self.owner.absorb(&source.owner);
         }
-        if (target_controller == null) source.owner.reservation_controller = &self.local_controller;
-        try self.owner.absorb(&source.owner);
     }
 
     pub fn allocator(self: *@This()) !std.mem.Allocator {
@@ -742,4 +734,78 @@ test "prepared empty published output retains its process domain during ownershi
     try std.testing.expect(owned.scope.owner.reservation_controller == null);
     try target.absorb(&owned.scope);
     try std.testing.expectEqual(@as(usize, @sizeOf(Owned)), controller.snapshot().hostTotalBytes());
+}
+
+const OfflineTransferRejection = enum { backing, prepaid, overflow, capacity };
+
+fn rejectShortLivedOfflineTarget(source: *Scope, variant: OfflineTransferRejection) !void {
+    var target = Scope.init(if (variant == .backing) std.heap.page_allocator else std.testing.allocator, null, .{}, null);
+    defer target.deinit();
+    if (variant == .prepaid) target.owner.prepaid_host_bytes = 1;
+    if (variant == .overflow) target.owner.live_bytes = std.math.maxInt(usize);
+    if (variant == .capacity) target.local_controller.shared_limits = .{ .host_limit_bytes = 1 };
+    defer {
+        target.owner.prepaid_host_bytes = 0;
+        target.owner.live_bytes = 0;
+    }
+    const before = source.local_controller.snapshot();
+    try std.testing.expectError(switch (variant) {
+        .overflow => error.Overflow,
+        .capacity => error.ResourceLimitExceeded,
+        else => error.InvalidAdmissionLeaseReduction,
+    }, target.absorb(source));
+    try std.testing.expectEqualDeep(before, source.local_controller.snapshot());
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, target.local_controller.snapshot());
+    var node = source.owner.reservations;
+    while (node) |reservation| : (node = reservation.next) try std.testing.expect(reservation.lease.?.controller == &source.local_controller);
+}
+
+test "prepared offline rejected transfer preserves source beyond destination lifetime" {
+    for ([_]OfflineTransferRejection{ .backing, .prepaid, .overflow, .capacity }) |variant| {
+        var source = Scope.init(std.testing.allocator, null, .{}, null);
+        defer source.deinit();
+        const a = try source.allocator();
+        const bytes = try a.dupe(u8, "retained source");
+        try rejectShortLivedOfflineTarget(&source, variant);
+        try std.testing.expectEqualStrings("retained source", bytes);
+        a.free(bytes);
+        try source.trim();
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, source.local_controller.snapshot());
+    }
+}
+
+fn checkOfflineTransferConsolidation(a: std.mem.Allocator) !void {
+    var target = Scope.init(a, null, .{}, null);
+    defer target.deinit();
+    const out = try target.allocator();
+    const earlier = try out.dupe(u8, "earlier");
+    var first: []u8 = undefined;
+    var second: []u8 = undefined;
+    {
+        var source = Scope.init(a, null, .{}, null);
+        defer source.deinit();
+        const work = try source.allocator();
+        first = try work.alloc(u8, 70 * 1024);
+        @memset(first, 'a');
+        second = try work.alloc(u8, 80 * 1024);
+        @memset(second, 'b');
+        try std.testing.expect(source.owner.reservations.?.next != null);
+        const bytes = target.local_controller.snapshot().host_scratch_bytes + source.local_controller.snapshot().host_scratch_bytes;
+        try target.absorb(&source);
+        try std.testing.expectEqual(bytes, target.local_controller.snapshot().host_scratch_bytes);
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, source.local_controller.snapshot());
+    }
+    try std.testing.expectEqualStrings("earlier", earlier);
+    for (first) |value| try std.testing.expectEqual(@as(u8, 'a'), value);
+    for (second) |value| try std.testing.expectEqual(@as(u8, 'b'), value);
+    out.free(earlier);
+    out.free(first);
+    out.free(second);
+    try target.trim();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, target.local_controller.snapshot());
+}
+
+test "prepared offline transfer consolidates reservations and releases after source destruction" {
+    try checkOfflineTransferConsolidation(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkOfflineTransferConsolidation, .{});
 }
