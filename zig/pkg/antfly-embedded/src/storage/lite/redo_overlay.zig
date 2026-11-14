@@ -328,6 +328,47 @@ pub const SharedRedoOverlay = struct {
         gop.value_ptr.* = node;
     }
 
+    /// Undoes a single, still-in-flight transaction's own append onto
+    /// `key`'s chain under `root` (perf/lwa-txn-overlay: transaction
+    /// isolation) -- the version `appendVersion` most recently pushed for
+    /// this key, restoring the chain to whatever it superseded (or
+    /// removing the key outright if this was its only version). Used only
+    /// to unwind a transaction's own not-yet-published mutation on abort
+    /// or savepoint rollback, never a version some other, already-
+    /// published commit owns: safe under the single-writer model, since
+    /// nothing else can have appended for the same key while this
+    /// transaction is still open, so the current head is always exactly
+    /// the node this call means to remove. A no-op if nothing is staged
+    /// for `key` (a savepoint opened before this key was ever touched).
+    pub fn removeLastVersion(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, root: u8, key: []const u8) void {
+        std.debug.assert(root < 3);
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const slot = self.maps[root].getPtr(key) orelse return;
+        const node = slot.*;
+        if (node.older) |older| {
+            slot.* = older;
+            // This append superseded `older` (`appendVersion`'s own
+            // `pending_retirement_versions` bump for that case); undoing
+            // the append un-supersedes it.
+            self.pending_retirement_versions -|= 1;
+        } else if (self.maps[root].fetchRemove(key)) |kv| {
+            allocator.free(kv.key);
+        }
+        allocator.free(node.value);
+        allocator.destroy(node);
+    }
+
+    /// Discards one page-shaped write this process itself staged and
+    /// never published -- the `pages`-side analogue of `removeLastVersion`,
+    /// used for the same abort/savepoint-rollback undo. A no-op if
+    /// nothing is staged for `page_id`.
+    pub fn discardPage(self: *SharedRedoOverlay, allocator: Allocator, io: std.Io, page_id: u64) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        if (self.pages.fetchRemove(page_id)) |kv| allocator.free(kv.value);
+    }
+
     /// The number of superseded-but-not-yet-reclaimed versions across
     /// every key and root -- see this struct's own field doc comment.
     /// Nonzero means a fold (`checkpointRedoLog`) would find at least one
