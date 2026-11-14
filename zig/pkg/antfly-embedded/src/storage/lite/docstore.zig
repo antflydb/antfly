@@ -6268,8 +6268,34 @@ pub const Txn = struct {
         // wait for read_mutex in its checkpoint observer behind that wait.
         // Lifetime-owned readers already retain an inode fence and preserve
         // admission during commit fsync.
+        //
+        // `lockStoreExclusive`, not plain `lockStore`: an externally-locked
+        // read is the one reader that *does* need `self.file`'s own
+        // up-to-date state (unlike an ordinary in-process reader, which
+        // only ever reads `read_generation.checkpoint`'s own `read_mutex`-
+        // protected cache, correctly updated only once a commit's
+        // `notifyPublication` runs at its very end). A commit's own
+        // `commit_in_sync` window (`applyMutationGroup`'s `sync_gate`,
+        // `commitTransactionWithDurability`'s `syncIfRequired`/
+        // `publishCheckpoint` hooks) releases `store.mutex` -- not
+        // `read_mutex` -- for the span of its own log/page fsync, after
+        // the mutation's own content is already eagerly visible in the
+        // shared redo overlay (§9.3a, "readers see committed-but-unchecked
+        // state") but before `self.header`'s own `commit_sequence` is
+        // bumped and `notifyPublication` fires. Plain `lockStore` let this
+        // read's own `beginRead` land inside exactly that window: it
+        // re-pins `store.read_generation.checkpoint` (still the *previous*
+        // commit's value, `observeReadCheckpoint` for this one not having
+        // run yet) while `generation.file`'s own overlay already has this
+        // commit's new version chained on top -- `readMark` then resolves
+        // at the stale pinned sequence and finds the old value, even
+        // though the write it raced had already, irreversibly, started
+        // publishing. `lockStoreExclusive` waits out `commit_in_sync` the
+        // same way vacuum/reclaim/checkpoint-publish already do before
+        // touching `self.file`, so this read can only ever land strictly
+        // before or strictly after the whole commit, never astride it.
         const serialized_admission = store.file.externally_locked;
-        if (serialized_admission) lockStore(store);
+        if (serialized_admission) lockStoreExclusive(store);
         defer if (serialized_admission) store.mutex.unlock();
         const pin = try store.readMetadataAllocator().create(ReadPin);
         errdefer store.readMetadataAllocator().destroy(pin);
