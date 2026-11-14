@@ -23,6 +23,7 @@ from uuid import uuid4
 
 import pytest
 from helpers import start_http_server, wait_until
+from requests.exceptions import ReadTimeout
 
 
 @pytest.fixture
@@ -180,17 +181,22 @@ def policy(endpoint):
 
 
 def query(api, table):
-    response = api.s.post(
-        api.url + "/query",
-        json={
-            "table": table,
-            "indexes": ["a0"],
-            "embeddings": {"a0": [1.0, 0.0]},
-            "fields": ["body"],
-            "limit": 100,
-        },
-        timeout=5,
-    )
+    try:
+        response = api.s.post(
+            api.url + "/query",
+            json={
+                "table": table,
+                "indexes": ["a0"],
+                "embeddings": {"a0": [1.0, 0.0]},
+                "fields": ["body"],
+                "limit": 100,
+            },
+            timeout=15,
+        )
+    except ReadTimeout:
+        # The protected-read barrier can outlive one polling request while
+        # inspection/publication catches up; the outer wait bounds convergence.
+        return None
     if response.status_code in (409, 503):
         return None
     assert response.status_code == 200, response.text
