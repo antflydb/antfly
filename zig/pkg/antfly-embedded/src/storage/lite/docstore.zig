@@ -204,6 +204,81 @@ test "issue1362 background assessments preserve same-owner page reuse" {
     try std.testing.expect((try store.file.check()).valid);
 }
 
+// Regression: `Policy.completed` used to reset `assessed_retirement_bytes`/
+// `next_assessment_size` from "now" -- whatever `retirement_bytes` happened
+// to be, and whatever `requestReassessment` had (or hadn't) been called,
+// *at completion time* -- rather than from what the vacuum run that is
+// completing actually started with. A request made while that run was
+// already in flight (hook fires mid-`performVacuum`, well after the run's
+// own `Policy.Snapshot` was captured) got silently discarded the instant
+// that run's own, now-stale completion ran: the owner went idle with no
+// error, the file stayed over its envelope, and nothing else was due to
+// notice until unrelated size/activity growth eventually cleared the
+// ordinary thresholds on their own -- observed live via "lite reclamation
+// automatic worker bounds sustained overwrite history (redo)" stalling at
+// the exact same file size every time it happened.
+//
+// The `.copy` maintenance-test-hook phase fires synchronously, on this same
+// call stack, partway through `performVacuum` -- deterministically "while a
+// vacuum is in flight" with no threads or timing needed at all.
+test "lite reclamation completed does not discard a reassessment request made while its own vacuum is in flight" {
+    const Hook = struct {
+        store: *Store,
+        requested: bool = false,
+        fn notify(ptr: *anyopaque, phase: Store.MaintenancePhase) !void {
+            if (phase != .copy) return;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // A restored/imported generation, a config change, or simply
+            // another caller -- asking for an out-of-band reassessment
+            // while this exact vacuum run is still in flight.
+            self.store.requestReassessment();
+            self.requested = true;
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reassessment-in-flight.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+
+    const value: [8192]u8 = @splat('v');
+    for (0..64) |i| {
+        var key: [32]u8 = undefined;
+        try store.file.putDocument(try std.fmt.bufPrint(&key, "pool-{d}", .{i}), &value);
+    }
+    for (0..64) |i| {
+        var key: [32]u8 = undefined;
+        try store.file.deleteDocument(try std.fmt.bufPrint(&key, "pool-{d}", .{i}));
+    }
+    _ = try store.file.reclaimPages(8192);
+    store.maintenance_policy = try reclamation.Policy.init(.{ .minimum_reclaim_bytes = 4096, .assessment_bytes = 4096, .amplification = 2 });
+
+    var hook: Hook = .{ .store = &store };
+    store.test_maintenance_hook = .{ .ptr = &hook, .notify = Hook.notify };
+    defer store.test_maintenance_hook = null;
+
+    try store.maintainOnce(true);
+    try std.testing.expect(hook.requested);
+    const rewrites_after_first = store.maintenance_policy.status.rewrite_count;
+    try std.testing.expect(rewrites_after_first >= 1);
+
+    // The request made during that vacuum must not have been silently
+    // discarded by its own stale completion: the owner's very next check
+    // must still see a reassessment due, regardless of the file's current
+    // size.
+    const size = (try store.file.file.stat(store.file.runtime())).size;
+    try std.testing.expect(store.maintenance_policy.due(size));
+
+    // And a second `maintainOnce`, with nothing else changed, must actually
+    // act on that -- not merely report `due()` true while doing nothing.
+    try store.maintainOnce(true);
+    try std.testing.expect(store.maintenance_policy.status.rewrite_count > rewrites_after_first);
+    try std.testing.expect((try store.file.check()).valid);
+}
+
 fn reclamationStaleQuotaEstimatesExpireAfterRootsShrinkImpl(a: Allocator, use_redo_log: bool) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -879,7 +954,7 @@ fn reclamationShrinkingObservesPartiallyLivePackedRecordsImpl(a: Allocator, use_
     // forcing it low makes the loop below reassess on its own next call,
     // exactly as it already does for the legacy variant where the
     // activity-based threshold alone is small enough to clear.
-    if (use_redo_log) store.maintenance_policy.next_assessment_size = 0;
+    if (use_redo_log) store.requestReassessment();
     for (0..32) |_| try store.maintainOnce(false);
     const status = try store.reclamationStatus();
     try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
@@ -1789,8 +1864,14 @@ fn reclamationAutomaticWorkerBoundsSustainedOverwriteHistoryImpl(alloc: Allocato
         // the size-based half low so the automatic worker's own next
         // due() check reassesses regardless, the same way it already
         // can for the legacy variant where that threshold is small
-        // enough to clear on its own.
-        if (use_redo_log) store.maintenance_policy.next_assessment_size = 0;
+        // enough to clear on its own. `store.requestReassessment()`, not
+        // the bare `Policy` method: this test waits only on the automatic
+        // background worker below, which blocks indefinitely on
+        // `maintenance_wake` once an ordinary cycle finishes idle with
+        // nothing else pending -- the bare `Policy` call preserves the
+        // request correctly but never wakes that sleeping loop to notice
+        // it before some unrelated later event happens to.
+        if (use_redo_log) store.requestReassessment();
         // No manual maintenance call: wait only for the owner's automatic task.
         // Redo's own divert/fold work makes each commit measurably
         // heavier than the legacy copy-on-write path, so the sustained
@@ -3420,6 +3501,13 @@ pub const Store = struct {
         // lock before vacuum; the owner takes its own capture snapshot.
         if (snapshot) |*source| source.close();
         snapshot = null;
+        // Captured here, before the run -- not re-derived from "now" once it
+        // returns. `performVacuum` can run for a while, contended, escalating
+        // through a fair writer ticket; see `Policy.completed`'s own doc
+        // comment for why using "now" at that point silently discards
+        // whatever debt accrued or `requestReassessment` call arrived while
+        // this exact run was in flight.
+        const vacuum_started = self.maintenance_policy.snapshot();
         const report = self.performVacuum(cancel, true) catch |err| {
             if (err == error.FileBusy or err == error.WouldBlock) {
                 lockStore(self);
@@ -3431,7 +3519,7 @@ pub const Store = struct {
         lockStore(self);
         defer self.mutex.unlock();
         self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
-        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes);
+        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started);
     }
 
     fn admitShrinkWorkspaceAssumeLocked(self: *Store, compact: u64, cancel: ?*const maintenance.CancelToken) !?u64 {
@@ -3676,16 +3764,39 @@ pub const Store = struct {
         return snapshot.checkAtFileSizeWithCancel(size, cancel);
     }
 
+    /// `Policy.requestReassessment`, plus the one thing a bare `Policy`
+    /// cannot do for itself: wake the maintenance loop. That loop blocks
+    /// indefinitely on `maintenance_wake.waitUncancelable` once an ordinary
+    /// cycle finishes with nothing else pending (`maintenanceLoop`'s own
+    /// `else` branch, no `rewrite_retry_at_ns` deadline) -- a request made
+    /// after it has already gone back to sleep otherwise sits honored
+    /// (`due()` correctly returns true the moment anything checks) but
+    /// unnoticed until some *unrelated* later event happens to wake it,
+    /// which may never come (observed live: "lite reclamation automatic
+    /// worker bounds sustained overwrite history (redo)" idling with a
+    /// pending, un-discarded request for the remainder of its own 30s
+    /// deadline). Every Store-level caller that wants an out-of-band
+    /// reassessment noticed promptly -- not just correctly preserved --
+    /// must come through here, never `self.maintenance_policy.
+    /// requestReassessment()` directly.
+    pub fn requestReassessment(self: *Store) void {
+        self.maintenance_policy.requestReassessment();
+        self.maintenance_wake.set(self.file.runtime());
+    }
+
     pub fn vacuum(self: *Store) !native.VacuumReport {
         return try self.vacuumWithCancel(null);
     }
 
     pub fn vacuumWithCancel(self: *Store, cancel: ?*const @import("../maintenance.zig").CancelToken) !native.VacuumReport {
+        // See the matching comment in `maintainOnceWithCancel`: captured
+        // before the run, not re-derived from "now" once it returns.
+        const vacuum_started = self.maintenance_policy.snapshot();
         const report = try self.performVacuum(cancel, false);
         lockStore(self);
         defer self.mutex.unlock();
         self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
-        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes);
+        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started);
         return report;
     }
 
@@ -4062,7 +4173,7 @@ pub const Store = struct {
         const old_handle = self.file.file.handle;
         defer if (self.file.file.handle != old_handle) {
             self.retireReadGeneration(old_bytes);
-            self.maintenance_policy.next_assessment_size = 0;
+            self.requestReassessment();
             self.maintenance_policy.assessed_retirement_bytes = self.file.retirement_activity_bytes;
         };
         return try self.file.replaceWithPreparedGeneration(&prepared.file);
