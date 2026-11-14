@@ -5262,6 +5262,36 @@ pub const HBCIndex = struct {
         try native_catalog_backend.deleteAllForScope(self.alloc, backend.sink, backend.scope);
     }
 
+    /// perf/lwa-maint-serialize (#1216's own two-commit race): call before
+    /// `deleteNativeCatalogScopeForRemoval` and keep held -- via the
+    /// paired `resumeMaintenanceAcrossRemoval`, called only after the
+    /// *separate* catalog-removal commit that makes this index's removal
+    /// visible has also landed -- so background maintenance can never
+    /// observe the scope-clear commit's own retirement debt and reclaim
+    /// against it in the gap between these two commits. That gap is real:
+    /// each commit is individually protected while it runs, but nothing
+    /// before this excluded the maintenance loop's *later* work from
+    /// running between them, and reclaiming in that window raced a
+    /// concurrently-running redo commit (crash sweeps "dense native-catalog
+    /// dimension replacement delete/admit and delete (#1216)").
+    /// A no-op for every backend other than `.native_catalog`, matching
+    /// `deleteNativeCatalogScopeForRemoval`'s own scope.
+    pub fn pauseMaintenanceAcrossRemoval(self: *HBCIndex) void {
+        const backend = switch (self.env_owner) {
+            .native_catalog => |backend| backend,
+            .lsm, .native => return,
+        };
+        if (backend.sink.pauseMaintenance) |f| f(backend.sink.ptr);
+    }
+
+    pub fn resumeMaintenanceAcrossRemoval(self: *HBCIndex) void {
+        const backend = switch (self.env_owner) {
+            .native_catalog => |backend| backend,
+            .lsm, .native => return,
+        };
+        if (backend.sink.resumeMaintenance) |f| f(backend.sink.ptr);
+    }
+
     /// Borrowed only by private synchronous construction owners. close() joins
     /// any native work before the owner may release this callback.
     construction_cancellation: ?@import("antfly_cancellation").CancellationToken = null,

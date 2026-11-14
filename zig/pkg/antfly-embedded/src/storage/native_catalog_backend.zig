@@ -121,6 +121,19 @@ pub const Sink = struct {
     /// one-member group every time, without adding a wait the caller doesn't
     /// need yet.
     submitDeferred: ?*const fn (ptr: *anyopaque, scope: []const u8, mutations: []const Mutation) anyerror!Pending = null,
+    /// perf/lwa-maint-serialize: optional (`null` for a `Sink` with no
+    /// background maintenance of its own, e.g. the test fakes below).
+    /// Brackets a caller-driven sequence of more than one `submit`/commit
+    /// that must land as one atomic-looking unit from background
+    /// maintenance's point of view -- see `HBCIndex
+    /// .pauseMaintenanceAcrossRemoval`'s own doc comment for the one
+    /// caller (#1216's native-catalog index delete: a durable scope-clear
+    /// `submit`, then a separate catalog-removal commit through a
+    /// different store entirely). `pauseMaintenance` must be called
+    /// before the first of those commits and `resumeMaintenance` after
+    /// the last; calls must be paired and never nested.
+    pauseMaintenance: ?*const fn (ptr: *anyopaque) void = null,
+    resumeMaintenance: ?*const fn (ptr: *anyopaque) void = null,
 };
 
 /// Durably removes every entry currently committed under `scope`, so a
