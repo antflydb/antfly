@@ -141,6 +141,9 @@ The optional requirement is carried through batch and transaction codecs and all
 SDKs. Omitted and explicit `none` remain distinct. Transaction-level defaults
 apply only to tables without an override. Session cloning, persistence and
 statement coalescing retain the strongest prerequisite selected for each table.
+Single-shard fast paths and grouped forwarding preserve the optional field.
+Requests with explicit requirements bypass the local write coalescer so each
+request retains its own preparation and source fences.
 
 Preparation dispatches bounded windows of at most 32 documents and 256 KiB of
 source bytes, preserving native dense/sparse and asset provider batching. The
