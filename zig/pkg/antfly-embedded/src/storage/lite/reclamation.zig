@@ -193,8 +193,19 @@ pub const Policy = struct {
     // and `completed` each set that from a different, caller-appropriate
     // source (see their own doc comments), not uniformly from "whatever
     // `retirement_bytes` is right now" the way this helper used to for both.
-    fn resetAssessmentBudget(self: *Policy, physical: u64) void {
-        const proportional = physical / 4;
+    //
+    // `fixed_overhead` (Bug 3, perf/lwa-budget-tail, §9.7a): a redo-log
+    // file's own fixed, non-reclaimable redo-log reservation
+    // (`NativeFile.header.redo_log_capacity` -- 0 for a legacy file),
+    // never part of a rewrite's own potential savings. Only the
+    // *proportional* quarter below is computed net of it: `physical`
+    // itself (and the absolute `next_assessment_size` threshold derived
+    // from it) stays in the same raw-file-size units `due()` compares
+    // against, so a caller that always measures the same way (raw
+    // `file.stat().size`, this struct's own contract) never sees a unit
+    // mismatch between the two.
+    fn resetAssessmentBudget(self: *Policy, physical: u64, fixed_overhead: u64) void {
+        const proportional = (physical -| fixed_overhead) / 4;
         self.next_assessment_size = physical +| @max(self.options.assessment_bytes, proportional);
         self.assessment_activity_bytes = @max(@min(self.options.assessment_bytes, self.options.minimum_reclaim_bytes), proportional);
     }
@@ -213,8 +224,8 @@ pub const Policy = struct {
         self.reassessment_requested +%= 1;
     }
 
-    pub fn assessed(self: *Policy, physical: u64, compact: u64, live: u64, sequence: u64) bool {
-        self.resetAssessmentBudget(physical);
+    pub fn assessed(self: *Policy, physical: u64, compact: u64, live: u64, sequence: u64, fixed_overhead: u64) bool {
+        self.resetAssessmentBudget(physical, fixed_overhead);
         // Assessment time, not completion time: this *is* "what this
         // decision is based on", the correct baseline `due()`'s activity
         // half measures fresh accrual against until the next assessment or
@@ -224,12 +235,22 @@ pub const Policy = struct {
         self.status.compact_size_estimate = compact;
         self.status.live_bytes_estimate = live;
         self.status.estimated_at_sequence = sequence;
-        return self.worthwhile(physical, compact);
+        return self.worthwhile(physical, compact, fixed_overhead);
     }
 
-    pub fn worthwhile(self: Policy, physical: u64, compact: u64) bool {
-        return physical -| compact >= self.options.minimum_reclaim_bytes and
-            physical > compact *| self.options.amplification;
+    // `fixed_overhead`: see `resetAssessmentBudget`'s own doc comment.
+    // Unlike that function, every use of `physical` here is proportional
+    // (how much of it is reclaimable relative to `compact`), so the
+    // reservation is subtracted from `physical` itself, not just an
+    // increment derived from it: the reservation is physically always
+    // present and never shrinks, so it would otherwise count as
+    // permanently "dead" space no rewrite can ever actually recover,
+    // keeping a redo-log file perpetually "worthwhile" to rewrite on
+    // every assessment even with no real savings available.
+    pub fn worthwhile(self: Policy, physical: u64, compact: u64, fixed_overhead: u64) bool {
+        const reclaimable = physical -| fixed_overhead;
+        return reclaimable -| compact >= self.options.minimum_reclaim_bytes and
+            reclaimable > compact *| self.options.amplification;
     }
 
     /// A point-in-time capture of exactly what a vacuum run saw when it
@@ -273,9 +294,9 @@ pub const Policy = struct {
     ///    since `started` was captured. One that did happen keeps the
     ///    size-based trigger forced low: this run's own result cannot have
     ///    satisfied a request it did not yet exist to observe.
-    pub fn completed(self: *Policy, physical: u64, reclaimed: u64, started: Snapshot) void {
+    pub fn completed(self: *Policy, physical: u64, reclaimed: u64, started: Snapshot, fixed_overhead: u64) void {
         const requested_during_run = self.reassessment_requested != started.reassessment_requested;
-        self.resetAssessmentBudget(physical);
+        self.resetAssessmentBudget(physical, fixed_overhead);
         if (requested_during_run) self.next_assessment_size = 0;
         self.assessed_retirement_bytes = started.retirement_bytes;
         self.status.rewrite_count +|= 1;
@@ -293,13 +314,13 @@ test "lite reclamation policy uses hysteresis and saturating size arithmetic" {
     var policy = try Policy.init(.{ .assessment_bytes = 64, .minimum_reclaim_bytes = 256 });
     try std.testing.expect(!policy.due(255));
     try std.testing.expect(policy.due(1024));
-    try std.testing.expect(policy.assessed(1024, 300, 200, 7));
+    try std.testing.expect(policy.assessed(1024, 300, 200, 7, 0));
     try std.testing.expect(!policy.due(1025));
-    policy.completed(300, 724, policy.snapshot());
+    policy.completed(300, 724, policy.snapshot(), 0);
     try std.testing.expect(!policy.due(374));
     try std.testing.expect(policy.due(375));
-    try std.testing.expect(!policy.assessed(600, 300, 200, 8));
-    try std.testing.expect(!policy.assessed(std.math.maxInt(u64), std.math.maxInt(u64) / 2 + 1, 0, 9));
+    try std.testing.expect(!policy.assessed(600, 300, 200, 8, 0));
+    try std.testing.expect(!policy.assessed(std.math.maxInt(u64), std.math.maxInt(u64) / 2 + 1, 0, 9, 0));
     try std.testing.expectEqual(std.math.maxInt(u64), policy.next_assessment_size);
     try std.testing.expectError(error.InvalidLiteMaintenanceOptions, Policy.init(.{ .assessment_bytes = 0 }));
     try std.testing.expectError(error.InvalidLiteMaintenanceOptions, Policy.init(.{ .max_storage_bytes = 4095 }));
@@ -315,7 +336,7 @@ test "lite reclamation policy uses hysteresis and saturating size arithmetic" {
 // already-stale) completion ran -- the request never took effect.
 test "lite reclamation requestReassessment made during a vacuum survives that vacuum's own completion" {
     var policy = try Policy.init(.{ .assessment_bytes = 64, .minimum_reclaim_bytes = 256 });
-    try std.testing.expect(policy.assessed(1024, 300, 200, 7));
+    try std.testing.expect(policy.assessed(1024, 300, 200, 7, 0));
     try std.testing.expect(!policy.due(1024));
     // The vacuum this snapshot belongs to captures it here, before it runs.
     const started = policy.snapshot();
@@ -329,7 +350,7 @@ test "lite reclamation requestReassessment made during a vacuum survives that va
     // otherwise set (`physical + max(assessment_bytes, physical/4)`,
     // comfortably above 1024) must not be what makes `due()` true below --
     // only the request-preservation path can, by forcing it back to zero.
-    policy.completed(5000, 724, started);
+    policy.completed(5000, 724, started, 0);
     try std.testing.expectEqual(@as(u64, 0), policy.next_assessment_size);
     // The request must not have been discarded by that stale completion:
     // `due()` must say yes regardless of size now.
@@ -345,12 +366,12 @@ test "lite reclamation requestReassessment made during a vacuum survives that va
 // only the activity-based half, correctly baselined, can carry this.
 test "lite reclamation completed from a stale snapshot does not discard debt accrued during the run" {
     var policy = try Policy.init(.{ .assessment_bytes = 64, .minimum_reclaim_bytes = 256 });
-    try std.testing.expect(policy.assessed(1024, 300, 200, 7));
+    try std.testing.expect(policy.assessed(1024, 300, 200, 7, 0));
     const started = policy.snapshot();
     // Retirement debt from concurrent writes accrues while this run --
     // already holding `started` -- is still in flight.
     policy.retirement_bytes += 1000;
-    policy.completed(2000, 500, started);
+    policy.completed(2000, 500, started, 0);
     try std.testing.expect(policy.next_assessment_size > 1024);
     try std.testing.expectEqual(started.retirement_bytes, policy.assessed_retirement_bytes);
     try std.testing.expect(policy.due(1024));
@@ -360,7 +381,7 @@ test "lite reclamation assessments amortize steady reuse and growth to store siz
     const mib = 1024 * 1024;
     for ([_]u64{ 1024 * mib, 16 * 1024 * mib, 64 * 1024 * mib }) |physical| {
         var policy = try Policy.init(.{});
-        try std.testing.expect(!policy.assessed(physical, physical - 4096, physical - 8192, 1));
+        try std.testing.expect(!policy.assessed(physical, physical - 4096, physical - 8192, 1, 0));
         // Identical 2 GiB of updates causes fewer scans as the store grows.
         // Each scan requires proportional retirement, even with no file growth.
         var scanned_bytes: u64 = 0;
@@ -368,7 +389,7 @@ test "lite reclamation assessments amortize steady reuse and growth to store siz
             policy.retirement_bytes += 64 * mib;
             if (policy.due(physical)) {
                 scanned_bytes += physical;
-                try std.testing.expect(!policy.assessed(physical, physical - 4096, physical - 8192, i + 2));
+                try std.testing.expect(!policy.assessed(physical, physical - 4096, physical - 8192, i + 2, 0));
             }
         }
         try std.testing.expect(scanned_bytes <= policy.retirement_bytes * 4);
@@ -383,7 +404,7 @@ test "lite reclamation assessments amortize steady reuse and growth to store siz
 test "lite reclamation proportional assessments still observe deletion without growth" {
     const physical = 16 * 1024 * 1024 * 1024;
     var policy = try Policy.init(.{});
-    try std.testing.expect(!policy.assessed(physical, physical, physical, 1));
+    try std.testing.expect(!policy.assessed(physical, physical, physical, 1, 0));
     var compact: u64 = physical;
     // Includes inline retirement: a shrinking trigger must not require free
     // whole pages or increasing file size. At most a quarter-file of activity
@@ -392,6 +413,6 @@ test "lite reclamation proportional assessments still observe deletion without g
         policy.retirement_bytes += physical / 4;
         compact -= physical / 4;
         try std.testing.expect(policy.due(physical));
-        try std.testing.expectEqual(i == 2, policy.assessed(physical, compact, compact, i + 2));
+        try std.testing.expectEqual(i == 2, policy.assessed(physical, compact, compact, i + 2, 0));
     }
 }

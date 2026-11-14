@@ -2732,6 +2732,73 @@ full_index writes survive a crash during ride-along merge and
 retirement") now pass as a side effect; the two target tests remain
 among the 13 for the independent reasons above.
 
+**Regression (`perf/lwa-eos-regress`): the ledger-only split above was
+reverted, then restored.** A later pass (085e219bff) switched
+`Store.startMaintenanceAssumeLocked` from
+`retirementNeedsServiceLedgerOnlyWithCancel` back to the full,
+redo-aware `retirementNeedsServiceWithCancel`, reasoning that
+upgrading this function's own lock to `lockStoreExclusive` (closing a
+real, separate TOCTOU race -- this read of `self.file` against a live
+commit's briefly released sync window, `commit_in_sync != 0`) had
+also closed the race that justifies staying ledger-only here. It had
+not: the race `retirementNeedsServiceLedgerOnlyWithCancel`'s own doc
+comment describes is the background `maintenanceLoop`'s *later work*
+racing a still-in-flight redo commit, not this decision read, and
+`lockStoreExclusive` says nothing about what the loop does once
+started. Reverting to the full signal reliably reproduced it again:
+deterministic `EndOfStream`/`OutcomeUnknown` crash-sweep failures,
+including on the sweep's own uncrashed run -- `crash sweep: dense
+native-catalog dimension replacement delete (#1216)` and its
+admit-and-delete sibling, `crash sweep exhaustive: full text
+synchronous visibility`, `crash sweep: full text with non-durable
+commit`. Fixed by reverting `startMaintenanceAssumeLocked` alone back
+to the ledger-only signal (085e219bff's other fix, the
+`lockStoreExclusive` upgrade for both of that commit's call sites, is
+independently correct and stays). New plain, non-sweep regression
+test: "startMaintenanceAssumeLocked stays on the ledger-only
+retirement signal under redo" (`docstore.zig`) -- with a redo log but
+no ledger-level retirement debt at all (no checkpoint fold has ever
+run), overwrites one key enough times to supersede a redo-overlay
+version and asserts the full signal sees "needs service" while the
+ledger-only signal, and `maintenance_started`, do not.
+
+**Not fully closed.** The background-loop/live-redo-commit race
+itself is still undiagnosed. It is also reachable through perfectly
+legitimate *ledger*-level retirement debt, not just the redo-only debt
+this split guards against: with reclamation genuinely due (real
+pages to retire -- the ordinary case once an index delete's own
+scope-removal has run), `retirementNeedsServiceLedgerOnlyWithCancel`
+correctly returns `true` too, the background loop starts the same way
+it always could, and the same class of failure can still surface --
+reproduced directly against `crash sweep: dense native-catalog
+dimension replacement delete (#1216)` even with this fix applied, now
+confined to specific barriers (a real injected crash plus recovery,
+not the sweep's own uncrashed run) rather than to every run
+unconditionally. `crash sweep: dense native-catalog dimension
+replacement admit and delete (#1216)` surfaces a different residual
+symptom the same way (`RepairTransitionConflict`/`IndexRebuilding` on
+an uncrashed run, not `EndOfStream`). Both predate this session's own
+changes -- the identical barrier-0 shape was already reproducible,
+intermittently, on integration before 085e219bff
+(`7965150ff0`, roughly one run in three) -- so this fix restores that
+original, latent failure rate rather than introducing it; it does not
+remove it. The deepest candidate is the delete path's own two-commit
+sequence (`HBCIndex.deleteNativeCatalogScopeForRemoval`'s scope
+removal, then the separate catalog-removal commit
+`persistCatalogExcludingWithAtomicMutation`): the background loop's
+`lockStoreExclusive` only ever excludes it from a commit's own
+briefly released sync window, not from the gap *between* two
+sequential commits belonging to one logical, multi-step operation, so
+a reclaim pass that runs in that gap sees a checkpoint state the
+second commit still depends on. Not confirmed by instrumentation --
+inferred from the two call sites' own documented ordering requirement
+and from `lockStoreExclusive`'s scope, which this session did not
+have the budget to trace further. Revisit together with whichever
+session next touches `perf/lwa-writer-race`'s own territory (the
+write-serialization race this same background-loop/live-commit
+interaction has overlapped since §9.7d's first pass) or the
+multi-commit delete-index sequence directly.
+
 ### 9.7e Transaction isolation and the large-transaction fallback (`perf/lwa-txn-overlay`)
 
 Two gaps in the redo log's transaction model, found via
@@ -2848,6 +2915,133 @@ test); the new overlay-undo test passes 3/3; `--test-filter "redo"`,
 `"savepoint"`, `"abort"`, `"rollback"`, `"index storage"`, `"subtree"`,
 and the redo differential oracle all stay green (see this branch's own
 report for exact counts).
+
+### 9.7f Budget admission and ratio heuristics under redo (`perf/lwa-budget-tail`)
+
+Two bugs in the reclamation path, found and fixed independently of
+§9.7d/§9.7e above but in the same family (a diverting commit's own
+shortcuts leaving gaps a legacy commit's real build never had).
+
+**Bug 2: two redo-only budget-admission gaps.**
+`NativeFile.flushTransactionWrites`'s diverting branch never reached
+`persistAllocator`'s own ledger-backed reserve-capacity check (no
+ledger is attached to `pageAllocatorForDivertingCommit`'s allocator at
+all), so it never enforced the bound a legacy commit always does:
+enough free page-id headroom under `max_file_bytes` for
+`allocator_v4.retirementReservePages`'s own future bookkeeping. An
+ordinary small write could be admitted when the identical write
+correctly failed closed outside redo. Fixed by mirroring that check
+for the diverting path, reading the currently *persisted* ledger
+directly. Separately, a savepoint rollback (`rollbackTransactionSavepoint`,
+WS2's per-group-commit-member undo) restored `checkpoint.page_count`
+but never `TransactionWrites.pages.next_page_id`, so a budget-rejected
+member's own page-shaped divert permanently stole that much budget
+headroom from every later write in the same transaction, until a real
+commit reset it. Fixed by rewinding the cursor on rollback too, with a
+matching cache-eviction-and-truncate (mirroring
+`discardTransactionTail`) so the file's physical size stays consistent
+-- `check()`'s `tail_bytes` validation otherwise flags the leftover
+growth as invalid. Only safe for a diverting commit's own allocator
+(`PageAllocator.diverting`); a real, page-shaped build's freshly
+allocated ids may already be retained inside a ledger's in-memory
+state with no way back, so that case keeps its existing, accepted
+"wasted until vacuum" tradeoff.
+
+**Bug 3: ratio-based reclamation heuristics counted the fixed log
+reservation as reclaimable.** `reclamation.Policy.resetAssessmentBudget`'s
+proportional (physical/4) reassessment threshold and
+`Policy.worthwhile`'s own physical-vs-compact ratio both took the raw
+physical file size, which under redo always includes this file's own
+fixed, non-reclaimable redo-log reservation (`header.redo_log_capacity`,
+§9.7a). That inflation cuts both ways: it raises the bar for how much
+real activity justifies a reassessment (online rewrite stops
+reassessing under activity that would trivially have triggered one
+under legacy), and it can make a ratio check pass on the log's own
+size alone, with no real reclaimable content at all -- several
+existing tests' own redo variants turned out to be passing for exactly
+that second, wrong reason (confirmed directly: the first-ever
+assessment in "lite reclamation shrinking observes deletions without
+growth"'s own redo variant judged a 100%-live file "worthwhile" to
+rewrite, purely because the file's fixed log reservation alone
+exceeded `compact * amplification`). Fixed by giving `Policy.worthwhile`/
+`resetAssessmentBudget`/`completed` an explicit `fixed_overhead`
+parameter, subtracted from `physical` before every proportional
+comparison (never from the absolute `next_assessment_size` threshold
+`due()` compares against, which stays in the same raw-file-size units
+`due()`'s own caller always measures in).
+
+Fixing Bug 3 correctly unmasked two things that are not this bug:
+
+- Bug 1's own orphaned-page-retention leak, in "lite reclamation
+  vacuum preserves collector capacity with retained readers (redo)"
+  and "lite reclamation shrinking observes partially live packed
+  records (redo)" (the latter's own rewrite-count assertion): both
+  were passing only because the admission/ratio gaps above were hiding
+  Bug 1's effect, not because Bug 1 was absent.
+- A structural fact about several small/budget-less reclamation tests
+  (also "shrinking observes deletions without growth", "writable
+  reopen services debt...", "automatic worker bounds sustained
+  overwrite history"): once the log reservation is correctly excluded,
+  a workload that only ever diverts (never grows real, physically
+  wasteful pages the way a legacy non-reusing build does) has nothing
+  for `Policy.worthwhile`'s ratio to find, because `checkpointRedoLog`'s
+  own fold -- the only thing that would turn deferred/logical debt into
+  something `NativeFile.retirement_activity_bytes` or a real rewrite
+  can see -- only runs under capacity pressure a budget-less store
+  never has (§9.7d's own `reserve_retirement_capacity`/`max_file_bytes`
+  gate). Their redo variants' `rewrite_count`-based assertions are now
+  gated to legacy only, with the envelope (`current_file_bytes`) claims
+  each test is actually named for kept unconditional, since a diverting
+  workload satisfies those by never growing in the first place rather
+  than by shrinking back down.
+
+**§9.7a policy revisited: is the fixed log reservation itself sized
+right?** Bug 3's fix makes the reservation's *accounting* correct, but
+does not change its *size*. Measured directly while fixing the five
+tests above: an unbounded (`max_storage_bytes == 0`) store always
+reserves the full `default_redo_log_capacity_bytes` (512 KiB) up
+front, regardless of how small the store's real data is -- for a
+toy/test-scale store with on the order of 100-200 KiB of real content,
+that is 2.5-5x the live data, and `Policy.worthwhile`'s ratio
+(correctly, now) finds nothing to reclaim until physical size clears
+the reservation by a further `minimum_reclaim_bytes`. For a *bounded*
+store, the existing scaling (`redo_log_capacity_bytes =
+min(default, max(max_storage_bytes / 4, 64 KiB))`,
+`docstore.Store.createWithOptions`) already keeps the reservation
+proportional down to a 64 KiB floor, but that floor itself is a large
+fraction of a small budget: 25% at and above a 256 KiB budget (where
+`max_storage_bytes / 4` first exceeds the floor), rising to 50% of a
+128 KiB budget and beyond as the budget shrinks further while the
+floor stays fixed.
+
+Recommendation (not implemented here -- see below for why): default
+`use_redo_log` to `false` when the caller configures `max_storage_bytes`
+below a floor of **4 MiB** (8x the unscaled 512 KiB default), unless
+the caller explicitly passes `use_redo_log = true`. At a 4 MiB budget
+the scaled reservation is `max(4 MiB / 4, 64 KiB) = 1 MiB` (25% of
+budget) -- already the steady-state ratio every larger bounded budget
+also pays, so a 4 MiB floor caps the *worst case* at that same 25%
+instead of letting the 64 KiB absolute floor dominate smaller budgets
+disproportionately. Leave the unbounded (`max_storage_bytes == 0`)
+default's flat 512 KiB reservation unchanged: a real unbounded
+production store is not meaningfully harmed by it, the artifacts found
+here are specific to deliberately tiny test workloads, and those are
+now accounted for directly (`fixed_overhead`) rather than by shrinking
+the reservation itself. A more thorough fix for the unbounded case --
+growing the reservation from a small floor as the file's real data
+grows, instead of reserving the maximum eagerly -- is a larger,
+separate change (§9.4's own checkpointer would need to drive the
+growth) and is left for whoever picks this up next.
+
+Not changed in this pass: `use_redo_log` is threaded through every
+layer listed in §9.7a and defaults to `true` globally once
+`page_reuse`/`indexed_reclamation` allow it; making that default
+budget-dependent would change behavior for every other caller in the
+codebase that relies on the current, size-independent default,
+including tests outside this investigation's own scope. That is
+exactly the kind of wide-blast-radius change worth a dedicated pass
+(with its own full-suite verification), not a decision folded into a
+budget-admission bugfix.
 
 ### 9.8 Gates (from step (c) on)
 

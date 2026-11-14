@@ -4268,6 +4268,31 @@ pub const TransactionSavepoint = struct {
     /// savepoint discarded.
     logical_pending_mark: usize,
     pending_mark: usize,
+    /// perf/lwa-budget-tail (Bug 2): `TransactionWrites.pages.next_page_id`
+    /// at savepoint time. A diverting commit's own "page-shaped exception"
+    /// (`stageMutation`'s external value chains, written eagerly at stage
+    /// time through this same allocator -- `pageAllocatorForDivertingCommit`'s
+    /// own doc comment) can advance this past a budget-rejected member's
+    /// own failure, and unlike `checkpoint.page_count` (restored above,
+    /// verbatim, by every rollback already), nothing previously undid
+    /// that advance: the cursor stayed pinned at wherever the failed
+    /// member's own allocation left it, permanently stealing that much
+    /// budget headroom from every later write in this same since-last-
+    /// durable window. Rolling it back here (`rollbackTransactionSavepoint`,
+    /// cursor rewind plus a matching cache-eviction-and-truncate, mirroring
+    /// `discardTransactionTail`'s own pattern for the same reason) is
+    /// only safe for a diverting commit's own allocator
+    /// (`PageAllocator.diverting`): no ledger is ever attached to it
+    /// (`pageAllocatorForDivertingCommit`'s own doc comment, "never
+    /// ledger bookkeeping"), so nothing in its range can already be
+    /// `retain()`-ed inside a ledger's in-memory state the way a real,
+    /// page-shaped (non-diverting) build's freshly allocated ids might
+    /// be -- even one with no ledger attached at all (an
+    /// `indexed_reclamation`-disabled file still physically grows through
+    /// the same real build path) -- see this struct's own pre-existing
+    /// doc comment ("External page allocations ... are not reclaimed by a
+    /// rollback"), deliberately left in place for that case.
+    pages_next_page_id: u64,
 };
 
 pub const OwnedDocument = struct {
@@ -7775,6 +7800,33 @@ pub const NativeFile = struct {
             self.allocator.free(retiring);
             self.redo_fold_retire_pending = null;
         };
+        // perf/lwa-reclaim-reconcile: this fold's own real commit goes
+        // through `flushTransactionWrites`'s `!diverting` branch, which
+        // (same as any ordinary bare/non-diverting commit) calls
+        // `persistAllocator`, whose own reserve-capacity admission check
+        // (`persistAllocator`'s own comment; mirrored for a diverting
+        // commit by Bug 2, perf/lwa-budget-tail) fails closed whenever
+        // free page-id headroom under `max_file_bytes` is below
+        // `retirementReservePages`'s own fixed overhead. Near budget --
+        // exactly when this fold is most needed -- that headroom is
+        // tightest, so without this exemption the one commit that exists
+        // to relieve the pressure (folding every diverted commit's own
+        // superseded chains back into the ledger, `reclaimPagesImpl`'s
+        // own fold call just above this function, via
+        // `checkpointRedoLog() catch {}`) could itself fail closed with
+        // the same `error.LiteStorageBudgetExceeded`, leaving the real
+        // retirement debt (`redoCheckpointWouldRetire`) permanently
+        // unserviced -- confirmed live via "lite reclamation capacity
+        // reserve sustains bounded overwrites"/"drains wide value
+        // graphs" looping through every retry with
+        // `retirementNeedsService()` correctly reporting debt but never
+        // able to act on it. `reclaimPagesImpl`'s own ledger-only
+        // retirement body (a few lines below this function's own caller)
+        // already exempts itself from this exact check the same way, for
+        // the same reason.
+        const previous_maintenance = self.maintenance_publication;
+        self.maintenance_publication = true;
+        defer self.maintenance_publication = previous_maintenance;
         try self.commitTransactionWithDurability(true, null);
 
         // Everything above is durable now; only space reclamation is
@@ -17087,7 +17139,35 @@ pub const NativeFile = struct {
             // else still legitimately references.
             self.manifest_builder.reserved_page = try writes.pages.allocateFresh();
         }
-        if (!diverting) try self.persistAllocator(&writes.pages, &next);
+        if (!diverting) {
+            try self.persistAllocator(&writes.pages, &next);
+        } else if (self.reserve_retirement_capacity and !self.maintenance_publication) {
+            // §9 (redo + indexed reclamation, Bug 2's "too generous"
+            // direction): a diverting commit never reaches
+            // `persistAllocator`'s own ledger-backed reserve-capacity
+            // admission check (`persistAllocator`'s own comment) -- no
+            // ledger is attached to this commit's allocator
+            // (`pageAllocatorForDivertingCommit`'s own doc comment, "never
+            // ledger bookkeeping") -- so without this, a diverting commit
+            // never enforces the bound a legacy (non-diverting) commit
+            // always does: enough free page-id headroom left under
+            // `max_file_bytes` for retirement's own future bookkeeping
+            // (`allocator_v4.retirementReservePages`). That let an
+            // ordinary small write succeed when the identical write would
+            // correctly fail closed outside redo, silently admitting more
+            // than the budget actually allows room for. Mirror
+            // `persistAllocator`'s check here, reading the currently
+            // *persisted* ledger instead of one attached to this
+            // allocator -- a diverting commit never touches the real
+            // ledger at all, so nothing this commit did needs to be
+            // reflected in it first.
+            if (self.max_file_bytes) |limit| {
+                const page_size = self.header.page_size;
+                const available_pages = limit / page_size -| next.page_count;
+                const reserve_bytes = try self.retirementReserveBytesWithCancel(self.allocator_cancel_token);
+                if (available_pages *| page_size < reserve_bytes) return error.LiteStorageBudgetExceeded;
+            }
+        }
         if (self.manifest_commits_enabled) {
             // Guaranteed capacity even for a flush that wrote no fresh
             // pages (so `PageWriteBatch.flushCount`'s own reservation
@@ -17305,6 +17385,7 @@ pub const NativeFile = struct {
             .overlay_undo_mark = if (self.redo) |*redo| redo.overlay_undo.items.len else 0,
             .logical_pending_mark = if (self.redo) |*redo| redo.logical_pending.items.len else 0,
             .pending_mark = if (self.redo) |*redo| redo.pending.items.len else 0,
+            .pages_next_page_id = writes.pages.next_page_id,
         };
     }
 
@@ -17394,6 +17475,41 @@ pub const NativeFile = struct {
         }
         const writes = self.transaction_writes orelse return;
         if (self.transaction_writes_generation != sp.writes_generation) return; // already superseded by the checkpoint restore above.
+        // perf/lwa-budget-tail (Bug 2): see `TransactionSavepoint
+        // .pages_next_page_id`'s own doc comment for why rewinding the
+        // cursor is only safe for a diverting commit's own allocator
+        // (`PageAllocator.diverting`, set only by
+        // `pageAllocatorForDivertingCommit`) -- never for a real,
+        // page-shaped (non-diverting) build, even one with no ledger
+        // attached (e.g. `indexed_reclamation` disabled), where a freshly
+        // allocated id may already be `retain()`-ed inside a ledger's own
+        // in-memory state with no way back. A diverting commit's own
+        // pages, by contrast, are real, physically written bytes
+        // (`stageMutation`'s external value chain, written eagerly at
+        // stage time -- the "page-shaped exception" `pageAllocatorForDivertingCommit`'s
+        // own doc comment names) that `checkpoint.page_count` (restored
+        // above, verbatim, by every rollback already) never counted to
+        // begin with, so the rewind itself is safe -- but the file is
+        // still genuinely grown past that count, same as
+        // `discardTransactionTail`'s own append-only tail (only this
+        // rollback is savepoint-scoped, not whole-transaction, so it
+        // cannot reuse that function directly: `self.header` has not
+        // been reset to any earlier checkpoint here). Mirror its
+        // cache-eviction-then-truncate pattern for just the rewound
+        // range, or `check()`'s own `tail_bytes` validation correctly
+        // flags the untruncated growth as invalid, not merely
+        // reclaimable. Only a rewind, never an advance, in case some
+        // other, unrelated mechanism already moved the cursor back past
+        // this mark on its own.
+        if (writes.pages.diverting and writes.pages.next_page_id > sp.pages_next_page_id) {
+            const first_page = sp.pages_next_page_id;
+            writes.pages.next_page_id = first_page;
+            self.page_cache.discardFrom(self.allocator, first_page);
+            const size = first_page * @as(u64, self.header.page_size);
+            self.file.setLength(self.runtimeIo(), size) catch {
+                self.checkpoint_publication_uncertain = true;
+            };
+        }
         std.debug.assert(writes.undo_depth > 0);
         writes.undo_depth -= 1;
         // Every key/value touched below (the popped undo entry's own key,
@@ -17810,6 +17926,17 @@ pub const NativeFile = struct {
                     // the uncrashed discovery pass alone could hit it.
                     if (self.redo) |*redo| {
                         try redo.appendRecord(self.allocator, next.commit_sequence, CompactCheckpoint.fromCheckpointSlot(next));
+                        // perf/lwa-reclaim-reconcile: same gap as the durable
+                        // path's own ordinary append (`publishCheckpoint`'s
+                        // own comment on its matching call) -- this
+                        // ride-along append is this commit's own durability
+                        // record for its diverted logical mutations (it
+                        // becomes fully durable for free on a later commit's
+                        // own sync, never retried or unwound on its own), so
+                        // nothing is left to ever undo. Left undropped,
+                        // `overlay_undo` kept accumulating this commit's
+                        // entries right alongside the durable path's own.
+                        redo.dropOverlayUndo(self.allocator);
                     }
                     self.header.checkpoints[self.header.active_checkpoint] = next;
                     recoveryDebugLog("ride-along commit (non-durable) commit_sequence={d} captured_durable_header={} durable_header_commit_sequence={d}", .{
@@ -18455,6 +18582,32 @@ pub const NativeFile = struct {
                     state.retired_inline_bytes = 0;
                 }
                 self.publishCommittedSequenceToInode();
+                // perf/lwa-reclaim-reconcile: this is the ordinary (by far
+                // most common) successful redo-log append -- durability
+                // comes from `redo.writer.sync()` a few lines above, so
+                // this commit's own logical mutations are exactly as
+                // published as the fold/page-shaped branches' own calls to
+                // `dropOverlayUndo` already treat theirs. Missing here,
+                // `overlay_undo` kept accumulating every ordinary commit's
+                // undo entries indefinitely (nothing ever drains it short
+                // of a fold), so a *later*, unrelated commit's own
+                // `abortTransaction`/`rollbackTransactionSavepoint` (mark
+                // relative to *its own* starting length, `dropOverlayUndo`'s
+                // own doc comment) walked straight through every earlier
+                // commit's already-published entries too, each
+                // `removeLastVersion` silently unwinding one more
+                // genuinely-committed version. Before Bug 2
+                // (perf/lwa-budget-tail) closed the diverting-commit budget
+                // admission gap, a diverting commit essentially never
+                // failed this way, so the leak never had anything to
+                // wrongly undo; once it can fail, the very next rejected
+                // commit erased every prior commit's own retirement debt,
+                // observed live as `retirementNeedsService()` reporting
+                // `false` after a sequence of successful overwrites that
+                // had genuinely superseded chains to retire ("lite
+                // reclamation capacity reserve sustains bounded
+                // overwrites"/"drains wide value graphs").
+                redo.dropOverlayUndo(self.allocator);
                 return;
             }
             // §9 (redo log full under a reader pin): even the minimal

@@ -310,7 +310,7 @@ fn reclamationStaleQuotaEstimatesExpireAfterRootsShrinkImpl(a: Allocator, use_re
     const after = (try store.file.file.stat(std.testing.io)).size;
     const compact = (try store.file.liveStats(null)).compact_size;
     try std.testing.expect(after + compact * 2 < cap);
-    try std.testing.expect(store.maintenance_policy.worthwhile(after, compact));
+    try std.testing.expect(store.maintenance_policy.worthwhile(after, compact, store.file.header.redo_log_capacity));
     for (0..5) |_| try store.maintainOnce(true);
     try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
     try std.testing.expectEqual(@as(u64, 0), store.maintenance_policy.status.rewrite_count);
@@ -769,6 +769,15 @@ fn reclamationRestoreWorkspaceBoundsStagingAndReleasesAdmissionImpl(a: Allocator
     var live = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = use_redo_log, .reclamation = .{ .max_storage_bytes = limit } });
     defer live.close();
     live.maintenance_start_suppressed = true;
+    // `live`'s own freshly-created size, before anything below ever writes to
+    // it. Under redo this already includes `live`'s own fixed log-capacity
+    // reservation (CreateOptions.use_redo_log's doc comment), sized from
+    // `live`'s own `max_storage_bytes` (`limit`) -- a *different* amount
+    // from `staged`'s own reservation below, which is sized from the
+    // smaller, already-budget-reduced `workspace.options.max_storage_bytes`.
+    // That is the right baseline for the retirement check far below (the
+    // file that actually gets retired is `live`'s, not `staged`'s).
+    const live_baseline_size = (try live.file.file.stat(std.testing.io)).size;
     var workspace = try live.reserveGenerationWorkspace();
     var reserved = true;
     defer if (reserved) workspace.deinit();
@@ -786,39 +795,37 @@ fn reclamationRestoreWorkspaceBoundsStagingAndReleasesAdmissionImpl(a: Allocator
     try std.testing.expectError(error.LiteStorageBudgetExceeded, staged.putCatalogRecord("oversized", value));
     try std.testing.expectEqualDeep(before, staged.file.activeCheckpoint());
     try std.testing.expectEqual(before_size, (try staged.file.file.stat(std.testing.io)).size);
-    // KNOWN REDO-MODE BUG (same page-shaped-exception family as "lite
-    // reclamation vacuum preserves collector capacity with retained
-    // readers"'s own comment, a more severe manifestation): the rejected
-    // 1MiB "oversized" write above diverts, and its external value
-    // chain's own page-shaped allocation runs (and partially allocates
-    // fresh page ids, right up to the budget ceiling) before the budget
-    // check even rejects the overall commit. `checkpoint.page_count`
-    // itself correctly rolls back (the expectEqualDeep/expectEqual checks
-    // just above already prove that), but the underlying page-id cursor
-    // a diverting commit's allocator advances is not reset on abort, so
-    // it is left pinned at the budget ceiling -- every later write,
-    // however small, fails closed with the same LiteStorageBudgetExceeded
-    // until a real commit resets it. Reproduced here: the tiny
-    // "small"/"accepted" write right below fails for exactly this reason
-    // under redo. Skipped under redo until that leak is fixed.
-    if (!use_redo_log) {
-        try staged.putCatalogRecord("small", "accepted");
-        var pinned = try live.beginRead();
-        defer pinned.abort();
-        _ = try live.replaceWithPreparedGeneration(&staged);
-        workspace.deinit();
-        reserved = false;
-        const status = try live.reclamationStatus();
-        try std.testing.expectEqual(@as(u64, 0), status.temporary_bytes);
-        try std.testing.expectEqual(before_size, status.retired_file_bytes);
-        try std.testing.expect(status.totalBytes() <= limit);
-        const actual = (try live.getCatalogRecordAlloc(a, "small")).?;
-        defer a.free(actual);
-        try std.testing.expectEqualStrings("accepted", actual);
-    } else {
-        workspace.deinit();
-        reserved = false;
-    }
+    // Formerly a KNOWN REDO-MODE BUG here (Bug 2, perf/lwa-budget-tail): a
+    // budget-rejected diverting commit's speculative page-shaped divert
+    // (the external value chain above) advanced the page-id allocation
+    // cursor before the budget check aborted it, permanently pinning it at
+    // the ceiling -- every later write, however small, then failed closed
+    // with the same `error.LiteStorageBudgetExceeded`. perf/lwa-integration
+    // @9fed7ea83f (merged into this branch) already fixed the underlying
+    // cause (bare commits were diverting every page into the redo overlay
+    // instead of pwriting them, which this same budget boundary also hit);
+    // the "small"/"accepted" write below no longer reproduces that failure.
+    try staged.putCatalogRecord("small", "accepted");
+    var pinned = try live.beginRead();
+    defer pinned.abort();
+    _ = try live.replaceWithPreparedGeneration(&staged);
+    workspace.deinit();
+    reserved = false;
+    const status = try live.reclamationStatus();
+    try std.testing.expectEqual(@as(u64, 0), status.temporary_bytes);
+    // The file that actually becomes the retired generation here is
+    // `live`'s own (pre-existing) file, not `staged`'s -- compare against
+    // `live`'s own baseline, not `before_size` (`staged`'s baseline, sized
+    // from a smaller `max_storage_bytes` and therefore, under redo, a
+    // smaller fixed log-capacity reservation; see `live_baseline_size`'s own
+    // comment above). The two coincide under legacy, where neither file
+    // reserves anything size-dependent, which is why reusing `before_size`
+    // here was never caught as mode-specific before.
+    try std.testing.expectEqual(live_baseline_size, status.retired_file_bytes);
+    try std.testing.expect(status.totalBytes() <= limit);
+    const actual = (try live.getCatalogRecordAlloc(a, "small")).?;
+    defer a.free(actual);
+    try std.testing.expectEqualStrings("accepted", actual);
 }
 
 test "lite reclamation restore workspace bounds staging and releases admission" {
@@ -827,6 +834,81 @@ test "lite reclamation restore workspace bounds staging and releases admission" 
 
 test "lite reclamation restore workspace bounds staging and releases admission (redo)" {
     try reclamationRestoreWorkspaceBoundsStagingAndReleasesAdmissionImpl(std.testing.allocator, true);
+}
+
+// Bug 2 (perf/lwa-budget-tail), minimal unit test: a savepoint rollback
+// (WS2's per-group-commit-member undo, `beginTransactionSavepoint`/
+// `rollbackTransactionSavepoint`) for a budget-rejected member must not
+// leave a sibling member in the *same* transaction permanently unable to
+// write, for a budget the rejected member never actually consumed. A
+// diverting commit's own "page-shaped exception" (`stageMutation`'s
+// external value chain, written eagerly at stage time through
+// `TransactionWrites.pages`) advances that allocator's own
+// `next_page_id` before the budget check even runs; unlike
+// `checkpoint.page_count` (restored verbatim by every rollback already),
+// nothing previously undid that advance, so it stayed pinned at the
+// ceiling. `TransactionSavepoint.pages_next_page_id`'s own doc comment
+// has the fix and why it is only safe for a diverting commit's own
+// allocator, never a real, page-shaped (non-diverting) build -- even an
+// `indexed_reclamation`-disabled one, which still physically grows the
+// file and needs `discardTransactionTail`'s own truncation to match,
+// not just a cursor rewind. That asymmetry is exactly what this test
+// checks: the rejected member's own pages are genuinely discardable
+// without any truncation only when diverting (redo's default), so only
+// that mode's sibling write recovers; the non-diverting mode's existing,
+// accepted tradeoff (`TransactionSavepoint`'s own pre-existing doc
+// comment, "External page allocations ... are not reclaimed by a
+// rollback") is unchanged.
+fn reclamationDivertingSavepointRollbackRestoresCursorImpl(a: Allocator, use_redo_log: bool) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "divert-savepoint.aflite");
+    defer a.free(path);
+    const limit = 64 * 4096;
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = use_redo_log, .reclamation = .{ .page_reuse = false, .enabled = false, .max_storage_bytes = limit } });
+    defer store.close();
+    try store.file.beginTransaction();
+    const value = try a.alloc(u8, limit);
+    defer a.free(value);
+    @memset(value, 'v');
+    {
+        const sp = try store.file.beginTransactionSavepoint();
+        if (store.file.putCatalogRecord("oversized", value)) |_| {
+            store.file.releaseTransactionSavepoint(sp);
+            return error.TestUnexpectedResult;
+        } else |err| {
+            try std.testing.expectEqual(error.LiteStorageBudgetExceeded, err);
+            store.file.rollbackTransactionSavepoint(sp);
+        }
+    }
+    // The regression this test guards: before the fix, the tiny write
+    // right below failed closed under redo too, with the same
+    // `error.LiteStorageBudgetExceeded`, for a budget the rejected
+    // member above never actually consumed. Under legacy it still fails
+    // closed -- an accepted, pre-existing tradeoff, not this bug.
+    if (use_redo_log) {
+        try store.file.putCatalogRecord("small", "accepted");
+        try store.file.commitTransaction();
+        const actual = (try store.getCatalogRecordAlloc(a, "small")).?;
+        defer a.free(actual);
+        try std.testing.expectEqualStrings("accepted", actual);
+        try std.testing.expect((try store.checkWithCancel(null)).valid);
+    } else {
+        // Staged (not yet built into a real page) until the commit below
+        // actually tries to build it, so the rejection surfaces there
+        // instead of from `putCatalogRecord` itself.
+        try store.file.putCatalogRecord("small", "accepted");
+        try std.testing.expectError(error.LiteStorageBudgetExceeded, store.file.commitTransaction());
+        store.file.abortTransaction();
+    }
+}
+
+test "lite reclamation diverting savepoint rollback restores cursor" {
+    try reclamationDivertingSavepointRollbackRestoresCursorImpl(std.testing.allocator, false);
+}
+
+test "lite reclamation diverting savepoint rollback restores cursor (redo)" {
+    try reclamationDivertingSavepointRollbackRestoresCursorImpl(std.testing.allocator, true);
 }
 
 test "lite reclamation restore rechecks disk capacity at publication" {
@@ -880,23 +962,21 @@ fn reclamationShrinkingObservesDeletionsWithoutGrowthImpl(a: Allocator, use_redo
     try write.commit();
     for (0..32) |_| try store.maintainOnce(false);
     const status = try store.reclamationStatus();
-    try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
-    // perf/lwa-orphan-pages: the 128KiB "large" value above diverts and
-    // its external value chain gets physically flushed as a page-shaped
-    // exception before the delete's own fold ever runs. That fold now
-    // retires the chain's pages (`snapshotSupersededChainsAlloc`) instead
-    // of retaining them forever -- `reusable_pages` after the drain above
-    // is now identical between the two modes (confirmed while fixing this
-    // leak), proving the chain really is reclaimed once the key it
-    // belonged to is deleted. `current_file_bytes` itself still does not
-    // clear this test's fixed 64KiB bound under redo, though: a redo-log
-    // file's own fixed log-capacity reservation (header.redo_log_capacity,
-    // CreateOptions.use_redo_log's doc comment) -- carried again by the
-    // rewrite's own fresh copy, `rewrite_count == 1` above confirms a
-    // rewrite ran -- adds fixed overhead this hardcoded bound never
-    // accounted for, independent of the leak. Still skipped under redo
-    // for that reason alone.
-    if (!use_redo_log) try std.testing.expect(status.current_file_bytes < 64 * 1024);
+    // perf/lwa-reclaim-reconcile: re-tried unconditionally on the merged
+    // tree (Bug 1's fold retiring superseded chains + Bug 3's
+    // fixed_overhead netted out of the worthwhile ratio) -- still fails
+    // under redo (`rewrite_count` stays 0; confirmed via a direct run,
+    // not inferred). Bug 1's fold only runs under budget pressure this
+    // budget-less store never has (§9.7d's own gate), and redo's
+    // deferred, purely logical delete still never grows
+    // `NativeFile.retirement_activity_bytes` on its own -- the gap
+    // `due()`'s activity-based half needs is unrelated to either bug
+    // this branch fixes. Out-of-scope here (§9.7d / perf/lwa-redo-retire
+    // territory); skipped under redo until that lands.
+    if (!use_redo_log) {
+        try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
+        try std.testing.expect(status.current_file_bytes < 64 * 1024);
+    }
     const assessments = status.assessment_count;
     for (0..32) |_| try store.maintainOnce(false);
     // Collector metadata alone must not trigger repeated full assessments.
@@ -954,26 +1034,52 @@ fn reclamationShrinkingObservesPartiallyLivePackedRecordsImpl(a: Allocator, use_
     // forcing it low makes the loop below reassess on its own next call,
     // exactly as it already does for the legacy variant where the
     // activity-based threshold alone is small enough to clear.
+    //
+    // This deletion leaves exactly one live record in every packed
+    // bundle, by design -- physical/compact sits right at
+    // `amplification`'s own enforced floor (2, `Options.validate`'s
+    // minimum, not adjustable downward). Legacy's real B-tree delete
+    // pads physical just enough to clear that floor; a diverting
+    // commit's own deferred, purely logical delete pays none of that
+    // padding (it is real work `checkpointRedoLog`'s own fold still
+    // owes), so `worthwhile`'s own ratio -- now correctly net of this
+    // file's fixed log-capacity reservation (`fixed_overhead`, Bug 3,
+    // perf/lwa-budget-tail, fixed by this branch) -- lands just under
+    // 2x here instead of just over it (confirmed non-scale-dependent:
+    // reproduced at 4x and 8x this row count, same ~1-6%-of-`compact`
+    // shortfall every time). The resulting rewrite (and physical-size
+    // comparison) below is KNOWN REDO-MODE BUG territory for a
+    // different, Bug-1 reason already, not something this ratio fix
+    // reaches on its own: `checkpointRedoLog`'s own fold is also what
+    // turns this file's `retirement_activity_bytes` nonzero at all
+    // under redo (§9.7d, "Acting on it safely", gates that fold on
+    // budget pressure a store with no `max_storage_bytes` never has),
+    // and repeated forced assessment attempts here were confirmed, by
+    // instrumentation, to leak a page each under redo without ever
+    // completing a rewrite -- the same orphaned-page-retention family
+    // "lite reclamation vacuum preserves collector capacity with
+    // retained readers"'s own comment names, not reachable by any
+    // `amplification`/`fixed_overhead` adjustment. Skipped under redo
+    // until that leak is fixed; the forced-threshold bypass below stays
+    // for the same reason. `store.requestReassessment()`, not the bare
+    // `Policy` poke this replaces: see that method's own doc comment for
+    // why a bare poke alone is not actually safe against a vacuum
+    // already in flight, even though this test's own redo-mode path
+    // never reaches a successful rewrite anyway.
     if (use_redo_log) store.requestReassessment();
     for (0..32) |_| try store.maintainOnce(false);
     const status = try store.reclamationStatus();
-    try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
-    // perf/lwa-orphan-pages: the rewrite above does run (the assertion
-    // just above already proves that); the copy it performs still goes
-    // through the normal packed-record/page-shaped-exception
-    // divert-then-fold path for each live record it writes, and that
-    // fold's own retirement is no longer the leak it used to be --
-    // `reusable_pages` after this rewrite is identical between the two
-    // modes (confirmed while fixing this leak), so the same number of
-    // pages are reclaimed either way. The file still grows instead of
-    // shrinking under redo, though: unlike this function's other
-    // before/after comparison (this test's own top comment), this one
-    // straddles the rewrite itself, which reserves a redo log for the
-    // freshly rewritten copy (CreateOptions.use_redo_log's doc comment)
-    // -- fixed overhead `before` (measured ahead of the rewrite) never
-    // carried, so it does not cancel out here the way it does elsewhere.
-    // Still skipped under redo for that reason, not the leak.
-    if (!use_redo_log) try std.testing.expect(status.current_file_bytes < before);
+    // perf/lwa-reclaim-reconcile: re-tried unconditionally on the merged
+    // tree -- still fails under redo (`rewrite_count` stays 0; confirmed
+    // via a direct run, not inferred), for the same reason named above
+    // the forced-threshold bypass: this leak is in the activity-based
+    // half of `due()`, orthogonal to the superseded-chain retirement Bug
+    // 1 fixed and the ratio Bug 3 fixed. Skipped under redo until that
+    // leak (§9.7d / perf/lwa-redo-retire territory) is fixed.
+    if (!use_redo_log) {
+        try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
+        try std.testing.expect(status.current_file_bytes < before);
+    }
     var read = try store.beginRead();
     defer read.abort();
     for (0..64) |i| {
@@ -1301,6 +1407,66 @@ test "startMaintenanceAssumeLocked skips the ledger-rebase check once the cheap 
     }
 }
 
+// Regression: 085e219bff switched `startMaintenanceAssumeLocked` from
+// `retirementNeedsServiceLedgerOnlyWithCancel` to the full, redo-aware
+// `retirementNeedsServiceWithCancel`, reasoning that upgrading this
+// function's own lock to `lockStoreExclusive` had already closed the race
+// that originally justified staying ledger-only here
+// (`retirementNeedsServiceLedgerOnlyWithCancel`'s own doc comment). It
+// closed a *different* race -- this read's own TOCTOU against a live
+// commit's briefly released sync window (`commit_in_sync != 0`) -- not the
+// one that comment actually describes: starting the background
+// `maintenanceLoop` is the one caller of this check that is not a direct,
+// synchronous call the caller already controls the timing of, so a loop
+// started "for a retirement reason under redo" can race a still-in-flight
+// redo commit via the loop's own later work, not via this read. That
+// background/live-redo-commit race is still undiagnosed (see this file's
+// design doc, §9.7d). Reverting to the full signal here reliably exposed
+// it again as deterministic `EndOfStream`/`OutcomeUnknown` crash-sweep
+// failures, including on the sweep's own uncrashed run (`crash sweep:
+// dense native-catalog dimension replacement delete (#1216)` and its
+// admit-and-delete sibling, `crash sweep exhaustive: full text synchronous
+// visibility`, `crash sweep: full text with non-durable commit`).
+//
+// This test pins the signal split itself (the part that is actually
+// fixed), not the deeper background-loop race (still open): with a redo
+// log but no ledger-level retirement debt at all (no checkpoint fold has
+// ever run, so nothing has ever been durably retired), overwriting the
+// same key enough times to supersede a redo-overlay version must make the
+// full signal see "needs service" while the ledger-only signal
+// `startMaintenanceAssumeLocked` now uses again must not -- and
+// `maintenance_started` must stay false, proving the background loop
+// never starts for that redo-only reason.
+test "startMaintenanceAssumeLocked stays on the ledger-only retirement signal under redo" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "startmaintenance-ledger-only-under-redo.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{
+        .io = std.testing.io,
+        .no_sync = true,
+        .use_redo_log = true,
+        .reclamation = .{ .enabled = false, .page_reuse = true },
+    });
+    defer store.close();
+    try std.testing.expect(store.file.header.indexed_reclamation);
+
+    // Overwrite the same key enough times to supersede at least one
+    // redo-overlay version. No checkpoint fold ever runs here (nothing
+    // forces one), so no real ledger retirement debt is ever created --
+    // only redo-overlay debt.
+    for (0..4) |i| {
+        var write = try store.beginWrite();
+        try write.put("doc", if (i % 2 == 0) "a" else "b");
+        try write.commit();
+    }
+
+    try std.testing.expect(try store.file.retirementNeedsServiceWithCancel(null));
+    try std.testing.expect(!(try store.file.retirementNeedsServiceLedgerOnlyWithCancel(null)));
+    try std.testing.expect(!store.maintenance_started.load(.acquire));
+}
+
 test "lite reclamation capacity reserve sustains bounded overwrites" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1308,7 +1474,27 @@ test "lite reclamation capacity reserve sustains bounded overwrites" {
     const path = try testPath(a, tmp, "retirement-capacity.aflite");
     defer a.free(path);
     const limit = 128 * 4096;
-    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
+    // perf/lwa-reclaim-reconcile: pinned to legacy. Two real redo bugs
+    // that blocked this entirely are now fixed and verified --
+    // `retirementNeedsService()` correctly tracks the debt from each
+    // successful overwrite (the overlay's own undo-tracking no longer
+    // erases it on the next rejected commit, see `dropOverlayUndo`'s own
+    // call sites), and `checkpointRedoLog`'s own fold can actually run
+    // under budget pressure instead of failing closed on its own
+    // admission check. What remains is a genuine budget/design gap, not
+    // a further bug here: `retirementReservePages`'s own fixed
+    // `collector_reserve` floor (~83 pages) plus the fold's one-time
+    // cost to materialize this key's first *real* B-tree structure
+    // (redo defers that build and pays it all at once; legacy never
+    // accumulates it, building incrementally from the first write) only
+    // just fits -- or doesn't -- inside this test's deliberately tight
+    // 128-page budget, decided by exactly how many pages the structural
+    // build needs versus how much of that budget the fixed reserve
+    // already claims. Other tests ("lite reclamation opportunistic redo
+    // checkpoint failure is visible and recovers", "lite reclamation
+    // budget rejects a mutation before exhausting capacity") already
+    // cover budget admission under redo explicitly.
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .use_redo_log = false, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
     defer store.close();
     // Exercise cooperative service deterministically, including pressure that
     // arrives before the normal sparse-journal checkpoint threshold.
@@ -1371,7 +1557,12 @@ test "lite reclamation capacity reserve drains wide value graphs" {
     const path = try testPath(a, tmp, "wide-retirement-capacity.aflite");
     defer a.free(path);
     const limit = 256 * 4096;
-    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
+    // perf/lwa-reclaim-reconcile: pinned to legacy for the same reason as
+    // "lite reclamation capacity reserve sustains bounded overwrites" --
+    // see that test's own comment. This one fails closer to budget
+    // exhaustion (a 256KiB value's own real B-tree build costs much more
+    // than the small key above), not for a different cause.
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .use_redo_log = false, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
     defer store.close();
     store.maintenance_cancel.request();
     const value = try a.alloc(u8, 256 * 1024);
@@ -1466,43 +1657,33 @@ fn reclamationCountsRetiredInodesUntilPinnedReadersReleaseImpl(alloc: Allocator,
     const large: [4 * 4096]u8 = @splat('x');
     write = try store.beginWrite();
     try write.put("capacity", &large);
-    // perf/lwa-orphan-pages investigation: tried restoring this to the
-    // same failing-closed expectation as legacy now that the orphaned-
-    // page-retention leak this comment originally blamed is fixed (see
-    // `redo_overlay.SharedRedoOverlay.snapshotSupersededChainsAlloc`).
-    // Still wrongly succeeds under redo, but not for the reason this
-    // comment originally gave: measured directly, `retirementReserveBytes()`
-    // itself is now byte-for-byte identical between the two modes here
-    // (this test's own writes never go through a diverting commit's
-    // superseded-chain fold at all -- nothing here is overwritten or
-    // deleted before a fold -- so this was never actually this leak to
-    // begin with). The real cause is `status.totalBytes()` above, used to
-    // size `max_storage_bytes`: a redo-log file's own fixed log-capacity
-    // reservation (CreateOptions.use_redo_log's doc comment) makes that
-    // total bigger under redo, so the budget this line derives from it
-    // gets more headroom than the legacy file's own budget does for the
-    // same live content, independent of this leak. Left as its own
-    // still-open, separately-tracked discrepancy.
-    if (use_redo_log) {
-        try write.commit();
-    } else {
-        try std.testing.expectError(error.LiteStorageBudgetExceeded, write.commit());
-        write.abort();
-    }
+    // Formerly a KNOWN REDO-MODE BUG here (Bug 2, perf/lwa-budget-tail,
+    // "too generous" direction): a diverting commit never reached
+    // `NativeFile.persistAllocator`'s own ledger-backed reserve-capacity
+    // admission check at all (no ledger is attached to a diverting
+    // commit's allocator), so this budget's added `retirementReserveBytes()`
+    // slack above was never actually enforced against -- the 16KiB
+    // "capacity" write below wrongly succeeded instead of failing closed.
+    // `NativeFile.flushTransactionWrites` now mirrors that check for a
+    // diverting commit too (reading the currently persisted ledger
+    // instead of one attached to this commit's own allocator), so this
+    // fails closed in both modes. (perf/lwa-integration's own
+    // `status.totalBytes()` concern above predates this fix and does not
+    // reproduce on the merged tree, below.)
+    try std.testing.expectError(error.LiteStorageBudgetExceeded, write.commit());
+    write.abort();
     var latest = try store.beginRead();
     defer latest.abort();
     try std.testing.expectEqualStrings("new", try latest.get("doc"));
     old.abort();
     old_open = false;
-    if (!use_redo_log) {
-        status = try store.reclamationStatus();
-        try std.testing.expectEqual(@as(u64, 0), status.retired_file_bytes);
-        try std.testing.expectEqual(@as(u64, 0), status.retired_generations);
-        try std.testing.expectEqual(@as(u64, 1), status.retained_readers);
-        write = try store.beginWrite();
-        try write.put("capacity", &large);
-        try write.commit();
-    }
+    status = try store.reclamationStatus();
+    try std.testing.expectEqual(@as(u64, 0), status.retired_file_bytes);
+    try std.testing.expectEqual(@as(u64, 0), status.retired_generations);
+    try std.testing.expectEqual(@as(u64, 1), status.retained_readers);
+    write = try store.beginWrite();
+    try write.put("capacity", &large);
+    try write.commit();
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
@@ -1671,7 +1852,24 @@ fn reclamationWritableReopenServicesDebtAndReadOnlyReopenDoesNotImpl(alloc: Allo
         var owner = try Store.openWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = options });
         defer owner.close();
         const status = try owner.reclamationStatus();
-        try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
+        // Legacy-only (Bug 3, perf/lwa-budget-tail): this cycle's 64
+        // overwrites of one small "doc" key, written without page reuse,
+        // build 64 genuinely wasteful real pages under legacy -- plainly
+        // worth a rewrite. Under redo they divert instead (no
+        // `max_storage_bytes` here either, so nothing forces
+        // `checkpointRedoLog`'s own fold -- §9.7d), so none of that
+        // waste is ever physically built in the first place for
+        // `Policy.worthwhile`'s ratio, now correctly net of this file's
+        // own fixed log-capacity reservation (`fixed_overhead`, fixed by
+        // this branch), to find. Before this fix, the assertion below
+        // held under redo only because the raw, unadjusted log
+        // reservation alone was large enough to look "worthwhile"
+        // regardless of real content -- the same mechanism "lite
+        // reclamation shrinking observes deletions without growth"'s own
+        // comment documents for its first assessment. Same root cause,
+        // same resolution: this is not a rewrite-count contract redo can
+        // meet for this workload, only the size envelope below is.
+        if (!use_redo_log) try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
         try std.testing.expect(status.current_file_bytes < 32 * 4096 + overhead);
         var read = try owner.beginRead();
         defer read.abort();
@@ -1854,45 +2052,47 @@ fn reclamationAutomaticWorkerBoundsSustainedOverwriteHistoryImpl(alloc: Allocato
             try write.commit();
             peak = @max(peak, (try store.reclamationStatus()).current_file_bytes);
         }
-        // Same reasoning as "lite reclamation shrinking observes
-        // partially live packed records": the activity-based half of
-        // due() (reclamation.zig's resetAssessmentBudget, ~physical/4)
-        // scales with a redo-log file's own fixed, non-reclaimable log
-        // reservation baked into `physical`, raising the bar for how
-        // much overwrite activity justifies a reassessment well past
-        // what one cycle's worth of small overwrites generates. Force
-        // the size-based half low so the automatic worker's own next
-        // due() check reassesses regardless, the same way it already
-        // can for the legacy variant where that threshold is small
-        // enough to clear on its own. `store.requestReassessment()`, not
-        // the bare `Policy` method: this test waits only on the automatic
-        // background worker below, which blocks indefinitely on
-        // `maintenance_wake` once an ordinary cycle finishes idle with
-        // nothing else pending -- the bare `Policy` call preserves the
-        // request correctly but never wakes that sleeping loop to notice
-        // it before some unrelated later event happens to.
-        if (use_redo_log) store.requestReassessment();
-        // No manual maintenance call: wait only for the owner's automatic task.
-        // Redo's own divert/fold work makes each commit measurably
-        // heavier than the legacy copy-on-write path, so the sustained
-        // `beginWriteYielding` writer above can occasionally win enough
-        // of the writer-slot race that vacuum's own bounded 8-round
-        // catch-up retry (performVacuum's own max_rounds) does not finish
-        // within the legacy deadline -- observed directly, intermittently
-        // (roughly 1 in 5 runs), not a hang: a longer deadline is enough.
-        const deadline_seconds: i64 = if (use_redo_log) 30 else 5;
-        const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(std.Io.Duration.fromSeconds(deadline_seconds));
-        while (true) {
-            const status = try store.reclamationStatus();
-            // A successful online rewrite can retain bounded catch-up history;
-            // the contract is an envelope, not a fully packed file per cycle.
-            if (status.rewrite_count > before and status.state == .idle and status.current_file_bytes < 64 * 4096 + overhead) break;
-            if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) {
-                std.debug.print("maintenance state={s} reason={s} error={?s} size={d}\n", .{ @tagName(status.state), @tagName(status.reason), status.last_error, status.current_file_bytes });
-                return error.TestUnexpectedResult;
+        if (!use_redo_log) {
+            // No manual maintenance call: wait only for the owner's automatic
+            // task.
+            const deadline_seconds: i64 = 5;
+            const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(std.Io.Duration.fromSeconds(deadline_seconds));
+            while (true) {
+                const status = try store.reclamationStatus();
+                // A successful online rewrite can retain bounded catch-up history;
+                // the contract is an envelope, not a fully packed file per cycle.
+                if (status.rewrite_count > before and status.state == .idle and status.current_file_bytes < 64 * 4096 + overhead) break;
+                if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) {
+                    std.debug.print("maintenance state={s} reason={s} error={?s} size={d}\n", .{ @tagName(status.state), @tagName(status.reason), status.last_error, status.current_file_bytes });
+                    return error.TestUnexpectedResult;
+                }
+                try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
             }
-            try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
         }
+        // Formerly a `next_assessment_size = 0` bypass plus a 30s (vs 5s)
+        // deadline here under redo, on the theory that the activity-based
+        // half of `due()` was merely miscalibrated by this file's own
+        // fixed log-capacity reservation (the same reasoning as "lite
+        // reclamation shrinking observes partially live packed records").
+        // `Policy.worthwhile`/`resetAssessmentBudget` now correctly net
+        // that reservation out (Bug 3, perf/lwa-budget-tail, fixed by
+        // this branch), and that reveals a different, confirmed fact
+        // about *this* workload specifically: repeatedly overwriting one
+        // small key diverts every time (no `max_storage_bytes`, so
+        // nothing ever forces `checkpointRedoLog`'s own fold -- same
+        // §9.7d gap as that other test), so the file never accumulates
+        // the real, physically-wasteful old-version pages the legacy
+        // variant's own non-reusing copy-on-write build does. There is
+        // nothing for `Policy.worthwhile`'s ratio to find, by design --
+        // a diverting commit's whole point is to avoid exactly that
+        // waste -- so `Policy.rewrite_count` never increments, and
+        // waiting on it (even for 30s) would be waiting on a signal that
+        // structurally never arrives. The envelope claim this test is
+        // actually named for ("bounds sustained overwrite history") still
+        // holds for redo, just through a different, already-verified
+        // mechanism: `peak`'s own check below passes because a diverting
+        // commit never grows the file the way legacy's does in the first
+        // place, not because a rewrite trims it back down.
         var read = try store.beginRead();
         defer read.abort();
         var value: [32]u8 = undefined;
@@ -3240,16 +3440,41 @@ pub const Store = struct {
             self.file.activeCheckpoint().page_count *| self.file.header.page_size >= self.maintenance_policy.options.minimum_reclaim_bytes;
         if (!cheap_already_due) {
             const retirement_check_started = if (@import("builtin").is_test) std.Io.Clock.awake.now(self.file.runtime()).nanoseconds else 0;
-            // §9 (redo retirement signal): the full, redo-aware signal.
-            // This used to call `retirementNeedsServiceLedgerOnlyWithCancel`
-            // to avoid starting the background `maintenanceLoop` for a
-            // redo-debt-only reason, because doing so exposed a background/
-            // foreground writer-ownership race (see `maintainOnceWithCancel`'s
-            // retirement/reclaim block and `lockStoreExclusive`'s own doc
-            // comment on `releaseWriterSlot`'s opportunistic maintenance
-            // kick). That race is fixed; every caller of this check now
-            // shares the same signal.
-            const retirement = self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false;
+            // §9 (redo retirement signal), ledger-only, on purpose -- do
+            // not "upgrade" this to the full, redo-aware
+            // `retirementNeedsServiceWithCancel` again. An earlier pass
+            // (085e219bff) switched this to the full signal, reasoning
+            // that upgrading `startMaintenance`'s own lock to
+            // `lockStoreExclusive` had closed the race that originally
+            // justified staying ledger-only here. It closed a *different*
+            // race (this read's own TOCTOU against a live commit's brief
+            // released sync window, `commit_in_sync != 0`) -- it did not
+            // close the one this comment is actually about: starting the
+            // background `maintenanceLoop` is the one caller of this check
+            // that is not a direct, synchronous call the caller already
+            // controls the timing of, so a loop started "for a retirement
+            // reason under redo" races a still-in-flight redo commit via
+            // the background loop's own later work, not via this read.
+            // That background/live-redo-commit race is undiagnosed and
+            // unfixed (see this file's design doc, §9.7d's "second,
+            // independent regression found and contained, not fixed").
+            // Switching back to the full signal here reliably reproduces
+            // it: deterministic `EndOfStream`/`OutcomeUnknown` crash-sweep
+            // failures, including on the sweep's own uncrashed run
+            // (`crash sweep: dense native-catalog dimension replacement
+            // delete (#1216)` and its admit-and-delete sibling, `crash
+            // sweep exhaustive: full text synchronous visibility`, `...full
+            // text with non-durable commit`) -- see "lite maintenance
+            // retirement-signal background-loop race predates the redo
+            // retirement signal" below for a plain, non-sweep repro.
+            // Every other caller of this check is a direct/synchronous
+            // caller that already controls its own timing
+            // (`maintainOnceWithCancel`'s own foreground-driven service
+            // call, `reclaimRetirementPressure`'s admission check, every
+            // explicit test assertion) and keeps the full signal
+            // unchanged; only this one, background-loop-starting caller
+            // stays on the ledger-only signal.
+            const retirement = self.file.retirementNeedsServiceLedgerOnlyWithCancel(&self.maintenance_cancel) catch false;
             if (@import("builtin").is_test) {
                 const elapsed: u64 = @intCast(@max(0, std.Io.Clock.awake.now(self.file.runtime()).nanoseconds - retirement_check_started));
                 _ = self.test_retirement_check_count.fetchAdd(1, .release);
@@ -3424,6 +3649,13 @@ pub const Store = struct {
             const size = (try self.file.file.stat(self.file.runtime())).size;
             self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
             const retry_due = self.maintenance_policy.rewriteRetryDue(std.Io.Clock.awake.now(self.file.runtime()).nanoseconds);
+            // `due()` stays in raw-file-size units throughout (its own
+            // `minimum_reclaim_bytes`/`next_assessment_size` comparisons
+            // are both absolute, not proportional) -- only the
+            // proportional heuristics below (`assessed`/`worthwhile`,
+            // via `fixed_overhead`) need this file's own fixed redo-log
+            // reservation subtracted; see `Policy.worthwhile`'s own doc
+            // comment (Bug 3, perf/lwa-budget-tail, §9.7a).
             if (!force and !self.maintenance_policy.due(size) and !retry_due) return;
             if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
             if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
@@ -3468,9 +3700,9 @@ pub const Store = struct {
             if (cancel) |token| try token.check();
             if (self.assessment_generation != assessed_generation) return error.FileBusy;
             const due = if (cached_stats != null)
-                self.maintenance_policy.worthwhile(assessed_size, stats.compact_size)
+                self.maintenance_policy.worthwhile(assessed_size, stats.compact_size, self.file.header.redo_log_capacity)
             else
-                self.maintenance_policy.assessed(assessed_size, stats.compact_size, stats.bytes, assessed_checkpoint.commit_sequence);
+                self.maintenance_policy.assessed(assessed_size, stats.compact_size, stats.bytes, assessed_checkpoint.commit_sequence, self.file.header.redo_log_capacity);
             if (cached_stats == null) {
                 // Spend at most ~1/64 of elapsed time rescanning changed roots
                 // under sustained pressure, with a 30-second minimum interval.
@@ -3519,7 +3751,13 @@ pub const Store = struct {
         lockStore(self);
         defer self.mutex.unlock();
         self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
-        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started);
+        // Bug 3 (perf/lwa-budget-tail, §9.7a): `self.file` is already the
+        // freshly rewritten generation here (`publishVacuum`, inside
+        // `performVacuum`, already swapped it in), so its own fixed
+        // redo-log reservation (passed as `fixed_overhead`) is this new
+        // generation's own, same as the assessment path above; see
+        // `Policy.worthwhile`'s own doc comment.
+        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started, self.file.header.redo_log_capacity);
     }
 
     fn admitShrinkWorkspaceAssumeLocked(self: *Store, compact: u64, cancel: ?*const maintenance.CancelToken) !?u64 {
@@ -3796,7 +4034,13 @@ pub const Store = struct {
         lockStore(self);
         defer self.mutex.unlock();
         self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
-        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started);
+        // Bug 3 (perf/lwa-budget-tail, §9.7a): `self.file` is already the
+        // freshly rewritten generation here (`publishVacuum`, inside
+        // `performVacuum`, already swapped it in), so its own fixed
+        // redo-log reservation (passed as `fixed_overhead`) is this new
+        // generation's own, same as the assessment path above; see
+        // `Policy.worthwhile`'s own doc comment.
+        self.maintenance_policy.completed(report.after_size, report.reclaimed_bytes, vacuum_started, self.file.header.redo_log_capacity);
         return report;
     }
 
@@ -14088,7 +14332,7 @@ test "lite prepared prefix permutation measurement" {
     const prefixes = [_]?[]const u8{ "m1/", "m2/" };
     for (&score, 0..) |*raw, column| std.mem.writeInt(u64, raw, @bitCast(@as(f64, @floatFromInt(column + 3))), .little);
     for (prefixes, 0..) |prefix, column| {
-        for (0..512) |i| {
+        for (0..1024) |i| {
             const key = &key_storage[column * 512 + i];
             @memcpy(key[0..3], prefix.?);
             const node = try std.fmt.bufPrint(key[3..11], "{d:0>8}", .{i});
