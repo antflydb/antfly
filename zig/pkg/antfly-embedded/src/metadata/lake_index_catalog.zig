@@ -436,7 +436,14 @@ pub fn desiredFingerprint(table: anytype) Digest {
     hash.update(&id);
     part(&hash, table.name);
     part(&hash, table.schema_json);
-    part(&hash, table.indexes_json);
+    // Alias routing and retry evidence do not change reusable physical
+    // payloads. Query definitions already exclude retry history. Retain the
+    // old raw fingerprint on allocation failure: this can conservatively miss
+    // reuse, but cannot equate different physical recipes.
+    const aliases = @import("../api/index_aliases.zig");
+    const physical = if (aliases.uses(table.indexes_json)) aliases.physicalProjection(std.heap.page_allocator, table.indexes_json) catch null else null;
+    defer if (physical) |bytes| std.heap.page_allocator.free(bytes);
+    part(&hash, physical orelse table.indexes_json);
     return hash.finalResult();
 }
 
@@ -769,4 +776,20 @@ test "metadata.lake index query definitions own publication bytes under allocati
     const table_bytes = try std.json.Stringify.valueAlloc(a, table, .{});
     defer a.free(table_bytes);
     try std.testing.expect(std.mem.indexOf(u8, table_bytes, "lake_index_catalog_json") == null);
+}
+
+test "index alias swaps preserve external lake physical publication fingerprints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const aliases = @import("../api/index_aliases.zig");
+    var table: @import("../common/topology_records.zig").TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = "target", .indexes_json = "{\"a\":{\"type\":\"full_text\"},\"b\":{\"type\":\"full_text\"}}" };
+    const expected = desiredFingerprint(table);
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"complete\":true}", .{});
+    table.indexes_json = try aliases.put(a, table.indexes_json, "live", .{ .index = "a", .idempotency_key = "1" }, ready, 1);
+    try std.testing.expectEqual(expected, desiredFingerprint(table));
+    table.indexes_json = try aliases.put(a, table.indexes_json, "live", .{ .index = "b", .expected_index = "a", .idempotency_key = "2" }, ready, 2);
+    try std.testing.expectEqual(expected, desiredFingerprint(table));
+    table.indexes_json = try aliases.queryProjection(a, table.indexes_json);
+    try std.testing.expectEqual(expected, desiredFingerprint(table));
 }

@@ -94,6 +94,15 @@ pub fn addIndexToTableIndexesJsonWithIo(
         else => return error.InvalidTableIndexMetadata,
     };
     if (config.value != .object) return error.InvalidCreateIndexRequest;
+    if (root.get(index_name)) |existing| {
+        if (!try equivalentIndexConfigValues(alloc, index_name, existing, config.value))
+            try @import("antfly_local_sources").api_index_metadata.aliases.ensureUnreferenced(alloc, current_indexes_json, index_name);
+    }
+    if (root.get(@import("antfly_local_sources").api_index_metadata.aliases.key)) |aliases| {
+        if (aliases != .object) return error.InvalidTableIndexMetadata;
+        if (aliases.object.contains(index_name)) return error.IndexAliasNameConflict;
+    }
+
     const stored_config = storedIndexConfigForMutationAlloc(
         alloc,
         io,
@@ -197,6 +206,7 @@ pub fn removeIndexFromTableIndexesJson(
     current_indexes_json: []const u8,
     index_name: []const u8,
 ) !?[]u8 {
+    try @import("antfly_local_sources").api_index_metadata.aliases.ensureUnreferenced(alloc, current_indexes_json, index_name);
     try @import("antfly_local_sources").privacy_catalog.ensureUserMutation(alloc, current_indexes_json, index_name);
     if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.ExtensionOwnedObject;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
@@ -460,6 +470,7 @@ pub fn validateArtifactEnrichmentsForTableIndexesJson(
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexesJsonSource(indexes_json), .{});
     defer parsed.deinit();
     try validateArtifactIndexReferences(alloc, parsed.value, enrichments);
+    try @import("antfly_local_sources").api_index_metadata.aliases.validateReferences(parsed.value);
 }
 
 /// Validate only properties that can be decided from one create-index request.

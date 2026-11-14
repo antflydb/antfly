@@ -1759,6 +1759,10 @@ components:
         Array-typed columns contain SQLArrayValue envelopes, with their element
         descriptor in the corresponding SQLColumn. They are not JSON columns.
       properties:
+        resolved_indexes:
+          type: array
+          items: {type: string}
+          description: Concrete graph index names selected from the statement catalog cut.
         columns:
           type: array
           items:
@@ -10649,6 +10653,10 @@ components:
       type: object
       required: [wire_version, columns, rows, plan, stats, graph_incarnation, graph_revision, complete]
       properties:
+        resolved_indexes:
+          type: array
+          items: {type: string}
+          description: Concrete graph index names selected from the statement catalog cut.
         wire_version: {type: integer, enum: [1]}
         columns:
           type: array
@@ -11921,6 +11929,10 @@ components:
         - took
         - status
       properties:
+        resolved_indexes:
+          type: array
+          items: {type: string}
+          description: Concrete index names selected for this query before embedding and execution.
         source_ranking:
           type: string
           enum: [rrf, ordered]
@@ -17723,6 +17735,122 @@ paths:
           $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/index-aliases/{aliasName}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: aliasName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [index_management]
+      operationId: getTableIndexAlias
+      summary: Inspect an index alias
+      responses:
+        "200":
+          description: Current alias and committed readiness proof
+          content:
+            application/json:
+              schema: {$ref: "indexes.yaml#/components/schemas/IndexAlias"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Stale expected target, incompatible kind, unready target, or catalog conflict
+    put:
+      tags: [index_management]
+      operationId: putTableIndexAlias
+      summary: Atomically create or swap an index alias
+      description: Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias, 64 aliases per table, and 512 KiB of retained alias control state per table. Every mutation reclaims expired receipts across the table; capacity exhaustion rejects new mutations with HTTP 409.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "indexes.yaml#/components/schemas/IndexAliasRequest"}
+      responses:
+        "200":
+          description: Current alias and committed readiness proof
+          content:
+            application/json:
+              schema: {$ref: "indexes.yaml#/components/schemas/IndexAlias"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Stale expected target, incompatible kind, unready target, or catalog conflict
+        "501":
+          description: This index kind or runtime does not support alias mutations
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: namespaceName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: tableName
+        in: path
+        required: true
+        schema: {type: string}
+      - name: aliasName
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      tags: [index_management]
+      operationId: getNamespaceTableIndexAlias
+      summary: Inspect an index alias
+      responses:
+        "200":
+          description: Current alias and committed readiness proof
+          content:
+            application/json:
+              schema: {$ref: "indexes.yaml#/components/schemas/IndexAlias"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Stale expected target, incompatible kind, unready target, or catalog conflict
+    put:
+      tags: [index_management]
+      operationId: putNamespaceTableIndexAlias
+      summary: Atomically create or swap an index alias
+      description: Requires table administration. The target must satisfy the reported readiness proof. Creation requires expected_index to be absent; replacement requires the exact current target. Retry the identical request with the same idempotency key to reconcile an ambiguous response, including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained receipts per alias, 64 aliases per table, and 512 KiB of retained alias control state per table. Every mutation reclaims expired receipts across the table; capacity exhaustion rejects new mutations with HTTP 409.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "indexes.yaml#/components/schemas/IndexAliasRequest"}
+      responses:
+        "200":
+          description: Current alias and committed readiness proof
+          content:
+            application/json:
+              schema: {$ref: "indexes.yaml#/components/schemas/IndexAlias"}
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "409":
+          description: Stale expected target, incompatible kind, unready target, or catalog conflict
+        "501":
+          description: This index kind or runtime does not support alias mutations
   /tables/{tableName}/indexes:
     parameters:
       - name: tableName

@@ -7946,6 +7946,166 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/index-aliases/{aliasName}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: aliasName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags:
+        - index_management
+      operationId: getTableIndexAlias
+      summary: Inspect an index alias
+      responses:
+        '200':
+          description: Current alias and committed readiness proof
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexAlias'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '409':
+          description: Stale expected target, incompatible kind, unready target, or catalog conflict
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    put:
+      tags:
+        - index_management
+      operationId: putTableIndexAlias
+      summary: Atomically create or swap an index alias
+      description: Requires table administration. The target must satisfy the reported readiness proof.
+        Creation requires expected_index to be absent; replacement requires the exact current target.
+        Retry the identical request with the same idempotency key to reconcile an ambiguous response,
+        including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained
+        receipts per alias, 64 aliases per table, and 512 KiB of retained alias control state per table.
+        Every mutation reclaims expired receipts across the table; capacity exhaustion rejects new mutations
+        with HTTP 409.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IndexAliasRequest'
+      responses:
+        '200':
+          description: Current alias and committed readiness proof
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexAlias'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '409':
+          description: Stale expected target, incompatible kind, unready target, or catalog conflict
+        '501':
+          description: This index kind or runtime does not support alias mutations
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/index-aliases/{aliasName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: namespaceName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: aliasName
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      tags:
+        - index_management
+      operationId: getNamespaceTableIndexAlias
+      summary: Inspect an index alias
+      responses:
+        '200':
+          description: Current alias and committed readiness proof
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexAlias'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '409':
+          description: Stale expected target, incompatible kind, unready target, or catalog conflict
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+    put:
+      tags:
+        - index_management
+      operationId: putNamespaceTableIndexAlias
+      summary: Atomically create or swap an index alias
+      description: Requires table administration. The target must satisfy the reported readiness proof.
+        Creation requires expected_index to be absent; replacement requires the exact current target.
+        Retry the identical request with the same idempotency key to reconcile an ambiguous response,
+        including after later swaps. Receipts are retained for at least 24 hours, with at most 128 retained
+        receipts per alias, 64 aliases per table, and 512 KiB of retained alias control state per table.
+        Every mutation reclaims expired receipts across the table; capacity exhaustion rejects new mutations
+        with HTTP 409.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IndexAliasRequest'
+      responses:
+        '200':
+          description: Current alias and committed readiness proof
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IndexAlias'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '409':
+          description: Stale expected target, incompatible kind, unready target, or catalog conflict
+        '501':
+          description: This index kind or runtime does not support alias mutations
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/tables/{tableName}/indexes:
     parameters:
       - name: tableName
@@ -25572,6 +25732,11 @@ components:
 
         descriptor in the corresponding SQLColumn. They are not JSON columns.
       properties:
+        resolved_indexes:
+          type: array
+          items:
+            type: string
+          description: Concrete graph index names selected from the statement catalog cut.
         columns:
           type: array
           items:
@@ -36422,6 +36587,11 @@ components:
         - graph_revision
         - complete
       properties:
+        resolved_indexes:
+          type: array
+          items:
+            type: string
+          description: Concrete graph index names selected from the statement catalog cut.
         wire_version:
           type: integer
           enum:
@@ -38090,6 +38260,11 @@ components:
         - took
         - status
       properties:
+        resolved_indexes:
+          type: array
+          items:
+            type: string
+          description: Concrete index names selected for this query before embedding and execution.
         source_ranking:
           type: string
           enum:
@@ -53709,6 +53884,55 @@ components:
           items:
             type: string
           description: IDs of retrieved documents (for retrieval metrics)
+    IndexAlias:
+      type: object
+      required:
+        - index
+        - swapped_at_ms
+        - require
+        - idempotency_key
+        - readiness
+      properties:
+        index:
+          type: string
+        previous_index:
+          type: string
+          nullable: true
+        swapped_at_ms:
+          type: integer
+          format: int64
+        require:
+          type: string
+          enum:
+            - queryable
+            - complete
+        idempotency_key:
+          type: string
+        readiness:
+          $ref: '#/components/schemas/IndexReadinessStatus'
+    IndexAliasRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - index
+        - idempotency_key
+      properties:
+        index:
+          type: string
+          minLength: 1
+          maxLength: 256
+        expected_index:
+          type: string
+        require:
+          type: string
+          enum:
+            - queryable
+            - complete
+          default: complete
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 256
     IndexMaintenanceOwnerProof:
       type: object
       additionalProperties: false

@@ -5,6 +5,25 @@ info:
   version: "0.0.1"
 components:
   schemas:
+    IndexAliasRequest:
+      type: object
+      additionalProperties: false
+      required: [index, idempotency_key]
+      properties:
+        index: {type: string, minLength: 1, maxLength: 256}
+        expected_index: {type: string}
+        require: {type: string, enum: [queryable, complete], default: complete}
+        idempotency_key: {type: string, minLength: 1, maxLength: 256}
+    IndexAlias:
+      type: object
+      required: [index, swapped_at_ms, require, idempotency_key, readiness]
+      properties:
+        index: {type: string}
+        previous_index: {type: string, nullable: true}
+        swapped_at_ms: {type: integer, format: int64}
+        require: {type: string, enum: [queryable, complete]}
+        idempotency_key: {type: string}
+        readiness: {$ref: "#/components/schemas/IndexReadinessStatus"}
     SortDirection:
       $ref: "sort.yaml#/components/schemas/SortDirection"
     SortField:

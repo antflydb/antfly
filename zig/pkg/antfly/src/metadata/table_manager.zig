@@ -16,7 +16,8 @@
 const std = @import("std");
 
 // Version 2 additionally enforces managed privacy sources and read fences.
-pub const artifact_sources_protocol_version: u16 = 2;
+/// v1: artifact sources; v2: privacy serving; v3: opaque index alias catalog state.
+pub const artifact_sources_protocol_version: u16 = 3;
 /// The store understands native HBC authority markers, WAL recovery, and the
 /// fail-closed placement contract used during rolling upgrades.
 pub const dense_native_storage_protocol_version: u16 = 1;
@@ -103,7 +104,7 @@ pub fn validateObjectTableMutation(a: std.mem.Allocator, before: TableRecord, af
     defer replacement_schema.deinit();
     if (external != isExternalObjectSchema(replacement_schema.value)) return error.ObjectTableDefinitionConflict;
     if (after.min_ranges != 0 or after.desired_replica_count != 0 or after.storage.dense_embeddings != .primary_lsm or after.storage_migration != null) return error.ObjectTablePlacementUnsupported;
-    if (!external and (!std.mem.eql(u8, before.schema_json, after.schema_json) or !std.mem.eql(u8, before.read_schema_json, after.read_schema_json) or !std.mem.eql(u8, before.indexes_json, after.indexes_json))) return error.ObjectTableDefinitionConflict;
+    if (!external and (!std.mem.eql(u8, before.schema_json, after.schema_json) or !std.mem.eql(u8, before.read_schema_json, after.read_schema_json) or !try @import("antfly_local_sources").api_index_metadata.aliases.configurationEqual(a, before.indexes_json, after.indexes_json))) return error.ObjectTableDefinitionConflict;
 }
 
 fn isExternalObjectSchema(root: std.json.Value) bool {
@@ -946,6 +947,10 @@ pub fn privacyProtocolSupported(reporter_incarnation: u64, protocol_version: u16
     return reporter_incarnation != 0 and protocol_version >= 2 and artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
 }
 
+pub fn indexAliasesProtocolSupported(reporter_incarnation: u64, protocol_version: u16) bool {
+    return reporter_incarnation != 0 and protocol_version >= 3 and artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
+}
+
 pub fn denseNativeStorageProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
     return protocol_version <= dense_native_storage_protocol_version and
         (protocol_version == 0 or reporter_incarnation != 0);
@@ -1468,6 +1473,18 @@ pub const TableManager = struct {
     }
 
     pub fn upsertTable(self: *TableManager, record: TableRecord) !void {
+        if (@import("antfly_local_sources").api_index_metadata.aliases.uses(record.indexes_json)) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, record.indexes_json, .{});
+            defer parsed.deinit();
+            try @import("antfly_local_sources").api_index_metadata.aliases.validateReferences(parsed.value);
+            if (record.schema_json.len != 0) {
+                var schema = try std.json.parseFromSlice(struct { relational_indexes: []const struct { name: []const u8 } = &.{} }, self.alloc, record.schema_json, .{ .ignore_unknown_fields = true });
+                defer schema.deinit();
+                if (parsed.value.object.get(@import("antfly_local_sources").api_index_metadata.aliases.key)) |aliases| {
+                    for (schema.value.relational_indexes) |index| if (aliases.object.contains(index.name)) return error.IndexAliasNameConflict;
+                }
+            }
+        }
         if (self.tables.get(record.table_id)) |existing| {
             try validateObjectTableMutation(self.alloc, existing, record);
             if (existing.storage_migration != null and !tableDefinitionsEqual(existing, record))

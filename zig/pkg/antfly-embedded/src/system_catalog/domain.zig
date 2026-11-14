@@ -51,7 +51,11 @@ pub const QueryDefinition = struct {
     }
 
     pub fn fromTable(table: anytype) @This() {
-        return .{ .storage_engine = table.storage.engine, .table_id = table.table_id, .object_storage_generation = table.object_storage_generation, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json, .lake_index_catalog_json = table.lake_index_catalog_json };
+        const T = switch (@typeInfo(@TypeOf(table))) {
+            .pointer => |pointer| pointer.child,
+            else => @TypeOf(table),
+        };
+        return .{ .storage_engine = table.storage.engine, .table_id = table.table_id, .object_storage_generation = table.object_storage_generation, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = if (@hasField(T, "query_indexes_json")) (if (table.query_indexes_json.len != 0) table.query_indexes_json else table.indexes_json) else table.indexes_json, .lake_index_catalog_json = table.lake_index_catalog_json };
     }
     pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
         const schema = try alloc.dupe(u8, self.schema_json);

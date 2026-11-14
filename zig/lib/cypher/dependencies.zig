@@ -17,6 +17,68 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const catalog = @import("catalog.zig");
+
+/// Owned concrete adjacency names selected by a bound graph execution.
+pub fn selectedIndexes(a: std.mem.Allocator, query: ast.Query, graph: catalog.Graph) ![]const []const u8 {
+    const Selection = struct {
+        a: std.mem.Allocator,
+        graph: catalog.Graph,
+        names: std.StringHashMapUnmanaged(void) = .empty,
+        full: bool = false,
+        fn walk(self: *@This(), value: anytype) anyerror!void {
+            const T = @TypeOf(value);
+            if (T == ast.Clause) switch (value.operation) {
+                .match, .project, .unwind, .subquery, .call => {},
+                else => self.full = true,
+            };
+            if (T == ast.Edge) for (self.graph.relationships) |mapping| {
+                const matches = value.types.len == 0 or for (value.types) |name| {
+                    if (std.mem.eql(u8, name, mapping.name)) break true;
+                } else false;
+                if (matches) try self.names.put(self.a, mapping.index, {});
+            };
+            switch (@typeInfo(T)) {
+                .pointer => |p| {
+                    if (p.size == .one) try self.walk(value.*);
+                    if (p.size == .slice and p.child != u8) for (value) |item| try self.walk(item);
+                },
+                .@"struct" => |fields| inline for (fields.field_names) |name| try self.walk(@field(value, name)),
+                .@"union" => switch (value) {
+                    inline else => |payload| try self.walk(payload),
+                },
+                .optional => if (value) |item| {
+                    try self.walk(item);
+                },
+                else => {},
+            }
+        }
+    };
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var selection: Selection = .{ .a = scratch.allocator(), .graph = graph };
+    try selection.walk(query);
+    if (selection.full) for (graph.relationships) |mapping| {
+        try selection.names.put(scratch.allocator(), mapping.index, {});
+    };
+    const names = try a.alloc([]const u8, selection.names.count());
+    var initialized: usize = 0;
+    errdefer {
+        for (names[0..initialized]) |name| a.free(name);
+        a.free(names);
+    }
+    var found = selection.names.keyIterator();
+    for (names) |*name| {
+        name.* = try a.dupe(u8, found.next().?.*);
+        initialized += 1;
+    }
+    std.mem.sort([]const u8, names, {}, struct {
+        fn less(_: void, l: []const u8, r: []const u8) bool {
+            return std.mem.lessThan(u8, l, r);
+        }
+    }.less);
+    return names;
+}
+
 const Plan = struct {
     graph: catalog.Graph,
     tables: std.StringHashMapUnmanaged(void) = .empty,
@@ -251,4 +313,18 @@ test "physical dependencies retain nested and wildcard edges and fail broad for 
         try std.testing.expectEqual(case.a_count, if (left) |names| names.len else null);
         try std.testing.expectEqual(case.b_count, if (right) |names| names.len else null);
     }
+}
+
+test "index alias search attribution does not invent adjacency reads" {
+    const a = std.testing.allocator;
+    var diagnostic: @import("compiler.zig").Diagnostic = .{};
+    var compiled = try @import("compiler.zig").compile(a, "CALL antfly.search('docs',{query:'hello',indexes:['live']}) YIELD node RETURN node", .{}, &diagnostic);
+    defer compiled.deinit();
+    const graph: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "Person", .table = "docs" }}, .relationships = &.{.{ .name = "KNOWS", .index = "unrelated", .source_label = "Person", .target_label = "Person", .stored_type = "knows" }} };
+    const selected = try selectedIndexes(a, compiled.query, graph);
+    defer {
+        for (selected) |name| a.free(name);
+        a.free(selected);
+    }
+    try std.testing.expectEqual(@as(usize, 0), selected.len);
 }

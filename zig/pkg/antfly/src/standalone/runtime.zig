@@ -16614,6 +16614,50 @@ test "standalone cdc review rejects replication sources with scoped HA ownership
     try std.testing.expectError(error.HACatalogReplicationSourcesUnsupported, LocalStandaloneMetadata.createTable(&metadata, a, "tickets", .{ .replication_sources_json = sources }));
 }
 
+test "index alias standalone catalog survives restart and rejects stale writers and target deletion" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"queryable\":true,\"complete\":true}", .{});
+    var committed: []const u8 = undefined;
+    {
+        var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        try LocalStandaloneMetadata.createTable(&metadata, alloc, "docs", .{});
+        try LocalStandaloneMetadata.createIndex(&metadata, alloc, "docs", "v1", "{\"type\":\"full_text\"}");
+        try LocalStandaloneMetadata.createIndex(&metadata, alloc, "docs", "v2", "{\"type\":\"full_text\"}");
+        const before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("docs").?.*);
+        var first = before;
+        first.indexes_json = try aliases.put(a, before.indexes_json, "live", .{ .index = "v1", .idempotency_key = "1" }, ready, 1);
+        try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, first);
+        var swapped = first;
+        swapped.indexes_json = try aliases.put(a, first.indexes_json, "live", .{ .index = "v2", .expected_index = "v1", .idempotency_key = "2" }, ready, 2);
+        try LocalStandaloneMetadata.replaceTableDefinition(&metadata, first, swapped);
+        try std.testing.expectError(error.TableGenerationChanged, LocalStandaloneMetadata.replaceTableDefinition(&metadata, first, swapped));
+        try std.testing.expectError(error.IndexReferencedByAlias, LocalStandaloneMetadata.dropIndex(&metadata, alloc, "docs", "v2"));
+        committed = try a.dupe(u8, swapped.indexes_json);
+    }
+    var reopened = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+    defer reopened.deinit();
+    const table = reopened.findTableByNameLocked("docs").?.*;
+    try std.testing.expectEqualStrings(committed, table.indexes_json);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, table.indexes_json, .{});
+    try std.testing.expectEqualStrings("v2", try aliases.resolve(parsed, "live"));
+    try std.testing.expect((try aliases.replay(a, parsed, "live", .{ .index = "v2", .expected_index = "v1", .idempotency_key = "2" })) != null);
+    var rolled = table;
+    rolled.indexes_json = try aliases.put(a, table.indexes_json, "live", .{ .index = "v1", .expected_index = "v2", .idempotency_key = "3" }, ready, 3);
+    try LocalStandaloneMetadata.replaceTableDefinition(&reopened, table, rolled);
+    try LocalStandaloneMetadata.dropIndex(&reopened, alloc, "docs", "v2");
+}
+
 test "privacy standalone progress retains routing and join planning generations" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -16779,4 +16823,39 @@ test "privacy standalone compact bindings refresh on policy publication and surv
     metadata.catalog_durability_failed = true;
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null));
     metadata.catalog_durability_failed = false;
+}
+
+test "index alias standalone snapshot install preserves swaps receipts and stale CAS fences" {
+    const a = std.testing.allocator;
+    const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/alias-snapshot", .{tmp.sub_path});
+    var source = try antfly.metadata.RaftApplyStore.init(a, .{ .root_dir = root });
+    defer source.deinit();
+    const group: u64 = 21;
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"complete\":true}", .{});
+    const request: aliases.Request = .{ .index = "a", .idempotency_key = "first" };
+    const first: antfly.metadata.TableRecord = .{ .table_id = 42, .name = "docs", .indexes_json = try aliases.put(scratch, "{\"a\":{\"type\":\"full_text\"},\"b\":{\"type\":\"full_text\"}}", "live", request, ready, 1) };
+    try source.applyStandaloneCommand(group, .{ .upsert_table = first });
+    var second = first;
+    second.indexes_json = try aliases.put(scratch, first.indexes_json, "live", .{ .index = "b", .expected_index = "a", .idempotency_key = "second" }, ready, 2);
+    try source.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = first, .replacement = second } });
+    const snapshot = try source.snapshotBuilder().buildSnapshot(scratch, group);
+    var restored = try antfly.metadata.RaftApplyStore.init(a, .{ .root_dir = try std.fmt.allocPrint(scratch, "{s}-restored", .{root}) });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(scratch, group, 100, snapshot));
+    const current = (try restored.tableByName(a, group, "docs")).?;
+    defer antfly.metadata.table_manager.freeTable(a, current);
+    const decoded = try std.json.parseFromSliceLeaky(std.json.Value, scratch, current.indexes_json, .{});
+    try std.testing.expectEqualStrings("b", try aliases.resolve(decoded, "live"));
+    try std.testing.expectEqualStrings("a", (try aliases.replay(scratch, decoded, "live", request)).?.index);
+    try std.testing.expect(current.query_indexes_json.len != 0);
+    try restored.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = first, .replacement = first } });
+    const after = (try restored.tableByName(a, group, "docs")).?;
+    defer antfly.metadata.table_manager.freeTable(a, after);
+    try std.testing.expectEqualStrings(second.indexes_json, after.indexes_json);
 }

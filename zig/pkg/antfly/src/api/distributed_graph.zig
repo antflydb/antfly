@@ -2408,6 +2408,7 @@ const GraphNodeAdmissionContext = struct {
     source_table: []const u8,
     graph_index_name: []const u8,
     source_topology_epoch: u64,
+    source_index_alias_fences: []const db_mod.types.IndexAliasFence = &.{},
     source_identity_read_generation: ?u64,
     source_identity_read_generations: []const db_mod.types.ShardIdentityReadGeneration,
     source_filter_query_json: []const u8,
@@ -2480,6 +2481,7 @@ const GraphNodeAdmissionContext = struct {
             .source_table = source_table,
             .graph_index_name = graph_index_name,
             .source_topology_epoch = source_topology_epoch,
+            .source_index_alias_fences = req.index_alias_fences,
             .source_identity_read_generation = req.identity_read_generation orelse source_result_identity_read_generation,
             .source_identity_read_generations = source_identity_read_generations,
             .source_filter_query_json = req.filter_query_json,
@@ -2610,6 +2612,17 @@ const GraphNodeAdmissionContext = struct {
             (try catalogGraphIndexIdentity(self.alloc, self.catalog, owned_name, self.graph_index_name)) orelse GraphIndexIdentity{}
         else
             GraphIndexIdentity{};
+
+        // A concrete graph name can be retired and recreated after alias
+        // binding. Preserve the producer cut before handing this identity to
+        // shard expansion and hydration, which enforce it on every read.
+        if (allowed and std.mem.eql(u8, owned_name, self.source_table)) {
+            for (self.source_index_alias_fences) |fence| {
+                if (std.mem.eql(u8, fence.name, self.graph_index_name) and
+                    fence.incarnation != graph_index_identity.incarnation)
+                    return error.CatalogGenerationChanged;
+            }
+        }
 
         var state = GraphAdmissionTableState{
             .table_name = owned_name,
@@ -8052,6 +8065,7 @@ fn batchFrontierByGroup(
 }
 
 pub const IncomingProbeOptions = struct {
+    index_identity: ?GraphIndexIdentity = null,
     ttl_now_ns: u64 = 0,
     work_budget: ?*graph_pattern_mod.WorkBudget = null,
 };
@@ -9745,8 +9759,7 @@ pub fn probeIncomingEdgesForKeysWithOptions(
     }
     @memset(physical_routes, null);
 
-    const index_identity = (try catalogGraphIndexIdentity(alloc, catalog, table_name, index_name)) orelse
-        return error.IndexNotFound;
+    const index_identity = options.index_identity orelse (try catalogGraphIndexIdentity(alloc, catalog, table_name, index_name)) orelse return error.IndexNotFound;
     const group_ids = try table_catalog.resolveGroupsForSpanPinnedUntil(
         alloc,
         catalog,
@@ -21367,4 +21380,17 @@ test "shortest path production reader scans 122K edges within default budgets" {
     try std.testing.expectEqual(count * 10, raised.max_edges - raised.remaining_physical_edges);
     try std.testing.expectEqual(count * 10, raised.max_edges - raised.remaining_edges);
     try std.testing.expectEqual(@as(usize, 0), raised.remaining_nodes);
+}
+
+test "index alias distributed graph rejects a replaced producer identity before expansion" {
+    const a = std.testing.allocator;
+    const H = ShortestPathTestHarness;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(a, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    var worker: H.State = .{ .graph = &graph };
+    const req: db_mod.types.SearchRequest = .{ .index_alias_fences = &.{.{ .name = "graph_idx", .incarnation = std.math.maxInt(u64) }} };
+    var admission = GraphNodeAdmissionContext.init(a, H.FakeCatalog.iface(), H.FakeWorker.iface(&worker), "docs", "graph_idx", 0, req, null, &.{}, .{}, .read_index);
+    defer admission.deinit();
+    try std.testing.expectError(error.CatalogGenerationChanged, admission.ensureTable("docs"));
+    try std.testing.expectEqual(@as(usize, 0), worker.calls);
 }

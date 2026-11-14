@@ -1916,6 +1916,10 @@ pub const AuthenticatedRequest = struct {
 };
 
 pub const SemanticStatusResolver = struct {
+    server: ?*ApiHttpServer = null,
+    catalog_resolver: ?*ApiHttpServer.CatalogQueryResolver = null,
+    pinned_indexes_json: ?[]const u8 = null,
+    statement_indexes_json: ?[]const u8 = null,
     source: StatusSource,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     io: ?std.Io = null,
@@ -1935,9 +1939,47 @@ pub const SemanticStatusResolver = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .bind_index_aliases = bindIndexAliases,
                 .resolve_dense_query = resolveDenseQuery,
             },
         };
+    }
+
+    fn bindIndexAliases(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, body: []const u8) !?query_contract.BoundIndexAliases {
+        const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
+        self.pinned_indexes_json = null;
+        const server = self.server orelse return null;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const owner = if (self.catalog_resolver) |resolver| resolver.arena else alloc;
+        const indexes_json = self.statement_indexes_json orelse table_indexes: {
+            const table = (try server.queryTableDefinition(if (self.catalog_resolver) |resolver| resolver.arena else a, self.catalog_resolver, table_name, .{
+                .deadline_ns = self.query_embedding_deadline_ns,
+                .cancellation = self.query_cancellation orelse .none,
+            })) orelse return null;
+            break :table_indexes table.indexes_json;
+        };
+        const aliases = @import("antfly_local_sources").api_index_metadata.aliases;
+        if (std.mem.indexOf(u8, indexes_json, "_index_aliases") == null and std.mem.indexOfScalar(u8, indexes_json, '\\') == null) return null;
+        const compact = try server.index_alias_cache.project(server.alloc, owner, indexes_json);
+        const owned_compact = self.catalog_resolver == null;
+        errdefer if (owned_compact) alloc.free(compact);
+        const catalog = try std.json.parseFromSliceLeaky(std.json.Value, a, compact, .{});
+        if (!catalog.object.contains(aliases.key)) {
+            if (owned_compact) alloc.free(compact);
+            return null;
+        }
+        self.pinned_indexes_json = compact;
+        var query = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{ .allocate = .alloc_always });
+        try aliases.bindQuery(a, catalog, &query);
+        if (query.object.getPtr("_index_alias_fences")) |fences| for (fences.array.items) |*fence| {
+            if (fence.object.get("incarnation").?.integer != 0) continue;
+            const name = fence.object.get("name").?.string;
+            const identity = (try indexes_api.indexRuntimeIdentity(a, name, catalog.object.get(name) orelse return error.InvalidTableIndexMetadata)) orelse return error.InvalidTableIndexMetadata;
+            try fence.object.put(a, "incarnation", .{ .integer = @intCast(identity.incarnation) });
+        };
+        return .{ .body = try std.json.Stringify.valueAlloc(alloc, query, .{}), .indexes_json = if (owned_compact) compact else null };
     }
 
     fn resolveDenseQuery(
@@ -1952,6 +1994,7 @@ pub const SemanticStatusResolver = struct {
         const self: *SemanticStatusResolver = @ptrCast(@alignCast(ptr));
         try ensureRequestActive(self.query_cancellation);
         const planned = try internal_query_operations.planSemanticQuery(.{
+            .indexes_json = self.pinned_indexes_json,
             .ptr = self.source.ptr,
             .admin_snapshot = self.source.vtable.admin_snapshot orelse return error.UnsupportedQueryRequest,
             .free_admin_snapshot = self.source.vtable.free_admin_snapshot orelse return error.UnsupportedQueryRequest,
@@ -4056,6 +4099,7 @@ pub const ApiHttpServer = struct {
     }
 
     object_tables: @import("object_table_runtime.zig").Manager = .{},
+    index_alias_cache: @import("index_alias_cache.zig").Cache = .{},
     retained_read_runtime: ?*@import("retained_read_owner.zig").Runtime = null,
     retained_read_runtime_mutex: std.Io.Mutex = .init,
     table_definition_cache: tables_api.DefinitionCache = .{},
@@ -4704,6 +4748,19 @@ pub const ApiHttpServer = struct {
             return error.ArtifactIndexSourcesTemporarilyUnavailable;
     }
 
+    pub fn ensureIndexAliasAdmission(self: *ApiHttpServer, request: api_operation.RequestContext) !void {
+        if (self.cfg.deployment_mode != .distributed) return;
+        var snapshot = (try self.source.linearizableSnapshot(request)) orelse return error.IndexAliasProtocolUpgradeRequired;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        var found = false;
+        for (snapshot.stores) |store| {
+            if (!store.live or !metadata_table_manager.storeServesTableData(store.role)) continue;
+            found = true;
+            if (!metadata_table_manager.indexAliasesProtocolSupported(store.reporter_incarnation, store.artifact_sources_protocol_version)) return error.IndexAliasProtocolUpgradeRequired;
+        }
+        if (!found) return error.IndexAliasProtocolUpgradeRequired;
+    }
+
     pub fn ensurePrivacyAdmission(self: *ApiHttpServer, request: api_operation.RequestContext) !void {
         const reads = self.table_reads orelse return error.PrivacyProtectiveInstallationRequired;
         if (reads.vtable.privacy_policy_version == null or self.cfg.deployment_mode == .serverless) return error.PrivacyProtectiveInstallationRequired;
@@ -5061,6 +5118,7 @@ pub const ApiHttpServer = struct {
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
         self.sql_plan_cache.deinit(queryEmbeddingCacheIo(self.cfg));
         self.sql_schema_cache.deinit();
+        self.index_alias_cache.deinit(self.alloc);
         self.lake_recent_vector_jobs.deinit();
         self.lake_retained_payloads.deinit();
         self.lake_recent_text.deinit();
@@ -5214,6 +5272,7 @@ pub const ApiHttpServer = struct {
         security_scope: []const u8,
     ) SemanticStatusResolver {
         return .{
+            .server = self,
             .source = self.source,
             .antfly_provider = self.antfly_provider,
             .io = self.inferenceIo(),
@@ -10930,6 +10989,20 @@ pub const ApiHttpServer = struct {
         index_name: []const u8,
         keys: []const []const u8,
     ) ![]bool {
+        var alias_arena = std.heap.ArenaAllocator.init(alloc);
+        defer alias_arena.deinit();
+        const scratch = alias_arena.allocator();
+        var concrete_index = index_name;
+        var selected_identity: ?distributed_graph.GraphIndexIdentity = null;
+        if (try self.queryTableDefinition(scratch, null, table_name, .{})) |table| {
+            const compact = try self.index_alias_cache.project(self.alloc, scratch, table.indexes_json);
+            const alias_catalog = try std.json.parseFromSliceLeaky(std.json.Value, scratch, compact, .{});
+            concrete_index = try @import("antfly_local_sources").api_index_metadata.aliases.resolve(alias_catalog, index_name);
+            if (!std.mem.eql(u8, concrete_index, index_name)) {
+                const identity = (try indexes_api.indexRuntimeIdentity(scratch, concrete_index, alias_catalog.object.get(concrete_index).?)) orelse return error.IndexNotFound;
+                selected_identity = .{ .incarnation = identity.incarnation, .config_hash = identity.config_hash };
+            }
+        }
         const SourceWorker = struct {
             server: *ApiHttpServer,
             source: table_reads.TableReadSource,
@@ -11014,16 +11087,17 @@ pub const ApiHttpServer = struct {
             .server = self,
             .source = source,
         };
-        return try distributed_graph.probeIncomingEdgesForKeys(
+        return try distributed_graph.probeIncomingEdgesForKeysWithOptions(
             alloc,
             catalog,
             worker.iface(),
             table_name,
             topology_epoch,
             null,
-            index_name,
+            concrete_index,
             keys,
             .read_index,
+            .{ .index_identity = selected_identity },
         );
     }
 
@@ -11179,6 +11253,25 @@ pub const ApiHttpServer = struct {
                 .graph => {
                     try self.appendQueryBuilderGraphIndexMetadata(&graph_metadata, entry.key_ptr.*, entry.value_ptr.*);
                 },
+            }
+        }
+
+        if (object.get(@import("antfly_local_sources").api_index_metadata.aliases.key)) |aliases| {
+            if (aliases != .object) return error.InvalidTableIndexMetadata;
+            var names = aliases.object.iterator();
+            while (names.next()) |entry| {
+                const target = try @import("antfly_local_sources").api_index_metadata.aliases.resolve(parsed.value, entry.key_ptr.*);
+                const config = object.get(target) orelse return error.InvalidTableIndexMetadata;
+                const kind = queryBuilderIndexContextType(target, config) orelse continue;
+                switch (kind) {
+                    .full_text => try self.appendQueryBuilderFullTextIndexMetadata(&full_text_metadata, entry.key_ptr.*, config),
+                    .embeddings => {
+                        const metadata = try self.queryBuilderEmbeddingIndexMetadata(entry.key_ptr.*, config);
+                        errdefer freeQueryBuilderEmbeddingIndexMetadataItem(self.alloc, metadata);
+                        try embedding_metadata.append(self.alloc, metadata);
+                    },
+                    .graph => try self.appendQueryBuilderGraphIndexMetadata(&graph_metadata, entry.key_ptr.*, config),
+                }
             }
         }
 
@@ -16125,6 +16218,7 @@ pub const ApiHttpServer = struct {
         defer resolver.native_capture_token = null;
         try ensureRequestActive(cancellation);
         var semantic_resolver = self.semanticStatusResolver(query_embedding_security_scope.domain, query_embedding_security_scope.value);
+        semantic_resolver.catalog_resolver = resolver;
         semantic_resolver.query_embedding_deadline_ns = request_deadline_ns;
         semantic_resolver.query_cancellation = cancellation;
         var query_req = query_api.parsePublicQueryRequestWithDeadline(
@@ -16610,6 +16704,7 @@ pub const ApiHttpServer = struct {
         const query_body = try stringifyJsonValueAlloc(alloc, query_value);
         defer alloc.free(query_body);
         var semantic_resolver = self.semanticStatusResolver(.internal, "");
+        semantic_resolver.catalog_resolver = resolver;
         semantic_resolver.query_embedding_deadline_ns = execution_deadline_ns;
         semantic_resolver.query_cancellation = cancellation;
         var owned = try query_api.parsePublicQueryRequestWithDeadline(
@@ -17016,6 +17111,22 @@ pub const ApiHttpServer = struct {
         return result;
     }
 
+    pub fn indexAliasTargetResource(self: *ApiHttpServer, alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, index: []const u8, request: api_operation.RequestContext) ![]u8 {
+        if (table.storage.engine == .object) {
+            var schema = try schema_mod.parseValidatedTableSchema(alloc, table.schema_json);
+            defer schema.deinit(alloc);
+            if (schema.external_base_source == null) {
+                const suffix = try std.fmt.allocPrint(alloc, "indexes/{s}", .{index});
+                defer alloc.free(suffix);
+                var response = (try self.tryObjectTableRequestWithOptions(table.name, .get, suffix, "", null, request, .{ .incarnation = .{ .table_id = table.table_id, .generation = table.object_storage_generation } })) orelse return error.UnsupportedOperation;
+                defer response.deinit(self.alloc);
+                if (response.status != 200) return error.IndexAliasTargetNotReady;
+                return alloc.dupe(u8, response.body);
+            }
+        }
+        return getIndexResourceWithExpected(self, alloc, table.name, index, request, table);
+    }
+
     fn executePublicTableGetIndex(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -17023,11 +17134,23 @@ pub const ApiHttpServer = struct {
         index_name: []const u8,
         request: api_operation.RequestContext,
     ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
+        return getIndexResourceWithExpected(ptr, alloc, table_name, index_name, request, null);
+    }
+
+    fn getIndexResourceWithExpected(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        request: api_operation.RequestContext,
+        expected: ?metadata_table_manager.TableRecord,
+    ) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
+        if (expected) |record| if (!metadata_table_manager.tableDefinitionsEqual(record, table.*)) return error.Conflict;
         if (table.schema_json.len != 0) {
             var parsed = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return error.InternalFailure;
             defer parsed.deinit(alloc);
@@ -17949,6 +18072,7 @@ pub const ApiHttpServer = struct {
         // through consensus and used as the projection expectation, making the
         // operation idempotent across retries and leadership changes.
         const assembled_indexes_json = indexes_api.addIndexToTableIndexesJsonWithIo(alloc, self.inferenceIo(), table_before.indexes_json, index_name, authorized_index_json) catch |err| switch (err) {
+            error.IndexAliasNameConflict, error.IndexReferencedByAlias => return error.Conflict,
             error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
@@ -18486,6 +18610,7 @@ pub const ApiHttpServer = struct {
             error.TableTransitionActive, error.TableGenerationChanged, error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => return error.Conflict,
             error.ExtensionOwnedObject => return error.MethodNotAllowed,
             error.UnsupportedOperation => return error.MethodNotAllowed,
+            error.IndexReferencedByAlias,
             error.InvalidEnrichmentConfig,
             error.ConflictingEnrichmentConfig,
             error.MissingEmbeddingArtifactEnrichment,
@@ -23336,6 +23461,10 @@ pub const ApiHttpServer = struct {
             if (hint.storage.engine != .object or hint.table_id != expected.table_id or hint.object_storage_generation != expected.generation) return error.TableGenerationChanged;
         }
         if (hint.storage.engine != .object) return null;
+        // Public controls must be rejected before a trusted alias envelope is
+        // produced or an object runtime can consume it. Native requests retain
+        // their normal parser admission and never bind during this engine probe.
+        if (std.mem.eql(u8, suffix, "query")) try @import("public_graph_query.zig").rejectInternalDocIdentityFields(self.alloc, body);
         var snapshot = (try self.source.linearizableSnapshot(context)) orelse return error.ReadUnavailable;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableGenerationChanged;
@@ -23378,6 +23507,13 @@ pub const ApiHttpServer = struct {
             const current = tables_api.findTableByName(&admitted, table_name) orelse return error.TableNotFound;
             if (!metadata_table_manager.tableDefinitionsEqual(current.*, bound)) return error.TableGenerationChanged;
         }
+        var alias_resolver = self.semanticStatusResolver(.internal, "");
+        alias_resolver.catalog_resolver = options.resolver;
+        alias_resolver.statement_indexes_json = hint.indexes_json;
+        alias_resolver.query_embedding_deadline_ns = context.deadline_ns;
+        alias_resolver.query_cancellation = context.cancellation;
+        const alias_body = if (std.mem.eql(u8, suffix, "query")) try SemanticStatusResolver.bindIndexAliases(&alias_resolver, self.alloc, table_name, body) else null;
+        defer if (alias_body) |value| value.deinit(self.alloc);
         var response = self.object_tables.handle(self.owner_alloc, self.embedding_provider_runtime.io, bound, .{
             .config = self.cfg.node_config,
             .secrets = self.cfg.secret_store,
@@ -23385,7 +23521,7 @@ pub const ApiHttpServer = struct {
             .local_base_dir = self.cfg.native_lake_artifact_base_dir,
             .graph_execution_limits = self.cfg.graph_execution_limits,
             .remote_content = self.cfg.remote_content,
-        }, method, suffix, body, context) catch |err| switch (err) {
+        }, method, suffix, if (alias_body) |value| value.body else body, context) catch |err| switch (err) {
             error.ObjectTableStorageBindingChanged => return try contextual_operations.textAlloc(self.alloc, 409, "object table storage binding differs from its durable catalog binding"),
             error.ObjectTableDefinitionConflict => return try contextual_operations.textAlloc(self.alloc, 409, "object table definition is immutable; use a new table and explicit migration"),
             error.ObjectTableRuntimeCapacityExceeded => return try contextual_operations.textAlloc(self.alloc, 503, "object table runtime capacity exhausted"),
@@ -23731,7 +23867,7 @@ pub const ApiHttpServer = struct {
         return switch (err) {
             error.ObjectTableJoinUnsupported => try contextual_operations.textAlloc(self.alloc, 400, "object table joins are not supported"),
             error.Forbidden => try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden"),
-            error.CatalogGenerationChanged, error.TableGenerationChanged, error.LakeSourceOwnerRequired => try contextual_operations.jsonErrorAlloc(self.alloc, 409, "catalog changed during query binding"),
+            error.PreparedGenerationChanged, error.CatalogGenerationChanged, error.TableGenerationChanged, error.LakeSourceOwnerRequired => try contextual_operations.jsonErrorAlloc(self.alloc, 409, "catalog changed during query binding"),
             error.InvalidCatalogName => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid table target"),
             error.InvalidComposedGraphIdentity, error.InvalidQueryRequest => if (db_mod.peekLastSortRejectionDiagnostic() != null)
                 try contextualUnsupportedExactSortResponse(self.alloc)
@@ -63450,6 +63586,42 @@ test "system catalog graph physical endpoints recheck logical grants and binding
     try std.testing.expectError(error.CatalogGenerationChanged, ApiHttpServer.CatalogGraphReadContext.authorize(&context, a, "table:another"));
 }
 
+test "index alias production resolver owns its producer cut without a catalog resolver" {
+    const alias_catalog = @import("antfly_local_sources").api_index_metadata.aliases;
+    const Fake = struct {
+        table: metadata_table_manager.TableRecord,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 0 };
+        }
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = @as(*[1]metadata_table_manager.TableRecord, @ptrCast(&self.table)), .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"complete\":true}", .{});
+    const base = "{\"a\":{\"type\":\"embeddings\",\"_index_incarnation\":41},\"b\":{\"type\":\"embeddings\",\"_index_incarnation\":42}}";
+    const first = try alias_catalog.put(scratch, base, "live", .{ .index = "a", .idempotency_key = "1" }, ready, 1);
+    const second = try alias_catalog.put(scratch, first, "live", .{ .index = "b", .expected_index = "a", .idempotency_key = "2" }, ready, 2);
+    var fake: Fake = .{ .table = .{ .table_id = 1, .name = "docs", .indexes_json = first } };
+    var server = ApiHttpServer.init(a, .{ .deployment_mode = .standalone }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.free } }, null, null);
+    defer server.deinit();
+    var resolver = server.semanticStatusResolver(.internal, "");
+    const iface = resolver.iface();
+    const bound = (try iface.vtable.bind_index_aliases.?(iface.ptr, a, "docs", "{\"indexes\":[\"live\"],\"semantic_search\":\"hello\"}")).?;
+    defer bound.deinit(a);
+    fake.table.indexes_json = second;
+    var document = try std.json.parseFromSlice(std.json.Value, a, bound.body, .{});
+    defer document.deinit();
+    try std.testing.expectEqualStrings("a", document.value.object.get("indexes").?.array.items[0].string);
+    try std.testing.expectEqual(@as(i64, 41), document.value.object.get("_index_alias_fences").?.array.items[0].object.get("incarnation").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, resolver.pinned_indexes_json.?, "\"index\":\"a\"") != null);
+}
+
 test "system catalog row filter scopes preserve tenant restriction and resolve auth references" {
     const alloc = std.testing.allocator;
     var filters = [_]usermgr.RowFilterEntry{
@@ -63728,6 +63900,40 @@ test "system catalog row filter composition releases partial allocations" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+}
+
+test "index alias object engine admission rejects private controls before storage and skips native binding" {
+    const Fake = struct {
+        engine: @import("antfly_local_sources").common_table_storage.Engine = .local,
+        reads: usize = 0,
+        aliases: bool = true,
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (call != .query_definition) return error.UnexpectedCatalogRead;
+            self.reads += 1;
+            return std.json.Stringify.valueAlloc(a, system_catalog.QueryDefinition{ .storage_engine = self.engine, .table_id = 7, .schema_json = "{}", .read_schema_json = "", .indexes_json = if (self.aliases) "{\"text\":{\"type\":\"full_text\",\"_index_incarnation\":41},\"_index_aliases\":{\"live\":{\"index\":\"text\"}}}" else "{\"text\":{\"type\":\"full_text\",\"_index_incarnation\":41}}" }, .{});
+        }
+    };
+    const a = std.testing.allocator;
+    var fake: Fake = .{};
+    var server = ApiHttpServer.init(a, .{}, .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.catalog, .supports_query_definitions = true, .supports_object_tables = true } }, null, null);
+    defer server.deinit();
+    try std.testing.expect((try server.tryObjectTableQuery("docs", "{\"indexes\":[\"live\"]}", null, null, null, null, null, .{ .primary_foreign = false, .context = .{} })) == null);
+    try std.testing.expectEqual(@as(usize, 1), fake.reads);
+    try std.testing.expectEqual(@as(usize, 0), server.index_alias_cache.retained_bytes);
+    fake.engine = .object;
+    for ([_]bool{ false, true }) |has_aliases| {
+        fake.aliases = has_aliases;
+        for ([_][]const u8{
+            "{\"_index_alias_fences\":1}",
+            "{\"_index_alias_fences\":[{}]}",
+            "{\"_index_alias_fences\":[{\"name\":\"text\",\"incarnation\":41}]}",
+            "{\"\\u005findex_alias_fences\":[]}",
+        }) |body| {
+            try std.testing.expectError(error.InvalidQueryRequest, server.tryObjectTableQuery("docs", body, null, null, null, null, null, .{ .primary_foreign = false, .context = .{} }));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), server.index_alias_cache.retained_bytes);
 }
 
 test "system catalog row filter composition rejects oversized tails with bounded allocation" {

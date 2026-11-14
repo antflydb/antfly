@@ -3268,6 +3268,13 @@ fn requirePrivacyStoreAdmission(service: anytype, record: metadata_table_manager
     for (tables) |table| if (metadata_topology_protocol.usesPrivacy(table.indexes_json)) return error.PrivacyProtocolUpgradeRequired;
 }
 
+fn requireIndexAliasStoreAdmission(service: anytype, record: metadata_table_manager.StoreRecord) !void {
+    if (!record.live or !metadata_table_manager.storeServesTableData(record.role) or metadata_table_manager.indexAliasesProtocolSupported(record.reporter_incarnation, record.artifact_sources_protocol_version)) return;
+    const tables = try service.listProjectedTables(service.alloc);
+    defer service.freeProjectedTables(service.alloc, tables);
+    for (tables) |table| if (metadata_topology_protocol.usesIndexAliases(table.indexes_json)) return error.IndexAliasProtocolUpgradeRequired;
+}
+
 fn validateDenseNativeStoreAdmission(
     stores: []const metadata_table_manager.StoreRecord,
     activated_version: u16,
@@ -3536,6 +3543,9 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
     var required = transitionBaseDecoderVersion(command);
     switch (command) {
+        .register_store, .upsert_store, .upsert_store_heartbeat => |record| {
+            if (record.artifact_sources_protocol_version >= 3) required = @max(required, metadata_topology_protocol.index_aliases_version);
+        },
         .upsert_table => |table| required = @max(required, tableDecoderVersion(table)),
         .compare_and_replace_table => |cas| required = @max(required, @max(tableDecoderVersion(cas.expected), tableDecoderVersion(cas.replacement))),
         .apply_table_topology => |mutation| switch (mutation) {
@@ -3554,12 +3564,28 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
 // higher decoder requirement, including the prior definition in a CAS.
 fn tableDecoderVersion(table: metadata_table_manager.TableRecord) u16 {
     var required: u16 = 0;
+    if (metadata_topology_protocol.usesIndexAliases(table.indexes_json)) required = @max(required, metadata_topology_protocol.index_aliases_version);
     if (table.storage.engine == .object) required = @max(required, metadata_topology_protocol.object_table_engine_version);
     if (table.lake_index_catalog_json.len != 0) required = @max(required, metadata_topology_protocol.lake_index_catalog_version);
     if (metadata_topology_protocol.usesPrivacy(table.indexes_json)) required = @max(required, metadata_topology_protocol.privacy_version);
     if (metadata_topology_protocol.usesResolverRecords(table.indexes_json)) required = @max(required, metadata_topology_protocol.resolver_records_version);
     if (metadata_topology_protocol.usesResolverNamespaces(table.indexes_json)) required = @max(required, metadata_topology_protocol.resolver_namespaces_version);
     return required;
+}
+
+test "index alias decoder floor composes with table features and preserves CAS history" {
+    const aliases: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs", .indexes_json = "{\"_index_aliases\":{},\"_privacy\":{}}", .storage = .{ .engine = .object }, .lake_index_catalog_json = "{}" };
+    const plain: metadata_table_manager.TableRecord = .{ .table_id = 1, .name = "docs" };
+    const floor = metadata_topology_protocol.index_aliases_version;
+    try std.testing.expectEqual(floor, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = aliases }));
+    const envelope = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .topology = .{ .create = .{ .table = aliases } } }, .{});
+    defer std.testing.allocator.free(envelope);
+    try std.testing.expectEqual(floor, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = envelope }));
+    try std.testing.expectEqual(floor, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = aliases, .replacement = plain } }));
+    try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(0, 3));
+    try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(7, 2));
+    try std.testing.expect(metadata_table_manager.indexAliasesProtocolSupported(7, 3));
+    try std.testing.expect(!metadata_table_manager.indexAliasesProtocolSupported(7, metadata_table_manager.artifact_sources_protocol_version + 1));
 }
 
 fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
@@ -3574,6 +3600,7 @@ fn transitionBaseDecoderVersion(command: metadata_storage.TransitionCommand) u16
         },
         else => "",
     };
+    if (namespace_indexes.len != 0 and @import("antfly_local_sources").api_index_metadata.aliases.usesEnvelope(namespace_indexes)) return metadata_topology_protocol.index_aliases_version;
     if (metadata_topology_protocol.usesPrivacy(namespace_indexes)) return metadata_topology_protocol.privacy_version;
     if (metadata_topology_protocol.usesResolverRecords(namespace_indexes)) return metadata_topology_protocol.resolver_records_version;
     if (metadata_topology_protocol.usesResolverNamespaces(namespace_indexes)) return metadata_topology_protocol.resolver_namespaces_version;
@@ -6939,6 +6966,7 @@ pub const MetadataService = struct {
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
         const floor = if (self.projectedStore()) |store| try store.getRelationalTopologyProtocolActivationVersion(self.metadata_group_id) else 0;
         try @import("relational_topology_admission.zig").requireStoreAtFloor(floor, record);
+        try requireIndexAliasStoreAdmission(self, record);
         try self.proposeTransitionCommand(.{ .upsert_store = record });
     }
 
@@ -6987,6 +7015,7 @@ pub const MetadataService = struct {
             0;
         try validateDenseNativeStoreAdmission(stores, activated_version, record);
         try requirePrivacyStoreAdmission(self, record);
+        try requireIndexAliasStoreAdmission(self, record);
         const topology_floor = if (self.projectedStore()) |store| try store.getRelationalTopologyProtocolActivationVersion(self.metadata_group_id) else 0;
         try @import("relational_topology_admission.zig").requireStoreAtFloor(topology_floor, record);
         try self.proposeTransitionCommand(.{ .register_store = record });
@@ -9526,6 +9555,7 @@ pub const MetadataHttpService = struct {
         if (readiness) |token| try self.validateTableTopologyProtocolReadinessWithContext(.{}, token);
         const floor = if (self.projectedStore()) |store| try store.getRelationalTopologyProtocolActivationVersion(self.metadata_group_id) else 0;
         try @import("relational_topology_admission.zig").requireStoreAtFloor(floor, record);
+        try requireIndexAliasStoreAdmission(self, record);
         try self.proposeTransitionCommand(.{ .upsert_store = record });
     }
 
@@ -9907,6 +9937,7 @@ pub const MetadataHttpService = struct {
             0;
         try validateDenseNativeStoreAdmission(stores, activated_version, record);
         try requirePrivacyStoreAdmission(self, record);
+        try requireIndexAliasStoreAdmission(self, record);
         const topology_floor = if (self.projectedStore()) |store| try store.getRelationalTopologyProtocolActivationVersion(self.metadata_group_id) else 0;
         try @import("relational_topology_admission.zig").requireStoreAtFloor(topology_floor, record);
         try self.proposeTransitionCommand(.{ .register_store = record });

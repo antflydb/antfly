@@ -31,6 +31,7 @@ class GraphQueryResult:
         graph_incarnation (str):
         graph_revision (str):
         complete (bool):
+        resolved_indexes (list[str] | Unset): Concrete graph index names selected from the statement catalog cut.
         commit (GraphWriteReceipt | Unset):
         read_only (bool | Unset): Whether the compiled statement has no mutation clauses; EXPLAIN also reports the
             underlying statement capability.
@@ -44,6 +45,7 @@ class GraphQueryResult:
     graph_incarnation: str
     graph_revision: str
     complete: bool
+    resolved_indexes: list[str] | Unset = UNSET
     commit: GraphWriteReceipt | Unset = UNSET
     read_only: bool | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -75,6 +77,10 @@ class GraphQueryResult:
 
         complete = self.complete
 
+        resolved_indexes: list[str] | Unset = UNSET
+        if not isinstance(self.resolved_indexes, Unset):
+            resolved_indexes = self.resolved_indexes
+
         commit: dict[str, Any] | Unset = UNSET
         if not isinstance(self.commit, Unset):
             commit = self.commit.to_dict()
@@ -95,6 +101,8 @@ class GraphQueryResult:
                 "complete": complete,
             }
         )
+        if resolved_indexes is not UNSET:
+            field_dict["resolved_indexes"] = resolved_indexes
         if commit is not UNSET:
             field_dict["commit"] = commit
         if read_only is not UNSET:
@@ -141,6 +149,8 @@ class GraphQueryResult:
 
         complete = d.pop("complete")
 
+        resolved_indexes = cast(list[str], d.pop("resolved_indexes", UNSET))
+
         _commit = d.pop("commit", UNSET)
         commit: GraphWriteReceipt | Unset
         if isinstance(_commit, Unset):
@@ -159,6 +169,7 @@ class GraphQueryResult:
             graph_incarnation=graph_incarnation,
             graph_revision=graph_revision,
             complete=complete,
+            resolved_indexes=resolved_indexes,
             commit=commit,
             read_only=read_only,
         )
