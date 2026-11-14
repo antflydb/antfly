@@ -10567,7 +10567,23 @@ test "WS5 serviceRetirement retires every lane in exactly one native commit" {
     // advance by 2 instead of 1. Suppressing the background loop keeps the
     // measurement deterministic without weakening what is actually being
     // asserted: serviceRetirement itself commits exactly once.
+    //
+    // Under a redo-log file, `maintenance_start_suppressed` alone is not
+    // enough: `ensureRideAlongFlushStarted`'s `rideAlongFlushLoop` is a
+    // separate background mechanism (started unconditionally for any
+    // redo-log file on its first commit, §9.4b) that also wakes on
+    // `ride_along_idle_ns` and opportunistically folds the redo log via
+    // `maybeCheckpointRedoLogOnIdleTurn` -- a second, independent real
+    // commit this test never asked for, racing the explicit
+    // `serviceRetirement` call below exactly the way the comment above
+    // already describes for the other loop. Disabling it the same way
+    // "lite ride-along ticket resolves within the idle window even if
+    // the idle-flush task never starts" does keeps `serviceRetirement`'s
+    // own ride-along commit the only one that ever runs: its ticket still
+    // resolves via `Ticket.waitSequence`'s own bounded wait-then-drive
+    // fallback, never the idle-flush task.
     store.maintenance_start_suppressed = true;
+    store.ride_along_flush_unavailable.store(true, .release);
     defer store.close();
 
     const payload = try change_journal_mod.encodeRecord(a, .{
@@ -10771,6 +10787,12 @@ test "WS5 retirement keeps deletes and credit release atomic across a mid-turn f
     defer a.free(path);
     var store = try Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
     store.maintenance_start_suppressed = true;
+    // See "WS5 serviceRetirement retires every lane in exactly one native
+    // commit"'s own comment: under a redo-log file, the idle-flush task
+    // (`rideAlongFlushLoop`/`maybeCheckpointRedoLogOnIdleTurn`) is a second
+    // background committer `maintenance_start_suppressed` does not cover,
+    // and this test's own exact commit_sequence deltas need it disabled too.
+    store.ride_along_flush_unavailable.store(true, .release);
     defer store.close();
     store.file.page_cache_enabled.store(false, .monotonic);
 
