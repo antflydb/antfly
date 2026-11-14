@@ -28,10 +28,12 @@ pub const AdmittedAllocator = struct {
     admit: ?*const fn (*anyopaque, usize) anyerror!memory.AdmissionLease = null,
     /// Custom process admission with cumulative owner residency, charged only
     /// for the new delta. Mutually exclusive with the independent-ledger hook.
-    admit_owned: ?*const fn (*anyopaque, usize, usize) anyerror!memory.AdmissionLease = null,
+    admit_owned: ?*const fn (*const AdmittedAllocator, usize) anyerror!memory.AdmissionLease = null,
     /// Refund auxiliary ledgers when a successful custom admission cannot be
     /// adopted because reservation metadata allocation fails.
     rollback_admission: ?*const fn (*anyopaque, usize) void = null,
+    /// Borrowed synchronous ancestry; never moved into a published result.
+    parent: ?*const AdmittedAllocator = null,
     trim_on_free: bool = false,
     live_bytes: usize = 0,
     reserved_bytes: usize = 0,
@@ -81,7 +83,7 @@ pub const AdmittedAllocator = struct {
     /// foreign domains and custom rollback ledgers retain execution ownership.
     pub fn canBorrowRun(self: *const @This(), session: sessions.Session, request: sessions.RunRequest) !bool {
         const admission = session.run_admission orelse return false;
-        if (admission.backend_class != .cpu or self.admit != null or self.admit_owned != null or self.rollback_admission != null or self.prepaid_host_bytes != 0) return false;
+        if (admission.backend_class != .cpu or self.admit != null or self.admit_owned != null or self.rollback_admission != null or self.parent != null or self.prepaid_host_bytes != 0) return false;
         var reservation = self.reservations;
         while (reservation) |node| : (reservation = node.next) {
             const lease = node.lease orelse return false;
@@ -102,6 +104,57 @@ pub const AdmittedAllocator = struct {
         return false;
     }
 
+    pub fn ownedHostBytesFor(self: *const @This(), controller: *memory.AdmissionController) !usize {
+        var bytes: usize = 0;
+        var reservation = self.reservations;
+        while (reservation) |node| : (reservation = node.next) {
+            if (node.lease) |lease| if (lease.controller == controller) {
+                bytes = try std.math.add(usize, bytes, lease.amounts.hostTotalBytes());
+            };
+        }
+        if (self.session) |session| if (session.run_admission) |admission| if (admission.controller == controller) {
+            bytes = try std.math.add(usize, bytes, self.prepaid_host_bytes);
+        };
+        if (self.parent) |parent| bytes = try std.math.add(usize, bytes, try parent.ownedHostBytesFor(controller));
+        return bytes;
+    }
+
+    /// Move proven allocations and leases between synchronous owners sharing
+    /// a backing heap and process domain, without copying data or reacquiring.
+    pub fn absorb(self: *@This(), source: *@This()) !void {
+        if (self == source or self.backing.ptr != source.backing.ptr or self.backing.vtable != source.backing.vtable or self.prepaid_host_bytes != 0 or source.prepaid_host_bytes != 0)
+            return error.InvalidAdmissionLeaseReduction;
+        const controller = if (self.session) |session| if (session.run_admission) |admission| admission.controller else null else null;
+        var check = source.reservations;
+        while (check) |entry| : (check = entry.next) if (entry.lease) |lease| {
+            if (controller != null and lease.controller != controller.?) return error.InvalidAdmissionLeaseReduction;
+        };
+        const live = try std.math.add(usize, self.live_bytes, source.live_bytes);
+        const reserved = try std.math.add(usize, self.reserved_bytes, source.reserved_bytes);
+        const metadata = try std.math.add(usize, self.metadata_bytes, source.metadata_bytes);
+        if (source.blocks) |head| {
+            var tail = head;
+            while (tail.next) |next| tail = next;
+            tail.next = self.blocks;
+            if (self.blocks) |previous| previous.prev = tail;
+            self.blocks = head;
+        }
+        if (source.reservations) |head| {
+            var tail = head;
+            while (tail.next) |next| tail = next;
+            tail.next = self.reservations;
+            self.reservations = head;
+        }
+        self.live_bytes = live;
+        self.reserved_bytes = reserved;
+        self.metadata_bytes = metadata;
+        source.blocks = null;
+        source.reservations = null;
+        source.live_bytes = 0;
+        source.reserved_bytes = 0;
+        source.metadata_bytes = 0;
+    }
+
     pub fn allocationOverhead(alignment: std.mem.Alignment) usize {
         return std.mem.alignForward(usize, @sizeOf(Header), alignment.toByteUnits());
     }
@@ -109,10 +162,11 @@ pub const AdmittedAllocator = struct {
     fn reserve(self: *@This(), amount: usize) !?memory.AdmissionLease {
         std.debug.assert(self.admit == null or self.admit_owned == null);
         const owned = std.math.add(usize, self.reserved_bytes, self.prepaid_host_bytes) catch return error.ResourceLimitExceeded;
-        if (self.admit_owned) |callback| return try callback(self.admission_context.?, amount, owned);
+        if (self.admit_owned) |callback| return try callback(self, amount);
         if (self.admit) |callback| return try callback(self.admission_context.?, amount);
         const session = self.session orelse return error.ResourceLimitExceeded;
-        return (try session.admitHostPreprocessOwned(amount, owned)).lease;
+        const inherited = if (self.parent) |parent| if (session.run_admission) |admission| try parent.ownedHostBytesFor(admission.controller) else 0 else 0;
+        return (try session.admitHostPreprocessOwned(amount, try std.math.add(usize, owned, inherited))).lease;
     }
 
     /// Execution borrows this permit's workspace. On exit, adopt its lease
@@ -122,10 +176,13 @@ pub const AdmittedAllocator = struct {
         permit: sessions.RunPermit,
         owner: ?*AdmittedAllocator = null,
         reservation: ?*Reservation = null,
+        host_only_transfer: bool = false,
 
         pub fn deinit(self: *@This()) void {
             if (self.owner) |owner| {
                 const node = self.reservation.?;
+                if (self.host_only_transfer) if (self.permit.lease) |*lease|
+                    lease.retain(.{ .host_scratch_bytes = owner.prepaid_host_bytes }) catch {};
                 node.* = .{ .next = owner.reservations, .lease = self.permit.lease, .bytes = owner.prepaid_host_bytes };
                 owner.reservations = node;
                 owner.reserved_bytes += owner.prepaid_host_bytes;
@@ -139,6 +196,25 @@ pub const AdmittedAllocator = struct {
             self.owner = null;
         }
     };
+
+    /// The caller supplies this allocator to the forward and every subsequent
+    /// host post-processing allocation. The run's existing host reservation is
+    /// credit, and any actual growth beyond it is admitted normally.
+    pub fn borrowExecution(self: *@This(), permit: sessions.RunPermit) !RunScope {
+        if (self.prepaid_host_bytes != 0 or permit.execution_yielded) return error.InvalidAdmissionLeaseReduction;
+        const lease = permit.lease orelse return .{ .permit = permit };
+        if (lease.amounts.host_kv_bytes != 0) return error.InvalidAdmissionLeaseReduction;
+        const bytes = lease.amounts.host_scratch_bytes;
+        // Allocation bookkeeping must be covered too. A zero-credit run uses
+        // ordinary admission, with no allocation or ownership transfer here.
+        if (bytes < @sizeOf(Reservation)) return .{ .permit = permit };
+        const node = try self.backing.create(Reservation);
+        self.metadata_bytes += @sizeOf(Reservation);
+        self.prepaid_host_bytes = bytes;
+        var bound = permit;
+        bound.allocation_credit_bound = true;
+        return .{ .permit = bound, .owner = self, .reservation = node, .host_only_transfer = true };
+    }
 
     pub fn admitRun(self: *@This(), request: sessions.RunRequest) !RunScope {
         const session = self.session orelse return error.InvalidAdmissionLeaseReduction;

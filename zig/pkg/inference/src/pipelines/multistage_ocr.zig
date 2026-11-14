@@ -80,35 +80,17 @@ pub const MultiStageOCRResult = struct {
     full_text: []u8,
     regions: []RecognizedRegion,
     layout: []LayoutRegion = &.{},
-
-    fn clone(self: MultiStageOCRResult, allocator: std.mem.Allocator) !MultiStageOCRResult {
-        const text = try allocator.dupe(u8, self.full_text);
-        errdefer allocator.free(text);
-        const regions = try allocator.alloc(RecognizedRegion, self.regions.len);
-        errdefer allocator.free(regions);
-        var count: usize = 0;
-        errdefer for (regions[0..count]) |*region| region.deinit(allocator);
-        for (self.regions, regions) |source, *target| {
-            const value = try allocator.dupe(u8, source.text);
-            errdefer allocator.free(value);
-            target.* = source;
-            target.text = value;
-            target.label = if (source.label) |label| try allocator.dupe(u8, label) else null;
-            count += 1;
-        }
-        const layout = try allocator.alloc(LayoutRegion, self.layout.len);
-        errdefer allocator.free(layout);
-        var layout_count: usize = 0;
-        errdefer for (layout[0..layout_count]) |*region| region.deinit(allocator);
-        for (self.layout, layout) |source, *target| {
-            target.* = source;
-            target.label = try allocator.dupe(u8, source.label);
-            layout_count += 1;
-        }
-        return .{ .allocator = allocator, .full_text = text, .regions = regions, .layout = layout };
-    }
+    storage: ?*@import("preprocessing_memory.zig").Owned = null,
 
     pub fn deinit(self: *MultiStageOCRResult) void {
+        if (self.storage) |storage| {
+            self.storage = null;
+            @import("preprocessing_memory.zig").Owned.release(storage);
+            self.full_text = &.{};
+            self.regions = &.{};
+            self.layout = &.{};
+            return;
+        }
         self.allocator.free(self.full_text);
         for (self.regions) |*region| region.deinit(self.allocator);
         if (self.regions.len > 0) self.allocator.free(self.regions);
@@ -320,10 +302,10 @@ pub const CTCRecognizer = struct {
     }
 
     pub fn recognize(self: *CTCRecognizer, img: image.Image, control: ?InferenceExecutionControl) !RecognitionResult {
-        return self.recognizePrepared(img, control, null);
+        return self.recognizePrepared(img, control, null, null);
     }
 
-    pub fn recognizePrepared(self: *CTCRecognizer, img: image.Image, control: ?InferenceExecutionControl, parent: ?*const @import("preprocessing_memory.zig").Scope) !RecognitionResult {
+    pub fn recognizePrepared(self: *CTCRecognizer, img: image.Image, control: ?InferenceExecutionControl, parent: ?*const @import("preprocessing_memory.zig").Scope, target: ?*Preparation) !RecognitionResult {
         var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.session.withAdmissionControl(control), parent);
         defer preparation.deinit();
         const work = try preparation.allocator();
@@ -367,31 +349,51 @@ pub const CTCRecognizer = struct {
         var input_tensor = try preparation.tensor(f32, input_name, &shape, pixel_values);
         defer input_tensor.deinit();
 
+        var execution = Preparation.child(self.allocator, self.session.withAdmissionControl(control), &preparation);
+        defer execution.deinit();
+        const a = try execution.allocator();
         var permit = try preparation.admitRun(self.session.withAdmissionControl(control), try self.session.planRun(&.{input_tensor}, null));
-        defer permit.deinit();
-        if (try permit.runResidentWithControl(&.{input_tensor}, self.allocator, control)) |resident_outputs| {
+        var run = execution.borrowExecution(permit) catch |err| {
+            permit.deinit();
+            return err;
+        };
+        var run_live = true;
+        defer if (run_live) run.deinit();
+        const decoded = self.forwardAndDecode(&run.permit, a, &.{input_tensor}, control) catch |err| return execution.failure(err);
+        run.deinit();
+        run_live = false;
+        execution.execution_residency = .{};
+        if (target) |output| {
+            try output.absorb(&execution);
+            return decoded;
+        }
+        return .{ .text = try self.allocator.dupe(u8, decoded.text), .confidence = decoded.confidence };
+    }
+
+    fn forwardAndDecode(self: *CTCRecognizer, permit: *@import("../backends/session.zig").RunPermit, a: std.mem.Allocator, inputs: []const backends.Tensor, control: ?InferenceExecutionControl) !RecognitionResult {
+        if (try permit.runResidentWithControl(inputs, a, control)) |resident_outputs| {
             var resident = resident_outputs;
             defer resident.deinit();
             if (resident.outputs.len == 0) return error.NoRecognitionOutput;
-            if (try ctc_decode.decodeResident(self.allocator, resident.backend, resident.outputs[0], self.char_dict)) |decoded| {
+            if (try ctc_decode.decodeResident(a, resident.backend, resident.outputs[0], self.char_dict)) |decoded| {
                 return .{ .text = decoded.text, .confidence = decoded.confidence };
             }
             // Reuse this forward if reduction is unsupported; exporting its
             // logits is cheaper than executing the entire recognizer again.
-            const output_shape = try resident.backend.tensorShape(resident.outputs[0], self.allocator);
-            defer self.allocator.free(output_shape);
-            const output_values = try resident.backend.toFloat32(resident.outputs[0], self.allocator);
-            defer self.allocator.free(output_values);
-            var host_output = try backends.Tensor.initFloat32(self.allocator, "ctc_logits", output_shape, output_values);
+            const output_shape = try resident.backend.tensorShape(resident.outputs[0], a);
+            defer a.free(output_shape);
+            const output_values = try resident.backend.toFloat32(resident.outputs[0], a);
+            defer a.free(output_values);
+            var host_output = backends.Tensor{ .data = std.mem.sliceAsBytes(output_values), .shape = output_shape, .dtype = .f32, .name = "ctc_logits", .allocator = a, .owns_data = false, .owns_shape = false };
             defer host_output.deinit();
-            const decoded = try ctc_decode.decodeFromTensor(self.allocator, &host_output, self.char_dict);
+            const decoded = try ctc_decode.decodeFromTensor(a, &host_output, self.char_dict);
             return .{ .text = decoded.text, .confidence = decoded.confidence };
         }
-        const outputs = try permit.runWithControl(&.{input_tensor}, self.allocator, control);
-        defer freeTensorSlice(self.allocator, outputs);
+        const outputs = try permit.runWithControl(inputs, a, control);
+        defer freeTensorSlice(a, outputs);
         if (outputs.len == 0) return error.NoRecognitionOutput;
 
-        const decoded = try ctc_decode.decodeFromTensor(self.allocator, &outputs[0], self.char_dict);
+        const decoded = try ctc_decode.decodeFromTensor(a, &outputs[0], self.char_dict);
         return .{
             .text = decoded.text,
             .confidence = decoded.confidence,
@@ -469,10 +471,10 @@ pub const Vision2SeqRecognizer = struct {
     }
 
     pub fn recognize(self: *Vision2SeqRecognizer, img: image.Image, control: ?InferenceExecutionControl) !RecognitionResult {
-        return self.recognizePrepared(img, control, null);
+        return self.recognizePrepared(img, control, null, null);
     }
 
-    pub fn recognizePrepared(self: *Vision2SeqRecognizer, img: image.Image, control: ?InferenceExecutionControl, parent: ?*const @import("preprocessing_memory.zig").Scope) !RecognitionResult {
+    pub fn recognizePrepared(self: *Vision2SeqRecognizer, img: image.Image, control: ?InferenceExecutionControl, parent: ?*const @import("preprocessing_memory.zig").Scope, target: ?*Preparation) !RecognitionResult {
         var reader = self.reader;
         reader.preparation_parent = parent;
         var result = try reader.readDecodedRaw(img, .{ .execution_control = control });
@@ -480,7 +482,7 @@ pub const Vision2SeqRecognizer = struct {
 
         const trimmed = std.mem.trim(u8, result.text, " \t\r\n");
         return .{
-            .text = try self.allocator.dupe(u8, trimmed),
+            .text = try (if (target) |output| try output.allocator() else self.allocator).dupe(u8, trimmed),
             .confidence = if (trimmed.len > 0) 1.0 else 0.0,
         };
     }
@@ -498,18 +500,19 @@ pub const Recognizer = union(enum) {
     }
 
     pub fn recognize(self: *Recognizer, img: image.Image, control: ?InferenceExecutionControl) !RecognitionResult {
-        return self.recognizePrepared(img, control, null);
+        return self.recognizePrepared(img, control, null, null);
     }
 
-    pub fn recognizePrepared(self: *Recognizer, img: image.Image, control: ?InferenceExecutionControl, parent: ?*const @import("preprocessing_memory.zig").Scope) !RecognitionResult {
+    pub fn recognizePrepared(self: *Recognizer, img: image.Image, control: ?InferenceExecutionControl, parent: ?*const @import("preprocessing_memory.zig").Scope, target: ?*Preparation) !RecognitionResult {
         return switch (self.*) {
-            .ctc => |*recognizer| recognizer.recognizePrepared(img, control, parent),
-            .vision2seq => |*recognizer| recognizer.recognizePrepared(img, control, parent),
+            .ctc => |*recognizer| recognizer.recognizePrepared(img, control, parent, target),
+            .vision2seq => |*recognizer| recognizer.recognizePrepared(img, control, parent, target),
         };
     }
 };
 
 pub const MultiStageOCRPipeline = struct {
+    preparation_owner: ?*const @import("../backends/admitted_allocator.zig").AdmittedAllocator = null,
     preparation_parent: ?*const @import("preprocessing_memory.zig").Scope = null,
     allocator: std.mem.Allocator,
     detector: backends.Session,
@@ -558,6 +561,7 @@ pub const MultiStageOCRPipeline = struct {
     pub fn runWithControl(self: *MultiStageOCRPipeline, image_bytes: []const u8, control: ?InferenceExecutionControl) !MultiStageOCRResult {
         if (control) |active| try active.update(.tokenizing, 0, 1);
         var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.detector.withAdmissionControl(control), self.preparation_parent);
+        if (self.preparation_parent == null) preparation.owner.parent = self.preparation_owner;
         defer preparation.deinit();
         const work = try preparation.allocator();
         const img = image.decode(work, image_bytes) catch |err| return preparation.failure(err);
@@ -573,10 +577,12 @@ pub const MultiStageOCRPipeline = struct {
     }
 
     pub fn runDecodedWithControl(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) !MultiStageOCRResult {
-        var retained = Preparation.child(self.allocator, self.detector.withAdmissionControl(control), self.preparation_parent);
-        defer retained.deinit();
-        const result = self.runDecodedPrepared(img, control, &retained) catch |err| return retained.failure(err);
-        return result.clone(self.allocator);
+        const owned = try @import("preprocessing_memory.zig").Owned.create(self.allocator, self.detector.withAdmissionControl(control), self.preparation_parent, self.preparation_owner);
+        errdefer @import("preprocessing_memory.zig").Owned.release(owned);
+        var result = self.runDecodedPrepared(img, control, &owned.scope) catch |err| return owned.scope.failure(err);
+        try owned.publish();
+        result.storage = owned;
+        return result;
     }
 
     fn runDecodedPrepared(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl, retained: *Preparation) !MultiStageOCRResult {
@@ -621,19 +627,18 @@ pub const MultiStageOCRPipeline = struct {
                 defer cropped.deinit(work);
                 try preparation.trim();
 
-                const rec = try recognizer.recognizePrepared(cropped, control, &preparation);
-                defer self.allocator.free(rec.text);
+                const rec = try recognizer.recognizePrepared(cropped, control, &preparation, retained);
                 if (rec.text.len == 0) {
+                    result_allocator.free(rec.text);
                     continue;
                 }
-                const text = try result_allocator.dupe(u8, rec.text);
-                errdefer result_allocator.free(text);
+                errdefer result_allocator.free(rec.text);
 
                 try recognized.append(result_allocator, .{
                     .bbox = region.bbox,
                     .polygon = region.polygon,
                     .confidence = region.confidence,
-                    .text = text,
+                    .text = rec.text,
                     .rec_confidence = rec.confidence,
                     .label = null,
                 });
@@ -744,7 +749,7 @@ pub const MultiStageOCRPipeline = struct {
         };
         defer freeTensorSlice(self.allocator, outputs);
         const previous_residency = retained.required_host_bytes;
-        retained.required_host_bytes = try std.math.add(usize, previous_residency, try layout.outputHostResidency(outputs));
+        retained.required_host_bytes = try std.math.add(usize, previous_residency, try self.detector.outputHostResidency(outputs));
         defer retained.required_host_bytes = previous_residency;
         const work = try retained.allocator();
         if (outputs.len == 0) return (try retained.allocator()).dupe(LayoutRegion, &.{});
@@ -797,7 +802,7 @@ pub const MultiStageOCRPipeline = struct {
         };
 
         const previous_residency = retained.required_host_bytes;
-        retained.required_host_bytes = try std.math.add(usize, previous_residency, try order.outputHostResidency(outputs));
+        retained.required_host_bytes = try std.math.add(usize, previous_residency, try self.detector.outputHostResidency(outputs));
         defer retained.required_host_bytes = previous_residency;
         try sortRegionsByPredictedOrder(try retained.allocator(), regions, order_data);
     }
@@ -1461,7 +1466,7 @@ fn checkPostprocessOwnership(allocator: std.mem.Allocator) !void {
     defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
     var result = try pipeline.runDecoded(.{ .data = &rgb, .width = 2, .height = 2, .channels = 3 });
     defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+    try std.testing.expect(controller.snapshot().hostTotalBytes() > 0);
     try std.testing.expectEqual(@as(usize, 1), result.regions.len);
     try std.testing.expectEqualStrings("", result.regions[0].text);
     try std.testing.expectEqual(@as(usize, 1), result.layout.len);
@@ -1472,4 +1477,105 @@ fn checkPostprocessOwnership(allocator: std.mem.Allocator) !void {
 test "multistage postprocessing transfers compact results and unwinds every allocation failure" {
     try checkPostprocessOwnership(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPostprocessOwnership, .{});
+}
+
+const CtcWorkspaceFixture = struct {
+    resident: bool,
+    reduction: bool,
+    fn info(_: *anyopaque) []const backends.TensorInfo {
+        return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ 1, 64, 3 } }};
+    }
+    fn backend(_: *anyopaque) backends.BackendType {
+        return .native;
+    }
+    fn close(_: *anyopaque) void {}
+    fn values() [64 * 3]f32 {
+        var data: [64 * 3]f32 = @splat(0);
+        for (0..64) |row| data[row * 3 + 1 + row % 2] = 1;
+        return data;
+    }
+    fn run(_: *anyopaque, _: []const backends.Tensor, a: std.mem.Allocator) ![]backends.Tensor {
+        const outputs = try a.alloc(backends.Tensor, 1);
+        errdefer a.free(outputs);
+        const data = values();
+        outputs[0] = try backends.Tensor.initFloat32(a, "logits", &.{ 1, 64, 3 }, &data);
+        return outputs;
+    }
+    const Native = @import("../ops/native_compute.zig");
+    const Ops = @import("../ops/ops.zig");
+    const Owner = struct {
+        allocator: std.mem.Allocator,
+        weights: Native.WeightStore,
+        compute: Native.NativeCompute,
+        table: Ops.ComputeBackend.VTable,
+        cb: Ops.ComputeBackend,
+        fn destroy(raw: *anyopaque, _: std.mem.Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.compute.deinit();
+            self.weights.deinitOwned();
+            self.allocator.destroy(self);
+        }
+    };
+    fn residentRun(raw: *anyopaque, _: []const backends.Tensor, a: std.mem.Allocator) !?@import("../backends/session.zig").ResidentOutputs {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.resident) return null;
+        const owner = try a.create(Owner);
+        owner.allocator = a;
+        owner.weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+        owner.compute = Native.NativeCompute.init(a, &owner.weights, null);
+        owner.table = owner.compute.computeBackend().vtable.*;
+        if (!self.reduction) owner.table.takeRows = null;
+        owner.cb = .{ .ptr = &owner.compute, .vtable = &owner.table };
+        errdefer Owner.destroy(owner, a);
+        const outputs = try a.alloc(Ops.CT, 1);
+        errdefer a.free(outputs);
+        const data = values();
+        outputs[0] = try owner.cb.fromFloat32Shape(&data, &.{ 1, 64, 3 });
+        return .{ .outputs = outputs, .backend = &owner.cb, .allocator = a, .backend_owner = owner, .deinit_backend_owner = Owner.destroy };
+    }
+    const table = backends.Session.VTable{ .run = run, .runResident = residentRun, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+};
+
+fn checkCtcWorkspace(a: std.mem.Allocator) !void {
+    for (0..3) |mode| {
+        var fixture = CtcWorkspaceFixture{ .resident = mode > 0, .reduction = mode == 2 };
+        var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+        const session = backends.Session{ .ptr = &fixture, .vtable = &CtcWorkspaceFixture.table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1024 * 1024, .scratch_limit_bytes = 1024 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+        var target = Preparation.child(a, session, null);
+        defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
+        defer target.deinit();
+        var first = [_]u8{'A'};
+        var second = [_]u8{'B'};
+        var dictionary = [_][]u8{ &first, &second };
+        var recognizer = CTCRecognizer{ .allocator = a, .session = session, .char_dict = &dictionary, .preprocess = .{ .width = 2, .height = 2 } };
+        var pixels: [12]u8 = @splat(255);
+        const result = try recognizer.recognizePrepared(.{ .data = &pixels, .width = 2, .height = 2, .channels = 3 }, null, null, &target);
+        try std.testing.expectEqual(@as(usize, 64), result.text.len);
+        for (result.text, 0..) |byte, index| try std.testing.expectEqual(@as(u8, if (index % 2 == 0) 'A' else 'B'), byte);
+        try std.testing.expect(target.owner.ownsRange(result.text));
+        (try target.allocator()).free(result.text);
+        try target.trim();
+    }
+}
+
+test "multistage CTC transfers admitted text through host resident and exported paths" {
+    try checkCtcWorkspace(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkCtcWorkspace, .{});
+}
+
+test "multistage CTC rejects long dictionary text expansion before backing growth" {
+    for (0..3) |mode| {
+        var fixture = CtcWorkspaceFixture{ .resident = mode > 0, .reduction = mode == 2 };
+        var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+        const session = backends.Session{ .ptr = &fixture, .vtable = &CtcWorkspaceFixture.table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 256 * 1024, .scratch_limit_bytes = 256 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+        var target = Preparation.child(std.testing.allocator, session, null);
+        defer target.deinit();
+        var first: [64 * 1024]u8 = @splat('A');
+        var second: [64 * 1024]u8 = @splat('B');
+        var dictionary = [_][]u8{ &first, &second };
+        var recognizer = CTCRecognizer{ .allocator = std.testing.allocator, .session = session, .char_dict = &dictionary, .preprocess = .{ .width = 2, .height = 2 } };
+        var pixels: [12]u8 = @splat(255);
+        try std.testing.expectError(error.ResourceLimitExceeded, recognizer.recognizePrepared(.{ .data = &pixels, .width = 2, .height = 2, .channels = 3 }, null, null, &target));
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+    }
 }

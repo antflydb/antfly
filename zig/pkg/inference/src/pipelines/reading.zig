@@ -150,6 +150,7 @@ const PreprocessScratchAdmission = struct {
 };
 
 pub const ReadingPipeline = struct {
+    preparation_owner: ?*const @import("../backends/admitted_allocator.zig").AdmittedAllocator = null,
     preparation_parent: ?*const @import("preprocessing_memory.zig").Scope = null,
     allocator: std.mem.Allocator,
     vision_encoder: backends.Session,
@@ -163,7 +164,9 @@ pub const ReadingPipeline = struct {
     native_execution_lane: ?*@import("../execution_control.zig").ExecutionLane = null,
 
     fn preparationScope(self: *ReadingPipeline) @import("preprocessing_memory.zig").Scope {
-        return @import("preprocessing_memory.zig").Scope.child(self.allocator, self.vision_encoder.withAdmissionControl(self.execution_control), self.preparation_parent);
+        var scope = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.vision_encoder.withAdmissionControl(self.execution_control), self.preparation_parent);
+        if (self.preparation_parent == null) scope.owner.parent = self.preparation_owner;
+        return scope;
     }
 
     fn preprocessOptions(self: *ReadingPipeline, scratch: *PreprocessScratchAdmission) image.BatchPreprocessOptions {
@@ -273,7 +276,7 @@ pub const ReadingPipeline = struct {
         // Memory ownership is independent of the optional GPU execution lane.
         // Ordinary encoder/decoder readers use the same bounded codec path.
         if (!expectsFlattenedPatches(self.vision_encoder)) return self.readBoundedNativeImage(image_data);
-        var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.vision_encoder.withAdmissionControl(self.execution_control), self.preparation_parent);
+        var preparation = self.preparationScope();
         defer preparation.deinit();
         const work = try preparation.allocator();
         const scope = antfly_image.work_control.Scope.enter(self.imageWorkControl());
@@ -1788,7 +1791,7 @@ pub const ReadingPipeline = struct {
 
     fn readPix2StructDecoded(self: *ReadingPipeline, img: image.Image) !ReadResult {
         const allocator = self.allocator;
-        var preparation = @import("preprocessing_memory.zig").Scope.child(allocator, self.vision_encoder.withAdmissionControl(self.execution_control), self.preparation_parent);
+        var preparation = self.preparationScope();
         defer preparation.deinit();
         const work = try preparation.allocator();
         const patch_height = if (self.config.pix2struct_patch_height > 0) self.config.pix2struct_patch_height else 16;
@@ -3067,6 +3070,7 @@ const AdmissionDenyingFlorenceSession = struct {
 test "reading entry points and batch publication honor execution control" {
     var pipeline: ReadingPipeline = undefined;
     pipeline.preparation_parent = null;
+    pipeline.preparation_owner = null;
     pipeline.native_execution_lane = null;
     pipeline.allocator = std.testing.allocator;
     pipeline.execution_control = .{ .deadline_ns = 0 };
@@ -3101,6 +3105,7 @@ test "reading cancellation interrupts encoded decode and borrowed raster preproc
     var probe = Probe{};
     var pipeline: ReadingPipeline = undefined;
     pipeline.preparation_parent = null;
+    pipeline.preparation_owner = null;
     pipeline.native_execution_lane = null;
     pipeline.allocator = std.testing.allocator;
     pipeline.config = .{ .image_size = 16 };
@@ -3283,6 +3288,7 @@ test "Florence preprocess output admission precedes allocation and unwinds alloc
     var lane = @import("../execution_control.zig").ExecutionLane{};
     var pipeline: ReadingPipeline = undefined;
     pipeline.preparation_parent = null;
+    pipeline.preparation_owner = null;
     pipeline.allocator = failing.allocator();
     pipeline.vision_encoder = session;
     pipeline.config = .{ .image_size = 8 };
@@ -3342,6 +3348,7 @@ test "Florence queued prepared encoded raster and decoded pixels release admissi
         var cancelled = std.atomic.Value(bool).init(false);
         var pipeline: ReadingPipeline = undefined;
         pipeline.preparation_parent = null;
+        pipeline.preparation_owner = null;
         pipeline.allocator = std.testing.allocator;
         pipeline.vision_encoder = session;
         pipeline.config = .{ .image_size = 4, .resample = .pillow_bicubic };

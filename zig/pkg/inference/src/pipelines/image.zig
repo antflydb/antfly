@@ -1098,20 +1098,18 @@ test "preprocessing slab growth failure leaves no retired backing allocation" {
     try std.testing.expect(budget.free_head == null);
 }
 
-test "adaptive preprocessing recovers concurrency for a cheap tail" {
-    const ceiling: usize = 8;
-    var workers = reduceAdaptivePreprocessWorkers(ceiling, ceiling);
-    try std.testing.expectEqual(@as(usize, 4), workers);
-    workers = reduceAdaptivePreprocessWorkers(workers, workers);
-    try std.testing.expectEqual(@as(usize, 2), workers);
-
-    // Once an expensive prefix has completed at the reduced width, successful
-    // cheap waves restore parallelism without exceeding the configured limit.
-    workers = recoverAdaptivePreprocessWorkers(workers, ceiling);
-    try std.testing.expectEqual(@as(usize, 4), workers);
-    workers = recoverAdaptivePreprocessWorkers(workers, ceiling);
-    try std.testing.expectEqual(ceiling, workers);
-    try std.testing.expectEqual(ceiling, recoverAdaptivePreprocessWorkers(workers, ceiling));
+test "preprocessing retains proven concurrency and recovers for smaller geometry" {
+    var budget = try SharedPreprocessBudget.initLazy(std.testing.allocator, 64, 1024, null);
+    defer budget.deinit();
+    var workers: usize = 8;
+    budget.attempt_work_bytes = 800;
+    budget.narrowWave(8, &workers);
+    try std.testing.expectEqual(@as(usize, 4), budget.planWorkers(&.{ 100, 100, 100, 100, 100, 100, 100, 100 }, 8));
+    // Finishing any number of those same-size waves does not widen again.
+    budget.beginAttempt();
+    try std.testing.expectEqual(@as(usize, 4), budget.planWorkers(&.{ 100, 100, 100, 100, 100, 100, 100, 100 }, 8));
+    try std.testing.expectEqual(@as(usize, 8), budget.planWorkers(&.{ 25, 25, 25, 25, 25, 25, 25, 25 }, 8));
+    try std.testing.expectEqual(@as(usize, 1), budget.planWorkers(&.{ 800, 100, 100, 100 }, 8));
 }
 
 test "decode png fixture dimensions are stable" {
@@ -1821,10 +1819,6 @@ fn reduceAdaptivePreprocessWorkers(current: usize, failed_wave_len: usize) usize
     return if (observed <= 2) 1 else observed / 2;
 }
 
-fn recoverAdaptivePreprocessWorkers(current: usize, configured_limit: usize) usize {
-    return @min(configured_limit, std.math.mul(usize, current, 2) catch configured_limit);
-}
-
 /// A wave-scoped, thread-safe allocator that accounts decoder output and all
 /// codec scratch against one aggregate ceiling. Using the allocator as the
 /// enforcement boundary avoids format-specific peak estimates becoming stale
@@ -1852,6 +1846,8 @@ const SharedPreprocessBudget = struct {
     preferred_bytes: usize = 0,
     required_bytes: usize = 0,
     growth_failure: ?anyerror = null,
+    attempt_work_bytes: usize = 0,
+    learned_work_capacity: ?usize = null,
 
     /// Sizing forecasts are advisory. No slab or admission is needed until a
     /// codec actually asks for scratch (bilinear/solid-color paths need none).
@@ -1979,6 +1975,30 @@ const SharedPreprocessBudget = struct {
         self.limit_exceeded.store(false, .release);
     }
 
+    /// A request-local ceiling learned from rejected concurrency. Identical
+    /// expensive pages keep the proven width; a cheaper prefix can widen it
+    /// without repeatedly replaying the same known-overbudget wave.
+    fn planWorkers(self: *const @This(), work: []const usize, configured: usize) usize {
+        const ceiling = @min(configured, work.len);
+        const capacity = self.learned_work_capacity orelse return @max(ceiling, 1);
+        var total: usize = 0;
+        var count: usize = 0;
+        for (work[0..ceiling]) |bytes| {
+            const next = std.math.add(usize, total, bytes) catch break;
+            if (count > 0 and next > capacity) break;
+            total = next;
+            count += 1;
+        }
+        return @max(count, 1);
+    }
+
+    fn narrowWave(self: *@This(), wave_len: usize, workers: *usize) void {
+        workers.* = reduceAdaptivePreprocessWorkers(workers.*, wave_len);
+        if (self.attempt_work_bytes == 0) return;
+        const capacity = @max(1, self.attempt_work_bytes / wave_len * workers.*);
+        self.learned_work_capacity = if (self.learned_work_capacity) |old| @min(old, capacity) else capacity;
+    }
+
     fn admissionRefusal(err: anyerror) bool {
         return switch (err) {
             error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded => true,
@@ -1998,13 +2018,13 @@ const SharedPreprocessBudget = struct {
             if (err != error.OutOfMemory or self.growth_failure != null or !self.limit_exceeded.load(.acquire)) return err;
             const grown = self.growAfterExhaustion() catch |growth_err| {
                 if (!admissionRefusal(growth_err) or wave_len <= 1) return growth_err;
-                workers.* = reduceAdaptivePreprocessWorkers(workers.*, wave_len);
+                self.narrowWave(wave_len, workers);
                 return true;
             };
             if (grown) return true;
             if (wave_len <= 1) return false;
         }
-        workers.* = reduceAdaptivePreprocessWorkers(workers.*, wave_len);
+        self.narrowWave(wave_len, workers);
         return true;
     }
 
@@ -2311,8 +2331,13 @@ fn runBorrowedRasterPreprocessBatch(
     var adaptive_worker_limit: usize = worker_limit;
     while (first < rasters.len) {
         try options.control.check();
+        var work: [maximum_preprocess_workers]usize = undefined;
+        const count = @min(worker_limit, rasters.len - first);
+        for (rasters[first..][0..count], work[0..count]) |raster, *bytes| bytes.* = raster.bytes.len;
+        adaptive_worker_limit = scratch_budget.planWorkers(work[0..count], worker_limit);
         const wave_len = @min(adaptive_worker_limit, rasters.len - first);
         scratch_budget.beginAttempt();
+        scratch_budget.attempt_work_bytes = preprocessWaveDecodedBytes(work[0..wave_len]);
         for (tasks[0..wave_len], 0..) |*task, offset| {
             const index = first + offset;
             task.* = .{
@@ -2342,7 +2367,6 @@ fn runBorrowedRasterPreprocessBatch(
             return error.ImagePreprocessDecodedBytesExceeded;
         }
         first += wave_len;
-        adaptive_worker_limit = recoverAdaptivePreprocessWorkers(adaptive_worker_limit, worker_limit);
     }
 }
 
@@ -2412,6 +2436,7 @@ fn runBoundedPreprocessBatch(
     const wave_allocator = wave_budget.allocator();
     while (first < image_list.len) {
         try options.control.check();
+        adaptive_worker_limit = wave_budget.planWorkers(decoded_bytes[first..], worker_limit);
         const wave_len = planPreprocessWaveLength(decoded_bytes, first, adaptive_worker_limit, options.max_inflight_decoded_bytes);
         const wave_decoded_bytes = preprocessWaveDecodedBytes(decoded_bytes[first..][0..wave_len]);
         std.debug.assert(wave_len > 0);
@@ -2422,6 +2447,7 @@ fn runBoundedPreprocessBatch(
             options.max_inflight_decoded_bytes,
         );
         wave_budget.beginAttempt();
+        wave_budget.attempt_work_bytes = wave_decoded_bytes;
 
         for (tasks[0..wave_len], 0..) |*task, offset| {
             const index = first + offset;
@@ -2472,7 +2498,6 @@ fn runBoundedPreprocessBatch(
             return error.ImagePreprocessDecodedBytesExceeded;
         }
         first += wave_len;
-        adaptive_worker_limit = recoverAdaptivePreprocessWorkers(adaptive_worker_limit, worker_limit);
     }
 }
 

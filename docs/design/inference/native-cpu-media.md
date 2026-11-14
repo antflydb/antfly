@@ -335,6 +335,33 @@ core-fix snapshot, rather than the executable above. It returned the correct
 deadline. This validates the failure diagnostics but is not complete-page
 qualification. Dense-page CPU fallback remains unqualified.
 
+## Encoded-reader ownership and concurrency
+
+Loader metadata, decoded images and retained preprocessing allocations form one
+request ancestry for admission feasibility. Their bytes remain charged exactly
+once; carrying ancestry into each model forward distinguishes an intrinsically
+oversized request from contention with other requests. Different admission
+domains never lend capacity to each other.
+
+CTC forwards and decoding allocate through an admitted execution owner. The
+forward's existing host reservation supplies allocation credit; actual growth,
+including expansion through long dictionary entries, must acquire additional
+capacity before allocating. Device workspace remains part of combined-memory
+feasibility until the backend is destroyed. Borrowed execution envelopes cannot
+be narrowed or yielded while allocator credit is live.
+
+Completed multistage OCR transfers its allocation owner and text to the reader.
+The reader builds its final region array once, retaining text and label pointers.
+Result cleanup releases storage and leases together, independently of model
+lifetime. The final wrapper severs synchronous loader ancestry after conversion
+and UTF-8 sanitation; subsequent result allocations use a frozen host policy.
+
+Preprocessing remembers a geometry-weighted concurrency ceiling after a failed
+wave. Equal-size pages retain the proven width instead of repeatedly doubling
+and replaying work. Smaller pages can recover parallelism within the learned
+capacity. This is a request-local scheduling hint: actual allocation admission
+remains authoritative and cancellation is checked between attempts.
+
 ## Adoption
 
 The native `/read` service owns PDF rendering, OCR and long-audio transcription.

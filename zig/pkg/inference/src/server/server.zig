@@ -6293,17 +6293,18 @@ pub const Node = struct {
     /// Planning runs before the execution lease, including on independent
     /// cohort/continuous workers. Its temporary allocations need their own owner.
     fn countAdmittedPromptTokens(self: *Node, model_dir: []const u8, model: *model_manager_mod.LoadedModel, cfg: gpt_model_mod.Config, messages: []const generation.Message, max_tokens: i32) !NativePromptTokenCount {
-        var preparation = self.inferencePreparation();
+        var preparation = try self.inferencePreparation();
         defer preparation.deinit();
         return countPromptTokens(preparation.allocator(), model_dir, model, cfg, messages, max_tokens, false, false) catch |err|
             if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
     }
 
-    fn inferencePreparation(self: *Node) @import("../backends/admitted_allocator.zig").AdmittedAllocator {
+    fn inferencePreparation(self: *Node) !@import("../backends/admitted_allocator.zig").AdmittedAllocator {
+        try self.model_manager.ensureResourceOwnerReady();
         const Preparation = struct {
-            fn acquire(raw: *anyopaque, bytes: usize, owned_bytes: usize) !runtime.tier.memory.AdmissionLease {
-                const node: *Node = @ptrCast(@alignCast(raw));
-                return node.model_manager.admitHostPreflightOwned(bytes, owned_bytes);
+            fn acquire(owner: *const @import("../backends/admitted_allocator.zig").AdmittedAllocator, bytes: usize) !runtime.tier.memory.AdmissionLease {
+                const node: *Node = @ptrCast(@alignCast(owner.admission_context.?));
+                return node.model_manager.admitHostPreflightOwned(bytes, try owner.ownedHostBytesFor(&node.model_manager.resource_domain.?.admission));
             }
         };
         return @import("../backends/admitted_allocator.zig").AdmittedAllocator{
@@ -6334,7 +6335,7 @@ pub const Node = struct {
         prompt_cache_key: ?[]const u8,
         supplied_control: InferenceExecutionControl,
     ) !DirectGenerateOutput {
-        var preparation = self.inferencePreparation();
+        var preparation = try self.inferencePreparation();
         defer preparation.deinit();
         const preparation_allocator = preparation.allocator();
         // Model execution is owned by the generation resource lease below.
@@ -10387,7 +10388,7 @@ pub const Node = struct {
         try control.check();
         var request_slot = try ReadRequestSlot.acquire(self, &control);
         defer request_slot.deinit();
-        var preparation = self.inferencePreparation();
+        var preparation = try self.inferencePreparation();
         defer preparation.deinit();
         const work = preparation.allocator();
         var cancellation = ReadCancellationBridge{ .control = &control };
@@ -11515,8 +11516,9 @@ pub const Node = struct {
         result_allocators: ?[]const std.mem.Allocator,
         control: InferenceExecutionControl,
     ) !readers_api.BatchResult {
-        var preparation = self.inferencePreparation();
+        var preparation = try self.inferencePreparation();
         defer preparation.deinit();
+        preparation.parent = @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(allocator);
         return self.runReadImageBatchPrepared(allocator, preparation.allocator(), model_path, image_datas, encoded_images, prompt, requested_max_tokens, source_fingerprint, execution_fence, result_allocators, control) catch |err|
             if (err == error.OutOfMemory) preparation.admission_error orelse err else err;
     }
@@ -11613,7 +11615,7 @@ pub const Node = struct {
             .max_tokens = max_tokens,
             .source_fingerprint = source_fingerprint,
             .execution_control = control,
-        });
+        }, @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(preparation_allocator));
         defer owned_batch.deinit();
         const batch = owned_batch.batch;
         const results = batch.results;
@@ -52790,7 +52792,7 @@ test "generation preparation admits prompt formatting before execution and refun
     var initial = try node.model_manager.admitHostPreflight(1);
     initial.release();
     node.model_manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = 4096, .scratch_limit_bytes = 4096 };
-    var preparation = node.inferencePreparation();
+    var preparation = try node.inferencePreparation();
     defer preparation.deinit();
     const content = try a.alloc(u8, 8192);
     defer a.free(content);
@@ -52907,7 +52909,7 @@ test "reader preparation cumulative owned allocations distinguish policy from pe
         node.model_manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = if (contended) 96 * 1024 else 48 * 1024, .scratch_limit_bytes = if (contended) 96 * 1024 else 48 * 1024 };
         var peer = try node.model_manager.admitHostPreflight(if (contended) 48 * 1024 else 0);
         defer peer.release();
-        var preparation = node.inferencePreparation();
+        var preparation = try node.inferencePreparation();
         defer preparation.deinit();
         const a = preparation.allocator();
         _ = try a.alloc(u8, 32 * 1024);
@@ -52916,5 +52918,35 @@ test "reader preparation cumulative owned allocations distinguish policy from pe
         // the first case; only unrelated peer occupancy prevents the second.
         try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 24 * 1024));
         try std.testing.expectEqual(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, preparation.admission_error.?);
+    }
+}
+
+test "reader metadata ancestry remains intrinsic during execution admission" {
+    const Scope = @import("../pipelines/preprocessing_memory.zig").Scope;
+    for ([_]bool{ false, true }) |contended| {
+        var node = try Node.init(std.testing.allocator, .{});
+        defer node.deinit();
+        var metadata = try node.inferencePreparation();
+        defer metadata.deinit();
+        node.model_manager.resource_domain.?.admission_limits = .{ .host_limit_bytes = if (contended) 160 * 1024 else 80 * 1024, .scratch_limit_bytes = if (contended) 160 * 1024 else 80 * 1024 };
+        _ = try metadata.allocator().alloc(u8, 32 * 1024);
+        try metadata.trim();
+        var peer = try node.model_manager.admitHostPreflight(if (contended) 80 * 1024 else 0);
+        defer peer.release();
+        const Fake = struct {
+            fn info(_: *anyopaque) []const backends_mod.TensorInfo {
+                return &.{};
+            }
+        };
+        const session = backends_mod.Session{ .ptr = undefined, .vtable = &.{ .run = undefined, .inputInfo = Fake.info, .outputInfo = Fake.info, .backend = undefined, .close = undefined }, .run_admission = .{ .controller = &node.model_manager.resource_domain.?.admission, .backend_class = .cpu, .limits = node.model_manager.resource_domain.?.admission_limits, .static_workspace_bytes = 1, .check_live_memory = false } };
+        var preparation = Scope.child(std.testing.allocator, session, null);
+        preparation.owner.parent = &metadata;
+        defer preparation.deinit();
+        const a = try preparation.allocator();
+        _ = try a.alloc(u8, 8 * 1024);
+        try std.testing.expectError(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, preparation.admitRun(session, .{ .output_bytes = 0, .workspace_bytes = 48 * 1024, .workspace_planned = true }));
+        try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 64 * 1024));
+        try std.testing.expectEqual(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, preparation.failure(error.OutOfMemory));
+        try std.testing.expect(node.model_manager.resource_domain.?.admission.snapshot().host_scratch_bytes > 0);
     }
 }

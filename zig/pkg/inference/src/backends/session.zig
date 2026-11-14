@@ -156,12 +156,16 @@ pub const RunAdmission = struct {
     }
 
     fn acquireAmountsWithOwned(self: RunAdmission, amounts: memory.AdmissionAmounts, owned: memory.AdmissionAmounts, pressure: *?memory.AdmissionPressure) !memory.AdmissionLease {
+        return self.acquireAmountsWithResidency(amounts, owned, .{}, pressure);
+    }
+
+    fn acquireAmountsWithResidency(self: RunAdmission, amounts: memory.AdmissionAmounts, owned: memory.AdmissionAmounts, extra: memory.Residency, pressure: *?memory.AdmissionPressure) !memory.AdmissionLease {
         pressure.* = null;
         if (self.controller.consumeForcedRunDenialForTesting()) {
             std.log.warn("test-only forced inference run admission denial", .{});
             return error.ResourceTemporarilyUnavailable;
         }
-        const required = try self.requiredResidency().merge(.fromAmounts(self.backend_class, owned));
+        const required = try (try self.requiredResidency().merge(.fromAmounts(self.backend_class, owned))).merge(extra);
         return self.controller.tryAcquireRequestsWithPressure(&.{.{
             .backend_class = self.backend_class,
             .limits = self.limits,
@@ -1177,10 +1181,14 @@ pub const Session = struct {
     /// Grow one request's preprocessing reservation atomically. Existing owned
     /// scratch affects feasibility only; only the new bytes are charged.
     pub fn admitHostPreprocessOwned(self: Session, bytes: usize, owned_bytes: usize) !RunPermit {
+        return self.admitHostPreprocessOwnedWithResidency(bytes, owned_bytes, .{});
+    }
+
+    pub fn admitHostPreprocessOwnedWithResidency(self: Session, bytes: usize, owned_bytes: usize, extra: memory.Residency) !RunPermit {
         var pressure: ?memory.AdmissionPressure = null;
         return .{
             .session = self,
-            .lease = if (self.run_admission) |admission| try admission.acquireAmountsWithOwned(.{ .host_scratch_bytes = bytes }, .{ .host_scratch_bytes = owned_bytes }, &pressure) else null,
+            .lease = if (self.run_admission) |admission| try admission.acquireAmountsWithResidency(.{ .host_scratch_bytes = bytes }, .{ .host_scratch_bytes = owned_bytes }, extra, &pressure) else null,
         };
     }
 
@@ -1322,6 +1330,8 @@ pub const RunPermit = struct {
     lease: ?memory.AdmissionLease,
     request: ?RunRequest = null,
     execution_yielded: bool = false,
+    /// Allocation owners may borrow this exact envelope until their run ends.
+    allocation_credit_bound: bool = false,
 
     fn resolveGeometry(self: *RunPermit, inputs: []const Tensor) !void {
         const request = self.request orelse return;
@@ -1345,6 +1355,7 @@ pub const RunPermit = struct {
     /// Queueing retains inputs/preprocessing, not idle compute workspace.
     /// Every subsequent run reacquires execution while these bytes stay owned.
     pub fn yieldExecution(self: *RunPermit) !bool {
+        if (self.allocation_credit_bound) return error.InvalidAdmissionLeaseReduction;
         if (self.execution_yielded) return true;
         const request = self.request orelse return false;
         const resident = (try addBytes(request.input_bytes, request.host_preprocess_bytes)) - request.pre_admitted_host_bytes;
@@ -1361,6 +1372,7 @@ pub const RunPermit = struct {
 
     /// Drop transient forward scratch once only materialized outputs remain.
     pub fn retainOutputs(self: *RunPermit, outputs: []const Tensor) !void {
+        if (self.allocation_credit_bound) return error.InvalidAdmissionLeaseReduction;
         if (self.lease) |*lease| try lease.retain(try retainedOutputAmounts(outputs, lease.amounts.host_kv_bytes > 0));
     }
 
@@ -1532,6 +1544,7 @@ pub const RunPermit = struct {
     /// Reduce two independently owned leases without merging their external
     /// process-owner tokens. All required capacity must already be admitted.
     pub fn retainForRunWithSupplement(self: *RunPermit, extra: *RunPermit, request: RunRequest) !void {
+        if (self.allocation_credit_bound or extra.allocation_credit_bound) return error.InvalidAdmissionLeaseReduction;
         if (extra.session.ptr != self.session.ptr or extra.session.vtable != self.session.vtable or self.execution_yielded or extra.execution_yielded) return error.InvalidAdmissionLeaseReduction;
         const admission = self.session.run_admission orelse {
             self.request = request;
@@ -1553,6 +1566,7 @@ pub const RunPermit = struct {
     }
 
     pub fn retainForRun(self: *RunPermit, request: RunRequest) !void {
+        if (self.allocation_credit_bound) return error.InvalidAdmissionLeaseReduction;
         if (self.execution_yielded) return error.InvalidAdmissionLeaseReduction;
         if (self.lease) |*lease| {
             const admission = self.session.run_admission orelse return error.InvalidAdmissionLeaseReduction;
@@ -1565,6 +1579,7 @@ pub const RunPermit = struct {
     /// as model inputs. The retained permit can then be composed with a run
     /// request carrying the same `pre_admitted_host_bytes` credit.
     pub fn retainHostBytes(self: *RunPermit, bytes: usize) !void {
+        if (self.allocation_credit_bound) return error.InvalidAdmissionLeaseReduction;
         if (self.lease) |*lease| try lease.retain(.{ .host_scratch_bytes = bytes });
     }
 

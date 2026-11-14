@@ -443,6 +443,7 @@ pub const LoadedReader = union(enum) {
         };
         errdefer result.deinit();
         try sanitizeResultUtf8(&result);
+        result.detachPreparation();
         return result;
     }
 
@@ -472,6 +473,7 @@ pub const LoadedReader = union(enum) {
         }
         for (batch.results) |*result| try sanitizeResultUtf8(result);
         if (options.execution_control) |control| try control.check();
+        for (batch.results) |*result| result.detachPreparation();
         return batch;
     }
 
@@ -488,7 +490,7 @@ pub const LoadedReader = union(enum) {
         }
     };
 
-    pub fn readBatchInWorkspace(self: *LoadedReader, work: std.mem.Allocator, image_datas: []const []const u8, options: ReadOptions) !WorkspaceBatch {
+    pub fn readBatchInWorkspace(self: *LoadedReader, work: std.mem.Allocator, image_datas: []const []const u8, options: ReadOptions, preparation: ?*const @import("../backends/admitted_allocator.zig").AdmittedAllocator) !WorkspaceBatch {
         // A borrowed execution view must never be deinitialized as a model:
         // model/tokenizer/dictionary ownership remains with the original reader.
         var execution = self.*;
@@ -496,10 +498,12 @@ pub const LoadedReader = union(enum) {
             .vision => |*reader| {
                 reader.allocator = work;
                 reader.core.allocator = work;
+                reader.core.preparation_owner = preparation;
             },
             .multistage => |*reader| {
                 reader.allocator = work;
                 reader.pipeline = reader.pipeline.executionView(work);
+                reader.pipeline.preparation_owner = preparation;
             },
             .moondream => {},
         }
@@ -757,7 +761,11 @@ fn sanitizeUtf8Alloc(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
 }
 
 fn sanitizeOwnedUtf8(allocator: std.mem.Allocator, value: *[]const u8) !void {
-    if (try sanitizeUtf8Alloc(allocator, value.*)) |sanitized| {
+    const replacement = sanitizeUtf8Alloc(allocator, value.*) catch |err| {
+        const owner = @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(allocator);
+        return if (err == error.OutOfMemory and owner != null) owner.?.admission_error orelse err else err;
+    };
+    if (replacement) |sanitized| {
         allocator.free(value.*);
         value.* = sanitized;
     }
@@ -1357,7 +1365,7 @@ test "reader execution workspace leaves metadata ownership and session teardown 
             .post_processor = .{ .db = .{ .threshold = 0.3, .box_threshold = 0.5, .unclip_ratio = 1.5, .min_box_area = 1, .max_candidates = 10 } },
         },
     } };
-    var batch = try reader.readBatchInWorkspace(a, &.{@import("antfly_documents").fixtures.get("one-pixel.png")}, .{});
+    var batch = try reader.readBatchInWorkspace(a, &.{@import("antfly_documents").fixtures.get("one-pixel.png")}, .{}, null);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(@as(usize, 0), fake.closes);
     try std.testing.expectEqual(@as(usize, 1), batch.batch.results.len);
@@ -1389,4 +1397,18 @@ test "reader Moondream mapped weights are admitted before checkpoint constructio
     // fit, even though these metadata allocations use an unrestricted test heap.
     try std.testing.expectError(error.ResourceLimitExceeded, native_moondream.load(a, path, &manager.session_manager, &manager, .{ .io = std.testing.io }));
     try std.testing.expectEqual(@as(usize, 0), manager.resource_domain.?.admission.snapshot().hostTotalBytes());
+}
+
+test "reader sanitation preserves admitted result policy failure" {
+    const memory = @import("../runtime/tier/memory.zig");
+    var controller = memory.AdmissionController{};
+    var owner = @import("../backends/admitted_allocator.zig").AdmittedAllocator{ .backing = std.testing.allocator, .session = .{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1600, .scratch_limit_bytes = 1600 }, .static_workspace_bytes = 1, .check_live_memory = false } } };
+    defer owner.deinit();
+    const a = owner.allocator();
+    const text = try a.alloc(u8, 1024);
+    @memset(text, 0xff);
+    var result = Result{ .text = text, .allocator = a };
+    defer result.deinit();
+    try std.testing.expectError(error.ResourceLimitExceeded, sanitizeResultUtf8(&result));
+    try std.testing.expect(result.text.ptr == text.ptr);
 }
