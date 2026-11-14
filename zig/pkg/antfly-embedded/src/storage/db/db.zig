@@ -7701,6 +7701,14 @@ pub const DB = struct {
                 return bytes;
             }
         };
+        {
+            var read = try self.core.store.beginProbeTxn();
+            defer read.abort();
+            if (try @import("artifact_publication.zig").authority(&read)) |authority| {
+                const validation = (try @import("artifact_producer_validation.zig").load(&read)) orelse return error.CommitRequirementUnavailable;
+                if (validation.authority_epoch != authority.epoch or !std.mem.eql(u8, &validation.namespace, &authority.namespace)) return error.CommitRequirementUnavailable;
+            } else if (try @import("../source_authority.zig").maintenanceMode(&read) == .ordered and self.core.hasGeneratedEnrichmentTargets()) return error.CommitRequirementUnavailable;
+        }
         var output = execution_resources.PreparationCapture{ .alloc = alloc, .request_digest = digest };
         try self.batchInternal(req, null, .{ .preparation_capture = &output, .wait_for_sync_level = false });
         return output.json orelse error.InvalidBatchRequest;
@@ -26311,6 +26319,15 @@ pub const DB = struct {
         const index_spans = try self.collectIndexSpanReservations(preparation_alloc, intents.items, prepared_schema_view);
         defer if (index_spans.len != 0) preparation_alloc.free(index_spans);
         try self.prepareOnlineVectorIntentBoundsLocked(preparation_alloc, intents.items, prepared_schema_view);
+        var endpoint_dependencies = std.heap.ArenaAllocator.init(preparation_alloc);
+        defer endpoint_dependencies.deinit();
+        try self.prepareGraphEndpointDependenciesLocked(preparation_alloc, endpoint_dependencies.allocator(), txn_id, intents.items, prepared_schema_view, &predicates);
+        if (packet) |value| {
+            var reservation_plan = self.core.relational_indexes.acquire();
+            defer if (reservation_plan) |*plan| plan.deinit();
+            const indexes = if (reservation_plan) |plan| plan.plan.boundIndexes().len else 0;
+            try @import("commit_requirements.zig").validateTransactionReservation(value.value, intents.items, predicates.items, indexes);
+        }
         if (packet) |value| if (value.value.artifact_writes.len != 0 or value.value.artifact_deletes.len != 0) {
             // The retained-source reservation covers generated effects before
             // this participant votes yes, including output-only tombstones.
@@ -26326,9 +26343,7 @@ pub const DB = struct {
                 first.retained_artifact_keys = std.math.add(u64, first.retained_artifact_keys, 1) catch return error.TransactionTooLarge;
             }
         };
-        var endpoint_dependencies = std.heap.ArenaAllocator.init(preparation_alloc);
-        defer endpoint_dependencies.deinit();
-        try self.prepareGraphEndpointDependenciesLocked(preparation_alloc, endpoint_dependencies.allocator(), txn_id, intents.items, prepared_schema_view, &predicates);
+
         if (row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         if (ordered_receipt) |identity| {
             switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
@@ -86101,7 +86116,17 @@ test "db commit requirements transaction retains prepared effects through restar
         try db.writeTransaction(committed, .{ .writes = &.{.{ .key = "accepted", .value = "{\"body\":\"new\"}" }}, .commit_requires = .direct_enrichments });
         try std.testing.expectError(error.VersionConflict, db.writeTransaction(committed, .{ .writes = &.{.{ .key = "accepted", .value = "{\"body\":\"different\"}" }}, .commit_requires = .direct_enrichments }));
         try std.testing.expectEqual(@as(usize, 2), fake.calls);
+        try std.testing.expectError(error.VersionConflict, db.writeTransaction(committed, .{ .writes = &.{.{ .key = "bypass", .value = "{}" }}, .commit_requires = .none }));
         try std.testing.expect((try db.get(a, "accepted")) == null);
+        {
+            const stale_key = try internal_keys.artifactNamedPrefixAlloc(a, "accepted", "asset", "summary");
+            defer a.free(stale_key);
+            var writer = try db.core.store.beginWriteTxn();
+            errdefer writer.abort();
+            try writer.put(stale_key, "late old-source output");
+            try std.testing.expectError(error.IntentConflict, writer.commit());
+            writer.abort();
+        }
         try std.testing.expect((try db.get(a, "rejected")) == null);
         const artifact_key = try internal_keys.artifactNamedPrefixAlloc(a, "accepted", "asset", "summary");
         defer a.free(artifact_key);
@@ -86113,6 +86138,8 @@ test "db commit requirements transaction retains prepared effects through restar
     {
         var db = try DB.open(a, directory.path(), options);
         defer db.close();
+        // The durable vote remains retryable after restart and catalog changes.
+        try db.writeTransaction(committed, .{ .writes = &.{.{ .key = "accepted", .value = "{\"body\":\"new\"}" }}, .commit_requires = .direct_enrichments });
         try db.commitTransaction(committed, 200);
         try db.abortTransaction(aborted, 201);
         // Terminal retries neither publish outputs again nor invoke a model.
@@ -86130,6 +86157,56 @@ test "db commit requirements transaction retains prepared effects through restar
         try std.testing.expectEqualStrings("prepared transaction output", artifact);
         try std.testing.expectEqual(@as(usize, 2), fake.calls);
     }
+}
+
+test "db commit requirements restored effects release every fallible allocation" {
+    const packet: execution_resources.PreparedEnrichments = .{
+        .request_digest = @splat(1),
+        .catalog_digest = @splat(2),
+        .writes = &.{},
+        .deletes = &.{},
+        .guards = &.{},
+        .artifact_writes = &.{.{ .key = "artifact", .value = &.{ 0xff, 0, 0xfe } }},
+        .artifact_deletes = &.{"retired"},
+        .pending = &.{.{ .kind = .asset, .index_name = "index", .artifact_name = "asset", .doc_key = "doc" }},
+        .coverage = &.{.{ .index_name = @constCast("index"), .doc_key = @constCast("doc"), .outcome = .produced }},
+        .producers = &.{.{ .definition = @splat(3), .doc_key = "doc", .revision = @splat(4) }},
+    };
+    const Check = struct {
+        fn run(a: Allocator, value: execution_resources.PreparedEnrichments) !void {
+            var restored = try local_mutation.restorePreparedEnrichments(a, value);
+            defer restored.deinit(a);
+            try std.testing.expectEqualSlices(u8, value.artifact_writes[0].value, restored.artifact_writes[0].value);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{packet});
+}
+
+test "db commit requirements oversized transaction effects reject before voting prepared" {
+    const a = std.testing.allocator;
+    const Producer = struct {
+        calls: usize = 0,
+        fn produce(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const result = try out.alloc(u8, 4 * 1024 * 1024);
+            @memset(result, 'x');
+            return result;
+        }
+    };
+    var directory = try TestDirectory.init("commit-requirements-reservation");
+    defer directory.cleanup();
+    var producer = Producer{};
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .owner_id = "reservation", .asset_producer = .{ .ptr = &producer, .vtable = &.{ .produce = Producer.produce, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } } } });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "large", .kind = .asset, .field = "body", .content_type = "application/octet-stream", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"large-generator\"}}" });
+    const txn = try db.beginTransaction(100);
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.writeTransaction(txn, .{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"source\"}" }}, .commit_requires = .direct_enrichments }));
+    try std.testing.expectEqual(@as(usize, 1), producer.calls);
+    try std.testing.expect((try db.get(a, "doc")) == null);
+    // Failure left no durable intent or exclusive source lock behind.
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{}" }}, .commit_requires = .none });
+    try db.abortTransaction(txn, 200);
 }
 
 test "db commit requirements missing provider cannot defer required work" {

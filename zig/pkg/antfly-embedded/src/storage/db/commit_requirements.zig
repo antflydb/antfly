@@ -95,6 +95,34 @@ pub const OutputBudget = struct {
     }
 };
 
+/// Reserve the complete transaction envelope before voting yes. Bounds include
+/// both retained journal encoding and receiver-owned metadata: source clocks,
+/// identities, TTL, readiness/work records, receipts, proof/count/reference
+/// replacement, artifact revisions, scope clocks and acceptance certificates.
+/// These deliberately cover replacement's delete-and-put paths together; phase
+/// two must never turn an irrevocable decision into a size rejection.
+pub fn validateTransactionReservation(packet: anytype, intents: anytype, predicates: anytype, relational_indexes: usize) !void {
+    var budget = OutputBudget{};
+    // Transaction record, admission/read manifests, watermark and replay head.
+    try budget.reserve(4096, 32);
+    for (intents) |intent| {
+        const payload = @max(if (intent.value) |value| value.len else @as(usize, 0), if (intent.prepared_row) |row| row.len else @as(usize, 0));
+        if (intent.key.len > max_output_bytes or payload > max_output_bytes) return error.CommitRequirementTooLarge;
+        // Primary bytes plus their journal bound. Existing vector/retirement
+        // reservations are authored by the pinned native materializer.
+        try budget.reserve(4096 + 16 * intent.key.len + 2 * payload, 16);
+        try budget.reserve(std.math.cast(usize, intent.retained_artifact_bytes) orelse return error.CommitRequirementTooLarge, std.math.cast(usize, intent.retained_artifact_keys) orelse return error.CommitRequirementTooLarge);
+        for (0..relational_indexes) |_| try budget.reserve(1024 + 8 * intent.key.len + 4 * payload, 8);
+    }
+    for (predicates) |predicate| {
+        if (predicate.key.len > max_output_bytes) return error.CommitRequirementTooLarge;
+        try budget.reserve(512 + 8 * predicate.key.len, 8);
+    }
+    for (packet.artifact_writes) |write| try budget.reserve(2048 + 12 * write.key.len + 2 * write.value.len, 12);
+    for (packet.artifact_deletes) |key| try budget.reserve(2048 + 12 * key.len, 12);
+    for (packet.producers) |producer| try budget.reserve(4096 + 8 * producer.doc_key.len, 16);
+}
+
 pub fn validateOutputBounds(writes: anytype, deletes: []const []const u8) !void {
     var budget = OutputBudget{};
     try budget.checkpoint(writes, deletes);

@@ -414,21 +414,27 @@ func TestCreateIndexPreservesTemporaryMutationRetry(t *testing.T) {
 
 func TestBatchCommitRequiresDistinguishesOmissionFromNone(t *testing.T) {
 	for _, requirement := range []CommitRequires{"", CommitRequiresNone, CommitRequiresDirectEnrichments} {
-		encoded, err := json.Marshal(BatchRequest{SyncLevel: SyncLevelWrite, CommitRequires: requirement})
-		if err != nil {
-			t.Fatal(err)
-		}
-		var body map[string]any
-		if err := json.Unmarshal(encoded, &body); err != nil {
-			t.Fatal(err)
-		}
-		got, present := body["commit_requires"]
-		if requirement == "" {
-			if present {
-				t.Fatalf("omitted requirement serialized as %v", got)
+		for _, request := range []any{
+			BatchRequest{SyncLevel: SyncLevelWrite, CommitRequires: requirement},
+			MultiBatchRequest{CommitRequires: requirement},
+			oapi.TransactionCommitRequest{CommitRequires: requirement},
+		} {
+			encoded, err := json.Marshal(request)
+			if err != nil {
+				t.Fatal(err)
 			}
-		} else if !present || got != string(requirement) {
-			t.Fatalf("requirement = %v, want %s", got, requirement)
+			var body map[string]any
+			if err := json.Unmarshal(encoded, &body); err != nil {
+				t.Fatal(err)
+			}
+			got, present := body["commit_requires"]
+			if requirement == "" {
+				if present {
+					t.Fatalf("omitted requirement serialized as %v", got)
+				}
+			} else if !present || got != string(requirement) {
+				t.Fatalf("requirement = %v, want %s", got, requirement)
+			}
 		}
 	}
 }

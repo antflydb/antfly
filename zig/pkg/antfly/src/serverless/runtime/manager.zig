@@ -469,25 +469,32 @@ pub const ManagedRuntime = struct {
         policy.chunk_embeddings_enabled = status.chunk_embeddings_enabled;
         policy.rerank_terms_enabled = status.rerank_terms_enabled;
         if (enrichment_mod.builtinPipelineForPolicy(policy).len != 0 and enricher == null) return error.CommitRequirementUnavailable;
+        var digest = try @import("../build/document_facts_builder.zig").fingerprint(self.alloc, policy, "{}");
         var exclude_model_sources = false;
         if (try self.catalog.getTableForNamespaceAlloc(self.alloc, namespace)) |record| {
             var table = record;
             defer table.deinit(self.alloc);
             var indexes = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
             defer indexes.deinit();
+            digest = try @import("../build/document_facts_builder.zig").fingerprint(self.alloc, policy, table.indexes_json);
             exclude_model_sources = try @import("../build/document_facts_builder.zig").hasModelSources(self.alloc, table.indexes_json);
-            if (policy.enrichment_enabled) {
+            if (policy.enrichment_enabled and policy.lexical_sparse_model_preference != .deterministic_only) {
                 if (try managed_embedder.ManagedEmbedder.createSparseEmbedderFromIndexValueWithOptions(self.alloc, indexes.value, self.cfg.embedder_options)) |handle| {
                     errdefer handle.deinit(self.alloc);
                     try enricher.?.setSparseEmbedder(handle, firstSparseIndexNameFromIndexesJson(indexes.value) orelse "serverless_sparse");
                 }
             }
-            if (policy.chunk_embeddings_enabled and !exclude_model_sources) {
+            if (policy.chunk_embeddings_enabled and policy.chunk_embeddings_model_preference != .deterministic_only and !exclude_model_sources) {
                 if (try managed_embedder.ManagedEmbedder.createDenseEmbedderFromIndexValueWithOptions(self.alloc, indexes.value, self.cfg.embedder_options)) |handle| {
                     errdefer handle.deinit(self.alloc);
                     try enricher.?.setChunkEmbedder(handle, firstDenseIndexNameFromIndexesJson(indexes.value) orelse "serverless_dense", denseDimsFromIndexesJson(indexes.value) orelse 8);
                 }
             }
+        }
+        if (enricher) |*value| {
+            value.prepared_catalog = digest;
+            if (value.chunk_embedder) |provider| value.prepared_dense_generation = try provider.captureTextGeneration(self.alloc, value.chunk_embedding_name.?);
+            if (value.sparse_embedder) |provider| value.prepared_sparse_revision = try provider.captureRevision(self.alloc, value.sparse_embedding_name.?);
         }
         const pipeline = enrichment_mod.builtinPipelineForPolicy(policy);
         var eligible: usize = 0;
@@ -516,6 +523,10 @@ pub const ManagedRuntime = struct {
             if (bytes > 8 * 1024 * 1024) return error.CommitRequirementTooLarge;
             out.* = .{ .kind = if (body != null) .prepared else .delete, .doc_id = id, .body = body };
             initialized += 1;
+        }
+        if (enricher) |*value| {
+            if (value.chunk_embedder) |provider| if (value.prepared_dense_generation) |generation| try provider.requireTextGeneration(self.alloc, value.chunk_embedding_name.?, generation);
+            if (value.sparse_embedder) |provider| try provider.requireRevision(self.alloc, value.sparse_embedding_name.?, value.prepared_sparse_revision);
         }
         try cancellation.check();
         return output;
@@ -581,6 +592,8 @@ pub const ManagedRuntime = struct {
             var table = table_record;
             defer table.deinit(self.alloc);
 
+            enricher.prepared_catalog = try @import("../build/document_facts_builder.zig").fingerprint(self.alloc, effective_policy, table.indexes_json);
+
             // Only model-backed stages need an embedder. Parse once and build
             // only the relevant provider set so deterministic stages avoid
             // configuration churn and an unrelated provider cannot block the
@@ -621,6 +634,7 @@ pub const ManagedRuntime = struct {
             // Namespace-only records predate the table catalog. Preserve their
             // fallback enrichment behavior without retaining a previous
             // namespace's managed embedder configuration.
+            enricher.prepared_catalog = try @import("../build/document_facts_builder.zig").fingerprint(self.alloc, effective_policy, "{}");
             enricher.clearSparseEmbedder();
             enricher.clearChunkEmbedder();
             enricher.clearModelChunker();

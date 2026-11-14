@@ -9919,10 +9919,13 @@ export interface components {
          *     including source keys/values, artifact effects, deletions, coverage, revisions,
          *     counters and replay payload. Both the submitted source envelope and final
          *     physical effect set must fit; this is not an artifact-only allowance.
-         *     Explicit none is supported across mutation engines. direct_enrichments is
-         *     currently supported by local embedded batches; server HTTP, Raft, serverless
-         *     and transaction-resolution surfaces reject that gate before admission until
-         *     their prepared-output protocols are available.
+         *     Supported by embedded batches, server/Raft writes and distributed transactions.
+         *     Raft prepares on the leader and replays immutable effects without inference.
+         *     Transactions reserve the complete envelope before voting prepared; their
+         *     conservative reservation can reject a batch below the final physical limit.
+         *     Serverless supports source-local pipeline stages through conditional atomic
+         *     WAL batches (at most 1024 mutations and 8 MiB including WAL framing).
+         *     Backends without that capability reject before source admission.
          *     Omission retains legacy embedded precomputation for enrichments/full_index
          *     during the compatibility window; other surfaces retain their existing waits.
          * @enum {string}
@@ -11404,6 +11407,12 @@ export interface components {
          */
         MultiBatchRequest: {
             /**
+             * @description Default admission prerequisite for tables without an explicit commit_requires.
+             *     A table-level value overrides this default. Staged transaction statements
+             *     retain the strongest prerequisite selected for each table.
+             */
+            commit_requires?: components["schemas"]["CommitRequires"];
+            /**
              * @description Map of table names to batch operations for that table.
              *     Each entry follows the same format as a single-table BatchRequest.
              * @example {
@@ -11472,6 +11481,12 @@ export interface components {
          *     its own read set and submits the full transaction in one request.
          */
         TransactionCommitRequest: {
+            /**
+             * @description Default admission prerequisite for tables without an explicit commit_requires.
+             *     A table-level value overrides this default. Staged transaction statements
+             *     retain the strongest prerequisite selected for each table.
+             */
+            commit_requires?: components["schemas"]["CommitRequires"];
             /**
              * @description Set of keys that were read during the transaction, with their observed versions.
              *     The server verifies these versions still match before committing writes.

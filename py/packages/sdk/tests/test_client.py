@@ -1114,3 +1114,21 @@ class TestAntflyClient:
         with pytest.raises(AntflyException, match=f"exceeded {limit} bytes"):
             client._request("GET", "/db/v1/test")
         assert stream.closed
+
+
+@pytest.mark.parametrize("requirement", [None, "none", "direct_enrichments"])
+def test_transaction_models_preserve_commit_requirement_defaults(requirement):
+    from antfly.client_generated.models.multi_batch_request import MultiBatchRequest
+    from antfly.client_generated.models.transaction_commit_request import TransactionCommitRequest
+
+    for model in (MultiBatchRequest, TransactionCommitRequest):
+        body = {"tables": {"docs": {"inserts": {"a": {}}}, "audit": {"commit_requires": "none"}}}
+        if model is TransactionCommitRequest:
+            body["read_set"] = []
+        if requirement is not None:
+            body["commit_requires"] = requirement
+        encoded = model.from_dict(body).to_dict()
+        assert ("commit_requires" in encoded) is (requirement is not None)
+        if requirement is not None:
+            assert encoded["commit_requires"] == requirement
+        assert encoded["tables"]["audit"]["commit_requires"] == "none"

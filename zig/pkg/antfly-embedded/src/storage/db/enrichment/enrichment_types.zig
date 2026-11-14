@@ -243,6 +243,21 @@ pub const GeneratedEnrichmentRequest = struct {
     reprocess_generation: u64 = 0,
 };
 
+pub const PreparedProducer = struct {
+    definition: [32]u8,
+    doc_key: []const u8,
+    revision: ?[32]u8 = null,
+
+    pub fn identity(self: @This()) [32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&self.definition);
+        hash.update(self.doc_key);
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
+};
+
 pub const GeneratedEnrichmentRef = struct {
     kind: GeneratedEnrichmentKind,
     index_name: []const u8,

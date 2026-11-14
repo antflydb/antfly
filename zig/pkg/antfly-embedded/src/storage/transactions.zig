@@ -736,6 +736,12 @@ pub const TxnManager = struct {
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status != .pending) return TxnError.DecisionConflict;
         const first_prepare = record.prepared_known and !record.prepared and record.intent_revision == 0;
+        if (!first_prepare and extra_batch.prepared_enrichments_json == null) {
+            if (try self.loadPreparedEnrichments(self.alloc, txn_id)) |packet| {
+                self.alloc.free(packet);
+                return error.VersionConflict;
+            }
+        }
 
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var schema_lease_value: [5]u8 = @splat(0);

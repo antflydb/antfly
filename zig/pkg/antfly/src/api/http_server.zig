@@ -14816,6 +14816,9 @@ pub const ApiHttpServer = struct {
         var retained_preparation: ?@import("antfly_local_sources").api_relational_integrity_commit.Prepared = null;
         defer if (retained_preparation) |*prepared| prepared.deinit();
         const outcome = (self.commitPublicTableBatchWithIntegrity(alloc, source, &tables, req.sync_level, request, &retained_preparation) catch |err| switch (err) {
+            error.UnsupportedCommitRequirement => return error.UnsupportedCommitRequirement,
+            error.CommitRequirementUnavailable => return error.Unavailable,
+            error.CommitRequirementTooLarge, error.CommitRequirementFailed => return error.InvalidBatchRequest,
             error.RelationalIndexKeyTooLarge => return error.RelationalIndexKeyTooLarge,
             error.UniqueConstraintViolation => return error.UniqueConstraintViolation,
             error.RelationalCheckViolation => return error.RelationalCheckViolation,

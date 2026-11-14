@@ -391,3 +391,42 @@ pub fn validatePublicMutation(alloc: Allocator, mutation: api_types.DocumentMuta
         }) return error.InvalidDocumentMutation;
     }
 }
+
+test "commit requirements serverless prepared batch commits source outputs and deletes atomically" {
+    const a = std.testing.allocator;
+    const objectstore = @import("objectstore");
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("db");
+    var indexed = try wal_mod.IndexedObjectStore.init(a, client, "db", "prepared");
+    defer indexed.deinit();
+    var wal = indexed.walStore();
+    var service = Service.init(a, &wal, undefined);
+    var initial = try service.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 1, .mutations = &.{.{ .kind = .upsert, .doc_id = "victim", .body = "{}" }} });
+    defer initial.deinit(a);
+    const body = "{\"text\":\"source\",\"generated\":\"ready\"}";
+    const prepared = try @import("../build/document_facts.zig").encodeEnrichedBodyAlloc(a, body, 6);
+    defer a.free(prepared);
+    const request: api_types.IngestBatchRequest = .{ .namespace = "docs", .timestamp_ns = 2, .operation_id = "gate", .mutations = &.{ .{ .kind = .prepared, .doc_id = "new", .body = prepared }, .{ .kind = .delete, .doc_id = "victim" } } };
+    try std.testing.expectError(error.VersionConflict, service.ingestPreparedBatch(request, 0));
+    try std.testing.expectEqual(@as(u64, 1), try wal.latestLsn("docs"));
+    var result = try service.ingestPreparedBatch(request, 1);
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(u64, 2), result.start_lsn);
+    try std.testing.expectEqual(@as(u64, 3), result.end_lsn);
+    var replay = try service.ingestPreparedBatch(request, 1);
+    defer replay.deinit(a);
+    try std.testing.expectEqual(result.start_lsn, replay.start_lsn);
+    try std.testing.expectEqual(result.end_lsn, replay.end_lsn);
+    const records = try wal.readFromAlloc("docs", 2);
+    defer wal_mod.freeRecords(a, records);
+    try std.testing.expectEqual(@as(usize, 2), records.len);
+    const first = try api_codec.decodeMutationView(records[0].payload);
+    try std.testing.expectEqual(api_types.MutationKind.prepared, first.kind);
+    const postimage = try @import("../build/document_facts.zig").parseEnrichedBody(first.body.?);
+    try std.testing.expectEqualStrings(body, postimage.body);
+    try std.testing.expectEqual(@as(u64, 6), postimage.source_input_bytes);
+    try std.testing.expectEqual(api_types.MutationKind.delete, (try api_codec.decodeMutationView(records[1].payload)).kind);
+    try std.testing.expectError(error.InvalidDocumentMutation, service.ingestBatch(request));
+}

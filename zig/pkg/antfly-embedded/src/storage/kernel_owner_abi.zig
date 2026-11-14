@@ -24,6 +24,7 @@ const failure_abi = @import("runtime_failure_abi");
 // Version 90 also fences certified graph document-key descriptor domains.
 // Version 91 fences selected-role merge-readiness projection responses.
 // Version 92 requires native batch decoders to preserve commit prerequisites.
+// Version 93 adds capture-only direct preparation and immutable effect replay.
 pub const abi_version: u32 = 93;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;

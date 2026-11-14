@@ -21153,6 +21153,8 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn canCoalesceProvisionedGroupBatch(self: *ProvisionedTableWriteSource, group: GroupBatch, req: db_mod.types.BatchRequest) bool {
         if (self.write_cache == null) return false;
+        // Each gated request owns its prepared source and output fences.
+        if (req.commit_requires != null or req.prepared_enrichments_json != null) return false;
         if (group.transforms.items.len != 0) return false;
         if (req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.predicates.len != 0) return false;
         return switch (req.sync_level) {
@@ -21684,6 +21686,8 @@ pub const ProvisionedTableWriteSource = struct {
             var accepted_groups: usize = 0;
             for (grouped.items) |group| {
                 batcher.batchGroupRoutedWithCancellation(alloc, group.route_fence orelse return error.CatalogRouteFenceRequired, table_name, .{
+                    .commit_requires = req.commit_requires,
+                    .prepared_enrichments_json = req.prepared_enrichments_json,
                     .writes = group.writes.items,
                     .deletes = group.deletes.items,
                     .transforms = group.transforms.items,
@@ -22413,6 +22417,7 @@ pub const ProvisionedTableWriteSource = struct {
         // `batch` retains the established schema, cache, coalescing, HA, and
         // sync-level behavior used by all non-transactional shard writes.
         const applied = self.batchWithVisibilityCancellation(alloc, table_req.table_name, .{
+            .commit_requires = table_req.commit_requires,
             .writes = transactionWritesAsBatchWrites(table_req.writes),
             .deletes = table_req.deletes,
             .transforms = table_req.transforms,
@@ -22483,6 +22488,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         const batcher = self.raft_batcher orelse return null;
         const req: db_mod.types.BatchRequest = .{
+            .commit_requires = table_req.commit_requires,
             .writes = transactionWritesAsBatchWrites(table_req.writes),
             .deletes = table_req.deletes,
             .transforms = table_req.transforms,
@@ -23448,7 +23454,10 @@ pub const ProvisionedTableWriteSource = struct {
         if (context.route_fence) |fence| {
             if (req.restore_staging_scope != null or fence.route.group_id != group_id or fence.topology_epoch != topology_epoch) return error.TopologyChanged;
             const deadline = self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }) orelse self.catalog.budget(null).nowNs() +| std.time.ns_per_s * 5;
-            guarded_admission = try self.acquireRoutedWriteAdmission(alloc, table_name, fence, deadline, context.cancellation);
+            // A gated Raft writer prepares outside catalog admission. The
+            // DataServer reacquires this exact route fence after inference.
+            if (req.commit_requires != .direct_enrichments or self.raft_batcher == null)
+                guarded_admission = try self.acquireRoutedWriteAdmission(alloc, table_name, fence, deadline, context.cancellation);
         }
         try enforceReplicationWriteGateOptional(self.replication_write_gate);
         self.beginGroupOperation(table_name, group_id);
@@ -26239,6 +26248,8 @@ pub const HostedProvisionedTableWriteSource = struct {
                             .table_name = table_name,
                         };
                         try cached.db.batchWithDocumentArtifactChildRangeDispatcher(.{
+                            .commit_requires = req.commit_requires,
+                            .prepared_enrichments_json = req.prepared_enrichments_json,
                             .writes = group.writes.items,
                             .deletes = group.deletes.items,
                             .transforms = group.transforms.items,
@@ -26252,6 +26263,8 @@ pub const HostedProvisionedTableWriteSource = struct {
                     },
                     .remote => |remote| {
                         const body = try encodeRemoteBatchRequest(alloc, .{
+                            .commit_requires = req.commit_requires,
+                            .prepared_enrichments_json = req.prepared_enrichments_json,
                             .writes = group.writes.items,
                             .deletes = group.deletes.items,
                             .transforms = group.transforms.items,
@@ -27822,16 +27835,7 @@ fn applyGroupBatchUnchecked(
     cancellation: db_mod.types.CancellationToken,
 ) !void {
     local_write_test_hooks.runTestBeforeBatchExecutionHook();
-    const batch_req: db_mod.types.BatchRequest = .{
-        .writes = group.writes.items,
-        .deletes = group.deletes.items,
-        .transforms = group.transforms.items,
-        .graph_writes = req.graph_writes,
-        .graph_deletes = req.graph_deletes,
-        .predicates = req.predicates,
-        .timestamp_ns = req.timestamp_ns,
-        .sync_level = req.sync_level,
-    };
+    const batch_req = groupBatchRequest(group, req);
     if (req.reject_graph_transform_projections) {
         try db.batchTransactionCompatibleWithVisibilityCancellation(batch_req, cancellation);
     } else {
@@ -27841,21 +27845,11 @@ fn applyGroupBatchUnchecked(
 }
 
 fn groupBatchRequest(group: GroupBatch, req: db_mod.types.BatchRequest) db_mod.types.BatchRequest {
-    return .{
-        .writes = group.writes.items,
-        .deletes = group.deletes.items,
-        .transforms = group.transforms.items,
-        .graph_writes = req.graph_writes,
-        .graph_deletes = req.graph_deletes,
-        .predicates = req.predicates,
-        .timestamp_ns = req.timestamp_ns,
-        .sync_level = req.sync_level,
-        .reject_graph_transform_projections = req.reject_graph_transform_projections,
-        .split_checkpoint = req.split_checkpoint,
-        .split_replication = req.split_replication,
-        .split_transition = req.split_transition,
-        .transaction = req.transaction,
-    };
+    var grouped = req;
+    grouped.writes = group.writes.items;
+    grouped.deletes = group.deletes.items;
+    grouped.transforms = group.transforms.items;
+    return grouped;
 }
 
 /// Apply one already-committed storage-owner command using only persisted local
@@ -33943,6 +33937,7 @@ fn consumerTests() type {
             const Capture = struct {
                 calls: usize = 0,
                 transforms: usize = 0,
+                requirement: ?db_mod.types.CommitRequires = null,
 
                 fn batchGroup(
                     ptr: *anyopaque,
@@ -33954,6 +33949,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.calls += 1;
                     self.transforms = req.transforms.len;
+                    self.requirement = req.commit_requires;
                 }
 
                 fn batchGroupRouted(ptr: *anyopaque, allocator: std.mem.Allocator, route_capability: metadata_api.CatalogRouteFence, table_name: []const u8, req: db_mod.types.BatchRequest, _: db_mod.types.CancellationToken) !void {
@@ -34007,6 +34003,14 @@ fn consumerTests() type {
             try std.testing.expect(ordinary == .committed);
             try std.testing.expectEqual(@as(usize, 1), capture.calls);
             try std.testing.expectEqual(@as(usize, 1), capture.transforms);
+            for ([_]db_mod.types.CommitRequires{ .direct_enrichments, .none }) |requirement| {
+                _ = try source.commitSingleGroupTransactionViaRaftBatcher(std.testing.allocator, &.{.{
+                    .table_name = "docs",
+                    .commit_requires = requirement,
+                    .writes = &.{.{ .key = "doc:a", .value = "{}" }},
+                }}, .write, .none);
+                try std.testing.expectEqual(requirement, capture.requirement.?);
+            }
         }
 
         test "provisioned stateless batch retries definite aborts to the production bound" {

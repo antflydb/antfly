@@ -2018,20 +2018,7 @@ pub const PreparedArtifactDeletes = struct {
     }
 };
 
-pub const PreparedProducer = struct {
-    definition: [32]u8,
-    doc_key: []const u8,
-    revision: ?[32]u8 = null,
-
-    pub fn identity(self: @This()) [32]u8 {
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update(&self.definition);
-        hash.update(self.doc_key);
-        var result: [32]u8 = undefined;
-        hash.final(&result);
-        return result;
-    }
-};
+pub const PreparedProducer = enrichment_types.PreparedProducer;
 
 /// Native effect language, independent of model runtimes and local write-plan
 /// generation numbers. Arrays/bytes use the binary-safe private JSON writer.

@@ -12714,7 +12714,7 @@ pub const DataServer = struct {
         return proposal;
     }
 
-    fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+    pub fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
         if (req.commit_requires == .direct_enrichments or req.prepared_enrichments_json != null)
             return @import("../common/data_raft_protocol.zig").batch_prepared_enrichments_protocol_version;
         if (antfly.db.types.requiresDenseArtifactFlagsProtocol(req))

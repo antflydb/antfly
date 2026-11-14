@@ -1687,7 +1687,7 @@ tags:
       1. **Embedding API Unavailable**
          - Enrichment retries automatically when service recovers
          - Documents remain indexed (without embeddings) for full-text search
-         - On supported embedded batch surfaces, use `commit_requires: direct_enrichments`
+         - On supported mutation surfaces, use `commit_requires: direct_enrichments`
            to precompute eligible enrichments before committing. `sync_level` selects a wait.
            A synchronous producer failure rejects the write. Failures detected after a
            document has committed retain it and may report `committed_repair_required` so
@@ -29176,13 +29176,19 @@ components:
 
         physical effect set must fit; this is not an artifact-only allowance.
 
-        Explicit none is supported across mutation engines. direct_enrichments is
+        Supported by embedded batches, server/Raft writes and distributed transactions.
 
-        currently supported by local embedded batches; server HTTP, Raft, serverless
+        Raft prepares on the leader and replays immutable effects without inference.
 
-        and transaction-resolution surfaces reject that gate before admission until
+        Transactions reserve the complete envelope before voting prepared; their
 
-        their prepared-output protocols are available.
+        conservative reservation can reject a batch below the final physical limit.
+
+        Serverless supports source-local pipeline stages through conditional atomic
+
+        WAL batches (at most 1024 mutations and 8 MiB including WAL framing).
+
+        Backends without that capability reject before source admission.
 
         Omission retains legacy embedded precomputation for enrichments/full_index
 
@@ -31414,6 +31420,15 @@ components:
       required:
         - tables
       properties:
+        commit_requires:
+          allOf:
+            - $ref: '#/components/schemas/CommitRequires'
+          description: >
+            Default admission prerequisite for tables without an explicit commit_requires.
+
+            A table-level value overrides this default. Staged transaction statements
+
+            retain the strongest prerequisite selected for each table.
         tables:
           type: object
           description: >
@@ -31505,6 +31520,15 @@ components:
         - read_set
         - tables
       properties:
+        commit_requires:
+          allOf:
+            - $ref: '#/components/schemas/CommitRequires'
+          description: >
+            Default admission prerequisite for tables without an explicit commit_requires.
+
+            A table-level value overrides this default. Staged transaction statements
+
+            retain the strongest prerequisite selected for each table.
         read_set:
           type: array
           description: >

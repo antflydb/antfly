@@ -135,58 +135,76 @@ cross-shard abort/recovery, bounds and cancellation, all eligibility cases and
 omitted/explicit-field migration behavior. Benchmark asynchronous ingestion and
 gated batching separately, including unrelated-write latency during slow inference.
 
-### Implementation Boundary
+### Engine Protocols
 
-The initial implementation exposes the optional field through batch codecs and
-SDKs and implements explicit `none` and `direct_enrichments` for unreplicated local
-embedded batches. It reuses the existing immutable row plans, pre-lock producer
-preparation, provider memo/batching, source and catalog generation fences, and
-atomic artifact/coverage commit. Direct admission bounds the complete atomic
-effect set (source mutations, artifacts, coverage, revisions, counters and replay
-payload) to 8 MiB and 16,384 physical rows. The submitted source envelope must
-also fit before providers run. Preparation dispatches windows of at most 32
-documents and 256 KiB of source bytes (one large document occupies its own
-window), preserving cross-document dense/sparse and asset batching. Provider
-result contracts receive the remaining output allowance. Artifact emission and
-retirement reserve bytes/rows individually, and the final commit check includes
-metadata amplification. Request-scoped retry memos and runtime working-set
-budgets bound speculative work independently of the durable-output limit.
-Extraction failures represented by terminal manifests reject the gate even when
-there are no consuming indexes. Direct extraction materializes its own units and
-navigation only; artifact-source descendants remain replay work. A durable
-`children_pending` state fence prevents fingerprint reuse from skipping unfinished
-children. The replay record retains the enrichment hint independently of ordinary
-generated requests, and parent completion does not discharge child coverage.
-Write/propose acknowledgment uses the normal thin replay record after preparation. Native
-owner ABI 92 prevents older decoders from ignoring these prerequisites.
+The optional requirement is carried through batch and transaction codecs and all
+SDKs. Omitted and explicit `none` remain distinct. Transaction-level defaults
+apply only to tables without an override. Session cloning, persistence and
+statement coalescing retain the strongest prerequisite selected for each table.
 
-Explicit `none` is accepted across server, native owner, Raft, serverless and
-transaction ingress. Server HTTP, Raft and serverless currently reject the
-`direct_enrichments` gate before admission. Local ordered-publication, replication,
-child-range dispatch and transaction-resolution paths reject the gate as well. These rejections are a
-capability boundary, not completion of the target engine adapters above.
-Outstanding work includes the immutable prepared-output effect language,
-ordered producer receipts, protocol negotiation, transaction intent transport,
-serverless WAL integration, durable request deduplication, gated/excluded response
-reporting, and the associated failure/leadership/performance qualification.
-Do not close #1681 or advertise all-engine gating until those are implemented.
+Preparation dispatches bounded windows of at most 32 documents and 256 KiB of
+source bytes, preserving native dense/sparse and asset provider batching. The
+submitted source envelope is checked before inference. Source mutations,
+artifacts, deletes, metadata and replay have an 8 MiB / 16,384-row physical budget.
+Provider result contracts and incremental output accounting stop oversized work.
+Transaction preparation additionally reserves a conservative bound for commit
+metadata, index effects, read guards and retained-source output before voting yes;
+that bound can reject a request below the final physical limit. Prepared primary
+intents fence background artifact publication, so the retirement footprint cannot
+expand after reservation. Workers defer that conflict without terminal failure.
 
-### Comparable Database Contracts
+The private `prepared-enrichments-batch-v1` envelope carries normalized source
+postimages, source/revision and catalog fences, artifact effects, pending work,
+coverage, and successful producer definition digests with available model
+revisions. It references each immutable catalog definition instead of repeating
+provider configuration for every document. Binary artifact values round-trip
+without UTF-8 conversion. Capture has no primary side effects. Receivers validate
+the complete eligible producer set and its physical output scopes without model
+calls. Native owner ABI 93 and storage engine ABI 39 fence the added interfaces.
 
-- Elasticsearch separates ingest processing from
-  [`refresh=wait_for`](https://www.elastic.co/docs/reference/elasticsearch/rest-apis/refresh-parameter),
-  which normally waits for scheduled search publication rather than forcing it.
-- OpenSearch [pipeline failures](https://docs.opensearch.org/latest/ingest-pipelines/pipeline-failures/)
-  reject indexing on an unhandled producer failure.
-- MongoDB [write concern](https://www.mongodb.com/docs/manual/reference/write-concern/)
-  distinguishes acknowledgment failures from write failures; timeout does not
-  undo successful mutations.
-- PostgreSQL [generated columns](https://www.postgresql.org/docs/18/ddl-generated-columns.html)
-  restrict generation to immutable current-row expressions. Antfly's remote
-  inference instead requires replicated outputs and explicit provenance.
+Raft leaders prepare before acquiring routed admission or the proposal lock.
+The all-member durable protocol-30 barrier precedes prepared-effect entries;
+older decoders reject their envelope. Every replica commits source, outputs and
+receiver-owned acceptance atomically. Acceptance binds the primary position and
+producer scope revision, and participates in the normal completion census.
+Unrelated producer scopes do not revoke it. Provenance records retain resolved
+model revisions where provided. Replaying an applied log identity performs no
+inference or second mutation. Certificate retirement has bounded epoch/root and
+current-record scans, with exact-record checks protecting concurrent renewal.
 
-These contracts motivate transactional ingest preparation plus independent
-publication waits, while preserving Antfly's asynchronous replay architecture.
+Distributed prepare persists the frozen packet with its intent vote and reserves
+its retained-source cost. Its request digest rejects identity collisions; retries
+of an accepted participant reuse the durable packet. A non-gated prepare cannot
+replace or extend that sealed vote. Commit and abort retire the packet atomically
+with intent resolution. Restart and phase two consume recorded effects without
+inference. A later catalog publication cannot revoke an irrevocable commit:
+historical outputs still commit, while current-catalog coverage stays pending
+and replay receives the work hint. Obsolete outputs never certify the new plan.
+
+Serverless uses private WAL mutation kind 5 for a self-contained primary postimage
+and its direct pipeline outputs, preserving logical source-byte accounting. One
+conditional atomic WAL batch admits all writes and deletes against the captured
+namespace cut, with an operation receipt for exact replay and collision checks.
+It is limited to 1,024 mutations and 8 MiB including framing. Legacy backends
+without conditional batch append reject before inference or source admission.
+Request-owned provider handles avoid the background runtime's configuration and
+publication locks. Media/model-source stages requiring artifact context remain
+asynchronous. Prepared completion markers bind the canonical producer catalog;
+configuration changes reopen their pending facts and prevent fingerprint reuse
+from skipping the replacement work. Available model revisions are recorded and
+revalidated before admission.
+
+Direct extraction materializes its own units and navigation. Its terminal
+failures reject admission even without a consuming index. Artifact-source children
+remain replay work: durable `children_pending` state prevents premature fingerprint
+reuse, and the replay hint survives materialized visibility waits. A parent's
+acceptance never discharges child coverage.
+
+`sync_level` continues to join ordinary publication frontiers after admission.
+A committed visibility timeout or downstream failure cannot be reclassified as
+rejection. Stable transaction/session or WAL operation identities must be retained
+when reconciling an unknown outcome; the gate does not make a new client request
+an idempotent retry, and model invocation itself is not exactly once.
 
 ## Artifact Identity And Lookup
 

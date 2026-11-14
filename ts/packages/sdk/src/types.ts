@@ -162,6 +162,7 @@ export interface BatchRequest {
 }
 export type BatchResult = components["schemas"]["BatchResponse"];
 export interface MultiBatchRequest {
+  commit_requires?: components["schemas"]["CommitRequires"];
   tables: Record<string, BatchRequest>;
   sync_level?: components["schemas"]["SyncLevel"];
 }

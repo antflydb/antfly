@@ -122,7 +122,6 @@ pub const Capture = struct {
             self.selected = try publication.authority(txn);
             self.checked = true;
         }
-        if (self.selected == null) return;
         if (artifact) {
             if (self.artifacts.contains(key)) return;
             const document = try @import("db/artifact_publication_owner.zig").documentAlloc(alloc, key);
@@ -130,6 +129,7 @@ pub const Capture = struct {
             defer if (owned) alloc.free(document);
             const owner = try self.artifact_owners.getOrPut(alloc, document);
             if (!owner.found_existing) owned = false;
+            if (self.selected == null) return;
             // Chunk reconstruction pages fence an entire root/unit stream,
             // including insertions and deletions beyond their current cursor.
             // The manifest need not exist: its revision is a prefix witness,
@@ -158,6 +158,7 @@ pub const Capture = struct {
             try self.rememberArtifact(alloc, key);
             return;
         }
+        if (self.selected == null) return;
         const document = (try keys.decodeDocumentComponentAlloc(alloc, key)) orelse return error.InvalidBatchRequest;
         errdefer alloc.free(document);
         const result = try self.documents.getOrPut(alloc, document);
@@ -169,7 +170,18 @@ pub const Capture = struct {
     /// while this helper stages only the revision sidecars and native clock.
     pub fn stage(self: *Capture, txn: anytype, retained_advanced: bool) !void {
         if (self.poisoned) return error.RetainedEffectsTransactionFailed;
-        if (self.staged or (self.documents.count() == 0 and self.artifacts.count() == 0)) return;
+        if (self.staged) return;
+        // Prepared primary writers freeze the retirement footprint too.
+        // Background producers may not expand the old postimage after a yes
+        // vote. Resolution removes its own intent locks in this same writer,
+        // so its source and artifact effects remain one atomic transition.
+        if (self.artifact_owners.count() != 0) {
+            var guard = @import("transactions.zig").IntentReadGuard.init(self.allocator orelse return error.ArtifactCatalogCorrupt, null);
+            defer guard.deinit();
+            var affected = self.artifact_owners.keyIterator();
+            while (affected.next()) |document| try guard.check(txn, document.*);
+        }
+        if (self.documents.count() == 0 and self.artifacts.count() == 0) return;
         errdefer self.poisoned = true;
         const expected = self.selected orelse return error.ArtifactCatalogCorrupt;
         const current = (try publication.authority(txn)) orelse return error.RetainedEffectsFenceMismatch;

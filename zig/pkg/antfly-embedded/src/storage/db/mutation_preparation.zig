@@ -916,6 +916,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var txn = try S.ownerField(self, "core").*.store.beginReadTxn();
             defer txn.abort();
             const authority = try publication.authority(&txn);
+            if (authority) |value| if (!std.mem.eql(u8, &value.catalog_digest, &(plan.publicationCatalogDigest(&txn) catch return error.PreparedGenerationChanged))) return error.PreparedGenerationChanged;
             const guards = try a.alloc(execution_resources.PreparedEnrichments.Guard, req.writes.len + req.deletes.len);
             for (guards, 0..) |*guard, i| {
                 const document = if (i < req.writes.len) req.writes[i].key else req.deletes[i - req.writes.len];
@@ -1248,6 +1249,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     window_end = @import("commit_requirements.zig").windowEnd(req.writes, i);
                     if (resolved_plan) |plan| {
                         const window_plan = GeneratedBatchWritePlan{ .alloc = alloc, .rows = plan.rows[i..window_end], .direct_gate_supported = plan.direct_gate_supported };
+                        for (window_plan.rows) |row| for (row.requests) |request| {
+                            if (@import("commit_requirements.zig").directEligibility(request) != .eligible) continue;
+                            // Reserve the closed-result identity and coverage
+                            // before provider batching or per-document clones.
+                            try output_budget.reserve(request.doc_key.len + request.index_name.len + request.artifact_name.len + request.embedding_name.len + 128, 1);
+                        };
                         var window_req = req;
                         window_req.writes = req.writes[i..window_end];
                         try prewarmGeneratedDenseMemo(self, window_req, extracted[i..window_end], precompute_mode, &window_plan, preparation_memo, force_generated_artifact_names);
@@ -1276,6 +1283,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break :blk owned_row_plan.?.rows[0].requests;
                 };
                 if (generated_templates.len == 0) continue;
+                if (precompute_mode == .direct and resolved_plan == null) for (generated_templates) |request| {
+                    if (@import("commit_requirements.zig").directEligibility(request) != .eligible) continue;
+                    try output_budget.reserve(request.doc_key.len + request.index_name.len + request.artifact_name.len + request.embedding_name.len + 128, 1);
+                };
                 const privacy_protected = for (generated_templates) |template| {
                     if (@import("../../privacy/document.zig").isProtectedArtifactName(template.artifact_name)) break true;
                 } else false;

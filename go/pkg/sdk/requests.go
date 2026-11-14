@@ -411,6 +411,9 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 
 // MultiBatchRequest represents a cross-table batch operation.
 type MultiBatchRequest struct {
+	// CommitRequires is the default prerequisite for tables without an override.
+	CommitRequires CommitRequires `json:"commit_requires,omitempty"`
+
 	// Tables maps table names to their batch operations.
 	Tables map[string]BatchRequest `json:"tables"`
 

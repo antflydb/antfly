@@ -201,7 +201,7 @@ pub const Prepared = struct {
         self.* = undefined;
     }
 
-    pub fn init(a: std.mem.Allocator, store: anytype, plan: *const Manager.WritePlanSnapshot, root: u128, sequence: u64, producers: []const @import("execution_resources.zig").PreparedProducer, writes: anytype, generated: anytype, removed: []const []const u8, other: ?commit_hooks.Participant) !Prepared {
+    pub fn init(a: std.mem.Allocator, store: anytype, plan: *const Manager.WritePlanSnapshot, root: u128, sequence: u64, producers: []const requests.PreparedProducer, writes: anytype, generated: anytype, removed: []const []const u8, other: ?commit_hooks.Participant) !Prepared {
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         const owned = arena.allocator();
