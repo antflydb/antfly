@@ -16,6 +16,11 @@ on:
         description: Optional literal test filter for capi-test or antfly-storage-owner-source-test
         type: string
         default: ''
+      merge_recovery_case:
+        description: Optional native merge recovery qualification after an antfly build
+        type: choice
+        default: none
+        options: [none, snapshot-raft_quorum, all]
       target:
         description: CPU-only target profile (qualify release backends separately)
         type: choice
@@ -61,6 +66,7 @@ env:
   ANTFLY_ZIG_MAX_RSS: '21474836480'
   ANTFLY_TEST_TIMINGS: '1'
   ANTFLY_PROFILE_TEST_FILTER: ${{ inputs.test_filter }}
+  ANTFLY_PROFILE_MERGE_RECOVERY_CASE: ${{ inputs.merge_recovery_case }}
 
 jobs:
   profile:
@@ -76,8 +82,20 @@ jobs:
           submodules: true
       - uses: ./.github/actions/load-toolchain-policy
         id: toolchain
+      - name: Validate native recovery selection
+        if: ${{ inputs.merge_recovery_case != 'none' }}
+        env:
+          BUILD_STEP: ${{ inputs.step }}
+          BUILD_TARGET: ${{ inputs.target }}
+        run: |
+          test "$BUILD_STEP" = antfly
+          test "$BUILD_TARGET" = x86_64-linux-gnu
+          test "$(uname -m)" = x86_64
       - name: Install diagnostic tools
-        run: bash scripts/ci/install_ubuntu_packages.sh build-essential pkg-config llvm time file python3 ca-certificates curl xz-utils
+        run: |
+          packages=(build-essential pkg-config llvm time file python3 ca-certificates curl xz-utils)
+          if [ "$ANTFLY_PROFILE_MERGE_RECOVERY_CASE" != none ]; then packages+=(python3-venv); fi
+          bash scripts/ci/install_ubuntu_packages.sh "${packages[@]}"
       - name: Install Nix
         uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
@@ -286,6 +304,34 @@ jobs:
         if: ${{ success() && (inputs.step == 'antfly-storage-owner-test' || inputs.step == 'local-query-owner-test') }}
         run: |
           python3 zig/tools/check_query_owner_cache.py --report .benchmark-results/compile-costs/query-owner-cache.json
+      - name: Qualify merge recovery on native Linux
+        if: ${{ success() && inputs.merge_recovery_case != 'none' }}
+        timeout-minutes: 40
+        env:
+          ANTFLY_BIN: ${{ github.workspace }}/zig/zig-out/bin/antfly
+          ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE: '1'
+          PYTHONPYCACHEPREFIX: ${{ github.workspace }}/.cache/profile-e2e/pyc
+        run: |
+          set -euo pipefail
+          python3 -m venv .cache/profile-e2e/venv
+          .cache/profile-e2e/venv/bin/python -m pip install pytest==9.0.2 pytest-xdist==3.8.0 requests==2.32.5
+          mkdir -p .cache/profile-e2e/tmp
+          export TMPDIR="$PWD/.cache/profile-e2e/tmp"
+          selector=zig/e2e/antfly/test_online_merge_recovery.py::test_online_merge_recovers_after_owner_link_outage_and_crash
+          limit=2100
+          if [ "$ANTFLY_PROFILE_MERGE_RECOVERY_CASE" = snapshot-raft_quorum ]; then
+            selector+="[snapshot-raft_quorum]"
+            limit=600
+          fi
+          timeout --signal=INT --kill-after=30s "$limit" \
+            .cache/profile-e2e/venv/bin/python -m pytest -q "$selector" \
+            2>&1 | tee .benchmark-results/compile-costs/merge-recovery.log
+      - name: Retain failed native recovery fixtures
+        if: ${{ failure() && inputs.merge_recovery_case != 'none' }}
+        run: |
+          if [ -d .cache/profile-e2e/tmp ]; then
+            tar -czf .benchmark-results/compile-costs/merge-recovery-fixtures.tgz -C .cache/profile-e2e/tmp .
+          fi
       - name: Retain measurements even on compiler failure
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -296,4 +342,6 @@ jobs:
           if-no-files-found: error
       - name: Remove this experiment's disposable compiler output
         if: always()
-        run: rm -rf -- "/mnt/cache/antfly/zig/profile-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        run: |
+          rm -rf -- "/mnt/cache/antfly/zig/profile-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rm -rf -- .cache/profile-e2e
