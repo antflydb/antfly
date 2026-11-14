@@ -609,11 +609,12 @@ pub fn runUntilIdle(handle: *h.Handle) !void {
 }
 
 fn drainDatabase(root: *h.Handle, database: *h.db_mod.DB) !void {
-    var arena = std.heap.ArenaAllocator.init(root.alloc);
-    defer arena.deinit();
     // Manual maintenance uses the same one-projection-per-turn pull as the
-    // native owner loop. A drain is explicitly allowed to repeat these turns.
+    // native owner loop. Each turn owns only its temporary inputs; retaining
+    // them across the whole drain scales memory with every historical page.
     for (0..4096) |_| {
+        var arena = std.heap.ArenaAllocator.init(root.alloc);
+        defer arena.deinit();
         if (!try @import("resolver_authority.zig").pullProjection(root, database, arena.allocator())) break;
     } else return error.RunUntilIdleDidNotConverge;
     if (root.lite_connection_context) |connection|

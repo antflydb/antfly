@@ -280,7 +280,7 @@ class BuildFailureEvidence(unittest.TestCase):
         ):
             nonlocal first_cache, first_global
             label, rebuilt = expected[len(seen)]
-            self.assertEqual(timeout_seconds, 3600 if label.endswith("cold") else 1800)
+            self.assertEqual(timeout_seconds, 3600)
             self.assertEqual(compiler_timeout_seconds, 1800)
             local_cache = cwd / command[command.index("--cache-dir") + 1]
             self.assertEqual(command[command.index("--build-file") + 1], "./build.zig")

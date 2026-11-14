@@ -47805,11 +47805,11 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 9), source.cached_routing_snapshot.?.snapshot.catalog_revision);
         }
 
-        test "remote routing normalizes every timeout class at the source boundary" {
+        test "remote routing preserves cancellation while normalizing timeout classes" {
             try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Timeout) == error.CatalogRoutingSnapshotTimeout);
             try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.DeadlineExceeded) == error.CatalogRoutingSnapshotTimeout);
-            try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Cancelled) == error.CatalogRoutingSnapshotTimeout);
-            try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Canceled) == error.CatalogRoutingSnapshotTimeout);
+            try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Cancelled) == error.Canceled);
+            try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.Canceled) == error.Canceled);
             try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.CatalogRoutingSnapshotTimeout) == error.CatalogRoutingSnapshotTimeout);
             try std.testing.expect(normalizeCatalogRoutingSnapshotError(error.NotLeader) == error.NotLeader);
         }

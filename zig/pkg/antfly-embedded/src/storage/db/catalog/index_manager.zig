@@ -4563,6 +4563,7 @@ pub const IndexManager = struct {
 
     pub fn denseNativeStoragePhase(self: *IndexManager, name: []const u8) types.DenseNativeStoragePhase {
         const entry = self.denseIndex(name) orelse return .legacy;
+        if (!denseIndexUsesVectorBlocks(entry)) return .legacy;
         const posting_authoritative = entry.index.experimentalPostingWalAuthoritative();
         if (posting_authoritative and self.vectorBlockReadyForDenseIndex(name)) return .native_authoritative;
         if (posting_authoritative or entry.index.experimentalPostingReadsEnabled()) return .native_validating;

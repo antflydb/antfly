@@ -503,6 +503,9 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     wasm_schema_mod.addImport("antfly-json", json_mod);
     wasm_schema_mod.addImport("antfly_platform", wasm_platform_mod);
     wasm_schema_mod.addImport("antfly_regex", regex_mod);
+    // Template dependency inspection shares lossless numeric equality with
+    // native rendering, while retaining browser-only provider capabilities.
+    embedded_support_wasm_mod.addImport("antfly_jsonschema", wasm_schema_mod);
     const wasm_generating_mod = b.createModule(.{ .root_source_file = b.path("lib/generating/src/mod.zig"), .target = wasm_target, .optimize = optimize });
     wasm_generating_mod.addImport("antfly_cloudflare_config", cloudflare_config_mod);
     wasm_generating_mod.addImport("antfly-json", json_mod);

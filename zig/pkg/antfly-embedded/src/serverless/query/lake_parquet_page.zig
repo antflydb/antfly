@@ -3377,11 +3377,10 @@ fn decodeCompressedExactAlloc(
             break :blk try decompress.reader.allocRemaining(alloc, .limited(read_limit));
         },
         .zstd => blk: {
-            var in: std.Io.Reader = .fixed(compressed);
-            const window = try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
-            defer alloc.free(window);
-            var decompress: @import("antfly_compress").ZstdDecoder = .init(&in, window, .{});
-            break :blk try decompress.reader.allocRemaining(alloc, .limited(read_limit));
+            const output = try alloc.alloc(u8, expected_len);
+            errdefer alloc.free(output);
+            try @import("antfly_compress").zstd.decodeExact(alloc, compressed, output, .{});
+            break :blk output;
         },
     };
     errdefer alloc.free(decoded);

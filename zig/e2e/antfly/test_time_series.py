@@ -22,6 +22,7 @@ import time
 
 import pytest
 from conftest import finish_create_table
+from helpers import PhaseTimings
 
 
 def _schema():
@@ -516,6 +517,7 @@ def test_sdk_preset_grouped_materializations(stateful_api, shards):
 
 def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
     """A maintained query must not hydrate the fallback's first 100,000 hits."""
+    timings = PhaseTimings("grouped-materializations-scale")
     fixture = json.loads(
         (Path(__file__).parent / "fixtures/time-series-sdk.json").read_text()
     )
@@ -524,6 +526,7 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
     finish_create_table(
         api, name, api._request("POST", f"/tables/{name}", fixture["table"])
     )
+    timings.mark("table-admission")
     count = 100_001
     for first in range(0, count, 1000):
         # Coalesce setup writes, but bound replay debt so a visibility fence
@@ -544,6 +547,9 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
             },
             sync_level="full_index" if fence else "write",
         )
+        if fence:
+            timings.observe("population-fence", rows=min(first + 1000, count))
+    timings.mark("population-and-indexing")
     payload = api.post("/query", dict(fixture["query"], table=name))
     result = payload.get("responses", [payload])[0]
     assert not result.get("error"), payload
@@ -556,6 +562,7 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
     metrics = bucket["sub_aggregations"]["points"]["buckets"][0]["sub_aggregations"]
     assert metrics["total"]["value"] == count
     assert metrics["average"]["avg"] == 1
+    timings.mark("bounded-materialized-query")
     populated = copy.deepcopy(fixture["query"])
     histogram = populated["aggregations"]["series"]["sub_aggregations"]["points"]
     histogram.pop("date_bounds")
@@ -575,6 +582,7 @@ def test_grouped_materializations_exceed_source_collection_limit(stateful_api):
         ]
         == count
     )
+    timings.mark("populated-bucket-query")
 
 
 def test_signed_origin_and_bounded_nesting_rejection(stateful_api):

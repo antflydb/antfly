@@ -2215,7 +2215,7 @@ fn ownedBlockScenario(a: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(i64, 9007199254740993), (try second.cell(a, 0, 0)).value.integer);
 }
 test "SQL transferred column views survive producer teardown and allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, ownedBlockScenario, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(ownedBlockScenario, .{});
 }
 
 fn transferBenchmark(copy: bool, root: *PendingColumns) !struct { ns: i96, checksum: i64 } {
@@ -2963,7 +2963,7 @@ test "SQL owned streams release allocator capability after delivery decline and 
             try std.testing.expectEqual(@as(usize, 4), page.output.rows.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("allocation_test_support.zig").checkAllAllocationFailures(Case.run, .{});
     var fixture: Fixture = .{};
     var compiled = try compiler.compile(std.testing.allocator, "CREATE TABLE d (id TEXT PRIMARY KEY)", .{});
     defer compiled.deinit();
