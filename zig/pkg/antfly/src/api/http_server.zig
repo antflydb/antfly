@@ -9707,7 +9707,7 @@ pub const ApiHttpServer = struct {
                     return error.Forbidden;
                 // Root discovery probes the physical reverse index, which
                 // cannot yet distinguish parents hidden by a row filter.
-                if (discovers_tree_roots and effectiveRowFilterJson(identity, table_name) != null)
+                if (discovers_tree_roots and hasEffectiveRowFilter(identity, table_name))
                     return error.Forbidden;
             }
 
@@ -9771,7 +9771,7 @@ pub const ApiHttpServer = struct {
                 if (catalog_identity) |identity| {
                     if (!permissionsAllow(identity.permissions, .table, table_name, .read))
                         return error.Forbidden;
-                    if (effectiveRowFilterJson(identity, table_name) != null)
+                    if (hasEffectiveRowFilter(identity, table_name))
                         return error.Forbidden;
                 }
                 return try runner.server.probeRetrievalIncomingEdges(
@@ -31472,20 +31472,8 @@ pub fn authSubjectsToResponse(
     return out;
 }
 
-pub fn effectiveRowFilterJson(identity: ?AuthenticatedIdentity, table_name: []const u8) ?[]const u8 {
-    const row_filters = if (identity) |value| value.row_filter else return null;
-    var selected: ?[]const u8 = null;
-    var rank: u8 = 0;
-    for (row_filters) |entry| {
-        if (!system_catalog.tableResourceMatches(entry.table, table_name)) continue;
-        const candidate_rank: u8 = if (std.mem.eql(u8, entry.table, "*")) 1 else if (std.mem.startsWith(u8, entry.table, system_catalog.target_key_prefix) and (system_catalog.TableScope.fromKey(entry.table) catch continue).table == null) 2 else 3;
-        if (candidate_rank > rank) {
-            selected = entry.filter;
-            rank = candidate_rank;
-        }
-    }
-    if (selected) |filter| if (!std.mem.eql(u8, filter, "null")) return filter;
-    return null;
+pub fn hasEffectiveRowFilter(identity: ?AuthenticatedIdentity, table_name: []const u8) bool {
+    return usermgr.hasRowFilterForTable((identity orelse return false).row_filter, table_name);
 }
 
 pub fn resolveEffectiveRowFilterJson(
@@ -31493,8 +31481,9 @@ pub fn resolveEffectiveRowFilterJson(
     identity: ?AuthenticatedIdentity,
     table_name: []const u8,
 ) !?[]u8 {
-    const raw = effectiveRowFilterJson(identity, table_name) orelse return null;
-    const active_identity = identity orelse return try alloc.dupe(u8, raw);
+    const active_identity = identity orelse return null;
+    const raw = (try usermgr.combinedRowFilterForTable(alloc, active_identity.row_filter, table_name)) orelse return null;
+    defer alloc.free(raw);
     return try resolveAuthRowFilterJson(alloc, active_identity, raw);
 }
 
@@ -59315,8 +59304,14 @@ pub fn projectCatalogIdentity(alloc: std.mem.Allocator, identity: *Authenticated
         identity.permissions = try alloc.realloc(identity.permissions, identity.permissions.len + 1);
         identity.permissions[identity.permissions.len - 1] = permission;
     }
-    if (effectiveRowFilterJson(identity.*, logical)) |raw| {
-        var filter = try usermgr.RowFilterEntry.initOwned(alloc, physical, raw);
+    // Global filters already match the physical name. Project only scopes
+    // that would otherwise be lost when the catalog maps to immutable storage.
+    const filter_count = identity.row_filter.len;
+    for (0..filter_count) |i| {
+        const original = identity.row_filter[i];
+        if (!system_catalog.tableResourceMatches(original.table, logical) or
+            system_catalog.tableResourceMatches(original.table, physical)) continue;
+        var filter = try usermgr.RowFilterEntry.initOwned(alloc, physical, original.filter);
         errdefer filter.deinit(alloc);
         identity.row_filter = try alloc.realloc(identity.row_filter, identity.row_filter.len + 1);
         identity.row_filter[identity.row_filter.len - 1] = filter;
@@ -63336,4 +63331,25 @@ test "system catalog graph physical endpoints recheck logical grants and binding
     try std.testing.expectEqual(@as(usize, 1), fake.forward_reads);
     fake.revision += 1;
     try std.testing.expectError(error.CatalogGenerationChanged, ApiHttpServer.CatalogGraphReadContext.authorize(&context, a, "table:another"));
+}
+
+test "system catalog row filter scopes preserve tenant restriction and resolve auth references" {
+    const alloc = std.testing.allocator;
+    var filters = [_]usermgr.RowFilterEntry{
+        try usermgr.RowFilterEntry.initOwned(alloc, "*", "{\"term\":{\"tenant_id\":{\"$auth\":\"metadata.tenant_id\"}}}"),
+        try usermgr.RowFilterEntry.initOwned(alloc, "calls", "{\"term\":{\"status\":\"open\"}}"),
+        try usermgr.RowFilterEntry.initOwned(alloc, "calls", "null"),
+    };
+    defer for (&filters) |*filter| filter.deinit(alloc);
+    const identity = AuthenticatedIdentity{ .username = @constCast("reader"), .row_filter = &filters, .metadata_json = @constCast("{\"tenant_id\":\"a\"}") };
+    const resolved = (try resolveEffectiveRowFilterJson(alloc, identity, "calls")).?;
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"tenant_id\":\"a\"}},{\"term\":{\"status\":\"open\"}}]}", resolved);
+    try std.testing.expect(hasEffectiveRowFilter(identity, "calls"));
+    var projected = (try cloneCatalogIdentity(alloc, identity)).?;
+    defer projected.deinit(alloc);
+    try projectCatalogIdentity(alloc, &projected, "calls", "table:immutable");
+    const physical = (try resolveEffectiveRowFilterJson(alloc, projected, "table:immutable")).?;
+    defer alloc.free(physical);
+    try std.testing.expectEqualStrings(resolved, physical);
 }

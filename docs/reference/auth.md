@@ -141,7 +141,7 @@ set, requires a matching `iss`. The claims are:
 
 ### Row Filters
 
-Row filters are query JSON stored per table, with `*` as a fallback for every
+Row filters are query JSON stored per table, with `*` applying to every
 table. They are attached to users, roles, and groups through
 `/auth/v1/users/{user}/row-filters/{table}` and
 `/auth/v1/subjects/{subject}/row-filters/{table}`, or carried in a trusted
@@ -157,9 +157,9 @@ Filters are validated before they are stored.
 
 At read time, Antfly:
 
-1. Selects the table-specific filter if one exists, and otherwise the `*`
-   filter. The two are not combined.
-2. Combines filters from the same table with `AND`: the user's own filter, the
+1. Combines every matching global (`*`), namespace, and table filter with `AND`.
+   A `null` filter adds no restriction; it never removes broader filters.
+2. Combines filters from every principal with `AND`: the user's own filter, the
    filters of every role and group the user inherits, and an API key's own
    filter.
 3. Resolves `$auth` references against the authenticated identity.

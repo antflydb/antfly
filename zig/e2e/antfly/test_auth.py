@@ -581,11 +581,18 @@ def test_standalone_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthA
                     "title": "gold doc",
                     "body": "visible body",
                     "tier": "gold",
+                    "tenant_id": "a",
+                },
+                "doc:other": {
+                    "title": "other tenant",
+                    "tier": "gold",
+                    "tenant_id": "b",
                 },
                 "doc:silver": {
                     "title": "silver doc",
                     "body": "hidden body",
                     "tier": "silver",
+                    "tenant_id": "a",
                 },
             },
             "sync_level": "full_index",
@@ -604,6 +611,7 @@ def test_standalone_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthA
             ],
         },
     )
+    auth_api.put("/auth/v1/users/reader/row-filters/*", {"term": {"tenant_id": "a"}})
     auth_api.put("/auth/v1/users/reader/row-filters/docs", {"term": {"tier": "gold"}})
 
     auth_api.s.headers["Authorization"] = _basic_auth("reader", "reader")
@@ -631,6 +639,27 @@ def test_standalone_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthA
     assert [entry["_id"] for entry in scan_result] == ["doc:gold"]
     assert scan_result[0]["tier"] == "gold"
     assert scan_result[0]["title"] == "gold doc"
+
+    query = auth_api.post(
+        "/tables/docs/query",
+        {"full_text_search": {"match_all": {}}, "limit": 10},
+    )["responses"][0]
+    assert [hit["_id"] for hit in query["hits"]["hits"]] == ["doc:gold"]
+    hidden = auth_api.request_raw("GET", "/tables/docs/documents/doc:other")
+    assert hidden.status_code == 404, hidden.text
+
+    # A narrow null filter must preserve the global tenant boundary.
+    auth_api.s.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    auth_api.request_raw(
+        "PUT",
+        "/auth/v1/users/reader/row-filters/docs",
+        data="null",
+        headers={"Content-Type": "application/json"},
+    ).raise_for_status()
+    auth_api.s.headers["Authorization"] = _basic_auth("reader", "reader")
+    assert auth_api.get("/tables/docs/documents/doc:silver")["tier"] == "silver"
+    hidden = auth_api.request_raw("GET", "/tables/docs/documents/doc:other")
+    assert hidden.status_code == 404, hidden.text
 
 
 def test_stateful_auth_uses_configured_admin_password(stateful_auth_api: AuthApi):

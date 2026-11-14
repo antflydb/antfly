@@ -670,7 +670,7 @@ test "storage-backed user store and casbin adapter persist usermgr state" {
     try std.testing.expectEqualStrings("alice", validated.username);
     try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", validated.metadata_json);
     try std.testing.expectEqual(@as(usize, 1), validated.permissions.len);
-    try std.testing.expectEqual(@as(usize, 1), validated.row_filter.len);
+    try std.testing.expectEqual(@as(usize, 2), validated.row_filter.len);
     try reloaded.updatePassword("alice", "changed");
     const persisted_users = try reloaded_user_store.iface().loadUsers(std.testing.allocator);
     defer {
@@ -769,7 +769,7 @@ test "portable auth seed preserves credentials policies roles filters and api ke
     defer validated.deinit(alloc);
     try std.testing.expectEqualStrings("alice", validated.username);
     try std.testing.expectEqual(@as(usize, 1), validated.permissions.len);
-    try std.testing.expectEqual(@as(usize, 1), validated.row_filter.len);
+    try std.testing.expectEqual(@as(usize, 2), validated.row_filter.len);
 
     const wrong_target = try std.fs.path.join(alloc, &.{ root, "wrong-auth" });
     defer alloc.free(wrong_target);
