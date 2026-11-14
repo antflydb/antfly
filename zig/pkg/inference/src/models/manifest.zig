@@ -36,6 +36,7 @@ const gguf_metadata = @import("../gguf/metadata.zig");
 const managed_receipt = @import("../registry/managed_receipt.zig");
 const build_options = @import("build_options");
 const jinja = @import("jinja");
+const glide = @import("glide.zig");
 
 pub const qwen3_vl_gguf_bundle_family = "qwen3_vl_gguf_bundle/v1";
 pub const qwen3_vl_safetensors_bundle_family = "qwen3_vl_safetensors_bundle/v1";
@@ -299,6 +300,11 @@ pub const listing_compatibility_sidecars = [_][]const u8{
     "config_sentence_transformers.json",
     "processor_config.json",
     "tokenizer_config.json",
+    // GLiDE detection: the readout's presence, the decision config, and the
+    // NVFP4 marker that makes a checkpoint unsupported.
+    glide.decision_config_file,
+    glide.readout_file,
+    "quant_config.json",
 };
 
 /// Resolved model configuration loaded from a model directory.
@@ -421,6 +427,15 @@ pub const ModelManifest = struct {
     gliner_span_special_tokens_digest: ?boundary_bundle.Digest = null,
     /// The config declares a valid ModernBERT Laya decision head.
     laya_declared: bool = false,
+    /// A Fastino GLiDE decision checkpoint: `decision_config.json` (format 1)
+    /// plus `readout.safetensors` next to a ModernBERT or Qwen3.5 backbone.
+    glide_declared: bool = false,
+    glide_backbone: glide.Backbone = .decoder,
+    /// GLiDE sidecars are present but the variant is not servable (looped,
+    /// NVFP4, unknown prompt format/pooling/attention mode, or a backbone that
+    /// does not match the declaration). Such checkpoints stay decide-only and
+    /// are reported incompatible rather than served as a plain backbone.
+    glide_unsupported: bool = false,
     gliner_default_labels: [][]const u8 = &.{},
     gliner_relation_labels: [][]const u8 = &.{},
     gliner_relation_threshold: f32 = 0.0,
@@ -1616,6 +1631,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
             try parseSpanEncoderConfigFromCatalog(&manifest, allocator, catalog, config_bytes);
         }
     }
+    try detectGlideFromCatalog(&manifest, allocator, catalog);
     if (manifest.gliner_architecture != .boundary and manifest.native_arch_hint == .none and manifest.max_position_embeddings == 512 and manifest.hidden_size == 768) {
         if (try catalog.readOptional("clip_config.json")) |config_bytes| {
             defer allocator.free(config_bytes);
@@ -1795,6 +1811,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
             try parseSpanEncoderConfigFromCatalog(&manifest, allocator, &catalog, config_bytes);
         }
     }
+    try detectGlideFromCatalog(&manifest, allocator, &catalog);
     if (manifest.native_arch_hint == .none and manifest.config_model_arch.len == 0) {
         if (try catalog.readOptional("clip_config.json")) |config_bytes| {
             defer allocator.free(config_bytes);
@@ -2136,7 +2153,58 @@ fn applySentenceTransformersPrompts(
     }
 }
 
+/// GLiDE is recognised from its decision sidecars alone; the backbone config
+/// must agree with the declared backbone (ModernBERT encoder or Qwen3.5).
+fn detectGlideFromCatalog(manifest: *ModelManifest, allocator: std.mem.Allocator, catalog: anytype) !void {
+    if (!try catalog.exists(glide.readout_file)) return;
+    const bytes = (try catalog.readOptional(glide.decision_config_file)) orelse return;
+    defer allocator.free(bytes);
+    // Both decision sidecars exist: this is a GLiDE checkpoint whether or not
+    // this runtime can serve the variant.
+    manifest.glide_declared = true;
+    var config = glide.parseDecisionConfig(allocator, bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            manifest.glide_unsupported = true;
+            return;
+        },
+    };
+    defer config.deinit(allocator);
+    manifest.glide_backbone = config.backbone;
+    const arch = manifest.config_model_arch;
+    const backbone_ok = switch (config.backbone) {
+        .encoder => std.mem.eql(u8, arch, "modernbert"),
+        .decoder => std.mem.eql(u8, arch, "qwen3_5") or std.mem.eql(u8, arch, "qwen3_5_text"),
+    };
+    // NVFP4 checkpoints: ModelOpt `quantization_config` in config.json, or the
+    // earlier `quant_config.json` layout. Only bf16 weights are served.
+    const quantized = blk: {
+        if (try catalog.exists("quant_config.json")) break :blk true;
+        const config_bytes = (try catalog.readOptional("config.json")) orelse break :blk false;
+        defer allocator.free(config_bytes);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{}) catch break :blk false;
+        defer parsed.deinit();
+        break :blk switch (parsed.value) {
+            .object => |obj| obj.get("quantization_config") != null,
+            else => false,
+        };
+    };
+    if (!backbone_ok or quantized) manifest.glide_unsupported = true;
+}
+
 fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const u8) !void {
+    if (manifest.glide_declared) {
+        // A GLiDE checkpoint only answers decisions: its backbone is never
+        // served for generation, embedding, or extraction.
+        try removeManifestStrings(manifest.allocator, &manifest.tasks, &.{ "generate", "chat", "embed", "extract", "classify", "rerank" });
+        try removeManifestStrings(manifest.allocator, &manifest.capabilities, &.{ "classification", "extraction", "embedding_similarity", "vision" });
+        try appendManifestStrings(manifest.allocator, &manifest.tasks, &.{"decide"});
+        try appendManifestStrings(manifest.allocator, &manifest.capabilities, &.{"typed_decisions"});
+        try setManifestInputs(manifest.allocator, manifest, &.{"text"});
+        manifest.model_type = .classifier;
+        manifest.model_type_origin = .config;
+        return;
+    }
     if (manifest.gliner_specialty_profile) |profile| {
         // Specialty contracts are independent of modern span and Decide grants.
         // Caller-provided manifests may narrow neither the architecture nor its

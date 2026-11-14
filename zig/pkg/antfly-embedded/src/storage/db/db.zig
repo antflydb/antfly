@@ -85343,6 +85343,59 @@ fn jsonTestNumber(value: std.json.Value) f64 {
     };
 }
 
+test "db mixed extraction batches retain document checkpoint ownership in either order" {
+    const a = std.testing.allocator;
+    const Producer = struct {
+        documents: std.atomic.Value(usize) = .init(0),
+        texts: std.atomic.Value(usize) = .init(0),
+        fn plain(_: *anyopaque, _: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            return error.TestMissingInvocationContext;
+        }
+        fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request, context: asset_producer_mod.InvocationContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.endsWith(u8, request.source_text, ".pdf")) {
+                if (context.document_checkpoints == null) return error.TestMissingDocumentCheckpoint;
+                _ = self.documents.fetchAdd(1, .monotonic);
+            } else {
+                _ = self.texts.fetchAdd(1, .monotonic);
+            }
+            return alloc.dupe(u8, "{\"entities\":[]}");
+        }
+        fn interface(self: *@This()) asset_producer_mod.Producer {
+            return .{ .ptr = self, .vtable = &.{ .produce = plain, .produce_with_context = produce, .foreground_bounded = true, .invocation_memory_for_requests = TestAssetProducer.invocationMemory } };
+        }
+    };
+    for ([_]bool{ false, true }) |document_first| {
+        var directory = try TestDirectory.init("mixed-document-checkpoints");
+        defer directory.cleanup();
+        var producer: Producer = .{};
+        var db = try DB.open(a, directory.path(), .{
+            .start_index_workers = false,
+            .start_optional_runtime_workers = false,
+            .start_independent_maintenance = false,
+            .enrichment = .{ .asset_producer = producer.interface() },
+        });
+        defer db.close();
+        try db.addEnrichment(.{ .name = "inspection", .kind = .asset, .field = "body", .content_type = "application/json", .producer_json = "{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\",\"model\":\"fixture\"}}", .execution = .{ .batch_items = 2, .batch_bytes = 1024 * 1024 } });
+        const text = "{\"body\":\"literal text\"}";
+        const document = "{\"body\":\"https://example.test/input.pdf\"}";
+        try db.batch(.{ .writes = &.{
+            .{ .key = "a", .value = if (document_first) document else text },
+            .{ .key = "b", .value = if (document_first) text else document },
+        }, .sync_level = .write });
+        try db.runUntilIdle();
+        try std.testing.expectEqual(@as(usize, 1), producer.documents.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), producer.texts.load(.acquire));
+        for ([_][]const u8{ "a", "b" }) |key| {
+            const artifact = try internal_keys.artifactNamedPrefixAlloc(a, key, "asset", "inspection");
+            defer a.free(artifact);
+            const stored = try db.core.store.get(a, artifact);
+            defer a.free(stored);
+            try std.testing.expectEqualStrings("{\"entities\":[]}", stored);
+        }
+    }
+}
+
 test "db asset producer enrichments execute fake providers and skip unchanged state" {
     const alloc = std.testing.allocator;
 

@@ -781,7 +781,7 @@ const AgentQueryRunner = struct {
         // Physical reverse-index probes do not carry row filters. Keep
         // explicit-key and query-seeded tree traversal available, but
         // fail closed for structural root discovery.
-        if (discovers_tree_roots and http_server_mod.effectiveRowFilterJson(identity, table_name) != null)
+        if (discovers_tree_roots and http_server_mod.hasEffectiveRowFilter(identity, table_name))
             return error.Forbidden;
     }
 
@@ -852,7 +852,7 @@ const AgentQueryRunner = struct {
         if (catalog_identity) |identity| {
             if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read))
                 return error.Forbidden;
-            if (http_server_mod.effectiveRowFilterJson(identity, table_name) != null)
+            if (http_server_mod.hasEffectiveRowFilter(identity, table_name))
                 return error.Forbidden;
         }
         return try runner.server.probeRetrievalIncomingEdges(
@@ -1442,6 +1442,7 @@ pub const AntflyApiHandler = struct {
 
     fn mapIngressError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         if (metadata_authority.isRetryableError(err)) return metadataNotLeaderResponse(ctx);
+        if (err == error.Forbidden) return jsonErrorResponse(ctx, 403, "forbidden");
         return err;
     }
 

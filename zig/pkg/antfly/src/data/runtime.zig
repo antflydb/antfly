@@ -56366,7 +56366,10 @@ fn implementationTests() type {
                 try std.testing.expectEqualStrings("alice", restored_key.username);
                 try std.testing.expectEqual(@as(usize, 1), restored_key.roles.len);
                 try std.testing.expectEqualStrings("role:tenant-reader", restored_key.roles[0]);
-                try std.testing.expectEqual(@as(usize, 1), restored_key.row_filter.len);
+                try std.testing.expectEqual(@as(usize, 2), restored_key.row_filter.len);
+                const effective = (try antfly.usermgr.combinedRowFilterForTable(alloc, restored_key.row_filter, "docs")).?;
+                defer effective.deinit(alloc);
+                try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"tenant_id\":\"acme\"}},{\"term\":{\"tier\":\"gold\"}}]}", effective.json);
                 try restored_auth.updatePassword("alice", "post-seed-secret");
             }
             // Materialization is a one-shot install. Subsequent auth mutations survive
