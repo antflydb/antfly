@@ -19,13 +19,20 @@
 //! of random operations against two stores opened on the same primary
 //! keyspace -- one with `use_redo_log = true` (the default), one with
 //! `false` (the reference/legacy behavior) -- and after every step compares
-//! every read API both expose. Any difference is the bug class this file
-//! exists to catch systematically: a read path that forgot to consult
-//! `SharedRedoOverlay`/`MergedCursor` (found and fixed four separate times
-//! so far -- `docstore.Cursor`, `getDocumentsAtCheckpointWithState`,
-//! `readBackingPages`'s read-ahead window, `transactionCatalogEntry`; see
-//! §9.7c's own "found three times" writeup plus the fourth, catalog-append
-//! fix on this branch).
+//! every read API both expose -- including, as of this branch, document
+//! identity/fingerprint, overlay-only existence
+//! (`hasLiveDocumentOutsidePrefix`), and catalog point reads/sizes, not
+//! just point/batch/cursor document and catalog scans. Any difference is
+//! the bug class this file exists to catch systematically: a read path
+//! that forgot to consult `SharedRedoOverlay`/`MergedCursor` (found and
+//! fixed six separate times so far -- `docstore.Cursor`,
+//! `getDocumentsAtCheckpointWithState`, `readBackingPages`'s read-ahead
+//! window, `transactionCatalogEntry`, `documentReferenceAtCheckpoint`/
+//! `documentFingerprintAtCheckpoint` (b63a20e9c7), and
+//! `hasLiveDocumentOutsidePrefix`'s own overlay-only fallback (this
+//! branch, native.zig); see §9.7c's own "found three times" writeup plus
+//! the fourth, catalog-append fix, and this branch's read audit for the
+//! fifth and sixth).
 //!
 //! Run (Debug only; filtered -- see this package's AGENTS.md for the
 //! two-step build-then-run split required for `lite-storage-test`):
@@ -456,6 +463,48 @@ fn compareAll(allocator: Allocator, seed: u64, step: usize, op: Op, redo: *Side,
         const r = redo_txn.get(key) catch |e| if (e == error.NotFound) null else return e;
         const l = legacy_txn.get(key) catch |e| if (e == error.NotFound) null else return e;
         if (!optionalEql(r, l)) return fail(seed, step, op, "point get mismatch key={s} redo={?s} legacy={?s}", .{ key, r, l });
+
+        // Fingerprint: a content digest, so it must match byte-for-byte
+        // across modes whenever both resolve a document at all (unlike
+        // identity below, this is not a storage-layout-dependent number).
+        // §9.7c: `documentFingerprintAtCheckpoint`'s own overlay-blind gap
+        // (b63a20e9c7) made this always report a committed-but-unfolded
+        // document as absent under redo; this probe would have caught it.
+        const rf = try redo_txn.valueFingerprint(key);
+        const lf = try legacy_txn.valueFingerprint(key);
+        if ((rf == null) != (lf == null)) return fail(seed, step, op, "fingerprint presence mismatch key={s} redo_present={} legacy_present={}", .{ key, rf != null, lf != null });
+        if (rf != null and !std.mem.eql(u8, &rf.?, &lf.?)) return fail(seed, step, op, "fingerprint value mismatch key={s}", .{key});
+
+        // Identity (`documentReferenceAtCheckpoint`): the raw reference
+        // numbering differs by design between an overlay-resident version
+        // (tagged with `packed_record_flag`) and a real page id, and
+        // between redo and legacy storage layouts entirely -- only
+        // presence (did this key resolve to *something live* at all) is
+        // comparable across modes. §9.7c: this is exactly the fourth
+        // overlay-blind-read occurrence this oracle is meant to catch
+        // (`PublicationCatalog.verify`'s `valueIdentity` never detecting
+        // an overlay-only change, fixed alongside fingerprint above).
+        const ri = try redo_txn.valueIdentity(key);
+        const li = try legacy_txn.valueIdentity(key);
+        if ((ri == null) != (li == null)) return fail(seed, step, op, "identity presence mismatch key={s} redo_present={} legacy_present={}", .{ key, ri != null, li != null });
+    }
+
+    // Existence over live record metadata, excluding one prefix group at a
+    // time (`Store.hasLiveDocumentOutsidePrefix` -- always opens its own
+    // fresh `Txn`, so this exercises the real call shape, not a borrowed
+    // one). §9.7c: this function's own overlay-only fallback (a document
+    // committed after a `ReadGeneration`'s `generation.file` was opened,
+    // never yet folded into the physical tree) used to gate itself on an
+    // equality that a tracked, current checkpoint almost never satisfies
+    // against that frozen snapshot -- the exact anti-pattern
+    // `OverlayScanState.initForPrefix` already had removed elsewhere;
+    // native.zig's own regression test exercises this directly with two
+    // handles on one path, this probe exercises it end to end through
+    // `Store`.
+    inline for (.{ "grp0/", "grp1/" }) |excluded| {
+        const r = try redo.store.hasLiveDocumentOutsidePrefix(excluded);
+        const l = try legacy.store.hasLiveDocumentOutsidePrefix(excluded);
+        if (r != l) return fail(seed, step, op, "hasLiveDocumentOutsidePrefix mismatch excluded={s} redo={} legacy={}", .{ excluded, r, l });
     }
 
     // Batch get (getManySorted requires a sorted, deduplicated key slice).
@@ -610,6 +659,7 @@ fn compareCatalogScan(allocator: Allocator, seed: u64, step: usize, op: Op, redo
             }
             if (!std.mem.eql(u8, r.?.key, l.?.key)) return fail(seed, step, op, "catalog scan key mismatch count={d} redo={s} legacy={s}", .{ count, r.?.key, l.?.key });
             if (!std.mem.eql(u8, r.?.value, l.?.value)) return fail(seed, step, op, "catalog scan value mismatch key={s} redo={s} legacy={s}", .{ r.?.key, r.?.value, l.?.value });
+            try comparePointCatalogRecord(allocator, seed, step, op, redo_file, redo_txn.checkpoint, legacy_file, legacy_txn.checkpoint, r.?.key, r.?.value);
             count += 1;
         }
     }
@@ -637,9 +687,47 @@ fn compareCatalogScan(allocator: Allocator, seed: u64, step: usize, op: Op, redo
             }
             if (!std.mem.eql(u8, r.?.key, l.?.key)) return fail(seed, step, op, "catalog directory scan key mismatch count={d} redo={s} legacy={s}", .{ count, r.?.key, l.?.key });
             if (!std.mem.eql(u8, r.?.value, l.?.value)) return fail(seed, step, op, "catalog directory scan value mismatch key={s} redo={s} legacy={s}", .{ r.?.key, r.?.value, l.?.value });
+            try comparePointCatalogRecord(allocator, seed, step, op, redo_file, redo_txn.checkpoint, legacy_file, legacy_txn.checkpoint, r.?.key, r.?.value);
             count += 1;
         }
     }
+}
+
+/// Self-consistency (point read must agree with what the cursor scan just
+/// returned, on each side independently) plus a cross-mode size check.
+/// §9.7c: a point lookup and a cursor scan reach the physical tree and the
+/// redo overlay through different code paths (`redoOverlayEntry` vs
+/// `CatalogCursor`'s own merge) -- this is exactly the shape of gap that
+/// let a cursor scan see an overlay-only catalog record while
+/// `getIndexCatalogRecordAtCheckpointAlloc`'s point read on the same key,
+/// at the same checkpoint, disagreed (or vice versa).
+fn comparePointCatalogRecord(
+    allocator: Allocator,
+    seed: u64,
+    step: usize,
+    op: Op,
+    redo_file: *native.NativeFile,
+    redo_checkpoint: native.CheckpointSlot,
+    legacy_file: *native.NativeFile,
+    legacy_checkpoint: native.CheckpointSlot,
+    key: []const u8,
+    expected_value: []const u8,
+) !void {
+    const redo_point = try redo_file.getIndexCatalogRecordAtCheckpointAlloc(allocator, key, redo_checkpoint);
+    defer if (redo_point) |p| allocator.free(p);
+    if (redo_point == null or !std.mem.eql(u8, redo_point.?, expected_value)) {
+        return fail(seed, step, op, "redo catalog point read disagrees with its own scan key={s} scan={s} point={?s}", .{ key, expected_value, redo_point });
+    }
+    const legacy_point = try legacy_file.getIndexCatalogRecordAtCheckpointAlloc(allocator, key, legacy_checkpoint);
+    defer if (legacy_point) |p| allocator.free(p);
+    if (legacy_point == null or !std.mem.eql(u8, legacy_point.?, expected_value)) {
+        return fail(seed, step, op, "legacy catalog point read disagrees with its own scan key={s} scan={s} point={?s}", .{ key, expected_value, legacy_point });
+    }
+
+    const redo_size = try redo_file.getIndexCatalogRecordSizeAtCheckpoint(key, redo_checkpoint);
+    const legacy_size = try legacy_file.getIndexCatalogRecordSizeAtCheckpoint(key, legacy_checkpoint);
+    if (redo_size == null or redo_size.? != expected_value.len) return fail(seed, step, op, "redo catalog size mismatch key={s} expected={d} got={?d}", .{ key, expected_value.len, redo_size });
+    if (legacy_size == null or legacy_size.? != expected_value.len) return fail(seed, step, op, "legacy catalog size mismatch key={s} expected={d} got={?d}", .{ key, expected_value.len, legacy_size });
 }
 
 fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {

@@ -2509,6 +2509,10 @@ pub const OpenOptions = struct {
     /// relational jobs, resolution, enrichment, algebraic HLL
     /// maintenance), not just whichever one a caller has in mind.
     ride_along_idle_ns: ?u64 = null,
+    /// Overrides `Store.redo_idle_checkpoint_ns`'s default (1s) when set.
+    /// See that field's own doc comment: a test-only knob for shrinking
+    /// the window, not a tuning lever for amplification numbers.
+    redo_idle_checkpoint_ns: ?u64 = null,
 };
 
 pub const CreateOptions = struct {
@@ -2521,6 +2525,8 @@ pub const CreateOptions = struct {
     io: ?std.Io = null,
     /// See `OpenOptions.ride_along_idle_ns`.
     ride_along_idle_ns: ?u64 = null,
+    /// See `OpenOptions.redo_idle_checkpoint_ns`.
+    redo_idle_checkpoint_ns: ?u64 = null,
     /// docs/design/lite-performance/lite-single-commit-write-path.md §9,
     /// point 3. `null` (the default) opts a new file into redo-log,
     /// *unless* `reclamation.max_storage_bytes` is set and below
@@ -2901,6 +2907,66 @@ pub const Store = struct {
     /// so callers override it only to test this barrier itself, never to
     /// tune write-amplification numbers for one caller's own benefit.
     ride_along_idle_ns: u64 = 50 * std.time.ns_per_ms,
+    /// How long `maybeCheckpointRedoLogOnIdleTurn`'s opportunistic fold
+    /// (no byte-capacity pressure, `threshold_due` false) waits for
+    /// genuine quiet before running, separate from `ride_along_idle_ns`
+    /// above. The two constants answer different questions:
+    /// `ride_along_idle_ns` bounds how long *already-staged* ride-along
+    /// work may sit undurable before something forces it through -- a
+    /// group-commit batching window, correctly short (50ms) because
+    /// undurable work sitting around is a real durability-latency cost.
+    /// A checkpoint fold is a different kind of thing: expensive relative
+    /// to one write (it is the whole point of the redo log that folding
+    /// batches *many* commits' worth of page rewrites into one), and it
+    /// pays its own standalone fsync when nothing else is around to
+    /// share it with. Reusing `ride_along_idle_ns` as this trigger (the
+    /// regression this constant fixes) made it fire on nearly every write
+    /// whenever consecutive writes are more than 50ms apart -- true of
+    /// any Debug-build-paced test harness, not just a genuinely idle
+    /// store -- costing a full extra commit+fsync per write instead of
+    /// batching across many. 1 second is long enough that no realistic
+    /// write cadence (this codebase's own SQLite-comparison target is
+    /// tens of thousands of writes/s; even this repo's slowest
+    /// Debug-harness cadence measured for this fix is ~100-300ms/write)
+    /// crosses it by accident, while still bounding how long a store that
+    /// goes genuinely quiet holds an unfolded overlay to about a second --
+    /// the same order of magnitude as `status_persist_interval` (5s,
+    /// §3.4) and `ride_along_byte_threshold`'s own order-of-magnitude-
+    /// slower cousin. Overridable via `OpenOptions.redo_idle_checkpoint_ns`/
+    /// `CreateOptions.redo_idle_checkpoint_ns` for tests that need to
+    /// observe this path without waiting a full second; production
+    /// callers should not tune it per the same reasoning
+    /// `ride_along_idle_ns`'s own doc comment gives.
+    ///
+    /// Deliberately NOT reused for `startMaintenanceAssumeLocked`'s
+    /// redo-only retirement-debt check (tried and reverted): that check
+    /// runs synchronously, inline with the very write whose debt it is
+    /// evaluating, so a flat "time since the check last ran" debounce
+    /// can suppress noticing debt that only arose partway through a burst
+    /// of rapid commits -- confirmed live: it broke "startMaintenanceAssumeLocked
+    /// starts for a redo-only retirement signal" (four rapid overwrites,
+    /// no real time elapsed between them under `no_sync`/`std.testing.io`).
+    /// The maintenance loop, once started, persists for the store's
+    /// remaining lifetime (`maintenance_started` never resets), so the
+    /// measured "2x" cost there is not from restarting per overwrite --
+    /// it is the already-running loop re-servicing on every wake
+    /// (`driveMutationCoordinator`'s `maintenance_wake.set()` after every
+    /// commit). Fixing that needs a throttle inside `maintenanceLoop`'s
+    /// own re-service cadence, not a debounce on whether to start it;
+    /// not attempted here -- see the report for this session.
+    redo_idle_checkpoint_ns: u64 = 1 * std.time.ns_per_s,
+    /// Safety-valve overlay-entry-count ceiling, independent of idleness:
+    /// a store that is *never* idle for a full `redo_idle_checkpoint_ns`
+    /// (a continuous trickle of small writes, each one comfortably under
+    /// the byte-capacity `threshold_due` trigger) would otherwise hold an
+    /// ever-growing unfolded overlay indefinitely. Checked the same way
+    /// `threshold_due` is -- independent of, and in addition to,
+    /// idleness -- so crossing it folds immediately regardless of write
+    /// cadence. 4096 entries is deliberately generous (the write-
+    /// amplification harness's own 128-update runs never approach it) --
+    /// this is a backstop against unbounded growth, not a batching target
+    /// to tune for throughput.
+    redo_idle_overlay_entry_ceiling: u64 = 4096,
     ride_along_byte_threshold: usize = 1024 * 1024,
     ride_along_flush_started: std.atomic.Value(bool) = .init(false),
     /// Set once `ensureRideAlongFlushStarted`'s `concurrent()` call fails --
@@ -3004,6 +3070,7 @@ pub const Store = struct {
             .maintenance_start_suppressed = true,
         };
         if (opts.ride_along_idle_ns) |idle_ns| result.ride_along_idle_ns = idle_ns;
+        if (opts.redo_idle_checkpoint_ns) |idle_ns| result.redo_idle_checkpoint_ns = idle_ns;
         errdefer result.close();
         // A standalone owner may live for only one CLI invocation, so reopen
         // services its debt. External owners schedule this work themselves:
@@ -3104,6 +3171,7 @@ pub const Store = struct {
             .maintenance_start_suppressed = opts.externally_locked,
         };
         if (opts.ride_along_idle_ns) |idle_ns| result.ride_along_idle_ns = idle_ns;
+        if (opts.redo_idle_checkpoint_ns) |idle_ns| result.redo_idle_checkpoint_ns = idle_ns;
         return result;
     }
 
@@ -5296,17 +5364,42 @@ pub const Store = struct {
         // non-empty. For any live workload the overlay is essentially never
         // perfectly empty between wakes, so that fired far more often than
         // the batched design intends -- confirmed live via WS4-for-dense/
-        // WS4-for-graph's own commit-count regression. Idle now means what
-        // the ride-along branch above already means by it: nothing
-        // enqueued for a full `ride_along_idle_ns`, checked against
-        // `last_mutation_enqueue_ns` (every enqueue, not just a ride-along
-        // one -- see that field's own doc comment) -- and debounced against
-        // `last_redo_fold_ns` too, so a fold's own settling on one wake
-        // doesn't immediately re-trigger on the very next, early-woken one.
+        // WS4-for-graph's own commit-count regression. Idle now means
+        // nothing enqueued for a full `redo_idle_checkpoint_ns`, checked
+        // against `last_mutation_enqueue_ns` (every enqueue, not just a
+        // ride-along one -- see that field's own doc comment) -- and
+        // debounced against `last_redo_fold_ns` too, so a fold's own
+        // settling on one wake doesn't immediately re-trigger on the very
+        // next, early-woken one.
+        //
+        // `redo_idle_checkpoint_ns` (1s default), not `ride_along_idle_ns`
+        // (50ms): this write-amplification regression was reusing the
+        // group-commit batching window as the checkpoint-fold trigger.
+        // `ride_along_idle_ns` is correctly short -- it bounds how long
+        // *already-staged* ride-along work sits undurable, a real
+        // durability-latency cost. A checkpoint fold is a different kind
+        // of thing: expensive relative to one write by design (folding
+        // is supposed to batch many commits' worth of page rewrites into
+        // one), and it pays its own standalone fsync when nothing else is
+        // around to share it with. At 50ms, this fired on nearly every
+        // write whenever consecutive writes were more than 50ms apart --
+        // true of any Debug-build-paced harness, not just a genuinely
+        // idle store -- costing a full extra commit+fsync per write
+        // instead of batching across many. See `redo_idle_checkpoint_ns`'s
+        // own doc comment for the value and the `OpenOptions`/
+        // `CreateOptions` override for tests.
         const now = std.Io.Clock.awake.now(io).nanoseconds;
         const last_activity_ns = @max(self.last_mutation_enqueue_ns, self.last_redo_fold_ns);
-        const idle_long_enough = now -| last_activity_ns >= @as(i96, @intCast(self.ride_along_idle_ns));
-        const has_overlay_work = idle_long_enough and (overlay_entries != 0 or redo.shared.pagesCount(io) != 0);
+        const idle_long_enough = now -| last_activity_ns >= @as(i96, @intCast(self.redo_idle_checkpoint_ns));
+        // Safety valve: a store that is never idle for a full
+        // `redo_idle_checkpoint_ns` (a continuous trickle of writes, each
+        // comfortably under the byte-capacity `threshold_due` trigger
+        // below) would otherwise hold an ever-growing unfolded overlay
+        // indefinitely. See `redo_idle_overlay_entry_ceiling`'s own doc
+        // comment; checked independently of idleness, like `threshold_due`.
+        const overlay_entry_ceiling_exceeded = overlay_entries >= self.redo_idle_overlay_entry_ceiling;
+        const has_overlay_work = (idle_long_enough or overlay_entry_ceiling_exceeded) and
+            (overlay_entries != 0 or redo.shared.pagesCount(io) != 0);
         // Threshold: byte usage past the halfway point, well before the
         // emergency 25%-remaining backpressure (`maybeAutoCheckpointRedoLog`)
         // would ever fire. Checked independently of `has_overlay_work` (and
@@ -5321,6 +5414,17 @@ pub const Store = struct {
         // AssumeLocked: this whole function runs under `lockStoreExclusive`
         // above, which locks the same `self.mutex` `recordMaintenanceError`
         // itself would try to lock -- see that function's own comment.
+        // Tagged `.ride_along_flush` (write_amplification_trace.zig), the
+        // same bucket `rideAlongFlushLoop`'s own forced drain already
+        // uses: both are the documented safety-net cost of bounding how
+        // long background work may sit unfolded/undurable when nothing
+        // else drives it, not foreground amplification. See that Stage's
+        // own doc comment and `write_amplification_bench_test.zig`'s
+        // `idleFlushDrains`/`...ExcludingIdleFlush` gates, bounded by how
+        // many times this can fire over a run's wall-clock duration, not
+        // by write volume.
+        const flush_scope = wal_trace.scope(.ride_along_flush);
+        defer flush_scope.end();
         self.file.checkpointRedoLog() catch |err| self.recordMaintenanceErrorAssumeLocked(err);
         self.last_redo_fold_ns = now;
     }

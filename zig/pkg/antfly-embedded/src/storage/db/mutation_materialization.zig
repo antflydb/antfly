@@ -3340,6 +3340,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             pub const max_segments = 4;
 
             alloc: Allocator,
+            index_manager: *index_manager_mod.IndexManager,
             entry: *index_manager_mod.IndexManager.TextIndex,
             apply_guard: index_manager_mod.IndexManager.ManagedIndexApplyGuard,
             segments: [max_segments]persistent_mod.PersistentIndex.InlineSegmentPublication = undefined,
@@ -3400,6 +3401,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 for (self.segments[0..self.segment_count]) |*seg| self.entry.persistent.installInlineSegmentPublication(seg);
                 self.entry.persistent.installInlineDeleteByIdsTracked(self.alloc, &self.delete);
+                // This fast path adds a one-document segment directly and
+                // never goes through `finalizeTextBatchMutations` (the
+                // non-inline batch-apply path's own post-write bookkeeping),
+                // so nothing else ever marks `compaction_pending` for an
+                // inline-published index: `TextMergeScheduler.select` only
+                // ever considers entries with that bit set, so segments
+                // would otherwise accumulate one per write with no merge
+                // ever scheduled, and `IndexWriter.deleteAllByIdsTracked`'s
+                // per-write segment scan would grow with them. Mirrors the
+                // exact needsMerge/schedule/noteComplete sequence
+                // `finalizeTextBatchMutations`/`beginTextMergeTask` already
+                // use for the slow path.
+                if (self.segment_count != 0 or !self.delete.isEmpty()) {
+                    self.index_manager.noteInlineTextPublicationSegments(self.entry) catch |err| {
+                        std.log.err("inline text publication install: merge-need check failed index={s} err={s}", .{ self.entry.config.name, @errorName(err) });
+                    };
+                }
                 self.apply_guard.unlock();
                 self.alloc.destroy(self);
             }
@@ -3547,6 +3565,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const result = try alloc.create(InlineTextPublication);
             result.* = .{
                 .alloc = alloc,
+                .index_manager = index_manager,
                 .entry = entry,
                 .apply_guard = apply_guard,
                 .segments = prepared_segments,

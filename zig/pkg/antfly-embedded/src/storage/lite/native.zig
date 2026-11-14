@@ -8069,6 +8069,33 @@ pub const NativeFile = struct {
         // landed.
         const old_tail = redo.writer.tail;
         const new_checkpoint_sequence = self.activeCheckpoint().commit_sequence;
+        // The commit just above already consumed `new_checkpoint_sequence`
+        // without ever appending a matching log record for it
+        // (`checkpointing = true` disabled the whole redo-append branch for
+        // that one commit, same as the `redo_fell_back_to_slot` case this
+        // mirrors) -- `self.header`'s checkpoint is durably ahead of
+        // `redo.writer.last_sequence` from this point on, committed or not.
+        // Advance the writer's own sequence counter (never `tail`, which
+        // the reclaim/zero/shrink steps below still own) right here, before
+        // any of them, rather than only as a side effect of the `Writer
+        // .init`/`initAt` calls those steps reach on success: every step
+        // from here through the end of this function is itself a durability
+        // barrier the crash sweep injects faults into (the log-zeroing
+        // write+sync, `maybeShrinkRedoLogCapacity`'s own commit), and a
+        // `try` failing partway through used to return with the writer
+        // never fixed up -- `self.header` already durably one ahead,
+        // `redo.writer.last_sequence` still naming the pre-fold value.
+        // Every later commit then recomputed the same doomed
+        // `header.commit_sequence + 1` from the unmoved header and
+        // collided with the writer's own stale continuity check forever
+        // (`error.SequenceOutOfOrder`, surfacing as the equally far less
+        // specific `error.OutcomeUnknown`) -- a derived worker retrying
+        // that error treats it as transient and backs off, but nothing
+        // about this file ever changes on its own, so it never recovers.
+        // Reproduced via "crash sweep: graph metric build and compaction
+        // mid-scenario": a fault landing on this function's own log-zero
+        // sync, right after its internal fold commit had already landed.
+        redo.writer.last_sequence = new_checkpoint_sequence;
         // §9.6a: unlike the pre-sharing design, this is not an
         // unconditional clear -- a reader pinned to an older checkpoint
         // than the one that just landed may still need an overlay version
@@ -8987,11 +9014,39 @@ pub const NativeFile = struct {
         // sync there (every commit alternates and rewrites them), so the
         // strict full-header comparison was never spuriously tripped and
         // must stay exactly as strict.
-        const headers_equivalent = if (self.redo != null)
-            self.header.active_checkpoint == reader.header.active_checkpoint and
-                std.meta.eql(self.header.checkpoints[self.header.active_checkpoint], reader.header.checkpoints[reader.header.active_checkpoint])
-        else
-            std.meta.eql(self.header, reader.header);
+        // perf/lwa-read-audit: `redo_folded_through` is a derived
+        // bookkeeping hint -- how far back a *fresh, independent* replay
+        // from the log can safely trust the overlay (`recoverRedoLog`'s
+        // own doc comment) -- not a reflection of physical tree content,
+        // and it can legitimately differ here even when nothing on disk
+        // changed at all. A real-publish bookkeeping-only commit (e.g.
+        // `maintainOnce`'s startup pass through `reclaimPagesImpl`'s
+        // ledger consolidation; see that call site's own "bookkeeping-
+        // only commit advances commit_sequence past the true fold
+        // boundary" comment and the matching redo differential oracle
+        // regression it is already safe against on reopen) advances this
+        // process's own in-memory `redo_folded_through` without a
+        // corresponding slot-page rewrite reaching disk for that field,
+        // so `reader` (freshly opened by path, recovered via the exact
+        // same conservative, log-replay-derived computation a real
+        // reopen would use) can come back with a strictly smaller value
+        // for the *same* `commit_sequence` and the *same* roots --
+        // confirmed live: every other field byte-identical, only this
+        // one differing. Comparing it here is also pointless, not just
+        // wrong: `reader.header` is unconditionally replaced by
+        // `self.header` a few lines below regardless of what this
+        // comparison decides, so `reader`'s own `redo_folded_through` is
+        // never actually used. Exclude it; everything else (roots,
+        // page_count, commit_sequence, logical generations) still
+        // compares exactly, so a real concurrent change is still caught.
+        const headers_equivalent = if (self.redo != null) blk: {
+            if (self.header.active_checkpoint != reader.header.active_checkpoint) break :blk false;
+            var self_slot = self.header.checkpoints[self.header.active_checkpoint];
+            var reader_slot = reader.header.checkpoints[reader.header.active_checkpoint];
+            self_slot.redo_folded_through = 0;
+            reader_slot.redo_folded_through = 0;
+            break :blk std.meta.eql(self_slot, reader_slot);
+        } else std.meta.eql(self.header, reader.header);
         if ((self.durable_header == null and !headers_equivalent) or inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentWaitCanceled;
         reader.header = self.header;
         if (coordinated) {
@@ -13408,7 +13463,18 @@ pub const NativeFile = struct {
         return .{ .leaf = false, .page = view.pointer(low) };
     }
 
-    pub fn documentValueAtIndexEntryAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, indexed: DocumentIndexEntry) !?[]u8 {
+    /// §9.7c: `indexed` must come from a `CheckpointedTree`/`DocumentIndexEntry`
+    /// walk the caller already ran itself (e.g. the fold, vacuum, or
+    /// recovery) -- this only materializes the value a raw tree entry
+    /// already named, with no key-based overlay lookup of its own (and
+    /// none is possible here: by the time a caller has a
+    /// `DocumentIndexEntry` in hand, the key-level merge decision --
+    /// whether the overlay's own version for this key supersedes the
+    /// tree's -- has to have already been made, by whoever produced
+    /// `indexed`, not by this function). Non-`pub` and named
+    /// `...CheckpointedOnly` so a reader cannot reach for this instead of
+    /// `ReadView`/`redoOverlayEntry` and silently skip that merge.
+    fn documentValueAtCheckpointedIndexEntryOnlyAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, indexed: DocumentIndexEntry) !?[]u8 {
         const payload = try self.readPagePayloadByKindAllocForCheckpoint(allocator, indexed.document_page_id, .document, checkpoint);
         defer allocator.free(payload);
         const entry = try decodeDocumentEntry(payload);
@@ -14209,10 +14275,29 @@ pub const NativeFile = struct {
         // might still have one: a document inserted (or moved outside the
         // prefix) since the last checkpoint, never yet reflected in the
         // tree at all, so the scan above never visited its key.
+        //
+        // §9.7c (ReadView): this used to gate the check below on
+        // `checkpoint.commit_sequence == self.activeCheckpoint().commit_sequence`
+        // and, when that held, resolve at `checkpoint.commit_sequence`
+        // directly -- the exact same overlay-blind-scan anti-pattern
+        // `OverlayScanState.initForPrefix`'s own removed "must equal the
+        // live checkpoint exactly" gate had: a caller reached through a
+        // `ReadGeneration`'s separately-opened `generation.file` (this
+        // function's `self`) passes a tracked, genuinely current
+        // `checkpoint` (`Txn.checkpoint`, kept current by
+        // `Store.observeReadCheckpoint`) that almost never equals
+        // `generation.file`'s own frozen, never-refreshed
+        // `activeCheckpoint()` -- so the guard failed on nearly every real
+        // call (`Store.hasLiveDocumentOutsidePrefix` always opens a fresh
+        // `Txn` this way), silently skipping the overlay fallback and
+        // returning `false` even when a document committed after this
+        // `generation.file` was opened -- and never yet folded into the
+        // physical tree -- made the real answer `true`. `readMark`
+        // already resolves this exact (C, M) split correctly in one
+        // place (`redoOverlayEntry`'s own primitive); call it unconditionally
+        // instead of re-deriving the same guard here.
         if (self.redo) |*redo| {
-            if (checkpoint.commit_sequence == self.activeCheckpoint().commit_sequence) {
-                if (redo.shared.hasLiveKeyOutsidePrefix(self.runtimeIo(), @backingInt(TransactionWrites.Root.documents), checkpoint.commit_sequence, excluded_prefix)) return true;
-            }
+            if (redo.shared.hasLiveKeyOutsidePrefix(self.runtimeIo(), @backingInt(TransactionWrites.Root.documents), self.readMark(checkpoint), excluded_prefix)) return true;
         }
         return false;
     }
@@ -33123,6 +33208,61 @@ test "lite redo log document scan merges the overlay across put, overwrite, dele
     // Excluding everything but "a" (alpha) and "g" (gamma, now deleted)
     // leaves beta/delta outside -- still true.
     try std.testing.expect(try file.hasLiveDocumentOutsidePrefix(file.activeCheckpoint(), "al"));
+}
+
+test "lite redo log hasLiveDocumentOutsidePrefix sees an overlay-only document through a tracked checkpoint newer than the reader's own frozen snapshot" {
+    // §9.7c: the overlay-blind-read bug class found and fixed four times
+    // (`docstore.Cursor`, `getDocumentsAtCheckpointWithState`,
+    // `readBackingPages`'s read-ahead window, `documentReferenceAtCheckpoint`/
+    // `documentFingerprintAtCheckpoint`) had a fifth occurrence here:
+    // `hasLiveDocumentOutsidePrefix`'s own overlay-only fallback (for a
+    // document never yet reflected in the physical tree at all) gated
+    // itself on `checkpoint.commit_sequence == self.activeCheckpoint()
+    // .commit_sequence` and, only then, resolved at
+    // `checkpoint.commit_sequence` directly -- the exact "must equal the
+    // live checkpoint exactly" anti-pattern `OverlayScanState.initForPrefix`
+    // already had removed elsewhere in this file. A `ReadGeneration`'s
+    // separately-opened `generation.file` (stood in for here by `reader`,
+    // a second handle on the same path that never commits and so never
+    // moves its own `activeCheckpoint()`) almost never satisfies that
+    // equality against a tracked, genuinely current `checkpoint`
+    // (`Txn.checkpoint`, kept current by `Store.observeReadCheckpoint`) --
+    // exactly `Store.hasLiveDocumentOutsidePrefix`'s own real call shape --
+    // so the overlay fallback silently never ran, always returning `false`.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-outside-prefix-tracked.aflite");
+    defer a.free(path);
+
+    var writer = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 64 * 1024);
+    defer writer.close();
+    var reader = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    defer reader.close();
+
+    // Never checkpointed/folded: "outside" lives only in the redo-log
+    // overlay, with no physical document-index page at all, and
+    // `reader`'s own `activeCheckpoint()` stays frozen at its open-time
+    // value throughout (it never commits).
+    try writer.beginTransaction();
+    try writer.putDocument("outside", "value");
+    try writer.commitTransaction();
+
+    const tracked = writer.activeCheckpoint();
+    try std.testing.expect(tracked.commit_sequence != reader.activeCheckpoint().commit_sequence);
+
+    // A plain overlay-aware point read through `reader`, at the same
+    // tracked checkpoint, already finds it (this path goes through
+    // `redoOverlayEntry`/`readMark`, not `hasLiveDocumentOutsidePrefix`'s
+    // own now-removed duplicate gate).
+    const seen = (try reader.getDocumentAtCheckpointAlloc(a, tracked, "outside")).?;
+    a.free(seen);
+
+    try std.testing.expect(try reader.hasLiveDocumentOutsidePrefix(tracked, "zzz-excluded-"));
+
+    // A prefix that *does* cover "outside" still finds nothing live
+    // beyond it (no other document exists at all here).
+    try std.testing.expect(!try reader.hasLiveDocumentOutsidePrefix(tracked, "out"));
 }
 
 test "lite redo log catalog cursor merges the overlay across put, overwrite, delete and a checkpoint boundary" {

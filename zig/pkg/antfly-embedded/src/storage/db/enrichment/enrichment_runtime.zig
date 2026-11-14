@@ -49638,8 +49638,10 @@ test "embedding publication verifies large parents using bounded content authori
     var read = try db.core.store.beginReadTxn();
     var read_open = true;
     defer if (read_open) read.abort();
-    const content_key = revisions.contentKey(revisions.keyForPhysical(primary).?);
-    const old_proof = (try read.get(&content_key))[0..49].*;
+    // v2 revision records carry the content proof inline: a 9-byte revision
+    // header followed by the 49-byte proof, stored at the revision key.
+    const content_key = revisions.keyForPhysical(primary).?;
+    const old_proof = (try read.get(&content_key))[revisions.encoded_len_without_content..revisions.encoded_len_with_content].*;
     const Counting = struct {
         inner: *@TypeOf(read),
         parent: []const u8,
@@ -49664,7 +49666,16 @@ test "embedding publication verifies large parents using bounded content authori
     read_open = false;
     // A stale certificate from an earlier writer must fall back to current
     // source bytes, rather than trusting an obsolete matching digest.
-    try db.core.store.put(&content_key, &old_proof);
+    {
+        // Keep the current revision header but attach the earlier writer's
+        // proof, so the revision check rejects it as stale.
+        const current_record = try db.core.store.get(a, &content_key);
+        defer a.free(current_record);
+        var stale: [revisions.encoded_len_with_content]u8 = undefined;
+        @memcpy(stale[0..revisions.encoded_len_without_content], current_record[0..revisions.encoded_len_without_content]);
+        @memcpy(stale[revisions.encoded_len_without_content..], &old_proof);
+        try db.core.store.put(&content_key, &stale);
+    }
     read = try db.core.store.beginReadTxn();
     read_open = true;
     try std.testing.expect(!try embeddingSourceStillCurrent(runtime.alloc, &counted, write, null));
@@ -49673,7 +49684,16 @@ test "embedding publication verifies large parents using bounded content authori
     read_open = false;
     // Publication repairs even malformed disposable metadata using source
     // bytes checked under the writer; the next 1024 checks stay bounded.
-    try db.core.store.put(&content_key, "malformed");
+    {
+        // A malformed proof after a valid revision header: the revision stays
+        // readable while the disposable content authority is rejected.
+        const current_record = try db.core.store.get(a, &content_key);
+        defer a.free(current_record);
+        var malformed: [revisions.encoded_len_without_content + "malformed".len]u8 = undefined;
+        @memcpy(malformed[0..revisions.encoded_len_without_content], current_record[0..revisions.encoded_len_without_content]);
+        @memcpy(malformed[revisions.encoded_len_without_content..], "malformed");
+        try db.core.store.put(&content_key, &malformed);
+    }
     const current = try db.core.store.get(a, primary);
     defer a.free(current);
     var fresh = write;

@@ -1691,15 +1691,29 @@ pub const Owner = struct {
             // Existing readers of an unknown peer publication remain poisoned.
             self.reader_coordinator.observeCurrent(probe_inode, probe.headerFingerprint());
             const same_inode = probe_inode == (try file.file.stat(file.runtime())).inode;
+            // Under the redo log, an ordinary commit advances the logical
+            // commit sequence (`NativeFile.committedSequence()`, whose own
+            // doc comment warns about exactly this) without ever touching
+            // the physical checkpoint slot or header until the next
+            // `checkpointRedoLog` fold. `probe` is a fresh open -- its own
+            // `recoverRedoLog` replay always reflects the latest durable
+            // sequence this inode has on disk -- but `file` (this Owner's
+            // own, possibly long-idle serving instance) only reflects what
+            // it last observed. Neither the raw header comparison below nor
+            // `runtimeMetadataUnchanged`/`loadedIndexInputsUnchanged` (both
+            // physical-root-only comparisons) can see a redo-only commit on
+            // a sibling connection on their own: every fast path here must
+            // also agree on this logical watermark before reusing `current`.
+            const sequence_unchanged = probe.committedSequence() == file.committedSequence();
             // An uncertain publication can fail before writing anything, so an
             // unchanged header does not prove the runtime is reusable: reopen
             // to reconcile from durable state.
-            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and std.meta.eql(probe.header, file.header)) {
+            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and sequence_unchanged and std.meta.eql(probe.header, file.header)) {
                 if (!file.free_pages_verified) if (self.maintenance_snapshot) |snapshot|
                     try file.inheritAllocatorVerification(&snapshot.owned_lite_backend.?.native_docstore.?.file);
                 return current;
             }
-            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and
+            if (current.immutable_query_borrows == 0 and current.maintenance_references == 0 and same_inode and !needsOutcomeReconciliation(current) and sequence_unchanged and
                 try file.runtimeMetadataUnchanged(&probe) and try loadedIndexInputsUnchanged(current, file, &probe))
             {
                 // Lease bookkeeping and unpublished shadow files do not change
@@ -6414,6 +6428,67 @@ test "capi native allocator proof issue1431 refreshed readers distinguish curren
     try file.putDocument("after-reader-close", "safe");
     try std.testing.expect((try file.allocatorStats()).?.reused_pages > blocked);
     try std.testing.expect((try file.check()).valid);
+}
+
+// perf/lwa-change-detect: `Owner.refresh()`'s fast paths used to compare
+// only physical state (`std.meta.eql(probe.header, file.header)`,
+// `runtimeMetadataUnchanged`/`loadedIndexInputsUnchanged`'s own root-page
+// comparisons) between a fresh probe and this Owner's own, possibly
+// long-idle `file`. Under the redo log, an ordinary commit on a *different*
+// `NativeFile` instance on the same inode -- another connection entirely,
+// modeled here the same way `AdmissionFollowupProbe.duringProof` models "a
+// peer committed" elsewhere in this file -- advances the logical commit
+// sequence without ever touching the physical checkpoint slot until the
+// next `checkpointRedoLog` fold, so both fast paths saw no change and kept
+// serving `before` forever. This test commits on a second, independent
+// `NativeFile` with no fold at all and checks `refresh()` still sees it.
+test "capi native sibling connection's refresh sees a redo-only commit without a fold" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("redo-sibling-refresh");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    const wrapper = try open(path, .{ .profile = .native, .no_sync = true }, true);
+    defer h.closeHandle(wrapper);
+    const connection = wrapper.lite_connection.?;
+    const owner = connection.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(io);
+    owner.worker.?.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    const before = owner.current.?;
+    const before_file = &before.owned_lite_backend.?.native_docstore.?.file;
+    try std.testing.expect(before_file.header.redo_log_capacity != 0);
+    try std.testing.expect(try before_file.getDocumentAlloc(a, "sibling-redo") == null);
+
+    // A second, independent connection on the same inode commits directly,
+    // never through `owner` at all -- durable, but with no fold.
+    {
+        var lease = try native.lockWriterPathWithIo(a, io, path);
+        defer lease.close();
+        var sibling = try native.NativeFile.openWithIo(a, io, path, .{ .externally_locked = true, .no_sync = true });
+        defer sibling.close();
+        try sibling.putDocument("sibling-redo", "{\"text\":\"redo-only\"}");
+        // Confirmed redo-only: the logical sequence moved past the real,
+        // on-disk fold boundary this checkpoint slot still reflects.
+        try std.testing.expect(sibling.redo != null);
+        try std.testing.expect(sibling.activeCheckpoint().redo_folded_through < sibling.committedSequence());
+    }
+
+    var lease = try connection.acquire();
+    defer {
+        lease.close();
+        connection.gate.mutex.unlock(io);
+    }
+    const after = try owner.refresh();
+    try std.testing.expect(after != before);
+    const value = try after.owned_lite_backend.?.native_docstore.?.file.getDocumentAlloc(a, "sibling-redo");
+    defer if (value) |bytes| a.free(bytes);
+    try std.testing.expect(value != null);
 }
 
 test "capi native recovery agenda clean opens avoid unrelated table runtimes" {

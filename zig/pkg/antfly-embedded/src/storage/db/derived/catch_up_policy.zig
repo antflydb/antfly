@@ -33,6 +33,19 @@ const dense_replay_default_window_bytes: u64 = 64 * 1024 * 1024;
 const dense_replay_max_window_bytes: u64 = 256 * 1024 * 1024;
 const recoverable_retry_min_delay_ns: u64 = 10 * std.time.ns_per_ms;
 const recoverable_retry_max_delay_ns: u64 = 250 * std.time.ns_per_ms;
+/// Cap on consecutive failures at one retry site before giving up. A
+/// genuinely transient fault -- a momentary disk hiccup, or an ambiguous
+/// commit outcome `NativeFile.reconcilePublicationUncertainty` resolves on
+/// the very next attempt -- clears within a handful of retries. Every
+/// attempt up to this cap already re-entered the write path (which
+/// transparently reconciles an ambiguous publication before trying again,
+/// see `isTransientIoError`'s own doc comment), so a failure that still has
+/// not cleared after this many tries will not clear on attempt N+1 either:
+/// retrying forever just turns a real, permanent fault into an unbounded
+/// hang instead of a surfaced failure. 30 attempts spans a few seconds of
+/// backoff (the delay caps at 250ms well before then), generous for a
+/// genuine transient blip and far short of "forever."
+const recoverable_retry_max_attempts: u8 = 30;
 
 /// Bounded backoff for transient derived-worker failures. The worker owns this
 /// state so a persistently unavailable dependency yields without poisoning the
@@ -52,6 +65,14 @@ pub const RecoverableRetryBackoff = struct {
 
     pub fn shouldLog(self: @This()) bool {
         return self.failures == 1 or std.math.isPowerOfTwo(self.failures);
+    }
+
+    /// True once this retry site has failed enough consecutive times that
+    /// continuing to retry can no longer be justified as "giving a
+    /// transient fault a chance to clear." The caller must stop retrying
+    /// and surface the error instead (never loop forever).
+    pub fn exhausted(self: @This()) bool {
+        return self.failures >= recoverable_retry_max_attempts;
     }
 };
 

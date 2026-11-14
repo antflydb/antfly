@@ -3690,54 +3690,78 @@ test "sustained full_index single writer keeps every acknowledged write searchab
     defer index_manager.setBenchmarkTextMergePolicyOverride(null);
 
     const key_count = 4;
-    // Was 4000. `openDbWithIo`'s raw open never installs an optional
-    // `TextMergeRuntime` (`DB.OpenOptions.text_merge` stays at its
-    // `enabled = false` default, same as any "native serving" handle), and
-    // `prepareInlineTextPublication`'s inline fast path for `.full_index`
-    // writes (`mutation_materialization.zig`) never itself triggers a merge
-    // check either: it adds its new one-document segment directly and never
-    // marks `entry.compaction_pending`, so nothing -- not even a background
-    // merge worker, if one were running -- ever learns this index needs a
-    // look. Confirmed directly (debug instrumentation, not guessed):
-    // segment count tracked 1:1 with write count (399 segments after 400
-    // writes) with zero merges ever happening. `index.IndexWriter.
-    // deleteAllByIdsTracked`'s per-write delete scans every live segment to
-    // find the old version of the key being overwritten, so its cost is
-    // O(live segment count) per write -- O(write count) once segments pile
-    // up unboundedly -- making the whole loop O(total_writes^2): per-100-
-    // write wall time grew write-over-write (18.2s, 21.8s, 25.3s, 29.0s,
-    // 32.7s for writes 0-500), hitting every one of the 300s/600s/900s
-    // timeouts this test used to fail on.
+    // `openDbWithIo`'s raw open never installs an optional `TextMergeRuntime`
+    // (`DB.OpenOptions.text_merge` stays at its `enabled = false` default,
+    // same as any "native serving" handle), so this harness still drives an
+    // explicit, synchronous compaction pass (`DB.compactTextIndexes` ->
+    // `IndexManager.compactAllTextIndexes`) below, alongside the explicit
+    // retirement turn: this harness bypasses the Owner/pool layer that would
+    // normally schedule both automatically, so both need a stand-in here.
     //
-    // Driving an actual background `TextMergeRuntime` from this test (so it
-    // marks `compaction_pending` and merges on its own, the way a real
-    // Owner-managed connection does) was tried and reverted: it reliably
-    // hung a *different*, previously-passing crash-sweep test ("crash
-    // sweep: graph metric build and compaction mid-scenario") in a
-    // `derived catch_up failed ... err=OutcomeUnknown` exponential-backoff
-    // retry loop that never recovers -- confirmed absent on an unmodified
-    // build at the same commit, so the interaction between the inline
-    // fast path marking `compaction_pending` for the first time and that
-    // scenario's own background derived-worker catch-up is a real,
-    // previously-latent bug, out of this fix's scope (same shape as the
-    // background-loop/live-redo-commit races lite-single-commit-write-
-    // path.md's own section 9.7d already documents and defers). Revisit together with
-    // that work rather than here.
+    // Was reduced to 500 for a session that routed around two now-fixed
+    // bugs instead of fixing them:
     //
-    // Instead, drive an explicit, synchronous, already-public compaction
-    // pass (`DB.compactTextIndexes` -> `IndexManager.compactAllTextIndexes`,
-    // the same foreground merge `finalizeTextBatchMutations` runs for the
-    // non-inline write path) alongside the already-explicit retirement
-    // turn below -- this harness bypasses the Owner/pool layer that would
-    // normally schedule both automatically, so both need a stand-in here,
-    // and this one never touches `compaction_pending`/`TextMergeScheduler`
-    // at all, so it cannot trip the hang above. 500 writes (125x
-    // `key_count`, ~17 `runRetirementTurn` calls and as many explicit
-    // compaction passes, still several real merges given the policy
-    // override's `max_segments_per_tier = 3`) keeps the same "sustained
-    // writes + merges + retirement" scenario this test documents wanting,
-    // just at a tractable size now that segments no longer pile up
-    // unboundedly between those passes.
+    // 1. `prepareInlineTextPublication`'s inline fast path for `.full_index`
+    //    writes (`mutation_materialization.zig`'s `InlineTextPublication
+    //    .install`) added its one-document segment directly and never
+    //    marked `entry.compaction_pending`, so a real `TextMergeRuntime` (if
+    //    one were running) would never have learned this index needed a
+    //    look -- confirmed directly (debug instrumentation): segment count
+    //    tracked 1:1 with write count (399 segments after 400 writes) with
+    //    zero merges ever happening, and `IndexWriter.deleteAllByIdsTracked`'s
+    //    per-write delete scan over every live segment made the whole loop
+    //    O(total_writes^2). Fixed: `install` now calls the new
+    //    `IndexManager.noteInlineTextPublicationSegments` (mirroring
+    //    `finalizeTextBatchMutations`'s own needsMerge/schedule/noteComplete
+    //    sequence) so `compaction_pending` gets set once the policy's
+    //    segment-count threshold is crossed, and `mutation_commit.zig`
+    //    notifies the merge runtime afterward. This harness still has no
+    //    `TextMergeRuntime` to act on that flag, so it does not change this
+    //    specific test's own numbers -- the explicit `compactTextIndexes`
+    //    pass below is still what bounds segments here -- but it is why
+    //    production (and any caller that does run a `TextMergeRuntime`)
+    //    no longer grows segments unboundedly on an inline-published index.
+    // 2. Driving an actual background `TextMergeRuntime` from this test was
+    //    separately tried and reverted at the time, because doing so
+    //    reliably hung a *different* crash-sweep test ("crash sweep: graph
+    //    metric build and compaction mid-scenario") in a `derived catch_up
+    //    failed ... err=OutcomeUnknown` retry loop that never recovered.
+    //    Root-caused: `NativeFile.checkpointRedoLog`'s fold consumes a
+    //    fresh `commit_sequence` for its own checkpoint publish (so
+    //    `self.header`'s checkpoint is durably one ahead of
+    //    `redo.writer.last_sequence`, which the fold's own epilogue fixes up
+    //    via `Writer.init`/`initAt`) -- but every step of that epilogue
+    //    between the fold's commit and the fix-up (the log-zeroing
+    //    write+sync, `maybeShrinkRedoLogCapacity`) is itself a durability
+    //    barrier the crash sweep injects faults into, and a fault landing
+    //    there used to leave the fix-up never applied: `self.header` stayed
+    //    permanently one ahead of `redo.writer.last_sequence`, dooming every
+    //    later commit to `error.SequenceOutOfOrder` (surfacing as the far
+    //    less specific `error.OutcomeUnknown`) forever, which a derived
+    //    worker's recoverable-error retry treats as transient and never
+    //    gives up on even though nothing about the file ever changes on its
+    //    own. Fixed in `checkpointRedoLog` itself: advance
+    //    `redo.writer.last_sequence` to the new checkpoint sequence right
+    //    after the fold's own commit succeeds, before any of the fallible
+    //    reclaim/zero/shrink steps, so a fault partway through that epilogue
+    //    can no longer leave the two desynchronized. Confirmed independent
+    //    of this test's own inline-publication fix (reproduces and is fixed
+    //    the same way with the inline fix reverted). Reproduction needed
+    //    `ANTFLY_CRASH_SWEEP_JOBS`'s default concurrency (2/3 default-
+    //    concurrency runs hung before the fix; 5/5 serial (`JOBS=1`) runs
+    //    did not reproduce it in the same session, likely just a smaller
+    //    sample against an intermittent fault-timing window, not evidence
+    //    the bug itself needs concurrency); 5/5 default-concurrency runs
+    //    passed after the fix.
+    //
+    // Confirmed both fixes hold at the original 4000 (passed, ~15 minutes
+    // in this Debug build), but left at 500 here rather than reverted: the
+    // explicit `compactTextIndexes`/`runRetirementTurn` passes below make
+    // this test's own cost scale with `total_writes` regardless of either
+    // fix (every pass re-walks the live segment/journal state), so 4000
+    // writes costs roughly 8x what 500 does -- past what is reasonable for
+    // a routine unit test run, independent of the O(n^2) blowup both fixes
+    // above actually closed.
     const total_writes = 500;
 
     var handle = try openDbWithIo(allocator, path, std.testing.io, true);
@@ -3787,6 +3811,127 @@ test "sustained full_index single writer keeps every acknowledged write searchab
         const key = try std.fmt.bufPrint(&reopen_key_buf, "doc-{d}", .{slot});
         try expectSearchableNow(&handle, allocator, "body_text", "body", key, latest_marker[slot]);
     }
+}
+
+// Problem 1 regression test: unlike the sustained test just above (which
+// deliberately bypasses the Owner/pool layer and drives compaction/
+// retirement by hand, `openDbWithIo` never installs a `TextMergeRuntime`),
+// this one opens through the ordinary `DB.open` path with a real
+// `TextMergeRuntime` running on its own background schedule -- the
+// production/Owner-managed configuration. Before `IndexManager
+// .noteInlineTextPublicationSegments` (called from
+// `InlineTextPublication.install`), the inline `.full_index` fast path
+// added one segment per write and never marked `compaction_pending`, so
+// even a running `TextMergeRuntime` never learned this index needed a
+// look: segments grew 1:1 with write count, and `IndexWriter
+// .deleteAllByIdsTracked`'s per-write delete scan over every live segment
+// made per-write cost grow with history. This asserts both are bounded
+// now that inline publication participates in merge scheduling.
+test "sustained inline full_index writes keep segment count and per-write cost bounded with a real TextMergeRuntime" {
+    const platform_time = @import("antfly_platform").time;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    index_manager.setBenchmarkTextMergePolicyOverride(.{
+        .max_segments_per_tier = 8,
+        .max_segment_size = 5 * 1024 * 1024 * 1024,
+        .floor_segment_size = 0,
+    });
+    defer index_manager.setBenchmarkTextMergePolicyOverride(null);
+
+    var lite_backend = try backend.Handle.createWithOptions(allocator, path, .{ .exclusive = true, .io = std.testing.io });
+    var backend_owned = true;
+    errdefer if (backend_owned) lite_backend.deinit();
+    const identity = connection.identityOpenOptions(true);
+    var db_opts = db_mod.OpenOptions{
+        .open_mode = .writer,
+        .identity_namespace = identity.identity_namespace,
+        .prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace,
+        .text_merge = .{ .enabled = true, .idle_interval_ms = 5 },
+    };
+    try lite_backend.configureDbOpenOptions(&db_opts);
+    var db = try db_mod.DB.open(allocator, path, db_opts);
+    var db_owned = true;
+    errdefer if (db_owned) db.close();
+    try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+    try db.runUntilIdle();
+    backend_owned = false;
+    db_owned = false;
+    var handle = DbHandle{ .backend = lite_backend, .db = db };
+    defer handle.close();
+
+    const key_count = 4;
+    const total_writes = 300;
+    const window = 20;
+    var key_buf: [32]u8 = undefined;
+    var value_buf: [256]u8 = undefined;
+
+    // The very first write for this index always defers to the slow,
+    // worker-driven path (`prepareInlineTextPublication`'s own
+    // `worker_applied == 0` check lets the worker's one-time admission
+    // bookkeeping run first), so drain it before the measured loop below
+    // instead of letting it skew the "first window" timing.
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .full_index });
+    try handle.db.runUntilIdle();
+
+    var max_segments_seen: usize = 0;
+    var first_window_ns: u64 = 0;
+    var last_window_ns: u64 = 0;
+
+    var i: usize = 0;
+    while (i < total_writes) : (i += 1) {
+        const slot = i % key_count;
+        const key = try std.fmt.bufPrint(&key_buf, "doc-{d}", .{slot});
+        const value = try std.fmt.bufPrint(&value_buf, "{{\"body\":\"marker{d} churn alpha beta gamma delta\"}}", .{i});
+        const started_ns = platform_time.monotonicNs();
+        try handle.db.batch(.{ .writes = &.{.{ .key = key, .value = value }}, .sync_level = .full_index });
+        const elapsed_ns = platform_time.monotonicNs() -| started_ns;
+        if (i < window) first_window_ns +|= elapsed_ns;
+        if (i >= total_writes - window) last_window_ns +|= elapsed_ns;
+
+        // Writes here land faster than the runtime's own 5ms idle poll
+        // would otherwise reliably catch between every one of them; a
+        // short, periodic yield gives it real wall-clock turns to run,
+        // the same way a real sustained-write client's own inter-request
+        // gaps do in production.
+        if (i % 20 == 0) try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+
+        if (handle.db.core.textIndexEntry("body_text")) |entry| {
+            max_segments_seen = @max(max_segments_seen, entry.persistent.snapshot().segments.len);
+        }
+    }
+
+    // Let the merge runtime finish draining whatever it still had in
+    // flight before taking the final segment-count reading.
+    try handle.db.runUntilIdle();
+    var drain_attempts: usize = 0;
+    while (drain_attempts < 200) : (drain_attempts += 1) {
+        const entry = handle.db.core.textIndexEntry("body_text") orelse break;
+        if (entry.persistent.snapshot().segments.len <= 8) break;
+        _ = try handle.db.text_merge_runtime.?.runOnce();
+        try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    const final_entry = handle.db.core.textIndexEntry("body_text") orelse return error.CrashConsistencyMissingDocstore;
+    const final_segments = final_entry.persistent.snapshot().segments.len;
+
+    // The actual claim: segments never grew anywhere close to
+    // `total_writes` (the pre-fix behavior was exactly 1:1 with write
+    // count, forever) -- a real `TextMergeRuntime` kept them bounded near
+    // the policy override instead.
+    try std.testing.expect(max_segments_seen < total_writes / 4);
+    try std.testing.expect(final_segments <= 16);
+
+    // Flat per-write cost: the last window's total must not be a large
+    // multiple of the first window's -- the O(live segment count)
+    // delete-scan regression this guards against grows without bound, so
+    // it would show up here as an order-of-magnitude difference, not
+    // noise. A generous multiplier (plus a fixed floor, since both sides
+    // are tiny and dominated by scheduling jitter on a quiet host) keeps
+    // this from flaking on a loaded one.
+    try std.testing.expect(last_window_ns < first_window_ns * 8 + 50 * std.time.ns_per_ms);
 }
 
 // docs/design/lite-performance/throughput-profile.md §6 root cause, isolated
