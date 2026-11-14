@@ -155,6 +155,7 @@ __version__ = "0.3.0"
 from .read_requirements import read_after_write
 
 __all__ = [
+    "CommitRequires",
     "GraphCatalogEntry",
     "GraphDefinition",
     "GraphLabelMapping",

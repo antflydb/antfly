@@ -23,6 +23,7 @@ from antfly.client_generated.models import (
     ChunkEmbeddingContext,
     ChunkEmbeddingObject,
     ChunkEmbeddingResponse,
+    CommitRequires,
     CreateAlgebraicIndexRequest,
     CreatedAlgebraicIndex,
     CreatedEmbeddingsIndex,
@@ -63,7 +64,6 @@ from antfly.client_generated.models import (
     SQLRequest,
     SQLResponse,
     SyncLevel,
-    CommitRequires,
     Transform,
 )
 from antfly.client_generated.models import (

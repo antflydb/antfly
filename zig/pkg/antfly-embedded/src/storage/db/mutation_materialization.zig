@@ -5826,6 +5826,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             document_execution: ?*enrichment_runtime_mod.PrecommitDocumentExecution,
             coverage_outcomes: *std.ArrayListUnmanaged(PrecomputedCoverageOutcome),
             preparation_memo: *GeneratedEmbeddingMemo,
+            precompute_mode: execution_resources.GeneratedPrecomputeMode,
         ) !void {
             var producer_cfg = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
             defer producer_cfg.deinit(alloc);
@@ -5840,7 +5841,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // neither may read the live catalog arrays themselves afterward.
             var document_extraction_view: DocumentExtractionCatalogView = .{};
             defer document_extraction_view.deinit(alloc);
-            if (producer_cfg.type == .document_extraction) {
+            if (producer_cfg.type == .document_extraction and precompute_mode != .direct) {
                 document_extraction_view = try buildDocumentExtractionCatalogView(alloc, db, artifact_name);
             }
 
@@ -5930,6 +5931,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (selected_manifest orelse retained_manifest) |manifest| {
                     const failed = try documentExtractionManifestHasLastError(alloc, manifest) or
                         try enrichment_runtime_mod.documentExtractionEmptyCoverageIsTerminalFailure(alloc, manifest);
+                    if (failed and precompute_mode == .direct) return error.CommitRequirementFailed;
                     try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, if (failed) .terminal_failed else .produced);
                 }
                 return;

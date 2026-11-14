@@ -2275,14 +2275,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.delete_artifacts_ns, delete_artifacts_start_ns);
 
             const use_thin_replay_fast_path =
-                effective_req.commit_requires != .direct_enrichments and
                 effective_req.sync_level != .full_text and
                 effective_req.sync_level != .enrichments and
                 effective_req.sync_level != .full_index and
                 opts.force_generated_artifact_names.len == 0 and
                 !splitShadowRequiresMaterializedDerivedBatch(self);
-            const include_generated_enrichment_hint = use_thin_replay_fast_path and
-                S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets();
+            // Producer admission is independent of the replay representation.
+            // A write/propose gate commits prepared effects with the usual thin
+            // journal instead of constructing a vector-bearing derived batch.
+            const prepare_generated = !use_thin_replay_fast_path or effective_req.commit_requires == .direct_enrichments;
 
             var precomputed_generated: PrecomputedGeneratedBatch = .{};
             defer precomputed_generated.deinit(preparation_alloc);
@@ -2312,7 +2313,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (owned_child_range_outbox_values.items) |value| S.ownerField(self, "alloc").*.free(value);
                 owned_child_range_outbox_values.deinit(S.ownerField(self, "alloc").*);
             }
-            if (!use_thin_replay_fast_path) {
+            if (prepare_generated) {
                 const precompute_generated_start_ns = monotonicTimeNs();
                 if (use_preprepared_rows and preparation.generated != null) {
                     precomputed_generated = preparation.generated.?;
@@ -2346,14 +2347,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 for (precomputed_generated.artifact_delete_keys) |key| {
                     try write_buffers.delete_keys.append(S.ownerField(self, "alloc").*, key);
-                    if (internal_keys.isAssetArtifactKey(key)) {
-                        try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, key);
-                    }
+                    try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, key);
                 }
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
                 enrichment_fully_precomputed = effective_req.sync_level == .enrichments and
                     precomputed_generated.generated_enrichment_refs.len == 0;
             }
+            const include_generated_enrichment_hint = use_thin_replay_fast_path and
+                (if (prepare_generated) precomputed_generated.generated_enrichment_refs.len != 0 else S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets());
             if (effective_req.merge_artifacts.len > 0 or (if (req.merge_page) |page| page.artifact_effects.len != 0 else false) or write_buffers.explicit_embedding_artifact_writes.items.len > 0 or
                 write_buffers.explicit_graph_artifact_writes.items.len > 0 or
                 precomputed_generated.artifact_writes.len > 0)
@@ -3181,6 +3182,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 test_before_primary_commit = null;
                 try hook.run(hook.ptr);
             };
+            // Validate the actual atomic effect set, including coverage, source
+            // revisions, counters and the journal. Preparation checks bound work
+            // between producers; this final check bounds durable amplification.
+            if (effective_req.commit_requires == .direct_enrichments) {
+                var effect_budget = @import("commit_requirements.zig").OutputBudget{};
+                try effect_budget.checkpoint(write_buffers.store_writes.items, write_buffers.delete_keys.items);
+                if (replay_append) |entry| try effect_budget.reserve(entry.payload.len, 1);
+            }
             const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
                 const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
                     resolution.txn_id,

@@ -941,11 +941,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var fallback_memo = GeneratedEmbeddingMemo.init(alloc);
             defer fallback_memo.deinit();
             const preparation_memo = generated_memo orelse &fallback_memo;
-            if (preplanned) |plan| if (generated_memo) |memo| {
+            // A direct gate checks each document's retained effects before dispatching
+            // another document. Whole-request speculative prewarming would run all
+            // providers before discovering an oversized early result.
+            if (precompute_mode != .direct) if (preplanned) |plan| if (generated_memo) |memo| {
                 try prewarmGeneratedDenseMemo(self, req, extracted, precompute_mode, plan, memo, force_generated_artifact_names);
                 try prewarmGeneratedSparseMemo(self, req, extracted, precompute_mode, plan, memo, force_generated_artifact_names);
             };
 
+            var output_budget = @import("commit_requirements.zig").OutputBudget{};
             var artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
             errdefer {
                 for (artifact_writes.items) |write| {
@@ -1135,6 +1139,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                 document_execution,
                                 &coverage_outcomes,
                                 preparation_memo,
+                                precompute_mode,
                             );
                             const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
                             defer alloc.free(asset_key);
@@ -1214,8 +1219,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             );
                         },
                     }
+                    if (precompute_mode == .direct)
+                        try output_budget.checkpoint(artifact_writes.items, artifact_delete_keys.items);
                 }
                 try inline_embedding_cleanup.flush(alloc, self, req.writes[i].key, &artifact_delete_keys);
+                if (precompute_mode == .direct) {
+                    try flushPrecomputeAssetProducerBatch(alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents, &coverage_outcomes);
+                    try output_budget.checkpoint(artifact_writes.items, artifact_delete_keys.items);
+                }
             }
 
             try flushPrecomputeAssetProducerBatch(alloc, self, &deferred_asset_producer_items, &artifact_writes, &documents, &coverage_outcomes);
@@ -1257,7 +1268,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             result.sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc);
             result.generated_enrichment_refs = try planned.toOwnedSlice(alloc);
             result.coverage_outcomes = try coverage_outcomes.toOwnedSlice(alloc);
-            if (precompute_mode == .direct) try @import("commit_requirements.zig").validateOutputBounds(result.artifact_writes, result.artifact_delete_keys);
+            if (precompute_mode == .direct) {
+                try output_budget.checkpoint(result.artifact_writes, result.artifact_delete_keys);
+                for (result.coverage_outcomes) |outcome|
+                    if (outcome.outcome == .terminal_failed) return error.CommitRequirementFailed;
+            }
             return result;
         }
 

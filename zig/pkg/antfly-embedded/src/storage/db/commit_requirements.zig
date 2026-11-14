@@ -52,20 +52,36 @@ pub fn catalogSupported(plan: anytype) bool {
 pub const max_output_bytes: usize = 8 * 1024 * 1024;
 pub const max_output_rows: usize = 16 * 1024;
 
+/// Incremental accounting is monotonic: callers check only newly appended
+/// effects before dispatching the next producer, avoiding quadratic rescans.
+pub const OutputBudget = struct {
+    bytes: usize = 0,
+    rows: usize = 0,
+    writes_seen: usize = 0,
+    deletes_seen: usize = 0,
+
+    pub fn reserve(self: *OutputBudget, bytes: usize, rows: usize) !void {
+        if (bytes > max_output_bytes - self.bytes or rows > max_output_rows - self.rows)
+            return error.CommitRequirementTooLarge;
+        self.bytes += bytes;
+        self.rows += rows;
+    }
+
+    pub fn checkpoint(self: *OutputBudget, writes: anytype, deletes: []const []const u8) !void {
+        std.debug.assert(writes.len >= self.writes_seen and deletes.len >= self.deletes_seen);
+        for (writes[self.writes_seen..]) |write| {
+            try self.reserve(write.key.len, 1);
+            try self.reserve(write.value.len, 0);
+        }
+        for (deletes[self.deletes_seen..]) |key| try self.reserve(key.len, 1);
+        self.writes_seen = writes.len;
+        self.deletes_seen = deletes.len;
+    }
+};
+
 pub fn validateOutputBounds(writes: anytype, deletes: []const []const u8) !void {
-    if (writes.len > max_output_rows or deletes.len > max_output_rows - writes.len)
-        return error.CommitRequirementTooLarge;
-    var remaining = max_output_bytes;
-    for (writes) |write| {
-        if (write.key.len > remaining) return error.CommitRequirementTooLarge;
-        remaining -= write.key.len;
-        if (write.value.len > remaining) return error.CommitRequirementTooLarge;
-        remaining -= write.value.len;
-    }
-    for (deletes) |key| {
-        if (key.len > remaining) return error.CommitRequirementTooLarge;
-        remaining -= key.len;
-    }
+    var budget = OutputBudget{};
+    try budget.checkpoint(writes, deletes);
 }
 
 // The policy consumes values, not the enrichment runtime or its import graph.
@@ -120,4 +136,18 @@ test "commit requirements prepared output bounds include deletes" {
     const oversized = try std.testing.allocator.alloc(u8, max_output_bytes);
     defer std.testing.allocator.free(oversized);
     try std.testing.expectError(error.CommitRequirementTooLarge, validateOutputBounds(&[_]Write{.{ .key = "artifact", .value = oversized }}, &.{}));
+}
+
+test "commit requirements incremental output budget counts each effect once" {
+    const Write = struct { key: []const u8, value: []const u8 };
+    const writes = [_]Write{ .{ .key = "a", .value = "bc" }, .{ .key = "de", .value = "f" } };
+    var budget = OutputBudget{};
+    try budget.checkpoint(writes[0..1], &.{});
+    try budget.checkpoint(&writes, &.{"gh"});
+    try budget.checkpoint(&writes, &.{"gh"});
+    try std.testing.expectEqual(@as(usize, 8), budget.bytes);
+    try std.testing.expectEqual(@as(usize, 3), budget.rows);
+    try budget.reserve(max_output_bytes - 8, max_output_rows - 3);
+    try std.testing.expectError(error.CommitRequirementTooLarge, budget.reserve(1, 0));
+    try std.testing.expectError(error.CommitRequirementTooLarge, budget.reserve(0, 1));
 }

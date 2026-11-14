@@ -85566,6 +85566,125 @@ test "db asset producer sync precompute fails closed on permanent item failure" 
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, bad_key));
 }
 
+test "db commit requirements extraction failure rejects without consumer indexes" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "units",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json =
+        \\{"type":"document_extraction","config":{"checksum_algorithm":"sha256","source":{"checksum_field":"digest"}}}
+        ,
+    });
+    try db.batch(.{ .writes = &.{.{ .key = "keep", .value = "{}" }}, .commit_requires = .none });
+    var committed = false;
+    try std.testing.expectError(error.CommitRequirementFailed, db.batchTracked(.{
+        .writes = &.{.{ .key = "rejected", .value =
+        \\{"url":"data:text/plain;base64,YWxwaGEgYmV0YQ==","digest":"0000000000000000000000000000000000000000000000000000000000000000"}
+        }},
+        .deletes = &.{"keep"},
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    }, &committed));
+    try std.testing.expect(!committed);
+    try std.testing.expect((try db.get(a, "rejected")) == null);
+    const kept = (try db.get(a, "keep")) orelse return error.TestExpectedEqual;
+    defer a.free(kept);
+    const manifest = try internal_keys.artifactNamedPrefixAlloc(a, "rejected", "asset", "units");
+    defer a.free(manifest);
+    try std.testing.expectError(error.NotFound, db.core.store.get(a, manifest));
+}
+
+test "db commit requirements extraction leaves artifact source descendants to replay" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "units",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "chunks",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "units",
+        .chunk_size = 16,
+        .chunk_overlap = 0,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc", .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"}" }},
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    });
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(a, "doc", "units", "document:000001");
+    defer a.free(unit_key);
+    const unit = try db.core.store.get(a, unit_key);
+    defer a.free(unit);
+    // The extraction unit is direct; chunking that unit is an excluded stage.
+    const chunk_prefix = try internal_keys.artifactTypePrefixAlloc(a, "doc", "chunk");
+    defer a.free(chunk_prefix);
+    const chunks = try db.core.store.scanPrefix(a, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(a, chunks);
+    try std.testing.expectEqual(@as(usize, 0), chunks.len);
+}
+
+test "db commit requirements output budget stops subsequent producer work atomically" {
+    const a = std.testing.allocator;
+    const Producer = struct {
+        calls: usize = 0,
+        fn produce(ptr: *anyopaque, out: Allocator, _: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const result = try out.alloc(u8, 5 * 1024 * 1024);
+            @memset(result, 'x');
+            return result;
+        }
+    };
+    var directory = try TestDirectory.init("commit-requirements");
+    defer directory.cleanup();
+    var producer = Producer{};
+    var db = try DB.open(a, directory.path(), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .owner_id = "budget", .asset_producer = .{ .ptr = &producer, .vtable = &.{
+            .produce = Producer.produce,
+            .invocation_memory_for_requests = TestAssetProducer.invocationMemory,
+        } } },
+    });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "summary",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}",
+    });
+    var committed = false;
+    try std.testing.expectError(error.CommitRequirementTooLarge, db.batchTracked(.{
+        .writes = &.{
+            .{ .key = "one", .value = "{\"body\":\"one\"}" },
+            .{ .key = "two", .value = "{\"body\":\"two\"}" },
+            .{ .key = "three", .value = "{\"body\":\"three\"}" },
+        },
+        .sync_level = .write,
+        .commit_requires = .direct_enrichments,
+    }, &committed));
+    try std.testing.expectEqual(@as(usize, 2), producer.calls);
+    try std.testing.expect(!committed);
+    for ([_][]const u8{ "one", "two", "three" }) |key|
+        try std.testing.expect((try db.get(a, key)) == null);
+}
+
 test "db commit requirements missing provider cannot defer required work" {
     const a = std.testing.allocator;
     var directory = try TestDirectory.init("commit-requirements");

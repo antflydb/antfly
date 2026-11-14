@@ -679,6 +679,7 @@ const mappings = [_]Mapping{
     .{ .status = .unsupported_commit_requirement, .err = error.UnsupportedCommitRequirement },
     .{ .status = .commit_requirement_unavailable, .err = error.CommitRequirementUnavailable },
     .{ .status = .commit_requirement_too_large, .err = error.CommitRequirementTooLarge },
+    .{ .status = .commit_requirement_failed, .err = error.CommitRequirementFailed },
     .{ .status = .incomplete_seed_artifact, .err = error.IncompleteSeedArtifact },
     .{ .status = .invalid_artifact_boundary, .err = error.InvalidArtifactBoundary },
     .{ .status = .invalid_artifact_chunk_size, .err = error.InvalidArtifactChunkSize },

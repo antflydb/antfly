@@ -141,9 +141,19 @@ The initial implementation exposes the optional field through batch codecs and
 SDKs and implements explicit `none` and `direct_enrichments` for unreplicated local
 embedded batches. It reuses the existing immutable row plans, pre-lock producer
 preparation, provider memo/batching, source and catalog generation fences, and
-atomic artifact/coverage commit. Direct-output admission is bounded to 8 MiB and
-16,384 physical rows. Native owner ABI 92 prevents older decoders from ignoring
-these prerequisites.
+atomic artifact/coverage commit. Direct admission bounds the complete atomic
+effect set (source mutations,
+artifacts, coverage, revisions, counters and replay payload) to 8 MiB and
+16,384 physical rows. Preparation accounts for new artifact effects between
+producers and flushes deferred producer batches at document boundaries. A gate
+does not speculatively prewarm the entire request before checking those bounds;
+per-document concurrency, provider invocation budgets and optimistic retry memos
+remain in use. The final commit check includes metadata amplification.
+Extraction failures represented by terminal manifests reject the gate even when
+there are no consuming indexes. Direct extraction materializes its own units and
+navigation only; artifact-source descendants remain replay work. Write/propose
+acknowledgment uses the normal thin replay record after preparation. Native
+owner ABI 92 prevents older decoders from ignoring these prerequisites.
 
 Server HTTP, Raft and serverless currently reject explicit requirements before
 admission. Local ordered-publication, replication, child-range dispatch and

@@ -879,6 +879,7 @@ pub const Status = enum(u32) {
     unsupported_commit_requirement = 919,
     commit_requirement_unavailable = 920,
     commit_requirement_too_large = 921,
+    commit_requirement_failed = 922,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
