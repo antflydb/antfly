@@ -43,7 +43,7 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, ex
         if (!server_api.permissionsAllow(value.permissions, .table, physical, if (request.action == .changes) .write else if (mutation) .admin else .read)) return error.Forbidden;
         // CDC accepts row mutations, while catalog/maintenance writes require
         // table administration. Neither path evaluates per-row write policies.
-        if (mutation and server_api.effectiveRowFilterJson(value, physical) != null) return error.Forbidden;
+        if (mutation and server_api.hasEffectiveRowFilter(value, physical)) return error.Forbidden;
     }
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.ReadUnavailable;
     defer server.source.freeAdminSnapshot(&snapshot);

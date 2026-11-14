@@ -670,7 +670,14 @@ test "storage-backed user store and casbin adapter persist usermgr state" {
     try std.testing.expectEqualStrings("alice", validated.username);
     try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", validated.metadata_json);
     try std.testing.expectEqual(@as(usize, 1), validated.permissions.len);
-    try std.testing.expectEqual(@as(usize, 1), validated.row_filter.len);
+    try std.testing.expectEqual(@as(usize, 2), validated.row_filter.len);
+    const effective = (try user_manager.combinedRowFilterForTable(std.testing.allocator, validated.row_filter, "docs")).?;
+    defer effective.deinit(std.testing.allocator);
+    var parsed_effective = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, effective.json, .{});
+    defer parsed_effective.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_effective.value.object.get("conjuncts").?.array.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, effective.json, "\"team\":\"eng\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, effective.json, "\"tier\":\"gold\"") != null);
     try reloaded.updatePassword("alice", "changed");
     const persisted_users = try reloaded_user_store.iface().loadUsers(std.testing.allocator);
     defer {
@@ -769,7 +776,14 @@ test "portable auth seed preserves credentials policies roles filters and api ke
     defer validated.deinit(alloc);
     try std.testing.expectEqualStrings("alice", validated.username);
     try std.testing.expectEqual(@as(usize, 1), validated.permissions.len);
-    try std.testing.expectEqual(@as(usize, 1), validated.row_filter.len);
+    try std.testing.expectEqual(@as(usize, 2), validated.row_filter.len);
+    const effective = (try user_manager.combinedRowFilterForTable(alloc, validated.row_filter, "docs")).?;
+    defer effective.deinit(alloc);
+    var parsed_effective = try std.json.parseFromSlice(std.json.Value, alloc, effective.json, .{});
+    defer parsed_effective.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed_effective.value.object.get("conjuncts").?.array.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, effective.json, "\"tenant_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, effective.json, "\"tier\":\"gold\"") != null);
 
     const wrong_target = try std.fs.path.join(alloc, &.{ root, "wrong-auth" });
     defer alloc.free(wrong_target);
