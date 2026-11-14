@@ -333,6 +333,9 @@ jobs:
           if [ -d .cache/profile-e2e/tmp ]; then
             tar -czf .benchmark-results/compile-costs/merge-recovery-fixtures.tgz -C .cache/profile-e2e/tmp .
           fi
+          if [ -s zig/zig-out/bin/antfly ] && [ -x zig/zig-out/bin/antfly ]; then
+            tar -czf .benchmark-results/compile-costs/merge-recovery-server.tgz -C zig/zig-out/bin antfly
+          fi
       - name: Retain measurements even on compiler failure
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
