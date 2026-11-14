@@ -842,7 +842,10 @@ extension ClientTests {
   @Test func formattedCleanupKeepsFirstEventAndFirstDraftTiming() async throws {
     FixtureProtocol.reply = { request in
       let body = try JSONSerialization.jsonObject(with: fixtureBody(request)) as! [String: Any]
-      #expect(body["dictionary"] as? [String] == ["Antfly"])
+      #expect(
+        body["dictionary"] as? [String] == (0..<64).map { "UnrelatedEntry" + String($0) } + [
+          "Antfly"
+        ])
       let raw = body["transcript_text"] as! String
       let event = try JSONSerialization.data(withJSONObject: [
         "type": "dictation.delta", "delta": raw,

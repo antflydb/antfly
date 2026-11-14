@@ -352,3 +352,24 @@ private actor FormattingCleaner {
   #expect(result.text == "Hello" && result.formatting?.pressEnter == true)
   #expect(await cleaner.inputs == ["Hello press enter"])
 }
+
+@Test func nativeSegmentAssemblyPreservesMultilingualTextThroughCleanup() async throws {
+  for (language, first, second, expected) in [
+    ("ja-JP", "こんにちは", "世界", "こんにちは世界"),
+    ("zh-CN", "你好", "世界", "你好世界"),
+    ("en-US", "Hello", " world.", "Hello world."),
+  ] {
+    for cleanup in [false, true] {
+      let pipeline = LiveDictation(
+        incremental: true, needsCleanup: cleanup, cumulativeCleanup: true,
+        language: language, preserveRecognitionWhitespace: true,
+        recognize: { _, commit in
+          commit ? [final(2, second, 100)] : [final(1, first, 0)]
+        }, clean: { DictationResult(raw: $0, text: $0) })
+      try await pipeline.append(Data([1]))
+      let result = try await pipeline.finish(Data())
+      #expect(result.raw == expected)
+      #expect(result.text == expected)
+    }
+  }
+}

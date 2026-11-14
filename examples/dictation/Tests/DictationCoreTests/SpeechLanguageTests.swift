@@ -58,6 +58,53 @@ import Testing
   #expect(
     CleanupVocabulary.relevant(["Antfly", "Colony", "Antfly"], to: "hello") == ["Antfly", "Colony"])
   let terms = (0..<64).map { "UnrelatedEntry" + String($0) } + ["Antfly"]
-  #expect(CleanupVocabulary.relevant(terms, to: "What about ant fly now?") == ["Antfly"])
+  #expect(CleanupVocabulary.relevant(terms, to: "What about ant fly now?") == terms)
   #expect(CleanupVocabulary.relevant(terms, to: "unrecognized speech") == terms)
+}
+
+@Test func whisperSetupDoesNotRequireAppleLanguageSupport() throws {
+  var preset = Preset(id: "test", name: "Test")
+  preset.speechLanguageChoice = .detect
+  #expect(try preset.setupLanguage(for: .whisper, supportedAppleLanguages: ["en-US"]) == "")
+  #expect(throws: (any Error).self) {
+    try preset.setupLanguage(for: .appleSpeech, supportedAppleLanguages: ["en-US"])
+  }
+  preset.speechLanguageChoice = .custom
+  preset.language = "hi-IN"
+  #expect(try preset.setupLanguage(for: .whisper, supportedAppleLanguages: ["en-US"]) == "")
+  preset.language = "fr-FR"
+  #expect(try preset.setupLanguage(for: .appleSpeech).hasPrefix("fr"))
+}
+
+@Test func dictionaryKeepsUnmatchedCorrectionsWhenOtherTermsMatch() {
+  let terms = (0..<40).map { "Entry" + String($0) } + ["Colony", "Antfly", "Antfly"]
+  #expect(CleanupVocabulary.relevant(terms, to: "Colony uses amplant") == Array(terms.dropLast()))
+}
+
+@Test func transcriptBoundariesPreserveWhitespaceAndUnspacedLanguages() {
+  #expect(TranscriptAssembly.join(["Hello", " world", "."]) == "Hello world.")
+  #expect(TranscriptAssembly.join(["hello", "world"]) == "hello world")
+  #expect(TranscriptAssembly.join(["こんにちは", "世界"], language: "ja-JP") == "こんにちは世界")
+  #expect(TranscriptAssembly.join(["你好", "世界"], language: "zh-CN") == "你好世界")
+  #expect(TranscriptAssembly.join(["你好", "世界"]) == "你好世界")
+  #expect(TranscriptAssembly.join(["Hello\n", "world"]) == "Hello\nworld")
+  #expect(TranscriptAssembly.join(["Hello ", "world"]) == "Hello world")
+}
+
+@Test func appSpecificRecordingUsesOnlyItsOwnCleanupPreparation() {
+  var config = Configuration()
+  config.presets[0].outputMode = .clean
+  config.presets[0].cleanupModel = "generators/default"
+  var specific = Preset(id: "specific", name: "Specific")
+  specific.appIDs = ["test.editor"]
+  specific.outputMode = .verbatim
+  config.presets.append(specific)
+  #expect(config.preset(for: nil).canUseCleanupPreparation(for: "generators/default"))
+  #expect(!config.preset(for: "test.editor").canUseCleanupPreparation(for: "generators/default"))
+  specific.outputMode = .clean
+  specific.cleanupModel = "generators/editor"
+  config.presets[config.presets.count - 1] = specific
+  #expect(!config.preset(for: "test.editor").canUseCleanupPreparation(for: "generators/default"))
+  #expect(config.preset(for: "test.editor").canUseCleanupPreparation(for: "generators/editor"))
+  #expect(!specific.canUseCleanupPreparation(for: nil))
 }

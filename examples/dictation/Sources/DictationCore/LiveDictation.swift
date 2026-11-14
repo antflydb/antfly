@@ -23,6 +23,8 @@ public actor LiveDictation {
   private let formatting: VoiceFormatting.Options?
   private var cleanupBoundaries: [Int] = []
   private var cleanedRawUTF16 = 0
+  private let language: String
+  private let preserveRecognitionWhitespace: Bool
   private let cumulativeCleanup: Bool
   private let incremental: Bool
   private let needsCleanup: Bool
@@ -49,11 +51,14 @@ public actor LiveDictation {
 
   public init(
     incremental: Bool, needsCleanup: Bool, formatting: VoiceFormatting.Options? = nil,
-    cumulativeCleanup: Bool = false,
+    cumulativeCleanup: Bool = false, language: String = "",
+    preserveRecognitionWhitespace: Bool = false,
     recognize: @escaping Recognize,
     clean: @escaping Clean, close: @escaping @Sendable () async -> Void = {},
     observe: @escaping Observe = { _ in }
   ) {
+    self.language = language
+    self.preserveRecognitionWhitespace = preserveRecognitionWhitespace
     self.cumulativeCleanup = cumulativeCleanup
     self.formatting = formatting
     self.incremental = incremental && formatting?.pressEnter != true
@@ -77,7 +82,7 @@ public actor LiveDictation {
     let cleanupFormatting = formatting ?? .init(commands: false, pressEnter: false)
     return LiveDictation(
       incremental: plan.incrementalCleanup, needsCleanup: preset.runsCleanup,
-      formatting: formatting, cumulativeCleanup: true,
+      formatting: formatting, cumulativeCleanup: true, language: preset.language,
       recognize: {
         try await client.appendSessionEvents(id, audio: $0, sampleRate: 16000, commit: $1)
       },
@@ -89,15 +94,11 @@ public actor LiveDictation {
       },
       close: { await client.closeSession(id) }, observe: observe)
   }
-  private var raw: String { segments.map(\.raw).joined(separator: " ") }
-  private var draft: String {
-    segments.compactMap(\.cleaned).filter { !$0.isEmpty }.reduce(into: "") { joined, next in
-      if !joined.isEmpty && joined.last?.isNewline != true && next.first?.isNewline != true {
-        joined.append(" ")
-      }
-      joined.append(next)
-    }
+  private func joined(_ parts: [String]) -> String {
+    TranscriptAssembly.join(parts, language: language)
   }
+  private var raw: String { joined(segments.map(\.raw)) }
+  private var draft: String { joined(segments.compactMap(\.cleaned)) }
   public func append(_ audio: Data, commit: Bool = false) async throws {
     guard !stopped, !committed, !appending else {
       throw DictationError.invalid("Recording session is closed or busy.")
@@ -114,7 +115,7 @@ public actor LiveDictation {
     await observe(
       DictationProgress(
         phase: commit ? .transcribing : .listening,
-        raw: [raw, partial].filter { !$0.isEmpty }.joined(separator: " "), draft: draft))
+        raw: joined([raw, partial]), draft: draft))
     startCleanup()
   }
   private func accept(_ events: [RecognitionEvent]) throws {
@@ -132,7 +133,9 @@ public actor LiveDictation {
         continue
       }
       partial = ""
-      let text = event.text.trimmingCharacters(in: .whitespacesAndNewlines)
+      let text =
+        preserveRecognitionWhitespace
+        ? event.text : event.text.trimmingCharacters(in: .whitespacesAndNewlines)
       if let existing = segments.first(where: {
         $0.start == event.start_ms && $0.end == event.end_ms
       }) {
@@ -141,7 +144,7 @@ public actor LiveDictation {
         }
         continue
       }
-      if text.isEmpty { continue }
+      if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
       guard segments.count < 2048,
         raw.utf8.count + text.utf8.count + (segments.isEmpty ? 0 : 1) <= 65536,
         event.start_ms >= (segments.last?.end ?? 0)
@@ -164,7 +167,7 @@ public actor LiveDictation {
       // Coalesce any backlog to avoid one model invocation per short phrase.
       let end = segments.count
       let first = cumulativeCleanup ? 0 : index
-      let input = segments[first..<end].map(\.raw).joined(separator: " ")
+      let input = joined(segments[first..<end].map(\.raw))
       do {
         let began = ProcessInfo.processInfo.systemUptime
         let output = try await clean(input)
@@ -185,7 +188,7 @@ public actor LiveDictation {
         if cumulativeCleanup {
           cleanedRawUTF16 = input.utf16.count
         } else {
-          cleanedRawUTF16 += (index == 0 ? 0 : 1) + input.utf16.count
+          cleanedRawUTF16 = joined(segments[..<end].map(\.raw)).utf16.count
         }
         cleanupBoundaries.append(cleanedRawUTF16)
         segments[first].cleaned = output.text
@@ -193,7 +196,7 @@ public actor LiveDictation {
         await observe(
           DictationProgress(
             phase: committed ? .cleaning : .listening,
-            raw: [raw, partial].filter { !$0.isEmpty }.joined(separator: " "), draft: draft))
+            raw: joined([raw, partial]), draft: draft))
       } catch {
         if !stopped && !Task.isCancelled { failure = error.localizedDescription }
         return

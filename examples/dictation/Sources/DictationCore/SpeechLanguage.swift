@@ -93,3 +93,19 @@ extension Preset {
     return result
   }
 }
+
+extension Preset {
+  /// Whisper installs independently of Apple locale support and detects language
+  /// when requested. Apple setup alone needs a concrete supported asset locale.
+  public func setupLanguage(
+    for operation: ModelSetupOperation, supportedAppleLanguages: [String]? = nil
+  ) throws -> String {
+    guard operation == .appleSpeech else { return "" }
+    let resolved = try resolvingLanguage(supported: supportedAppleLanguages)
+    guard !resolved.language.isEmpty else {
+      throw DictationError.invalid(
+        "Apple speech needs a selected language. Choose Use Mac language or a language in Presets.")
+    }
+    return resolved.language
+  }
+}

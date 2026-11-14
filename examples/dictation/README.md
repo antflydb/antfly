@@ -685,14 +685,15 @@ small synthetic generation request per selected processor, refreshing after two
 minutes of idle time when dictation starts or engine discovery is requested;
 no audio, dictionary, or user transcript is sent, and external services are never
 prewarmed. It is optional and has a three-second server budget. Microphone capture
-continues independently; server recognition/cleanup drains any in-flight preparation
-first so warmup cannot compete for a single inference slot. Failed warmup falls back
+continues independently; server recognition/cleanup drains preparation for the active preset first.
+App-specific presets determine which processor is prepared; unrelated preparation
+is canceled when recording starts, and Verbatim never waits for a warmup task. Failed warmup falls back
 to normal on-demand processing.
 
-Large cleanup dictionaries prioritize plausible spelling hints for each batch;
-small dictionaries are retained intact, and no-match batches conservatively retain
-the complete dictionary. Saved dictionaries, user instructions, completion checks,
-and output limits are preserved. Cleanup never requests translation.
+Cleanup retains every preferred spelling, deduplicated in preference order.
+Recognition errors may bear little lexical resemblance to the intended term, so
+unmatched hints are never discarded. Saved dictionaries, user instructions,
+completion checks, and output limits are preserved. Cleanup never requests translation.
 
 Raw text appears before cleanup finishes. **Use original now** cancels remaining
 processing and selects the raw transcript; automatic paste still targets only the

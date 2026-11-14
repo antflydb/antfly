@@ -190,6 +190,16 @@ struct SettingsView: View {
       )
     }
       .confirmationDialog(
+        "Publish preferences snapshot?", isPresented: $navigation.confirmPublication
+      ) {
+        Button("Publish preferences") { store.publish() }
+          .disabled(store.settingsLocked || store.state != .idle || store.capturingShortcut)
+      } message: {
+        Text(
+          "This overwrites the selected remote profile with your current preferences. Credentials are never published."
+        )
+      }
+      .confirmationDialog(
         "Replace preferences from Antfly?", isPresented: $navigation.confirmReplacement
       ) {
         Button("Replace preferences", role: .destructive) { store.download() }
@@ -826,7 +836,7 @@ private struct RuntimeControls: View {
       if showAdvanced { Button("Open engine log") { NSWorkspace.shared.open(runtime.logURL) } }
     }
     Text(
-      "Apple speech needs macOS 26+ and language assets. Install / check downloads assets for the active preset’s language (English by default) and verifies speech before selecting it. Whisper is an alternative. Text cleanup is configured separately in Presets."
+      "Apple speech needs macOS 26+ and language assets. Install / check downloads assets for the active preset’s language (using your Mac language by default) and verifies speech before selecting it. Whisper is an alternative. Text cleanup is configured separately in Presets."
     ).font(.caption)
       .confirmationDialog("Download Whisper Tiny?", isPresented: $consent.whisper) {
         Button("Download & set up Whisper") { store.installLocalWhisper() }

@@ -185,3 +185,11 @@ actor InferenceGate {
     if waiters.isEmpty { held -= 1 } else { waiters.removeFirst().1.resume() }
   }
 }
+
+extension Preset {
+  /// A recording must never wait on another preset's processor or on warmup
+  /// when its output does not require generation.
+  public func canUseCleanupPreparation(for model: String?) -> Bool {
+    runsCleanup && model == cleanupModel
+  }
+}
