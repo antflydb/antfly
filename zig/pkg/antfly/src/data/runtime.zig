@@ -47396,7 +47396,7 @@ fn consumerTests() type {
                         // Every revisioned candidate must be tried before a
                         // legacy read can establish successful read affinity.
                         try std.testing.expectEqual(@as(usize, 2), self.point_calls);
-                        const snapshot: antfly.metadata_api.AdminSnapshot = .{ .status = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1') }, .tables = @constCast(&tables), .ranges = @constCast(&ranges), .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+                        const snapshot: antfly.metadata_api.AdminSnapshot = .{ .status = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .metrics = .{} }, .tables = @constCast(&tables), .ranges = @constCast(&ranges), .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
                         return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, snapshot, .{}) };
                     }
                     return error.TestUnexpectedResult;
