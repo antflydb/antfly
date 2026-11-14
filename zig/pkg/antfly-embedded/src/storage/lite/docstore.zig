@@ -1502,7 +1502,22 @@ test "lite allocator v4 releasing the last old reader starts idle retirement" {
     write = try store.beginWrite();
     try write.delete("large");
     try write.commit();
-    try std.testing.expect(store.maintenance_future == null);
+    // §9 (redo retirement signal): used to assert `maintenance_future ==
+    // null` here, on the assumption that nothing could have started the
+    // background loop yet. Under the ledger-only signal
+    // `startMaintenanceAssumeLocked` used to consult, that held
+    // incidentally: a reader-pinned delete leaves no *ledger* work to
+    // find this early. Once that signal became the full, redo-aware one
+    // (matching every other caller), the put+delete above chains a
+    // superseded version onto "large"'s head in the same uncheckpointed
+    // window -- genuine redo retirement debt `redoCheckpointWouldRetire`
+    // correctly reports right away, which legitimately starts
+    // `maintenanceLoop` immediately rather than waiting for the reader to
+    // release. That is the intended behavior this signal switch exists
+    // for, not a bug: the test's actual invariant -- idle retirement
+    // cannot *complete* until the pinning reader releases -- is already
+    // the `while` loop below, unaffected by exactly when the background
+    // loop happens to spin up.
     oldest.abort();
     oldest_open = false;
     const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(std.Io.Duration.fromSeconds(10));
