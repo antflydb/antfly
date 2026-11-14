@@ -1014,7 +1014,7 @@ fn createNativeSessionForCudaUpload(
     allocator: std.mem.Allocator,
     requested_model_path: []const u8,
     override: ?TaskOverride,
-    retain_gliner_q8: bool,
+    for_cuda_upload: bool,
     borrowed_manifest: ?*const manifest_mod.ModelManifest,
 ) !Session {
     var direct_quant_enabled = directQuantEnabled();
@@ -1025,9 +1025,8 @@ fn createNativeSessionForCudaUpload(
 
     // Detect architecture from config.json
     var arch_config = try detectArchitecture(allocator, model_path, mf);
-    // Reject Metal-only GLiDE decoders (also on the CUDA upload path) before
-    // opening the tensor store or loading any weights.
-    try requireGlideBackend(mf, .native);
+    // Validate the eventual execution backend before loading any weights.
+    try requireGlideBackend(mf, if (for_cuda_upload) .cuda else .native);
     // Determine weight prefix for the native backend (strip from source tensor names)
     var store = try tensor_store_mod.openFromManifest(allocator, mf);
     var store_owned = true;
@@ -1069,7 +1068,7 @@ fn createNativeSessionForCudaUpload(
         // the generic native direct-quant representation.
         direct_quant_enabled = false;
     }
-    const keep_gliner_q8 = retain_gliner_q8 and requiresModernBertSpanClassifier(mf) and ggufEncoderHasQuantizedTensors(store);
+    const keep_gliner_q8 = for_cuda_upload and requiresModernBertSpanClassifier(mf) and ggufEncoderHasQuantizedTensors(store);
     if (keep_gliner_q8) {
         const identity = gliner_decision_identity orelse return error.UnsupportedGlinerDecisionArtifact;
         if (try gliner_decide_qualification.require(identity) != .decide_1b) return error.UnsupportedGlinerDecisionArtifact;
@@ -1187,7 +1186,7 @@ fn createNativeSessionForCudaUpload(
         // CUDA transfers the resident inventory and closes this host session.
         // EmbeddingGemma 2's CPU lazy weights must be materialized here so its
         // encoder and media towers remain available after that handoff.
-        const cuda_embedding_gemma2_upload = retain_gliner_q8 and arch_config == .embedding_gemma2;
+        const cuda_embedding_gemma2_upload = for_cuda_upload and arch_config == .embedding_gemma2;
         if (!cuda_embedding_gemma2_upload and shouldLazyLoadWeight(store.kind(), arch_config, key)) {
             if (lazy_weights.contains(key)) {
                 continue;
@@ -1305,7 +1304,7 @@ fn createNativeSessionForCudaUpload(
     };
 
     const task = sessionTaskForModelType(mf.model_type, override);
-    const glide_head = try loadGlideHead(allocator, mf, model_path, arch_config, .native);
+    const glide_head = try loadGlideHead(allocator, mf, model_path, arch_config, if (for_cuda_upload) .cuda else .native);
     // Owned here until `errdefer archClose(impl)` takes over (archClose
     // destroys the session's head).
     var glide_head_owned = true;
@@ -2103,14 +2102,17 @@ fn createCudaSessionWithRequiredProfile(
 
     if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
-    cuda_compute.strict_f32_weights = cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert or model_manifest.gliner_specialty_profile != null;
+    cuda_compute.glide_cuda = model_manifest.glide_declared;
+    const glide_fp32 = model_manifest.glide_declared and platform.env.getenvBool("ANTFLY_GLIDE_CUDA_FP32");
+    cuda_compute.strict_f32_weights = glide_fp32 or (!model_manifest.glide_declared and (cuda_profile == .laya or cuda_profile == .gliner25_boundary or cuda_profile == .gliner25_modern_bert or model_manifest.gliner_specialty_profile != null));
     cuda_compute.qualified_span_fp32 = model_manifest.gliner_specialty_profile != null;
     if (model_manifest.gliner_specialty_profile) |profile| {
         std.log.info("gliner_specialty_cuda_policy profile={s} weights=f32 attention=f32 diagnostic_overrides=ignored", .{@tagName(profile)});
     }
     cuda_compute.gliner_encoder_attention = cuda_profile == .gliner25_modern_bert;
     cuda_compute.gliner_boundary_inference = cuda_profile == .gliner25_boundary;
-    cuda_compute.gliner_mixed_attention = cuda_compute.gliner_encoder_attention and (gliner_precision == .fp16 or gliner_precision == .bf16);
+    cuda_compute.gliner_mixed_attention = cuda_compute.gliner_encoder_attention and
+        ((model_manifest.glide_declared and !glide_fp32) or gliner_precision == .fp16 or gliner_precision == .bf16);
     cuda_compute.gliner_q8_f16_mirrors = cuda_compute.gliner_encoder_attention and
         native_impl.gliner_decision_identity != null and !native_impl.gliner_decision_identity.?.inventory.all_f32 and
         platform.env.getenvBool("ANTFLY_CUDA_GLINER_1B_Q8_F16_MIRRORS");
@@ -2155,8 +2157,12 @@ fn createCudaSessionWithRequiredProfile(
     for (resident_uploads.items) |upload| {
         if (upload.mmap_bytes) |bytes| c_file.MmapRegion.adviseBytesSequential(bytes);
         const owned_key = try allocator.dupe(u8, upload.key);
-        uploadGlinerCudaWeight(&cuda_compute, owned_key, upload.loaded, gliner_precision) catch |err| {
-            allocator.free(owned_key);
+        const uploaded = if (model_manifest.glide_declared)
+            uploadGlideCudaWeight(&cuda_compute, owned_key, upload.loaded, !glide_fp32)
+        else
+            uploadGlinerCudaWeight(&cuda_compute, owned_key, upload.loaded, gliner_precision);
+        uploaded catch |err| {
+            if (!model_manifest.glide_declared) allocator.free(owned_key);
             return err;
         };
     }
@@ -2252,6 +2258,51 @@ fn createCudaSessionWithRequiredProfile(
     }
     if (debug_cuda_session) std.log.info("cuda-session: return session path={s}", .{model_path});
     return .{ .ptr = impl, .vtable = &arch_vtable };
+}
+
+/// Keep one compact projection copy. F16 operands retain more activation
+/// mantissa than BF16 while the residual stream and readout remain F32.
+fn isGlideProjectionWeight(name: []const u8, rank: usize) bool {
+    return rank == 2 and (std.mem.startsWith(u8, name, "model.layers.") or
+        std.mem.startsWith(u8, name, "model.language_model.layers.")) and std.mem.endsWith(u8, name, ".weight");
+}
+
+fn uploadGlideCudaWeight(compute: *cuda_compute_mod.CudaCompute, name: []const u8, loaded: *const LoadedWeight, mixed: bool) !void {
+    var transferred = false;
+    errdefer if (!transferred) compute.allocator.free(name);
+    if (loaded.quantized or loaded.quantized_storage != null) return error.UnsupportedGlideCheckpoint;
+    const projection = mixed and isGlideProjectionWeight(name, loaded.tensor.shape.len);
+    if (mixed and !projection and loaded.tensor.shape.len >= 2 and loaded.tensor.dtype == .bf16) {
+        transferred = true;
+        return compute.insertGlideWeightFromTensor(name, &loaded.tensor);
+    }
+    var converted = try weight_source_mod.convertToF32(compute.allocator, &loaded.tensor);
+    defer converted.deinit();
+    if (!projection) {
+        transferred = true;
+        return compute.insertGlideWeightFromTensor(name, &converted);
+    }
+    const values = converted.asFloat32();
+    const half = try compute.allocator.alloc(f16, values.len);
+    defer compute.allocator.free(half);
+    for (values, half) |value, *dest| {
+        dest.* = @floatCast(value);
+        if (!std.math.isFinite(dest.*)) return error.UnsupportedGlideCheckpoint;
+    }
+    var tensor = converted;
+    tensor.dtype = .f16;
+    tensor.data = std.mem.sliceAsBytes(half);
+    transferred = true;
+    return compute.insertGlideWeightFromTensor(name, &tensor);
+}
+
+test "GLiDE CUDA compact projections recognize encoder and wrapped decoder names" {
+    try std.testing.expect(isGlideProjectionWeight("model.layers.0.mlp.Wi.weight", 2));
+    try std.testing.expect(isGlideProjectionWeight("model.language_model.layers.0.linear_attn.in_proj_qkv.weight", 2));
+    try std.testing.expect(!isGlideProjectionWeight("model.language_model.layers.0.linear_attn.conv1d.weight", 3));
+    try std.testing.expect(!isGlideProjectionWeight("model.language_model.layers.0.input_layernorm.weight", 1));
+    try std.testing.expect(!isGlideProjectionWeight("model.language_model.embed_tokens.weight", 2));
+    try std.testing.expect(!isGlideProjectionWeight("glide_readout.weight", 2));
 }
 
 fn uploadGlinerCudaWeight(compute: anytype, name: []const u8, loaded: *const LoadedWeight, precision: GlinerCudaPrecision) !void {
@@ -2391,6 +2442,12 @@ fn cudaProfileForArch(
         .modern_bert => |cfg| blk: {
             if (cfg.num_attention_heads == 0 or cfg.hidden_size % cfg.num_attention_heads != 0) break :blk null;
             const head_dim = cfg.hidden_size / cfg.num_attention_heads;
+            // GLiDE shares ModernBERT's device operator contract; its prompt
+            // and readout remain independent of the GLiNER extraction path.
+            if (model_manifest.glide_declared and !model_manifest.glide_unsupported and
+                model_manifest.glide_backbone == .encoder and head_dim == 64 and
+                cfg.hidden_size == 1024 and cfg.intermediate_size == 2624 and cfg.num_hidden_layers == 28 and
+                cfg.max_position_embeddings > 0 and cfg.max_position_embeddings <= 8192) break :blk .gliner25_modern_bert;
             if (task == .extractor and model_manifest.gliner_architecture == .span and
                 model_manifest.gliner_span_encoder_family == .modern_bert and
                 cfg.max_position_embeddings > 0 and cfg.max_position_embeddings <= 8192 and
@@ -2419,7 +2476,16 @@ fn cudaProfileForArch(
                 .qwen3_vl_generation
             else
                 null,
-            .qwen3_5 => if (task == .generic and model_manifest.isLightOnOcr3() and
+            .qwen3_5 => if (model_manifest.glide_declared and !model_manifest.glide_unsupported and
+                model_manifest.glide_backbone == .decoder and cfg.num_hidden_layers == 24 and
+                cfg.num_attention_heads == 8 and cfg.effectiveKVHeads() == 2 and cfg.headDim() == 256 and
+                cfg.qwen35_linear_num_key_heads == 16 and cfg.qwen35_linear_num_value_heads == 16 and
+                ((cfg.hidden_size == 1024 and cfg.intermediate_size == 3584) or
+                    (cfg.hidden_size == 2048 and cfg.intermediate_size == 6144)) and
+                cfg.qwen35_linear_key_head_dim == 128 and cfg.qwen35_linear_value_head_dim == 128 and
+                cfg.qwen35_linear_conv_kernel_dim == 4)
+                .lightonocr3
+            else if (task == .generic and model_manifest.isLightOnOcr3() and
                 cfg.hasQwen35VisionArchitectureContract() and
                 cfg.qwen35_linear_key_head_dim == 128 and cfg.qwen35_linear_value_head_dim == 128 and
                 cfg.qwen35_linear_conv_kernel_dim == 4)
@@ -10456,14 +10522,14 @@ fn archRunWithControl(
 }
 
 /// The Qwen3.5 GLiDE decoder (bidirectional full attention + packed
-/// Gated-DeltaNet) is implemented for Metal only. Constructors call this
+/// Gated-DeltaNet) is implemented for Metal and CUDA. Constructors call this
 /// before loading weights so backend selection moves on cheaply, instead of
 /// loading a checkpoint (or publishing a session whose every run fails). The
 /// ModernBERT encoder runs on every backend.
 fn requireGlideBackend(mf: manifest_mod.ModelManifest, backend: BackendType) !void {
     if (!mf.glide_declared) return;
     if (mf.glide_unsupported) return error.UnsupportedGlideCheckpoint;
-    if (mf.glide_backbone == .decoder and backend != .metal) return error.GlideDecoderRequiresMetal;
+    if (mf.glide_backbone == .decoder and backend != .metal and backend != .cuda) return error.GlideDecoderRequiresGpu;
 }
 
 fn loadGlideHead(allocator: std.mem.Allocator, mf: manifest_mod.ModelManifest, model_path: []const u8, arch_config: ArchConfig, backend: BackendType) !?*glide_mod.Head {
@@ -10531,6 +10597,13 @@ fn runGlideReadout(
         if (index < 0 or index >= @as(i64, @intCast(seq_len))) return error.InvalidGlideReadoutIndex;
         if (attention_mask[row * seq_len + @as(usize, @intCast(index))] != 1) return error.InvalidGlideReadoutIndex;
     }
+
+    if (comptime build_options.enable_cuda) if (cb.kind() == .cuda) {
+        var real_tokens: usize = 0;
+        for (attention_mask) |value| real_tokens += @intFromBool(value == 1);
+        const compute: *cuda_compute_mod.CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        try compute.prepareGlideRequest(.{ batch, seq_len, real_tokens });
+    };
 
     const hidden_rows = switch (self.arch_config) {
         .modern_bert => |cfg| try glide_encoder.readoutHidden(cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, readout_index),
@@ -11925,7 +11998,7 @@ fn glideRunGeometry(self: *const ArchSession, batch: usize, sequence: usize) !@i
     // of the FFN peak; the F32 fallback MLP is the larger case (~17.7 H/token
     // at the 0.4B geometry).
     const encoder_floats = dims.hidden * 8 + @max(dims.hidden * 6, dims.hidden * 2 + dims.intermediate * 3);
-    const floats = if (dims.decoder) @max(dims.hidden * 6, dims.hidden * 2 + dims.intermediate * 3, dims.hidden * 20) else encoder_floats;
+    const floats = if (dims.decoder) @max(dims.hidden * 6, dims.hidden * 2 + dims.intermediate * 3, dims.hidden * 20, if (self.backend_type == .cuda) @as(usize, 32768) else 0) else encoder_floats;
     const activations = mul(usize, mul(usize, tokens, floats) catch return error.ResourceLimitExceeded, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
     // Decoder: bounded dense-attention workspace plus a per-row quadratic term.
     // Measured peak footprints on Metal (single row): 1.26 GB @ 10k tokens,
@@ -11935,7 +12008,19 @@ fn glideRunGeometry(self: *const ArchSession, batch: usize, sequence: usize) !@i
     // The dense attention planner's workspace (one query tile of scores over
     // the widest row plus packed K/V and Q/O tiles) is capped at 256 MiB, but
     // short rows need only a few MiB, so they are not charged the cap.
-    const attention: usize = if (dims.decoder) blk: {
+    const attention: usize = if (dims.decoder and self.backend_type == .cuda) blk: {
+        // Bound both tile sizes: a shorter row in a mixed batch can use a
+        // larger query tile than its longest row.
+        const tile = @min(tokens, 256);
+        const padded_sequence = (std.math.add(usize, sequence, 15) catch return error.ResourceLimitExceeded) & ~@as(usize, 15);
+        const packed_kv = mul(usize, padded_sequence, dims.kv_heads * dims.head_dim * 4) catch return error.ResourceLimitExceeded;
+        const query_and_output = mul(usize, tile, dims.heads * dims.head_dim * 6) catch return error.ResourceLimitExceeded;
+        const scores = mul(usize, mul(usize, tile, padded_sequence) catch return error.ResourceLimitExceeded, dims.heads * 6) catch return error.ResourceLimitExceeded;
+        const dense = std.math.add(usize, std.math.add(usize, packed_kv, query_and_output) catch return error.ResourceLimitExceeded, scores) catch return error.ResourceLimitExceeded;
+        // 18 independent layer states (history plus 128x128x16 recurrence),
+        // norm snapshots and staging/vendor workspace fit the constant term.
+        break :blk std.math.add(usize, 64 * 1024 * 1024, @min(std.math.add(usize, dense, 1536) catch return error.ResourceLimitExceeded, glide_decoder.gemm_attention_workspace_cap)) catch return error.ResourceLimitExceeded;
+    } else if (dims.decoder) blk: {
         const square = mul(usize, sequence, sequence) catch return error.ResourceLimitExceeded;
         const tile = @min(tokens, 512);
         const scores = if (sequence > 1 << 20) glide_decoder.gemm_attention_workspace_cap else @min(
@@ -13400,4 +13485,65 @@ test "Jina legacy adapter discovery owns incomplete pair cleanup" {
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     try std.testing.expectError(error.IncompleteJinaV5Adapter, jinaRetrievalAdapterPaths(a, root, .{ .allocator = a }));
+}
+
+test "GLiDE CUDA qualification admits supported decoder sizes and rejects incompatible heads" {
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .glide_declared = true,
+        .glide_backbone = .decoder,
+    };
+    var cfg = gpt_mod.Config{
+        .family = .qwen3_5,
+        .hidden_size = 1024,
+        .intermediate_size = 3584,
+        .num_hidden_layers = 24,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+        .qwen35_linear_key_head_dim = 128,
+        .qwen35_linear_value_head_dim = 128,
+        .qwen35_linear_num_key_heads = 16,
+        .qwen35_linear_num_value_heads = 16,
+        .qwen35_linear_conv_kernel_dim = 4,
+    };
+    try requireGlideBackend(manifest, .cuda);
+    try requireGlideBackend(manifest, .metal);
+    try std.testing.expectError(error.GlideDecoderRequiresGpu, requireGlideBackend(manifest, .native));
+    try std.testing.expectEqual(CudaCapabilityProfile.lightonocr3, cudaProfileForArch(.{ .gpt = cfg }, .generic, &manifest).?);
+    cfg.hidden_size = 2048;
+    cfg.intermediate_size = 6144;
+    try std.testing.expectEqual(CudaCapabilityProfile.lightonocr3, cudaProfileForArch(.{ .gpt = cfg }, .generic, &manifest).?);
+    cfg.attention_head_dim = 128;
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = cfg }, .generic, &manifest) == null);
+    cfg.attention_head_dim = 256;
+    manifest.glide_unsupported = true;
+    try std.testing.expectError(error.UnsupportedGlideCheckpoint, requireGlideBackend(manifest, .cuda));
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = cfg }, .generic, &manifest) == null);
+    manifest.glide_unsupported = false;
+    manifest.glide_declared = false;
+    try std.testing.expect(cudaProfileForArch(.{ .gpt = cfg }, .generic, &manifest) == null);
+}
+
+test "GLiDE CUDA admission covers chunk scratch and bounds long attention" {
+    var session: ArchSession = undefined;
+    session.backend_type = .cuda;
+    session.arch_config = .{ .gpt = .{
+        .family = .qwen3_5,
+        .hidden_size = 1024,
+        .intermediate_size = 3584,
+        .num_hidden_layers = 24,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .attention_head_dim = 256,
+    } };
+    for ([_]usize{ 1, 257, 5129, 40000 }) |sequence| {
+        const geometry = try glideRunGeometry(&session, 2, sequence);
+        const chunk = try @import("../ops/cuda/glide_delta.zig").layout(sequence, 16);
+        const ordinary = 2 * sequence * 20 * 1024 * @sizeOf(f32);
+        try std.testing.expect(geometry.workspace_bytes >= ordinary + (if (sequence >= 256) chunk.total else 0) + 64 * 1024 * 1024);
+        try std.testing.expect(geometry.workspace_bytes <= 2 * sequence * 128 * 1024 + 320 * 1024 * 1024);
+        try std.testing.expectEqual(@as(usize, 2 * glide_mod.max_options * @sizeOf(f32) + 2 * @sizeOf(i64)), geometry.output_bytes);
+    }
+    try std.testing.expectError(error.ResourceLimitExceeded, glideRunGeometry(&session, std.math.maxInt(usize), 2));
 }

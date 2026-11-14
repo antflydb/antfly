@@ -25703,6 +25703,7 @@ pub const Node = struct {
             error.GlideDecisionConfigNotFound,
             error.UnsupportedGlideCheckpoint,
             error.GlideDecoderRequiresMetal,
+            error.GlideDecoderRequiresGpu,
             => ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) }),
             else => extractionV2FailureResponse(ctx, err, .{}),
         };

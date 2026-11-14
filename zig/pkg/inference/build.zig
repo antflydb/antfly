@@ -1577,12 +1577,30 @@ pub fn build(b: *std.Build) void {
     runtime_graph.identities.addImports(glide_bench_exe.root_module);
     configureNativeTool(b, glide_bench_exe, target, enable_system_blas, blas_root, false);
     const install_glide_bench = b.addInstallArtifact(glide_bench_exe, .{});
+    glide_bench_exe.root_module.strip = strip;
     const glide_bench_install_step = b.step("glide-bench", "Build the GLiDE parity/throughput benchmark");
     glide_bench_install_step.dependOn(&install_glide_bench.step);
     const run_glide_bench = b.addRunArtifact(glide_bench_exe);
     run_glide_bench.addPassthruArgs();
     const glide_bench_step = b.step("bench-glide", "Run GLiDE decision backbone parity/throughput benchmark over a reference fixture");
     glide_bench_step.dependOn(&run_glide_bench.step);
+    const glide_cuda_tests = b.addTest(.{
+        .name = "glide-cuda-tests",
+        .max_rss = 6 * 1024 * 1024 * 1024,
+        .filters = &.{"GLiDE CUDA"},
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_glide_cuda.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    var glide_test_imports = inference_internal_mod.import_table.iterator();
+    glide_cuda_tests.root_module.strip = strip;
+    while (glide_test_imports.next()) |entry|
+        glide_cuda_tests.root_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    configureNativeTool(b, glide_cuda_tests, target, enable_system_blas, blas_root, false);
+    b.step("test-glide-cuda", "Run focused GLiDE CUDA qualification and operator regressions").dependOn(&b.addRunArtifact(glide_cuda_tests).step);
     // GLiDE config, prompt, token-wrap and public-contract tests without the
     // model runtime. ANTFLY_GLIDE_REFERENCE enables reference prompt/id parity.
     const glide_tests = b.addTest(.{

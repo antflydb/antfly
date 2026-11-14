@@ -12279,10 +12279,10 @@ fn loadSessionForPreferredBackendsWithArtifacts(
             rememberPreferredLoadError(&first_err, error.A4bRequiresGpu);
             continue;
         }
-        // GLiDE decoders are Metal-only. Skip other backends before artifact
+        // GLiDE decoders require Metal or CUDA. Skip CPU backends before artifact
         // verification and load admission reserve their weights.
-        if (man.glide_declared and man.glide_backbone == .decoder and backend != .metal) {
-            rememberPreferredLoadError(&first_err, error.GlideDecoderRequiresMetal);
+        if (man.glide_declared and man.glide_backbone == .decoder and backend != .metal and backend != .cuda) {
+            rememberPreferredLoadError(&first_err, error.GlideDecoderRequiresGpu);
             continue;
         }
         if (source_session_manager.kernel_jit.mode.failClosed() and

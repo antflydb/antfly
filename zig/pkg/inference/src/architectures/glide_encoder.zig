@@ -15,7 +15,7 @@
 
 //! GLiDE encoder backbone (ModernBERT). Every layer is bidirectional over the
 //! row's real tokens; local layers use the +-64 token window. Right-padded rows
-//! take the padding-free row-segment attention path on Metal.
+//! take the padding-free row-segment attention path on Metal and CUDA.
 //!
 //! GLiDE-only Metal execution (ModernBERT `Config.glide`; other callers keep
 //! their routes):
@@ -25,6 +25,9 @@
 //!     rows only (`modern_bert.forwardReadoutCT`).
 //! `ANTFLY_GLIDE_DISABLE_{ROW_FLASH,F16_LINEARS,TAIL_PRUNE}` restore the
 //! generic route for each, for A/B qualification.
+//! CUDA uses compact F16 projection weights with F32 accumulation, per-row
+//! ModernBERT attention, and readout-only final output projection/MLP.
+//! `ANTFLY_GLIDE_CUDA_DISABLE_ENCODER_PACKING` restores padded CUDA execution.
 
 const std = @import("std");
 const platform = @import("antfly_platform");

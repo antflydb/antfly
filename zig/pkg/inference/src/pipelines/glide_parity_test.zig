@@ -39,7 +39,7 @@ const Capture = struct {
 
 /// `trunc04_tokens.json` holds over-long encoder prompts (head/tail
 /// truncation) with whitespace runs that hit ModernBERT's added space tokens.
-pub const fixture_names = [_][]const u8{ "fix04_cpu_fp32.json", "fix08_cpu_fp32.json", "fix2b_cpu_fp32.json", "trunc04_tokens.json" };
+pub const fixture_names = [_][]const u8{ "fix04_cpu_fp32.json", "fix08_cpu_fp32.json", "fix2b_cpu_fp32.json", "fix04_cuda_fp32.json", "fix08_cuda_fp32.json", "fix2b_cuda_fp32.json", "trunc04_tokens.json" };
 
 pub fn referenceDir() ![]const u8 {
     return platform.env.getenv("ANTFLY_GLIDE_REFERENCE") orelse {
@@ -101,7 +101,10 @@ test "GLiDE prompts and token ids match the Python reference exactly" {
         try std.testing.expectEqual(index, ids_ok);
         checked += 1;
     }
-    if (checked == 0) return error.SkipZigTest;
+    if (checked == 0) {
+        if (platform.env.getenvBoolDefault("ANTFLY_GLIDE_REQUIRE_TESTS", false)) return error.MissingGlideFixture;
+        return error.SkipZigTest;
+    }
 }
 
 test "GLiDE encoder wrap truncates head and tail around special tokens" {

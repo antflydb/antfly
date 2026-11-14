@@ -33,7 +33,7 @@ const native_backend_guard = inference.native_backend_guard;
 const metal_runtime = inference.metal_runtime;
 const Tensor = backends.Tensor;
 
-const BackendChoice = enum { native, metal };
+const BackendChoice = enum { native, metal, cuda };
 const Mode = enum { single, batched, both };
 
 const Options = struct {
@@ -46,6 +46,8 @@ const Options = struct {
     measure_iters: usize = 3,
     only: ?[]usize = null,
     verbose: bool = false,
+    max_dlogit: f64 = std.math.inf(f64),
+    max_dprob: f64 = std.math.inf(f64),
 };
 
 const Prompt = struct {
@@ -62,6 +64,8 @@ const Stats = struct {
     count: usize = 0,
 
     fn add(self: *Stats, got: []const f32, want: []const f32, n: usize, temperature: f64) !void {
+        for (got) |value| if (!std.math.isFinite(value)) return error.NonFiniteGlideLogit;
+        for (want) |value| if (!std.math.isFinite(value)) return error.NonFiniteGlideReference;
         var p_got: [glide.max_options]f64 = undefined;
         var p_want: [glide.max_options]f64 = undefined;
         try glide.optionProbabilities(got, n, temperature, p_got[0..n]);
@@ -97,6 +101,7 @@ pub fn main(init: std.process.Init) !void {
     if (opts.only) |only| {
         for (only) |i| if (i < parsed.value.prompts.len) try selected.append(allocator, i);
     } else for (0..parsed.value.prompts.len) |i| try selected.append(allocator, i);
+    if (selected.items.len == 0) return error.EmptyGlideBenchmark;
     const prompts = parsed.value.prompts;
 
     var decision = try glide.loadDecisionConfig(allocator, opts.model_dir);
@@ -106,6 +111,12 @@ pub fn main(init: std.process.Init) !void {
     session_manager.preferred_backends = switch (opts.backend) {
         .native => &.{backends.BackendType.native},
         .metal => &.{backends.BackendType.metal},
+        .cuda => &.{backends.BackendType.cuda},
+    };
+    session_manager.required_backend = switch (opts.backend) {
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
     };
     const load_start = nowNs();
     const session = session_manager.loadModel(opts.model_dir) catch |err| {
@@ -155,6 +166,7 @@ pub fn main(init: std.process.Init) !void {
             @as(f64, @floatFromInt(total_tokens)) / nsToS(sum_median_ns), stats.max_dlogit, stats.max_dprob,
             stats.flips,
         });
+        if (stats.flips != 0 or stats.max_dlogit > opts.max_dlogit or stats.max_dprob > opts.max_dprob) return error.GlideParityFailed;
     }
 
     if (opts.mode == .batched or opts.mode == .both) {
@@ -206,6 +218,7 @@ pub fn main(init: std.process.Init) !void {
             @as(f64, @floatFromInt(stats.count)) / nsToS(median), stats.max_dlogit,  stats.max_dprob,
             stats.flips,
         });
+        if (stats.flips != 0 or stats.max_dlogit > opts.max_dlogit or stats.max_dprob > opts.max_dprob) return error.GlideParityFailed;
     }
 }
 
@@ -248,6 +261,7 @@ fn runBatch(allocator: std.mem.Allocator, session: backends.Session, decision: g
 }
 
 fn ensureBackendAvailable(backend: BackendChoice) !void {
+    if (backend == .cuda and !build_options.enable_cuda) return error.CudaNotBuilt;
     if (backend != .metal) return;
     if (native_backend_guard.checkMetal(build_options.enable_metal, metal_runtime.metalDeviceAvailable())) |failure| {
         native_backend_guard.printFailure(failure);
@@ -279,6 +293,12 @@ fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init) !Options {
             var it = std.mem.splitScalar(u8, args.next() orelse return error.InvalidArguments, ',');
             while (it.next()) |part| try list.append(allocator, try std.fmt.parseInt(usize, part, 10));
             opts.only = try list.toOwnedSlice(allocator);
+        } else if (std.mem.eql(u8, arg, "--max-dlogit")) {
+            opts.max_dlogit = try std.fmt.parseFloat(f64, args.next() orelse return error.InvalidArguments);
+            if (!std.math.isFinite(opts.max_dlogit) or opts.max_dlogit < 0) return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--max-dprob")) {
+            opts.max_dprob = try std.fmt.parseFloat(f64, args.next() orelse return error.InvalidArguments);
+            if (!std.math.isFinite(opts.max_dprob) or opts.max_dprob < 0) return error.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             opts.verbose = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -312,7 +332,7 @@ fn nsToS(ns: u64) f64 {
 
 fn printUsage() void {
     std.debug.print(
-        "usage: zig build bench-glide -Doptimize=ReleaseFast -- --model-dir <GLiDE dir> --fixture <reference.json> [--backend metal|native] [--mode single|batched|both] [--budget 16384] [--warmup 1] [--iters 3] [--only 0,3,5]\n",
+        "usage: zig build bench-glide -Doptimize=fast -- --model-dir <GLiDE dir> --fixture <reference.json> [--backend metal|native|cuda] [--mode single|batched|both] [--budget 16384] [--warmup 1] [--iters 3] [--only 0,3,5] [--max-dlogit N] [--max-dprob N]\n",
         .{},
     );
 }

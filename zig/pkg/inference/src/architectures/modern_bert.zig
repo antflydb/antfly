@@ -541,7 +541,8 @@ fn forwardImpl(
     // `[heads, seq, seq]` bias per layer, and every linear would multiply the
     // padding rows too.
     const row_segments = if (packed_row == null and branches == null and capture == null and
-        ((cb.kind() == .metal and metalRowSegmentsEnabled()) or cb.kind() == .native))
+        ((cb.kind() == .metal and metalRowSegmentsEnabled()) or cb.kind() == .native or
+            (cb.kind() == .cuda and readout != null and !platform.env.getenvBool("ANTFLY_GLIDE_CUDA_DISABLE_ENCODER_PACKING"))))
         try rowSegments(allocator, input_ids, attention_mask, batch, seq_len)
     else
         null;
@@ -801,7 +802,7 @@ fn encoderLayer(
     }
     const attn_out = if (packed_row) |row|
         try packedAttention(cb, allocator, Q, joined[0] orelse K, joined[1] orelse qkv.v, row, if (is_global) std.math.maxInt(u32) else config.local_attention_window / 2, total, seq_len, num_heads, head_dim)
-    else if (!is_global and cb.kind() == .cuda)
+    else if (!is_global and cb.kind() == .cuda and row_segments == null)
         (try cb.encoderLocalAttention(Q, K, qkv.v, attention_mask, batch, seq_len, num_heads, head_dim, config.local_attention_window / 2)) orelse return error.UnsupportedLayaBackend
     else if (row_segments) |rows|
         try cb.segmentAttention(allocator, Q, K, qkv.v, &.{
@@ -1027,7 +1028,15 @@ fn finishLayer(
     else
         null;
     defer if (glide_activated) |activated| cb.free(activated);
-    const ffn_out = if (glide_activated) |activated|
+    const cuda_glide_ffn = if (cb.kind() == .cuda and config.glide.f16_linears and
+        config.checkpoint_layout == .huggingface_fused_qkv_no_bias and
+        !platform.env.getenvBool("ANTFLY_GLIDE_CUDA_DISABLE_TILED_FFN"))
+        try glideCudaGeGluFfn(cb, normed_ffn, Wi_w, Wo_w, total, H, intermediate)
+    else
+        null;
+    const ffn_out = if (cuda_glide_ffn) |output|
+        output
+    else if (glide_activated) |activated|
         try linearNoBiasWithSlot(cb, activated, Wo_w, total, intermediate, H, modernBertLinearSlot(layer_idx, .ffn_out))
     else
         try geGluFfn(
@@ -1193,6 +1202,61 @@ fn linearNoBiasWithSlot(
 // Keep the gate/value split on the active backend. Metal exposes device-side
 // last-dimension slicing, exact GELU, and multiplication, avoiding a
 // per-layer download and re-upload of the large gated projection.
+
+/// GLiDE's CUDA encoder keeps the large GeGLU projection bounded by a token
+/// tile. Other ModernBERT callers retain their existing execution path.
+fn glideCudaGeGluFfn(cb: *const ComputeBackend, input: CT, wi: CT, wo: CT, rows: usize, hidden: usize, intermediate: usize) !?CT {
+    if (rows <= 1024) return null;
+    const slice = cb.vtable.sliceRows2D orelse return null;
+    const copy = cb.vtable.copyRows2D orelse return null;
+    const output = (try cb.allocUninitF32Shape(&.{ @intCast(rows), @intCast(hidden) })) orelse return null;
+    errdefer cb.free(output);
+    var first: usize = 0;
+    while (first < rows) : (first += 1024) {
+        try cb.checkExecutionControl();
+        const count = @min(rows - first, 1024);
+        const input_rows = try slice(cb.ptr, input, first, count, hidden);
+        defer cb.free(input_rows);
+        const result = try geGluFfn(cb, input_rows, wi, wo, count, hidden, intermediate, true, null, null);
+        defer cb.free(result);
+        if (!try copy(cb.ptr, output, first, result, 0, count, hidden)) return error.UnsupportedOperation;
+    }
+    return output;
+}
+
+test "GLiDE CUDA encoder GeGLU tiles preserve row tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try @import("../ops/cuda/cuda_compute.zig").CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const hidden = 64;
+    const intermediate = 96;
+    var wi: [2 * intermediate * hidden]f32 = undefined;
+    var wo: [hidden * intermediate]f32 = undefined;
+    for (&wi, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.17) * 0.05;
+    for (&wo, 0..) |*value, i| value.* = @cos(@as(f32, @floatFromInt(i)) * 0.21) * 0.05;
+    const wi_ct = try cb.fromFloat32Shape(&wi, &.{ 2 * intermediate, hidden });
+    defer cb.free(wi_ct);
+    const wo_ct = try cb.fromFloat32Shape(&wo, &.{ hidden, intermediate });
+    defer cb.free(wo_ct);
+    for ([_]usize{ 1025, 2049 }) |rows| {
+        const values = try a.alloc(f32, rows * hidden);
+        defer a.free(values);
+        for (values, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.037);
+        const input = try cb.fromFloat32Shape(values, &.{ @intCast(rows), hidden });
+        defer cb.free(input);
+        const expected = try geGluFfn(&cb, input, wi_ct, wo_ct, rows, hidden, intermediate, true, null, null);
+        defer cb.free(expected);
+        const actual = (try glideCudaGeGluFfn(&cb, input, wi_ct, wo_ct, rows, hidden, intermediate)).?;
+        defer cb.free(actual);
+        const want = try cb.toFloat32(expected, a);
+        defer a.free(want);
+        const got = try cb.toFloat32(actual, a);
+        defer a.free(got);
+        for (want, got) |reference, value| try std.testing.expectApproxEqAbs(reference, value, 2e-5);
+    }
+}
 
 fn geGluFfn(
     cb: *const ComputeBackend,

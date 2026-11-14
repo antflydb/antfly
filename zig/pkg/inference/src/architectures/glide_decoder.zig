@@ -21,10 +21,11 @@
 //! Rows are packed without padding into one [N, hidden] activation: every
 //! dense projection and FFN runs once over all N real tokens, attention is
 //! segment-restricted to each row's own keys, and each DeltaNet recurrence
-//! runs over its row's contiguous token range from a zero history (all rows
-//! in one packed-core dispatch). The whole stack is one Metal frame, and the
+//! runs over its row's contiguous token range from a zero history. Metal uses
+//! one packed-core dispatch; CUDA launches each independent row. The
 //! final layer computes queries, attention and FFN only for the readout rows.
-//! Activations stay F32 end to end (BF16 weights, F32 accumulation).
+//! Activations stay F32 end to end. CUDA stores projection weights and tensor
+//! core operands in F16 with F32 accumulation; Metal preserves BF16 weights.
 //!
 //! Debug knobs: ANTFLY_GLIDE_DECODER_PROFILE (timings),
 //! ANTFLY_GLIDE_DECODER_DUMP=<file> (per-layer readout rows, raw f32),
@@ -39,6 +40,9 @@ const ops = @import("../ops/ops.zig");
 const gpt_mod = @import("../models/gpt.zig");
 const gpt_arch = @import("gpt.zig");
 const metal_compute_mod = @import("../ops/metal_compute.zig");
+const CudaLinearState = if (build_options.enable_cuda) @import("../ops/cuda/lighton_recurrent.zig").State else struct {
+    fn deinit(_: *@This()) void {}
+};
 
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
@@ -315,6 +319,8 @@ const Forward = struct {
 
         var linear_states: [64]metal_compute_mod.Qwen35LinearState = @splat(.{});
         defer for (&linear_states) |*state| state.deinit();
+        var cuda_states: [64]CudaLinearState = @splat(.{});
+        defer for (&cuda_states) |*state| state.deinit();
         if (self.config.num_hidden_layers > linear_states.len) return error.UnsupportedGlideBackbone;
 
         // One command-buffer frame for the whole stack: per-layer submit/wait
@@ -348,7 +354,7 @@ const Forward = struct {
             // The readout needs only the final layer's readout rows: its
             // keys/values (or recurrence) still span every token.
             const prune = last and !platform.env.getenvBool("ANTFLY_GLIDE_DECODER_NO_PRUNE");
-            const next = try self.decoderLayer(hidden, layer, &linear_states[layer], prune);
+            const next = try self.decoderLayer(hidden, layer, &linear_states[layer], &cuda_states[layer], prune);
             cb.free(hidden);
             hidden = next;
             hidden_rows = if (prune) self.plan.batch else n;
@@ -415,7 +421,7 @@ const Forward = struct {
 
     /// One decoder layer over all packed tokens. With `prune`, only the
     /// readout rows leave the token mixer: the result is [batch, hidden].
-    fn decoderLayer(self: *Forward, hidden: CT, layer: usize, state: *metal_compute_mod.Qwen35LinearState, prune: bool) !CT {
+    fn decoderLayer(self: *Forward, hidden: CT, layer: usize, state: *metal_compute_mod.Qwen35LinearState, cuda_state: *CudaLinearState, prune: bool) !CT {
         const cb = self.cb;
         const hidden_size: usize = self.config.hidden_size;
         const intermediate: usize = self.config.intermediate_size;
@@ -426,7 +432,7 @@ const Forward = struct {
             defer cb.free(normed);
             if (!self.config.layerUsesQwen35LinearAttention(layer))
                 break :blk try self.fullAttention(normed, layer, if (prune) self.plan.readout() else self.plan.all());
-            const all_rows = try self.linearAttention(normed, layer, state);
+            const all_rows = try self.linearAttention(normed, layer, state, cuda_state);
             if (!prune) break :blk all_rows;
             defer cb.free(all_rows);
             break :blk try self.gatherReadout(all_rows, hidden_size);
@@ -440,8 +446,20 @@ const Forward = struct {
         defer cb.free(attn_res);
 
         const ffn_in = try self.layerNorm(attn_res, layer, "post_attention_layernorm.weight");
+        defer cb.free(ffn_in);
+        if (cb.kind() == .cuda) {
+            const gate_weight = try self.weight(layer, "mlp.gate_proj.weight");
+            defer cb.free(gate_weight);
+            const up_weight = try self.weight(layer, "mlp.up_proj.weight");
+            defer cb.free(up_weight);
+            const down_weight = try self.weight(layer, "mlp.down_proj.weight");
+            defer cb.free(down_weight);
+            if (try cb.gatedFfnNoBias(&.{ .input = ffn_in, .gate_weight = gate_weight, .up_weight = up_weight, .down_weight = down_weight, .rows = rows, .hidden_size = hidden_size, .intermediate_size = intermediate, .activation = .silu })) |output| {
+                defer cb.free(output);
+                return cb.add(output, attn_res);
+            }
+        }
         const activated = blk: {
-            defer cb.free(ffn_in);
             const gate = try self.linear(ffn_in, rows, layer, "mlp.gate_proj.weight", hidden_size, intermediate);
             defer cb.free(gate);
             const up = try self.linear(ffn_in, rows, layer, "mlp.up_proj.weight", hidden_size, intermediate);
@@ -622,7 +640,7 @@ const Forward = struct {
         return joined;
     }
 
-    fn linearAttention(self: *Forward, normed: CT, layer: usize, state: *metal_compute_mod.Qwen35LinearState) !CT {
+    fn linearAttention(self: *Forward, normed: CT, layer: usize, state: *metal_compute_mod.Qwen35LinearState, cuda_state: *CudaLinearState) !CT {
         const cb = self.cb;
         const hidden_size: usize = self.config.hidden_size;
         const key_heads: usize = self.config.qwen35_linear_num_key_heads;
@@ -646,7 +664,19 @@ const Forward = struct {
                 .conv_dim = conv_dim,
             });
         }
-        return error.GlideDecoderRequiresMetal;
+        if (comptime build_options.enable_cuda) {
+            if (cb.kind() == .cuda) return self.linearAttentionCuda(normed, layer, cuda_state, .{
+                .hidden_size = hidden_size,
+                .key_heads = key_heads,
+                .value_heads = value_heads,
+                .key_head_dim = key_head_dim,
+                .value_head_dim = value_head_dim,
+                .conv_kernel = conv_kernel,
+                .value_dim = value_dim,
+                .conv_dim = conv_dim,
+            });
+        }
+        return error.GlideDecoderRequiresGpu;
     }
 
     const LinearDims = struct {
@@ -659,6 +689,87 @@ const Forward = struct {
         value_dim: usize,
         conv_dim: usize,
     };
+
+    fn linearAttentionCudaProjections(self: *Forward, normed: CT, layer: usize, dims: LinearDims) ![4]CT {
+        const names = .{ "linear_attn.in_proj_qkv.weight", "linear_attn.in_proj_z.weight", "linear_attn.in_proj_b.weight", "linear_attn.in_proj_a.weight" };
+        const widths = [_]usize{ dims.conv_dim, dims.value_dim, dims.value_heads, dims.value_heads };
+        const n = self.plan.tokens;
+        if (n >= 256 and n <= max_projection_rows and dims.conv_dim == 6144 and dims.value_dim == 2048 and dims.value_heads == 16) {
+            var weights: [4]CT = undefined;
+            var loaded: usize = 0;
+            defer for (weights[0..loaded]) |weight_ct| self.cb.free(weight_ct);
+            inline for (names, 0..) |name, i| {
+                weights[i] = try self.weight(layer, name);
+                loaded += 1;
+            }
+            if (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.glideDeltaProjections(self.cb, normed, weights, n, dims.hidden_size)) |result| return result;
+        }
+        var result: [4]CT = undefined;
+        var initialized: usize = 0;
+        errdefer for (result[0..initialized]) |value| self.cb.free(value);
+        inline for (names, 0..) |name, i| {
+            result[i] = try self.linear(normed, n, layer, name, dims.hidden_size, widths[i]);
+            initialized += 1;
+        }
+        return result;
+    }
+
+    fn linearAttentionCuda(self: *Forward, normed: CT, layer: usize, state: *CudaLinearState, dims: LinearDims) !CT {
+        const cb = self.cb;
+        const n = self.plan.tokens;
+        const projections = try self.linearAttentionCudaProjections(normed, layer, dims);
+        defer for (0..projections.len) |i| cb.free(projections[projections.len - 1 - i]);
+        const mixed, const z, const beta, const a = projections;
+        const conv_w = try self.weight(layer, "linear_attn.conv1d.weight");
+        defer cb.free(conv_w);
+        const a_log = try self.weight(layer, "linear_attn.A_log");
+        defer cb.free(a_log);
+        const dt_bias = try self.weight(layer, "linear_attn.dt_bias");
+        defer cb.free(dt_bias);
+        const norm_w = try self.weight(layer, "linear_attn.norm.weight");
+        defer cb.free(norm_w);
+        const core = (try cb.allocUninitF32Shape(&.{ @intCast(n), @intCast(dims.value_dim) })) orelse return error.GlideDeltaNetCoreUnavailable;
+        defer cb.free(core);
+        for (self.plan.starts, self.plan.lengths) |start, len| {
+            try cb.checkExecutionControl();
+            const mixed_row = try cb.sliceRows2D(self.allocator, mixed, start, len, dims.conv_dim);
+            defer cb.free(mixed_row);
+            const z_row = try cb.sliceRows2D(self.allocator, z, start, len, dims.value_dim);
+            defer cb.free(z_row);
+            const beta_row = try cb.sliceRows2D(self.allocator, beta, start, len, dims.value_heads);
+            defer cb.free(beta_row);
+            const a_row = try cb.sliceRows2D(self.allocator, a, start, len, dims.value_heads);
+            defer cb.free(a_row);
+            const destination = try cb.sliceRows2D(self.allocator, core, start, len, dims.value_dim);
+            defer cb.free(destination);
+            // GLiDE questions are independent, including their convolution
+            // history and DeltaNet state. A previous row must never leak in.
+            state.reset();
+            const out = (try @import("../ops/cuda/cuda_compute.zig").CudaCompute.qwen35LinearCore(cb, state, .{
+                .destination = @as(?CT, destination),
+                // This row's QKV projection has no readers after its prefix
+                // convolution; the chunk workspace may consume that storage.
+                .glide_consume_mixed = true,
+                .mixed = mixed_row,
+                .z = z_row,
+                .beta = beta_row,
+                .a = a_row,
+                .conv_weight = conv_w,
+                .a_log = a_log,
+                .dt_bias = dt_bias,
+                .norm_weight = norm_w,
+                .seq_len = len,
+                .key_heads = dims.key_heads,
+                .value_heads = dims.value_heads,
+                .dim = dims.key_head_dim,
+                .value_dim = dims.value_head_dim,
+                .conv_kernel = dims.conv_kernel,
+                .eps = self.config.norm_eps,
+            })) orelse return error.GlideDeltaNetCoreUnavailable;
+            cb.free(out);
+        }
+        return self.linear(core, n, layer, "linear_attn.out_proj.weight", dims.value_dim, dims.hidden_size);
+    }
 
     fn linearAttentionMetal(self: *Forward, normed: CT, layer: usize, state: *metal_compute_mod.Qwen35LinearState, dims: LinearDims) !CT {
         const cb = self.cb;
