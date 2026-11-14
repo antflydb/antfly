@@ -242,15 +242,16 @@ fn reclamationStaleQuotaEstimatesExpireAfterRootsShrinkImpl(a: Allocator, use_re
     try std.testing.expectEqual(reclamation.Reason.storage_budget, store.maintenance_policy.status.reason);
     // Advance the private monotonic deadline rather than sleeping in a test.
     store.assessment_cache.?.revalidate_at = .zero;
-    // KNOWN REDO-MODE BUG (same family as "lite reclamation vacuum
-    // preserves collector capacity with retained readers"'s own
-    // comment): the rewrite this call triggers (performVacuum ->
-    // prepareVacuum) needs to reserve a fresh redo log for the rewritten
-    // copy (CreateOptions.use_redo_log's doc comment) out of this same
-    // tight, self-referential `cap`, which was only ever sized for one
-    // live copy's own data. Skipped under redo until that tension (and
-    // the related orphaned-page leak likely inflating `physical` above
-    // to begin with) is resolved.
+    // perf/lwa-orphan-pages: the orphaned-page-retention leak that used
+    // to inflate `physical` above (retaining the 64 "large" writes'
+    // superseded chains forever instead of retiring them) is fixed -- see
+    // `redo_overlay.SharedRedoOverlay.snapshotSupersededChainsAlloc`. The
+    // other half of this test's own original comment -- the rewrite this
+    // call triggers needing to reserve a fresh redo log out of this same
+    // tight, self-referential `cap` -- is a separate, still-open budget
+    // tension (perf/lwa-budget-tail's own territory: the ratio heuristic
+    // sizing this reservation does not yet account for it), not this
+    // leak; still skipped under redo for that reason alone.
     if (!use_redo_log) {
         try store.maintainOnce(true);
         try std.testing.expectEqual(@as(u64, 2), store.maintenance_policy.status.assessment_count);
@@ -587,30 +588,23 @@ fn reclamationVacuumPreservesCollectorCapacityWithRetainedReadersImpl(a: Allocat
     const compact = (try store.file.liveStats(null)).compact_size;
     store.maintenance_policy.options.max_storage_bytes = size + compact * 2;
     const initial = try store.reclamationStatus();
-    // KNOWN REDO-MODE BUG (found while deriving this threshold, not yet
-    // fixed): the 400KiB "large" write above diverts and its external
-    // value chain gets physically flushed as a page-shaped exception
-    // (checkpointRedoLog's own "page-shaped exception" doc comment)
-    // before the second write ("kept") ever supersedes "small" in the
-    // logical overlay. When the automatic fold that `putCatalogRecord`'s
-    // own commit triggers finally runs, it applies only the live head
-    // ("kept") to the real document/catalog index -- "large"'s own chain
-    // pages are retained once each by the fold's redo_fold_retain_pending
-    // reconciliation (native.zig, the same mechanism "lite replay cleanup
-    // commits bounded chunks isolates namespaces and retries" needed a
-    // per-record retain fix for) but never associated with any key the
-    // real index still points at, so nothing ever marks them for
-    // retirement: they are retained forever, inflating both the physical
-    // page count and (via state.pending/counts) retirementReserveBytes's
-    // own estimate. A full fix needs the fold to recognize a staged
-    // page-shaped chain whose owning key's current overlay head no
-    // longer points at it, and retire it instead of retaining it --
-    // tracking which key each staged page belongs to isn't information
-    // the current staging structure keeps. Not attempted here; this
-    // assertion is skipped under redo until that lands (see "lite
-    // reclamation ride-along passes force no sync before the next
-    // durable write"'s own unexpected_page_kind failure for the same
-    // leak surfacing through check() instead).
+    // perf/lwa-orphan-pages: the orphaned-page-retention leak this
+    // comment originally described (the 400KiB "large" chain's pages
+    // retained forever instead of being retired once "kept" superseded
+    // them) is fixed -- see `redo_overlay.SharedRedoOverlay
+    // .snapshotSupersededChainsAlloc`, and "lite redo fold retires a
+    // superseded catalog value chain" for a deterministic, targeted
+    // regression test covering exactly this shape. This test's own exact
+    // byte-for-byte parity with the legacy path still does not hold under
+    // redo, though: investigation during the orphan-pages fix found
+    // `reusable_pages` lower under redo than legacy for this same
+    // scenario even after the leak fix (fewer of "large"'s own chain
+    // pages become reusable here, not zero) -- a separate, narrower
+    // discrepancy (possibly the same self-referential fixed redo-log
+    // reservation tension "lite reclamation stale quota estimates expire
+    // after roots shrink"'s own comment already documents for this
+    // family) that this investigation did not chase further. Still
+    // skipped under redo for that reason, not the orphaned-page leak.
     if (!use_redo_log) try std.testing.expect(compact * 2 + initial.reusable_pages * 4096 >= try store.file.retirementReserveBytes());
     try std.testing.expectError(error.LiteStorageBudgetExceeded, store.vacuum());
     try std.testing.expectEqualDeep(before, store.file.activeCheckpoint());
@@ -618,15 +612,6 @@ fn reclamationVacuumPreservesCollectorCapacityWithRetainedReadersImpl(a: Allocat
     try store.putCatalogRecord("next", "value");
     pinned.abort();
     pin_active = false;
-    // KNOWN REDO-MODE BUG, downstream of the same leak: `max_storage_bytes`
-    // above is sized from `size` (already inflated by the leaked "large"
-    // chain) plus slack for one live copy, but prepareVacuum's own fresh
-    // redo log for the vacuumed copy (CreateOptions.use_redo_log's doc
-    // comment) needs still more room than that slack covers, so even this
-    // now-unconstrained vacuum (the pinned reader that forced the earlier
-    // one to fail is released) fails allocating its own log's pages. Not
-    // chased further under the same time-boxed investigation as the
-    // other bugs this test's comments already cite.
     if (!use_redo_log) {
         _ = try store.vacuum();
         try store.putCatalogRecord("after", "still writable");
@@ -821,17 +806,21 @@ fn reclamationShrinkingObservesDeletionsWithoutGrowthImpl(a: Allocator, use_redo
     for (0..32) |_| try store.maintainOnce(false);
     const status = try store.reclamationStatus();
     try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
-    // KNOWN REDO-MODE BUG (same root cause as "lite reclamation vacuum
-    // preserves collector capacity with retained readers"'s own comment):
-    // the 128KiB "large" value above diverts and its external value chain
-    // gets physically flushed as a page-shaped exception before the
-    // delete's own fold ever runs. That fold's redo_fold_retain_pending
-    // reconciliation (native.zig) retains the chain's pages once each
-    // without ever marking them for retirement, so they are never
-    // reclaimed even after the key they belonged to is deleted -- not
-    // just the fixed log-capacity reservation (header.redo_log_capacity,
-    // CreateOptions.use_redo_log's doc comment), which alone would still
-    // satisfy this bound. Skipped under redo until that leak is fixed.
+    // perf/lwa-orphan-pages: the 128KiB "large" value above diverts and
+    // its external value chain gets physically flushed as a page-shaped
+    // exception before the delete's own fold ever runs. That fold now
+    // retires the chain's pages (`snapshotSupersededChainsAlloc`) instead
+    // of retaining them forever -- `reusable_pages` after the drain above
+    // is now identical between the two modes (confirmed while fixing this
+    // leak), proving the chain really is reclaimed once the key it
+    // belonged to is deleted. `current_file_bytes` itself still does not
+    // clear this test's fixed 64KiB bound under redo, though: a redo-log
+    // file's own fixed log-capacity reservation (header.redo_log_capacity,
+    // CreateOptions.use_redo_log's doc comment) -- carried again by the
+    // rewrite's own fresh copy, `rewrite_count == 1` above confirms a
+    // rewrite ran -- adds fixed overhead this hardcoded bound never
+    // accounted for, independent of the leak. Still skipped under redo
+    // for that reason alone.
     if (!use_redo_log) try std.testing.expect(status.current_file_bytes < 64 * 1024);
     const assessments = status.assessment_count;
     for (0..32) |_| try store.maintainOnce(false);
@@ -894,16 +883,21 @@ fn reclamationShrinkingObservesPartiallyLivePackedRecordsImpl(a: Allocator, use_
     for (0..32) |_| try store.maintainOnce(false);
     const status = try store.reclamationStatus();
     try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
-    // KNOWN REDO-MODE BUG (same family as "lite reclamation vacuum
-    // preserves collector capacity with retained readers"'s own comment,
-    // a different manifestation here): the rewrite above does run (the
-    // assertion just above already proves that), but under redo the file
-    // grows instead of shrinking -- the copy a rewrite performs still
-    // goes through the normal packed-record/page-shaped-exception
-    // divert-then-fold path for each live record it writes, so the same
-    // orphaned-page leak native.zig's redo_fold_retain_pending
-    // reconciliation has applies to the rewritten copy too. Skipped under
-    // redo until that leak is fixed.
+    // perf/lwa-orphan-pages: the rewrite above does run (the assertion
+    // just above already proves that); the copy it performs still goes
+    // through the normal packed-record/page-shaped-exception
+    // divert-then-fold path for each live record it writes, and that
+    // fold's own retirement is no longer the leak it used to be --
+    // `reusable_pages` after this rewrite is identical between the two
+    // modes (confirmed while fixing this leak), so the same number of
+    // pages are reclaimed either way. The file still grows instead of
+    // shrinking under redo, though: unlike this function's other
+    // before/after comparison (this test's own top comment), this one
+    // straddles the rewrite itself, which reserves a redo log for the
+    // freshly rewritten copy (CreateOptions.use_redo_log's doc comment)
+    // -- fixed overhead `before` (measured ahead of the rewrite) never
+    // carried, so it does not cancel out here the way it does elsewhere.
+    // Still skipped under redo for that reason, not the leak.
     if (!use_redo_log) try std.testing.expect(status.current_file_bytes < before);
     var read = try store.beginRead();
     defer read.abort();
@@ -920,6 +914,202 @@ test "lite reclamation shrinking observes partially live packed records" {
 
 test "lite reclamation shrinking observes partially live packed records (redo)" {
     try reclamationShrinkingObservesPartiallyLivePackedRecordsImpl(std.testing.allocator, true);
+}
+
+// perf/lwa-orphan-pages ("Bug 1"): a diverting commit's page-shaped
+// exception (an external value chain, or a packed-record bundle) used to
+// be reconciled into the ledger only at the next `checkpointRedoLog` fold
+// (`redo_fold_retain_pending`/`retainUnretainedValueChainPages`), which
+// retained every such page but never recorded which key or version owned
+// it. If the owning key was superseded or deleted *before* that fold ran,
+// the superseded version's pages were retained forever instead of ever
+// being marked for retirement -- a permanent leak, inflating
+// `retirementReserveBytes`/`current_file_bytes` and tripping shrink/vacuum
+// assertions and `check()`'s `unexpected_page_kind` under redo (see the
+// "KNOWN REDO-MODE BUG" comments throughout this file's own reclamation
+// tests above, now fixed). `redo_overlay.SharedRedoOverlay
+// .snapshotSupersededChainsAlloc` gives the fold each superseded version's
+// own chain so it can retain-then-retire it, exactly once, alongside the
+// surviving head it already builds a real record for.
+fn redoFoldRetiresSupersededDocumentValueChainsImpl(a: Allocator, use_redo_log: bool) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-fold-retire-document.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = use_redo_log, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+
+    const large = try a.alloc(u8, 256 * 1024);
+    defer a.free(large);
+    @memset(large, 'v');
+
+    // "overwrite" key: a large multi-page chain, then overwritten with a
+    // small inline value before any fold ever runs.
+    var write = try store.beginWrite();
+    try write.put("overwritten", large);
+    try write.put("deleted", large);
+    try write.commit();
+
+    const before = try store.reclamationStatus();
+
+    write = try store.beginWrite();
+    try write.put("overwritten", "small");
+    try write.delete("deleted");
+    try write.commit();
+
+    // Nothing has folded yet (under redo): both chains are still only
+    // staged, exactly the pre-fold window this bug needed.
+    if (use_redo_log) try store.checkpointRedoLog();
+
+    const after_fold = try store.reclamationStatus();
+    // Both superseded chains (the overwritten version and the deleted
+    // version) are now queued for retirement, not retained forever.
+    try std.testing.expect(after_fold.pending_retirement_objects > before.pending_retirement_objects);
+
+    for (0..64) |_| try store.maintainOnce(false);
+
+    const drained = try store.reclamationStatus();
+    // Space becomes reusable (free) once the queued retirement drains;
+    // the file itself only shrinks on an explicit rewrite/vacuum, not a
+    // plain reclaim pass, so `reusable_pages` (not `current_file_bytes`)
+    // is the right signal that the superseded chain was actually retired.
+    try std.testing.expect(drained.reusable_pages > before.reusable_pages);
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("small", try read.get("overwritten"));
+    try std.testing.expectError(error.NotFound, read.get("deleted"));
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite redo fold retires superseded document value chains before any pin needs them" {
+    try redoFoldRetiresSupersededDocumentValueChainsImpl(std.testing.allocator, false);
+}
+
+test "lite redo fold retires superseded document value chains before any pin needs them (redo)" {
+    try redoFoldRetiresSupersededDocumentValueChainsImpl(std.testing.allocator, true);
+}
+
+// Packed-record variant: several small documents fold together with one
+// large, superseded one in the *same* batch, so `checkpointRedoLog`'s own
+// real build runs with `pack_records = true` (`heads.len > 1`) -- the
+// `record_bundle` page-shaped-exception family `af488c9a18` already
+// covers on the retain side. The superseded chain's own retirement must
+// still land correctly alongside that packed build.
+fn redoFoldRetiresSupersededValueChainAlongsidePackedRecordsImpl(a: Allocator, use_redo_log: bool) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-fold-retire-packed.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = use_redo_log, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+
+    const large = try a.alloc(u8, 256 * 1024);
+    defer a.free(large);
+    @memset(large, 'v');
+
+    var write = try store.beginWrite();
+    try write.put("large", large);
+    for (0..8) |i| {
+        var key: [8]u8 = undefined;
+        try write.put(try std.fmt.bufPrint(&key, "k{d:0>6}", .{i}), "v");
+    }
+    try write.commit();
+
+    const before = try store.reclamationStatus();
+
+    // Supersede the large chain; touch every small key too so this fold's
+    // own batch (`heads.len > 1`) packs several records onto one page.
+    write = try store.beginWrite();
+    try write.put("large", "small");
+    for (0..8) |i| {
+        var key: [8]u8 = undefined;
+        try write.put(try std.fmt.bufPrint(&key, "k{d:0>6}", .{i}), "v2");
+    }
+    try write.commit();
+
+    if (use_redo_log) try store.checkpointRedoLog();
+
+    const after_fold = try store.reclamationStatus();
+    try std.testing.expect(after_fold.pending_retirement_objects > before.pending_retirement_objects);
+
+    for (0..64) |_| try store.maintainOnce(false);
+
+    const drained = try store.reclamationStatus();
+    // Space becomes reusable (free) once the queued retirement drains;
+    // the file itself only shrinks on an explicit rewrite/vacuum, not a
+    // plain reclaim pass, so `reusable_pages` (not `current_file_bytes`)
+    // is the right signal that the superseded chain was actually retired.
+    try std.testing.expect(drained.reusable_pages > before.reusable_pages);
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("small", try read.get("large"));
+    for (0..8) |i| {
+        var key: [8]u8 = undefined;
+        try std.testing.expectEqualStrings("v2", try read.get(try std.fmt.bufPrint(&key, "k{d:0>6}", .{i})));
+    }
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite redo fold retires a superseded value chain alongside a packed-record build" {
+    try redoFoldRetiresSupersededValueChainAlongsidePackedRecordsImpl(std.testing.allocator, false);
+}
+
+test "lite redo fold retires a superseded value chain alongside a packed-record build (redo)" {
+    try redoFoldRetiresSupersededValueChainAlongsidePackedRecordsImpl(std.testing.allocator, true);
+}
+
+// Catalog direct-written variant: a catalog value's own pages are
+// pwritten immediately (`direct_value_pages`), never staged through
+// `SharedRedoOverlay.pages` -- `retainUnretainedValueChainPages`
+// (`c95566d5d3`) only ever walked a *surviving* head's own chain, so a
+// superseded catalog chain was never even retained, let alone retired.
+fn redoFoldRetiresSupersededCatalogValueChainImpl(a: Allocator, use_redo_log: bool) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-fold-retire-catalog.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = use_redo_log, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+
+    const large = try a.alloc(u8, 256 * 1024);
+    defer a.free(large);
+    @memset(large, 'v');
+
+    try store.putCatalogRecord("small", large);
+    const before = try store.reclamationStatus();
+
+    try store.putCatalogRecord("small", "kept");
+    if (use_redo_log) try store.checkpointRedoLog();
+
+    const after_fold = try store.reclamationStatus();
+    try std.testing.expect(after_fold.pending_retirement_objects > before.pending_retirement_objects);
+
+    for (0..64) |_| try store.maintainOnce(false);
+
+    const drained = try store.reclamationStatus();
+    // Space becomes reusable (free) once the queued retirement drains;
+    // the file itself only shrinks on an explicit rewrite/vacuum, not a
+    // plain reclaim pass, so `reusable_pages` (not `current_file_bytes`)
+    // is the right signal that the superseded chain was actually retired.
+    try std.testing.expect(drained.reusable_pages > before.reusable_pages);
+
+    const value = (try store.getCatalogRecordAlloc(a, "small")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("kept", value);
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite redo fold retires a superseded catalog value chain" {
+    try redoFoldRetiresSupersededCatalogValueChainImpl(std.testing.allocator, false);
+}
+
+test "lite redo fold retires a superseded catalog value chain (redo)" {
+    try redoFoldRetiresSupersededCatalogValueChainImpl(std.testing.allocator, true);
 }
 
 // §3.2a/§3.6: a background reclamation pass must never pay for its own
@@ -1201,16 +1391,23 @@ fn reclamationCountsRetiredInodesUntilPinnedReadersReleaseImpl(alloc: Allocator,
     const large: [4 * 4096]u8 = @splat('x');
     write = try store.beginWrite();
     try write.put("capacity", &large);
-    // KNOWN REDO-MODE BUG (same orphaned-page-retention family as "lite
-    // reclamation vacuum preserves collector capacity with retained
-    // readers"'s own comment): retirementReserveBytes() scales with the
-    // ledger's own tracked page/pending counts (allocator_v4
-    // .retirementReservePages), which the same leak that test documents
-    // can inflate -- here that inflates the *budget* this line adds the
-    // reserve into, instead of the requirement a budget is checked
-    // against, so the 16KiB "capacity" write below gets more headroom
-    // than intended and wrongly succeeds instead of failing closed.
-    // Skipped under redo until that leak is fixed.
+    // perf/lwa-orphan-pages investigation: tried restoring this to the
+    // same failing-closed expectation as legacy now that the orphaned-
+    // page-retention leak this comment originally blamed is fixed (see
+    // `redo_overlay.SharedRedoOverlay.snapshotSupersededChainsAlloc`).
+    // Still wrongly succeeds under redo, but not for the reason this
+    // comment originally gave: measured directly, `retirementReserveBytes()`
+    // itself is now byte-for-byte identical between the two modes here
+    // (this test's own writes never go through a diverting commit's
+    // superseded-chain fold at all -- nothing here is overwritten or
+    // deleted before a fold -- so this was never actually this leak to
+    // begin with). The real cause is `status.totalBytes()` above, used to
+    // size `max_storage_bytes`: a redo-log file's own fixed log-capacity
+    // reservation (CreateOptions.use_redo_log's doc comment) makes that
+    // total bigger under redo, so the budget this line derives from it
+    // gets more headroom than the legacy file's own budget does for the
+    // same live content, independent of this leak. Left as its own
+    // still-open, separately-tracked discrepancy.
     if (use_redo_log) {
         try write.commit();
     } else {
