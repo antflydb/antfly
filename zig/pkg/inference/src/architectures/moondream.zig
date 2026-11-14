@@ -327,6 +327,10 @@ pub fn encodeImage(
     pixels_chw: []const f32,
     host_attention: bool,
 ) ![]f32 {
+    return encodeImageWithIo(cb, allocator, config, pixels_chw, host_attention, null);
+}
+
+pub fn encodeImageWithIo(cb: *const ComputeBackend, allocator: std.mem.Allocator, config: Config, pixels_chw: []const f32, host_attention: bool, io: ?std.Io) ![]f32 {
     const tokens = config.imageTokens();
     const vd = config.vision_hidden_size;
 
@@ -358,7 +362,7 @@ pub fn encodeImage(
 
     for (0..config.vision_num_layers) |layer| {
         try cb.checkExecutionControl();
-        const next = try visionBlock(cb, allocator, config, hidden, tokens, layer, host_attention);
+        const next = try visionBlock(cb, allocator, config, hidden, tokens, layer, host_attention, io);
         cb.free(hidden);
         hidden = next;
     }
@@ -399,6 +403,7 @@ fn visionBlock(
     tokens: usize,
     layer: usize,
     host_attention: bool,
+    io: ?std.Io,
 ) !CT {
     const vd = config.vision_hidden_size;
     var buf: [160]u8 = undefined;
@@ -431,7 +436,7 @@ fn visionBlock(
             for (0..tokens) |r| {
                 for (0..3) |part| @memcpy(parts[part * tokens * vd + r * vd ..][0..vd], host[r * 3 * vd + part * vd ..][0..vd]);
             }
-            const out = try attentionHostParallel(allocator, parts[0 .. tokens * vd], parts[tokens * vd ..][0 .. tokens * vd], parts[2 * tokens * vd ..][0 .. tokens * vd], tokens, config.vision_num_heads, config.visionHeadDim(), false);
+            const out = try attentionHostParallelWithIo(allocator, parts[0 .. tokens * vd], parts[tokens * vd ..][0 .. tokens * vd], parts[2 * tokens * vd ..][0 .. tokens * vd], tokens, config.vision_num_heads, config.visionHeadDim(), false, io);
             defer allocator.free(out);
             const shape = [_]i32{ @intCast(tokens), @intCast(vd) };
             const attn = try cb.fromFloat32Shape(out, &shape);
@@ -516,6 +521,7 @@ pub const KvState = struct {
     /// Host backends compute prefill attention with the head-parallel host
     /// flash kernel below; device backends use `gqaCausalAttention`.
     host_prefill_attention: bool = false,
+    host_attention_io: ?std.Io = null,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !KvState {
         var manager = runtime.kv.manager.KvManager.init(allocator);
@@ -712,7 +718,7 @@ fn decoderBlock(
         const attn = if (past == 0) blk_prefill: {
             try kv.manager.writeLayerKvSuffix(kv.sequence_id, layer, total, rows, k, v);
             if (kv.host_prefill_attention) {
-                const out = try causalAttentionHostParallel(allocator, q, k, v, rows, config.num_heads, head_dim);
+                const out = try attentionHostParallelWithIo(allocator, q, k, v, rows, config.num_heads, head_dim, true, kv.host_attention_io);
                 defer allocator.free(out);
                 break :blk_prefill try cb.fromFloat32Shape(out, &shape);
             }
@@ -786,6 +792,11 @@ pub fn attentionHostParallel(
     head_dim: usize,
     causal: bool,
 ) ![]f32 {
+    return attentionHostParallelWithIo(allocator, q, k, v, rows, num_heads, head_dim, causal, null);
+}
+
+pub fn attentionHostParallelWithIo(allocator: std.mem.Allocator, q: []const f32, k: []const f32, v: []const f32, rows: usize, num_heads: usize, head_dim: usize, causal: bool, io: ?std.Io) ![]f32 {
+    if (io) |handle| try handle.checkCancel();
     if (num_heads == 0 or head_dim == 0) return error.InvalidAttentionShape;
     const width = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
     const elements = std.math.mul(usize, rows, width) catch return error.InvalidAttentionShape;
@@ -793,7 +804,7 @@ pub fn attentionHostParallel(
     const output = try allocator.alloc(f32, elements);
     errdefer allocator.free(output);
     if (rows == 0) return output;
-    const cpus = std.Thread.getCpuCount() catch 1;
+    const cpus = linalg.pool.cachedCpuCount();
     const workers = @max(@as(usize, 1), @min(@min(cpus, 8), num_heads));
 
     const Worker = struct {
@@ -811,7 +822,8 @@ pub fn attentionHostParallel(
         workspace: linalg.FlashCausalAttentionWorkspace,
         failure: ?anyerror = null,
 
-        fn run(self: *@This()) void {
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
             self.runInner() catch |err| {
                 self.failure = err;
             };
@@ -836,7 +848,7 @@ pub fn attentionHostParallel(
     };
 
     var states: [8]Worker = undefined;
-    var threads: [8]?std.Thread = @splat(null);
+    var jobs: [8]linalg.pool.Job = undefined;
     var prepared: usize = 0;
     defer for (states[0..prepared]) |*state| {
         state.workspace.deinit(allocator);
@@ -866,14 +878,12 @@ pub fn attentionHostParallel(
             .packed_buf = packed_buf,
             .workspace = workspace,
         };
+        jobs[w] = .{ .fn_ptr = Worker.run, .ctx = &states[w] };
         prepared += 1;
     }
-    // Worker 0 runs on the calling thread; spawn failures fall back inline.
-    for (1..workers) |w| threads[w] = std.Thread.spawn(.{}, Worker.run, .{&states[w]}) catch null;
-    states[0].run();
-    for (1..workers) |w| {
-        if (threads[w]) |t| t.join() else states[w].run();
-    }
+    // The shared executor bounds background threads across concurrent callers,
+    // handles unavailable capacity inline, and drains every job before cleanup.
+    if (io) |handle| try linalg.pool.dispatchJobsIo(handle, jobs[0..workers]) else linalg.pool.dispatchJobs(jobs[0..workers]);
     for (states[0..workers]) |state| if (state.failure) |err| return err;
     return output;
 }
@@ -1034,4 +1044,26 @@ test "moondream parallel host attention accounts worker storage before dispatch"
     try std.testing.expectEqual(error.ResourceLimitExceeded, scope.failure(error.OutOfMemory));
     try scope.trim();
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}
+
+test "moondream caller executor preserves causal and bidirectional attention and cancellation" {
+    const q: [18]f32 = @splat(0.25);
+    const k: [18]f32 = @splat(-0.5);
+    var v: [18]f32 = undefined;
+    for (&v, 0..) |*value, i| value.* = @floatFromInt(i);
+    for ([_]bool{ false, true }) |causal| {
+        const expected = try attentionHostParallel(std.testing.allocator, &q, &k, &v, 3, 3, 2, causal);
+        defer std.testing.allocator.free(expected);
+        const actual = try attentionHostParallelWithIo(std.testing.allocator, &q, &k, &v, 3, 3, 2, causal, std.testing.io);
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualSlices(f32, expected, actual);
+    }
+    const Cancelled = struct {
+        fn check(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    var vtable = std.Io.failing.vtable.*;
+    vtable.checkCancel = Cancelled.check;
+    try std.testing.expectError(error.Canceled, attentionHostParallelWithIo(std.testing.failing_allocator, &q, &k, &v, 3, 3, 2, false, .{ .vtable = &vtable, .userdata = null }));
 }

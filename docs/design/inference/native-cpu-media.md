@@ -372,14 +372,21 @@ its own model is a permanent limit failure; unrelated occupancy remains retryabl
 Moondream prepares packed QKV and reusable flash-attention workspaces through
 the admitted caller allocator before starting host worker threads. Worker
 execution allocates nothing through that allocator, preserving head parallelism
-without sharing a non-thread-safe request ledger. Allocation failure before
-launch releases all prepared worker storage.
+without sharing a non-thread-safe request ledger. The caller's borrowed I/O
+executor serves both the vision blocks and decoder prefill. Worker width respects
+the effective CPU quota; callers without an executor use the shared bounded
+synchronous pool. No layer creates a fresh set of operating-system threads.
+Allocation failure before launch releases all prepared worker storage.
 
 Encoder/decoder recognizers move their owned text allocations and leases into
 the document owner. Whitespace trimming compacts in place at the allocation
 base. Empty outputs retain their process domain after publication, and offline
-transfers rehome local leases before destroying the source frame. Native results
-without an allocation owner still copy into the document scope.
+transfers rehome local leases before destroying the source frame. Transfer
+validates backing heaps, credits, domains, and counter sums before changing either
+owner. Offline transfer acquires one aggregate destination lease, consolidates
+source reservation bookkeeping, and then commits without fallible operations.
+A rejected transfer leaves the source independent of the destination's lifetime.
+Native results without an allocation owner still copy into the document scope.
 
 Allocation owners enforce a single reservation domain and cache their retained
 host total. Regional result transfers and ancestor queries do not repeatedly

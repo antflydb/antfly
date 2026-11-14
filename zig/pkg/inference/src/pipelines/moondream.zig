@@ -105,6 +105,7 @@ pub const PromptTokens = struct {
 
 pub const Pipeline = struct {
     allocator: std.mem.Allocator,
+    io: ?std.Io = null,
     config: Config,
     tokenizer: *hf_tokenizer.HfTokenizer,
     compute: if (build_options.enable_native) *native_mod.NativeCompute else void,
@@ -227,6 +228,7 @@ pub const Pipeline = struct {
 
         return .{
             .allocator = allocator,
+            .io = io,
             .config = config,
             .tokenizer = tok,
             .compute = compute,
@@ -277,7 +279,7 @@ pub const Pipeline = struct {
         const pixels = try preprocessImage(self.allocator, self.config, image_bytes);
         defer self.allocator.free(pixels);
         var cb = self.backend(control);
-        return arch.encodeImage(&cb, self.allocator, self.config, pixels, true);
+        return arch.encodeImageWithIo(&cb, self.allocator, self.config, pixels, true, if (control) |active| active.io orelse self.io else self.io);
     }
 
     pub fn embedTokens(self: *Pipeline, ids: []const i32, out: []f32) !void {
@@ -382,6 +384,7 @@ pub const Pipeline = struct {
         var kv = try arch.KvState.init(self.allocator, self.config);
         defer kv.deinit();
         kv.host_prefill_attention = true;
+        kv.host_attention_io = if (control) |active| active.io orelse self.io else self.io;
 
         var history = std.ArrayListUnmanaged(i64).empty;
         defer history.deinit(self.allocator);

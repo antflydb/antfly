@@ -1642,3 +1642,83 @@ test "multistage ordering propagates one shot checkpoints and only falls back fo
     fixture.failure = error.OrderExecutionFailed;
     try std.testing.expectError(error.OrderExecutionFailed, pipeline.determineOrder(&regions, null, &retained));
 }
+
+fn checkVisionRecognizerCallerOwnership(a: std.mem.Allocator) !void {
+    const memory = @import("../runtime/tier/memory.zig");
+    const Fixture = struct {
+        encoder: bool,
+        calls: usize = 0,
+        fn info(raw: *anyopaque) []const backends.TensorInfo {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.encoder) &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 1, 3, 2, 2 } }} else &.{.{ .name = "input_ids", .dtype = .i64, .shape = &.{ 1, -1 } }};
+        }
+        fn out(raw: *anyopaque) []const backends.TensorInfo {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.encoder) &.{.{ .name = "encoder_hidden_states", .dtype = .f32, .shape = &.{ 1, 2, 1 } }} else &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ 1, -1, 3 } }};
+        }
+        fn run(raw: *anyopaque, inputs: []const backends.Tensor, heap: std.mem.Allocator) ![]backends.Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const outputs = try heap.alloc(backends.Tensor, 1);
+            errdefer heap.free(outputs);
+            if (self.encoder) {
+                outputs[0] = try backends.Tensor.initFloat32(heap, "encoder_hidden_states", &.{ 1, 2, 1 }, &.{ 1, 2 });
+            } else {
+                const n = inputs[0].shape[1];
+                const values = try heap.alloc(f32, @as(usize, @intCast(n)) * 3);
+                defer heap.free(values);
+                @memset(values, 0);
+                values[values.len - 3 + @as(usize, if (n == 1) 1 else 2)] = 1;
+                outputs[0] = try backends.Tensor.initFloat32(heap, "logits", &.{ 1, n, 3 }, values);
+            }
+            return outputs;
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        const vtable: backends.Session.VTable = .{ .run = run, .inputInfo = info, .outputInfo = out, .backend = backend, .close = close };
+    };
+    var controller = memory.AdmissionController{};
+    defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
+    const admission = @import("../backends/session.zig").RunAdmission{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 256 * 1024, .scratch_limit_bytes = 256 * 1024 }, .static_workspace_bytes = 256, .check_live_memory = false };
+    var encoder = Fixture{ .encoder = true };
+    var decoder = Fixture{ .encoder = false };
+    const encoder_session = backends.Session{ .ptr = &encoder, .vtable = &Fixture.vtable, .run_admission = admission };
+    const decoder_session = backends.Session{ .ptr = &decoder, .vtable = &Fixture.vtable, .run_admission = admission };
+    const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a,
+        \\{"model":{"type":"WordPiece","vocab":{"[UNK]":0,"hello":1},"unk_token":"[UNK]","continuing_subword_prefix":"##"},"pre_tokenizer":{"type":"Whitespace"}}
+    );
+    defer tokenizer.deinitSelf();
+    var recognizer = Vision2SeqRecognizer{ .allocator = a, .reader = .{
+        .allocator = a,
+        .encoder_session = encoder_session,
+        .decoder_session = decoder_session,
+        .managed_hf_tok = .{ .tokenizer = tokenizer, .owns_tokenizer = false },
+        .dec_config = .{ .decoder_start_token_id = 0, .eos_token_id = 2, .max_length = 4 },
+        .preproc = .{ .image_size = 2, .resample = .nearest },
+    } };
+    var target = Preparation.child(a, encoder_session, null);
+    defer target.deinit();
+    const out_allocator = try target.allocator();
+    const earlier = try out_allocator.dupe(u8, "earlier");
+    var pixels: [12]u8 = @splat(128);
+    const result = try recognizer.recognizePrepared(.{ .data = &pixels, .width = 2, .height = 2, .channels = 3 }, null, null, &target);
+    try std.testing.expectEqual(@as(usize, 1), encoder.calls);
+    try std.testing.expectEqual(@as(usize, 2), decoder.calls);
+    try std.testing.expectEqualStrings("hello", result.text);
+    try std.testing.expect(target.owner.ownsRange(result.text));
+    // A subsequent destination failure must leave transferred text usable and
+    // cleanup independent of the decoder's already-destroyed result frame.
+    target.owner.session.?.run_admission.?.limits = .{ .host_limit_bytes = 1, .scratch_limit_bytes = 1 };
+    try target.trim();
+    try std.testing.expectError(error.OutOfMemory, out_allocator.alloc(u8, 1024));
+    try std.testing.expectEqual(error.ResourceLimitExceeded, target.failure(error.OutOfMemory));
+    try std.testing.expectEqualStrings("hello", result.text);
+    try std.testing.expectEqualStrings("earlier", earlier);
+}
+
+test "multistage vision recognizer caller transfers owned decoded text and survives later destination failure" {
+    try checkVisionRecognizerCallerOwnership(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkVisionRecognizerCallerOwnership, .{});
+}
