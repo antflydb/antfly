@@ -373,6 +373,17 @@ const BackendState = struct {
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
+        // Allocator.create does not apply field defaults. In particular, the
+        // native Apple path returns before acquiring a quota, but deinit still
+        // inspects it. Initialize every default before any provider can return.
+        state.* = .{
+            .http = http,
+            .alloc = alloc,
+            .cfg = cfg,
+            // Assigned below after fallible credential/provider setup; error
+            // paths before that point only destroy the allocation.
+            .provider = undefined,
+        };
 
         try cfg.validate();
         if (cfg.provider == .apple) try lib.apple_native.checkAvailable();
@@ -380,10 +391,7 @@ const BackendState = struct {
         state.limits = limits;
         state.usage_observer = usage_observer;
         _ = try provider_limits.Policy.fromConfig(cfg.rate_limit);
-        state.alloc = alloc;
         state.io = http.io;
-        state.http = http;
-        state.cfg = cfg;
         state.owned_base_url = if (cfg.provider == .antfly and cfg.url.len == 0 and embedded_antfly_provider == null)
             if (execution.resolveAntflyEndpoint(null, false)) |endpoint|
                 try @import("../common/inference_gateway.zig").apiBaseAlloc(alloc, endpoint)
@@ -2401,4 +2409,27 @@ test "Apple strict completion factory accepts completion-aware native bridge" {
     defer generator.deinit();
     const state: *BackendState = @ptrCast(@alignCast(generator.ptr));
     try std.testing.expect(state.require_completion);
+}
+
+test "Apple strict completion factory initializes quota in reused allocation" {
+    if (!lib.apple_native.enabled) return error.SkipZigTest;
+    try lib.apple_native.checkAvailable();
+    var client = httpx.Client.initWithConfig(std.testing.allocator, std.testing.io, .{});
+    defer client.deinit();
+    // Run this target in ReleaseFast as well as safe modes: Allocator.create's
+    // safety poisoning masks the caller-supplied bytes in Debug/ReleaseSafe.
+    for ([_]u8{ 0x01, 0x41, 0xa5, 0xff }) |poison| {
+        var bytes: [8192]u8 align(@alignOf(BackendState)) = undefined;
+        @memset(&bytes, poison);
+        var arena = std.heap.FixedBufferAllocator.init(&bytes);
+        const alloc = arena.allocator();
+        var factory = BackendFactory.initWithOptions(alloc, &client, .{});
+        var generator = try factory.factory().create(alloc, .{ .provider = .apple, .model = "", .url = "" });
+        const state: *BackendState = @ptrCast(@alignCast(generator.ptr));
+        try std.testing.expect(state.quota == null);
+        // Exercise the real destructor: an uninitialized quota is interpreted
+        // as a registry pointer after request memory has held generated text.
+        generator.deinit();
+        try std.testing.expectEqual(@as(usize, 0), arena.end_index);
+    }
 }
