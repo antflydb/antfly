@@ -2197,7 +2197,7 @@ fn descriptorProjectionFromRoutingSnapshot(
     return null;
 }
 
-test "descriptor projection retains the catalog observation with the physical definition" {
+test "owner descriptor projection retains the catalog observation with the physical definition" {
     const tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .indexes_json = "{\"model_b\":{}}" }};
     const ranges = [_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .range_id = 71, .start_key = "", .end_key = null }};
     const incarnation: metadata_api.MetadataClusterIncarnation = @splat(3);

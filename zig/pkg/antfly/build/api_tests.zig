@@ -1736,7 +1736,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const evaluation_graph_step = b.step("inference-evaluation-graph-test", "Verify final-ranked graph starts in public and cross-range queries");
-    const evaluation_public_graph = b.addRunArtifact(public_api_parity_tests);
+    const evaluation_public_graph = b.addRunArtifact(public_api_integration.executable);
     evaluation_public_graph.addArgs(&.{ "--test-filter", "public api integration supports hybrid query pruner and reranker" });
     const evaluation_distributed_graph = b.addRunArtifact(write_implementation_tests);
     evaluation_distributed_graph.addArgs(&.{ "--test-filter", "hosted cross-range graph start set follows final reranking" });
