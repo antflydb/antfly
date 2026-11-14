@@ -131,6 +131,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "remote metadata source pins one cluster incarnation across cache invalidation",
         "remote metadata source restore staging authority binds every owner read",
+        "remote table descriptors prefer ordered peers before legacy fallback",
         "remote metadata mutation failover preserves ambiguous and deterministic outcomes",
         "privacy remote mutation forwarding retains response metadata through the status source",
         "privacy remote read bindings pin metadata identity and never fall back to full catalogs",

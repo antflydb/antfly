@@ -2314,6 +2314,8 @@ ownership, but does not by itself qualify the unstripped unit memory budget.
 
 `zig build public-api-parity-test` runs both owners. Runtime filters are checked
 against their combined inventory, including rejection of unmatched filters.
+The aggregate unit and integration gates use that same audited owner group,
+so a filter selecting only one shard does not fail in its empty sibling.
 An explicit `-Dtest-filter` retains the single-owner focused compile path so
 the selected test is not compiled and executed in both owners. The dedicated
 `inference-evaluation-graph-test` also follows the moved integration fixture.
@@ -2321,8 +2323,9 @@ the selected test is not compiled and executed in both owners. The dedicated
 `zig build public-api-parity-compile` compiles both default owners without
 running their fixtures. The opt-in compile-cost workflow supports this target
 and uses the same pinned glibc-linked Nix Zig as production Linux CI. Select
-Debug with `strip: false` when qualifying unit reservations: a stripped build
-does not measure the unit gate's debug-symbol working set. The workflow keeps
+Debug with `strip: true` when qualifying CI unit reservations. Use
+`strip: false` to measure local Debug builds with symbols; those peaks have
+separate reservations and must not qualify the stripped CI profile. The workflow keeps
 its disposable output on the ARC cache volume and removes it after retaining
 the measurements. Focused CAPI and storage-owner-source profiles additionally
 accept a literal `test_filter` and retain per-test timing output.

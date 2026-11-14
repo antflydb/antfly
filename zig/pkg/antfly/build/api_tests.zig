@@ -37,7 +37,7 @@ pub const AddTestsResult = struct {
     hosted_recovery_step: *std.Build.Step,
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
-    run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
+    public_api_parity_step: *std.Build.Step,
     run_lib_api_auth_tests: *std.Build.Step.Run,
     run_algebraic_dynamic_template_tests: *std.Build.Step.Run,
     run_lib_api_connections_tests: *std.Build.Step.Run,
@@ -344,7 +344,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_integration_runtime_filters),
         .max_rss = 0,
     });
-    const run_public_api_integration = addFilteredTestRunArtifactWithRuntimeFilters(b, public_api_integration.executable, public_api_integration_runtime_filters);
     const public_api_parity_runtime_filters = selectTestFilters(b, &public_api_parity_default_filters);
     const public_api_parity = @import("linked_tests.zig").add(b, .{
         .name = "public-api-parity",
@@ -369,15 +368,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         public_api_parity_tests,
         public_api_parity_runtime_filters,
     );
-    const run_public_api_parity_aggregate_tests = addFilteredTestRunArtifactWithRuntimeFilters(
-        b,
-        public_api_parity_tests,
-        public_api_parity_runtime_filters,
-    );
-    if (!focused_public_api_compile)
-        run_public_api_parity_aggregate_tests.step.dependOn(&run_public_api_integration.step);
     run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
-    run_public_api_parity_aggregate_tests.step.dependOn(&openapi_root_check.step);
     const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
     if (focused_public_api_compile) {
         public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
@@ -2113,7 +2104,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // aggregate-gate runs on one lane so bounded CI hosts do not convert
     // aggregate memory pressure into allocator failures. Focused aliases use
     // the independent run artifacts above.
-    run_api_table_writes_production_regression_unit_tests.step.dependOn(&run_public_api_parity_aggregate_tests.step);
+    run_api_table_writes_production_regression_unit_tests.step.dependOn(public_api_parity_test_step);
     const api_table_writes_production_regression_step = b.step("antfly-api-table-writes-lifecycle-test", "Run focused restore and writer-cache lifecycle regressions");
     api_table_writes_production_regression_step.dependOn(&run_api_table_writes_production_regression_tests.step);
     const replica_retirement_batch_tests = @import("linked_tests.zig").addPair(b, .{
@@ -2578,7 +2569,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     return .{
         .run_lib_api_standalone_backup_restore_tests = run_lib_api_standalone_backup_restore_tests,
         .distributed_query_availability_step = lib_api_distributed_query_availability_test_step,
-        .run_public_api_parity_aggregate_tests = run_public_api_parity_aggregate_tests,
+        .public_api_parity_step = public_api_parity_test_step,
         .run_lib_api_auth_tests = run_lib_api_auth_tests,
         .run_algebraic_dynamic_template_tests = run_algebraic_dynamic_template_tests,
         .run_lib_api_connections_tests = run_lib_api_connections_tests,

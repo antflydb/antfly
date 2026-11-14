@@ -7811,9 +7811,15 @@ test "owner descriptor catalog watermark fences index-only regressions across ow
     }
     entry.restore = null;
     descriptor.indexes_json = "{\"model_a\":{}}";
-    for ([_]Source.LeaseAdmission{ .shared, .exclusive, .exclusive_if_idle }) |admission| {
-        try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, controls));
-        try std.testing.expect(!entry.retired);
+    for ([_]u64{ 41, 0 }) |revision| {
+        controls.catalog_observation.?.revision = revision;
+        for ([_]Source.LeaseAdmission{ .shared, .exclusive, .exclusive_if_idle }) |admission| {
+            try std.testing.expectError(error.StorageKernelOwnerStaleDescriptor, source.acquireDescriptorOnce(1, "docs", "/unused", descriptor, admission, .resident, controls));
+            try std.testing.expect(!entry.retired);
+        }
+        // Legacy snapshots cannot reset an ordered watermark or replace a
+        // changed definition; the adapter must find a revisioned peer.
+        try std.testing.expectEqual(@as(u64, 42), source.catalog_observations.get(1).?.revision);
     }
     // Committed Raft entries still use their exact historical descriptor;
     // they must not acquire current-catalog authority or lower this watermark.
