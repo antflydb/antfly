@@ -66,7 +66,13 @@ readiness through shutdown, with FD/RSS and mapping-RSS samples and per-lifetime
 peaks. Top-level peaks cover both lifetimes. Sampling failures stop qualification before further batches and wake the steady
 wait. Only process-lookup failures after exit end sampling normally; permission
 and I/O errors remain failures even when they race with exit.
-Logs and partial reports survive failures. Diagnostic-copy and cleanup errors
+Logs and partial reports survive failures, including initial startup and recovery
+readiness or process-observer failures. Startup diagnostics are copied before
+temporary-root cleanup, and diagnostic errors remain secondary to the startup
+exception. Visibility polling checks monitor and query health before and after
+each status request, uses a five-second HTTP timeout, and uses interruptible waits within its overall
+five-minute deadline. Only timed-out read-only status observations are repeated
+within that deadline; commit, query and explicit HTTP failures remain failures. Diagnostic-copy and cleanup errors
 cannot skip server termination or other cleanup, and the primary failure is
 preserved. Failed thread startup never joins an unstarted worker; on an operation
 failure, cleanup stops the server before its bounded query-worker join. The low-FD CI lane

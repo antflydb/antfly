@@ -1342,3 +1342,91 @@ def test_standalone_process_observer_runs_before_initial_and_recovery_readiness(
         (2, "observe"),
         (2, "ready"),
     ]
+
+
+@pytest.mark.parametrize("diagnostics_fail", [False, True])
+def test_startup_failure_captures_diagnostics_before_cleanup_and_preserves_error(
+    tmp_path, diagnostics_fail
+):
+    server = object.__new__(e2e_conftest.StandaloneAntflyServer)
+    server.root = tmp_path
+    server.log_path = tmp_path / "server.log"
+    server.log_path.write_text("startup failure details")
+    events = []
+    primary = RuntimeError("startup failed")
+
+    def launch(**_kwargs):
+        raise primary
+
+    def capture(value):
+        events.append("capture")
+        assert value.log_path.read_text() == "startup failure details"
+        if diagnostics_fail:
+            raise OSError("diagnostic disk full")
+
+    def stop(**kwargs):
+        events.append("stop")
+        assert kwargs["test_failed"]
+        server.log_path.unlink()
+        if diagnostics_fail:
+            raise OSError("cleanup failed")
+
+    server._launch_process = launch
+    server.on_startup_failed = capture
+    server.stop = stop
+    with pytest.raises(RuntimeError) as caught:
+        server._start_process(truncate_logs=False)
+    assert caught.value is primary
+    assert events == ["capture", "stop"]
+    if diagnostics_fail:
+        assert len(primary.__notes__) == 2
+
+
+@pytest.mark.parametrize("failure_at", ["observer", "readiness"])
+def test_launch_failure_reaches_diagnostic_hook_before_log_is_deleted(
+    tmp_path, monkeypatch, failure_at
+):
+    server = object.__new__(e2e_conftest.StandaloneAntflyServer)
+    server.binary = "/unused/antfly"
+    server.host, server.port = "127.0.0.1", 12345
+    server.root = tmp_path
+    server.config_path = None
+    server.inference_host_budget_mb = None
+    server.storage_engine = None
+    server.pgwire_port = server.health_port = None
+    server.url = server.api_url = "http://127.0.0.1:12345"
+    server.log_path = tmp_path / "server.log"
+    server.log_path.write_text("complete launch diagnostics")
+    server.port_reservations = SimpleNamespace(handoff_to=lambda _ports, fn: fn())
+    captured, stopped = [], []
+
+    def observe(_proc):
+        if failure_at == "observer":
+            raise RuntimeError("process observer failed")
+
+    def capture(value):
+        captured.append(value.log_path.read_text())
+
+    def stop(**_kwargs):
+        stopped.append(True)
+        server.log_file.close()
+        server.log_path.unlink()
+
+    server.on_process_started = observe
+    server.on_startup_failed = capture
+    server.stop = stop
+    monkeypatch.setattr(
+        e2e_conftest, "_standalone_stateful_command", lambda *_a, **_k: []
+    )
+    monkeypatch.setattr(
+        e2e_conftest.subprocess, "Popen", lambda *_a, **_k: SimpleNamespace(pid=123)
+    )
+    monkeypatch.setattr(e2e_conftest, "wait_for_server", lambda *_a, **_k: False)
+    expected = (
+        "process observer failed" if failure_at == "observer" else "failed to start"
+    )
+    with server.log_path.open("a") as server.log_file:
+        with pytest.raises(RuntimeError, match=expected):
+            server._start_process(truncate_logs=False)
+    assert captured == ["complete launch diagnostics"]
+    assert stopped == [True]

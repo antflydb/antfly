@@ -1482,6 +1482,7 @@ class StandaloneAntflyServer:
         storage_engine: str | None = None,
         inference_host_budget_mb: int | None = None,
         on_process_started: Callable[[subprocess.Popen], None] | None = None,
+        on_startup_failed: Callable[["StandaloneAntflyServer"], None] | None = None,
     ):
         self.binary = resolve_binary_path(binary)
         self.host = host
@@ -1489,6 +1490,7 @@ class StandaloneAntflyServer:
         self.storage_engine = storage_engine
         self.inference_host_budget_mb = inference_host_budget_mb
         self.on_process_started = on_process_started
+        self.on_startup_failed = on_startup_failed
         with ExitStack() as setup:
             self.port_reservations = LoopbackPortReservations(host)
             setup.callback(self.port_reservations.close)
@@ -1512,14 +1514,27 @@ class StandaloneAntflyServer:
             self.log_file = setup.enter_context(self.log_path.open("w"))
             self.proc: subprocess.Popen[str] | None = None
             setup.pop_all()
-        try:
-            self._start_process(truncate_logs=False)
-        except BaseException:
-            if not self.log_file.closed:
-                self.stop()
-            raise
+        self._start_process(truncate_logs=False)
 
     def _start_process(self, *, truncate_logs: bool) -> None:
+        try:
+            self._launch_process(truncate_logs=truncate_logs)
+        except BaseException as primary:
+            # Capture diagnostics while the root and log still exist, including
+            # failures during recovery and in the process observer itself.
+            observer = getattr(self, "on_startup_failed", None)
+            if observer is not None:
+                try:
+                    observer(self)
+                except BaseException as exc:
+                    primary.add_note(f"Startup diagnostic capture failed: {exc!r}")
+            try:
+                self.stop(test_failed=True)
+            except BaseException as exc:
+                primary.add_note(f"Startup cleanup also failed: {exc!r}")
+            raise
+
+    def _launch_process(self, *, truncate_logs: bool) -> None:
         if truncate_logs:
             self.log_file = self.log_path.open("w")
         log_start = self.log_path.stat().st_size
@@ -1576,7 +1591,6 @@ class StandaloneAntflyServer:
             ),
         ):
             out = _read_log_tail(self.log_path)
-            self.stop()
             raise RuntimeError(
                 f"Standalone API server failed to start at {self.api_url}\n{out}"
             )

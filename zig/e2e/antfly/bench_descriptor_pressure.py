@@ -404,8 +404,8 @@ def corpus(data, count):
     return row
 
 
-def call(session, url, method, path, body=None):
-    response = session.request(method, url + path, json=body, timeout=300)
+def call(session, url, method, path, body=None, *, timeout=300):
+    response = session.request(method, url + path, json=body, timeout=timeout)
     if not response.ok:
         raise RuntimeError(
             f"{method} {path}: HTTP {response.status_code}: {response.text[:2048]}"
@@ -430,12 +430,30 @@ def query(session, url, vector):
         raise RuntimeError(f"self-query did not recover first document: {hits}")
 
 
-def wait_visible(session, url, count):
+def wait_visible(session, url, count, *, check_health, failure_event):
     deadline = time.monotonic() + 300
     while True:
-        state = call(session, url, "GET", "/tables/documents/indexes/vec").get(
-            "status", {}
-        )
+        check_health()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"index visibility did not reach {count}")
+        # Status reads are small and read-only. Bound each request separately
+        # from the overall visibility deadline so health failures surface soon.
+        try:
+            state = call(
+                session,
+                url,
+                "GET",
+                "/tables/documents/indexes/vec",
+                timeout=min(5, remaining),
+            ).get("status", {})
+        except requests.Timeout:
+            # A slow read-only observation can be repeated within the outer
+            # budget. Never retry writes, queries, or explicit HTTP failures.
+            check_health()
+            failure_event.wait(min(0.25, max(0, deadline - time.monotonic())))
+            continue
+        check_health()
         if (
             state.get("total_indexed") == count
             and state.get("query_visible_doc_count") == count
@@ -443,7 +461,7 @@ def wait_visible(session, url, count):
             return state
         if time.monotonic() >= deadline:
             raise RuntimeError(f"index visibility did not reach {count}: {state}")
-        time.sleep(0.25)
+        failure_event.wait(min(0.25, max(0, deadline - time.monotonic())))
 
 
 def write_server_wrapper(path, binary, limit):
@@ -481,6 +499,11 @@ def qualify(binary, limit, count, data, output, steady_seconds):
     session = requests.Session()
     worker = None
     worker_started = False
+
+    def capture_startup_failure(failed_server):
+        report["server_root"] = str(failed_server.root)
+        shutil.copyfile(failed_server.log_path, output / f"server-{limit}.log")
+
     try:
         write_server_wrapper(wrapper, binary, limit)
         server = StandaloneAntflyServer(
@@ -489,6 +512,7 @@ def qualify(binary, limit, count, data, output, steady_seconds):
             find_free_port(),
             api_root=ANTFLY_PUBLIC_API_ROOT,
             on_process_started=measurements.start,
+            on_startup_failed=capture_startup_failure,
         )
         report["server_root"] = str(server.root)
         measurements.check()
@@ -581,7 +605,13 @@ def qualify(binary, limit, count, data, output, steady_seconds):
                         flush=True,
                     )
             check_health()
-            report["visibility"] = wait_visible(session, url, count)
+            report["visibility"] = wait_visible(
+                session,
+                url,
+                count,
+                check_health=check_health,
+                failure_event=measurements.failed,
+            )
             report["ingestion_seconds"] = time.perf_counter() - started
             query_times.switch("steady")
             measurements.wait(steady_seconds)
@@ -613,7 +643,13 @@ def qualify(binary, limit, count, data, output, steady_seconds):
         measurements.phase = "recovery"
         server.resume()
         measurements.check()
-        report["recovered_visibility"] = wait_visible(session, url, count)
+        report["recovered_visibility"] = wait_visible(
+            session,
+            url,
+            count,
+            check_health=check_health,
+            failure_event=measurements.failed,
+        )
         for _ in range(20):
             measurements.check()
             query(session, url, first_vector)

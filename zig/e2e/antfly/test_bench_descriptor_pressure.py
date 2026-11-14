@@ -248,7 +248,7 @@ def test_single_batch_qualifies_and_recovery_startup_samples_are_retained(
         started.set()
         assert release.wait(2)
 
-    def visible(*_args):
+    def visible(*_args, **_kwargs):
         if not visible_calls:
             assert started.wait(2)
         visible_calls.append(True)
@@ -635,3 +635,147 @@ def test_steady_wait_observes_sampler_failure_without_waiting_for_deadline(
         measurements.wait(3600)
     assert waits == [3600]
     measurements.close()
+
+
+def test_initial_constructor_failure_retains_log_and_partial_report(
+    tmp_path, monkeypatch, qualification_fakes
+):
+    import json
+    from pathlib import Path
+    import bench_descriptor_pressure as bench
+
+    root = tmp_path / "failed-startup"
+    root.mkdir()
+    log = root / "server.log"
+    log.write_text("complete startup diagnostics")
+
+    def failed_constructor(*_args, on_startup_failed, **_kwargs):
+        on_startup_failed(SimpleNamespace(root=root, log_path=log))
+        log.unlink()
+        root.rmdir()
+        raise RuntimeError("startup readiness failed")
+
+    monkeypatch.setattr(bench, "StandaloneAntflyServer", failed_constructor)
+    with pytest.raises(RuntimeError, match="startup readiness failed"):
+        bench.qualify(Path("/unused"), 256, 256, None, tmp_path, 1)
+    report = json.loads((tmp_path / "limit-256.json").read_text())
+    assert report["server_root"] == str(root)
+    assert not report["completed"]
+    assert (tmp_path / "server-256.log").read_text() == "complete startup diagnostics"
+    assert all(session.closed for session in qualification_fakes.sessions)
+
+
+@pytest.mark.parametrize("failure_at", ["before_request", "during_request", "wait"])
+@pytest.mark.parametrize("phase", ["initial", "recovery"])
+def test_visibility_polling_propagates_health_failures_promptly(
+    monkeypatch, failure_at, phase
+):
+    import bench_descriptor_pressure as bench
+
+    failed = [failure_at == "before_request"]
+    requests, waits = [], []
+
+    def check():
+        if failed[0]:
+            raise RuntimeError(f"{phase} monitoring failed")
+
+    def call(*_args, timeout):
+        requests.append(timeout)
+        if failure_at == "during_request":
+            failed[0] = True
+        return {"status": {"total_indexed": 0}}
+
+    def wait(seconds):
+        waits.append(seconds)
+        failed[0] = True
+
+    monkeypatch.setattr(bench, "call", call)
+    with pytest.raises(RuntimeError, match=f"{phase} monitoring failed"):
+        bench.wait_visible(
+            None,
+            "http://unused",
+            256,
+            check_health=check,
+            failure_event=SimpleNamespace(wait=wait),
+        )
+    assert len(requests) == (0 if failure_at == "before_request" else 1)
+    assert all(0 < timeout <= 5 for timeout in requests)
+    assert len(waits) == (1 if failure_at == "wait" else 0)
+
+
+def test_visibility_checks_health_even_when_response_reports_complete(monkeypatch):
+    import bench_descriptor_pressure as bench
+
+    failed = [False]
+
+    def call(*_args, **_kwargs):
+        failed[0] = True
+        return {"status": {"total_indexed": 256, "query_visible_doc_count": 256}}
+
+    def check():
+        if failed[0]:
+            raise RuntimeError("query worker failed")
+
+    monkeypatch.setattr(bench, "call", call)
+    with pytest.raises(RuntimeError, match="query worker failed"):
+        bench.wait_visible(
+            None, "http://unused", 256, check_health=check, failure_event=None
+        )
+
+
+@pytest.mark.parametrize("unhealthy", [False, True])
+def test_visibility_status_timeouts_recheck_health_before_retry(monkeypatch, unhealthy):
+    import bench_descriptor_pressure as bench
+    import requests
+
+    calls, waits = [], []
+
+    def call(*_args, **_kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            raise requests.Timeout("slow status")
+        return {"status": {"total_indexed": 256, "query_visible_doc_count": 256}}
+
+    def health():
+        if calls and unhealthy:
+            raise RuntimeError("sampler failed")
+
+    monkeypatch.setattr(bench, "call", call)
+    kwargs = dict(check_health=health, failure_event=SimpleNamespace(wait=waits.append))
+    if unhealthy:
+        with pytest.raises(RuntimeError, match="sampler failed"):
+            bench.wait_visible(None, "http://unused", 256, **kwargs)
+        assert len(calls) == 1
+        assert not waits
+    else:
+        assert (
+            bench.wait_visible(None, "http://unused", 256, **kwargs)["total_indexed"]
+            == 256
+        )
+        assert len(calls) == 2
+        assert len(waits) == 1
+
+
+def test_visibility_status_timeouts_cannot_extend_overall_deadline(monkeypatch):
+    import bench_descriptor_pressure as bench
+    import requests
+
+    now = [0]
+    calls = []
+
+    def call(*_args, **_kwargs):
+        calls.append(True)
+        now[0] = 301
+        raise requests.Timeout("status deadline")
+
+    monkeypatch.setattr(bench, "call", call)
+    monkeypatch.setattr(bench.time, "monotonic", lambda: now[0])
+    with pytest.raises(RuntimeError, match="visibility did not reach"):
+        bench.wait_visible(
+            None,
+            "http://unused",
+            256,
+            check_health=lambda: None,
+            failure_event=SimpleNamespace(wait=lambda _: None),
+        )
+    assert len(calls) == 1
