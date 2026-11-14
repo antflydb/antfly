@@ -805,8 +805,14 @@ private final class PendingAssetProtocol: URLProtocol, @unchecked Sendable {
   static let stopped = AssetRequestSignal()
   override class func canInit(with request: URLRequest) -> Bool { true }
   override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-  override func startLoading() { Task { await Self.started.send() } }
-  override func stopLoading() { Task { await Self.stopped.send() } }
+  override func startLoading() {
+    let signal = PendingAssetProtocol.started
+    Task { await signal.send() }
+  }
+  override func stopLoading() {
+    let signal = PendingAssetProtocol.stopped
+    Task { await signal.send() }
+  }
 }
 extension ClientTests {
   @Test(.timeLimit(.minutes(1))) func assetInstallationCancellationCancelsTheUnderlyingRequest()
