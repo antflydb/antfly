@@ -31,6 +31,8 @@ const InferenceExecutionControl = @import("../execution_control.zig").InferenceE
 pub const PreprocessorConfig = vision_config.PreprocessorConfig;
 
 pub const LoadedVisionReader = struct {
+    preparation_owner: ?*const @import("../backends/admitted_allocator.zig").AdmittedAllocator = null,
+    preparation_parent: ?*const @import("../pipelines/preprocessing_memory.zig").Scope = null,
     allocator: std.mem.Allocator,
     encoder_session: backends.Session,
     decoder_session: backends.Session,
@@ -363,6 +365,8 @@ pub const LoadedVisionReader = struct {
             self.florence_final_logits_bias_zero,
         );
         reader_pipeline.execution_control = options.execution_control;
+        reader_pipeline.preparation_parent = self.preparation_parent;
+        reader_pipeline.preparation_owner = self.preparation_owner;
         if (self.loaded_model) |model| {
             if (reading_pipeline_mod.nativeFlorencePreprocessOverlapEnabled(self.encoder_session))
                 reader_pipeline.native_execution_lane = &model.native_reader_execution_lane;

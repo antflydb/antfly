@@ -18,6 +18,7 @@
 
 test {
     _ = @import("models/glide.zig");
+    _ = @import("architectures/glide_residual.zig");
     _ = @import("pipelines/glide_prompt.zig");
     _ = @import("pipelines/glide_parity_test.zig");
 }

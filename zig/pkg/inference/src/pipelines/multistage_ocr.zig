@@ -19,6 +19,7 @@ const platform = @import("antfly_platform");
 const backends = @import("../backends/backends.zig");
 const image = @import("image.zig");
 const crop = @import("crop.zig");
+const Preparation = @import("preprocessing_memory.zig").Scope;
 const ctc_decode = @import("ctc_decode.zig");
 const connected_components = @import("connected_components.zig");
 const vision_reader = @import("../readers/vision_reader.zig");
@@ -79,8 +80,17 @@ pub const MultiStageOCRResult = struct {
     full_text: []u8,
     regions: []RecognizedRegion,
     layout: []LayoutRegion = &.{},
+    storage: ?*@import("preprocessing_memory.zig").Owned = null,
 
     pub fn deinit(self: *MultiStageOCRResult) void {
+        if (self.storage) |storage| {
+            self.storage = null;
+            @import("preprocessing_memory.zig").Owned.release(storage);
+            self.full_text = &.{};
+            self.regions = &.{};
+            self.layout = &.{};
+            return;
+        }
         self.allocator.free(self.full_text);
         for (self.regions) |*region| region.deinit(self.allocator);
         if (self.regions.len > 0) self.allocator.free(self.regions);
@@ -292,14 +302,21 @@ pub const CTCRecognizer = struct {
     }
 
     pub fn recognize(self: *CTCRecognizer, img: image.Image, control: ?InferenceExecutionControl) !RecognitionResult {
+        return self.recognizePrepared(img, control, null, null);
+    }
+
+    pub fn recognizePrepared(self: *CTCRecognizer, img: image.Image, control: ?InferenceExecutionControl, parent: ?*const @import("preprocessing_memory.zig").Scope, target: ?*Preparation) !RecognitionResult {
+        var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.session.withAdmissionControl(control), parent);
+        defer preparation.deinit();
+        const work = try preparation.allocator();
         var input_width = self.preprocess.width;
         const pixel_values = if (self.preprocess.keep_aspect_ratio) blk: {
             if (self.preprocess.dynamic_width) {
                 input_width = try recognitionInputWidth(self.preprocess, img.width, img.height);
             }
 
-            break :blk try image.preprocessDecodedRectKeepAspectPadRightScaledWithResample(
-                self.allocator,
+            break :blk image.preprocessDecodedRectKeepAspectPadRightScaledWithResample(
+                work,
                 img,
                 input_width,
                 self.preprocess.height,
@@ -308,9 +325,9 @@ pub const CTCRecognizer = struct {
                 self.preprocess.rescale_factor,
                 self.preprocess.resample,
                 self.preprocess.pad_value_rgb,
-            );
-        } else try image.preprocessDecodedRectScaledWithResample(
-            self.allocator,
+            ) catch |err| return preparation.failure(err);
+        } else image.preprocessDecodedRectScaledWithResample(
+            work,
             img,
             self.preprocess.width,
             self.preprocess.height,
@@ -318,8 +335,9 @@ pub const CTCRecognizer = struct {
             self.preprocess.std,
             self.preprocess.rescale_factor,
             self.preprocess.resample,
-        );
-        defer self.allocator.free(pixel_values);
+        ) catch |err| return preparation.failure(err);
+        defer work.free(pixel_values);
+        try preparation.trim();
 
         const input_name = if (self.session.inputInfo().len > 0) self.session.inputInfo()[0].name else "x";
         const shape = [_]i64{
@@ -328,34 +346,57 @@ pub const CTCRecognizer = struct {
             @intCast(self.preprocess.height),
             @intCast(input_width),
         };
-        var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, pixel_values);
+        var input_tensor = try preparation.tensor(f32, input_name, &shape, pixel_values);
         defer input_tensor.deinit();
 
-        var permit = try self.session.admit(try self.session.planRun(&.{input_tensor}, null));
-        defer permit.deinit();
-        if (try permit.runResidentWithControl(&.{input_tensor}, self.allocator, control)) |resident_outputs| {
+        var execution = Preparation.child(self.allocator, self.session.withAdmissionControl(control), &preparation);
+        defer execution.deinit();
+        var permit = try preparation.admitRun(self.session.withAdmissionControl(control), try self.session.planRun(&.{input_tensor}, null));
+        var permit_live = true;
+        defer if (permit_live) permit.deinit();
+        const decoded = self.forwardAndDecode(&permit, &execution, &.{input_tensor}, control) catch |err| return execution.failure(err);
+        permit.deinit();
+        permit_live = false;
+        execution.execution_residency = .{};
+        try execution.trim();
+        if (target) |output| {
+            try output.absorb(&execution);
+            return decoded;
+        }
+        return .{ .text = try self.allocator.dupe(u8, decoded.text), .confidence = decoded.confidence };
+    }
+
+    fn forwardAndDecode(self: *CTCRecognizer, permit: *@import("../backends/session.zig").RunPermit, execution: *Preparation, inputs: []const backends.Tensor, control: ?InferenceExecutionControl) !RecognitionResult {
+        const a = try execution.allocator();
+        // Forward buffers may be owned by a persistent imported backend. Never
+        // lend that opaque reservation to the post-processing allocator.
+        if (try permit.runResidentWithControl(inputs, self.allocator, control)) |resident_outputs| {
             var resident = resident_outputs;
             defer resident.deinit();
+            const lease = resident.resource_lease orelse permit.lease;
+            execution.execution_residency = if (lease) |held| .fromLease(held) else .{};
             if (resident.outputs.len == 0) return error.NoRecognitionOutput;
-            if (try ctc_decode.decodeResident(self.allocator, resident.backend, resident.outputs[0], self.char_dict)) |decoded| {
+            if (try ctc_decode.decodeResident(a, resident.backend, resident.outputs[0], self.char_dict)) |decoded| {
                 return .{ .text = decoded.text, .confidence = decoded.confidence };
             }
             // Reuse this forward if reduction is unsupported; exporting its
             // logits is cheaper than executing the entire recognizer again.
-            const output_shape = try resident.backend.tensorShape(resident.outputs[0], self.allocator);
-            defer self.allocator.free(output_shape);
-            const output_values = try resident.backend.toFloat32(resident.outputs[0], self.allocator);
-            defer self.allocator.free(output_values);
-            var host_output = try backends.Tensor.initFloat32(self.allocator, "ctc_logits", output_shape, output_values);
+            const output_shape = try resident.backend.tensorShape(resident.outputs[0], a);
+            defer a.free(output_shape);
+            const output_values = try resident.backend.toFloat32(resident.outputs[0], a);
+            defer a.free(output_values);
+            var host_output = backends.Tensor{ .data = std.mem.sliceAsBytes(output_values), .shape = output_shape, .dtype = .f32, .name = "ctc_logits", .allocator = a, .owns_data = false, .owns_shape = false };
             defer host_output.deinit();
-            const decoded = try ctc_decode.decodeFromTensor(self.allocator, &host_output, self.char_dict);
+            const decoded = try ctc_decode.decodeFromTensor(a, &host_output, self.char_dict);
             return .{ .text = decoded.text, .confidence = decoded.confidence };
         }
-        const outputs = try permit.runWithControl(&.{input_tensor}, self.allocator, control);
+        const outputs = try permit.runWithControl(inputs, self.allocator, control);
         defer freeTensorSlice(self.allocator, outputs);
+        execution.execution_residency = if (permit.lease) |held| .fromLease(held) else .{};
+        if (permit.execution_yielded) execution.required_host_bytes = try self.session.outputHostResidency(outputs);
         if (outputs.len == 0) return error.NoRecognitionOutput;
 
-        const decoded = try ctc_decode.decodeFromTensor(self.allocator, &outputs[0], self.char_dict);
+        const decoded = try ctc_decode.decodeFromTensor(a, &outputs[0], self.char_dict);
         return .{
             .text = decoded.text,
             .confidence = decoded.confidence,
@@ -433,12 +474,22 @@ pub const Vision2SeqRecognizer = struct {
     }
 
     pub fn recognize(self: *Vision2SeqRecognizer, img: image.Image, control: ?InferenceExecutionControl) !RecognitionResult {
-        var result = try self.reader.readDecodedRaw(img, .{ .execution_control = control });
+        return self.recognizePrepared(img, control, null, null);
+    }
+
+    pub fn recognizePrepared(self: *Vision2SeqRecognizer, img: image.Image, control: ?InferenceExecutionControl, parent: ?*const @import("preprocessing_memory.zig").Scope, target: ?*Preparation) !RecognitionResult {
+        var reader = self.reader;
+        reader.preparation_parent = parent;
+        var result = try reader.readDecodedRaw(img, .{ .execution_control = control });
         defer result.deinit();
 
+        if (target) |output| if (try result.takeTrimmedTextInto(output)) |text| return .{
+            .text = text,
+            .confidence = if (text.len > 0) 1.0 else 0.0,
+        };
         const trimmed = std.mem.trim(u8, result.text, " \t\r\n");
         return .{
-            .text = try self.allocator.dupe(u8, trimmed),
+            .text = try (if (target) |output| try output.allocator() else self.allocator).dupe(u8, trimmed),
             .confidence = if (trimmed.len > 0) 1.0 else 0.0,
         };
     }
@@ -456,14 +507,20 @@ pub const Recognizer = union(enum) {
     }
 
     pub fn recognize(self: *Recognizer, img: image.Image, control: ?InferenceExecutionControl) !RecognitionResult {
+        return self.recognizePrepared(img, control, null, null);
+    }
+
+    pub fn recognizePrepared(self: *Recognizer, img: image.Image, control: ?InferenceExecutionControl, parent: ?*const @import("preprocessing_memory.zig").Scope, target: ?*Preparation) !RecognitionResult {
         return switch (self.*) {
-            .ctc => |*recognizer| recognizer.recognize(img, control),
-            .vision2seq => |*recognizer| recognizer.recognize(img, control),
+            .ctc => |*recognizer| recognizer.recognizePrepared(img, control, parent, target),
+            .vision2seq => |*recognizer| recognizer.recognizePrepared(img, control, parent, target),
         };
     }
 };
 
 pub const MultiStageOCRPipeline = struct {
+    preparation_owner: ?*const @import("../backends/admitted_allocator.zig").AdmittedAllocator = null,
+    preparation_parent: ?*const @import("preprocessing_memory.zig").Scope = null,
     allocator: std.mem.Allocator,
     detector: backends.Session,
     detection_preprocess: PreprocessConfig,
@@ -472,6 +529,21 @@ pub const MultiStageOCRPipeline = struct {
     recognition_crop_orientation: crop.Orientation = .preserve,
     layout: ?backends.Session = null,
     order: ?backends.Session = null,
+
+    /// Borrow immutable models and dictionaries for one synchronous execution.
+    /// Only transient buffers/results use work; teardown belongs to the loader.
+    pub fn executionView(self: MultiStageOCRPipeline, work: std.mem.Allocator) MultiStageOCRPipeline {
+        var view = self;
+        view.allocator = work;
+        if (view.recognizer) |*recognizer| switch (recognizer.*) {
+            .ctc => |*ctc| ctc.allocator = work,
+            .vision2seq => |*vision| {
+                vision.allocator = work;
+                vision.reader.allocator = work;
+            },
+        };
+        return view;
+    }
 
     pub fn deinit(self: *MultiStageOCRPipeline) void {
         if (self.recognizer) |*recognizer| {
@@ -495,9 +567,16 @@ pub const MultiStageOCRPipeline = struct {
 
     pub fn runWithControl(self: *MultiStageOCRPipeline, image_bytes: []const u8, control: ?InferenceExecutionControl) !MultiStageOCRResult {
         if (control) |active| try active.update(.tokenizing, 0, 1);
-        const img = try image.decode(self.allocator, image_bytes);
-        defer img.deinit(self.allocator);
-        return self.runDecodedWithControl(img, control);
+        var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.detector.withAdmissionControl(control), self.preparation_parent);
+        if (self.preparation_parent == null) preparation.owner.parent = self.preparation_owner;
+        defer preparation.deinit();
+        const work = try preparation.allocator();
+        const img = image.decode(work, image_bytes) catch |err| return preparation.failure(err);
+        defer img.deinit(work);
+        try preparation.trim();
+        var execution = self.*;
+        execution.preparation_parent = &preparation;
+        return execution.runDecodedWithControl(img, control);
     }
 
     pub fn runDecoded(self: *MultiStageOCRPipeline, img: image.Image) !MultiStageOCRResult {
@@ -505,46 +584,64 @@ pub const MultiStageOCRPipeline = struct {
     }
 
     pub fn runDecodedWithControl(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) !MultiStageOCRResult {
-        const regions = try self.detect(img, control);
-        defer if (regions.len > 0) self.allocator.free(regions);
+        const owned = try @import("preprocessing_memory.zig").Owned.create(self.allocator, self.detector.withAdmissionControl(control), self.preparation_parent, self.preparation_owner);
+        errdefer @import("preprocessing_memory.zig").Owned.release(owned);
+        var result = self.runDecodedPrepared(img, control, &owned.scope) catch |err| return owned.scope.failure(err);
+        try owned.publish();
+        result.storage = owned;
+        return result;
+    }
+
+    fn runDecodedPrepared(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl, retained: *Preparation) !MultiStageOCRResult {
+        const result_allocator = try retained.allocator();
+        const regions = try self.detect(img, control, retained);
+        defer if (regions.len > 0) result_allocator.free(regions);
+        try retained.trim();
 
         var layout_regions: []LayoutRegion = &.{};
         errdefer {
-            for (layout_regions) |*region| region.deinit(self.allocator);
-            if (layout_regions.len > 0) self.allocator.free(layout_regions);
+            for (layout_regions) |*region| region.deinit(result_allocator);
+            if (layout_regions.len > 0) result_allocator.free(layout_regions);
         }
 
         if (self.layout != null) {
-            layout_regions = try self.analyzeLayout(img, control);
+            layout_regions = try self.analyzeLayout(img, control, retained);
+            try retained.trim();
         }
 
         if (self.order != null) {
-            try self.determineOrder(regions, control);
+            try self.determineOrder(regions, control, retained);
+            try retained.trim();
         } else {
             sortRegionsByReadingOrder(TextRegion, regions);
         }
 
         var recognized = std.ArrayListUnmanaged(RecognizedRegion).empty;
         errdefer {
-            for (recognized.items) |*region| region.deinit(self.allocator);
-            recognized.deinit(self.allocator);
+            for (recognized.items) |*region| region.deinit(result_allocator);
+            recognized.deinit(result_allocator);
         }
 
         if (self.recognizer) |*recognizer| {
             for (regions, 0..) |region, index| {
                 if (control) |active|
                     try active.update(.executing, @intCast(index), @intCast(regions.len));
-                const cropped = try crop.cropBBox(self.allocator, img, region.bbox, self.recognition_crop_orientation);
-                defer cropped.deinit(self.allocator);
+                try retained.trim();
+                var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.detector.withAdmissionControl(control), retained);
+                defer preparation.deinit();
+                const work = try preparation.allocator();
+                const cropped = crop.cropBBox(work, img, region.bbox, self.recognition_crop_orientation) catch |err| return preparation.failure(err);
+                defer cropped.deinit(work);
+                try preparation.trim();
 
-                const rec = try recognizer.recognize(cropped, control);
+                const rec = try recognizer.recognizePrepared(cropped, control, &preparation, retained);
                 if (rec.text.len == 0) {
-                    self.allocator.free(rec.text);
+                    result_allocator.free(rec.text);
                     continue;
                 }
-                errdefer self.allocator.free(rec.text);
+                errdefer result_allocator.free(rec.text);
 
-                try recognized.append(self.allocator, .{
+                try recognized.append(result_allocator, .{
                     .bbox = region.bbox,
                     .polygon = region.polygon,
                     .confidence = region.confidence,
@@ -555,11 +652,11 @@ pub const MultiStageOCRPipeline = struct {
             }
         } else {
             for (regions) |region| {
-                try recognized.append(self.allocator, .{
+                try recognized.append(result_allocator, .{
                     .bbox = region.bbox,
                     .polygon = region.polygon,
                     .confidence = region.confidence,
-                    .text = try self.allocator.dupe(u8, ""),
+                    .text = try result_allocator.dupe(u8, ""),
                     .rec_confidence = region.confidence,
                     .label = null,
                 });
@@ -567,115 +664,138 @@ pub const MultiStageOCRPipeline = struct {
         }
 
         if (layout_regions.len > 0) {
-            try attachLayoutLabels(self.allocator, recognized.items, layout_regions);
+            try attachLayoutLabels(result_allocator, recognized.items, layout_regions);
         }
 
         const full_text = if (recognized.items.len > 0)
-            try assembleFullText(self.allocator, recognized.items)
+            try assembleFullText(result_allocator, recognized.items)
         else
-            try self.allocator.dupe(u8, "");
+            try result_allocator.dupe(u8, "");
 
         return .{
-            .allocator = self.allocator,
+            .allocator = result_allocator,
             .full_text = full_text,
-            .regions = try recognized.toOwnedSlice(self.allocator),
+            .regions = try recognized.toOwnedSlice(result_allocator),
             .layout = layout_regions,
         };
     }
 
-    fn detect(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) ![]TextRegion {
+    fn detect(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl, retained: *Preparation) ![]TextRegion {
         const input_size = try detectionInputSize(self.detection_preprocess, img.width, img.height);
-        const pixel_values = try image.preprocessDecodedRectScaledWithResample(
-            self.allocator,
-            img,
-            input_size.width,
-            input_size.height,
-            self.detection_preprocess.mean,
-            self.detection_preprocess.std,
-            self.detection_preprocess.rescale_factor,
-            self.detection_preprocess.resample,
-        );
-        defer self.allocator.free(pixel_values);
+        const outputs = blk: {
+            var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.detector.withAdmissionControl(control), retained);
+            defer preparation.deinit();
+            const work = try preparation.allocator();
+            const pixel_values = image.preprocessDecodedRectScaledWithResample(
+                work,
+                img,
+                input_size.width,
+                input_size.height,
+                self.detection_preprocess.mean,
+                self.detection_preprocess.std,
+                self.detection_preprocess.rescale_factor,
+                self.detection_preprocess.resample,
+            ) catch |err| return preparation.failure(err);
+            defer work.free(pixel_values);
+            try preparation.trim();
 
-        const input_name = if (self.detector.inputInfo().len > 0) self.detector.inputInfo()[0].name else "pixel_values";
-        const shape = [_]i64{
-            1,
-            3,
-            @intCast(input_size.height),
-            @intCast(input_size.width),
+            const input_name = if (self.detector.inputInfo().len > 0) self.detector.inputInfo()[0].name else "pixel_values";
+            const shape = [_]i64{
+                1,
+                3,
+                @intCast(input_size.height),
+                @intCast(input_size.width),
+            };
+            var input_tensor = try preparation.tensor(f32, input_name, &shape, pixel_values);
+            defer input_tensor.deinit();
+
+            break :blk try preparation.run(self.detector, &.{input_tensor}, self.allocator, control);
         };
-        var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, pixel_values);
-        defer input_tensor.deinit();
-
-        const outputs = try self.detector.runWithControl(&.{input_tensor}, self.allocator, control);
         defer freeTensorSlice(self.allocator, outputs);
-        if (outputs.len == 0) return self.allocator.dupe(TextRegion, &.{});
+        const previous_residency = retained.required_host_bytes;
+        retained.required_host_bytes = try std.math.add(usize, previous_residency, try self.detector.outputHostResidency(outputs));
+        defer retained.required_host_bytes = previous_residency;
+        const work = try retained.allocator();
+        if (outputs.len == 0) return work.dupe(TextRegion, &.{});
 
-        const heatmap = try extractDetectionHeatmap(self.allocator, &outputs[0], input_size.width, input_size.height);
-        defer self.allocator.free(heatmap.values);
+        const heatmap = try extractDetectionHeatmap(&outputs[0], input_size.width, input_size.height);
         traceDetectionHeatmap(&outputs[0], heatmap.values, heatmap.width, heatmap.height, self.post_processor);
-        return self.post_processor.process(self.allocator, heatmap.values, heatmap.width, heatmap.height, img.width, img.height);
+        return self.post_processor.process(work, heatmap.values, heatmap.width, heatmap.height, img.width, img.height);
     }
 
-    fn analyzeLayout(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl) ![]LayoutRegion {
-        const layout = self.layout orelse return self.allocator.dupe(LayoutRegion, &.{});
+    fn analyzeLayout(self: *MultiStageOCRPipeline, img: image.Image, control: ?InferenceExecutionControl, retained: *Preparation) ![]LayoutRegion {
+        const layout = self.layout orelse return (try retained.allocator()).dupe(LayoutRegion, &.{});
+        const outputs = blk: {
+            var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, layout.withAdmissionControl(control), retained);
+            defer preparation.deinit();
+            const work = try preparation.allocator();
+            const pixel_values = image.preprocessDecodedRectScaledWithResample(
+                work,
+                img,
+                self.detection_preprocess.width,
+                self.detection_preprocess.height,
+                self.detection_preprocess.mean,
+                self.detection_preprocess.std,
+                self.detection_preprocess.rescale_factor,
+                self.detection_preprocess.resample,
+            ) catch |err| return preparation.failure(err);
+            defer work.free(pixel_values);
+            try preparation.trim();
 
-        const pixel_values = try image.preprocessDecodedRectScaledWithResample(
-            self.allocator,
-            img,
-            self.detection_preprocess.width,
-            self.detection_preprocess.height,
-            self.detection_preprocess.mean,
-            self.detection_preprocess.std,
-            self.detection_preprocess.rescale_factor,
-            self.detection_preprocess.resample,
-        );
-        defer self.allocator.free(pixel_values);
+            const input_name = if (layout.inputInfo().len > 0) layout.inputInfo()[0].name else "pixel_values";
+            const shape = [_]i64{
+                1,
+                3,
+                @intCast(self.detection_preprocess.height),
+                @intCast(self.detection_preprocess.width),
+            };
+            var input_tensor = try preparation.tensor(f32, input_name, &shape, pixel_values);
+            defer input_tensor.deinit();
 
-        const input_name = if (layout.inputInfo().len > 0) layout.inputInfo()[0].name else "pixel_values";
-        const shape = [_]i64{
-            1,
-            3,
-            @intCast(self.detection_preprocess.height),
-            @intCast(self.detection_preprocess.width),
+            break :blk try preparation.run(layout, &.{input_tensor}, self.allocator, control);
         };
-        var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, pixel_values);
-        defer input_tensor.deinit();
-
-        const outputs = try layout.runWithControl(&.{input_tensor}, self.allocator, control);
         defer freeTensorSlice(self.allocator, outputs);
-        if (outputs.len == 0) return self.allocator.dupe(LayoutRegion, &.{});
+        const previous_residency = retained.required_host_bytes;
+        retained.required_host_bytes = try std.math.add(usize, previous_residency, try self.detector.outputHostResidency(outputs));
+        defer retained.required_host_bytes = previous_residency;
+        const work = try retained.allocator();
+        if (outputs.len == 0) return (try retained.allocator()).dupe(LayoutRegion, &.{});
 
-        return parseLayoutOutput(self.allocator, &outputs[0], img.width, img.height);
+        return parseLayoutOutput(work, &outputs[0], img.width, img.height);
     }
 
-    fn determineOrder(self: *MultiStageOCRPipeline, regions: []TextRegion, control: ?InferenceExecutionControl) !void {
+    fn determineOrder(self: *MultiStageOCRPipeline, regions: []TextRegion, control: ?InferenceExecutionControl, retained: *Preparation) !void {
         if (regions.len <= 1) return;
         const order = self.order orelse {
             sortRegionsByReadingOrder(TextRegion, regions);
             return;
         };
 
-        const bbox_data = try self.allocator.alloc(f32, regions.len * 4);
-        defer self.allocator.free(bbox_data);
-        for (regions, 0..) |region, idx| {
-            bbox_data[idx * 4 + 0] = @floatCast(region.bbox[0]);
-            bbox_data[idx * 4 + 1] = @floatCast(region.bbox[1]);
-            bbox_data[idx * 4 + 2] = @floatCast(region.bbox[2]);
-            bbox_data[idx * 4 + 3] = @floatCast(region.bbox[3]);
-        }
+        const outputs = blk: {
+            var preparation = @import("preprocessing_memory.zig").Scope.child(self.allocator, order.withAdmissionControl(control), retained);
+            defer preparation.deinit();
+            const work = try preparation.allocator();
+            const bbox_data = work.alloc(f32, regions.len * 4) catch |err| return preparation.failure(err);
+            defer work.free(bbox_data);
+            for (regions, 0..) |region, idx| {
+                bbox_data[idx * 4 + 0] = @floatCast(region.bbox[0]);
+                bbox_data[idx * 4 + 1] = @floatCast(region.bbox[1]);
+                bbox_data[idx * 4 + 2] = @floatCast(region.bbox[2]);
+                bbox_data[idx * 4 + 3] = @floatCast(region.bbox[3]);
+            }
 
-        const input_name = if (order.inputInfo().len > 0) order.inputInfo()[0].name else "boxes";
-        const shape = [_]i64{ 1, @intCast(regions.len), 4 };
-        var input_tensor = try backends.Tensor.initFloat32(self.allocator, input_name, &shape, bbox_data);
-        defer input_tensor.deinit();
+            const input_name = if (order.inputInfo().len > 0) order.inputInfo()[0].name else "boxes";
+            const shape = [_]i64{ 1, @intCast(regions.len), 4 };
+            var input_tensor = try preparation.tensor(f32, input_name, &shape, bbox_data);
+            defer input_tensor.deinit();
 
-        const outputs = order.runWithControl(&.{input_tensor}, self.allocator, control) catch |err| switch (err) {
-            error.Cancelled, error.Timeout => return err,
-            else => {
-                sortRegionsByReadingOrder(TextRegion, regions);
-                return;
-            },
+            break :blk preparation.run(order, &.{input_tensor}, self.allocator, control) catch |err| switch (err) {
+                error.UnsupportedOperation, error.UnsupportedOperator, error.UnsupportedOnnxOperator => {
+                    sortRegionsByReadingOrder(TextRegion, regions);
+                    return;
+                },
+                else => return err,
+            };
         };
         defer freeTensorSlice(self.allocator, outputs);
         if (outputs.len == 0) {
@@ -688,12 +808,15 @@ pub const MultiStageOCRPipeline = struct {
             return;
         };
 
-        try sortRegionsByPredictedOrder(self.allocator, regions, order_data);
+        const previous_residency = retained.required_host_bytes;
+        retained.required_host_bytes = try std.math.add(usize, previous_residency, try self.detector.outputHostResidency(outputs));
+        defer retained.required_host_bytes = previous_residency;
+        try sortRegionsByPredictedOrder(try retained.allocator(), regions, order_data);
     }
 };
 
 const DetectionHeatmap = struct {
-    values: []f32,
+    values: []const f32,
     width: usize,
     height: usize,
 };
@@ -882,16 +1005,17 @@ fn sortRegionsByPredictedOrder(
 }
 
 fn extractDetectionHeatmap(
-    allocator: std.mem.Allocator,
     output: *const backends.Tensor,
     fallback_width: u32,
     fallback_height: u32,
 ) !DetectionHeatmap {
     if (output.dtype != .f32) return error.UnsupportedTensorType;
+    _ = try output.denseElementCount();
     const output_data = output.asFloat32IfAligned() orelse return error.UnalignedTensorData;
 
     switch (output.shape.len) {
         4 => {
+            if (output.shape[0] != 1 or output.shape[1] <= 0) return error.InvalidInputShape;
             const num_classes: usize = @intCast(output.shape[1]);
             const out_h: usize = @intCast(output.shape[2]);
             const out_w: usize = @intCast(output.shape[3]);
@@ -901,7 +1025,7 @@ fn extractDetectionHeatmap(
             else
                 output_data[0..plane_size];
             return .{
-                .values = try allocator.dupe(f32, plane),
+                .values = plane,
                 .width = out_w,
                 .height = out_h,
             };
@@ -911,13 +1035,13 @@ fn extractDetectionHeatmap(
             const out_w: usize = @intCast(output.shape[2]);
             const plane_size = out_h * out_w;
             return .{
-                .values = try allocator.dupe(f32, output_data[0..plane_size]),
+                .values = output_data[0..plane_size],
                 .width = out_w,
                 .height = out_h,
             };
         },
         else => return .{
-            .values = try allocator.dupe(f32, output_data),
+            .values = output_data,
             .width = fallback_width,
             .height = fallback_height,
         },
@@ -1105,9 +1229,9 @@ test "extractDetectionHeatmap selects foreground plane from multi-class output" 
     });
     defer tensor.deinit();
 
-    const heatmap = try extractDetectionHeatmap(allocator, &tensor, 2, 2);
-    defer allocator.free(heatmap.values);
+    const heatmap = try extractDetectionHeatmap(&tensor, 2, 2);
 
+    try std.testing.expect(heatmap.values.ptr == tensor.asFloat32().ptr + 4);
     try std.testing.expectEqual(@as(usize, 2), heatmap.width);
     try std.testing.expectEqual(@as(usize, 2), heatmap.height);
     try std.testing.expectEqualSlices(f32, &.{ 0.9, 0.8, 0.7, 0.6 }, heatmap.values);
@@ -1267,4 +1391,254 @@ test "media residency OCR recognition reuses resident outputs when reduction is 
         try std.testing.expectApproxEqAbs(@as(f64, 0.85), result.confidence, 1e-6);
         try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     }
+}
+
+test "multistage reader decoding and preprocessing deny before backing allocation" {
+    var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+    const session = backends.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1, .scratch_limit_bytes = 1 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var pipeline = MultiStageOCRPipeline{
+        .allocator = std.testing.failing_allocator,
+        .detector = session,
+        .detection_preprocess = .{ .width = 2, .height = 2 },
+        .post_processor = .{ .db = .{ .threshold = 0.3, .box_threshold = 0.5, .unclip_ratio = 1.5, .min_box_area = 1 } },
+    };
+    try std.testing.expectError(error.ResourceLimitExceeded, pipeline.run(@import("antfly_documents").fixtures.get("one-pixel.png")));
+    var rgb: [12]u8 = @splat(255);
+    const img = image.Image{ .data = &rgb, .width = 2, .height = 2, .channels = 3 };
+    try std.testing.expectError(error.ResourceLimitExceeded, pipeline.runDecoded(img));
+    var recognizer = CTCRecognizer{ .allocator = std.testing.failing_allocator, .session = session, .char_dict = &.{}, .preprocess = .{ .width = 2, .height = 2 } };
+    try std.testing.expectError(error.ResourceLimitExceeded, recognizer.recognize(img, null));
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}
+
+test "multistage postprocessing admits detector and layout component scratch" {
+    for ([_]bool{ false, true }) |layout| {
+        var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+        var detector = PostprocessFixture{ .empty = layout, .fragmented = true };
+        var layout_model = PostprocessFixture{ .empty = false, .fragmented = true };
+        const table = backends.Session.VTable{ .run = PostprocessFixture.run, .inputInfo = PostprocessFixture.inputInfo, .outputInfo = PostprocessFixture.outputInfo, .backend = PostprocessFixture.backend, .close = PostprocessFixture.close };
+        const session = backends.Session{ .ptr = &detector, .vtable = &table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 160 * 1024, .scratch_limit_bytes = 160 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+        var layout_session = session;
+        layout_session.ptr = &layout_model;
+        var pipeline = MultiStageOCRPipeline{ .allocator = std.testing.allocator, .detector = session, .layout = if (layout) layout_session else null, .detection_preprocess = .{ .width = 2, .height = 2 }, .post_processor = .{ .db = .{ .threshold = 0.3, .box_threshold = 0.5, .unclip_ratio = 1.5, .min_box_area = 1 } } };
+        var rgb: [12]u8 = @splat(255);
+        try std.testing.expectError(error.ResourceLimitExceeded, pipeline.runDecoded(.{ .data = &rgb, .width = 2, .height = 2, .channels = 3 }));
+        try std.testing.expectEqual(@as(usize, 1), detector.calls);
+        if (layout) try std.testing.expectEqual(@as(usize, 1), layout_model.calls);
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+    }
+}
+
+const PostprocessFixture = struct {
+    empty: bool,
+    dimension: usize = 64,
+    fragmented: bool = false,
+    calls: usize = 0,
+    fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+        return &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 1, 3, 2, 2 } }};
+    }
+    fn outputInfo(raw: *anyopaque) []const backends.TensorInfo {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return switch (self.dimension) {
+            2 => &.{.{ .name = "heatmap", .dtype = .f32, .shape = &.{ 1, 1, 2, 2 } }},
+            16 => &.{.{ .name = "heatmap", .dtype = .f32, .shape = &.{ 1, 1, 16, 16 } }},
+            else => &.{.{ .name = "heatmap", .dtype = .f32, .shape = &.{ 1, 1, 64, 64 } }},
+        };
+    }
+    fn backend(_: *anyopaque) backends.BackendType {
+        return .native;
+    }
+    fn close(_: *anyopaque) void {}
+    fn run(raw: *anyopaque, _: []const backends.Tensor, a: std.mem.Allocator) ![]backends.Tensor {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        if (self.empty) return a.alloc(backends.Tensor, 0);
+        const outputs = try a.alloc(backends.Tensor, 1);
+        errdefer a.free(outputs);
+        var values: [64 * 64]f32 = @splat(1);
+        if (self.fragmented) for (&values, 0..) |*value, index| {
+            value.* = if ((index / self.dimension + index % self.dimension) % 2 == 0) 1 else 0;
+        };
+        outputs[0] = try backends.Tensor.initFloat32(a, "heatmap", &.{ 1, 1, @intCast(self.dimension), @intCast(self.dimension) }, values[0 .. self.dimension * self.dimension]);
+        return outputs;
+    }
+};
+
+fn checkPostprocessOwnership(allocator: std.mem.Allocator) !void {
+    var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+    var fake = PostprocessFixture{ .empty = false, .dimension = 16 };
+    const session = backends.Session{ .ptr = &fake, .vtable = &.{ .run = PostprocessFixture.run, .inputInfo = PostprocessFixture.inputInfo, .outputInfo = PostprocessFixture.outputInfo, .backend = PostprocessFixture.backend, .close = PostprocessFixture.close }, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 * 1024, .scratch_limit_bytes = 64 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+    var pipeline = MultiStageOCRPipeline{ .allocator = allocator, .detector = session, .layout = session, .detection_preprocess = .{ .width = 2, .height = 2 }, .post_processor = .{ .db = .{ .threshold = 0.3, .box_threshold = 0.5, .unclip_ratio = 1, .min_box_area = 1 } } };
+    var rgb: [12]u8 = @splat(255);
+    defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
+    var result = try pipeline.runDecoded(.{ .data = &rgb, .width = 2, .height = 2, .channels = 3 });
+    defer result.deinit();
+    try std.testing.expect(controller.snapshot().hostTotalBytes() > 0);
+    try std.testing.expectEqual(@as(usize, 1), result.regions.len);
+    try std.testing.expectEqualStrings("", result.regions[0].text);
+    try std.testing.expectEqual(@as(usize, 1), result.layout.len);
+    try std.testing.expectEqualStrings("Caption", result.layout[0].label);
+    try std.testing.expectEqualStrings("Caption", result.regions[0].label.?);
+}
+
+test "multistage postprocessing transfers compact results and unwinds every allocation failure" {
+    try checkPostprocessOwnership(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPostprocessOwnership, .{});
+}
+
+const CtcWorkspaceFixture = struct {
+    resident: bool,
+    reduction: bool,
+    opaque_bytes: usize = 0,
+    fn info(_: *anyopaque) []const backends.TensorInfo {
+        return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ 1, 64, 3 } }};
+    }
+    fn backend(_: *anyopaque) backends.BackendType {
+        return .native;
+    }
+    fn close(_: *anyopaque) void {}
+    fn values() [64 * 3]f32 {
+        var data: [64 * 3]f32 = @splat(0);
+        for (0..64) |row| data[row * 3 + 1 + row % 2] = 1;
+        return data;
+    }
+    fn run(_: *anyopaque, _: []const backends.Tensor, a: std.mem.Allocator) ![]backends.Tensor {
+        const outputs = try a.alloc(backends.Tensor, 1);
+        errdefer a.free(outputs);
+        const data = values();
+        outputs[0] = try backends.Tensor.initFloat32(a, "logits", &.{ 1, 64, 3 }, &data);
+        return outputs;
+    }
+    const Native = @import("../ops/native_compute.zig");
+    const Ops = @import("../ops/ops.zig");
+    const Owner = struct {
+        allocator: std.mem.Allocator,
+        weights: Native.WeightStore,
+        compute: Native.NativeCompute,
+        table: Ops.ComputeBackend.VTable,
+        cb: Ops.ComputeBackend,
+        opaque_storage: []u8 = &.{},
+        fn destroy(raw: *anyopaque, _: std.mem.Allocator) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.compute.deinit();
+            self.weights.deinitOwned();
+            self.allocator.free(self.opaque_storage);
+            self.allocator.destroy(self);
+        }
+    };
+    fn residentRun(raw: *anyopaque, _: []const backends.Tensor, a: std.mem.Allocator) !?@import("../backends/session.zig").ResidentOutputs {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.resident) return null;
+        const owner = try a.create(Owner);
+        owner.allocator = a;
+        owner.opaque_storage = &.{};
+        owner.weights = .{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+        owner.compute = Native.NativeCompute.init(a, &owner.weights, null);
+        owner.table = owner.compute.computeBackend().vtable.*;
+        if (!self.reduction) owner.table.takeRows = null;
+        owner.cb = .{ .ptr = &owner.compute, .vtable = &owner.table };
+        errdefer Owner.destroy(owner, a);
+        owner.opaque_storage = try a.alloc(u8, self.opaque_bytes);
+        const outputs = try a.alloc(Ops.CT, 1);
+        errdefer a.free(outputs);
+        const data = values();
+        outputs[0] = try owner.cb.fromFloat32Shape(&data, &.{ 1, 64, 3 });
+        return .{ .outputs = outputs, .backend = &owner.cb, .allocator = a, .backend_owner = owner, .deinit_backend_owner = Owner.destroy };
+    }
+    fn geometry(raw: *anyopaque, _: @import("../backends/session.zig").ShapeInputs, _: usize) !?@import("../backends/session.zig").RunGeometry {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return .{ .sequence = 1, .output_bytes = 64 * 3 * 4, .workspace_bytes = self.opaque_bytes };
+    }
+    const table = backends.Session.VTable{ .runGeometry = geometry, .run = run, .runResident = residentRun, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+};
+
+fn checkCtcWorkspace(a: std.mem.Allocator) !void {
+    for (0..3) |mode| {
+        var fixture = CtcWorkspaceFixture{ .resident = mode > 0, .reduction = mode == 2 };
+        var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+        const session = backends.Session{ .ptr = &fixture, .vtable = &CtcWorkspaceFixture.table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1024 * 1024, .scratch_limit_bytes = 1024 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+        var target = Preparation.child(a, session, null);
+        defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
+        defer target.deinit();
+        var first = [_]u8{'A'};
+        var second = [_]u8{'B'};
+        var dictionary = [_][]u8{ &first, &second };
+        var recognizer = CTCRecognizer{ .allocator = a, .session = session, .char_dict = &dictionary, .preprocess = .{ .width = 2, .height = 2 } };
+        var pixels: [12]u8 = @splat(255);
+        const result = try recognizer.recognizePrepared(.{ .data = &pixels, .width = 2, .height = 2, .channels = 3 }, null, null, &target);
+        try std.testing.expectEqual(@as(usize, 64), result.text.len);
+        for (result.text, 0..) |byte, index| try std.testing.expectEqual(@as(u8, if (index % 2 == 0) 'A' else 'B'), byte);
+        try std.testing.expect(target.owner.ownsRange(result.text));
+        (try target.allocator()).free(result.text);
+        try target.trim();
+    }
+}
+
+test "multistage CTC transfers admitted text through host resident and exported paths" {
+    try checkCtcWorkspace(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkCtcWorkspace, .{});
+}
+
+test "multistage CTC rejects long dictionary text expansion before backing growth" {
+    for (0..3) |mode| {
+        var fixture = CtcWorkspaceFixture{ .resident = mode > 0, .reduction = mode == 2 };
+        var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+        const session = backends.Session{ .ptr = &fixture, .vtable = &CtcWorkspaceFixture.table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 256 * 1024, .scratch_limit_bytes = 256 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+        var target = Preparation.child(std.testing.allocator, session, null);
+        defer target.deinit();
+        var first: [64 * 1024]u8 = @splat('A');
+        var second: [64 * 1024]u8 = @splat('B');
+        var dictionary = [_][]u8{ &first, &second };
+        var recognizer = CTCRecognizer{ .allocator = std.testing.allocator, .session = session, .char_dict = &dictionary, .preprocess = .{ .width = 2, .height = 2 } };
+        var pixels: [12]u8 = @splat(255);
+        try std.testing.expectError(error.ResourceLimitExceeded, recognizer.recognizePrepared(.{ .data = &pixels, .width = 2, .height = 2, .channels = 3 }, null, null, &target));
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+    }
+}
+
+test "multistage CTC cannot spend opaque resident workspace on expanded text" {
+    var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+    var fixture = CtcWorkspaceFixture{ .resident = true, .reduction = true, .opaque_bytes = 96 * 1024 };
+    const session = backends.Session{ .ptr = &fixture, .vtable = &CtcWorkspaceFixture.table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 128 * 1024, .scratch_limit_bytes = 128 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+    var first: [1024]u8 = @splat('A');
+    var second: [1024]u8 = @splat('B');
+    var dictionary = [_][]u8{ &first, &second };
+    var recognizer = CTCRecognizer{ .allocator = std.testing.allocator, .session = session, .char_dict = &dictionary, .preprocess = .{ .width = 2, .height = 2 } };
+    var pixels: [12]u8 = @splat(255);
+    try std.testing.expectError(error.ResourceLimitExceeded, recognizer.recognize(.{ .data = &pixels, .width = 2, .height = 2, .channels = 3 }, null));
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}
+
+test "multistage ordering propagates one shot checkpoints and only falls back for unsupported operations" {
+    const Fixture = struct {
+        failure: anyerror,
+        calls: usize = 0,
+        fn run(raw: *anyopaque, _: []const backends.Tensor, _: std.mem.Allocator) ![]backends.Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.failure;
+        }
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 1) return error.CheckpointRevisionUnavailable;
+        }
+    };
+    var fixture = Fixture{ .failure = error.UnsupportedOperation };
+    const session = backends.Session{ .ptr = &fixture, .vtable = &.{ .run = Fixture.run, .inputInfo = Fixture.info, .outputInfo = Fixture.info, .backend = Fixture.backend, .close = Fixture.close } };
+    var pipeline = MultiStageOCRPipeline{ .allocator = std.testing.allocator, .detector = session, .order = session, .detection_preprocess = .{ .width = 2, .height = 2 }, .post_processor = .{ .heatmap = .{ .threshold = 0.5, .min_area = 1 } } };
+    var regions = [_]TextRegion{ .{ .bbox = .{ 0, 10, 1, 11 }, .confidence = 1 }, .{ .bbox = .{ 0, 0, 1, 1 }, .confidence = 1 } };
+    var retained = Preparation.child(std.testing.allocator, session, null);
+    defer retained.deinit();
+    try std.testing.expectError(error.CheckpointRevisionUnavailable, pipeline.determineOrder(&regions, .{ .ptr = &fixture, .check_fn = Fixture.check }, &retained));
+    try pipeline.determineOrder(&regions, null, &retained);
+    try std.testing.expectEqual(@as(f64, 0), regions[0].bbox[1]);
+    fixture.failure = error.OrderExecutionFailed;
+    try std.testing.expectError(error.OrderExecutionFailed, pipeline.determineOrder(&regions, null, &retained));
 }

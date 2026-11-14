@@ -37,6 +37,7 @@ const session_mod = @import("../backends/session.zig");
 const ops = @import("../ops/ops.zig");
 const tokenizer_mod = @import("inference_tokenizer");
 const image = @import("image.zig");
+const admission_memory = @import("../runtime/tier/memory.zig");
 const antfly_image = @import("antfly_image");
 
 const CT = ops.CT;
@@ -92,7 +93,33 @@ pub const ReadResult = struct {
     text: []const u8,
     allocator: std.mem.Allocator,
 
+    storage: ?*@import("preprocessing_memory.zig").Owned = null,
+
+    /// Move admitted text into the document owner without overlapping payloads.
+    /// Keep the allocation base when trimming so the destination can free it.
+    /// Unowned native results retain the caller's copy-based fallback.
+    pub fn takeTrimmedTextInto(self: *ReadResult, target: *@import("preprocessing_memory.zig").Scope) !?[]u8 {
+        const storage = self.storage orelse return null;
+        const trimmed = std.mem.trim(u8, self.text, " \t\r\n");
+        if (trimmed.len == 0) {
+            self.allocator.free(self.text);
+            self.text = &.{};
+            return @constCast(self.text);
+        }
+        try target.absorb(&storage.scope);
+        const text = @constCast(self.text)[0..trimmed.len];
+        std.mem.copyForwards(u8, text, trimmed);
+        self.text = &.{};
+        return text;
+    }
+
     pub fn deinit(self: *ReadResult) void {
+        if (self.storage) |storage| {
+            @import("preprocessing_memory.zig").Owned.release(storage);
+            self.storage = null;
+            self.text = &.{};
+            return;
+        }
         self.allocator.free(self.text);
     }
 };
@@ -124,6 +151,7 @@ const PreprocessScratchAdmission = struct {
     allocator: std.mem.Allocator,
     session: backends.Session,
     permits: std.ArrayListUnmanaged(session_mod.RunPermit) = .empty,
+    parent: ?*const @import("preprocessing_memory.zig").Scope = null,
 
     fn descriptor(self: *@This()) image.ScratchAdmission {
         return .{ .context = self, .grow = growOpaque };
@@ -134,7 +162,8 @@ const PreprocessScratchAdmission = struct {
         if (target_bytes < current_bytes) return error.InvalidBatchPreprocessOptions;
         const additional = target_bytes - current_bytes;
         if (additional == 0) return;
-        var permit = try self.session.admitHostPreprocess(additional);
+        const inherited = if (self.parent) |parent| try parent.ownedHostBytesFor(self.session) else 0;
+        var permit = try self.session.admitHostPreprocessOwned(additional, try std.math.add(usize, current_bytes, inherited));
         errdefer permit.deinit();
         try self.permits.append(self.allocator, permit);
     }
@@ -147,6 +176,8 @@ const PreprocessScratchAdmission = struct {
 };
 
 pub const ReadingPipeline = struct {
+    preparation_owner: ?*const @import("../backends/admitted_allocator.zig").AdmittedAllocator = null,
+    preparation_parent: ?*const @import("preprocessing_memory.zig").Scope = null,
     allocator: std.mem.Allocator,
     vision_encoder: backends.Session,
     decoder: backends.Session,
@@ -158,51 +189,56 @@ pub const ReadingPipeline = struct {
     /// Borrowed from the pinned model generation for the complete read.
     native_execution_lane: ?*@import("../execution_control.zig").ExecutionLane = null,
 
-    fn admitPreprocessPixels(self: *ReadingPipeline, count: usize) !?session_mod.RunPermit {
-        if (self.native_execution_lane == null) return null;
-        return try self.vision_encoder.admitHostPreprocess(std.math.mul(usize, count, @sizeOf(f32)) catch return error.InvalidInputShape);
+    fn preparationScope(self: *ReadingPipeline) @import("preprocessing_memory.zig").Scope {
+        var scope = @import("preprocessing_memory.zig").Scope.child(self.allocator, self.vision_encoder.withAdmissionControl(self.execution_control), self.preparation_parent);
+        if (self.preparation_parent == null) scope.owner.parent = self.preparation_owner;
+        return scope;
     }
 
     fn preprocessOptions(self: *ReadingPipeline, scratch: *PreprocessScratchAdmission) image.BatchPreprocessOptions {
         return .{
             .io = self.config.preprocess_io,
             .control = self.imageWorkControl(),
-            .scratch_admission = if (self.native_execution_lane != null) scratch.descriptor() else null,
+            .scratch_admission = scratch.descriptor(),
         };
     }
 
-    fn preprocessEncodedBatchInto(self: *ReadingPipeline, pixels: []f32, images: []const []const u8) !void {
-        var scratch = PreprocessScratchAdmission{ .allocator = self.allocator, .session = self.vision_encoder };
+    fn preprocessEncodedBatchInto(self: *ReadingPipeline, pixels: []f32, images: []const []const u8, parent: *const @import("preprocessing_memory.zig").Scope) !void {
+        var capture = admission_memory.AdmissionFailure.Capture.init(if (self.vision_encoder.run_admission) |admission| admission.failure else null);
+        var scratch = PreprocessScratchAdmission{ .allocator = self.allocator, .session = self.vision_encoder.withAdmissionFailure(capture.sink()), .parent = parent };
         defer scratch.deinit();
-        try image.preprocessBatchIntoBounded(pixels, images, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample, self.preprocessOptions(&scratch));
+        image.preprocessBatchIntoBounded(pixels, images, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample, self.preprocessOptions(&scratch)) catch |err| {
+            capture.publish(err);
+            return err;
+        };
     }
 
-    fn preprocessRasterBatchInto(self: *ReadingPipeline, pixels: []f32, rasters: []const antfly_image.BorrowedRasterAttachment) !void {
-        var scratch = PreprocessScratchAdmission{ .allocator = self.allocator, .session = self.vision_encoder };
+    fn preprocessRasterBatchInto(self: *ReadingPipeline, pixels: []f32, rasters: []const antfly_image.BorrowedRasterAttachment, parent: *const @import("preprocessing_memory.zig").Scope) !void {
+        var capture = admission_memory.AdmissionFailure.Capture.init(if (self.vision_encoder.run_admission) |admission| admission.failure else null);
+        var scratch = PreprocessScratchAdmission{ .allocator = self.allocator, .session = self.vision_encoder.withAdmissionFailure(capture.sink()), .parent = parent };
         defer scratch.deinit();
-        try image.preprocessBorrowedRasterBatchIntoWithOptions(self.allocator, pixels, rasters, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample, self.preprocessOptions(&scratch));
+        image.preprocessBorrowedRasterBatchIntoWithOptions(self.allocator, pixels, rasters, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample, self.preprocessOptions(&scratch)) catch |err| {
+            capture.publish(err);
+            return err;
+        };
     }
 
     fn readBoundedNativeImage(self: *ReadingPipeline, bytes: []const u8) !ReadResult {
         const side = std.math.mul(usize, self.config.image_size, self.config.image_size) catch return error.InvalidInputShape;
         const count = std.math.mul(usize, side, 3) catch return error.InvalidInputShape;
-        var permit = try self.admitPreprocessPixels(count);
-        defer if (permit) |*owned| owned.deinit();
-        const pixels = try self.allocator.alloc(f32, count);
-        defer self.allocator.free(pixels);
-        try self.preprocessEncodedBatchInto(pixels, &.{bytes});
+        var preparation = self.preparationScope();
+        defer preparation.deinit();
+        const work = try preparation.allocator();
+        const pixels = work.alloc(f32, count) catch |err| return preparation.failure(err);
+        defer work.free(pixels);
+        try preparation.trim();
+        try self.preprocessEncodedBatchInto(pixels, &.{bytes}, &preparation);
         if (self.execution_control) |control| try control.check();
-        return self.readPixelValues(pixels);
+        return self.readPixelValues(pixels, &preparation);
     }
 
     fn imageWorkControl(self: *ReadingPipeline) antfly_image.work_control.Control {
         return if (self.execution_control) |*control| control.imageWorkControl() else .{};
-    }
-
-    fn preprocessDecoded(self: *ReadingPipeline, decoded: image.Image) ![]f32 {
-        const scope = antfly_image.work_control.Scope.enter(self.imageWorkControl());
-        defer scope.deinit();
-        return image.preprocessDecodedWithResample(self.allocator, decoded, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample);
     }
 
     pub fn init(
@@ -263,33 +299,20 @@ pub const ReadingPipeline = struct {
         active_read_profile_source_fingerprint = self.config.source_fingerprint;
         defer active_read_profile_source_fingerprint = previous_source_fingerprint;
         resetLastReadTelemetry();
-        if (self.native_execution_lane != null) return self.readBoundedNativeImage(image_data);
-        const allocator = self.allocator;
-        const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
-        if (debug_cuda_session) std.log.info("reading: decode start bytes={d}", .{image_data.len});
-        const decode_start = nowNs();
-        const decoded = blk: {
-            const scope = antfly_image.work_control.Scope.enter(self.imageWorkControl());
-            defer scope.deinit();
-            break :blk try image.decode(allocator, image_data);
-        };
-        logReadProfile("decode", decode_start);
-        if (debug_cuda_session) std.log.info("reading: decode done", .{});
-        defer decoded.deinit(allocator);
-
-        if (expectsFlattenedPatches(self.vision_encoder)) {
-            if (debug_cuda_session) std.log.info("reading: pix2struct path", .{});
-            return self.readPix2StructDecoded(decoded);
-        }
-
-        const img_size: u32 = @intCast(self.config.image_size);
-        if (debug_cuda_session) std.log.info("reading: preprocess start image_size={d}", .{img_size});
-        const preprocess_start = nowNs();
-        const pixel_values = try self.preprocessDecoded(decoded);
-        logReadProfile("preprocess", preprocess_start);
-        if (debug_cuda_session) std.log.info("reading: preprocess done pixels={d}", .{pixel_values.len});
-        defer allocator.free(pixel_values);
-        return self.readPixelValues(pixel_values);
+        // Memory ownership is independent of the optional GPU execution lane.
+        // Ordinary encoder/decoder readers use the same bounded codec path.
+        if (!expectsFlattenedPatches(self.vision_encoder)) return self.readBoundedNativeImage(image_data);
+        var preparation = self.preparationScope();
+        defer preparation.deinit();
+        const work = try preparation.allocator();
+        const scope = antfly_image.work_control.Scope.enter(self.imageWorkControl());
+        defer scope.deinit();
+        const decoded = image.decode(work, image_data) catch |err| return preparation.failure(err);
+        defer decoded.deinit(work);
+        try preparation.trim();
+        var execution = self.*;
+        execution.preparation_parent = &preparation;
+        return execution.readPix2StructDecoded(decoded);
     }
 
     /// Read text from a homogeneous image batch. Unsupported model families fall
@@ -460,12 +483,14 @@ pub const ReadingPipeline = struct {
         const per_image_side = std.math.mul(usize, img_size, img_size) catch
             return error.InvalidInputShape;
         const count = std.math.mul(usize, per_image_side, 3) catch return error.InvalidInputShape;
-        var host_pixels = try self.admitPreprocessPixels(count);
-        defer if (host_pixels) |*permit| permit.deinit();
-        const pixel_values = try self.allocator.alloc(f32, count);
-        defer self.allocator.free(pixel_values);
-        try self.preprocessRasterBatchInto(pixel_values, &.{raster});
-        return self.readPixelValues(pixel_values);
+        var preparation = self.preparationScope();
+        defer preparation.deinit();
+        const work = try preparation.allocator();
+        const pixel_values = work.alloc(f32, count) catch |err| return preparation.failure(err);
+        defer work.free(pixel_values);
+        try preparation.trim();
+        try self.preprocessRasterBatchInto(pixel_values, &.{raster}, &preparation);
+        return self.readPixelValues(pixel_values, &preparation);
     }
 
     fn readBorrowedRasterBatchNativeChunked(
@@ -517,16 +542,19 @@ pub const ReadingPipeline = struct {
         const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
         const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
         const pixel_count = std.math.mul(usize, batch, per_image) catch return error.InvalidInputShape;
-        var host_pixels = try self.admitPreprocessPixels(pixel_count);
-        defer if (host_pixels) |*permit| permit.deinit();
-        const pixel_values = try self.allocator.alloc(f32, pixel_count);
-        defer self.allocator.free(pixel_values);
+        var preparation = self.preparationScope();
+        defer preparation.deinit();
+        const work = try preparation.allocator();
+        const pixel_values = work.alloc(f32, pixel_count) catch |err| return preparation.failure(err);
+        defer work.free(pixel_values);
+        try preparation.trim();
         resetLastReadTelemetry();
-        try self.preprocessRasterBatchInto(pixel_values, rasters);
+        try self.preprocessRasterBatchInto(pixel_values, rasters, &preparation);
         return self.readBatchNativeFlorencePixels(
             pixel_values,
             batch,
             florence_cfg,
+            &preparation,
             platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION"),
         );
     }
@@ -605,19 +633,22 @@ pub const ReadingPipeline = struct {
         const per_image_side = std.math.mul(usize, ts, ts) catch return error.InvalidInputShape;
         const per_image = std.math.mul(usize, 3, per_image_side) catch return error.InvalidInputShape;
         const pixel_count = std.math.mul(usize, batch, per_image) catch return error.InvalidInputShape;
-        var host_pixels = try self.admitPreprocessPixels(pixel_count);
-        defer if (host_pixels) |*permit| permit.deinit();
-        const pixel_values = try allocator.alloc(f32, pixel_count);
-        defer allocator.free(pixel_values);
+        var preparation = self.preparationScope();
+        defer preparation.deinit();
+        const work = try preparation.allocator();
+        const pixel_values = work.alloc(f32, pixel_count) catch |err| return preparation.failure(err);
+        defer work.free(pixel_values);
+        try preparation.trim();
 
         if (self.execution_control) |control| try control.check();
-        try self.preprocessEncodedBatchInto(pixel_values, image_datas);
+        try self.preprocessEncodedBatchInto(pixel_values, image_datas, &preparation);
         if (self.execution_control) |control| try control.check();
 
         return self.readBatchNativeFlorencePixels(
             pixel_values,
             batch,
             florence_cfg,
+            &preparation,
             debug_cuda_session,
         );
     }
@@ -627,6 +658,7 @@ pub const ReadingPipeline = struct {
         pixel_values: []const f32,
         batch: usize,
         florence_cfg: florence_arch.Config,
+        preparation: *@import("preprocessing_memory.zig").Scope,
         debug_cuda_session: bool,
     ) ![]ReadResult {
         defer if (platform.env.getenvBool("ANTFLY_FLORENCE2_TRACE_NO_REPEAT_ARGMAX"))
@@ -641,19 +673,20 @@ pub const ReadingPipeline = struct {
         var run_permit: ?session_mod.RunPermit = null;
         defer if (run_permit) |*permit| permit.deinit();
 
+        const work = try preparation.allocator();
         const prompt_text = self.config.prompt orelse "<OCR>";
-        const prompt_i32 = try buildFlorencePromptIds(
-            allocator,
+        const prompt_i32 = buildFlorencePromptIds(
+            work,
             self.tokenizer,
             florence_cfg,
             prompt_text,
-        );
-        defer allocator.free(prompt_i32);
+        ) catch |err| return preparation.failure(err);
+        defer work.free(prompt_i32);
 
         const prompt_len = prompt_i32.len;
         const prompt_total = std.math.mul(usize, batch, prompt_len) catch return error.InvalidInputShape;
-        const prompt_i64 = try allocator.alloc(i64, prompt_total);
-        defer allocator.free(prompt_i64);
+        const prompt_i64 = work.alloc(i64, prompt_total) catch |err| return preparation.failure(err);
+        defer work.free(prompt_i64);
         for (0..batch) |b| {
             for (prompt_i32, 0..) |id, i| prompt_i64[b * prompt_len + i] = id;
         }
@@ -661,7 +694,7 @@ pub const ReadingPipeline = struct {
         // Direct compute bypasses Session.run, so retain its admission permit
         // through both encoder/decoder execution and backend cleanup.
         var incremental_admission = cudaFlorenceIncrementalAdmissionEligible(self.vision_encoder.backend(), florenceKvCacheDisabled());
-        run_permit = self.vision_encoder.admit(try nativeFlorenceRunRequestWithLogitMode(
+        run_permit = preparation.admitInputRun(self.vision_encoder.withAdmissionControl(self.execution_control), try nativeFlorenceRunRequestWithLogitMode(
             florence_cfg,
             batch,
             pixel_values.len,
@@ -674,7 +707,7 @@ pub const ReadingPipeline = struct {
             // the incremental envelope and give up that fallback for this run.
             if (incremental_admission or !florenceIncrementalAdmissionRetryEligible(self.vision_encoder.backend(), florenceKvCacheDisabled(), err)) return err;
             incremental_admission = true;
-            break :permit try self.vision_encoder.admit(try nativeFlorenceRunRequestWithLogitMode(
+            break :permit try preparation.admitInputRun(self.vision_encoder.withAdmissionControl(self.execution_control), try nativeFlorenceRunRequestWithLogitMode(
                 florence_cfg,
                 batch,
                 pixel_values.len,
@@ -1172,31 +1205,29 @@ pub const ReadingPipeline = struct {
 
     fn readDecodedImpl(self: *ReadingPipeline, img: image.Image) !ReadResult {
         resetLastReadTelemetry();
-        if (expectsFlattenedPatches(self.vision_encoder)) {
-            return self.readPix2StructDecoded(img);
-        }
-
+        if (expectsFlattenedPatches(self.vision_encoder)) return self.readPix2StructDecoded(img);
         const allocator = self.allocator;
-        if (self.native_execution_lane != null) {
-            const side = std.math.mul(usize, self.config.image_size, self.config.image_size) catch return error.InvalidInputShape;
-            const count = std.math.mul(usize, side, 3) catch return error.InvalidInputShape;
-            var permit = try self.admitPreprocessPixels(count);
-            defer if (permit) |*owned| owned.deinit();
-            const pixels = try allocator.alloc(f32, count);
-            defer allocator.free(pixels);
-            {
-                var scratch = PreprocessScratchAdmission{ .allocator = allocator, .session = self.vision_encoder };
-                defer scratch.deinit();
-                try image.preprocessDecodedWithResampleIntoBounded(allocator, img, pixels, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample, self.preprocessOptions(&scratch));
-            }
-            return self.readPixelValues(pixels);
+        const side = std.math.mul(usize, self.config.image_size, self.config.image_size) catch return error.InvalidInputShape;
+        const count = std.math.mul(usize, side, 3) catch return error.InvalidInputShape;
+        var preparation = self.preparationScope();
+        defer preparation.deinit();
+        const work = try preparation.allocator();
+        const pixels = work.alloc(f32, count) catch |err| return preparation.failure(err);
+        defer work.free(pixels);
+        try preparation.trim();
+        {
+            var capture = admission_memory.AdmissionFailure.Capture.init(if (self.vision_encoder.run_admission) |admission| admission.failure else null);
+            var scratch = PreprocessScratchAdmission{ .allocator = allocator, .session = self.vision_encoder.withAdmissionFailure(capture.sink()), .parent = &preparation };
+            defer scratch.deinit();
+            image.preprocessDecodedWithResampleIntoBounded(allocator, img, pixels, @intCast(self.config.image_size), self.config.image_mean, self.config.image_std, self.config.resample, self.preprocessOptions(&scratch)) catch |err| {
+                capture.publish(err);
+                return err;
+            };
         }
-        const pixel_values = try self.preprocessDecoded(img);
-        defer allocator.free(pixel_values);
-        return self.readPixelValues(pixel_values);
+        return self.readPixelValues(pixels, &preparation);
     }
 
-    fn readPixelValues(self: *ReadingPipeline, pixel_values: []const f32) !ReadResult {
+    fn readPixelValues(self: *ReadingPipeline, pixel_values: []const f32, preparation: *@import("preprocessing_memory.zig").Scope) !ReadResult {
         const lane: ?@import("../execution_control.zig").ExecutionLane.Lease =
             if (self.native_execution_lane) |owner|
                 try owner.acquire(self.execution_control orelse .{ .io = self.config.preprocess_io })
@@ -1210,23 +1241,24 @@ pub const ReadingPipeline = struct {
         // 1. Preprocess image: decode/resize/normalize → [1, 3, H, W] f32
         // 2. Run vision encoder
         const img_sz: i64 = @intCast(img_size);
-        if (try self.readPixelValuesFlorenceResident(pixel_values)) |result| return result;
+        if (try self.readPixelValuesFlorenceResident(pixel_values, preparation)) |result| return result;
 
         const pv_shape = [_]i64{ 1, 3, img_sz, img_sz };
         if (debug_cuda_session) std.log.info("reading: pixel tensor init start", .{});
-        var pv_tensor = try backends.Tensor.initFloat32(allocator, "pixel_values", &pv_shape, pixel_values);
+        var pv_tensor = try preparation.tensor(f32, "pixel_values", &pv_shape, pixel_values);
         if (debug_cuda_session) std.log.info("reading: pixel tensor init done", .{});
         defer pv_tensor.deinit();
 
         const encoder_outputs = if (session_factory.getFlorenceConfig(self.vision_encoder)) |florence_cfg| blk: {
             const prompt_text = self.config.prompt orelse "<OCR>";
-            const prompt_i32 = try buildFlorencePromptIds(
-                allocator,
+            const work = try preparation.allocator();
+            const prompt_i32 = buildFlorencePromptIds(
+                work,
                 self.tokenizer,
                 florence_cfg,
                 prompt_text,
-            );
-            defer allocator.free(prompt_i32);
+            ) catch |err| return preparation.failure(err);
+            defer work.free(prompt_i32);
 
             break :blk try runFlorenceVisionEncoder(
                 self.vision_encoder,
@@ -1234,10 +1266,11 @@ pub const ReadingPipeline = struct {
                 pv_tensor,
                 prompt_i32,
                 self.execution_control,
+                preparation,
             );
         } else blk: {
             if (self.execution_control) |control| try control.update(.executing, 0, 1);
-            const outputs = try self.vision_encoder.runWithControl(&.{pv_tensor}, allocator, self.execution_control);
+            const outputs = try preparation.run(self.vision_encoder, &.{pv_tensor}, allocator, self.execution_control);
             break :blk outputs;
         };
         if (debug_cuda_session) std.log.info("reading: vision encoder run done outputs={d}", .{encoder_outputs.len});
@@ -1253,7 +1286,7 @@ pub const ReadingPipeline = struct {
         logTensorStatsF32("encoder_hidden(session)", encoder_outputs[0].asFloat32());
         if (debug_cuda_session) std.log.info("reading: decode from encoder outputs start", .{});
         const decode_start = nowNs();
-        const result = try self.decodeFromEncoderOutputs(encoder_outputs, null);
+        const result = try self.decodeFromEncoderOutputs(encoder_outputs, null, preparation);
         logReadProfile("decode_from_encoder", decode_start);
         return result;
     }
@@ -1264,21 +1297,20 @@ pub const ReadingPipeline = struct {
         pixel_tensor: backends.Tensor,
         prompt_ids: []const i32,
         execution_control: ?@import("../execution_control.zig").InferenceExecutionControl,
+        parent: ?*const @import("preprocessing_memory.zig").Scope,
     ) ![]backends.Tensor {
-        const prompt_i64 = try allocator.alloc(i64, prompt_ids.len);
-        defer allocator.free(prompt_i64);
+        var preparation = @import("preprocessing_memory.zig").Scope.child(allocator, vision_encoder.withAdmissionControl(execution_control), parent);
+        defer preparation.deinit();
+        const work = try preparation.allocator();
+        const prompt_i64 = work.alloc(i64, prompt_ids.len) catch |err| return preparation.failure(err);
+        defer work.free(prompt_i64);
         for (prompt_ids, 0..) |id, i| prompt_i64[i] = id;
 
         const prompt_shape = [_]i64{ 1, @intCast(prompt_ids.len) };
-        var prompt_tensor = try backends.Tensor.initInt64(
-            allocator,
-            "input_ids",
-            &prompt_shape,
-            prompt_i64,
-        );
+        var prompt_tensor = try preparation.tensor(i64, "input_ids", &prompt_shape, prompt_i64);
         defer prompt_tensor.deinit();
 
-        return vision_encoder.runWithControl(&.{ pixel_tensor, prompt_tensor }, allocator, execution_control);
+        return preparation.run(vision_encoder, &.{ pixel_tensor, prompt_tensor }, allocator, execution_control);
     }
 
     fn readNativeFlorencePixelValues(self: *ReadingPipeline, pixel_values: []const f32, florence_cfg: florence_arch.Config) !ReadResult {
@@ -1430,7 +1462,7 @@ pub const ReadingPipeline = struct {
         return .{ .text = cleaned, .allocator = allocator, .completion = if (dec_len >= self.config.max_length) .length else .complete, .completion_tokens = text_len };
     }
 
-    fn readPixelValuesFlorenceResident(self: *ReadingPipeline, pixel_values: []const f32) !?ReadResult {
+    fn readPixelValuesFlorenceResident(self: *ReadingPipeline, pixel_values: []const f32, preparation: *@import("preprocessing_memory.zig").Scope) !?ReadResult {
         const backend = self.vision_encoder.backend();
         if (backend != .native and backend != .metal and backend != .cuda) return null;
         if (self.vision_encoder.vtable != self.decoder.vtable or self.vision_encoder.ptr != self.decoder.ptr) return null;
@@ -1441,22 +1473,23 @@ pub const ReadingPipeline = struct {
         var run_permit: ?session_mod.RunPermit = null;
         defer if (run_permit) |*permit| permit.deinit();
 
+        const work = try preparation.allocator();
         const prompt_text = self.config.prompt orelse "<OCR>";
-        const prompt_i32 = try buildFlorencePromptIds(
-            allocator,
+        const prompt_i32 = buildFlorencePromptIds(
+            work,
             self.tokenizer,
             florence_cfg,
             prompt_text,
-        );
-        defer allocator.free(prompt_i32);
+        ) catch |err| return preparation.failure(err);
+        defer work.free(prompt_i32);
 
-        const prompt_i64 = try allocator.alloc(i64, prompt_i32.len);
-        defer allocator.free(prompt_i64);
+        const prompt_i64 = work.alloc(i64, prompt_i32.len) catch |err| return preparation.failure(err);
+        defer work.free(prompt_i64);
         for (prompt_i32, 0..) |id, i| prompt_i64[i] = id;
 
         // Direct compute bypasses Session.run, so retain its admission permit
         // through both encoder/decoder execution and backend cleanup.
-        run_permit = try self.vision_encoder.admit(try nativeFlorenceRunRequest(
+        run_permit = try preparation.admitInputRun(self.vision_encoder.withAdmissionControl(self.execution_control), try nativeFlorenceRunRequest(
             florence_cfg,
             1,
             pixel_values.len,
@@ -1784,6 +1817,9 @@ pub const ReadingPipeline = struct {
 
     fn readPix2StructDecoded(self: *ReadingPipeline, img: image.Image) !ReadResult {
         const allocator = self.allocator;
+        var preparation = self.preparationScope();
+        defer preparation.deinit();
+        const work = try preparation.allocator();
         const patch_height = if (self.config.pix2struct_patch_height > 0) self.config.pix2struct_patch_height else 16;
         const patch_width = if (self.config.pix2struct_patch_width > 0) self.config.pix2struct_patch_width else 16;
         const max_patches = if (self.config.pix2struct_max_patches > 0) self.config.pix2struct_max_patches else 2048;
@@ -1791,25 +1827,26 @@ pub const ReadingPipeline = struct {
         var patches = blk: {
             const scope = antfly_image.work_control.Scope.enter(self.imageWorkControl());
             defer scope.deinit();
-            break :blk try image.preprocessDecodedPix2Struct(
-                allocator,
+            break :blk image.preprocessDecodedPix2Struct(
+                work,
                 img,
                 patch_height,
                 patch_width,
                 max_patches,
                 self.config.pix2struct_do_normalize,
                 self.config.resample,
-            );
+            ) catch |err| return preparation.failure(err);
         };
         defer patches.deinit();
+        try preparation.trim();
 
         const feature_depth = 2 + patch_height * patch_width * 3;
         const patch_shape = [_]i64{ 1, @intCast(max_patches), @intCast(feature_depth) };
-        var patch_tensor = try backends.Tensor.initFloat32(allocator, "flattened_patches", &patch_shape, patches.flattened_patches);
+        var patch_tensor = try preparation.tensor(f32, "flattened_patches", &patch_shape, patches.flattened_patches);
         defer patch_tensor.deinit();
 
         const mask_shape = [_]i64{ 1, @intCast(max_patches) };
-        var mask_tensor = try backends.Tensor.initInt64(allocator, "attention_mask", &mask_shape, patches.attention_mask);
+        var mask_tensor = try preparation.tensor(i64, "attention_mask", &mask_shape, patches.attention_mask);
         defer mask_tensor.deinit();
 
         const inputs = if (hasInput(self.vision_encoder, "attention_mask"))
@@ -1817,7 +1854,7 @@ pub const ReadingPipeline = struct {
         else
             &[_]backends.Tensor{patch_tensor};
 
-        const encoder_outputs = try self.vision_encoder.runWithControl(inputs, allocator, self.execution_control);
+        const encoder_outputs = try preparation.run(self.vision_encoder, inputs, allocator, self.execution_control);
         defer {
             for (encoder_outputs) |*t| {
                 var mt = t.*;
@@ -1827,26 +1864,43 @@ pub const ReadingPipeline = struct {
         }
         if (encoder_outputs.len == 0) return error.NoEncoderOutput;
 
-        return self.decodeFromEncoderOutputs(encoder_outputs, patches.attention_mask);
+        return self.decodeFromEncoderOutputs(encoder_outputs, patches.attention_mask, &preparation);
     }
 
     fn decodeFromEncoderOutputs(
         self: *ReadingPipeline,
         encoder_outputs: []const backends.Tensor,
         encoder_attention_mask_opt: ?[]const i64,
+        parent: *const @import("preprocessing_memory.zig").Scope,
     ) !ReadResult {
-        const allocator = self.allocator;
+        const Owned = @import("preprocessing_memory.zig").Owned;
+        const owned = try Owned.create(self.allocator, self.decoder.withAdmissionControl(self.execution_control), parent, self.preparation_owner);
+        errdefer Owned.release(owned);
+        owned.scope.required_host_bytes = try std.math.add(usize, owned.scope.required_host_bytes, try self.decoder.outputHostResidency(encoder_outputs));
+        var result = self.decodeFromEncoderOutputsPrepared(encoder_outputs, encoder_attention_mask_opt, &owned.scope) catch |err| return owned.scope.failure(err);
+        try owned.publish();
+        result.storage = owned;
+        return result;
+    }
+
+    fn decodeFromEncoderOutputsPrepared(
+        self: *ReadingPipeline,
+        encoder_outputs: []const backends.Tensor,
+        encoder_attention_mask_opt: ?[]const i64,
+        preparation: *@import("preprocessing_memory.zig").Scope,
+    ) !ReadResult {
+        const allocator = try preparation.allocator();
         const encoder_hidden = &encoder_outputs[0];
 
         const enc_seq_len: usize = if (encoder_hidden.shape.len >= 2) @intCast(encoder_hidden.shape[1]) else 1;
         const encoder_attention_mask = if (encoder_attention_mask_opt) |mask|
-            mask
+            try allocator.dupe(i64, mask)
         else blk: {
             const all_ones = try allocator.alloc(i64, enc_seq_len);
             @memset(all_ones, 1);
             break :blk all_ones;
         };
-        defer if (encoder_attention_mask_opt == null) allocator.free(encoder_attention_mask);
+        defer allocator.free(encoder_attention_mask);
 
         // 3. Autoregressive decode
         const max_len = self.config.max_length;
@@ -1862,6 +1916,10 @@ pub const ReadingPipeline = struct {
             }
         }
 
+        const decoder_attention_mask = if (hasInput(self.decoder, "decoder_attention_mask")) try allocator.alloc(i64, max_len) else null;
+        defer if (decoder_attention_mask) |mask| allocator.free(mask);
+        if (decoder_attention_mask) |mask| @memset(mask, 1);
+        const enc_mask_shape = [_]i64{ 1, @intCast(enc_seq_len) };
         const decode_loop_start = nowNs();
         var decoder_run_total_ns: u64 = 0;
         var decoder_steps: usize = 0;
@@ -1870,44 +1928,27 @@ pub const ReadingPipeline = struct {
             const dec_seq: i64 = @intCast(dec_len);
             const dec_shape = [_]i64{ 1, dec_seq };
 
-            var decoder_inputs = std.ArrayListUnmanaged(backends.Tensor).empty;
-            defer {
-                for (decoder_inputs.items) |*tensor| tensor.deinit();
-                decoder_inputs.deinit(allocator);
-            }
-
-            try decoder_inputs.append(
-                allocator,
-                try backends.Tensor.initInt64(allocator, "input_ids", &dec_shape, dec_ids[0..dec_len]),
-            );
-
+            // Every tensor borrows storage through this synchronous forward.
+            // Keep masks and shapes outside conditional scopes, and reuse the
+            // maximum mask instead of allocating/copying it for every token.
+            var decoder_inputs: [4]backends.Tensor = undefined;
+            var input_count: usize = 0;
+            decoder_inputs[input_count] = try preparation.tensor(i64, "input_ids", &dec_shape, dec_ids[0..dec_len]);
+            input_count += 1;
             if (hasInput(self.decoder, "encoder_attention_mask")) {
-                const enc_mask_shape = [_]i64{ 1, @intCast(enc_seq_len) };
-                try decoder_inputs.append(
-                    allocator,
-                    try backends.Tensor.initInt64(allocator, "encoder_attention_mask", &enc_mask_shape, encoder_attention_mask),
-                );
+                decoder_inputs[input_count] = try preparation.tensor(i64, "encoder_attention_mask", &enc_mask_shape, encoder_attention_mask);
+                input_count += 1;
             }
-            if (hasInput(self.decoder, "decoder_attention_mask")) {
-                const dec_mask = try allocator.alloc(i64, dec_len);
-                defer allocator.free(dec_mask);
-                @memset(dec_mask, 1);
-                try decoder_inputs.append(
-                    allocator,
-                    try backends.Tensor.initInt64(allocator, "decoder_attention_mask", &dec_shape, dec_mask),
-                );
+            if (decoder_attention_mask) |mask| {
+                decoder_inputs[input_count] = try preparation.tensor(i64, "decoder_attention_mask", &dec_shape, mask[0..dec_len]);
+                input_count += 1;
             }
-
-            const enc_hidden = encoder_outputs[0].borrowedView("encoder_hidden_states");
-            try decoder_inputs.append(allocator, enc_hidden);
+            decoder_inputs[input_count] = encoder_outputs[0].borrowedView("encoder_hidden_states");
+            input_count += 1;
 
             const decoder_run_start = nowNs();
             if (self.execution_control) |control| try control.update(.executing, @intCast(dec_len), @intCast(max_len));
-            const dec_outputs = try self.decoder.runWithControl(
-                decoder_inputs.items,
-                allocator,
-                self.execution_control,
-            );
+            const dec_outputs = try preparation.run(self.decoder, decoder_inputs[0..input_count], self.allocator, self.execution_control);
             const decoder_run_ns = nowNs() - decoder_run_start;
             decoder_run_total_ns += decoder_run_ns;
             decoder_steps += 1;
@@ -1917,7 +1958,7 @@ pub const ReadingPipeline = struct {
                     var mt = t.*;
                     mt.deinit();
                 }
-                allocator.free(dec_outputs);
+                self.allocator.free(dec_outputs);
             }
 
             if (dec_outputs.len == 0) return error.NoDecoderOutput;
@@ -1945,7 +1986,9 @@ pub const ReadingPipeline = struct {
         logReadProfileStep("decoder_total", decoder_steps, dec_len, nowNs() - decode_loop_start);
         logReadProfileStep("decoder_run_total", decoder_steps, dec_len, decoder_run_total_ns);
 
-        return try self.decodeGeneratedIds(dec_ids[0..dec_len], dec_len);
+        var output = self.*;
+        output.allocator = allocator;
+        return try output.decodeGeneratedIds(dec_ids[0..dec_len], dec_len);
     }
 
     fn decodeGeneratedIds(self: *ReadingPipeline, dec_ids: []const i64, dec_len: usize) !ReadResult {
@@ -3058,6 +3101,8 @@ const AdmissionDenyingFlorenceSession = struct {
 
 test "reading entry points and batch publication honor execution control" {
     var pipeline: ReadingPipeline = undefined;
+    pipeline.preparation_parent = null;
+    pipeline.preparation_owner = null;
     pipeline.native_execution_lane = null;
     pipeline.allocator = std.testing.allocator;
     pipeline.execution_control = .{ .deadline_ns = 0 };
@@ -3091,6 +3136,8 @@ test "reading cancellation interrupts encoded decode and borrowed raster preproc
     };
     var probe = Probe{};
     var pipeline: ReadingPipeline = undefined;
+    pipeline.preparation_parent = null;
+    pipeline.preparation_owner = null;
     pipeline.native_execution_lane = null;
     pipeline.allocator = std.testing.allocator;
     pipeline.config = .{ .image_size = 16 };
@@ -3098,8 +3145,21 @@ test "reading cancellation interrupts encoded decode and borrowed raster preproc
     const rgba = @as([(32 * 32 * 4)]u8, @splat(127));
     const png = try antfly_image.png.encodeRgba(std.testing.allocator, 32, 32, &rgba);
     defer std.testing.allocator.free(png);
-    // Backend fields intentionally remain undefined: cancellation must stop
-    // inside preprocessing, before any model/session is consulted.
+    const MetadataOnly = struct {
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn run(_: *anyopaque, _: []const backends.Tensor, _: std.mem.Allocator) ![]backends.Tensor {
+            return error.UnexpectedModelExecution;
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    // Preparation may inspect admission and input metadata, but cancellation
+    // must stop inside the codec before a model forward or decoder is touched.
+    pipeline.vision_encoder = .{ .ptr = undefined, .vtable = &.{ .run = MetadataOnly.run, .inputInfo = MetadataOnly.info, .outputInfo = MetadataOnly.info, .backend = MetadataOnly.backend, .close = MetadataOnly.close } };
     try std.testing.expectError(error.Cancelled, pipeline.read(png));
     try std.testing.expectEqual(@as(usize, 3), probe.checks);
     probe.checks = 0;
@@ -3126,6 +3186,7 @@ test "Florence prompt tensor cleanup survives encoder admission denial" {
             allocator,
             pixel_tensor,
             &.{ 11, 22, 33 },
+            null,
             null,
         ),
     );
@@ -3250,13 +3311,16 @@ test "Florence preprocess output admission precedes allocation and unwinds alloc
     const memory = @import("../runtime/tier/memory.zig");
     var controller = memory.AdmissionController{};
     defer controller.deinit();
-    controller.configureForcedRunDenialsForTesting(1);
+    // An allocation owner tries its growth quantum, then the exact minimum.
+    controller.configureForcedRunDenialsForTesting(2);
     var fake = AdmissionDenyingFlorenceSession{};
     var session = fake.session();
     session.run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var lane = @import("../execution_control.zig").ExecutionLane{};
     var pipeline: ReadingPipeline = undefined;
+    pipeline.preparation_parent = null;
+    pipeline.preparation_owner = null;
     pipeline.allocator = failing.allocator();
     pipeline.vision_encoder = session;
     pipeline.config = .{ .image_size = 8 };
@@ -3315,6 +3379,8 @@ test "Florence queued prepared encoded raster and decoded pixels release admissi
         defer owner.release();
         var cancelled = std.atomic.Value(bool).init(false);
         var pipeline: ReadingPipeline = undefined;
+        pipeline.preparation_parent = null;
+        pipeline.preparation_owner = null;
         pipeline.allocator = std.testing.allocator;
         pipeline.vision_encoder = session;
         pipeline.config = .{ .image_size = 4, .resample = .pillow_bicubic };
@@ -3324,8 +3390,10 @@ test "Florence queued prepared encoded raster and decoded pixels release admissi
         defer _ = waiting.cancel(std.testing.io) catch {};
         defer cancelled.store(true, .release);
         try Worker.awaitParked(&lane);
-        // Codec/resampler slabs have retired; only the queued output remains.
-        try std.testing.expectEqual(@as(usize, 3 * 4 * 4 * @sizeOf(f32)), controller.admitted.host_scratch_bytes);
+        // Codec/resampler slabs have retired; retain the queued pixels and
+        // bounded allocation bookkeeping, rather than an idle codec quantum.
+        try std.testing.expect(controller.admitted.host_scratch_bytes >= 3 * 4 * 4 * @sizeOf(f32));
+        try std.testing.expect(controller.admitted.host_scratch_bytes < 4096);
         try std.testing.expect(!fake.run_called);
         cancelled.store(true, .release);
         try std.testing.expectError(error.Cancelled, waiting.await(std.testing.io));
@@ -3458,4 +3526,201 @@ test "LightOnOCR3 CUDA Florence incremental admission preserves complete KV capa
     live = false;
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
     try std.testing.expect(!probe.run_called);
+}
+
+test "reading legacy and flattened image preparation denies before backing allocation" {
+    const Fake = struct {
+        flattened: bool,
+        fn info(raw: *anyopaque) []const backends.TensorInfo {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.flattened) &.{.{ .name = "flattened_patches", .dtype = .f32, .shape = &.{ 1, 1, 1 } }} else &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 1, 3, 2, 2 } }};
+        }
+    };
+    for ([_]bool{ false, true }) |flattened| {
+        var fake = Fake{ .flattened = flattened };
+        var table: backends.Session.VTable = undefined;
+        table.inputInfo = Fake.info;
+        var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+        const session = backends.Session{ .ptr = &fake, .vtable = &table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1, .scratch_limit_bytes = 1 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+        var pipeline = ReadingPipeline.init(std.testing.failing_allocator, session, undefined, undefined, .{ .image_size = 2 }, null);
+        try std.testing.expectError(error.ResourceLimitExceeded, pipeline.read(@import("antfly_documents").fixtures.get("one-pixel.png")));
+        try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+    }
+}
+
+test "reading codec growth includes pixels and earlier slab capacity in feasibility" {
+    const Scope = @import("preprocessing_memory.zig").Scope;
+    for ([_]bool{ false, true }) |contended| {
+        var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+        const session = backends.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = if (contended) 80 * 1024 else 40 * 1024, .scratch_limit_bytes = if (contended) 80 * 1024 else 40 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+        var pixels = Scope.child(std.testing.allocator, session, null);
+        defer pixels.deinit();
+        const a = try pixels.allocator();
+        _ = try a.alloc(u8, 20 * 1024);
+        try pixels.trim();
+        var peer = try session.admitHostPreprocess(if (contended) 24 * 1024 else 0);
+        defer peer.deinit();
+        var scratch = PreprocessScratchAdmission{ .allocator = std.testing.allocator, .session = session, .parent = &pixels };
+        defer scratch.deinit();
+        try PreprocessScratchAdmission.growOpaque(&scratch, 0, 16 * 1024);
+        try std.testing.expectError(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, PreprocessScratchAdmission.growOpaque(&scratch, 16 * 1024, if (contended) 40 * 1024 else 24 * 1024));
+    }
+}
+
+test "reading codec forecast fallback clears speculative policy diagnostics" {
+    const Scope = @import("preprocessing_memory.zig").Scope;
+    var controller = admission_memory.AdmissionController{};
+    var failure = admission_memory.AdmissionFailure{};
+    const session = backends.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .cpu,
+        .limits = .{ .host_limit_bytes = 32 * 1024, .scratch_limit_bytes = 32 * 1024 },
+        .static_workspace_bytes = 0,
+        .check_live_memory = false,
+        .failure = &failure,
+    } };
+    var pipeline = ReadingPipeline.init(std.testing.allocator, session, undefined, undefined, .{ .image_size = 8, .resample = .pillow_bicubic }, null);
+    var parent = Scope.child(std.testing.allocator, session, null);
+    defer parent.deinit();
+    const a = try parent.allocator();
+    const pixels = try a.alloc(f32, 3 * 8 * 8);
+    defer a.free(pixels);
+    try parent.trim();
+    // The 64 KiB forecast fails, but actual codec demand fits with the pixels.
+    try pipeline.preprocessEncodedBatchInto(pixels, &.{@import("antfly_documents").fixtures.get("one-pixel.png")}, &parent);
+    try std.testing.expect(failure.snapshot() == null);
+    var rgba = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255 };
+    try pipeline.preprocessRasterBatchInto(pixels, &.{.{ .bytes = &rgba, .width = 2, .height = 2, .stride_bytes = 8 }}, &parent);
+    try std.testing.expect(failure.snapshot() == null);
+    // Only the parent pixels remain after codec permits are retired.
+    try std.testing.expectEqual(try parent.ownedHostBytesFor(session), controller.snapshot().hostTotalBytes());
+}
+
+test "reading decoder preparation is admitted before dispatch and cleans partial buffers" {
+    var controller = admission_memory.AdmissionController{};
+    const session = backends.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 * 1024, .scratch_limit_bytes = 64 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+    var pipeline = ReadingPipeline.init(std.testing.allocator, session, session, undefined, .{ .max_length = 8192 }, null);
+    var parent = @import("preprocessing_memory.zig").Scope.child(std.testing.allocator, session, null);
+    defer parent.deinit();
+    const values = try std.testing.allocator.alloc(f32, 4096);
+    defer std.testing.allocator.free(values);
+    var output = try backends.Tensor.initFloat32(std.testing.allocator, "encoder_hidden", &.{ 1, 4096, 1 }, values);
+    defer output.deinit();
+    try std.testing.expectError(error.ResourceLimitExceeded, pipeline.decodeFromEncoderOutputs(&.{output}, null, &parent));
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}
+
+fn checkPreparedDecoder(a: std.mem.Allocator) !void {
+    const Fixture = struct {
+        calls: usize = 0,
+        fn info(_: *anyopaque) []const backends.TensorInfo {
+            return &.{ .{ .name = "encoder_attention_mask", .dtype = .i64, .shape = &.{ 1, 2 } }, .{ .name = "decoder_attention_mask", .dtype = .i64, .shape = &.{ 1, -1 } } };
+        }
+        fn out(_: *anyopaque) []const backends.TensorInfo {
+            return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ 1, -1, 3 } }};
+        }
+        fn run(raw: *anyopaque, inputs: []const backends.Tensor, heap: std.mem.Allocator) ![]backends.Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const n = inputs[0].shape[1];
+            const values = try heap.alloc(f32, @as(usize, @intCast(n)) * 3);
+            defer heap.free(values);
+            @memset(values, 0);
+            values[values.len - 3 + @as(usize, if (n == 1) 1 else 2)] = 1;
+            const output = try heap.alloc(backends.Tensor, 1);
+            errdefer heap.free(output);
+            output[0] = try backends.Tensor.initFloat32(heap, "logits", &.{ 1, n, 3 }, values);
+            return output;
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        fn decode(_: *anyopaque, heap: std.mem.Allocator, ids: []const i32) ![]u8 {
+            try std.testing.expectEqualSlices(i32, &.{1}, ids);
+            return heap.dupe(u8, "hello");
+        }
+    };
+    var fixture = Fixture{};
+    var controller = admission_memory.AdmissionController{};
+    defer std.debug.assert(controller.snapshot().hostTotalBytes() == 0);
+    const session = backends.Session{ .ptr = &fixture, .vtable = &.{ .run = Fixture.run, .inputInfo = Fixture.info, .outputInfo = Fixture.out, .backend = Fixture.backend, .close = Fixture.close }, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1024 * 1024, .scratch_limit_bytes = 1024 * 1024 }, .static_workspace_bytes = 4096, .check_live_memory = false } };
+    var tokenizer_table: tokenizer_mod.Tokenizer.VTable = undefined;
+    tokenizer_table.decode = Fixture.decode;
+    var pipeline = ReadingPipeline.init(a, session, session, .{ .ptr = undefined, .vtable = &tokenizer_table }, .{ .max_length = 4, .decoder_start_token_id = 0 }, null);
+    var parent = @import("preprocessing_memory.zig").Scope.child(a, session, null);
+    defer parent.deinit();
+    var encoder = try backends.Tensor.initFloat32(a, "encoder_hidden_states", &.{ 1, 2, 1 }, &.{ 1, 2 });
+    defer encoder.deinit();
+    var result = try pipeline.decodeFromEncoderOutputs(&.{encoder}, null, &parent);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectEqualStrings("hello", result.text);
+    try std.testing.expect(result.storage != null);
+}
+
+test "reading prepared decoder executes masks and tokens with owned output and complete rollback" {
+    try checkPreparedDecoder(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPreparedDecoder, .{});
+}
+
+fn checkReadingTextTransfer(allocator: std.mem.Allocator) !void {
+    const memory = @import("preprocessing_memory.zig");
+    for ([_]bool{ false, true }) |admitted| {
+        for ([_][]const u8{ " \ttext\r\n", " \r\n", "" }) |input| {
+            var controller = admission_memory.AdmissionController{};
+            const session = backends.Session{ .ptr = undefined, .vtable = undefined, .run_admission = if (admitted) .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } else null };
+            var target = memory.Scope.child(allocator, session, null);
+            defer target.deinit();
+            const earlier = try (try target.allocator()).dupe(u8, "earlier document text");
+            try target.trim();
+            const owned = try memory.Owned.create(allocator, session, null, null);
+            var result = ReadResult{ .allocator = try owned.scope.allocator(), .storage = owned, .text = &.{} };
+            var result_live = true;
+            defer if (result_live) result.deinit();
+            result.text = try result.allocator.dupe(u8, input);
+            const expected = std.mem.trim(u8, input, " \t\r\n");
+            const original = result.text.ptr;
+            try owned.publish();
+            const before = controller.snapshot().host_scratch_bytes;
+            const text = (try result.takeTrimmedTextInto(&target)).?;
+            if (expected.len > 0) try std.testing.expectEqual(original, text.ptr);
+            try std.testing.expectEqualStrings(expected, text);
+            try std.testing.expect(controller.snapshot().host_scratch_bytes <= before);
+            if (expected.len > 0) try std.testing.expectEqual(before, controller.snapshot().host_scratch_bytes);
+            // Destroy the old frame before using or freeing the moved allocation.
+            result.deinit();
+            result_live = false;
+            try std.testing.expectEqualStrings(expected, text);
+            (try target.allocator()).free(text);
+            try std.testing.expectEqualStrings("earlier document text", earlier);
+            (try target.allocator()).free(earlier);
+            try target.trim();
+            try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+        }
+    }
+}
+
+test "reading owned text transfers without copying and survives source teardown" {
+    try checkReadingTextTransfer(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkReadingTextTransfer, .{});
+}
+
+test "reading text transfer rejects a different process ledger without changing source" {
+    const memory = @import("preprocessing_memory.zig");
+    var controllers = [_]admission_memory.AdmissionController{ .{}, .{} };
+    const session = backends.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controllers[0], .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var target = memory.Scope.child(std.testing.allocator, session, null);
+    defer target.deinit();
+    const owned = try memory.Owned.create(std.testing.allocator, session, null, null);
+    var result = ReadResult{ .allocator = try owned.scope.allocator(), .storage = owned, .text = &.{} };
+    defer result.deinit();
+    result.text = try result.allocator.dupe(u8, " text ");
+    try owned.publish();
+    target.owner.session.?.run_admission.?.controller = &controllers[1];
+    const before = controllers[0].snapshot();
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, result.takeTrimmedTextInto(&target));
+    try std.testing.expectEqualStrings(" text ", result.text);
+    try std.testing.expectEqualDeep(before, controllers[0].snapshot());
+    try std.testing.expectEqual(@as(usize, 0), controllers[1].snapshot().hostTotalBytes());
 }

@@ -58,9 +58,100 @@ pub const Scope = struct {
     budget_bytes: usize = 0,
     local_controller: memory.AdmissionController = .{},
     started: bool = false,
+    // Retain the domain even when publication drops the borrowed Session and
+    // an empty result has no allocation reservations identifying its ledger.
+    process_controller: ?*memory.AdmissionController = null,
+    /// Synchronous ancestor preparation remains live while a child executes.
+    parent: ?*const Scope = null,
+    /// External host output leases retained during synchronous post-processing.
+    /// Feasibility only: these bytes are already charged and never allocator
+    /// credit. Their owning tensors must outlive this borrowed residency.
+    required_host_bytes: usize = 0,
+    execution_residency: memory.Residency = .{},
 
     pub fn init(backing: std.mem.Allocator, session: ?sessions.Session, credit: Credit, budget: ?*memory.RunBudget) @This() {
-        return .{ .owner = .{ .backing = backing, .session = session, .prepaid_host_bytes = credit.process_bytes }, .budget = budget, .borrowed_budget_bytes = credit.budget_bytes };
+        return .{ .owner = .{ .backing = backing, .session = session, .prepaid_host_bytes = credit.process_bytes }, .budget = budget, .borrowed_budget_bytes = credit.budget_bytes, .process_controller = if (session) |active| if (active.run_admission) |a| a.controller else null else null };
+    }
+
+    pub fn child(backing: std.mem.Allocator, session: sessions.Session, parent: ?*const Scope) @This() {
+        var result = init(backing, session, .{}, null);
+        result.parent = parent;
+        return result;
+    }
+
+    pub fn ownedHostBytesFor(self: *const @This(), session: sessions.Session) !usize {
+        const admission = session.run_admission orelse return 0;
+        var owned = try self.owner.ownedHostBytesFor(admission.controller);
+        if (self.owner.session) |source| if (source.run_admission) |source_admission| if (source_admission.controller == admission.controller) {
+            owned = try std.math.add(usize, owned, self.required_host_bytes);
+        };
+        if (self.parent) |parent| owned = try std.math.add(usize, owned, try parent.ownedHostBytesFor(session));
+        return owned;
+    }
+
+    pub fn borrowedResidencyFor(self: *const @This(), session: sessions.Session) !memory.Residency {
+        const admission = session.run_admission orelse return .{};
+        const own = try self.owner.requiredResidencyFor(admission.controller);
+        return if (self.parent) |parent| try own.merge(try parent.borrowedResidencyFor(session)) else own;
+    }
+
+    /// Borrow proven, admitted storage for one synchronous model invocation.
+    /// Shape and payload remain owned by the caller; no tensor copy is made.
+    pub fn tensor(self: *const @This(), comptime T: type, name: []const u8, shape: []const i64, values: []const T) !@import("../backends/tensor.zig").Tensor {
+        const bytes = std.mem.sliceAsBytes(values);
+        if (!self.owner.ownsRange(bytes)) return error.InvalidAdmissionLeaseReduction;
+        const Tensor = @import("../backends/tensor.zig").Tensor;
+        const result = Tensor{ .data = @constCast(bytes), .dtype = if (T == f32) .f32 else if (T == i64) .i64 else @compileError("unsupported prepared input dtype"), .shape = shape, .name = name, .allocator = self.owner.backing, .owns_data = false, .owns_shape = false, .shared_storage = @constCast(bytes), .admitted_storage_domain = if (self.owner.session) |session| if (session.run_admission) |admission| admission.controller else null else null };
+        _ = try result.denseElementCount();
+        return result;
+    }
+
+    pub fn admitRun(self: *@This(), session: sessions.Session, request: sessions.RunRequest) !sessions.RunPermit {
+        try self.trim();
+        return session.admitPreparedWithResidency(request, try self.ownedHostBytesFor(session), try self.borrowedResidencyFor(session));
+    }
+
+    /// Direct native executors consume the prepared host arrays themselves.
+    pub fn admitInputRun(self: *@This(), session: sessions.Session, request: sessions.RunRequest) !sessions.RunPermit {
+        if (request.input_bytes > self.owner.live_bytes) return error.InvalidAdmissionLeaseReduction;
+        var credited = request;
+        credited.pre_admitted_host_bytes = request.input_bytes;
+        return self.admitRun(session, credited);
+    }
+
+    pub fn run(self: *@This(), session: sessions.Session, inputs: []const @import("../backends/tensor.zig").Tensor, allocator_: std.mem.Allocator, control: ?@import("../execution_control.zig").InferenceExecutionControl) ![]@import("../backends/tensor.zig").Tensor {
+        const active = session.withAdmissionControl(control);
+        var permit = try self.admitRun(active, try active.planRun(inputs, null));
+        defer permit.deinit();
+        return permit.runTransferringOutputs(inputs, allocator_, control);
+    }
+
+    // Published result scopes have no borrowed Session, but their retained
+    // domain still identifies the process ledger. Offline scopes instead
+    // use their own embedded ledger, which must be rehomed on transfer.
+    fn processController(self: *@This()) ?*memory.AdmissionController {
+        if (self.owner.session) |session| if (session.run_admission) |a| return a.controller;
+        return self.process_controller;
+    }
+
+    pub fn absorb(self: *@This(), source: *@This()) !void {
+        if (self.budget != null or source.budget != null) return error.InvalidAdmissionLeaseReduction;
+        const target_controller = self.processController();
+        const source_controller = source.processController();
+        if (target_controller != source_controller) return error.InvalidAdmissionLeaseReduction;
+        // Offline scopes use embedded ledgers. Rehome those leases before the
+        // source's stack frame disappears; process-domain leases stay intact.
+        if (target_controller == null) {
+            var reservation = source.owner.reservations;
+            while (reservation) |node| : (reservation = node.next) {
+                var replacement = try self.local_controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = node.bytes }, false);
+                errdefer replacement.release();
+                if (node.lease) |*lease| lease.release();
+                node.lease = replacement;
+            }
+        }
+        if (target_controller == null) source.owner.reservation_controller = &self.local_controller;
+        try self.owner.absorb(&source.owner);
     }
 
     pub fn allocator(self: *@This()) !std.mem.Allocator {
@@ -78,12 +169,16 @@ pub const Scope = struct {
 
     fn acquire(raw: *anyopaque, amount: usize) !memory.AdmissionLease {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        const owned = try std.math.add(usize, self.owner.prepaid_host_bytes, self.owner.reserved_bytes);
-        const required_budget = (try std.math.add(usize, owned, amount)) -| self.borrowed_budget_bytes;
+        const owned = try std.math.add(usize, self.required_host_bytes, try std.math.add(usize, self.owner.prepaid_host_bytes, self.owner.reserved_bytes));
+        const required_budget = (try std.math.add(usize, owned - self.required_host_bytes, amount)) -| self.borrowed_budget_bytes;
         const budget_growth = required_budget -| self.budget_bytes;
         if (self.budget) |budget| try reserveBudget(budget, budget_growth);
         errdefer if (self.budget) |budget| budget.release(.{ .kind = .scratch, .tier = .host, .bytes = budget_growth });
-        const lease = if (self.owner.session) |session| (try session.admitHostPreprocessOwned(amount, owned)).lease else null;
+        const lease = if (self.owner.session) |session| blk: {
+            const inherited = if (self.parent) |parent| try parent.ownedHostBytesFor(session) else 0;
+            const allocations = if (self.owner.parent) |parent| if (session.run_admission) |admission| try parent.ownedHostBytesFor(admission.controller) else 0 else 0;
+            break :blk (try session.admitHostPreprocessOwnedWithResidency(amount, try std.math.add(usize, owned, try std.math.add(usize, inherited, allocations)), try self.execution_residency.merge(try self.borrowedResidencyFor(session)))).lease;
+        } else null;
         // Offline callers may have only a local run budget and no session.
         // A local lease gives those reservations the same owned cleanup path.
         const result = lease orelse try self.local_controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = amount }, false);
@@ -474,4 +569,177 @@ test "preprocessing admission discards recovered proposals without losing termin
     a.free(first);
     try scope.trim();
     try std.testing.expectEqualDeep(weights.amounts, controller.snapshot());
+}
+
+test "prepared tensor borrowing preserves pointer admission and independent output lifetime" {
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const Fake = struct {
+        expected: [*]const f32,
+        calls: usize = 0,
+        fn info(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+            return &.{.{ .name = "out", .dtype = .f32, .shape = &.{ 1, 2 } }};
+        }
+        fn run(raw: *anyopaque, inputs: []const Tensor, a: std.mem.Allocator) ![]Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(inputs[0].asFloat32().ptr == self.expected);
+            self.calls += 1;
+            const outputs = try a.alloc(Tensor, 1);
+            errdefer a.free(outputs);
+            outputs[0] = try Tensor.initFloat32(a, "out", &.{ 1, 2 }, &.{ 7, 9 });
+            return outputs;
+        }
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var controller = memory.AdmissionController{};
+    var fake = Fake{ .expected = undefined };
+    const session = sessions.Session{ .ptr = &fake, .vtable = &.{ .run = Fake.run, .inputInfo = Fake.info, .outputInfo = Fake.info, .backend = Fake.backend, .close = Fake.close }, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 4096, .scratch_limit_bytes = 4096 }, .static_workspace_bytes = 1024, .check_live_memory = false } };
+    var parent = Scope.child(std.testing.allocator, session, null);
+    defer parent.deinit();
+    const parent_a = try parent.allocator();
+    _ = try parent_a.alloc(u8, 128);
+    try parent.trim();
+    var child_scope = Scope.child(std.testing.allocator, session, &parent);
+    defer child_scope.deinit();
+    const a = try child_scope.allocator();
+    const values = try a.alloc(f32, 16);
+    @memset(values, 3);
+    fake.expected = values.ptr;
+    try child_scope.trim();
+    var input = try child_scope.tensor(f32, "in", &.{ 1, 16 }, values);
+    defer input.deinit();
+    try std.testing.expectEqual(@as(usize, 64), try session.inputResidencyCredit(&.{input}));
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, child_scope.tensor(f32, "foreign", &.{1}, &.{1}));
+    const outputs = try child_scope.run(session, &.{input}, std.testing.allocator, null);
+    defer std.testing.allocator.free(outputs);
+    defer for (outputs) |*output| output.deinit();
+    child_scope.deinit();
+    parent.deinit();
+    try std.testing.expectEqualSlices(f32, &.{ 7, 9 }, outputs[0].asFloat32());
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    try std.testing.expect(controller.snapshot().host_scratch_bytes < 512);
+}
+
+test "prepared child scopes distinguish aggregate policy failure from peer contention" {
+    for ([_]bool{ false, true }) |contended| {
+        var controller = memory.AdmissionController{};
+        const session = Test.session(&controller, if (contended) 80 * 1024 else 40 * 1024);
+        var parent = Scope.child(std.testing.allocator, session, null);
+        defer parent.deinit();
+        const a = try parent.allocator();
+        _ = try a.alloc(u8, 20 * 1024);
+        try parent.trim();
+        var peer = try session.admitHostPreprocess(if (contended) 40 * 1024 else 0);
+        defer peer.deinit();
+        var child_scope = Scope.child(std.testing.allocator, session, &parent);
+        defer child_scope.deinit();
+        const child_a = try child_scope.allocator();
+        try std.testing.expectError(error.OutOfMemory, child_a.alloc(u8, 24 * 1024));
+        try std.testing.expectEqual(if (contended) error.ResourceTemporarilyUnavailable else error.ResourceLimitExceeded, child_scope.failure(error.OutOfMemory));
+    }
+}
+
+/// Heap-owned admitted result storage. Publishing severs request/model ancestry
+/// and freezes a host-only policy. A reader may retain its synchronous loader
+/// ancestry through conversion; detachPreparation severs that final borrow
+/// before callers retain the result beyond the reader wrapper.
+pub const Owned = struct {
+    backing: std.mem.Allocator,
+    scope: Scope,
+    header: ?memory.AdmissionLease,
+    controller: ?*memory.AdmissionController,
+    limits: memory.Limits,
+    check_live_memory: bool,
+    preparation_parent: ?*const AdmittedAllocator,
+    preparation_residency: memory.Residency = .{},
+
+    pub fn create(backing: std.mem.Allocator, session: sessions.Session, parent: ?*const Scope, allocation_parent: ?*const AdmittedAllocator) !*Owned {
+        const inherited = if (parent) |p| try p.ownedHostBytesFor(session) else if (allocation_parent) |p| if (session.run_admission) |a| try p.ownedHostBytesFor(a.controller) else 0 else 0;
+        const residency = if (parent) |p| try p.borrowedResidencyFor(session) else if (allocation_parent) |p| if (session.run_admission) |a| try p.requiredResidencyFor(a.controller) else memory.Residency{} else memory.Residency{};
+        var permit = try session.admitHostPreprocessOwnedWithResidency(@sizeOf(Owned), inherited, residency);
+        errdefer permit.deinit();
+        const self = try backing.create(Owned);
+        self.* = .{ .backing = backing, .scope = Scope.child(backing, session, parent), .header = permit.lease, .controller = if (session.run_admission) |a| a.controller else null, .limits = if (session.run_admission) |a| a.limits else .{}, .check_live_memory = if (session.run_admission) |a| a.check_live_memory else false, .preparation_parent = allocation_parent };
+        self.scope.required_host_bytes = if (permit.lease != null) @sizeOf(Owned) else 0;
+        if (parent == null) self.scope.owner.parent = allocation_parent;
+        return self;
+    }
+
+    pub fn publish(self: *Owned) !void {
+        try self.scope.trim();
+        const session = self.scope.owner.session;
+        const borrowed = if (session) |active| try self.scope.borrowedResidencyFor(active) else memory.Residency{};
+        self.scope.parent = null;
+        self.scope.required_host_bytes = 0;
+        self.scope.execution_residency = .{};
+        self.scope.owner.parent = self.preparation_parent;
+        self.preparation_residency = try (if (session) |active| if (active.run_admission) |admission| admission.requiredResidency() else memory.Residency{} else memory.Residency{}).merge(borrowed);
+        self.scope.owner.session = null;
+        self.scope.owner.admit = null;
+        self.scope.owner.rollback_admission = null;
+        self.scope.owner.admit_owned = acquire;
+        self.scope.owner.admission_context = self;
+    }
+
+    /// The wrapper calls this after conversion/sanitization, before the result
+    /// crosses the synchronous metadata owner's lifetime boundary.
+    pub fn detachPreparation(raw: *anyopaque) void {
+        const self: *Owned = @ptrCast(@alignCast(raw));
+        self.scope.owner.parent = null;
+        self.preparation_parent = null;
+        self.preparation_residency = .{};
+    }
+
+    fn acquire(owner: *const AdmittedAllocator, bytes: usize) !memory.AdmissionLease {
+        const self: *Owned = @ptrCast(@alignCast(owner.admission_context.?));
+        const controller = self.controller orelse return self.scope.local_controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = bytes }, false);
+        const owned = try std.math.add(usize, try owner.ownedHostBytesFor(controller), if (self.header) |header| header.amounts.hostTotalBytes() else 0);
+        var pressure: ?memory.AdmissionPressure = null;
+        return controller.tryAcquireRequestsWithPressure(&.{.{ .backend_class = .cpu, .limits = self.limits, .amounts = .{ .host_scratch_bytes = bytes }, .required_residency = try self.preparation_residency.merge(.fromAmounts(.cpu, .{ .host_scratch_bytes = owned })) }}, self.check_live_memory, &pressure);
+    }
+
+    pub fn release(raw: *anyopaque) void {
+        const self: *Owned = @ptrCast(@alignCast(raw));
+        self.scope.deinit();
+        if (self.header) |*header| header.release();
+        self.backing.destroy(self);
+    }
+};
+
+test "prepared postprocessing retains opaque host and device execution residency" {
+    var controller = memory.AdmissionController{};
+    const session = sessions.Session{ .ptr = undefined, .vtable = &.{ .run = undefined, .inputInfo = Empty.info, .outputInfo = Empty.info, .backend = undefined, .close = undefined }, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 32 * 1024, .backend_limit_bytes = 32 * 1024, .combined_limit_bytes = 40 * 1024, .scratch_limit_bytes = 40 * 1024 }, .static_workspace_bytes = 1, .check_live_memory = false } };
+    var execution = Scope.child(std.testing.allocator, session, null);
+    defer execution.deinit();
+    const a = try execution.allocator();
+    var permit = try session.admitPrepared(.{ .output_bytes = 4096, .workspace_bytes = 24 * 1024, .workspace_planned = true }, 0);
+    defer permit.deinit();
+    execution.execution_residency = .fromLease(permit.lease.?);
+    const small = try a.alloc(u8, 1);
+    defer a.free(small);
+    const before = controller.snapshot();
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 16 * 1024));
+    try std.testing.expectEqual(error.ResourceLimitExceeded, execution.failure(error.OutOfMemory));
+    try std.testing.expectEqualDeep(before, controller.snapshot());
+}
+
+const Empty = struct {
+    fn info(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+        return &.{};
+    }
+};
+
+test "prepared empty published output retains its process domain during ownership transfer" {
+    var controller = memory.AdmissionController{};
+    const session = sessions.Session{ .ptr = undefined, .vtable = undefined, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var target = Scope.child(std.testing.allocator, session, null);
+    defer target.deinit();
+    const owned = try Owned.create(std.testing.allocator, session, null, null);
+    defer Owned.release(owned);
+    try owned.publish();
+    try std.testing.expect(owned.scope.owner.reservation_controller == null);
+    try target.absorb(&owned.scope);
+    try std.testing.expectEqual(@as(usize, @sizeOf(Owned)), controller.snapshot().hostTotalBytes());
 }
