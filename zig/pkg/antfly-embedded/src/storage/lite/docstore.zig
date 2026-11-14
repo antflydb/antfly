@@ -242,15 +242,16 @@ fn reclamationStaleQuotaEstimatesExpireAfterRootsShrinkImpl(a: Allocator, use_re
     try std.testing.expectEqual(reclamation.Reason.storage_budget, store.maintenance_policy.status.reason);
     // Advance the private monotonic deadline rather than sleeping in a test.
     store.assessment_cache.?.revalidate_at = .zero;
-    // KNOWN REDO-MODE BUG (same family as "lite reclamation vacuum
-    // preserves collector capacity with retained readers"'s own
-    // comment): the rewrite this call triggers (performVacuum ->
-    // prepareVacuum) needs to reserve a fresh redo log for the rewritten
-    // copy (CreateOptions.use_redo_log's doc comment) out of this same
-    // tight, self-referential `cap`, which was only ever sized for one
-    // live copy's own data. Skipped under redo until that tension (and
-    // the related orphaned-page leak likely inflating `physical` above
-    // to begin with) is resolved.
+    // perf/lwa-orphan-pages: the orphaned-page-retention leak that used
+    // to inflate `physical` above (retaining the 64 "large" writes'
+    // superseded chains forever instead of retiring them) is fixed -- see
+    // `redo_overlay.SharedRedoOverlay.snapshotSupersededChainsAlloc`. The
+    // other half of this test's own original comment -- the rewrite this
+    // call triggers needing to reserve a fresh redo log out of this same
+    // tight, self-referential `cap` -- is a separate, still-open budget
+    // tension (perf/lwa-budget-tail's own territory: the ratio heuristic
+    // sizing this reservation does not yet account for it), not this
+    // leak; still skipped under redo for that reason alone.
     if (!use_redo_log) {
         try store.maintainOnce(true);
         try std.testing.expectEqual(@as(u64, 2), store.maintenance_policy.status.assessment_count);
@@ -587,30 +588,23 @@ fn reclamationVacuumPreservesCollectorCapacityWithRetainedReadersImpl(a: Allocat
     const compact = (try store.file.liveStats(null)).compact_size;
     store.maintenance_policy.options.max_storage_bytes = size + compact * 2;
     const initial = try store.reclamationStatus();
-    // KNOWN REDO-MODE BUG (found while deriving this threshold, not yet
-    // fixed): the 400KiB "large" write above diverts and its external
-    // value chain gets physically flushed as a page-shaped exception
-    // (checkpointRedoLog's own "page-shaped exception" doc comment)
-    // before the second write ("kept") ever supersedes "small" in the
-    // logical overlay. When the automatic fold that `putCatalogRecord`'s
-    // own commit triggers finally runs, it applies only the live head
-    // ("kept") to the real document/catalog index -- "large"'s own chain
-    // pages are retained once each by the fold's redo_fold_retain_pending
-    // reconciliation (native.zig, the same mechanism "lite replay cleanup
-    // commits bounded chunks isolates namespaces and retries" needed a
-    // per-record retain fix for) but never associated with any key the
-    // real index still points at, so nothing ever marks them for
-    // retirement: they are retained forever, inflating both the physical
-    // page count and (via state.pending/counts) retirementReserveBytes's
-    // own estimate. A full fix needs the fold to recognize a staged
-    // page-shaped chain whose owning key's current overlay head no
-    // longer points at it, and retire it instead of retaining it --
-    // tracking which key each staged page belongs to isn't information
-    // the current staging structure keeps. Not attempted here; this
-    // assertion is skipped under redo until that lands (see "lite
-    // reclamation ride-along passes force no sync before the next
-    // durable write"'s own unexpected_page_kind failure for the same
-    // leak surfacing through check() instead).
+    // perf/lwa-orphan-pages: the orphaned-page-retention leak this
+    // comment originally described (the 400KiB "large" chain's pages
+    // retained forever instead of being retired once "kept" superseded
+    // them) is fixed -- see `redo_overlay.SharedRedoOverlay
+    // .snapshotSupersededChainsAlloc`, and "lite redo fold retires a
+    // superseded catalog value chain" for a deterministic, targeted
+    // regression test covering exactly this shape. This test's own exact
+    // byte-for-byte parity with the legacy path still does not hold under
+    // redo, though: investigation during the orphan-pages fix found
+    // `reusable_pages` lower under redo than legacy for this same
+    // scenario even after the leak fix (fewer of "large"'s own chain
+    // pages become reusable here, not zero) -- a separate, narrower
+    // discrepancy (possibly the same self-referential fixed redo-log
+    // reservation tension "lite reclamation stale quota estimates expire
+    // after roots shrink"'s own comment already documents for this
+    // family) that this investigation did not chase further. Still
+    // skipped under redo for that reason, not the orphaned-page leak.
     if (!use_redo_log) try std.testing.expect(compact * 2 + initial.reusable_pages * 4096 >= try store.file.retirementReserveBytes());
     try std.testing.expectError(error.LiteStorageBudgetExceeded, store.vacuum());
     try std.testing.expectEqualDeep(before, store.file.activeCheckpoint());
@@ -618,15 +612,6 @@ fn reclamationVacuumPreservesCollectorCapacityWithRetainedReadersImpl(a: Allocat
     try store.putCatalogRecord("next", "value");
     pinned.abort();
     pin_active = false;
-    // KNOWN REDO-MODE BUG, downstream of the same leak: `max_storage_bytes`
-    // above is sized from `size` (already inflated by the leaked "large"
-    // chain) plus slack for one live copy, but prepareVacuum's own fresh
-    // redo log for the vacuumed copy (CreateOptions.use_redo_log's doc
-    // comment) needs still more room than that slack covers, so even this
-    // now-unconstrained vacuum (the pinned reader that forced the earlier
-    // one to fail is released) fails allocating its own log's pages. Not
-    // chased further under the same time-boxed investigation as the
-    // other bugs this test's comments already cite.
     if (!use_redo_log) {
         _ = try store.vacuum();
         try store.putCatalogRecord("after", "still writable");
@@ -902,35 +887,13 @@ fn reclamationShrinkingObservesDeletionsWithoutGrowthImpl(a: Allocator, use_redo
     try write.commit();
     for (0..32) |_| try store.maintainOnce(false);
     const status = try store.reclamationStatus();
-    // Before Bug 3 (perf/lwa-budget-tail) was fixed, this `rewrite_count
-    // == 1` held under redo for the wrong reason: the very first
-    // `maintainOnce(false)` above (right after writing "large", before
-    // any delete) already judged itself `worthwhile` -- raw physical
-    // included this file's own fixed, non-reclaimable log-capacity
-    // reservation, which alone exceeded `compact*amplification` for a
-    // file that, at that point, was 100% live data -- and rewrote
-    // immediately, satisfying this count before the delete this test is
-    // actually about ever ran. `Policy.worthwhile`'s own ratio is now
-    // correctly net of that reservation (`fixed_overhead`), so that
-    // spurious early rewrite no longer fires (confirmed: legacy, which
-    // never had the reservation to begin with, never took this path
-    // either -- its own first assessment already correctly judged
-    // "nothing dead yet, not worthwhile"). What is left blocking the
-    // *real*, delete-triggered reassessment this test means to exercise
-    // is the same gap "lite reclamation shrinking observes partially
-    // live packed records"'s own comment documents in detail: redo's
-    // deferred, purely logical delete never grows
-    // `NativeFile.retirement_activity_bytes`, which `due()`'s
-    // activity-based half needs, without a fold `checkpointRedoLog`
-    // only runs under budget pressure this budget-less store never has
-    // (§9.7d). Confirmed directly: no second assessment ever runs here
-    // under redo, at any `minimum_reclaim_bytes`/`assessment_bytes`.
-    // Out-of-scope for this bug (§9.7d / perf/lwa-redo-retire
-    // territory); skipped under redo until that lands.
-    if (!use_redo_log) {
-        try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
-        try std.testing.expect(status.current_file_bytes < 64 * 1024);
-    }
+    // TRY-REDO(reconcile): on the merged tree (Bug 1's fold retiring
+    // superseded chains + Bug 3's fixed_overhead netted out of the
+    // worthwhile ratio), re-verify whether the real, delete-triggered
+    // reassessment now fires under redo before falling back to a
+    // legacy-only skip.
+    try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
+    try std.testing.expect(status.current_file_bytes < 64 * 1024);
     const assessments = status.assessment_count;
     for (0..32) |_| try store.maintainOnce(false);
     // Collector metadata alone must not trigger repeated full assessments.
@@ -1005,10 +968,11 @@ fn reclamationShrinkingObservesPartiallyLivePackedRecordsImpl(a: Allocator, use_
     if (use_redo_log) store.maintenance_policy.next_assessment_size = 0;
     for (0..32) |_| try store.maintainOnce(false);
     const status = try store.reclamationStatus();
-    if (!use_redo_log) {
-        try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
-        try std.testing.expect(status.current_file_bytes < before);
-    }
+    // TRY-REDO(reconcile): re-verify under redo on the merged tree before
+    // falling back to a legacy-only skip (see note above the forced
+    // threshold bypass).
+    try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
+    try std.testing.expect(status.current_file_bytes < before);
     var read = try store.beginRead();
     defer read.abort();
     for (0..64) |i| {
@@ -1024,6 +988,202 @@ test "lite reclamation shrinking observes partially live packed records" {
 
 test "lite reclamation shrinking observes partially live packed records (redo)" {
     try reclamationShrinkingObservesPartiallyLivePackedRecordsImpl(std.testing.allocator, true);
+}
+
+// perf/lwa-orphan-pages ("Bug 1"): a diverting commit's page-shaped
+// exception (an external value chain, or a packed-record bundle) used to
+// be reconciled into the ledger only at the next `checkpointRedoLog` fold
+// (`redo_fold_retain_pending`/`retainUnretainedValueChainPages`), which
+// retained every such page but never recorded which key or version owned
+// it. If the owning key was superseded or deleted *before* that fold ran,
+// the superseded version's pages were retained forever instead of ever
+// being marked for retirement -- a permanent leak, inflating
+// `retirementReserveBytes`/`current_file_bytes` and tripping shrink/vacuum
+// assertions and `check()`'s `unexpected_page_kind` under redo (see the
+// "KNOWN REDO-MODE BUG" comments throughout this file's own reclamation
+// tests above, now fixed). `redo_overlay.SharedRedoOverlay
+// .snapshotSupersededChainsAlloc` gives the fold each superseded version's
+// own chain so it can retain-then-retire it, exactly once, alongside the
+// surviving head it already builds a real record for.
+fn redoFoldRetiresSupersededDocumentValueChainsImpl(a: Allocator, use_redo_log: bool) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-fold-retire-document.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = use_redo_log, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+
+    const large = try a.alloc(u8, 256 * 1024);
+    defer a.free(large);
+    @memset(large, 'v');
+
+    // "overwrite" key: a large multi-page chain, then overwritten with a
+    // small inline value before any fold ever runs.
+    var write = try store.beginWrite();
+    try write.put("overwritten", large);
+    try write.put("deleted", large);
+    try write.commit();
+
+    const before = try store.reclamationStatus();
+
+    write = try store.beginWrite();
+    try write.put("overwritten", "small");
+    try write.delete("deleted");
+    try write.commit();
+
+    // Nothing has folded yet (under redo): both chains are still only
+    // staged, exactly the pre-fold window this bug needed.
+    if (use_redo_log) try store.checkpointRedoLog();
+
+    const after_fold = try store.reclamationStatus();
+    // Both superseded chains (the overwritten version and the deleted
+    // version) are now queued for retirement, not retained forever.
+    try std.testing.expect(after_fold.pending_retirement_objects > before.pending_retirement_objects);
+
+    for (0..64) |_| try store.maintainOnce(false);
+
+    const drained = try store.reclamationStatus();
+    // Space becomes reusable (free) once the queued retirement drains;
+    // the file itself only shrinks on an explicit rewrite/vacuum, not a
+    // plain reclaim pass, so `reusable_pages` (not `current_file_bytes`)
+    // is the right signal that the superseded chain was actually retired.
+    try std.testing.expect(drained.reusable_pages > before.reusable_pages);
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("small", try read.get("overwritten"));
+    try std.testing.expectError(error.NotFound, read.get("deleted"));
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite redo fold retires superseded document value chains before any pin needs them" {
+    try redoFoldRetiresSupersededDocumentValueChainsImpl(std.testing.allocator, false);
+}
+
+test "lite redo fold retires superseded document value chains before any pin needs them (redo)" {
+    try redoFoldRetiresSupersededDocumentValueChainsImpl(std.testing.allocator, true);
+}
+
+// Packed-record variant: several small documents fold together with one
+// large, superseded one in the *same* batch, so `checkpointRedoLog`'s own
+// real build runs with `pack_records = true` (`heads.len > 1`) -- the
+// `record_bundle` page-shaped-exception family `af488c9a18` already
+// covers on the retain side. The superseded chain's own retirement must
+// still land correctly alongside that packed build.
+fn redoFoldRetiresSupersededValueChainAlongsidePackedRecordsImpl(a: Allocator, use_redo_log: bool) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-fold-retire-packed.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = use_redo_log, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+
+    const large = try a.alloc(u8, 256 * 1024);
+    defer a.free(large);
+    @memset(large, 'v');
+
+    var write = try store.beginWrite();
+    try write.put("large", large);
+    for (0..8) |i| {
+        var key: [8]u8 = undefined;
+        try write.put(try std.fmt.bufPrint(&key, "k{d:0>6}", .{i}), "v");
+    }
+    try write.commit();
+
+    const before = try store.reclamationStatus();
+
+    // Supersede the large chain; touch every small key too so this fold's
+    // own batch (`heads.len > 1`) packs several records onto one page.
+    write = try store.beginWrite();
+    try write.put("large", "small");
+    for (0..8) |i| {
+        var key: [8]u8 = undefined;
+        try write.put(try std.fmt.bufPrint(&key, "k{d:0>6}", .{i}), "v2");
+    }
+    try write.commit();
+
+    if (use_redo_log) try store.checkpointRedoLog();
+
+    const after_fold = try store.reclamationStatus();
+    try std.testing.expect(after_fold.pending_retirement_objects > before.pending_retirement_objects);
+
+    for (0..64) |_| try store.maintainOnce(false);
+
+    const drained = try store.reclamationStatus();
+    // Space becomes reusable (free) once the queued retirement drains;
+    // the file itself only shrinks on an explicit rewrite/vacuum, not a
+    // plain reclaim pass, so `reusable_pages` (not `current_file_bytes`)
+    // is the right signal that the superseded chain was actually retired.
+    try std.testing.expect(drained.reusable_pages > before.reusable_pages);
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("small", try read.get("large"));
+    for (0..8) |i| {
+        var key: [8]u8 = undefined;
+        try std.testing.expectEqualStrings("v2", try read.get(try std.fmt.bufPrint(&key, "k{d:0>6}", .{i})));
+    }
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite redo fold retires a superseded value chain alongside a packed-record build" {
+    try redoFoldRetiresSupersededValueChainAlongsidePackedRecordsImpl(std.testing.allocator, false);
+}
+
+test "lite redo fold retires a superseded value chain alongside a packed-record build (redo)" {
+    try redoFoldRetiresSupersededValueChainAlongsidePackedRecordsImpl(std.testing.allocator, true);
+}
+
+// Catalog direct-written variant: a catalog value's own pages are
+// pwritten immediately (`direct_value_pages`), never staged through
+// `SharedRedoOverlay.pages` -- `retainUnretainedValueChainPages`
+// (`c95566d5d3`) only ever walked a *surviving* head's own chain, so a
+// superseded catalog chain was never even retained, let alone retired.
+fn redoFoldRetiresSupersededCatalogValueChainImpl(a: Allocator, use_redo_log: bool) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-fold-retire-catalog.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .use_redo_log = use_redo_log, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+
+    const large = try a.alloc(u8, 256 * 1024);
+    defer a.free(large);
+    @memset(large, 'v');
+
+    try store.putCatalogRecord("small", large);
+    const before = try store.reclamationStatus();
+
+    try store.putCatalogRecord("small", "kept");
+    if (use_redo_log) try store.checkpointRedoLog();
+
+    const after_fold = try store.reclamationStatus();
+    try std.testing.expect(after_fold.pending_retirement_objects > before.pending_retirement_objects);
+
+    for (0..64) |_| try store.maintainOnce(false);
+
+    const drained = try store.reclamationStatus();
+    // Space becomes reusable (free) once the queued retirement drains;
+    // the file itself only shrinks on an explicit rewrite/vacuum, not a
+    // plain reclaim pass, so `reusable_pages` (not `current_file_bytes`)
+    // is the right signal that the superseded chain was actually retired.
+    try std.testing.expect(drained.reusable_pages > before.reusable_pages);
+
+    const value = (try store.getCatalogRecordAlloc(a, "small")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("kept", value);
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite redo fold retires a superseded catalog value chain" {
+    try redoFoldRetiresSupersededCatalogValueChainImpl(std.testing.allocator, false);
+}
+
+test "lite redo fold retires a superseded catalog value chain (redo)" {
+    try redoFoldRetiresSupersededCatalogValueChainImpl(std.testing.allocator, true);
 }
 
 // §3.2a/§3.6: a background reclamation pass must never pay for its own
@@ -1315,7 +1475,9 @@ fn reclamationCountsRetiredInodesUntilPinnedReadersReleaseImpl(alloc: Allocator,
     // `NativeFile.flushTransactionWrites` now mirrors that check for a
     // diverting commit too (reading the currently persisted ledger
     // instead of one attached to this commit's own allocator), so this
-    // fails closed in both modes.
+    // fails closed in both modes. (perf/lwa-integration's own
+    // `status.totalBytes()` concern above predates this fix and does not
+    // reproduce on the merged tree, below.)
     try std.testing.expectError(error.LiteStorageBudgetExceeded, write.commit());
     write.abort();
     var latest = try store.beginRead();
@@ -1882,7 +2044,22 @@ test "lite allocator v4 releasing the last old reader starts idle retirement" {
     write = try store.beginWrite();
     try write.delete("large");
     try write.commit();
-    try std.testing.expect(store.maintenance_future == null);
+    // §9 (redo retirement signal): used to assert `maintenance_future ==
+    // null` here, on the assumption that nothing could have started the
+    // background loop yet. Under the ledger-only signal
+    // `startMaintenanceAssumeLocked` used to consult, that held
+    // incidentally: a reader-pinned delete leaves no *ledger* work to
+    // find this early. Once that signal became the full, redo-aware one
+    // (matching every other caller), the put+delete above chains a
+    // superseded version onto "large"'s head in the same uncheckpointed
+    // window -- genuine redo retirement debt `redoCheckpointWouldRetire`
+    // correctly reports right away, which legitimately starts
+    // `maintenanceLoop` immediately rather than waiting for the reader to
+    // release. That is the intended behavior this signal switch exists
+    // for, not a bug: the test's actual invariant -- idle retirement
+    // cannot *complete* until the pinning reader releases -- is already
+    // the `while` loop below, unaffected by exactly when the background
+    // loop happens to spin up.
     oldest.abort();
     oldest_open = false;
     const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(std.Io.Duration.fromSeconds(10));
@@ -2922,7 +3099,17 @@ pub const Store = struct {
         // publication mutex again on every reader/writer release: a continuous
         // group-commit writer could otherwise starve vacuum's return path.
         if (self.maintenance_started.load(.acquire)) return;
-        lockStore(self);
+        // Exclusive: `startMaintenanceAssumeLocked` reads `self.file`'s
+        // checkpoint/ledger/redo-debt state (`retirementNeedsServiceWithCancel`,
+        // `activeCheckpoint`) to decide whether to start the background
+        // `maintenanceLoop` -- the same category of `self.file` access
+        // `lockStoreExclusive`'s own doc comment calls out, so it must not
+        // run during another commit's released sync window. Plain
+        // `lockStore` let this read (and the decision to spawn the
+        // background loop) interleave with a live commit's in-flight
+        // redo-log publish; see `releaseWriterSlot`'s own fix for the
+        // opportunistic counterpart of this same bug.
+        lockStoreExclusive(self);
         defer self.mutex.unlock();
         self.startMaintenanceAssumeLocked();
     }
@@ -2947,12 +3134,16 @@ pub const Store = struct {
             self.file.activeCheckpoint().page_count *| self.file.header.page_size >= self.maintenance_policy.options.minimum_reclaim_bytes;
         if (!cheap_already_due) {
             const retirement_check_started = if (@import("builtin").is_test) std.Io.Clock.awake.now(self.file.runtime()).nanoseconds else 0;
-            // §9 (redo retirement signal): ledger-only here on purpose --
-            // see `retirementNeedsServiceLedgerOnlyWithCancel`'s own doc
-            // comment. Starting the background `maintenanceLoop` is the
-            // one caller of this check that isn't a direct, synchronous
-            // call the caller already controls the timing of.
-            const retirement = self.file.retirementNeedsServiceLedgerOnlyWithCancel(&self.maintenance_cancel) catch false;
+            // §9 (redo retirement signal): the full, redo-aware signal.
+            // This used to call `retirementNeedsServiceLedgerOnlyWithCancel`
+            // to avoid starting the background `maintenanceLoop` for a
+            // redo-debt-only reason, because doing so exposed a background/
+            // foreground writer-ownership race (see `maintainOnceWithCancel`'s
+            // retirement/reclaim block and `lockStoreExclusive`'s own doc
+            // comment on `releaseWriterSlot`'s opportunistic maintenance
+            // kick). That race is fixed; every caller of this check now
+            // shares the same signal.
+            const retirement = self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false;
             if (@import("builtin").is_test) {
                 const elapsed: u64 = @intCast(@max(0, std.Io.Clock.awake.now(self.file.runtime()).nanoseconds - retirement_check_started));
                 _ = self.test_retirement_check_count.fetchAdd(1, .release);
@@ -4823,7 +5014,27 @@ pub const Store = struct {
             // `startMaintenance()` again once it finishes (see
             // `driveMutationCoordinator`), so nothing is lost, only
             // deferred to a call that is not on this latency-sensitive path.
-            if (!self.maintenance_started.load(.acquire) and self.mutex.tryLock()) {
+            //
+            // `tryLockStoreExclusive`, not a plain `tryLock`: a plain
+            // `self.mutex.tryLock()` succeeds not only when the leader
+            // holds the mutex throughout (the common case this comment
+            // above describes, where contention correctly skips this
+            // turn), but also during the leader's own brief released sync
+            // window (`commit_in_sync != 0`, mutex unlocked around just
+            // the redo/manifest fsync -- see `applyMutationGroup`'s
+            // `sync_gate`/`lockStoreExclusive`'s own doc comment). A plain
+            // `tryLock` winning that race let `startMaintenanceAssumeLocked`
+            // read `self.file`'s checkpoint/ledger/redo-debt state (and,
+            // once the redo retirement signal considers redo debt, decide
+            // to spin up the background `maintenanceLoop`) while that
+            // commit's own publish was still in flight -- the
+            // concurrency bug the redo retirement signal's own design
+            // doc section flagged and deferred. `tryLockStoreExclusive`
+            // treats that window as contended too, so this opportunistic
+            // kick now only ever fires when the leader has fully
+            // finished (or has not started), exactly like every other
+            // caller that touches `self.file`.
+            if (!self.maintenance_started.load(.acquire) and tryLockStoreExclusive(self)) {
                 self.startMaintenanceAssumeLocked();
                 self.mutex.unlock();
             }

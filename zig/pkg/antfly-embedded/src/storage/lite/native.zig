@@ -6712,6 +6712,21 @@ pub const NativeFile = struct {
     /// processes those maps later. Owned by `checkpointRedoLog`; cleared
     /// (and freed) by whichever of the two reaches it first.
     redo_fold_retain_pending: ?[]const u64 = null,
+    /// perf/lwa-orphan-pages: page ids `checkpointRedoLog` found owned by
+    /// a version its own fold just discovered superseded or deleted,
+    /// strictly within the window just folded -- see
+    /// `redo_overlay.SharedRedoOverlay.SupersededChain`'s own doc comment
+    /// for the orphaned-page-retention bug this fixes. Consumed once by
+    /// `flushTransactionWrites`'s own real (non-diverting) fold, the same
+    /// way and at the same point as `redo_fold_retain_pending` -- each
+    /// chain this names gets retained (idempotently: harmless if
+    /// `redo_fold_retain_pending`'s own sweep, or a surviving head's own
+    /// write, already retained some of its pages) and then immediately
+    /// queued for retirement, exactly like a normal, non-redo overwrite's
+    /// `IndexEditor` replace already does inline for the record it
+    /// displaces. Owned by `checkpointRedoLog`; cleared (and freed) by
+    /// whichever of the two reaches it first.
+    redo_fold_retire_pending: ?[]const redo_overlay.SharedRedoOverlay.SupersededChain = null,
     /// Accumulates (page_id, crc) for every data page `PageWriteBatch`
     /// physically writes since the *last durable checkpoint publish* --
     /// across staging (`stageMutation`'s eager external-value writes,
@@ -7418,10 +7433,39 @@ pub const NativeFile = struct {
             }
         }.populate);
 
+        // `checkpointRedoLog`'s own fold consumes a fresh `commit_sequence`
+        // for its checkpoint publish without ever appending a matching log
+        // record (its `checkpointing = true` span disables every diversion
+        // point, so that sequence is never logged) -- by design, since the
+        // checkpoint slot is already a complete, self-sufficient durability
+        // record for it. `redo_log.replay`'s own scan of the physical log
+        // therefore legitimately stops one behind the checkpoint whenever
+        // the most recent event before a crash was such a fold: `outcome
+        // .last_sequence` reports the last record it actually found on
+        // disk (superseded or not), which is correct for *that* question,
+        // but is not on its own a safe cursor to resume the writer from.
+        // Recovery's restored checkpoint (`recovered_checkpoint_sequence`,
+        // taken after the `compact.toCheckpointSlot()` update above) is
+        // never behind what the log physically holds, but a fold can leave
+        // it strictly *ahead* -- resuming the writer at the log's own
+        // last-seen sequence in that case lets the very next commit
+        // recompute `checkpoint.commit_sequence + 1` as its own next
+        // sequence while the writer's continuity check still expects
+        // `outcome.last_sequence + 1`, one behind -- a guaranteed
+        // `error.SequenceOutOfOrder` (surfacing as `error.OutcomeUnknown`)
+        // on the very first write after reopen. Clamping the writer's
+        // resumed sequence to at least the recovered checkpoint's own
+        // keeps the two in the same continuity domain they share on every
+        // live commit (ride-along and durable alike both advance
+        // `self.header`'s checkpoint and the log's `last_sequence`
+        // together; only a fold's own checkpoint-only publish ever splits
+        // them).
+        const recovered_checkpoint_sequence = self.header.checkpoints[self.header.active_checkpoint].commit_sequence;
+        const resumed_sequence = @max(outcome.last_sequence orelse recovered_checkpoint_sequence, recovered_checkpoint_sequence);
         self.redo = RedoCommitState{
-            .writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, outcome.valid_bytes, outcome.last_sequence),
+            .writer = redo_log.Writer.initAt(self.file, io, self.header.redo_log_offset, self.header.redo_log_capacity, outcome.valid_bytes, resumed_sequence),
             .shared = shared,
-            .durable_sequence = outcome.last_sequence orelse checkpoint.commit_sequence,
+            .durable_sequence = resumed_sequence,
             .checkpoint_sequence = checkpoint.commit_sequence,
         };
         self.publishRedoLogState();
@@ -7643,13 +7687,41 @@ pub const NativeFile = struct {
             for (staged_pages, pending) |p, *out| out.* = p.page_id;
             self.redo_fold_retain_pending = pending;
         }
+        // §9 (redo, re-fold guard): the sequence boundary this fold is
+        // building on top of -- `redo.checkpoint_sequence` is not
+        // advanced to `new_checkpoint_sequence` until this function's own
+        // epilogue, well after this loop, so every version at or below
+        // this captured value was already included in a *prior*
+        // `checkpointRedoLog` fold. `reclaim`'s own pin-aware floor can
+        // leave such an already-folded head sitting in `redo.shared.maps`
+        // indefinitely (a live pin older than the key's entire chain
+        // never finds anything `<= floor` to collapse, so the key is
+        // never dropped, even though it is already durably on disk) --
+        // without this guard, `snapshotHeadsAlloc` would hand this same
+        // stale head to a *later* fold again, which would build a
+        // *second* real record for the same key, re-referencing an
+        // external value chain's `external_value_root_page` that the
+        // first fold already attached to the first record. See
+        // `snapshotHeadsAlloc`'s own doc comment for the full mechanism
+        // and the "redo differential oracle" / "crash sweep ... dense
+        // native-catalog" failures this caused.
+        const fold_floor = redo.checkpoint_sequence;
+        // perf/lwa-orphan-pages: every page-shaped chain this fold's own
+        // overlay snapshot finds superseded or deleted within
+        // `(fold_floor, new fold]`, across every root -- see
+        // `redo_overlay.SharedRedoOverlay.SupersededChain`'s own doc
+        // comment. Collected across all three roots' loop iterations
+        // below, then handed to `flushTransactionWrites` the same way
+        // `redo_fold_retain_pending` already is.
+        var retiring_chains: std.ArrayListUnmanaged(redo_overlay.SharedRedoOverlay.SupersededChain) = .empty;
+        errdefer retiring_chains.deinit(self.allocator);
         for (0..3) |root_idx| {
             // A fully-owned snapshot, folded outside `shared`'s own lock
             // (`snapshotHeadsAlloc`'s own doc comment) -- `putDocumentBatch`/
             // `putCatalogBatchForRoot` below run a real `IndexEditor` pass,
             // not something to do while holding a lock every reader on
             // this inode also needs.
-            const heads = try redo.shared.snapshotHeadsAlloc(self.allocator, io, @intCast(root_idx));
+            const heads = try redo.shared.snapshotHeadsAlloc(self.allocator, io, @intCast(root_idx), fold_floor);
             defer {
                 for (heads) |h| {
                     self.allocator.free(h.key);
@@ -7657,6 +7729,13 @@ pub const NativeFile = struct {
                 }
                 self.allocator.free(heads);
             }
+            // Same `fold_floor` boundary as `heads` above -- see
+            // `snapshotSupersededChainsAlloc`'s own doc comment for why
+            // this never double-counts a chain an earlier fold already
+            // retired.
+            const superseded = try redo.shared.snapshotSupersededChainsAlloc(self.allocator, io, @intCast(root_idx), fold_floor);
+            defer self.allocator.free(superseded);
+            try retiring_chains.appendSlice(self.allocator, superseded);
             if (heads.len == 0) continue;
             if (root_idx == @backingInt(TransactionWrites.Root.documents)) {
                 var docs = try std.ArrayListUnmanaged(DocumentMutation).initCapacity(self.allocator, heads.len);
@@ -7692,17 +7771,34 @@ pub const NativeFile = struct {
                 try self.putCatalogBatchForRoot(if (root_idx == 0) .metadata else .index, batch.items, .{});
             }
         }
+        // `retiring_chains` never grew at all (stays `.empty`, nothing
+        // allocated) when nothing was superseded in this fold's own
+        // window -- nothing to free in that case, and no explicit deinit
+        // call here either: this list's own `errdefer` (just above the
+        // loop) already owns cleanup for every path out of this
+        // function, and calling `deinit` a second time on the same value
+        // (once here, once from that still-registered errdefer were a
+        // later error to occur) would poison it (`deinit` sets `self.*
+        // = undefined`) before the errdefer's own call ever ran.
+        if (retiring_chains.items.len != 0) {
+            self.redo_fold_retire_pending = try retiring_chains.toOwnedSlice(self.allocator);
+        }
         // Builds the real pages above, then (via `flushTransactionWrites`,
         // `commitTransactionWithDurability`, `publishCheckpoint`, all
         // running their ordinary non-redo behavior because `checkpointing`
         // is true) syncs them and writes a real, physical checkpoint slot.
         // `flushTransactionWrites` itself consumes and frees
-        // `self.redo_fold_retain_pending` (see that field's own doc
-        // comment); this only cleans up if something above returned an
-        // error before `flushTransactionWrites` ever ran.
+        // `self.redo_fold_retain_pending`/`self.redo_fold_retire_pending`
+        // (see those fields' own doc comments); this only cleans up if
+        // something above returned an error before `flushTransactionWrites`
+        // ever ran.
         errdefer if (self.redo_fold_retain_pending) |pending| {
             self.allocator.free(pending);
             self.redo_fold_retain_pending = null;
+        };
+        errdefer if (self.redo_fold_retire_pending) |retiring| {
+            self.allocator.free(retiring);
+            self.redo_fold_retire_pending = null;
         };
         try self.commitTransactionWithDurability(true, null);
 
@@ -9150,6 +9246,63 @@ pub const NativeFile = struct {
         if (page == 0 or page >= checkpoint.page_count) return error.InvalidPageId;
         graph.maximum_page = @max(graph.maximum_page, page);
         try graph.pages.put(self.allocator, page, {});
+    }
+
+    /// Retains every page of the external value chain rooted at `root`
+    /// (extent tree or simple linked chain) that `state` has not already
+    /// counted -- idempotent per page via `state.count(page) == 0`, so
+    /// it is safe to call even after the chain's own root was already
+    /// retained elsewhere (`retainRecord`'s own `retainValue(root)` call,
+    /// made when the record pointing at this chain was built).
+    ///
+    /// `checkpointRedoLog`'s own fold needs this for one case
+    /// `redo_fold_retain_pending`'s staged-page sourcing never covers: a
+    /// *catalog* value's own pages (`file.direct_value_pages`,
+    /// `writeCatalogValue`'s own doc comment) are written for real,
+    /// immediately, by the diverting commit that creates them --
+    /// `PageWriteBatch.flushCount`'s own `direct_value_pages` branch
+    /// pwrites them directly rather than staging them through
+    /// `SharedRedoOverlay.pages`, to avoid holding an unboundedly large
+    /// catalog value in memory across private-flush chunking. That same
+    /// diverting commit's own `writeExtentNode`/`writeValuePagesAllocated`
+    /// calls -- which normally retain every child page the moment it is
+    /// linked -- ran against `pageAllocatorForDivertingCommit`'s allocator,
+    /// which never attaches a ledger, so every one of those retains was a
+    /// silent no-op; only the chain's root ever gets retained, by
+    /// `retainRecord`, once the fold finally builds a real record for it.
+    /// Reading the chain's actual on-disk structure here (rather than
+    /// anything staged in memory) is also safe across a crash between the
+    /// diverting commit and the fold that first processes its head: the
+    /// bytes are already durably on disk by the time this ever runs.
+    fn retainUnretainedValueChainPages(self: *NativeFile, state: *allocator_v4.State, checkpoint: CheckpointSlot, root: u64, length: u64, cancel: ?*const maintenance.CancelToken) !void {
+        if (length == 0 or physicalPage(root) != root) return error.InvalidNativeValueChain;
+        const Value = struct { page: u64, length: u64 };
+        var work: std.ArrayList(Value) = .empty;
+        defer work.deinit(self.allocator);
+        var visited: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer visited.deinit(self.allocator);
+        try work.append(self.allocator, .{ .page = root, .length = length });
+        while (work.pop()) |value| {
+            if (cancel) |token| try token.check();
+            if (value.length == 0 or physicalPage(value.page) != value.page) return error.InvalidNativeValueChain;
+            if ((try visited.fetchPut(self.allocator, value.page, {})) != null) continue;
+            if (state.count(value.page) == 0 and !state.isSelfDescribingPage(value.page)) try state.retain(value.page);
+            const raw = try self.readPageAllocForCheckpoint(self.allocator, value.page, checkpoint);
+            defer self.allocator.free(raw);
+            switch (raw[4]) {
+                @backingInt(PageKind.value) => {
+                    const leaf = try decodeValuePage(try decodePagePayload(raw, .value));
+                    if (leaf.chunk.len == 0 or leaf.chunk.len > value.length) return error.InvalidNativeValueChain;
+                    const remaining = value.length - leaf.chunk.len;
+                    if (leaf.next_page != 0) try work.append(self.allocator, .{ .page = leaf.next_page, .length = remaining });
+                },
+                @backingInt(PageKind.value_extent) => {
+                    const node = try decodeExtentNode(try decodePagePayload(raw, .value_extent), value.length);
+                    for (node.children[0..node.count]) |child| try work.append(self.allocator, .{ .page = child.page, .length = child.len });
+                },
+                else => return error.InvalidNativeValueChain,
+            }
+        }
     }
 
     fn indexedValue(self: *NativeFile, graph: *IndexedGraph, checkpoint: CheckpointSlot, root: u64, length: u64, cancel: ?*const maintenance.CancelToken) !void {
@@ -15527,7 +15680,22 @@ pub const NativeFile = struct {
         if (value.len == 0) return error.InvalidNativeValueChain;
         const chunk_size = self.maxValuePagePayloadBytes();
         if (chunk_size == 0) return error.InvalidNativePageLength;
-        var batch = PageWriteBatch{ .file = self };
+        // See `PageAllocator.diverting`'s own doc comment: this batch's
+        // pages are the one page-shaped exception a diverting transactional
+        // commit still makes (an external value chain under the inline
+        // threshold, via `writeDocumentValue`/`writeCatalogValue`). Unlike
+        // `ExtentAppender.init`/`writeValueTree` (the >=64 KiB value-tree
+        // path), this standalone batch literal was never threaded with
+        // `page_allocator.diverting` when 4a7817f3dd scoped diversion to
+        // the owning allocator -- it silently kept `diverting`'s `false`
+        // default, so every sub-64-KiB external value always took the
+        // real-pwrite branch regardless of `self.file.redo`, even during an
+        // ordinary diverting commit. That starves the redo log of the
+        // page-shaped bytes `maybeAutoCheckpointRedoLog`'s own 25%-remaining
+        // backstop is supposed to react to, so a write pattern built almost
+        // entirely from such values never opportunistically checkpoints at
+        // all and instead runs straight into the page/storage budget wall.
+        var batch = PageWriteBatch{ .file = self, .diverting = page_allocator.diverting };
         var page = try page_allocator.allocate();
         const root = page;
         var offset: usize = 0;
@@ -16744,6 +16912,49 @@ pub const NativeFile = struct {
                 for (batch.items, docs) |m, *doc| doc.* = .{ .key = m.key, .value = m.value, .is_delete = m.is_delete, .external_value_root_page = m.external_value_root_page, .external_value_len = m.external_value_len };
                 try self.putDocumentBatch(docs);
             } else try self.putCatalogBatchForRoot(if (root == 0) .metadata else .index, batch.items, .{});
+            // §9 (redo + indexed reclamation): a *catalog* external
+            // value's own pages (`file.direct_value_pages`,
+            // `writeCatalogValue`'s own doc comment) were written for
+            // real, immediately, by the diverting commit that created
+            // them -- `PageWriteBatch.flushCount`'s own
+            // `direct_value_pages` branch pwrites them directly instead
+            // of staging them through `SharedRedoOverlay.pages`, to keep
+            // an unbounded catalog value from accumulating in memory
+            // across private-flush chunking. `redo_fold_retain_pending`
+            // below is sourced entirely from that overlay's own staged
+            // pages, so it never sees these pages at all; the
+            // `putCatalogBatchForRoot` call just above only retained
+            // each chain's own *root* (`retainRecord`), never its
+            // children, which a normal (non-redo) write retains through
+            // `writeExtentNode`'s own `retainValue` calls -- calls this
+            // exact head's own diverting commit already made, but
+            // against `pageAllocatorForDivertingCommit`'s allocator,
+            // which never attaches a ledger, so every one of them was a
+            // silent no-op. Walking each surviving head's chain here and
+            // retaining whatever `writes.pages.ledger` has not already
+            // counted covers that gap; a page it already retained (the
+            // root) is simply skipped.
+            //
+            // Scoped to catalog roots only (`root != .documents`):
+            // `writeDocumentValue` never sets `direct_value_pages` (only
+            // `writeCatalogValue` does), so a document's own chain is
+            // always fully covered already, by `retainRecord` (its root)
+            // and `redo_fold_retain_pending` (its staged continuation
+            // pages) -- walking it here too would be redundant extra
+            // page-read/allocation work on every document fold, observed
+            // live to tip an already-tight storage budget into failing
+            // the triggering commit itself instead of only the
+            // opportunistic checkpoint ("lite reclamation opportunistic
+            // redo checkpoint failure is visible and recovers").
+            if (!diverting and root != @backingInt(TransactionWrites.Root.documents)) {
+                if (writes.pages.ledger) |state| {
+                    const checkpoint = self.activeCheckpoint();
+                    for (batch.items) |m| {
+                        if (m.is_delete or m.external_value_root_page == 0) continue;
+                        try self.retainUnretainedValueChainPages(state, checkpoint, m.external_value_root_page, m.external_value_len, null);
+                    }
+                }
+            }
             // The next root may resolve external index keys written here.
             try writes.pages.flush();
         }
@@ -16819,6 +17030,42 @@ pub const NativeFile = struct {
                             try state.retain(page_id);
                         }
                     }
+                }
+            }
+        }
+        // perf/lwa-orphan-pages (Bug 1): `checkpointRedoLog`'s own
+        // `redo_fold_retire_pending` (see that field's own doc comment)
+        // names every page-shaped chain this fold's overlay snapshot
+        // found superseded or deleted strictly within the window just
+        // folded -- a version a later write in the same uncheckpointed
+        // window already overwrote or deleted before any fold ever
+        // applied it to the real tree, so the loop above never retains it
+        // as a side effect of writing a surviving record. Retaining each
+        // one here is idempotent (`retainUnretainedValueChainPages`'s own
+        // `count(page) == 0` guard skips any page the sweep above, or a
+        // surviving head's own write, already retained) and then
+        // immediately queuing it for retirement gives the ledger the same
+        // ownership a normal, non-redo overwrite's `IndexEditor` replace
+        // already assigns inline when it displaces a record -- `.value`-
+        // kind retirement's own epoch-gated completion (the switch a few
+        // hundred lines up) defers the actual release until no reader
+        // pinned at an older physical checkpoint could still need these
+        // bytes, exactly like any other superseded value chain. Without
+        // this, nothing ever marks a superseded page-shaped run for
+        // retirement at all: it is retained once (by the sweep above, or
+        // `retainUnretainedValueChainPages`'s own surviving-head walk
+        // finding it already live) and never released, inflating
+        // `retirementReserveBytes`/`current_file_bytes` forever.
+        if (self.redo_fold_retire_pending) |retiring| {
+            defer {
+                self.allocator.free(retiring);
+                self.redo_fold_retire_pending = null;
+            }
+            if (writes.pages.ledger) |state| {
+                const checkpoint = self.activeCheckpoint();
+                for (retiring) |chain| {
+                    try self.retainUnretainedValueChainPages(state, checkpoint, chain.external_value_root_page, chain.external_value_len, null);
+                    try state.retire(.{ .epoch = self.publicationEpoch(), .page = chain.external_value_root_page, .length = chain.external_value_len, .kind = .value });
                 }
             }
         }
@@ -32590,6 +32837,134 @@ test "lite redo log a pin survives checkpoint and reclaim: a superseded multi-pa
     const pinned_value = (try file.getDocumentAtCheckpointAlloc(a, checkpoint_at_large, "doc")).?;
     defer a.free(pinned_value);
     try std.testing.expectEqualSlices(u8, large, pinned_value);
+}
+
+// Regression: `checkpointRedoLog`'s own fold used to re-apply an overlay
+// head that a *prior* fold had already folded into a real record,
+// whenever `reclaim`'s pin-aware floor could not drop it. `reclaim`'s
+// floor is "the oldest live pin," not "has this version already been
+// folded" -- a pin older than a key's entire chain never finds any node
+// `<= floor` to collapse onto (the walk in `SharedRedoOverlay.reclaim`
+// falls all the way to `node == null` without ever setting `kept`), so
+// the key's entry survives in `redo.shared.maps` indefinitely, even
+// once `durable_checkpoint_sequence` already covers it -- regardless of
+// whether that specific pin would ever actually need to resolve through
+// this entry (a pin predating a key's first write in the window always
+// falls through to the real tree either way; see `snapshotHeadsAlloc`'s
+// own doc comment for the full mechanism this guards against).
+//
+// For a key with a multi-page external value chain, re-folding its
+// already-applied head a second time built a *second* real document
+// record referencing the exact same `external_value_root_page` as the
+// first -- two distinct, live records sharing one chain. `check()`'s
+// reachability walk (`markReachablePage`'s own duplicate-page
+// detection) correctly flags that as `invalid_page_chain`; found via
+// the wide redo differential oracle (`ANTFLY_LITE_REDO_ORACLE_SEEDS=6
+// ANTFLY_LITE_REDO_ORACLE_STEPS=300`, ride-along on) where a long-lived
+// reader pin plus the ride-along idle turn's own opportunistic
+// `checkpointRedoLog` calls supplied the second fold nondeterministically;
+// this test reproduces the identical shape deterministically with two
+// explicit `checkpointRedoLog` calls, no background timer needed.
+test "lite redo log checkpoint does not re-fold an already-folded head a pin keeps alive" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-no-refold-pinned-head.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 256 * 1024);
+    defer file.close();
+
+    // A pin at sequence 0: strictly older than anything this file will
+    // ever write, so its own `resolve` call always falls through to the
+    // real tree for "doc" regardless of whether the overlay keeps or
+    // drops that key's entry -- holding it live only ever defers
+    // `reclaim`, it never actually needs this entry.
+    const entry = file.inode_lock_ref.load(.acquire).?;
+    if (file.redo) |*redo| try redo.shared.pin(std.heap.page_allocator, std.testing.io, 0);
+    try inode_lock.pinReader(entry, std.testing.io, .{ .data = 0, .metadata = 0 });
+    defer {
+        inode_lock.unpinReader(entry, std.testing.io, .{ .data = 0, .metadata = 0 });
+        if (file.redo) |*redo| redo.shared.unpin(std.testing.io, 0);
+    }
+
+    const large = try a.alloc(u8, 20 * 1024);
+    defer a.free(large);
+    @memset(large, 'B');
+
+    try file.beginTransaction();
+    try file.putDocument("doc", large);
+    try file.commitTransaction();
+
+    // Fold #1: applies "doc"'s head for the first time, attaching its
+    // external value chain's own root page to a real document record.
+    try file.checkpointRedoLog();
+
+    // Nothing new has been written since fold #1 -- but the pin above
+    // means `reclaim` could not drop "doc"'s now-redundant overlay
+    // entry, so `redo.shared.count()` is still nonzero and this second
+    // fold still runs. Without the `snapshotHeadsAlloc` sequence guard,
+    // it would see the same stale head again and build a second real
+    // record referencing the same chain.
+    try file.checkpointRedoLog();
+
+    const report = try file.check();
+    try std.testing.expect(report.valid);
+
+    const current = (try file.getDocumentAlloc(a, "doc")).?;
+    defer a.free(current);
+    try std.testing.expectEqualSlices(u8, large, current);
+}
+
+// Investigation (#1216): a plain, non-sweep reproduction of the
+// "native_catalog" delete-scope shape (`native_catalog_backend.
+// deleteAllForScope`: load every entry under a scope, then submit one
+// batch of all-delete mutations for them) against an indexed_reclamation
+// + redo-log file, with one of the scope's entries large enough to need
+// an external value chain -- the shape "crash sweep: dense native-
+// catalog dimension replacement delete (#1216)" exercises at the
+// HBCIndex/db layer, where it fails even on the *uncrashed* run. No
+// crash injected here either: if this reproduces, the bug is in the
+// ordinary (redo, indexed) retain/retire accounting for a deleted
+// catalog record's external value chain, not in crash/recovery timing.
+test "lite native catalog delete-scope batch with an external value chain under indexed redo" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "delete-scope-indexed-redo.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{ .indexed_reclamation = true }, 256 * 1024);
+    defer file.close();
+
+    const large = try a.alloc(u8, 20 * 1024);
+    defer a.free(large);
+    @memset(large, 'C');
+
+    // Mirrors deleteAllForScope's own shape: several small records plus
+    // one large (external-value-chain) record, all under one scope
+    // prefix, written first (dims/root-node-ish small records, a large
+    // postings-ish record), then folded.
+    try file.beginTransaction();
+    try file.putCatalogRecord("\x00scope/dims", "3");
+    try file.putCatalogRecord("\x00scope/root", "root-node-bytes");
+    try file.putCatalogRecord("\x00scope/postings", large);
+    try file.commitTransaction();
+    try file.checkpointRedoLog();
+
+    // deleteAllForScope's own shape: one batch, every mutation a delete,
+    // submitted together.
+    try file.putCatalogBatch(&.{
+        .{ .key = "\x00scope/dims", .is_delete = true },
+        .{ .key = "\x00scope/root", .is_delete = true },
+        .{ .key = "\x00scope/postings", .is_delete = true },
+    });
+    try file.checkpointRedoLog();
+
+    const report = try file.check();
+    try std.testing.expect(report.valid);
+
+    try std.testing.expect((try file.getCatalogRecordAlloc(a, "\x00scope/postings")) == null);
 }
 
 // Regression: `commitTransactionWithDurability`'s own `flushTransactionWrites`
