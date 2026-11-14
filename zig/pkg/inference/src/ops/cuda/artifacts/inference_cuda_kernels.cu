@@ -23874,6 +23874,88 @@ extern "C" __global__ void termite_deberta_attention_fused_f32(
     }
 }
 
+// FP32 streaming DeBERTa attention: eight independent query warps per block.
+// Keep Q and online-softmax accumulators in registers. No reduced-precision
+// conversion or shared score tile is needed. The exact Decide CUDA profile
+// selects this route; other profiles retain their existing attention dispatch.
+extern "C" __global__ void termite_deberta_attention_stream_f32(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* q_r,
+    const float* k_r,
+    const long long* mask,
+    unsigned int batch,
+    unsigned int seq_len,
+    unsigned int num_heads,
+    unsigned int head_dim
+) {
+    constexpr unsigned int kWarpsPerBlock = 8u;
+    constexpr unsigned int kHeadDim = 64u;
+    if (seq_len == 0u || seq_len > 512u || head_dim != kHeadDim || blockDim.x != 256u) return;
+
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5u;
+    const unsigned int block = blockIdx.x;
+    const unsigned int query_group = block % ((seq_len + kWarpsPerBlock - 1u) / kWarpsPerBlock);
+    const unsigned int bh = block / ((seq_len + kWarpsPerBlock - 1u) / kWarpsPerBlock);
+    const unsigned int head = bh % num_heads;
+    const unsigned int b = bh / num_heads;
+    const unsigned int qi = query_group * kWarpsPerBlock + warp;
+    if (b >= batch || qi >= seq_len) return;
+
+    const unsigned int hidden = num_heads * head_dim;
+    const unsigned int head_off = head * head_dim;
+    const unsigned int q_base = (b * seq_len + qi) * hidden + head_off;
+    const float scale = rsqrtf((float)head_dim * 3.0f);
+    const float q0 = q[q_base + lane];
+    const float q1 = q[q_base + lane + 32u];
+
+    float running_max = -3.402823466e+38f;
+    float running_sum = 0.0f;
+    float value0 = 0.0f;
+    float value1 = 0.0f;
+    for (unsigned int ki = 0u; ki < seq_len; ++ki) {
+        if (mask[b * seq_len + ki] == 0ll) continue;
+        const unsigned int k_base = (b * seq_len + ki) * hidden + head_off;
+        const unsigned int rel_idx = qi + seq_len - 1u - ki;
+        const unsigned int rel_base = rel_idx * hidden + head_off;
+        const float k0 = k[k_base + lane];
+        const float k1 = k[k_base + lane + 32u];
+        const float kr0 = k_r[rel_base + lane];
+        const float kr1 = k_r[rel_base + lane + 32u];
+        const float qr0 = q_r[rel_base + lane];
+        const float qr1 = q_r[rel_base + lane + 32u];
+        // Preserve the fused FP32 kernel's per-lane accumulation order.
+        float score = 0.0f;
+        score += q0 * k0;
+        score += q0 * kr0;
+        score += qr0 * k0;
+        score += q1 * k1;
+        score += q1 * kr1;
+        score += qr1 * k1;
+        score += __shfl_down_sync(0xffffffffu, score, 16);
+        score += __shfl_down_sync(0xffffffffu, score, 8);
+        score += __shfl_down_sync(0xffffffffu, score, 4);
+        score += __shfl_down_sync(0xffffffffu, score, 2);
+        score += __shfl_down_sync(0xffffffffu, score, 1);
+        score = __shfl_sync(0xffffffffu, score, 0) * scale;
+
+        const float next_max = fmaxf(running_max, score);
+        const float alpha = expf(running_max - next_max);
+        const float beta = expf(score - next_max);
+        value0 = value0 * alpha + beta * v[k_base + lane];
+        value1 = value1 * alpha + beta * v[k_base + lane + 32u];
+        running_sum = running_sum * alpha + beta;
+        running_max = next_max;
+    }
+    const float inv_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+    dst[q_base + lane] = value0 * inv_sum;
+    dst[q_base + lane + 32u] = value1 * inv_sum;
+}
+
+
 // FP16-storage DeBERTa-v3 encoder prefill attention.  Unlike the F32 fused
 // fallback above, each warp owns a query and performs an online softmax while
 // accumulating two FP32 value lanes.  This avoids the score/probability

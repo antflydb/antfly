@@ -4065,12 +4065,16 @@ pub const LoadedModel = struct {
 
     pub fn glinerPipeline(self: *LoadedModel, allocator: std.mem.Allocator) GlinerPipeline {
         const tok = self.getTokenizer();
+        const metal_policy = session_factory.getGlinerDecideMetalExecutionPolicy(self.session);
         return .{
             .allocator = allocator,
             .session = self.session,
             .tok = tok,
             .execution_lock = self.targetInferenceExecutionMutex(),
             .config = .{
+                .decision_batch_size = if (metal_policy) |policy| policy.batch_items else 64,
+                .decision_batch_tokens = if (metal_policy) |policy| policy.padded_batch_tokens else 16384,
+                .decision_reuse_batch_padding = if (metal_policy) |policy| policy.reuse_batch_padding else false,
                 .max_width = self.manifest.gliner_max_width,
                 .max_length = if (self.manifest.gliner_architecture == .span and
                     self.manifest.gliner_span_encoder_family == .modern_bert and
@@ -11724,6 +11728,10 @@ const ComponentArtifactEstimate = union(enum) {
         self: *const ComponentArtifactEstimate,
         backend: backends.BackendType,
     ) runtime.tier.memory.AdmissionAmounts {
+        if (backend == .cuda) return switch (self.*) {
+            .native => |man| cudaDecideQ8MirrorAdmission(man.*),
+            .disabled, .onnx => .{},
+        };
         if (backend != .metal) return .{};
         return switch (self.*) {
             .native => |man| session_factory.metalDebertaFastPathAdmissionAmounts(man.*),
@@ -11899,6 +11907,8 @@ fn estimateBaseModelLoadAdmission(
     }
     const extra_backend_resident = if (backend_runtime.backend == .metal)
         session_factory.metalDebertaFastPathAdmissionAmounts(man)
+    else if (backend_runtime.backend == .cuda)
+        cudaDecideQ8MirrorAdmission(man)
     else
         runtime.tier.memory.AdmissionAmounts{};
     var plan = try nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident);
@@ -12185,6 +12195,35 @@ fn onnxModelLoadAdmission(
     };
 }
 
+fn cudaDecideQ8MirrorAdmission(man: manifest_mod.ModelManifest) runtime.tier.memory.AdmissionAmounts {
+    // Cheap pre-load reservation only. Session construction still authenticates
+    // both Q8 files and sidecars before enabling any execution mirrors.
+    if (man.gliner_classification_head != .label_marker_mlp or man.gliner_span_encoder_family != .deberta or
+        man.nativeWeightArtifactKind() != .gguf) return .{};
+    return .{ .backend_weight_bytes = @import("../models/gliner_decide_qualification.zig").cuda_q8_projection_mirror_bytes };
+}
+
+test "Decide Q8 mirror admission reserves construction and resident bytes" {
+    var man = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .gliner_classification_head = .label_marker_mlp,
+        .gliner_span_encoder_family = .deberta,
+        .gguf_path = "gliner2-encoder.Q8_0.gguf",
+    };
+    const extra = cudaDecideQ8MirrorAdmission(man);
+    try std.testing.expectEqual(@as(usize, 704643072), extra.backend_weight_bytes);
+    const base = try nativeModelLoadAdmission(527210176, .cuda, .{});
+    const expanded = try nativeModelLoadAdmission(527210176, .cuda, extra);
+    try std.testing.expectEqual(base.peak.backend_weight_bytes + extra.backend_weight_bytes, expanded.peak.backend_weight_bytes);
+    try std.testing.expectEqual(base.resident.backend_weight_bytes + extra.backend_weight_bytes, expanded.resident.backend_weight_bytes);
+    man.gliner_span_encoder_family = .modern_bert;
+    try std.testing.expectEqual(@as(usize, 0), cudaDecideQ8MirrorAdmission(man).backend_weight_bytes);
+    man.gliner_span_encoder_family = .deberta;
+    man.gguf_path = null;
+    man.safetensors_path = "model.safetensors";
+    try std.testing.expectEqual(@as(usize, 0), cudaDecideQ8MirrorAdmission(man).backend_weight_bytes);
+}
+
 fn nativeModelLoadAdmission(
     weights: usize,
     backend: backends.BackendType,
@@ -12212,11 +12251,11 @@ fn nativeModelLoadAdmission(
             .peak = .{
                 // CUDA construction currently builds a complete native session first,
                 // then uploads every resident weight before releasing the native copy.
-                .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights),
+                .backend_weight_bytes = std.math.add(usize, try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights), extra_backend_resident.backend_weight_bytes) catch return error.ResourceLimitExceeded,
                 .host_weight_bytes = weights,
             },
             .resident = .{
-                .backend_weight_bytes = try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights),
+                .backend_weight_bytes = std.math.add(usize, try session_factory.estimateBackendWeightResidencyBytes(.cuda, weights), extra_backend_resident.backend_weight_bytes) catch return error.ResourceLimitExceeded,
             },
         },
         .native, .wasm => .{
