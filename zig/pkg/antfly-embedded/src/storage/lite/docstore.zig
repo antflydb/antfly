@@ -9906,7 +9906,20 @@ test "lite online vacuum publishes while group-commit mutations keep landing" {
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
-test "lite online vacuum catches foreground commits while its copy is blocked" {
+/// Shared body for the "online vacuum catches foreground commits while
+/// its copy is blocked" pair below: identical race, two budget shapes.
+/// `page_reuse = false` keeps the live file's own admission math to just
+/// the redo log's reservation plus this test's own tiny content;
+/// `page_reuse = true` (the product default) additionally owes indexed
+/// reclamation's own fixed-size retirement reserve
+/// (`NativeFile.persistAllocator`'s own `retirementReservePages`) and
+/// ledger-rebuild cost on every commit and every synchronous
+/// 25%-remaining redo-log checkpoint -- both sized independently of how
+/// little data this test ever writes, and both large enough on their
+/// own to blow through a budget sized only for the `page_reuse = false`
+/// case. `storage_limit`/`assessment_bytes` are the caller's own
+/// per-variant tuning for exactly that difference.
+fn onlineVacuumCatchesForegroundCommitsWhileItsCopyIsBlockedImpl(alloc: Allocator, file_name: []const u8, page_reuse: bool, storage_limit: u64, assessment_bytes: u64) !void {
     const Gate = struct {
         var live_handle: std.Io.File.Handle = undefined;
         var armed: std.atomic.Value(bool) = .init(false);
@@ -9930,10 +9943,9 @@ test "lite online vacuum catches foreground commits while its copy is blocked" {
             };
         }
     };
-    const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try testPath(alloc, tmp, "foreground-vacuum.aflite");
+    const path = try testPath(alloc, tmp, file_name);
     defer alloc.free(path);
     var vtable = std.Options.debug_io.vtable.*;
     vtable.fileSync = Gate.sync;
@@ -9948,20 +9960,11 @@ test "lite online vacuum catches foreground commits while its copy is blocked" {
     // 128 pages/16 pages were tuned pre-redo, when neither needed any
     // extra room, and started failing admission
     // (`LiteStorageBudgetExceeded`) before the test ever reached the
-    // foreground-commit race it exists to exercise. `page_reuse = false`
-    // (this test never needed indexed reclamation) keeps the live file's
-    // own admission math to just that log reservation plus this test's
-    // own tiny content, instead of also owing indexed reclamation's own
-    // fixed-size retirement reserve and ledger-rebuild cost on every
-    // commit and every synchronous 25%-remaining redo-log checkpoint --
-    // both sized independently of how little data this test ever writes,
-    // and both large enough on their own to blow through a budget this
-    // tight.
-    const storage_limit = 512 * 4096;
+    // foreground-commit race it exists to exercise.
     var store = try Store.createWithOptions(alloc, path, .{ .io = io, .reclamation = .{
         .enabled = false,
-        .page_reuse = false,
-        .assessment_bytes = 160 * 4096,
+        .page_reuse = page_reuse,
+        .assessment_bytes = assessment_bytes,
         .max_storage_bytes = storage_limit,
     } });
     defer store.close();
@@ -10023,6 +10026,21 @@ test "lite online vacuum catches foreground commits while its copy is blocked" {
     try std.testing.expectEqualStrings("during copy", try fresh.get("doc"));
     try std.testing.expectEqualStrings("also during copy", try fresh.get("new"));
     try std.testing.expect((try store.checkWithCancel(null)).valid);
+}
+
+test "lite online vacuum catches foreground commits while its copy is blocked" {
+    try onlineVacuumCatchesForegroundCommitsWhileItsCopyIsBlockedImpl(std.testing.allocator, "foreground-vacuum.aflite", false, 512 * 4096, 160 * 4096);
+}
+
+// §9.7a/§9 (vacuum redo-log retention, 0de1ef453d): `page_reuse` defaults
+// to `true` (indexed reclamation is the product default); the variant
+// above turns it off to isolate the race from indexed reclamation's own
+// fixed-size admission costs. Keep reclamation on here too, with a
+// budget sized for its own fixed retirement reserve and ledger-rebuild
+// cost on top of the same redo-log reservations, so the race stays
+// covered under the shape stores actually run in by default.
+test "lite online vacuum catches foreground commits while its copy is blocked with indexed reclamation" {
+    try onlineVacuumCatchesForegroundCommitsWhileItsCopyIsBlockedImpl(std.testing.allocator, "foreground-vacuum-indexed.aflite", true, 8192 * 4096, 1024 * 4096);
 }
 
 test "lite index sync skips allocator admission and redundant durability barriers" {
