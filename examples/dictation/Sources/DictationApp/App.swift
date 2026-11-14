@@ -93,6 +93,9 @@ struct MenuContent: View {
         Button("Copy") { store.copy(store.result.isEmpty ? store.preview : store.result) }.disabled(
           store.result.isEmpty && store.preview.isEmpty)
       }
+      if store.canUseOriginalWhileCleaning {
+        Button("Use original now") { store.useOriginalWhileCleaning() }
+      }
       if store.canRecoverRaw {
         HStack {
           Button("Insert original") { store.insertOriginal() }
@@ -354,6 +357,19 @@ struct SettingsView: View {
           }
         }
         if navigation.page == "Speech & text" {
+          Section("Text processing") {
+            Toggle(
+              "Prepare Apple text processor in advance",
+              isOn: Binding(
+                get: { store.config.usesCleanupPrewarming },
+                set: { store.config.prewarmCleanup = $0 }))
+            Text(
+              "Uses a short local request when an Apple text processor is selected. No recording or transcript is sent. External processors are never prewarmed."
+            ).font(.caption)
+            if !store.cleanupWarmupStatus.isEmpty {
+              Text(store.cleanupWarmupStatus).font(.caption).foregroundStyle(.secondary)
+            }
+          }
           Section("Voice formatting") {
             Toggle(
               "Spoken line and paragraph breaks",
@@ -485,13 +501,57 @@ struct SettingsView: View {
                 TextField("Rewrite instructions", text: $preset.instructions, axis: .vertical)
               }
               TextField("Where you'll use this", text: $preset.context)
-              TextField("Speech language", text: $preset.language, prompt: Text("Automatic"))
-                .help(
-                  "Leave empty to use the speech engine's default language, or enter a language such as en-US."
-                )
+              Picker(
+                "Speech language",
+                selection: Binding(
+                  get: { preset.speechLanguageChoice }, set: { preset.speechLanguageChoice = $0 })
+              ) {
+                Text("Use Mac language").tag(SpeechLanguageChoice.system)
+                Text("Choose a language").tag(SpeechLanguageChoice.custom)
+                if store.supportsLanguageDetection(preset) || preset.speechLanguageChoice == .detect
+                {
+                  Text("Detect spoken language").tag(SpeechLanguageChoice.detect)
+                }
+                if !store.config.usesManagedRuntime || preset.speechLanguageChoice == .server {
+                  Text("Use server default").tag(SpeechLanguageChoice.server)
+                }
+              }
+              if preset.speechLanguageChoice == .custom {
+                TextField("Language code", text: $preset.language, prompt: Text("en-US"))
+                Menu("Choose language") {
+                  ForEach(store.nativeSpeechLanguages ?? SpeechLanguages.common, id: \.self) {
+                    code in
+                    Button(store.speechLanguageLabel(code, for: preset)) { preset.language = code }
+                  }
+                }
+              } else if preset.speechLanguageChoice == .system {
+                Text(
+                  (try? store.resolvedPreset(preset)).map {
+                    "Using " + SpeechLanguages.name($0.language)
+                  }
+                    ?? "Choose a supported speech language."
+                ).font(.caption).foregroundStyle(.secondary)
+              } else if preset.speechLanguageChoice == .detect
+                && !store.supportsLanguageDetection(preset)
+              {
+                Label(
+                  "This engine does not advertise language detection. Choose another language option.",
+                  systemImage: "exclamationmark.triangle"
+                ).foregroundStyle(.orange)
+              }
               DictionaryEditor(
                 title: "Preferred spellings for this preset", words: $preset.dictionary)
               DisclosureGroup("Advanced") {
+                if store.config.usesManagedRuntime && preset.model == "transcribers/apple-speech" {
+                  Toggle(
+                    "Favor faster Apple speech results",
+                    isOn: Binding(
+                      get: { preset.fasterAppleSpeech ?? false },
+                      set: { preset.fasterAppleSpeech = $0 }))
+                  Text(
+                    "Off by default to preserve accuracy. Uses a smaller recognition context and may make more mistakes."
+                  ).font(.caption).foregroundStyle(.secondary)
+                }
                 Text(store.processingDescription(preset)).font(.caption).foregroundStyle(.secondary)
                 TextField(
                   "App bundle IDs (automatic selection)",
@@ -563,6 +623,13 @@ struct SettingsView: View {
         Text(store.preview.isEmpty ? store.phase.label : store.preview)
           .foregroundStyle(.secondary).lineLimit(4)
       }
+      if store.canUseOriginalWhileCleaning {
+        HStack {
+          Text("Original transcript is ready. Text processing is still running.").font(.caption)
+          Spacer()
+          Button("Use original now") { store.useOriginalWhileCleaning() }
+        }
+      }
       if !store.draft.isEmpty {
         Text("Cleanup preview — not inserted").font(.headline)
         Text(store.draft).lineLimit(5).textSelection(.enabled)
@@ -602,8 +669,17 @@ struct SettingsView: View {
                   "Recognition requests: %.2f s · Cleanup requests: %.2f s · Session: %.2f s · Release to result: %.2f s",
                 timing.recognition, timing.cleanup, timing.total, timing.afterRelease)
             ).font(.caption)
+            if let first = timing.firstEvent {
+              Text(String(format: "First recognition/response event: %.2f s", first)).font(.caption)
+            }
+            if let first = timing.firstDraft {
+              Text(String(format: "First cleanup text: %.2f s", first)).font(.caption)
+            }
             Text(
-              "Request durations include transport and queueing; overlapping stages do not add up to session duration."
+              "Server queueing, prompt processing, and model loading are not separately reported by this runtime."
+            ).font(.caption).foregroundStyle(.secondary)
+            Text(
+              "Durations include transport and queueing when applicable; overlapping stages do not add up to session duration."
             ).font(.caption).foregroundStyle(.secondary)
           }
         }

@@ -44,6 +44,8 @@ public actor LiveDictation {
   private var started = ProcessInfo.processInfo.systemUptime
   private var recognitionSeconds: TimeInterval = 0
   private var cleanupSeconds: TimeInterval = 0
+  private var firstEvent: TimeInterval?
+  private var firstDraft: TimeInterval?
 
   public init(
     incremental: Bool, needsCleanup: Bool, formatting: VoiceFormatting.Options? = nil,
@@ -63,7 +65,8 @@ public actor LiveDictation {
   }
   public static func open(
     client: AntflyClient, preset: Preset, dictionary: [String],
-    plan: ProcessingPlan, formatting: VoiceFormatting.Options? = nil, observe: @escaping Observe
+    plan: ProcessingPlan, formatting: VoiceFormatting.Options? = nil,
+    cleanupPreparation: Task<Void, Never>? = nil, observe: @escaping Observe
   ) async throws -> LiveDictation {
     let id = try await client.createSession(preset: preset, dictionary: dictionary)
     if Task.isCancelled {
@@ -79,7 +82,8 @@ public actor LiveDictation {
         try await client.appendSessionEvents(id, audio: $0, sampleRate: 16000, commit: $1)
       },
       clean: {
-        try await client.cleanupText(
+        await cleanupPreparation?.value
+        return try await client.cleanupText(
           $0, preset: preset, dictionary: dictionary, formatting: cleanupFormatting,
           context: context)
       },
@@ -115,6 +119,7 @@ public actor LiveDictation {
   }
   private func accept(_ events: [RecognitionEvent]) throws {
     for event in events {
+      if firstEvent == nil { firstEvent = ProcessInfo.processInfo.systemUptime - started }
       if event.sequence <= sequence { continue }  // Replay is idempotent.
       guard event.start_ms >= 0, event.end_ms >= event.start_ms,
         ["partial", "final"].contains(event.type), event.text.utf8.count <= 65536
@@ -163,6 +168,11 @@ public actor LiveDictation {
       do {
         let began = ProcessInfo.processInfo.systemUptime
         let output = try await clean(input)
+        if firstDraft == nil {
+          firstDraft =
+            began - started
+            + (output.timing?.firstDraft ?? (ProcessInfo.processInfo.systemUptime - began))
+        }
         cleanupSeconds += ProcessInfo.processInfo.systemUptime - began
         try Task.checkCancellation()
         guard !stopped else { return }
@@ -212,7 +222,15 @@ public actor LiveDictation {
           final = draft
         } else {
           let began = ProcessInfo.processInfo.systemUptime
-          do { final = try await clean(original).text } catch is CancellationError {
+          do {
+            let response = try await clean(original)
+            final = response.text
+            if firstDraft == nil {
+              firstDraft =
+                began - started
+                + (response.timing?.firstDraft ?? (ProcessInfo.processInfo.systemUptime - began))
+            }
+          } catch is CancellationError {
             throw CancellationError()
           } catch {
             throw DictationError.cleanupFailed(raw: original, message: error.localizedDescription)
@@ -237,7 +255,8 @@ public actor LiveDictation {
         raw: original, text: final,
         timing: DictationTiming(
           recognition: recognitionSeconds, cleanup: cleanupSeconds,
-          total: ProcessInfo.processInfo.systemUptime - started))
+          total: ProcessInfo.processInfo.systemUptime - started, firstEvent: firstEvent,
+          firstDraft: firstDraft))
       if let formatting {
         let plan = VoiceFormatting.Plan(original, options: formatting)
         if !needsCleanup { result.text = plan.render().text }

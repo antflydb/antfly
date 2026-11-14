@@ -27,6 +27,8 @@ public struct Preset: Codable, Identifiable, Equatable, Sendable {
   public var model: String
   public var cleanupModel: String
   public var language: String
+  public var languageChoice: SpeechLanguageChoice?
+  public var fasterAppleSpeech: Bool?
   public var style: String
   public var context: String
   public var instructions: String
@@ -104,6 +106,8 @@ public struct Configuration: Codable, Equatable, Sendable {
   public var retainHistory = false
   public var retainAudio = false
   public var concurrentRequests: Int?
+  public var prewarmCleanup: Bool?
+  public var usesCleanupPrewarming: Bool { prewarmCleanup ?? true }
   public var microphoneID = ""
   public var selectedPreset = "slack"
   public var dictionary = ["Antfly", "Colony"]
@@ -199,7 +203,8 @@ public struct Configuration: Codable, Equatable, Sendable {
   }
   /// Only automatic local defaults follow readiness; explicit/custom selections survive discovery.
   @discardableResult public mutating func selectAvailableManagedTranscriber(
-    from catalog: ModelCatalog, supportsApple: Bool
+    from catalog: ModelCatalog, supportsApple: Bool,
+    supportedAppleLanguages: [String]? = nil, nativeAppleStreaming: Bool = false
   ) -> Bool {
     guard usesManagedRuntime else { return false }
     let apple = catalog.transcriber("transcribers/apple-speech")
@@ -208,20 +213,29 @@ public struct Configuration: Codable, Equatable, Sendable {
       guard presets[index].automaticallySelectLocalTranscriber != false,
         ["transcribers/whisper", "transcribers/apple-speech"].contains(presets[index].model)
       else { continue }
+      let language = try? presets[index].resolvingLanguage(
+        supported: supportedAppleLanguages,
+        detectsLanguage: false
+      ).language
       let ready =
-        apple?.speechReadiness(language: presets[index].language, defaultLanguage: "en-US").isReady
-        == true
+        language.map { !($0.isEmpty) && apple?.speechReadiness(language: $0).isReady == true }
+        ?? false
       var appleCandidate = presets[index]
       appleCandidate.model = "transcribers/apple-speech"
       appleCandidate.transcriberRoute = .gateway
       let selected =
         supportsApple && ready && appleCandidate.hasCompatibleSharedProcessor(in: catalog)
-          && appleCandidate.supportsProcessing(with: apple)
+          && appleCandidate.supportsProcessing(
+            with: apple, nativeAppleStreaming: nativeAppleStreaming)
         ? "transcribers/apple-speech" : "transcribers/whisper"
       var selectedCandidate = presets[index]
       selectedCandidate.model = selected
       selectedCandidate.transcriberRoute = .gateway
-      guard selectedCandidate.supportsProcessing(with: catalog.transcriber(selected)) else {
+      guard
+        selectedCandidate.supportsProcessing(
+          with: catalog.transcriber(selected),
+          nativeAppleStreaming: selected == "transcribers/apple-speech" && nativeAppleStreaming)
+      else {
         continue
       }
       if presets[index].model != selected || presets[index].transcriberRoute != .gateway {
@@ -308,6 +322,7 @@ public struct DiscoveredModel: Decodable, Identifiable, Sendable {
     public var text_cleanup: Bool?
     public var live_preview: Bool
     public var recognition_hints: Bool
+    public var language_detection: Bool?
     public var readiness_error: String?
     public var native_status: NativeSpeechStatus?
     public var executor: String?

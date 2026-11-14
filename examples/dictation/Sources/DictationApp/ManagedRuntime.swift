@@ -107,7 +107,7 @@ import Security
           "transcribers": [
             "whisper": ["provider": "antfly", "model": "openai/whisper-tiny"],
             "apple-speech": [
-              "provider": "apple", "language_code": "en-US",
+              "provider": "apple", "language_code": try SpeechLanguages.system(),
               "download_assets": FileManager.default.fileExists(
                 atPath: directory.appendingPathComponent("apple-assets-enabled").path),
             ],

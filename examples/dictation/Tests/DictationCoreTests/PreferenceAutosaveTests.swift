@@ -161,4 +161,21 @@ private final class PreferenceWriteCount: @unchecked Sendable {
     #expect(store.config.presets[1].outputMode == .clean)
     await store.prepareToQuit()
   }
+  @Test @MainActor func selectingOriginalDuringCleanupKeepsRawTextAndStopsGeneration() async throws
+  {
+    let root = try directory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = Store(directory: root, registerHotkey: false)
+    store.config.autoPaste = false
+    store.preview = "What about Antfly now?"
+    store.phase = .cleaning
+    store.state = .processing
+    #expect(store.canUseOriginalWhileCleaning)
+    store.useOriginalWhileCleaning()
+    #expect(store.result == "What about Antfly now?")
+    #expect(store.state == .idle && store.phase == .ready)
+    #expect(!store.canUseOriginalWhileCleaning)
+    await store.prepareToQuit()
+  }
+
 }

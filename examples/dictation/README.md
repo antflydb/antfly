@@ -222,7 +222,7 @@ Official downloads are Apple Silicon only and include a pinned, released Antfly 
 download Whisper Tiny, or use native Apple speech and cleanup on macOS 26+
 when the required assets and Apple Intelligence are ready. Automatic local presets
 prefer ready Apple speech and otherwise use Whisper; explicit transcriber choices
-are preserved. The bundled rc.13
+are preserved. The bundled v0.3.0
 runtime includes the Apple bridge. The app handles startup,
 authentication, model discovery, and shutdown. No separate server install is needed.
 Existing configurations keep their chosen external server. See [updates and
@@ -582,12 +582,12 @@ recognition replacements.
 
 For the bundled engine, **Install / check … speech** explicitly permits Apple
 asset downloads, restarts the engine, and sends one second of generated silence to
-install and verify the active preset’s language (English when the language is
-empty). This does not record microphone audio, paste text, or create history. Setup displays its current stage and can be canceled;
+install and verify the active preset’s language (the Mac’s preferred supported language when no explicit language is
+selected). This does not record microphone audio, paste text, or create history. Setup displays its current stage and can be canceled;
 Apple controls the download and does not expose percentage progress through this
 released runtime. Installation uses a separate cancellable HTTP session and an
 explicit `X-Antfly-Inference-Timeout-Ms: 1800000` budget supported by the pinned
-rc.13 engine. The setup request allows 30 minutes, with a short client grace period
+v0.3.0 engine. The setup request allows 30 minutes, with a short client grace period
 for the server's final response. Normal dictation keeps its existing shorter
 request budgets; this does not change inference defaults globally. Select another
 preset before setup to install/check its language separately. Regional equivalence
@@ -652,3 +652,76 @@ Startup recovery only removes regular, UUID-named `.dictation-settings-*.tmp` fi
 inside the app's support directory. A private directory lock coordinates cleanup
 with active writers across app instances; recovery skips a busy writer. It does not
 scan export destinations, follow symlinks, or remove unrelated files.
+
+
+## Speech languages and cleanup latency
+
+**Use Mac language** follows the Mac’s ordered preferred languages. For native
+Apple speech it selects a supported equivalent locale; unsupported preferences
+produce a language-selection message instead of silently falling back to English.
+An explicit language is preserved across system changes. **Detect spoken language**
+is offered for the bundled multilingual Whisper model or an external transcriber
+that advertises `language_detection`. Apple speech requires a selected locale.
+**Use server default** remains available for external servers. Whisper requests use
+its primary language code (for example `fr`); Apple requests retain the locale.
+The language actually selected is frozen in each recording’s configuration.
+
+On macOS 26+, bundled Apple speech uses a native `SpeechAnalyzer` input stream in
+the app. Audio stays on this Mac; external servers always retain their server path.
+The app supplies preferred spellings as native recognition hints and never downloads
+assets during recording. The existing recorded clip remains available if live
+recognition fails. Bounded audio/result queues fail visibly rather than dropping
+samples, and cancellation drains the analyzer’s owned tasks. Final phrases can feed
+Automatic/Clean up processing while recording; Rewrite and Whole utterance wait for
+the complete transcript. Short utterances may not produce a final phrase until
+release. Spoken Enter commands continue to defer cleanup until their final intent
+is known. The Advanced preset option **Favor faster Apple speech results** is off
+by default: Apple documents a smaller context window and lower accuracy for that
+mode. Live recognition itself does not require enabling this tradeoff.
+
+**Prepare Apple text processor in advance**, in Settings → Speech & text, is on by
+default when a local Apple text processor is explicitly configured. It sends one
+small synthetic generation request per selected processor, refreshing after two
+minutes of idle time when dictation starts or engine discovery is requested;
+no audio, dictionary, or user transcript is sent, and external services are never
+prewarmed. It is optional and has a three-second server budget. Microphone capture
+continues independently; server recognition/cleanup drains any in-flight preparation
+first so warmup cannot compete for a single inference slot. Failed warmup falls back
+to normal on-demand processing.
+
+Large cleanup dictionaries prioritize plausible spelling hints for each batch;
+small dictionaries are retained intact, and no-match batches conservatively retain
+the complete dictionary. Saved dictionaries, user instructions, completion checks,
+and output limits are preserved. Cleanup never requests translation.
+
+Raw text appears before cleanup finishes. **Use original now** cancels remaining
+processing and selects the raw transcript; automatic paste still targets only the
+original captured text field, without executing a spoken Enter command. Cleanup
+previews remain non-insertable until complete and protected formatting markers are
+never shown as draft prose.
+
+Processing details report release-to-result time, first recognition/response event,
+and first cleanup text when available. Queueing, model loading, and prompt processing
+are not separately reported by the released runtime and are not guessed.
+
+Optional local checks (existing assets, no microphone input or downloads):
+
+```sh
+ANTFLY_RUN_NATIVE_SPEECH=1 ./test.sh
+```
+
+The synthetic end-to-end latency probe additionally uses
+`ANTFLY_RUN_DICTATION_PIPELINE=1`. Point `ANTFLY_DICTATION_PROBE_SERVER` to an isolated
+local test server, or provide the existing local engine credential through
+`ANTFLY_DICTATION_RUNTIME_PASSWORD`. Supply credentials only through the environment;
+never put them in a command argument, settings file, or captured log. The probe
+creates no history and compares paced native recognition plus released cleanup with
+a recorded clip through the same server. The generation path is qualified against
+the pinned v0.3.0 release; the same synthetic request crashed rc.13 during local
+qualification and did not reproduce across repeated v0.3.0 runs.
+
+Instruction-prefix prewarming inside Antfly’s Apple bridge is a separate runtime
+change, opt-in because short local samples showed no consistent gain. Its bounded,
+expiring, instruction-only session cache never reuses a session
+containing a previous dictation. The app continues to bundle the pinned released
+runtime; bridge improvements take effect after an Antfly release and pin update.
