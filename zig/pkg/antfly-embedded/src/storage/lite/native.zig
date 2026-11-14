@@ -7618,13 +7618,32 @@ pub const NativeFile = struct {
             for (staged_pages, pending) |p, *out| out.* = p.page_id;
             self.redo_fold_retain_pending = pending;
         }
+        // §9 (redo, re-fold guard): the sequence boundary this fold is
+        // building on top of -- `redo.checkpoint_sequence` is not
+        // advanced to `new_checkpoint_sequence` until this function's own
+        // epilogue, well after this loop, so every version at or below
+        // this captured value was already included in a *prior*
+        // `checkpointRedoLog` fold. `reclaim`'s own pin-aware floor can
+        // leave such an already-folded head sitting in `redo.shared.maps`
+        // indefinitely (a live pin older than the key's entire chain
+        // never finds anything `<= floor` to collapse, so the key is
+        // never dropped, even though it is already durably on disk) --
+        // without this guard, `snapshotHeadsAlloc` would hand this same
+        // stale head to a *later* fold again, which would build a
+        // *second* real record for the same key, re-referencing an
+        // external value chain's `external_value_root_page` that the
+        // first fold already attached to the first record. See
+        // `snapshotHeadsAlloc`'s own doc comment for the full mechanism
+        // and the "redo differential oracle" / "crash sweep ... dense
+        // native-catalog" failures this caused.
+        const fold_floor = redo.checkpoint_sequence;
         for (0..3) |root_idx| {
             // A fully-owned snapshot, folded outside `shared`'s own lock
             // (`snapshotHeadsAlloc`'s own doc comment) -- `putDocumentBatch`/
             // `putCatalogBatchForRoot` below run a real `IndexEditor` pass,
             // not something to do while holding a lock every reader on
             // this inode also needs.
-            const heads = try redo.shared.snapshotHeadsAlloc(self.allocator, io, @intCast(root_idx));
+            const heads = try redo.shared.snapshotHeadsAlloc(self.allocator, io, @intCast(root_idx), fold_floor);
             defer {
                 for (heads) |h| {
                     self.allocator.free(h.key);
@@ -32501,6 +32520,83 @@ test "lite redo log a pin survives checkpoint and reclaim: a superseded multi-pa
     const pinned_value = (try file.getDocumentAtCheckpointAlloc(a, checkpoint_at_large, "doc")).?;
     defer a.free(pinned_value);
     try std.testing.expectEqualSlices(u8, large, pinned_value);
+}
+
+// Regression: `checkpointRedoLog`'s own fold used to re-apply an overlay
+// head that a *prior* fold had already folded into a real record,
+// whenever `reclaim`'s pin-aware floor could not drop it. `reclaim`'s
+// floor is "the oldest live pin," not "has this version already been
+// folded" -- a pin older than a key's entire chain never finds any node
+// `<= floor` to collapse onto (the walk in `SharedRedoOverlay.reclaim`
+// falls all the way to `node == null` without ever setting `kept`), so
+// the key's entry survives in `redo.shared.maps` indefinitely, even
+// once `durable_checkpoint_sequence` already covers it -- regardless of
+// whether that specific pin would ever actually need to resolve through
+// this entry (a pin predating a key's first write in the window always
+// falls through to the real tree either way; see `snapshotHeadsAlloc`'s
+// own doc comment for the full mechanism this guards against).
+//
+// For a key with a multi-page external value chain, re-folding its
+// already-applied head a second time built a *second* real document
+// record referencing the exact same `external_value_root_page` as the
+// first -- two distinct, live records sharing one chain. `check()`'s
+// reachability walk (`markReachablePage`'s own duplicate-page
+// detection) correctly flags that as `invalid_page_chain`; found via
+// the wide redo differential oracle (`ANTFLY_LITE_REDO_ORACLE_SEEDS=6
+// ANTFLY_LITE_REDO_ORACLE_STEPS=300`, ride-along on) where a long-lived
+// reader pin plus the ride-along idle turn's own opportunistic
+// `checkpointRedoLog` calls supplied the second fold nondeterministically;
+// this test reproduces the identical shape deterministically with two
+// explicit `checkpointRedoLog` calls, no background timer needed.
+test "lite redo log checkpoint does not re-fold an already-folded head a pin keeps alive" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "redo-no-refold-pinned-head.aflite");
+    defer a.free(path);
+
+    var file = try NativeFile.createWithRedoLog(a, std.testing.io, path, .{}, 256 * 1024);
+    defer file.close();
+
+    // A pin at sequence 0: strictly older than anything this file will
+    // ever write, so its own `resolve` call always falls through to the
+    // real tree for "doc" regardless of whether the overlay keeps or
+    // drops that key's entry -- holding it live only ever defers
+    // `reclaim`, it never actually needs this entry.
+    const entry = file.inode_lock_ref.load(.acquire).?;
+    if (file.redo) |*redo| try redo.shared.pin(std.heap.page_allocator, std.testing.io, 0);
+    try inode_lock.pinReader(entry, std.testing.io, .{ .data = 0, .metadata = 0 });
+    defer {
+        inode_lock.unpinReader(entry, std.testing.io, .{ .data = 0, .metadata = 0 });
+        if (file.redo) |*redo| redo.shared.unpin(std.testing.io, 0);
+    }
+
+    const large = try a.alloc(u8, 20 * 1024);
+    defer a.free(large);
+    @memset(large, 'B');
+
+    try file.beginTransaction();
+    try file.putDocument("doc", large);
+    try file.commitTransaction();
+
+    // Fold #1: applies "doc"'s head for the first time, attaching its
+    // external value chain's own root page to a real document record.
+    try file.checkpointRedoLog();
+
+    // Nothing new has been written since fold #1 -- but the pin above
+    // means `reclaim` could not drop "doc"'s now-redundant overlay
+    // entry, so `redo.shared.count()` is still nonzero and this second
+    // fold still runs. Without the `snapshotHeadsAlloc` sequence guard,
+    // it would see the same stale head again and build a second real
+    // record referencing the same chain.
+    try file.checkpointRedoLog();
+
+    const report = try file.check();
+    try std.testing.expect(report.valid);
+
+    const current = (try file.getDocumentAlloc(a, "doc")).?;
+    defer a.free(current);
+    try std.testing.expectEqualSlices(u8, large, current);
 }
 
 // Regression: `commitTransactionWithDurability`'s own `flushTransactionWrites`
