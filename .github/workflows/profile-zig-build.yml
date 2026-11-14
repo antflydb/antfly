@@ -7,7 +7,7 @@ on:
       step:
         type: choice
         default: memory-test
-        options: [products, compiled-pdf-native-test, compiled-template-pdf-test, opaque-pdf-session-test, opaque-pdf-consumer-compile, runtime-unit-enrichment_compute, memory-test, unit-storage-compile, local-query-contract-test, local-query-owner-test, opaque-query-consumer-compile, opaque-query-owner-test, aggregation-plan-test, query-paging-test, mutation-plan-test, antfly-storage-owner-test, runtime-unit-local_query, runtime-unit-api_kernel, runtime-unit-storage-engine, runtime-unit-inference-core, runtime-archives, antfly]
+        options: [products, compiled-pdf-native-test, compiled-template-pdf-test, opaque-pdf-session-test, opaque-pdf-consumer-compile, runtime-unit-enrichment_compute, memory-test, unit-storage-compile, public-api-parity-compile, local-query-contract-test, local-query-owner-test, opaque-query-consumer-compile, opaque-query-owner-test, aggregation-plan-test, query-paging-test, mutation-plan-test, antfly-storage-owner-test, runtime-unit-local_query, runtime-unit-api_kernel, runtime-unit-storage-engine, runtime-unit-inference-core, runtime-archives, antfly]
       optimize:
         type: choice
         default: debug
