@@ -38,7 +38,7 @@ publish the app. See [release activation and installation](UPDATES.md).
 ## Voice formatting and insertion
 
 Voice formatting runs locally and does not require a cleanup generator. In
-Settings → Voice formatting, spoken breaks and insertion spacing default on:
+Settings → Speech & text → Voice formatting, spoken breaks and insertion spacing default on:
 
 | Say | Inserted text |
 | --- | --- |
@@ -179,8 +179,8 @@ so macOS can associate permissions with its stable bundle identifier.
    generation readiness is independent of Speech. Replace it with another
    generator if needed. Without a generator, output is raw transcription.
    Verbatim always skips cleanup.
-7. Save settings. To save them in Antfly, create the storage table and publish a
-   settings snapshot.
+7. Preferences save automatically. To save a snapshot in Antfly, use Settings →
+   Advanced to create the storage table and publish it.
 8. Focus a text field in another app, hold the shortcut, speak, then release.
 
 For Apple, build the server from the repository's `zig/` directory:
@@ -260,7 +260,7 @@ backpressure can disable live processing without discarding the complete recordi
 Settings also provide clickable Fn/Control/Option/Shift/Command buttons, a live shortcut
 label, **Record shortcut**, **Modifiers only**, and **Reset to Fn**. During selection,
 dictation is paused and captured keystrokes are consumed locally. Release your
-keys to accept the selection, or press Escape to cancel. Save settings to apply;
+keys to accept the selection, or press Escape to cancel. Completed selections save automatically;
 a registration failure preserves the previous working shortcut. Settings and
 credentials still save when shortcut permission is missing; the shortcut status
 shows the remaining setup step. Reapplying an active shortcut is idempotent. Common editing
@@ -268,7 +268,7 @@ and system commands such as Command-C/Command-V cannot replace dictation shortcu
 
 Modifier-only and Fn combinations use a dedicated global keyboard event loop and
 need macOS Accessibility access. Click **Set up shortcut & paste access**, grant
-access in System Settings, then return or save settings again. If macOS also opens
+access in System Settings, then return or choose Set up shortcut & paste access again. If macOS also opens
 its emoji picker, set **Press Globe key to → Do Nothing** under Keyboard settings.
 The app never changes system keyboard preferences or grants itself permissions.
 Ordinary Fn navigation/key combinations interrupt a modifier-only dictation and
@@ -276,7 +276,7 @@ pass through instead of inserting accidental speech. Other key chords retain
 Carbon conflict detection. Only one app instance should register the shortcut.
 
 Existing saved shortcuts are preserved, including older numeric Carbon settings;
-click Reset to Fn and Save if you want the new default. Exported settings retain
+click Reset to Fn if you want the new default; the change saves automatically. Exported settings retain
 compatibility fields while the optional `shortcut` object stores native modifier
 flags and an optional physical key code. No numeric editing is required in the UI.
 
@@ -335,7 +335,7 @@ focus for its nonactivating recording overlay. Paste runs only if both the appli
 field still match. A focus change, missing permissions, or an insertion error
 leaves the text available to copy. The menu bar icon indicates recording and
 processing; the overlay shows Listening, Transcribing, Cleaning, and completion.
-The popover and Transcript tab keep raw, cleanup-preview, and final text separate.
+The popover and Dictation view keep raw, cleanup-preview, and final text separate.
 The app pastes once after successful completion, rather than revising text in another app.
 Native and TypeScript clients reject duplicate transcripts/completions and any text
 mutation after completion. The native app waits for complete stream validation before insertion.
@@ -539,17 +539,38 @@ optional managed-local-server design.
 
 ## Getting ready and everyday use
 
-The Getting ready checklist separates microphone permission, Accessibility permission,
+The Setup & permissions checklist separates microphone permission, Accessibility permission,
 shortcut registration, and speech model discovery. Recording from the window is a
 useful test without Accessibility; dictating into another app requires its text field
 to be focused before using the global shortcut. Permission status refreshes when you
 return from System Settings.
 
+The window opens to **Dictation**: a compact preset and shortcut strip, a test
+button, and the latest result. **Presets**, **History**, and **Settings** have their
+own actions; import/export JSON and remote snapshots live in Settings → Advanced.
+Completed setup collapses to a ready summary and reopens when something needs
+attention. Missing text processors get a separate, actionable banner with
+**Choose processor** and **Use Verbatim**; speech readiness alone does not imply
+that text cleanup is configured. Raw transcripts and processing timings are under
+an expandable details section in Dictation.
+
 Settings are grouped into General (updates and retention), Speech & text (engine and
 voice formatting), Shortcuts & permissions, and Advanced (server/storage details).
-Edits are held in memory for the current session. **Save settings** persists them
-and applies shortcut/retention changes; the footer shows unsaved changes. History shows **Off** in its tab when disabled. Enabling history explicitly saves
-settings; text history and local audio retention are independent.
+Ordinary preferences save after a 650 ms pause. Saving waits until recording,
+shortcut capture, and other owned operations finish; normal quit flushes valid
+pending edits. The footer shows pending, saving, saved, or failed state. Invalid
+edits and write failures remain visible with a retry action in Settings and Presets.
+No JSON serialization happens during ordinary result rendering.
+
+Retention toggles are drafts until **Apply retention changes** is confirmed.
+Canceling leaves active retention untouched. Imports, remote preference replacement,
+history deletion, model downloads, and publishing remote snapshots also require explicit confirmation. Other preferences continue
+autosaving while retention toggles are staged. Corrupt/missing-settings recovery
+requires explicit saving and never silently resumes uploads. History shows **Off**
+in its tab when disabled, a compact empty state with **Enable history**, and an
+optional search of existing server history. Earlier local entries remain accessible;
+empty list, upload, and deletion controls stay hidden in the off state when there is nothing to act on.
+Text history and local audio retention are independent.
 
 New installations start with Verbatim output. **Clean up** removes fillers and fixes
 punctuation; **Rewrite** also applies tone and instructions. Both require a text

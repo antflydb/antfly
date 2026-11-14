@@ -144,7 +144,9 @@ struct ShortcutSettings: View {
       if !store.shortcutStatus.isEmpty {
         Text(store.shortcutStatus).font(.caption).textSelection(.enabled)
       }
-      Text("Setup saves only your selected shortcut. Other edits still use Save settings.").font(
+      Text(
+        "Setup saves and activates your selected shortcut. Other preferences save automatically."
+      ).font(
         .caption
       ).foregroundStyle(.secondary)
       HStack {
@@ -196,7 +198,7 @@ struct ShortcutSettings: View {
         ).font(.caption)
       } else {
         Text(
-          "Hold Fn/Globe to dictate, or choose Control + Option for keyboards without Fn. Save settings to apply. Existing shortcuts are preserved until you change them."
+          "Hold Fn/Globe to dictate, or choose Control + Option for keyboards without Fn. Shortcut changes save automatically when selection is complete. Existing shortcuts are preserved until you change them."
         ).font(.caption).foregroundStyle(.secondary)
       }
       if let issue = validationError { Text(issue).font(.caption).foregroundStyle(.red) }

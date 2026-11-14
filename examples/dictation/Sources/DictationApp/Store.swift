@@ -12,7 +12,12 @@ struct PreparedModelSetup: Sendable {
 }
 
 @MainActor final class Store: ObservableObject {
-  @Published var config = Configuration() { didSet { updateSettingsDirtyState() } }
+  @Published var config = Configuration() {
+    didSet {
+      updateSettingsDirtyState()
+      scheduleAutomaticSave()
+    }
+  }
   let runtime: ManagedRuntime
   private let managedAppleSupport: @MainActor () -> Bool
   var canUseManagedAppleSpeech: Bool { managedAppleSupport() }
@@ -37,7 +42,7 @@ struct PreparedModelSetup: Sendable {
   private var setupCleanupResolution = CleanupResolution.requireCompatible
   private var setupProcessingResolution = ProcessingResolution.requireCompatible
   @Published var history: [HistoryEntry] = []
-  @Published var state = RecordingState.idle
+  @Published var state = RecordingState.idle { didSet { scheduleAutomaticSave() } }
   @Published var phase = DictationPhase.idle { didSet { updateOverlay() } }
   @Published var draft = "" { didSet { updateOverlay() } }
   @Published var processingNote = ""
@@ -95,10 +100,84 @@ struct PreparedModelSetup: Sendable {
   private func updateSettingsDirtyState() {
     let dirty = config != savedConfiguration || credentialEdited
     if hasUnsavedSettings != dirty { hasUnsavedSettings = dirty }
+    if !dirty { settingsSaveError = nil }
   }
   private var loadingCredential = false
   private var credentialOrigin: String?
-  private var credentialEdited = false { didSet { updateSettingsDirtyState() } }
+  private var credentialEdited = false {
+    didSet {
+      updateSettingsDirtyState()
+      scheduleAutomaticSave()
+    }
+  }
+  private var automaticSavingEnabled = false
+  private(set) var automaticSaveTask: Task<Void, Never>?
+  @Published private(set) var settingsSaveError: String?
+  var requiresRetentionConfirmation: Bool {
+    config.retainHistory != savedConfiguration.retainHistory
+      || config.retainAudio != savedConfiguration.retainAudio
+  }
+  var settingsSaveStatus: String {
+    if savingSettings { return "Saving…" }
+    if hasPendingSetupCommit { return "Selection not saved" }
+    if settingsSaveError != nil { return "Changes not saved" }
+    if requiresRetentionConfirmation { return "Apply retention changes to save" }
+    return hasUnsavedSettings ? "Changes pending" : "Saved"
+  }
+  func enableAutomaticSaving() {
+    guard !automaticSavingEnabled else { return }
+    automaticSavingEnabled = true
+    scheduleAutomaticSave()
+  }
+  private func scheduleAutomaticSave() {
+    guard automaticSavingEnabled else { return }
+    automaticSaveTask?.cancel()
+    automaticSaveTask = nil
+    guard !terminating, !isBusy, state == .idle, !capturingShortcut,
+      !hasPendingSetupCommit, settingsLoadError == nil, hasUnsavedSettings,
+      !requiresRetentionConfirmation
+    else { return }
+    automaticSaveTask = Task { [weak self] in
+      do { try await Task.sleep(for: .milliseconds(650)) } catch { return }
+      guard let self, !Task.isCancelled else { return }
+      await self.flushAutomaticSettings()
+    }
+  }
+  func flushAutomaticSettings() async {
+    automaticSaveTask?.cancel()
+    automaticSaveTask = nil
+    guard automaticSavingEnabled, !terminating, !isBusy, state == .idle,
+      !capturingShortcut, !hasPendingSetupCommit, settingsLoadError == nil,
+      hasUnsavedSettings, !requiresRetentionConfirmation
+    else { return }
+    // Do not save incomplete text-field edits or loop on failed writes.
+    do { _ = try config.validated() } catch {
+      settingsSaveError = error.localizedDescription
+      return
+    }
+    save()
+    await settingsTask?.value
+  }
+  func useVerbatimForSelectedPreset() {
+    guard !settingsLocked, state == .idle,
+      let index = config.presets.firstIndex(where: { $0.id == config.selectedPreset })
+    else { return }
+    config.presets[index].outputMode = .verbatim
+  }
+  var selectedPresetNeedsProcessor: Bool {
+    let preset = config.preset(for: nil)
+    guard preset.outputMode != .verbatim else { return false }
+    if preset.cleanupModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+    return discoveryState == .current && preset.usesNamedTranscriber
+      && !preset.hasCompatibleSharedProcessor(in: ModelCatalog(data: models))
+  }
+  var canRetryRecording: Bool {
+    state == .idle && !isBusy && retryRecording != nil && retryPreset != nil
+  }
+  var setupComplete: Bool {
+    microphoneAllowed && accessibilityAllowed && shortcutReady && engineReadiness.isReady
+      && !selectedPresetNeedsProcessor
+  }
   private func loadCredential(for origin: String) {
     loadingCredential = true
     token = credentialReader(origin)
@@ -106,7 +185,7 @@ struct PreparedModelSetup: Sendable {
     credentialOrigin = origin
     credentialEdited = false
   }
-  @Published var working = false
+  @Published var working = false { didSet { scheduleAutomaticSave() } }
   @Published var historySyncStatus = "History sync idle."
   @Published var historyWorking = false
   @Published private(set) var settingsLoadError: String?
@@ -397,6 +476,7 @@ struct PreparedModelSetup: Sendable {
     if capturing { cancelShortcutSetup() }
     capturingShortcut = capturing
     hotkey?.setSuspended(capturing)
+    if !capturing { scheduleAutomaticSave() }
   }
 
   func setUpShortcut() {
@@ -484,6 +564,7 @@ struct PreparedModelSetup: Sendable {
     guard settingsWriteOwner == owner else { return }
     settingsWriteOwner = nil
     savingSettings = false
+    if settingsSaveError == nil { scheduleAutomaticSave() }
   }
   private func startSettingsTask(
     allowPending: Bool = false,
@@ -493,13 +574,19 @@ struct PreparedModelSetup: Sendable {
       allowPending || !hasPendingSetupCommit
     else { return }
     do {
+      automaticSaveTask?.cancel()
+      automaticSaveTask = nil
+      settingsSaveError = nil
       let owner = try reserveSettingsWrite()
       settingsTask = Task { [self] in
         defer {
           releaseSettingsWrite(owner)
           settingsTask = nil
         }
-        do { try await action(owner) } catch { message = error.localizedDescription }
+        do { try await action(owner) } catch {
+          settingsSaveError = error.localizedDescription
+          message = error.localizedDescription
+        }
       }
     } catch { message = error.localizedDescription }
   }
@@ -1180,6 +1267,10 @@ struct PreparedModelSetup: Sendable {
     action: @escaping @MainActor () async throws -> PreparedModelSetup
   ) {
     guard !settingsLocked, !terminating, state == .idle, config.usesManagedRuntime else { return }
+    guard !requiresRetentionConfirmation else {
+      message = "Apply or undo retention changes in Settings before setting up a speech engine."
+      return
+    }
     let baseline = config
     let previousDiscovery = discoveryTask
     previousDiscovery?.cancel()
@@ -1425,6 +1516,8 @@ struct PreparedModelSetup: Sendable {
   /// Finish durable local work on normal app termination. Remote uploads remain
   /// in the outbox for restart; quitting does not wait for network synchronization.
   func prepareToQuit() async {
+    automaticSaveTask?.cancel()
+    automaticSaveTask = nil
     terminating = true
     working = true
     discoveryTask?.cancel()
@@ -1439,6 +1532,19 @@ struct PreparedModelSetup: Sendable {
     await settingsTask?.value
     _ = try? await settingsCommitTask?.value
     await settingsCleanupTask?.value
+    // Recording and setup are now quiesced. Flush valid ordinary edits that were
+    // deferred by either operation, using the same owned commit during shutdown.
+    if automaticSavingEnabled, hasUnsavedSettings, !requiresRetentionConfirmation,
+      !hasPendingSetupCommit, settingsLoadError == nil
+    {
+      do {
+        let candidate = try config.validated()
+        let owner = try reserveSettingsWrite()
+        defer { releaseSettingsWrite(owner) }
+        settingsSaveError = nil
+        _ = try await persistSettings(candidate, reservation: owner)
+      } catch { settingsSaveError = error.localizedDescription }
+    }
     await exportTask?.value
     await clipboardRestoration()
     historyDeletionTask?.cancel()
@@ -1507,6 +1613,10 @@ struct PreparedModelSetup: Sendable {
   }
   func publish() {
     guard !hasPendingSetupCommit else { return }
+    guard !requiresRetentionConfirmation else {
+      message = "Apply or undo retention changes in Settings before publishing preferences."
+      return
+    }
     run {
       _ = try await self.persistSettings()
       try await self.client().saveSettings(self.config)

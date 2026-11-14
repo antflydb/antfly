@@ -19,7 +19,7 @@ public enum DictationMode: String, Codable, CaseIterable, Sendable {
   public func validateProcessor(_ model: String) throws {
     if self != .verbatim && model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       throw DictationError.invalid(
-        "Choose a text processor for \(label) in Presets & dictionary, or select Verbatim.")
+        "Choose a text processor for \(label) in Presets, or select Verbatim.")
     }
   }
 }

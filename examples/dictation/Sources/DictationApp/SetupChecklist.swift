@@ -46,10 +46,21 @@ struct SetupChecklist: View {
         .font(.caption).foregroundStyle(.secondary)
       }.disabled(store.state != .idle || store.settingsLocked)
     } label: {
-      Label("Getting ready", systemImage: "checklist")
+      HStack {
+        Label(
+          store.setupComplete ? "Ready to dictate" : "Setup & permissions",
+          systemImage: store.setupComplete ? "checkmark.circle" : "checklist")
+        if store.setupComplete {
+          Text("· " + store.config.effectiveShortcut.label).foregroundStyle(.secondary)
+        }
+      }
     }
     .padding(10).background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
-    .onAppear { store.refreshPermissions() }
+    .onAppear {
+      store.refreshPermissions()
+      presentation.expanded = !store.setupComplete
+    }
+    .onChange(of: store.setupComplete) { _, complete in presentation.expanded = !complete }
     .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification))
     { _ in
       store.refreshPermissions()
