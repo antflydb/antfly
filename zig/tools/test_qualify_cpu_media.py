@@ -20,7 +20,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from qualify_cpu_media import validate_read, main
+from qualify_cpu_media import validate_read, validate_timeout, main
 
 
 class CompletionAssertions(unittest.TestCase):
@@ -65,6 +65,21 @@ class CompletionAssertions(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             validate_read(result, [])
+
+
+class DeadlineAssertions(unittest.TestCase):
+    def test_only_known_timeout_contracts_pass(self):
+        for code in ("INFERENCE_TIMEOUT", "Timeout"):
+            validate_timeout(504, {"error": code})
+        for status, code in (
+            (200, "Timeout"),
+            (503, "Timeout"),
+            (504, "DocumentBudgetExhausted"),
+            (504, "MODEL_RESOURCE_BUSY"),
+            (504, "unknown"),
+        ):
+            with self.subTest(status=status, code=code), self.assertRaises(ValueError):
+                validate_timeout(status, {"error": code})
 
 
 class ReportAssertions(unittest.TestCase):

@@ -64,6 +64,14 @@ def validate_read(response, expected):
     return text
 
 
+def validate_timeout(status, response):
+    # Native document/audio reads expose the document contract's Timeout;
+    # direct generation uses the inference envelope's INFERENCE_TIMEOUT.
+    # DocumentBudgetExhausted can also be 504 and must never pass this probe.
+    if status != 504 or response.get("error") not in ("INFERENCE_TIMEOUT", "Timeout"):
+        raise ValueError("deadline probe did not return the expected timeout")
+
+
 def request(port, route, body, timeout, *, budget_ms=None):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
@@ -285,10 +293,7 @@ def run_case(args, case, index):
                     port, "/read", body, args.timeout, budget_ms=args.cancel_after_ms
                 )
                 result["cancellation"] = dict(status=status, response=canceled)
-                if status != 504 or canceled.get("error") != "INFERENCE_TIMEOUT":
-                    raise ValueError(
-                        "deadline probe did not return the expected timeout"
-                    )
+                validate_timeout(status, canceled)
                 status, recovered = request(port, "/read", body, args.timeout)
                 if status != 200:
                     raise ValueError("worker did not recover after cancellation")
