@@ -18252,7 +18252,44 @@ pub const NativeFile = struct {
             // `error.OutcomeUnknown` below).
             var try_redo_log = true;
             if (redo.pendingRecordLen() > redo.writer.remaining()) {
-                if (redo.logical_pending.items.len != 0) {
+                // perf/lwa-reuse-loss: the original condition here was
+                // `redo.logical_pending.items.len != 0` -- *this* commit's
+                // own diverted logical mutations. But `checkpoint` (the
+                // slot about to be published, below, if we fall through)
+                // names a `commit_sequence` that recovery's own
+                // `redo_log.replay(..., start_after_sequence =
+                // checkpoint.commit_sequence, ...)` treats as "everything
+                // at or below this is already real, on disk" -- true only
+                // if every version `redo.shared` holds at or below that
+                // sequence has actually been folded into real pages.
+                // `logical_pending` says nothing about *earlier* commits'
+                // own still-unfolded heads sitting in `redo.shared.maps`
+                // (accumulated across however many commits have landed
+                // since the last real `checkpointRedoLog` fold): this
+                // commit can easily have no logical mutation of its own
+                // (a bare/page-only/no-op commit) while an earlier one's
+                // key is still only logical, never folded. Publishing the
+                // bare slot below in that case claims coverage of a
+                // record that is not actually in real pages yet --
+                // confirmed live as "redo differential oracle" data loss
+                // (a key written a few commits before a reopen, lost
+                // under redo, present under legacy) and as resurrection
+                // (an overwrite/delete superseded in the overlay but
+                // never folded, with recovery's replay skipping both the
+                // live and the superseded version alike and falling back
+                // to the real tree's older answer). Folding whenever
+                // *any* root still has unfolded logical work -- not just
+                // this commit's own -- keeps `checkpoint.commit_sequence`
+                // truthful: `checkpointRedoLog` is a no-op when there is
+                // truly nothing pending anywhere (`has_logical_work`,
+                // mirroring its own early-return check), so this adds no
+                // extra fold when `logical_pending` was already the only
+                // thing outstanding.
+                const log_full_io = self.runtimeIo();
+                const has_unfolded_logical_work = redo.logical_pending.items.len != 0 or for (0..3) |root_idx| {
+                    if (redo.shared.count(log_full_io, @intCast(root_idx)) != 0) break true;
+                } else false;
+                if (has_unfolded_logical_work) {
                     // This commit diverted logical mutations, already
                     // staged in `redo.shared` (the same
                     // `appendLogicalMutation` call that built
@@ -18290,20 +18327,20 @@ pub const NativeFile = struct {
                     redo.dropOverlayUndo(self.allocator);
                     return;
                 }
-                // Page-shaped only (or nothing of this commit's own --
-                // either way, safe to flush unconditionally): a bare
-                // commit's own real pages (document index, free map,
-                // namespace directory -- not just external value
-                // chains) are diverted here too (`PageWriteBatch.
-                // flushCount`), with no logical mutation ever staged
-                // alongside them, so `checkpointRedoLog`'s logical-heads
-                // fold has nothing to "absorb" -- it is a wholly
-                // separate checkpoint computation from this commit's own
-                // already-correct `checkpoint`, and calling it here
-                // would discard `checkpoint` (never publish it) instead.
-                // Flush the real pages directly to their own locations
-                // instead, then fall through to publish `checkpoint`
-                // exactly as this function always does.
+                // Page-shaped only, and no unfolded logical work anywhere
+                // in `redo.shared` (checked above, not just this commit's
+                // own `logical_pending`): a bare commit's own real pages
+                // (document index, free map, namespace directory -- not
+                // just external value chains) are diverted here too
+                // (`PageWriteBatch.flushCount`), with no logical mutation
+                // ever staged alongside them, so `checkpointRedoLog`'s
+                // logical-heads fold has nothing to "absorb" -- it is a
+                // wholly separate checkpoint computation from this
+                // commit's own already-correct `checkpoint`, and calling
+                // it here would discard `checkpoint` (never publish it)
+                // instead. Flush the real pages directly to their own
+                // locations instead, then fall through to publish
+                // `checkpoint` exactly as this function always does.
                 const pages = try redo.shared.snapshotAllPagesAlloc(std.heap.page_allocator, self.runtimeIo());
                 defer std.heap.page_allocator.free(pages);
                 for (pages) |p| {

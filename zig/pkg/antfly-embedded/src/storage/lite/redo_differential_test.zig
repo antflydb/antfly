@@ -742,6 +742,21 @@ fn runSweep(allocator: Allocator, seed_count: u64, steps: usize, page_reuse: boo
     }
 }
 
+// perf/lwa-reuse-loss (Bug 2 of the reclamation sweep): a durable commit
+// that falls back to a bare checkpoint-slot publish (the redo log too full
+// even for its own minimal tracking entry) used to check only *this*
+// commit's own `redo.logical_pending`, not whether `redo.shared` still held
+// *any* unfolded logical head from an earlier commit. Publishing the slot
+// in that state claims `checkpoint.commit_sequence` covers every version at
+// or below it, when an earlier, still-only-logical key is not actually in
+// real pages yet -- `recoverRedoLog`'s replay then skips that key as
+// "already in the checkpoint" on the next reopen, losing it outright.
+// Minimal direct repro (`page_reuse = true`, the product default).
+test "storage.lite. redo differential oracle: direct repro seed=5 steps=44 reuse=1dce (orphaned pre-fold head lost across a log-full bare-slot publish)" {
+    const allocator = std.testing.allocator;
+    try runSeed(allocator, 5, 44, true);
+}
+
 test "storage.lite. redo differential oracle: redo log vs legacy commit path" {
     const allocator = std.testing.allocator;
     const seed_count = envUsize("ANTFLY_LITE_REDO_ORACLE_SEEDS", default_seed_count);
