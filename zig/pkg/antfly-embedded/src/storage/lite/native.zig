@@ -4699,11 +4699,31 @@ const RedoCommitState = struct {
 
     /// Appends `logical_pending`/`pending` (prefixed with `compact` and a
     /// length-delimited boundary between the two sections) as one
-    /// redo-log record for `commit_sequence`, then clears both -- called
-    /// once per `commitTransactionWithDurability` call that actually
-    /// changed anything, whether or not it ends up durable (a ride-along
-    /// commit still appends, unsynced, exactly like a ride-along
-    /// copy-on-write commit still physically writes its pages today).
+    /// redo-log record for `commit_sequence` -- called once per
+    /// `commitTransactionWithDurability` call that actually changed
+    /// anything, whether or not it ends up durable (a ride-along commit
+    /// still appends, unsynced, exactly like a ride-along copy-on-write
+    /// commit still physically writes its pages today).
+    ///
+    /// Deliberately does NOT clear `logical_pending`/`pending` or drop
+    /// `overlay_undo` itself: a successful `self.writer.append` here only
+    /// means the record is staged in the writer's own in-memory buffer,
+    /// not that this commit has actually published. The durable caller
+    /// (`publishCheckpoint`'s redo branch) still has to `sync()` after
+    /// this returns, and that sync can fail independently -- clearing the
+    /// pending buffers or dropping the undo log here, before that sync is
+    /// known to have succeeded, would discard the only record of what to
+    /// undo if it does not (perf/lwa-maint-serialize: a sync failure left
+    /// `overlay_undo` already dropped and `shared`'s versions/pages
+    /// permanently, invisibly published with no corresponding durable log
+    /// record, which a later `checkpointRedoLog` fold would then bake
+    /// into the real tree as if the commit had succeeded). Every caller
+    /// must itself clear both buffers and call `dropOverlayUndo` once its
+    /// own durability barrier (a successful `sync()`, or -- for a
+    /// ride-along append, which has no further barrier of its own --
+    /// this call returning at all) is confirmed, and must instead call
+    /// `undoOverlaySince(allocator, io, 0)` plus clear both buffers on
+    /// failure.
     fn appendRecord(self: *RedoCommitState, allocator: Allocator, commit_sequence: u64, compact: CompactCheckpoint) !void {
         var compact_buf: [CompactCheckpoint.encoded_size]u8 = undefined;
         compact.encode(&compact_buf);
@@ -4716,11 +4736,6 @@ const RedoCommitState = struct {
         record.appendSliceAssumeCapacity(self.logical_pending.items);
         record.appendSliceAssumeCapacity(self.pending.items);
         try self.writer.append(commit_sequence, record.items);
-        self.logical_pending.clearRetainingCapacity();
-        self.pending.clearRetainingCapacity();
-        // perf/lwa-txn-overlay: this transaction's content just published
-        // (durably or as a ride-along) -- nothing left to undo.
-        self.dropOverlayUndo(allocator);
     }
 
     /// The exact byte length `appendRecord` would write right now for the
@@ -17925,17 +17940,35 @@ pub const NativeFile = struct {
                     // commits), independent of any crash or injected fault --
                     // the uncrashed discovery pass alone could hit it.
                     if (self.redo) |*redo| {
-                        try redo.appendRecord(self.allocator, next.commit_sequence, CompactCheckpoint.fromCheckpointSlot(next));
-                        // perf/lwa-reclaim-reconcile: same gap as the durable
-                        // path's own ordinary append (`publishCheckpoint`'s
-                        // own comment on its matching call) -- this
-                        // ride-along append is this commit's own durability
-                        // record for its diverted logical mutations (it
-                        // becomes fully durable for free on a later commit's
-                        // own sync, never retried or unwound on its own), so
-                        // nothing is left to ever undo. Left undropped,
-                        // `overlay_undo` kept accumulating this commit's
-                        // entries right alongside the durable path's own.
+                        redo.appendRecord(self.allocator, next.commit_sequence, CompactCheckpoint.fromCheckpointSlot(next)) catch |err| {
+                            // perf/lwa-maint-serialize: `appendRecord` no
+                            // longer clears `logical_pending`/`pending` or
+                            // drops `overlay_undo` on its own (see that
+                            // function's own doc comment) -- a failed
+                            // append here leaves this commit's own staged
+                            // overlay versions/pages as the only record of
+                            // what never published. Undo them the same way
+                            // `rollbackTransactionSavepoint`/`abortTransaction`
+                            // do, rather than leaving them to leak into a
+                            // later fold as phantom, never-logged content.
+                            redo.undoOverlaySince(self.allocator, self.runtimeIo(), 0);
+                            redo.logical_pending.clearRetainingCapacity();
+                            redo.pending.clearRetainingCapacity();
+                            return err;
+                        };
+                        // perf/lwa-reclaim-reconcile: this ride-along
+                        // append is this commit's own durability record
+                        // for its diverted logical mutations (it becomes
+                        // fully durable for free on a later commit's own
+                        // sync, never retried or unwound on its own) --
+                        // once `appendRecord` above returns successfully,
+                        // there is nothing left to ever undo, so clear the
+                        // pending buffers and drop the undo log now. Left
+                        // undropped, `overlay_undo` kept accumulating this
+                        // commit's entries right alongside the durable
+                        // path's own.
+                        redo.logical_pending.clearRetainingCapacity();
+                        redo.pending.clearRetainingCapacity();
                         redo.dropOverlayUndo(self.allocator);
                     }
                     self.header.checkpoints[self.header.active_checkpoint] = next;
@@ -18537,6 +18570,26 @@ pub const NativeFile = struct {
                     break :blk {};
                 }) catch {
                     redo.writer.rollbackTo(append_mark);
+                    // perf/lwa-maint-serialize: `rollbackTo` above only
+                    // restores the log writer's own physical cursor.
+                    // `appendRecord` (on success, just above) no longer
+                    // clears `logical_pending`/`pending` or drops
+                    // `overlay_undo` itself -- see that function's own doc
+                    // comment -- specifically so this catch block can still
+                    // undo this commit's own staged overlay versions/pages
+                    // (and discard its not-yet-logged record bytes) when
+                    // the sync that would have made them durable fails.
+                    // Without this, `self.redo.shared` kept this commit's
+                    // content permanently, invisibly "published" with no
+                    // corresponding durable log record, and the next
+                    // `checkpointRedoLog` fold (background maintenance's
+                    // own, or any other caller's) baked it into the real
+                    // tree as if the commit had succeeded -- corrupting it
+                    // in a way that outlives this ambiguous outcome and
+                    // survives a clean reopen.
+                    redo.undoOverlaySince(self.allocator, self.runtimeIo(), 0);
+                    redo.logical_pending.clearRetainingCapacity();
+                    redo.pending.clearRetainingCapacity();
                     return error.OutcomeUnknown;
                 };
                 // §9.7c (ReadView): `redo.writer.sync()` above is this
@@ -18607,6 +18660,15 @@ pub const NativeFile = struct {
                 // had genuinely superseded chains to retire ("lite
                 // reclamation capacity reserve sustains bounded
                 // overwrites"/"drains wide value graphs").
+                //
+                // perf/lwa-maint-serialize: `appendRecord` above no longer
+                // clears `logical_pending`/`pending` itself (see its own
+                // doc comment) -- now that `redo.writer.sync()` has
+                // actually succeeded, this commit is genuinely durable, so
+                // clear both here, alongside the existing `dropOverlayUndo`
+                // call.
+                redo.logical_pending.clearRetainingCapacity();
+                redo.pending.clearRetainingCapacity();
                 redo.dropOverlayUndo(self.allocator);
                 return;
             }
