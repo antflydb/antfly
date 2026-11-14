@@ -153423,6 +153423,9 @@ test "index alias storage fences reject same-name replacement and survive query 
     _ = try db.searchRequestAtCurrentIdentityGeneration(request);
     lease.release();
     _ = try db.deleteIndex("text");
+    // Retirement owns the physical name until asynchronous artifact cleanup
+    // completes; replacement must exercise the post-cleanup incarnation fence.
+    db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
     try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}", .coverage_generation = 42 });
     lease = try db.beginQueryReadLease();
     defer lease.release();
