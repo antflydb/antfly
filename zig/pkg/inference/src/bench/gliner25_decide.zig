@@ -196,12 +196,14 @@ fn runCase(io: std.Io, pipeline: *gliner.GlinerPipeline, selected: []const u8, p
     }.less);
     const median = if (reps % 2 == 0) (samples[reps / 2 - 1] + samples[reps / 2]) / 2 else samples[reps / 2];
     const p95 = samples[@min(reps - 1, (reps * 95 + 99) / 100 - 1)];
+    const identity: ?inference.models.gliner_decide_qualification.Identity = factory.getGlinerDecisionIdentity(pipeline.session) catch null;
     const output = try std.json.Stringify.valueAlloc(a, .{
         .implementation = "antfly_gliner25_decide",
         .request_id = request_id,
         .duration_ns = @as(u64, @intFromFloat(median * std.time.ns_per_ms)),
         .backend = selected,
         .precision = if (precision == .auto) "fp32" else @tagName(precision),
+        .model_variant = if (identity) |loaded| inference.models.gliner_decide_qualification.qualifiedVariant(loaded) else null,
         .case_index = case_index,
         .batch_size = requests.len,
         .physical_batch_limit = pipeline.config.decision_batch_size,

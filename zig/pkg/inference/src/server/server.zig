@@ -12604,7 +12604,7 @@ pub const Node = struct {
         if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
             options.classification_batch_items = gliner_decide_qualification.cuda_batch_items;
             options.max_sequences_per_item = 1;
-        } else if (backend == .metal and qualified_variant == .decide_deberta) {
+        } else if (backend == .metal and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
             const policy = gliner_decide_qualification.metalExecutionPolicy(qualified_identity.?) orelse return error.UnsupportedGlinerDecisionArtifact;
             options.classification_batch_items = policy.batch_items;
             options.classification_batch_tokens = policy.padded_batch_tokens;

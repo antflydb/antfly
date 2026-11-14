@@ -1,6 +1,6 @@
 # GLiNER2.5-Decide on Metal
 
-This benchmark compares the loaded Antfly typed batch API with Fastino's
+The FP32 benchmark compares the loaded Antfly typed batch API with Fastino's
 `batch_classify_text` on the same FP32 checkpoint and inputs. Tokenization,
 encoder execution, classification and decoding are timed. HTTP transport is
 outside this measurement.
@@ -115,3 +115,75 @@ Run the benchmark provenance regression with:
 ```sh
 python3 zig/pkg/inference/scripts/gliner25/test_benchmark_decide_metal_matrix.py -v
 ```
+
+## Q8_0 split bundle
+
+The published [Antfly Q8_0 bundle](https://huggingface.co/antflydb/GLiNER2.5-Decide/tree/358ae4b1263cedb79faf9e8b7984c3b4e5586874)
+contains a quantized encoder and an FP32 auxiliary head. Both exact GGUF hashes,
+the tokenizer and configuration must match before the Metal policy is installed.
+It uses FP32 encoder mirrors decoded from the Q8 weights, the same bounded
+physical batches, and independent serving admission reservations. Relative
+position tables decode on the GPU when the bucket layout changes, avoiding a
+2 MiB host download/upload round trip while retaining the bounded cache.
+
+Quantization changes the learned scores. Compare runtime correctness with an
+independent Python decode of these same GGUF bytes at the original strict
+tolerances, and report drift from the original FP32 checkpoint separately. Keep
+reference processes separate from both timed runtimes and their memory samples.
+
+```sh
+DECIDE_Q8=/path/to/installed/GLiNER2.5-Decide-Q8_0
+DECIDE_Q8_REFERENCE=.benchmark-results/models/decide-q8-reference
+
+$DECIDE_PYTHON zig/pkg/inference/scripts/gliner25/prepare_decide_metal_q8_reference.py \
+  --bundle "$DECIDE_Q8" --source "$DECIDE_MODEL" --output "$DECIDE_Q8_REFERENCE"
+
+$DECIDE_PYTHON zig/pkg/inference/scripts/gliner25/benchmark_decide_metal_matrix.py campaign \
+  --upstream .benchmark-upstream/GLiNER2 --model-dir "$DECIDE_Q8" \
+  --python-model-dir "$DECIDE_MODEL" --reference-model-dir "$DECIDE_Q8_REFERENCE" \
+  --antfly-quantization q8_0 \
+  --binary zig/zig-out/bin/antfly-inference-gliner25-decide-bench \
+  --cases "$DECIDE_CASES" --python-microbatch 8 --antfly-controlled \
+  --blocks 3 --warmup 3 --reps 20 --output .benchmark-results/decide-q8-default8
+
+$DECIDE_PYTHON zig/pkg/inference/scripts/gliner25/evaluate_decide_metal_matrix.py \
+  --campaign .benchmark-results/decide-q8-default8 --fixture "$DECIDE_CASES" \
+  --output .benchmark-results/decide-q8-default8-evaluation.json
+```
+
+The timed Python baseline remains the original Fastino FP32 checkpoint. The
+decoded-Q8 checkpoint supplies correctness outputs only. Repeat the five
+32-input cases with `--python-microbatch 0` to check full Python batching.
+
+The Q8 campaign on the same M4 Pro passed all 60 paired blocks and 2,400 timed
+performance calls, including every paired median, peak RSS and footprint check,
+pooled p95, exact token IDs and decoded labels against the decoded-Q8 reference.
+
+| Original FP32 Python baseline | Cells | Median speedup | Lower sampled peak footprint |
+| --- | ---: | ---: | ---: |
+| Default internal batch of 8 | 15 | 1.25-3.23x | 5-41% |
+| Full internal batch of 32 | 5 | 1.14-3.74x | 28-60% |
+
+Peak RSS was 71-83% lower in the default-batch matrix. The maximum error against
+the decoded-Q8 reference was 0.000032 for logits and 0.0000057 for probabilities.
+Labels also matched the original FP32 model on all frozen performance inputs;
+the maximum probability difference from FP32 was 0.0088. These synthetic inputs
+do not establish an accuracy guarantee.
+
+All 58 focused tests passed without skips or leaks, including real Q8 and FP32
+serving batches through 128 inputs, concurrent admission, cancellation, budget
+pressure and retry recovery. The CPU GGUF decoder, finite-value guard and source
+provenance regressions also passed.
+
+A separate 512-token stress probe with eight distinct inputs stayed within the
+numeric tolerances (maximum logit error 0.000143, probability error 0.000032).
+Two decisions selected different labels with reference top-score gaps of zero
+and 0.00000048. Exact label identity therefore failed for that near-tie probe;
+its raw failure and batch-shape diagnostic remain retained, and it is excluded
+from the qualified performance matrix. Original numeric tolerances and exact-label
+requirements remain in force for the performance matrix.
+
+Raw Q8 evidence, the immutable executable/source snapshot and the aggregate
+report remain in `.benchmark-results/q8-confirmation-*`,
+`.benchmark-results/q8-device-policy-snapshot` and
+`.benchmark-results/q8-final-report.json`.

@@ -43,6 +43,15 @@ def evaluate(folder, fixture, min_blocks=3, min_reps=20):
         failures.append("Python full-batch or upstream-default-8 baseline required")
     if identity["warmup"] < 3:
         failures.append("At least three warmups required")
+    q8 = identity.get("antfly_quantization") == "q8_0"
+    if q8:
+        from prepare_decide_metal_q8_reference import PINS
+        if {name: value["sha256"] for name, value in identity["model_weights"].items()} != PINS:
+            failures.append("Exact published Q8 encoder and head required")
+        if identity["python_weights"].get("model.safetensors", {}).get("sha256") != "40a5a23ff860dc3dff426cecd1048cacdd29c648c96db209dad818e9686dc997":
+            failures.append("Original FP32 Python timing baseline required")
+        if not identity.get("reference_weights") or not identity.get("reference_tools"):
+            failures.append("Separate decoded Q8 reference provenance required")
     expected_policy = dict(batch_items=8, padded_batch_tokens=1000,
         reuse_batch_padding=True,
         packed_qkv_cache_bytes=512 * 1024 * 1024,
@@ -50,6 +59,11 @@ def evaluate(folder, fixture, min_blocks=3, min_reps=20):
     results = []
     for row in rows:
         problems = []
+        if q8:
+            reference_dir = folder / f'{row["id"]}-q8-reference'
+            if not read(reference_dir / "receipt.json")["passed"]:
+                problems.append("failed independent decoded-Q8 reference")
+            reference_report = read(reference_dir / "report.json")
         antfly_samples, python_samples = [], []
         if len(row["pairs"]) != identity["blocks"]:
             problems.append("paired block inventory")
@@ -66,6 +80,12 @@ def evaluate(folder, fixture, min_blocks=3, min_reps=20):
                 dest = folder / f'{row["id"]}-{block}-{runtime}'
                 receipt, report = read(dest / "receipt.json"), read(dest / "report.json")
                 if runtime == "antfly":
+                    if q8:
+                        from benchmark_decide_metal_matrix import compare
+                        if report.get("model_variant") != "decide_deberta_q8":
+                            problems.append(f"block {block}: authenticated Q8 model variant")
+                        if not compare(report, reference_report)["passed"]:
+                            problems.append(f"block {block}: decoded Q8 reference parity")
                     if report.get("metal_model_policy") != expected_policy:
                         problems.append(f"block {block}: authenticated Metal policy")
                     if (report.get("physical_batch_limit") != expected_policy["batch_items"] or

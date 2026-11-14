@@ -33,6 +33,18 @@ def sha(path):
         return hashlib.file_digest(f, "sha256").hexdigest()
 
 
+def model_identity(model):
+    names = ("model.safetensors",) if (model / "model.safetensors").exists() else (
+        "gliner2-encoder.Q8_0.gguf", "gliner2-head.Q8_0.gguf")
+    return {name: dict(sha256=sha(model / name), bytes=(model / name).stat().st_size)
+            for name in names}
+
+
+def sidecar_identity(model):
+    return {name: sha(model / name) for name in ("config.json", "encoder_config/config.json",
+        "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json")}
+
+
 def source_diff(cwd=None):
     """Keep source identity stable when unchanged files are staged for commit."""
     return subprocess.check_output(["git", "diff", "HEAD"], cwd=cwd, text=True)
@@ -222,7 +234,10 @@ def compare(antfly, python):
     tokens_equal = antfly["prepared_input_ids"] == python["prepared_input_ids"]
     a = [r["raw_logits"] for r in antfly["decisions"]]
     p = python["raw_logits"]
-    assert len(a) == len(p) and all(len(x) == len(y) for x, y in zip(a,p))
+    if (len(a) != len(p) or any(len(x) != len(y) for x, y in zip(a, p)) or
+        any(not math.isfinite(value) for rows in (a, p, python["probabilities"])
+            for row in rows for value in row)):
+        raise ValueError("Reference and runtime logits must have matching shapes and finite values")
     error = max(abs(x-y) for xs,ys in zip(a,p) for x,y in zip(xs,ys))
     winners_equal = all(
         max(range(r["start"],r["end"]),key=lambda i: x[i]) ==
@@ -262,6 +277,8 @@ def campaign(args):
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=False)
     model = Path(args.model_dir).resolve()
+    python_model = Path(args.python_model_dir or model).resolve()
+    reference_model = Path(args.reference_model_dir).resolve() if args.reference_model_dir else None
     binary = Path(args.binary).resolve()
     cases_path = Path(args.cases).resolve()
     cases = json.loads(cases_path.read_text())["cases"]
@@ -274,8 +291,34 @@ def campaign(args):
     for override in args.env:
         name, value = override.split("=", 1)
         env[name] = value
-    weights = model / "model.safetensors"
-    identity = dict(model_dir=str(model), model_sha256=sha(weights), model_bytes=weights.stat().st_size,
+    model_weights = model_identity(model)
+    python_weights = model_identity(python_model)
+    sidecars = {str(path): sidecar_identity(path) for path in
+                (model, python_model, reference_model) if path is not None}
+    if any(value != sidecars[str(model)] for value in sidecars.values()):
+        raise ValueError("Antfly, Python and reference must use identical configuration/tokenizer sidecars")
+    if args.antfly_quantization == "q8_0":
+        from prepare_decide_metal_q8_reference import PINS
+        if {name: entry["sha256"] for name, entry in model_weights.items()} != PINS:
+            raise ValueError("Q8 campaign requires the exact published bundle")
+        if python_weights.get("model.safetensors", {}).get("sha256") != "40a5a23ff860dc3dff426cecd1048cacdd29c648c96db209dad818e9686dc997":
+            raise ValueError("Q8 timing baseline must use the original Fastino FP32 checkpoint")
+        reference_receipt = json.loads((reference_model / "q8_reference.json").read_text())
+        reference_weights = model_identity(reference_model)
+        if (reference_receipt["source_bundle"] != PINS or
+            reference_receipt["sha256"] != reference_weights["model.safetensors"]["sha256"]):
+            raise ValueError("Decoded Q8 reference identity changed")
+    else:
+        reference_weights = None
+    identity = dict(model_dir=str(model), model_sha256=next(iter(model_weights.values()))["sha256"],
+        model_bytes=sum(entry["bytes"] for entry in model_weights.values()),
+        model_weights=model_weights, python_model_dir=str(python_model), python_weights=python_weights,
+        antfly_quantization=args.antfly_quantization,
+        reference_model_dir=str(reference_model) if reference_model else None,
+        reference_weights=reference_weights,
+        model_sidecars=sidecars,
+        reference_tools={name: sha(Path(__file__).with_name(name)) for name in
+            ("prepare_decide_metal_q8_reference.py", "benchmark_decide_quant.py")} if reference_model else {},
         model_files={str(p.relative_to(model)):sha(p) for p in sorted(model.rglob("*.json"))},
         binary=str(binary), binary_sha256=sha(binary), cases_sha256=sha(cases_path),
         script_sha256=sha(__file__), upstream_commit=subprocess.check_output(
@@ -291,13 +334,25 @@ def campaign(args):
         execution_environment={k:v for k,v in env.items() if k.startswith(
             ("TERMITE_", "ANTFLY_INFERENCE_", "ANTFLY_METAL_", "PYTORCH_", "OMP_", "VECLIB_", "OPENBLAS_"))},
         timing_scope="loaded public batch API: preprocess+encoder+head+decode; no HTTP/socket",
-        arithmetic="FP32 source checkpoint; Python FP32; Metal policy recorded in each report; binary precision field selects CUDA only",
+        arithmetic=("Q8_0 encoder with FP32 head and FP32 Metal mirrors; decoded-Q8 parity reference; original FP32 Python timing baseline"
+                    if reference_model else "FP32 source checkpoint; Python FP32; Metal policy recorded in each report; binary precision field selects CUDA only"),
         memory_scope="whole fresh process including load; RSS and macOS phys_footprint are separate")
     write(output / "identity.json", identity)
     summary = []
     selected = range(len(cases)) if args.case is None else [args.case]
     for index in selected:
         case = cases[index]
+        reference = None
+        if reference_model:
+            dest = output / f'{case["id"]}-q8-reference'
+            command = [sys.executable, str(Path(__file__).resolve()), "python",
+                "--upstream", str(Path(args.upstream).resolve()), "--model-dir", str(reference_model),
+                "--cases", str(cases_path), "--case", str(index), "--warmup", "0", "--reps", "3",
+                "--python-microbatch", str(args.python_microbatch), "--output", str(dest / "report.json")]
+            receipt = run_child(command, dest, env, args.timeout, int(args.max_footprint_gb * 1e9))
+            if not receipt["passed"]:
+                raise RuntimeError(f"Decoded Q8 reference failed: {dest}")
+            reference = json.loads((dest / "report.json").read_text())
         pairs = []
         for block in range(args.blocks):
             reports, receipts = {}, {}
@@ -312,7 +367,7 @@ def campaign(args):
                         "--batch-tokens", str(args.antfly_batch_tokens)]
                 else:
                     command = [sys.executable, str(Path(__file__).resolve()), "python",
-                        "--upstream", str(Path(args.upstream).resolve()), "--model-dir", str(model),
+                        "--upstream", str(Path(args.upstream).resolve()), "--model-dir", str(python_model),
                         "--cases", str(cases_path), "--case", str(index),
                         "--warmup", str(args.warmup), "--reps", str(args.reps),
                         "--python-microbatch", str(args.python_microbatch),
@@ -324,23 +379,34 @@ def campaign(args):
                     print(f"FAILED: {dest}", flush=True)
                     return 1
                 reports[runtime] = json.loads((dest / "report.json").read_text())
-            parity = compare(reports["antfly"], reports["python"])
+            parity = compare(reports["antfly"], reference or reports["python"])
             pair = dict(block=block, parity=parity,
                 antfly_ms=reports["antfly"]["median_ms"], python_ms=reports["python"]["median_ms"],
                 antfly_p95_ms=reports["antfly"]["p95_ms"], python_p95_ms=reports["python"]["p95_ms"],
                 **{f'{r}_{k}': receipts[r][f'peak_{k}_bytes'] for r in receipts for k in ("rss","footprint")})
+            if reference:
+                pair["original_fp32_comparison"] = compare(reports["antfly"], reports["python"])
             pairs.append(pair)
             write(output / f'{case["id"]}-pairs.json', pairs)
             print(json.dumps(pair), flush=True)
         row = dict(id=case["id"], batch=len(case["texts"]), pairs=pairs,
             **{key:statistics.median(p[key] for p in pairs) for key in pairs[0]
-               if key not in ("block","parity")})
+               if key not in ("block","parity","original_fp32_comparison")})
         row.update(speedup_python_over_antfly=row["python_ms"]/row["antfly_ms"],
             antfly_items_per_second=1000*row["batch"]/row["antfly_ms"],
             python_items_per_second=1000*row["batch"]/row["python_ms"],
             parity_passed=all(p["parity"]["passed"] for p in pairs))
         summary.append(row)
         write(output / "summary.json", summary)
+    if model_identity(model) != model_weights or model_identity(python_model) != python_weights:
+        raise RuntimeError("Model weights changed during campaign")
+    if reference_model and model_identity(reference_model) != reference_weights:
+        raise RuntimeError("Decoded reference weights changed during campaign")
+    for name, digest in identity["reference_tools"].items():
+        if sha(Path(__file__).with_name(name)) != digest:
+            raise RuntimeError("Q8 reference decoder changed during campaign")
+    if any(sidecar_identity(Path(path)) != value for path, value in sidecars.items()):
+        raise RuntimeError("Configuration or tokenizer changed during campaign")
     write(output / "completion.json", dict(completed=True,
         source_unchanged=source_diff() == identity["antfly_diff"],
         binary_unchanged=sha(binary) == identity["binary_sha256"],
@@ -355,6 +421,9 @@ def main():
     p.add_argument("mode", choices=("fixture", "python", "campaign"))
     p.add_argument("--upstream", required=True)
     p.add_argument("--model-dir", required=True)
+    p.add_argument("--python-model-dir", help="Original FP32 timing baseline when Antfly loads Q8")
+    p.add_argument("--reference-model-dir", help="Decoded Q8 correctness reference, run separately from timed processes")
+    p.add_argument("--antfly-quantization", choices=("fp32", "q8_0"), default="fp32")
     p.add_argument("--output", required=True)
     p.add_argument("--binary")
     p.add_argument("--cases")
@@ -381,6 +450,8 @@ def main():
         p.error("--cases is required")
     if args.mode == "campaign" and not args.binary:
         p.error("--binary is required for a campaign")
+    if args.mode == "campaign" and (args.antfly_quantization == "q8_0") != bool(args.reference_model_dir):
+        p.error("Q8 campaigns require --reference-model-dir; FP32 campaigns must omit it")
     if args.mode == "python" and args.case is None:
         p.error("--case is required for a Python child")
     return {"fixture":fixture,"python":python_benchmark,"campaign":campaign}[args.mode](args)

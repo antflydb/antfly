@@ -14642,9 +14642,40 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
 
+        // A Q8 relative table cannot feed layerNorm directly. Decode it on
+        // device instead of falling back through a full host download and
+        // upload whenever the requested bucket layout changes. The temporary
+        // has ordinary owned storage; only the normalized gathered table is
+        // retained by the existing bounded relative-embedding cache.
+        var decoded_weight: ?CT = null;
+        defer if (decoded_weight) |weight| freeOp(ctx, weight);
+        const weight_buf = toBuf(request.weight);
+        if (weight_buf.quantized_storage orelse weight_buf.runtime_quantized_storage) |storage| {
+            if (!std.meta.eql(storage.tensor_type, gguf_tensor_types.TensorType{ .known = .Q8_0 }) or
+                storage.packed_expert != null or storage.shape.len != 2 or
+                storage.shape[0] <= 0) return null;
+            const columns = std.math.cast(usize, storage.shape[1]) orelse return null;
+            if (columns != request.hidden_size) return null;
+            const rows: usize = @intCast(storage.shape[0]);
+            const slot = (try self.ensureQuantizedStorageLinearSlot(request.weight, request.hidden_size, rows)) orelse return null;
+            var dense = (try metal_runtime.decoderRuntimeCopyQuantLinearSlotToF32(
+                self.provider_impl,
+                slot,
+                0,
+                rows,
+                request.hidden_size,
+                rows,
+                1.0,
+            )) orelse return null;
+            decoded_weight = self.ctFromOwnedMetalTensor(dense) catch |err| {
+                dense.deinit();
+                return err;
+            };
+        }
+
         const normed = layerNormOp(
             ctx,
-            request.weight,
+            decoded_weight orelse request.weight,
             request.layer_norm_weight,
             request.layer_norm_bias,
             request.hidden_size,

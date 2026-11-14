@@ -493,3 +493,11 @@ test "GLiNER production Metal batch lifecycle multilingual FP32" {
 test "GLiNER production Metal batch lifecycle Decide FP32" {
     try parity(.decide, "ANTFLY_GLINER_DECIDE_MODEL", true);
 }
+
+test "GLiNER production Metal distinct input batches Decide Q8" {
+    try parity(.decide, "ANTFLY_GLINER_DECIDE_Q8_MODEL", false);
+}
+
+test "GLiNER production Metal batch lifecycle Decide Q8" {
+    try parity(.decide, "ANTFLY_GLINER_DECIDE_Q8_MODEL", true);
+}

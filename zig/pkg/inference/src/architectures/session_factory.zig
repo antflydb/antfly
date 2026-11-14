@@ -639,6 +639,10 @@ test "GLiNER Decide Metal policy leaves native CUDA and changed artifacts untouc
     config = .{ .gliner = .{} };
     try applyGlinerDecideMetalExecutionPolicy(&config, .metal, changed);
     try std.testing.expect(!config.gliner.metal_decide_execution_policy);
+    config = .{ .gliner = .{} };
+    try applyGlinerDecideMetalExecutionPolicy(&config, .metal, gliner_decide_qualification.pinned_legacy_q8_identity);
+    try std.testing.expect(config.gliner.metal_require_f32_weight_mirrors);
+    try std.testing.expect(config.gliner.metal_decide_execution_policy);
 }
 
 test "qualified PII specialty requires DeBERTa F32 mirrors without changing GLiGuard" {
@@ -672,7 +676,7 @@ pub fn metalDebertaFastPathAdmissionAmounts(mf: manifest_mod.ModelManifest) runt
     if (!gliner_deberta and !direct_deberta and !unknown_reranker) return .{};
 
     const decide_policy_hint = mf.gliner_classification_head == .label_marker_mlp and
-        mf.safetensors_path != null and
+        (mf.safetensors_path != null or mf.gliner_head_gguf_path != null) and
         gliner_decide_qualification.metalPolicySidecarHint(mf.gliner_span_config_digest, mf.gliner_span_encoder_digest);
     const reservation = deberta_arch.metalFastPathReservationBytes(.{
         .hidden_size = mf.hidden_size,
@@ -719,6 +723,11 @@ test "GLiNER Decide Metal admission covers the authenticated execution policy" {
     }, true);
     try std.testing.expectEqual(expected.persistent_bytes, actual.backend_weight_bytes);
     try std.testing.expectEqual(expected.scratch_bytes, actual.backend_scratch_bytes);
+    mf.safetensors_path = null;
+    mf.gliner_head_gguf_path = "gliner2-head.Q8_0.gguf";
+    const q8 = metalDebertaFastPathAdmissionAmounts(mf);
+    try std.testing.expectEqual(actual.backend_weight_bytes, q8.backend_weight_bytes);
+    try std.testing.expectEqual(actual.backend_scratch_bytes, q8.backend_scratch_bytes);
     mf.gliner_span_config_digest = null;
     const ordinary = metalDebertaFastPathAdmissionAmounts(mf);
     try std.testing.expect(actual.backend_weight_bytes > ordinary.backend_weight_bytes);
