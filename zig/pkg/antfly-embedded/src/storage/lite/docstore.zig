@@ -678,7 +678,7 @@ fn reclamationVacuumPreservesCollectorCapacityWithRetainedReadersImpl(a: Allocat
     const before_handle = store.file.file.handle;
     const size = (try store.file.file.stat(std.testing.io)).size;
     const compact = (try store.file.liveStats(null)).compact_size;
-    store.maintenance_policy.options.max_storage_bytes = size + compact * 2;
+    store.maintenance_policy.options.max_storage_bytes = size + compact * 4;
     const initial = try store.reclamationStatus();
     // perf/lwa-orphan-pages: the orphaned-page-retention leak this
     // comment originally described (the 400KiB "large" chain's pages
@@ -709,20 +709,54 @@ fn reclamationVacuumPreservesCollectorCapacityWithRetainedReadersImpl(a: Allocat
     // creation time, so `createWithOptions`'s own §9.7a scaling (which
     // only ever runs against the budget the caller passes in at
     // creation) never saw the tight budget assigned here afterward.
-    // That left too little of the `compact * 2` headroom above for the
+    // That left too little of the `compact * 4` headroom above for the
     // diverting commit's own conservative admission check (Bug 2,
     // perf/lwa-budget-tail), even though the vacuum-rejecting budget
-    // above correctly fails either way. Fixed directly, not worked
-    // around: `submitScopedMutation`'s own retry (§9.7f) catches
-    // exactly this -- an oversized, stale reservation is the reason
-    // this write was rejected -- folds (`checkpointRedoLog`'s own
-    // `maybeShrinkRedoLogCapacity`, which re-derives the reservation
-    // from whatever budget is current on *every* fold, not just at
-    // creation) and retries once, so the small write below now succeeds
-    // in both modes.
-    try store.putCatalogRecord("next", "value");
+    // above correctly fails either way. `submitScopedMutation`'s own
+    // retry (§9.7f) catches exactly this -- an oversized, stale
+    // reservation is the reason this write was rejected -- folds
+    // (`checkpointRedoLog`'s own `maybeShrinkRedoLogCapacity`, which
+    // re-derives the reservation from whatever budget is current on
+    // *every* fold, not just at creation) and retries once.
+    //
+    // perf/lwa-recent-regress: landing that fix exposed two more things
+    // this test's own 99a522bb98 revert (success in both modes) did not
+    // account for, confirmed by instrumenting both call sites directly:
+    //
+    // 1. The retry's own fold only shrinks the reservation through
+    // `maybeShrinkRedoLogCapacity`'s `!pinned_below` branch
+    // (`checkpointRedoLog`'s own doc comment) -- the same
+    // no-cross-process-reader-pinned-below-the-checkpoint gate that
+    // already decides whether this fold can reset/empty the log at all.
+    // `pinned` (opened above) pins the checkpoint this fold is about to
+    // publish from "below" it for as long as it stays open, so the
+    // shrink -- and therefore the retry -- cannot succeed while it is.
+    // Released here instead of after the write: every assertion that
+    // actually needs it held (the vacuum rejection and the
+    // unchanged-checkpoint/handle checks above) already ran.
+    //
+    // 2. Releasing `pinned` alone was not enough: with the stale 512 KiB
+    // reservation shrunk to the current budget's own ~255 KiB target,
+    // `pageAllocatorForDivertingCommit`'s admission check (this same
+    // 177d142243 pass's own "credit already-free, reusable pages"
+    // addition, native.zig) still came up short by about ten pages --
+    // the fold's own bookkeeping commit (a fresh free-map root, plus
+    // whatever of "small"/"kept"'s own logical heads this was the first
+    // fold ever to materialize into real pages) grows `page_count` by a
+    // few pages too, and `compact * 2`'s margin was sized only for the
+    // simpler, pre-resize gap this comment used to describe. `compact * 4`
+    // leaves enough real headroom for both the fold's own growth and
+    // `allocator_v4.retirementReservePages`'s fixed reserve, confirmed
+    // directly (not inferred): `pageAllocatorForDivertingCommit`'s own
+    // available-pages tally went from 73 (just short of the ~83-page
+    // reserve) to 85 once the budget widened, with every other quantity
+    // in the computation unchanged. `store.vacuum()`'s own rejection
+    // above is unaffected by either change -- still gated on `compact`
+    // itself, not this margin -- so the small write below now succeeds
+    // in both modes without loosening what the vacuum rejection checks.
     pinned.abort();
     pin_active = false;
+    try store.putCatalogRecord("next", "value");
     if (!use_redo_log) {
         _ = try store.vacuum();
         try store.putCatalogRecord("after", "still writable");
