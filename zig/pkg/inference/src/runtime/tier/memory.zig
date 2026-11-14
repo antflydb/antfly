@@ -2215,7 +2215,12 @@ fn deriveLimitsForBackend(backend: BackendClass, info: SystemMemoryInfo) Limits 
                     host_limit,
                 ),
                 .scratch_limit_bytes = @min(
-                    clampBytes(safe_pool / 12, mib(256), gib(1)),
+                    // CPU media inference can need several GiB of transient
+                    // encoder/decoder memory. Scale with the safe process pool
+                    // instead of imposing a model-independent 1 GiB ceiling.
+                    // This is a category cap, not an upfront reservation; the
+                    // host/combined ledger and live checks still bound the sum.
+                    @max(safe_pool / 4, mib(256)),
                     host_limit,
                 ),
             };
@@ -5165,4 +5170,17 @@ test "request admission failure sinks preserve concurrent isolation" {
     try one.await(std.testing.io);
     try two.await(std.testing.io);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}
+
+test "CPU scratch scales with the safe pool while total reservations remain bounded" {
+    for ([_]usize{ mib(128), gib(2), gib(8), gib(32), gib(128) }) |total| {
+        const limits = deriveLimitsForBackend(.cpu, .{ .total_bytes = total, .available_bytes = total });
+        try std.testing.expect(limits.scratch_limit_bytes <= limits.host_limit_bytes);
+        if (total >= gib(32)) try std.testing.expect(limits.scratch_limit_bytes >= gib(4));
+        var controller = AdmissionController{};
+        var scratch = try controller.tryAcquire(.cpu, limits, .{ .host_scratch_bytes = limits.scratch_limit_bytes }, false);
+        defer scratch.release();
+        if (limits.host_limit_bytes == 0) continue;
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = limits.host_limit_bytes }, false));
+    }
 }

@@ -11565,7 +11565,12 @@ pub const Node = struct {
             try validateLoadedMediaRevision(expected, handle.get().resolution_revision);
         }
         const timestamps = (request.timestamps orelse false) or (request.diarization orelse false);
+        const admitted_workspace = @import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(work);
+        if (whisper.encoder.backend() == .native) if (admitted_workspace) |workspace|
+            try workspace.bindSession(whisper.encoder.withAdmissionControl(control));
         var pipeline = try whisper.pipeline(request.language, max_working_bytes, control, timestamps, .full);
+        if (whisper.encoder.backend() == .native and pipeline.batch_dispatch == null)
+            pipeline.native_workspace = admitted_workspace;
 
         // The same windowed path the HTTP handler takes: clips longer than
         // one Whisper window are cut at pauses and decoded window by window,

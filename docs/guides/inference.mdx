@@ -211,6 +211,36 @@ Admission checks every request limit before considering contention. A request th
 
 Default CPU and Metal host budgets use the shared safe host pool; on Metal, host and device allocations also share a combined unified-memory cap. Lazy media encoders must fit alongside their required resident model. Explicit `--host-budget-mb` and other budget overrides remain hard caps.
 
+CPU scratch defaults to one quarter of the safe host pool (with a 256 MiB tuning
+floor, always clamped to that pool). It scales with the effective process/cgroup
+limit instead of stopping at 1 GiB. This is a ceiling for actual reservations,
+not memory allocated at startup. Host and combined limits still constrain the
+sum of weights, KV and scratch across concurrent requests. An explicit
+`resources.inference.memory.max_scratch_bytes` overrides the automatic value.
+
+For a bounded CPU media worker, start with a 32 GiB process envelope and one
+concurrent request. A reproducible fixed policy can set a 4 GiB scratch cap:
+
+```json
+{
+  "resources": {
+    "memory": {"max_bytes": 34359738368},
+    "inference": {
+      "admission": {"max_concurrent_requests": 1},
+      "memory": {"max_scratch_bytes": 4294967296}
+    }
+  }
+}
+```
+
+These are workload starting points, not a promise that every page, clip or model
+fits. Keep request/output ceilings and deadlines bounded; measure the actual
+checkpoint and geometry before enabling a CPU fallback. Changing the number of
+CPU threads does not change the memory envelope. The
+[CPU media verification procedure](../design/inference/native-cpu-media.md)
+records complete `/read` results, first-use and warm timings, checkpoint/library
+hashes, and request cancellation recovery.
+
 Feasibility includes the model's live session and tokenizer leases in their original CPU or GPU domains. Releasing an optional component removes it from the required working set. Incremental preprocessing checks the cumulative memory owned by that request, while charging only its new allocations. Failed trial reservations remain local to their retrying operation; successful fallbacks do not overwrite another operation’s terminal diagnostic.
 
 Generation requests that exceed a stable budget return HTTP 400 with `retryable: false`, the blocking `budget`, `required_bytes` (including required resident resources), and `limit_bytes`. These diagnostics also cover lazy model/component loads and incremental media preprocessing. A checkpoint resume includes its held upload/decode reservation when checking whether execution can fit; that reservation is not charged twice. After streaming headers have been sent, permanent budget failures use the same JSON fields in an SSE `error` event and close without `[DONE]`. SDK stream readers preserve these fields and continue to accept legacy plain-text error events.
