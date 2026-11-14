@@ -4188,11 +4188,16 @@ fn isGraphRecoveryPending(err: anyerror) bool {
 }
 
 fn isEnrichmentProgressPending(err: anyerror) bool {
-    return err == error.EnrichmentSourceChanged or err == error.ArtifactPublicationPending or isGraphRecoveryPending(err);
+    return err == error.EnrichmentSourceChanged or err == error.IntentConflict or err == error.ArtifactPublicationPending or isGraphRecoveryPending(err);
 }
 
 fn isEnrichmentControlError(err: anyerror) bool {
     return err == error.EnrichmentRetryAborted or isEnrichmentProgressPending(err);
+}
+
+test "commit requirements prepared sources defer background publication without terminal failure" {
+    try std.testing.expect(isEnrichmentProgressPending(error.IntentConflict));
+    try std.testing.expect(isEnrichmentControlError(error.IntentConflict));
 }
 
 test "enrichment distinguishes transient capacity from permanent resource limits" {
@@ -31712,6 +31717,11 @@ fn captureAssetProducerContext(runtime: *EnrichmentRuntime, request: enrichment_
     defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
     var read = try runtime.store.beginProbe();
     defer read.abort();
+    var intent_guard = @import("../../transactions.zig").IntentReadGuard.init(runtime.alloc, null);
+    defer intent_guard.deinit();
+    const source_owner = try @import("../artifact_publication_owner.zig").documentAlloc(runtime.alloc, source_key);
+    defer runtime.alloc.free(source_owner);
+    try intent_guard.check(&read, source_owner);
     if (try ordered_publication.authority(&read) == null) return null;
     var plan = try runtime.index_manager.acquireWritePlanSnapshot();
     defer plan.release();
@@ -31755,6 +31765,11 @@ fn captureProducerInput(runtime: *EnrichmentRuntime, request: enrichment_types.G
     defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
     var read = try runtime.store.beginProbe();
     defer read.abort();
+    var intent_guard = @import("../../transactions.zig").IntentReadGuard.init(runtime.alloc, null);
+    defer intent_guard.deinit();
+    const source_owner = try @import("../artifact_publication_owner.zig").documentAlloc(runtime.alloc, source_key);
+    defer runtime.alloc.free(source_owner);
+    try intent_guard.check(&read, source_owner);
     if (try ordered_publication.authority(&read) == null) return null;
     var plan = try runtime.index_manager.acquireWritePlanSnapshot();
     defer plan.release();
@@ -36190,6 +36205,8 @@ fn documentExtractionStateHasChunkUnitFingerprints(alloc: Allocator, state: []co
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, state, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
+    if (parsed.value.object.get("children_pending")) |pending|
+        if (pending != .bool or pending.bool) return false;
     const version = parsed.value.object.get("chunk_unit_fingerprint_version") orelse return false;
     return document_unit_fingerprint.stateVersionIsCurrent(version);
 }

@@ -33,6 +33,8 @@ pub fn fingerprint(alloc: Allocator, policy: catalog.NamespacePolicy, indexes_js
     // A version tag owns changes to projection/enrichment semantics. Policy is
     // a fixed struct, giving deterministic field ordering and explicit values.
     const encoded = try std.json.Stringify.valueAlloc(alloc, .{
+        .lexical_model = if (policy.enrichment_enabled) policy.lexical_sparse_model_preference else .deterministic_only,
+        .chunk_model = if (policy.chunk_embeddings_enabled) policy.chunk_embeddings_model_preference else .deterministic_only,
         .enrichment_enabled = policy.enrichment_enabled,
         .enrichment_pipeline_version = if (policy.enrichment_enabled) policy.enrichment_pipeline_version else 0,
         .chunk_preview_enabled = policy.chunk_preview_enabled,
@@ -44,13 +46,13 @@ pub fn fingerprint(alloc: Allocator, policy: catalog.NamespacePolicy, indexes_js
     }, .{});
     defer alloc.free(encoded);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update("antfly:document-facts:semantics:v4:");
+    hash.update("antfly:document-facts:semantics:v5:");
     var len: [8]u8 = undefined;
     std.mem.writeInt(u64, &len, encoded.len, .little);
     hash.update(&len);
     hash.update(encoded);
     // Presence uses only chunked full-text source extraction. Graph aliases,
-    // metric policies, dense index options and JSON presentation cannot change
+    // metric policies and JSON presentation cannot change
     // any fact. Names/order/duplicates of equivalent chunk sources cannot
     // change their any-source-present result either.
     const chunked = try full_text_indexes.listChunkedFullTextSourcesAlloc(alloc, indexes_json);
@@ -91,6 +93,21 @@ pub fn fingerprint(alloc: Allocator, policy: catalog.NamespacePolicy, indexes_js
         std.mem.writeInt(u64, &length, field.len, .little);
         hash.update(&length);
         hash.update(field);
+    }
+    if (policy.enrichment_enabled or policy.chunk_embeddings_enabled) {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, if (indexes_json.len == 0) "{}" else indexes_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidTableIndexMetadata;
+        var producers: std.json.Value = .{ .object = .empty };
+        var it = parsed.value.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .object) continue;
+            const kind = entry.value_ptr.object.get("type");
+            if (entry.value_ptr.object.contains("chunker") or (kind != null and kind.? == .string and std.mem.eql(u8, kind.?.string, "embeddings"))) try producers.object.put(parsed.arena.allocator(), entry.key_ptr.*, entry.value_ptr.*);
+        }
+        const canonical = try @import("antfly_local_sources").storage_db_document_content_hash.canonicalJsonValueAlloc(alloc, producers);
+        defer alloc.free(canonical);
+        hash.update(canonical);
     }
     return hash.finalResult();
 }
@@ -173,11 +190,13 @@ pub const Context = struct {
     policy: catalog.NamespacePolicy,
     chunked_sources: []full_text_indexes.ChunkedFullTextSource,
     media_fields: [][]const u8,
+    prepared_catalog: [32]u8,
 
     pub fn init(alloc: Allocator, policy: catalog.NamespacePolicy, indexes_json: []const u8) !Context {
         const fields = try mediaFields(alloc, indexes_json);
         errdefer freeMediaFields(alloc, fields);
-        return .{ .alloc = alloc, .policy = policy, .media_fields = fields, .chunked_sources = try full_text_indexes.listChunkedFullTextSourcesAlloc(alloc, indexes_json) };
+        const digest = try fingerprint(alloc, policy, indexes_json);
+        return .{ .alloc = alloc, .policy = policy, .prepared_catalog = digest, .media_fields = fields, .chunked_sources = try full_text_indexes.listChunkedFullTextSourcesAlloc(alloc, indexes_json) };
     }
     pub fn deinit(self: *Context) void {
         freeMediaFields(self.alloc, self.media_fields);
@@ -193,6 +212,7 @@ pub const Context = struct {
             defer self.alloc.free(text);
             has_chunk_preview = text.len > 0;
         }
+        const stale_prepared = if (projection.prepared_catalog) |digest| !std.mem.eql(u8, &digest, &self.prepared_catalog) else false;
         const policy = self.policy;
         const needs_text = policy.enrichment_enabled or policy.chunk_preview_enabled or policy.rerank_terms_enabled or
             (policy.chunk_embeddings_enabled and projection.chunk_preview == null);
@@ -207,10 +227,10 @@ pub const Context = struct {
             .present = @as(u3, @intFromBool(has_chunk_preview)) |
                 (@as(u3, @intFromBool(projection.chunk_embeddings != null)) << 1) |
                 (@as(u3, @intFromBool(projection.rerank_terms != null)) << 2),
-            .pending = @as(u4, @intFromBool(policy.enrichment_enabled and has_text and (projection.lexical_sparse_version == null or projection.lexical_sparse_version.? < policy.enrichment_pipeline_version))) |
-                (@as(u4, @intFromBool(policy.chunk_preview_enabled and has_text and (projection.chunk_preview_version == null or projection.chunk_preview_version.? < policy.chunk_preview_pipeline_version))) << 1) |
-                (@as(u4, @intFromBool(policy.chunk_embeddings_enabled and has_chunk_source and (projection.chunk_embeddings_pending or projection.chunk_embeddings_version == null or projection.chunk_embeddings_version.? < policy.chunk_embeddings_pipeline_version))) << 2) |
-                (@as(u4, @intFromBool(policy.rerank_terms_enabled and has_text and (projection.rerank_terms_version == null or projection.rerank_terms_version.? < policy.rerank_terms_pipeline_version))) << 3),
+            .pending = @as(u4, @intFromBool(policy.enrichment_enabled and has_text and (stale_prepared or projection.lexical_sparse_version == null or projection.lexical_sparse_version.? < policy.enrichment_pipeline_version))) |
+                (@as(u4, @intFromBool(policy.chunk_preview_enabled and has_text and (stale_prepared or projection.chunk_preview_version == null or projection.chunk_preview_version.? < policy.chunk_preview_pipeline_version))) << 1) |
+                (@as(u4, @intFromBool(policy.chunk_embeddings_enabled and has_chunk_source and (stale_prepared or projection.chunk_embeddings_pending or projection.chunk_embeddings_version == null or projection.chunk_embeddings_version.? < policy.chunk_embeddings_pipeline_version))) << 2) |
+                (@as(u4, @intFromBool(policy.rerank_terms_enabled and has_text and (stale_prepared or projection.rerank_terms_version == null or projection.rerank_terms_version.? < policy.rerank_terms_pipeline_version))) << 3),
         };
     }
 };

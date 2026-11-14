@@ -1085,7 +1085,14 @@ pub const PreparedCommitDisposition = struct {
     }
 };
 
+pub const PreparationCapture = struct {
+    request_digest: [32]u8 = @splat(0),
+    alloc: Allocator,
+    json: ?[]u8 = null,
+};
+
 pub const BatchExecutionOptions = struct {
+    preparation_capture: ?*PreparationCapture = null,
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
     /// Native-only completion observation; never encoded in a replicated command.
@@ -1352,6 +1359,7 @@ pub const DocumentExtractionChunkView = struct {
 };
 
 pub const DocumentExtractionCatalogView = struct {
+    children_pending: bool = false,
     chunks: []DocumentExtractionChunkView = &.{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -1728,6 +1736,8 @@ pub const PrecomputedCoverageCandidate = struct {
 pub const GeneratedBatchWritePlan = struct {
     alloc: Allocator,
     rows: []index_manager_mod.IndexManager.WritePlanSnapshot.BorrowedGeneratedRowPlan,
+    /// Admission capability captured from the same pinned catalog as the rows.
+    direct_gate_supported: bool = true,
     initialized: usize = 0,
 
     pub fn deinit(self: *GeneratedBatchWritePlan) void {
@@ -1944,9 +1954,142 @@ pub const GeneratedEmbeddingMemo = struct {
 pub const GeneratedPrecomputeMode = enum {
     none,
     all,
+    direct,
+};
+
+/// Owns prepared artifact bytes and reserves durable output before retaining
+/// each row. The budget is shared with deletion accounting and survives flushes.
+pub const PreparedArtifactWrites = struct {
+    list: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
+    items: []types.BatchWrite = &.{},
+    budget: ?*@import("commit_requirements.zig").OutputBudget = null,
+
+    pub fn append(self: *@This(), alloc: Allocator, write: types.BatchWrite) !void {
+        const before = if (self.budget) |budget| budget.* else null;
+        errdefer if (self.budget) |budget| if (before) |value| {
+            budget.* = value;
+        };
+        if (self.budget) |budget| {
+            try budget.reserve(write.key.len, 1);
+            try budget.reserve(write.value.len, 0);
+        }
+        try self.list.append(alloc, write);
+        self.items = self.list.items;
+        if (self.budget) |budget| budget.writes_seen = self.items.len;
+    }
+
+    pub fn toOwnedSlice(self: *@This(), alloc: Allocator) ![]types.BatchWrite {
+        const result = try self.list.toOwnedSlice(alloc);
+        self.items = self.list.items;
+        return result;
+    }
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.list.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const PreparedArtifactDeletes = struct {
+    list: std.ArrayListUnmanaged([]const u8) = .empty,
+    items: [][]const u8 = &.{},
+    budget: ?*@import("commit_requirements.zig").OutputBudget = null,
+
+    pub fn append(self: *@This(), alloc: Allocator, key: []const u8) !void {
+        const before = if (self.budget) |budget| budget.* else null;
+        errdefer if (self.budget) |budget| if (before) |value| {
+            budget.* = value;
+        };
+        if (self.budget) |budget| try budget.reserve(key.len, 1);
+        try self.list.append(alloc, key);
+        self.items = self.list.items;
+        if (self.budget) |budget| budget.deletes_seen = self.items.len;
+    }
+
+    pub fn toOwnedSlice(self: *@This(), alloc: Allocator) ![][]const u8 {
+        const result = try self.list.toOwnedSlice(alloc);
+        self.items = self.list.items;
+        return result;
+    }
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.list.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const PreparedProducer = enrichment_types.PreparedProducer;
+
+/// Native effect language, independent of model runtimes and local write-plan
+/// generation numbers. Arrays/bytes use the binary-safe private JSON writer.
+pub const PreparedEnrichments = struct {
+    request_digest: [32]u8,
+    version: u16 = 1,
+    catalog_digest: [32]u8,
+    schema_version: ?u32 = null,
+    authority: ?@import("artifact_publication.zig").Authority = null,
+    writes: []const types.BatchWrite,
+    deletes: []const []const u8,
+    graph_writes: []const types.GraphEdgeWrite = &.{},
+    graph_deletes: []const types.GraphEdgeDelete = &.{},
+    guards: []const Guard,
+    artifact_writes: []const types.BatchWrite,
+    artifact_deletes: []const []const u8,
+    pending: []const enrichment_types.GeneratedEnrichmentRef,
+    coverage: []const PrecomputedCoverageOutcome,
+    producers: []const PreparedProducer,
+    pending_children: bool = false,
+
+    pub fn requestDigest(a: Allocator, req: types.BatchRequest) ![32]u8 {
+        const value = .{
+            .writes = req.writes,
+            .deletes = req.deletes,
+            .transforms = req.transforms,
+            .graph_writes = req.graph_writes,
+            .graph_deletes = req.graph_deletes,
+            .predicates = req.predicates,
+            .integrity = req.integrity,
+            .integrity_commands = req.integrity_commands,
+            .schema_version = req.schema_version,
+            .relational_schema_version = req.relational_schema_version,
+            .relational_integrity_generation_set = req.relational_integrity_generation_set,
+            .relational_activation = req.relational_activation,
+            .relational_retirement = req.relational_retirement,
+            .relational_index_maintenance = req.relational_index_maintenance,
+            .restore_staging_scope = req.restore_staging_scope,
+            .restore_staging_plan_id = req.restore_staging_plan_id,
+            .relational_repair = req.relational_repair,
+            .normalized_graph_rows = req.normalized_graph_rows,
+        };
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+        try @import("relational_integrity_json.zig").writeCompact(value, &stream);
+        const bytes = try output.toOwnedSlice();
+        defer a.free(bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        return digest;
+    }
+
+    pub const Guard = struct {
+        document: []const u8,
+        key: []const u8,
+        value_digest: ?[32]u8,
+        position: ?@import("artifact_publication.zig").Position,
+        artifact_position: ?@import("artifact_publication.zig").Position = null,
+        local_revision: ?u64 = null,
+    };
+
+    pub fn jsonStringify(self: @This(), stream: anytype) !void {
+        return @import("relational_integrity_json.zig").writeCompact(self, stream);
+    }
 };
 
 pub const PrecomputedGeneratedBatch = struct {
+    pending_catalog_work: bool = false,
+    pending_child_work: bool = false,
+    prepared_producers: []const PreparedProducer = &.{},
     artifact_writes: []types.BatchWrite = &.{},
     artifact_delete_keys: []const []const u8 = &.{},
     documents: []const derived_types.DerivedDocument = &.{},
@@ -1959,6 +2102,8 @@ pub const PrecomputedGeneratedBatch = struct {
     // allocation walks out of those exits; each batch pays one call while LLVM
     // optimizes one cleanup body instead of copies throughout the commit CFG.
     pub noinline fn deinit(self: *PrecomputedGeneratedBatch, alloc: Allocator) void {
+        for (self.prepared_producers) |request| alloc.free(request.doc_key);
+        if (self.prepared_producers.len != 0) alloc.free(self.prepared_producers);
         for (self.artifact_writes) |write| {
             alloc.free(@constCast(write.key));
             alloc.free(@constCast(write.value));

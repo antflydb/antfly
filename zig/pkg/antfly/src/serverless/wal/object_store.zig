@@ -557,6 +557,7 @@ pub const ObjectStore = struct {
         value.read_range_alloc = erasedRange;
         value.append_batch = erasedUnkeyedBatch;
         value.append_batch_idempotent = erasedBatch;
+        value.append_batch_idempotent_if_latest = erasedConditionalBatch;
         break :blk value;
     };
     fn erasedMaterialize(ptr: *anyopaque, ns: []const u8, cancellation: ?objectstore.CancellationToken) !bool {
@@ -578,6 +579,10 @@ pub const ObjectStore = struct {
     fn erasedUnkeyedBatch(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8) !wal_types.BatchResult {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return self.indexed.?.appendBatch(ns, timestamp, payloads);
+    }
+    fn erasedConditionalBatch(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, expected: u64) !wal_types.BatchResult {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.indexed.?.appendBatchIdempotentIfLatest(ns, timestamp, payloads, id, expected);
     }
     fn erasedBatch(ptr: *anyopaque, ns: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8) !wal_types.BatchResult {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));

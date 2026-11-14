@@ -26,6 +26,7 @@ pub const WalStore = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         append: *const fn (*anyopaque, []const u8, u64, []const u8) anyerror!u64,
         append_batch: ?*const fn (*anyopaque, []const u8, u64, []const []const u8) anyerror!wal_types.BatchResult = null,
+        append_batch_idempotent_if_latest: ?*const fn (*anyopaque, []const u8, u64, []const []const u8, []const u8, u64) anyerror!wal_types.BatchResult = null,
         append_batch_idempotent: ?*const fn (*anyopaque, []const u8, u64, []const []const u8, []const u8) anyerror!wal_types.BatchResult = null,
         append_idempotent: ?*const fn (*anyopaque, []const u8, u64, []const u8, []const u8) anyerror!u64 = null,
         append_idempotent_if_latest: ?*const fn (*anyopaque, []const u8, u64, []const u8, []const u8, u64) anyerror!?u64 = null,
@@ -95,6 +96,15 @@ pub const WalStore = struct {
 
     /// An atomic batch requires a store-provided commit primitive. Never
     /// emulate it with independently acknowledged per-record appends.
+    pub fn supportsConditionalBatchAppend(self: *const WalStore) bool {
+        return self.vtable.append_batch_idempotent_if_latest != null;
+    }
+
+    pub fn appendBatchIdempotentIfLatest(self: *WalStore, namespace: []const u8, timestamp: u64, payloads: []const []const u8, id: []const u8, expected: u64) !wal_types.BatchResult {
+        const call = self.vtable.append_batch_idempotent_if_latest orelse return error.AtomicBatchAppendUnsupported;
+        return call(self.ptr, namespace, timestamp, payloads, id, expected);
+    }
+
     pub fn appendBatchIdempotent(self: *WalStore, namespace: []const u8, timestamp_ns: u64, payloads: []const []const u8, operation_id: []const u8) !wal_types.BatchResult {
         const append_fn = self.vtable.append_batch_idempotent orelse return error.IdempotentBatchAppendUnsupported;
         return append_fn(self.ptr, namespace, timestamp_ns, payloads, operation_id);

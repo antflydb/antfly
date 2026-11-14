@@ -258,6 +258,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const admission_api_tests = b.addTest(.{
         .root_module = admission_api_root,
         .filters = &.{
+            "commit requirements",
+            "http handler honors public serverless sync levels",
             "public table create index preserves permanent inference budget",
             "public artifact enrichment preserves permanent inference budget",
             "PDF embedding input public contract",
@@ -7856,6 +7858,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.text_memory_stats.",
             "storage.db.transform.",
             "storage.db.mutation_commit_disposition_test.",
+            "storage.db.commit_requirements.",
             "storage.db.mutation_plan.",
             "storage.db.transform_read_plan.",
             "storage.db.typed_doc_values_coverage.",

@@ -2736,6 +2736,7 @@ fn buildRecoveryIntentBatch(
 ) !transactions_mod.ResolutionExtraBatch {
     const alloc = owner.allocator();
     owner.snapshot = try manager.collectIntentBatch(alloc, txn_id);
+    if (owner.snapshot.prepared_enrichments_json != null) return error.PreparedIntentRequiresMaterialization;
     const binding = owner.snapshot.schema_binding;
     const context_snapshot = blk: {
         identity_ctx.mutex.lockUncancelable(identity_ctx.io);

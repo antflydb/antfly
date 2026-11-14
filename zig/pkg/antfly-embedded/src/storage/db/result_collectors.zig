@@ -96,12 +96,17 @@ pub fn externalizeArtifactWritesAlloc(alloc: Allocator, writes: []types.BatchWri
 }
 
 /// Reserve first, then transfer only a fully initialized owned value.
-pub fn appendArtifact(alloc: Allocator, out: *std.ArrayListUnmanaged(types.BatchWrite), key: []const u8, value: []const u8) !void {
-    try out.ensureUnusedCapacity(alloc, 1);
+pub fn appendArtifact(alloc: Allocator, out: anytype, key: []const u8, value: []const u8) !void {
+    if (comptime @hasField(@TypeOf(out.*), "budget")) if (out.budget) |budget| {
+        var projected = budget.*;
+        try projected.reserve(key.len, 1);
+        try projected.reserve(value.len, 0);
+    };
     const owned_key = try alloc.dupe(u8, key);
     errdefer alloc.free(owned_key);
     const owned_value = try alloc.dupe(u8, value);
-    out.appendAssumeCapacity(.{ .key = owned_key, .value = owned_value });
+    errdefer alloc.free(owned_value);
+    try out.append(alloc, .{ .key = owned_key, .value = owned_value });
 }
 
 pub fn appendDocument(alloc: Allocator, out: *std.ArrayListUnmanaged(types.EnrichmentDocumentWrite), key: []const u8, value: []const u8, names: []const []const u8) !void {

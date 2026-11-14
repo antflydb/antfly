@@ -363,7 +363,10 @@ pub const ResolutionExtraBatch = struct {
 /// Additional primary-store mutations that must commit atomically with a
 /// transaction metadata transition. Raft apply uses this to fence the exact log
 /// entry without a crash window between the transaction and its replay marker.
+const prepared_enrichments_prefix = "\x00\x00__txn_prepared_enrichments__:";
+
 pub const MutationExtraBatch = struct {
+    prepared_enrichments_json: ?[]const u8 = null,
     document_revisions: ?bool = null,
     writes: []const docstore.KVPair = &.{},
     deletes: []const []const u8 = &.{},
@@ -417,6 +420,7 @@ pub const ReplayAppend = struct {
 };
 
 pub const IntentBatch = struct {
+    prepared_enrichments_json: ?[]u8 = null,
     document_revisions: bool = false,
     writes: []docstore.KVPair = &.{},
     deletes: [][]const u8 = &.{},
@@ -428,6 +432,7 @@ pub const IntentBatch = struct {
     owned_entries: ?[]backend_scan.OwnedKVPair = null,
 
     pub fn deinit(self: *IntentBatch, alloc: Allocator) void {
+        if (self.prepared_enrichments_json) |bytes| alloc.free(bytes);
         if (self.prepared_rows.len != 0) alloc.free(self.prepared_rows);
         if (self.owned_entries) |entries| {
             backend_scan.freeResults(alloc, entries);
@@ -731,6 +736,12 @@ pub const TxnManager = struct {
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status != .pending) return TxnError.DecisionConflict;
         const first_prepare = record.prepared_known and !record.prepared and record.intent_revision == 0;
+        if (!first_prepare and extra_batch.prepared_enrichments_json == null) {
+            if (try self.loadPreparedEnrichments(self.alloc, txn_id)) |packet| {
+                self.alloc.free(packet);
+                return error.VersionConflict;
+            }
+        }
 
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var schema_lease_value: [5]u8 = @splat(0);
@@ -774,6 +785,9 @@ pub const TxnManager = struct {
         };
         const previous_admission = try self.loadIntentAdmission(self.alloc, txn_id);
         var admission = previous_admission orelse IntentAdmission{};
+        if (first_prepare) if (extra_batch.prepared_enrichments_json) |packet| {
+            admission.bytes = std.math.add(u64, admission.bytes, packet.len + prepared_enrichments_prefix.len + 16) catch return error.TransactionTooLarge;
+        };
         var pending_costs = std.StringHashMapUnmanaged(IntentCost).empty;
         defer pending_costs.deinit(self.alloc);
         var last_intents = std.StringHashMapUnmanaged(usize).empty;
@@ -957,6 +971,17 @@ pub const TxnManager = struct {
         if (extra_batch.schema_binding != null)
             try writes.append(self.alloc, .{ .key = &schema_lease_key, .value = &schema_lease_value });
 
+        const prepared_key = makeSidecarKey(prepared_enrichments_prefix, txn_id);
+        if (extra_batch.prepared_enrichments_json) |packet| {
+            const previous = self.getAlloc(self.alloc, &prepared_key) catch |err| if (err == error.NotFound) null else return err;
+            defer if (previous) |bytes| self.alloc.free(bytes);
+            if (previous) |bytes| {
+                if (!std.mem.eql(u8, bytes, packet)) return error.VersionConflict;
+            } else {
+                if (!first_prepare) return error.InvalidTxnRecord;
+                try writes.append(self.alloc, .{ .key = &prepared_key, .value = packet });
+            }
+        }
         try writes.appendSlice(self.alloc, extra_batch.writes);
 
         try self.applyBatchWithReservation(writes.items, extra_batch.deletes, null, .{ .previous = if (previous_admission) |old| old.reservation() else 0, .next = admission.reservation() });
@@ -1068,6 +1093,7 @@ pub const TxnManager = struct {
             try self.loadIntentEntries(self.alloc, txn_id, scan_prefix);
         defer if (extra_batch.captured_intents == null) backend_scan.freeResults(self.alloc, intent_entries);
 
+        const prepared_key = makeSidecarKey(prepared_enrichments_prefix, txn_id);
         const read_prefix = makeSidecarKey(read_members_prefix, txn_id);
         const read_admission = try self.loadReadAdmission(txn_id);
         const read_entries: []backend_scan.OwnedKVPair = if (read_admission.count != 0) try self.scanPrefix(self.alloc, &read_prefix) else &.{};
@@ -1097,6 +1123,7 @@ pub const TxnManager = struct {
             try completion_deletes.append(self.alloc, &stale_manifest_key);
             try completion_deletes.append(self.alloc, &stale_admission_key);
             try completion_deletes.append(self.alloc, &schema_lease_key);
+            try completion_deletes.append(self.alloc, &prepared_key);
             try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
             const admission = try self.loadIntentAdmission(self.alloc, txn_id);
             try self.applyBatchWithReservation(completion_writes.items, completion_deletes.items, null, .{ .previous = if (admission) |value| value.reservation() else 0, .next = 0 });
@@ -1120,6 +1147,7 @@ pub const TxnManager = struct {
         defer writes.deinit(self.alloc);
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer deletes.deinit(self.alloc);
+        try deletes.append(self.alloc, &prepared_key);
         var owned_apply_keys = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (owned_apply_keys.items) |key| self.alloc.free(key);
@@ -1272,6 +1300,9 @@ pub const TxnManager = struct {
         // the DB apply lock detects any prepare that raced with this snapshot.
         const record = try self.loadTransactionRecord(txn_id);
         const schema_binding = try self.loadSchemaBinding(alloc, txn_id);
+        const prepared_key = makeSidecarKey(prepared_enrichments_prefix, txn_id);
+        const prepared_json = self.getAlloc(alloc, &prepared_key) catch |err| if (err == error.NotFound) null else return err;
+        errdefer if (prepared_json) |bytes| alloc.free(bytes);
         var intent_prefix_buf: [intents_prefix.len + 17]u8 = undefined;
         @memcpy(intent_prefix_buf[0..intents_prefix.len], intents_prefix);
         @memcpy(intent_prefix_buf[intents_prefix.len..][0..16], &txn_id);
@@ -1306,7 +1337,12 @@ pub const TxnManager = struct {
                 writes_initialized += 1;
             }
         }
-        return .{ .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries, .document_revisions = record.document_revisions };
+        return .{ .prepared_enrichments_json = prepared_json, .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries, .document_revisions = record.document_revisions };
+    }
+
+    pub fn loadPreparedEnrichments(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?[]u8 {
+        const selected = makeSidecarKey(prepared_enrichments_prefix, txn_id);
+        return self.getAlloc(alloc, &selected) catch |err| if (err == error.NotFound) null else err;
     }
 
     pub fn loadSchemaBinding(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?SchemaBinding {

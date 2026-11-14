@@ -25,6 +25,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_artifact_catalog_proposal;
     _ = @import("antfly_local_sources").storage_db_authority_invalidation;
     _ = @import("antfly_local_sources").storage_db_mutation_commit_disposition_test;
+    _ = @import("antfly_local_sources").storage_db_commit_requirements;
     _ = @import("antfly_local_sources").storage_db_mutation_plan;
     _ = @import("antfly_local_sources").storage_db_query_cypher_projection;
     _ = @import("antfly_local_sources").storage_db_transform_read_plan;

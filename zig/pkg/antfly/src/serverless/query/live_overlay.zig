@@ -115,9 +115,9 @@ pub const Overlay = struct {
     pub fn lookup(self: *Overlay, id: []const u8) !Lookup {
         const mutation = self.by_id.getPtr(id) orelse return .unchanged;
         if (mutation.kind == .delete) return .deleted;
-        if (mutation.kind == .checkpoint or mutation.kind == .enriched) {
+        if (mutation.kind == .checkpoint or (mutation.kind == .enriched or mutation.kind == .prepared)) {
             const raw = mutation.body orelse return error.InvalidDocumentBody;
-            const resolved = if (mutation.kind == .enriched) resolved: {
+            const resolved = if ((mutation.kind == .enriched or mutation.kind == .prepared)) resolved: {
                 const body = try @import("../build/document_facts.zig").parseEnrichedBody(raw);
                 break :resolved try self.alloc.dupe(u8, body.body);
             } else resolved: {

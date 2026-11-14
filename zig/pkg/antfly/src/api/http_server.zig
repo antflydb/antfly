@@ -14797,6 +14797,7 @@ pub const ApiHttpServer = struct {
         const txn_writes: []const db_mod.types.TransactionWrite = @ptrCast(req.writes);
         const tables = [_]distributed_txn.TableCommitRequest{.{
             .table_name = table_name,
+            .commit_requires = req.commit_requires,
             .writes = txn_writes,
             .deletes = req.deletes,
             .transforms = req.transforms,
@@ -14815,6 +14816,9 @@ pub const ApiHttpServer = struct {
         var retained_preparation: ?@import("antfly_local_sources").api_relational_integrity_commit.Prepared = null;
         defer if (retained_preparation) |*prepared| prepared.deinit();
         const outcome = (self.commitPublicTableBatchWithIntegrity(alloc, source, &tables, req.sync_level, request, &retained_preparation) catch |err| switch (err) {
+            error.UnsupportedCommitRequirement => return error.UnsupportedCommitRequirement,
+            error.CommitRequirementUnavailable => return error.Unavailable,
+            error.CommitRequirementTooLarge, error.CommitRequirementFailed => return error.InvalidBatchRequest,
             error.RelationalIndexKeyTooLarge => return error.RelationalIndexKeyTooLarge,
             error.UniqueConstraintViolation => return error.UniqueConstraintViolation,
             error.RelationalCheckViolation => return error.RelationalCheckViolation,
@@ -29728,6 +29732,13 @@ test "httpx inference gateway authorization tells disabled public inference apar
         defer server.deinit();
         try std.testing.expectEqual(case.expected, try server.authorizeInferenceRequest(.{ .trusted_principal = token }, .write));
     }
+}
+
+test "api http commit requirements require a coordinator source" {
+    var server = ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    try std.testing.expectError(error.NotFound, ApiHttpServer.executePublicTableBatch(&server, std.testing.allocator, "docs", .{ .commit_requires = .direct_enrichments }, .{}));
+    try std.testing.expectError(error.NotFound, ApiHttpServer.executePublicTableBatch(&server, std.testing.allocator, "docs", .{ .commit_requires = .none }, .{}));
 }
 
 test "api http server validates dedicated internal service runtime credentials" {

@@ -1038,6 +1038,7 @@ class TestAntflyClient:
         def handler(request):
             body = json.loads(request.content)
             assert body["sync_level"] == "full_index"
+            assert body["commit_requires"] == "none"
             assert body["transforms"][0]["upsert"] is True
             return httpx.Response(
                 201,
@@ -1052,6 +1053,7 @@ class TestAntflyClient:
         result = client.batch(
             "users",
             sync_level="full_index",
+            commit_requires="none",
             transforms=[{"key": "u", "upsert": True, "operations": [{"op": "$set", "path": "$.name", "value": "Ada"}]}],
         )
         assert result.to_dict()["status"] == "committed_repair_required"
@@ -1112,3 +1114,21 @@ class TestAntflyClient:
         with pytest.raises(AntflyException, match=f"exceeded {limit} bytes"):
             client._request("GET", "/db/v1/test")
         assert stream.closed
+
+
+@pytest.mark.parametrize("requirement", [None, "none", "direct_enrichments"])
+def test_transaction_models_preserve_commit_requirement_defaults(requirement):
+    from antfly.client_generated.models.multi_batch_request import MultiBatchRequest
+    from antfly.client_generated.models.transaction_commit_request import TransactionCommitRequest
+
+    for model in (MultiBatchRequest, TransactionCommitRequest):
+        body = {"tables": {"docs": {"inserts": {"a": {}}}, "audit": {"commit_requires": "none"}}}
+        if model is TransactionCommitRequest:
+            body["read_set"] = []
+        if requirement is not None:
+            body["commit_requires"] = requirement
+        encoded = model.from_dict(body).to_dict()
+        assert ("commit_requires" in encoded) is (requirement is not None)
+        if requirement is not None:
+            assert encoded["commit_requires"] == requirement
+        assert encoded["tables"]["audit"]["commit_requires"] == "none"

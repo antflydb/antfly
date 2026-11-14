@@ -162,6 +162,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageHotStandbySeedPruneJson, "antfly_storage_hot_standby_seed_prune_json");
     exportInternal(&storage_kernel_exports.storageOwnerConfigure, "antfly_storage_owner_configure");
     exportInternal(&storage_kernel_exports.storageOwnerReconcile, "antfly_storage_owner_reconcile");
+    exportInternal(&storage_kernel_exports.storageOwnerPrepareEnrichments, "antfly_storage_owner_prepare_enrichments");
     exportInternal(&storage_kernel_exports.storageOwnerPreflightWriteAdmission, "antfly_storage_owner_preflight_write_admission");
     exportInternal(&storage_kernel_exports.storageOwnerFindMedianKey, "antfly_storage_owner_find_median_key");
     exportInternal(&storage_kernel_exports.storageOwnerBulkBegin, "antfly_storage_owner_bulk_begin");

@@ -108,6 +108,10 @@ pub const TableCommitRequest = struct {
     }
 
     pub fn mergeFrom(self: *TableCommitRequest, alloc: std.mem.Allocator, other: TableCommitRequest) !void {
+        // Staged statements may strengthen admission, never erase an earlier
+        // prerequisite while coalescing the final table postimage.
+        if (other.batch.req.commit_requires == .direct_enrichments or self.batch.req.commit_requires == null)
+            self.batch.req.commit_requires = other.batch.req.commit_requires;
         if (other.range_guards) |guards| try self.mergeRangeGuards(alloc, guards.value);
         if (other.conflict_guards) |guards| try self.mergeConflictGuards(alloc, guards.value);
         if (self.schema_version != null and other.schema_version != null and self.schema_version != other.schema_version) return error.CatalogGenerationChanged;
@@ -317,6 +321,7 @@ pub const OwnedTransactionCommitRequest = struct {
             offset += table_writes.len;
             out[i] = .{
                 .table_name = self.physicalName(table.table_name),
+                .commit_requires = table.batch.req.commit_requires,
                 .schema_version = table.schema_version,
                 .relational_schema_version = table.relational_schema_version,
                 .relational_integrity_generation_set = if (table.conflict_guards) |guards| guards.value.generation_set else null,
@@ -4363,7 +4368,8 @@ pub fn parseMultiBatchRequest(alloc: std.mem.Allocator, body: []const u8) !Owned
     var fields = root.iterator();
     while (fields.next()) |field| {
         if (!std.mem.eql(u8, field.key_ptr.*, "tables") and
-            !std.mem.eql(u8, field.key_ptr.*, "sync_level"))
+            !std.mem.eql(u8, field.key_ptr.*, "sync_level") and
+            !std.mem.eql(u8, field.key_ptr.*, "commit_requires"))
         {
             return error.InvalidTransactionCommitRequest;
         }
@@ -4372,6 +4378,10 @@ pub fn parseMultiBatchRequest(alloc: std.mem.Allocator, body: []const u8) !Owned
     var req: OwnedTransactionCommitRequest = .{};
     errdefer req.deinit(alloc);
     req.tables = try parseTables(alloc, root.get("tables") orelse return error.InvalidTransactionCommitRequest);
+    const requirement = if (root.get("commit_requires")) |value| try db_mod.types.parseCommitRequires(value) else null;
+    for (req.tables) |*table| if (table.batch.req.commit_requires == null) {
+        table.batch.req.commit_requires = requirement;
+    };
     if (req.tables.len == 0) return error.InvalidTransactionCommitRequest;
     if (root.get("sync_level")) |sync_level_value| {
         req.sync_level = parseSyncLevel(sync_level_value) orelse return error.InvalidTransactionCommitRequest;
@@ -4804,6 +4814,8 @@ fn parseCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedTrans
         else => return error.InvalidTransactionCommitRequest,
     };
 
+    const default_requirement = if (root.get("commit_requires")) |requirement_value| try db_mod.types.parseCommitRequires(requirement_value) else null;
+
     var req: OwnedTransactionCommitRequest = .{};
     errdefer req.deinit(alloc);
 
@@ -4812,6 +4824,9 @@ fn parseCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !OwnedTrans
 
     const tables_value = root.get("tables") orelse return error.InvalidTransactionCommitRequest;
     req.tables = try parseTables(alloc, tables_value);
+    for (req.tables) |*table| if (table.batch.req.commit_requires == null) {
+        table.batch.req.commit_requires = default_requirement;
+    };
 
     if (root.get("sync_level")) |sync_level_value| {
         req.sync_level = parseSyncLevel(sync_level_value) orelse return error.InvalidTransactionCommitRequest;
@@ -4928,6 +4943,10 @@ fn encodeTableBatchRequest(alloc: std.mem.Allocator, table: TableCommitRequest) 
             try out.appendSlice(alloc, encoded);
         }
     }
+    if (table.batch.req.commit_requires) |requirement| {
+        if (!first) try out.append(alloc, ',');
+        try out.print(alloc, "\"commit_requires\":\"{s}\"", .{@tagName(requirement)});
+    }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
@@ -5043,6 +5062,8 @@ fn participantPhaseText(phase: distributed_txn.ParticipantPhase) []const u8 {
 
 fn cloneBatchRequest(alloc: std.mem.Allocator, batch: batch_api.OwnedBatchRequest) !batch_api.OwnedBatchRequest {
     var out: batch_api.OwnedBatchRequest = .{};
+    out.req.commit_requires = batch.req.commit_requires;
+    out.req.sync_level = batch.req.sync_level;
     errdefer out.deinit(alloc);
     try appendBatchWrites(alloc, &out, batch.writes);
     try appendBatchDeletes(alloc, &out, batch.deletes);
@@ -5053,7 +5074,11 @@ fn cloneBatchRequest(alloc: std.mem.Allocator, batch: batch_api.OwnedBatchReques
 }
 
 fn syncBatchReq(batch: *batch_api.OwnedBatchRequest) void {
+    const requirement = batch.req.commit_requires;
+    const sync_level = batch.req.sync_level;
     batch.req = .{
+        .commit_requires = requirement,
+        .sync_level = sync_level,
         .writes = batch.writes,
         .deletes = batch.deletes,
         .transforms = batch.transforms,
@@ -5479,6 +5504,7 @@ pub fn isEmptySessionCommitBody(body: []const u8) bool {
 
 fn parseTableBatch(alloc: std.mem.Allocator, value: std.json.Value) !batch_api.OwnedBatchRequest {
     var owned = try batch_api.public_codec.parseBatchValue(alloc, value);
+    errdefer owned.deinit(alloc);
     return batch_api.takePublic(&owned);
 }
 
@@ -6182,6 +6208,17 @@ test "multi batch parser accepts the public batch envelope without a read set" {
     try std.testing.expectEqual(@as(usize, 1), req.tables[0].batch.writes.len);
     try std.testing.expectEqualStrings("audit", req.tables[1].table_name);
     try std.testing.expectEqual(@as(usize, 1), req.tables[1].batch.deletes.len);
+}
+
+test "multi batch commit requirements survive transaction planning" {
+    const a = std.testing.allocator;
+    var gated = try parseMultiBatchRequest(a, "{\"tables\":{\"docs\":{\"inserts\":{\"a\":{}},\"commit_requires\":\"direct_enrichments\"}}}");
+    defer gated.deinit(a);
+    var distributed = try gated.distributedTables(a);
+    defer distributed.deinit();
+    try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, distributed.tables[0].commit_requires.?);
+    var no_gate = try parseCommitRequest(a, "{\"read_set\":[],\"tables\":{\"docs\":{\"commit_requires\":\"none\"}}}");
+    defer no_gate.deinit(a);
 }
 
 test "multi batch parser derives strongest per-table sync level" {
@@ -8264,4 +8301,24 @@ test "durable session mutations publish only after persistence succeeds: shared 
     // contract, and callers can supply Store.write_gate for other providers.
     runtime.write_serialization = .intrinsic;
     try durable.bindRegistrationIssuer(1);
+}
+
+test "commit requirements survive transaction session cloning persistence and statement merging" {
+    const a = std.testing.allocator;
+    var request = try parseCommitRequest(a, "{\"read_set\":[],\"commit_requires\":\"direct_enrichments\",\"tables\":{\"docs\":{\"inserts\":{\"a\":{}}},\"audit\":{\"inserts\":{\"b\":{}},\"commit_requires\":\"none\"}}}");
+    defer request.deinit(a);
+    const encoded = try encodeCommitRequest(a, request);
+    defer a.free(encoded);
+    var recovered = try parseCommitRequest(a, encoded);
+    defer recovered.deinit(a);
+    var view = try recovered.distributedTables(a);
+    defer view.deinit();
+    for (view.tables) |table| try std.testing.expectEqual(if (std.mem.eql(u8, table.table_name, "docs")) db_mod.types.CommitRequires.direct_enrichments else .none, table.commit_requires.?);
+    var staged = try request.tables[0].clone(a);
+    defer staged.deinit(a);
+    var next = try parseMultiBatchRequest(a, "{\"commit_requires\":\"none\",\"tables\":{\"docs\":{\"inserts\":{\"c\":{}}}}}");
+    defer next.deinit(a);
+    try staged.mergeFrom(a, next.tables[0]);
+    try std.testing.expectEqual(db_mod.types.CommitRequires.direct_enrichments, staged.batch.req.commit_requires.?);
+    try std.testing.expectEqual(@as(usize, 2), staged.batch.writes.len);
 }
