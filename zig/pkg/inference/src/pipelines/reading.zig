@@ -3053,6 +3053,7 @@ const AdmissionDenyingFlorenceSession = struct {
 
 test "reading entry points and batch publication honor execution control" {
     var pipeline: ReadingPipeline = undefined;
+    pipeline.preparation_parent = null;
     pipeline.native_execution_lane = null;
     pipeline.allocator = std.testing.allocator;
     pipeline.execution_control = .{ .deadline_ns = 0 };
@@ -3086,6 +3087,7 @@ test "reading cancellation interrupts encoded decode and borrowed raster preproc
     };
     var probe = Probe{};
     var pipeline: ReadingPipeline = undefined;
+    pipeline.preparation_parent = null;
     pipeline.native_execution_lane = null;
     pipeline.allocator = std.testing.allocator;
     pipeline.config = .{ .image_size = 16 };
@@ -3259,13 +3261,15 @@ test "Florence preprocess output admission precedes allocation and unwinds alloc
     const memory = @import("../runtime/tier/memory.zig");
     var controller = memory.AdmissionController{};
     defer controller.deinit();
-    controller.configureForcedRunDenialsForTesting(1);
+    // An allocation owner tries its growth quantum, then the exact minimum.
+    controller.configureForcedRunDenialsForTesting(2);
     var fake = AdmissionDenyingFlorenceSession{};
     var session = fake.session();
     session.run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var lane = @import("../execution_control.zig").ExecutionLane{};
     var pipeline: ReadingPipeline = undefined;
+    pipeline.preparation_parent = null;
     pipeline.allocator = failing.allocator();
     pipeline.vision_encoder = session;
     pipeline.config = .{ .image_size = 8 };
@@ -3324,6 +3328,7 @@ test "Florence queued prepared encoded raster and decoded pixels release admissi
         defer owner.release();
         var cancelled = std.atomic.Value(bool).init(false);
         var pipeline: ReadingPipeline = undefined;
+        pipeline.preparation_parent = null;
         pipeline.allocator = std.testing.allocator;
         pipeline.vision_encoder = session;
         pipeline.config = .{ .image_size = 4, .resample = .pillow_bicubic };
@@ -3333,8 +3338,10 @@ test "Florence queued prepared encoded raster and decoded pixels release admissi
         defer _ = waiting.cancel(std.testing.io) catch {};
         defer cancelled.store(true, .release);
         try Worker.awaitParked(&lane);
-        // Codec/resampler slabs have retired; only the queued output remains.
-        try std.testing.expectEqual(@as(usize, 3 * 4 * 4 * @sizeOf(f32)), controller.admitted.host_scratch_bytes);
+        // Codec/resampler slabs have retired; retain the queued pixels and
+        // bounded allocation bookkeeping, rather than an idle codec quantum.
+        try std.testing.expect(controller.admitted.host_scratch_bytes >= 3 * 4 * 4 * @sizeOf(f32));
+        try std.testing.expect(controller.admitted.host_scratch_bytes < 4096);
         try std.testing.expect(!fake.run_called);
         cancelled.store(true, .release);
         try std.testing.expectError(error.Cancelled, waiting.await(std.testing.io));
