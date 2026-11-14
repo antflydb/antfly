@@ -3552,6 +3552,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "cdc work permit ",
             "metadata proposal receipt ",
             "metadata reconciliation plan uses one terminal receipt for ordered apply",
+            "metadata reconciliation sequential plans fence rejection proofs after a transition",
             "metadata reconciliation never appends an ordinary placement after hidden BEGIN races preflight",
             "table workflow cancellation stops before reconciliation lease work",
             "table workflow can drive real metadata service topology and split setup",
@@ -3592,6 +3593,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_metadata_service_tests = addFilteredTestRunArtifact(b, lib_metadata_service_tests);
     const lib_metadata_service_test_step = b.step("antfly-metadata-service-test", "Run metadata service/control-loop integration tests");
     lib_metadata_service_test_step.dependOn(&run_lib_metadata_service_tests.step);
+
+    const metadata_admission_proof_tests = b.addTest(.{
+        .name = "metadata-admission-proof-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{
+            "metadata reconciliation sequential plans fence rejection proofs after a transition",
+            "metadata mutation non-admission classification excludes ambiguous authority failures",
+            "metadata http server maps source split merge doc identity conflicts",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-admission-proof-test", "Verify compound metadata proposal outcomes and HTTP replay proofs")
+        .dependOn(&addFilteredTestRunArtifact(b, metadata_admission_proof_tests).step);
 
     const cypher_status_protocol_tests = b.addTest(.{
         .root_module = antfly_test_mod,
