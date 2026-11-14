@@ -77,6 +77,8 @@ pub const global_kind: u8 = 0x5e;
 pub const subscription_family: u8 = 0x01;
 pub const impact_family: u8 = 0x02;
 pub const debounce_family: u8 = 0x03;
+/// Per-spec pivot vectors for cosine `similar` subscriptions (append-only).
+pub const pivot_family: u8 = 0x06;
 
 pub const max_reasons: usize = 8;
 pub const default_retain_versions: u32 = 16;
@@ -171,6 +173,92 @@ pub fn subscriptionTuplePrefix(spec: Digest, tuple: Digest) [4 + 64]u8 {
     @memcpy(out[4..36], &spec);
     @memcpy(out[36..68], &tuple);
     return out;
+}
+
+pub fn pivotKey(spec: Digest) [4 + 32]u8 {
+    var out: [4 + 32]u8 = undefined;
+    @memcpy(out[0..4], &familyPrefix(pivot_family));
+    @memcpy(out[4..36], &spec);
+    return out;
+}
+
+/// Pivots of `spec` (`u32` dims, then each pivot as little-endian `f32`s).
+pub fn loadPivotsAlloc(a: Allocator, reader: Reader, plan: ?*const Plan, spec: Digest) ![]const []const f32 {
+    const key = pivotKey(spec);
+    var owned: ?[]u8 = null;
+    defer if (owned) |raw| a.free(raw);
+    const raw: []const u8 = blk: {
+        if (plan) |p| switch (p.pending(&key)) {
+            .put => |v| break :blk v,
+            .deleted => return &.{},
+            .untouched => {},
+        };
+        owned = (try reader.get(a, &key)) orelse return &.{};
+        break :blk owned.?;
+    };
+    if (raw.len < 4) return &.{};
+    const dims = std.mem.readInt(u32, raw[0..4], .little);
+    if (dims == 0 or (raw.len - 4) % (@as(usize, dims) * 4) != 0) return &.{};
+    const count = (raw.len - 4) / (@as(usize, dims) * 4);
+    const out = try a.alloc([]const f32, count);
+    for (out, 0..) |*pivot, i| {
+        const v = try a.alloc(f32, dims);
+        for (v, 0..) |*x, d| x.* = @bitCast(std.mem.readInt(u32, raw[4 + (i * dims + d) * 4 ..][0..4], .little));
+        pivot.* = v;
+    }
+    return out;
+}
+
+fn encodePivotsAlloc(alloc: Allocator, pivots: []const []const f32) ![]u8 {
+    const dims = pivots[0].len;
+    const out = try alloc.alloc(u8, 4 + pivots.len * dims * 4);
+    std.mem.writeInt(u32, out[0..4], @intCast(dims), .little);
+    for (pivots, 0..) |p, i| for (p, 0..) |x, d| std.mem.writeInt(u32, out[4 + (i * dims + d) * 4 ..][0..4], @bitCast(x), .little);
+    return out;
+}
+
+/// Replace pivot carriers with each dependent's pivot-distance blocks. A
+/// dependent with no pivot within its radius contributes its own query as a
+/// new pivot while the spec has fewer than `max_pivots`; pivots never change
+/// once written, so registered blocks stay valid as the set grows. The
+/// returned tuples borrow residual bytes from `tuples`; `arena` owns the rest.
+pub fn expandPivotTuplesAlloc(arena: Allocator, reader: Reader, plan: *Plan, tuples: []const ctx.SubscriptionTuple) ![]const ctx.SubscriptionTuple {
+    var any = false;
+    for (tuples) |t| if (t.pivot != null) {
+        any = true;
+    };
+    if (!any) return tuples;
+    var out = std.ArrayListUnmanaged(ctx.SubscriptionTuple).empty;
+    for (tuples) |t| {
+        const pq = t.pivot orelse {
+            try out.append(arena, t);
+            continue;
+        };
+        var pivots = std.ArrayListUnmanaged([]const f32).empty;
+        try pivots.appendSlice(arena, try loadPivotsAlloc(arena, reader, plan, t.spec));
+        var best: ?usize = null;
+        var best_d: f64 = std.math.inf(f64);
+        for (pivots.items, 0..) |p, j| {
+            if (p.len != pq.unit.len) continue;
+            const d = ctx.pivotDistance(pq.unit, p);
+            if (d < best_d) {
+                best = j;
+                best_d = d;
+            }
+        }
+        const same_dims = pivots.items.len == 0 or pivots.items[0].len == pq.unit.len;
+        if ((best == null or best_d > pq.radius) and pivots.items.len < ctx.max_pivots and same_dims) {
+            try pivots.append(arena, pq.unit);
+            const key = pivotKey(t.spec);
+            try plan.putOwned(try plan.alloc.dupe(u8, &key), try encodePivotsAlloc(plan.alloc, pivots.items));
+            best = pivots.items.len - 1;
+            best_d = 0;
+        }
+        const blocks: []const Digest = if (best) |j| try ctx.pivotBoundTuplesAlloc(arena, t.tuple, j, best_d, pq.radius) else &.{t.tuple};
+        for (blocks) |b| try out.append(arena, .{ .spec = t.spec, .tuple = b, .residual = t.residual });
+    }
+    ctx.sortUniqueTuples(&out);
+    return out.items;
 }
 
 pub fn subscriptionSpecPrefix(spec: Digest) [4 + 32]u8 {
@@ -881,9 +969,12 @@ pub fn planRegister(
     plan: *Plan,
     doc_key: []const u8,
     artifact: []const u8,
-    tuples: []const ctx.SubscriptionTuple,
+    raw_tuples: []const ctx.SubscriptionTuple,
     config_digest: Digest,
 ) !Capture {
+    var pivot_arena = std.heap.ArenaAllocator.init(alloc);
+    defer pivot_arena.deinit();
+    const tuples = try expandPivotTuplesAlloc(pivot_arena.allocator(), reader, plan, raw_tuples);
     const existing = try loadState(alloc, reader, plan, doc_key, artifact);
     const loaded = existing != null;
     // Zero-length default slices make `deinit` safe for a fresh state too.
@@ -970,7 +1061,11 @@ pub const PublishResult = struct {
 /// subscription set with exactly the tuples now bound, and (for a new output
 /// version) append an immutable manifest plus its impact hints while pruning
 /// versions beyond retention.
-pub fn planPublish(alloc: Allocator, reader: Reader, plan: *Plan, doc_key: []const u8, artifact: []const u8, input: PublishInput) !PublishResult {
+pub fn planPublish(alloc: Allocator, reader: Reader, plan: *Plan, doc_key: []const u8, artifact: []const u8, raw_input: PublishInput) !PublishResult {
+    var pivot_arena = std.heap.ArenaAllocator.init(alloc);
+    defer pivot_arena.deinit();
+    var input = raw_input;
+    input.tuples = try expandPivotTuplesAlloc(pivot_arena.allocator(), reader, plan, raw_input.tuples);
     var state = (try loadState(alloc, reader, plan, doc_key, artifact)) orelse return error.DependencyGenerationSuperseded;
     defer state.deinit(alloc);
     if (state.generation != input.capture.generation or
@@ -1475,6 +1570,11 @@ pub fn copyHintsForRange(alloc: Allocator, source: Reader, plan: *Plan, lower: [
                     const entry = (try parseDebounceKeyAlloc(self.alloc, key)) orelse return true;
                     self.alloc.free(entry.artifact);
                     break :blk entry.doc_key;
+                } else if (key.len >= 4 and key[3] == pivot_family) {
+                    // Spec-wide: every destination needs the same pivots.
+                    try self.plan.put(key, value);
+                    self.copied += 1;
+                    return true;
                 } else return true;
             };
             defer self.alloc.free(doc_key);

@@ -246,6 +246,11 @@ pub const Notice = struct {
     /// Further tuples touched by the same row change (range-aware specs
     /// touch a value's ancestor blocks); processed after `tuple` in order.
     more_tuples: []const Digest = &.{},
+    /// `tuple`/`more_tuples` are pivot carriers the dependent must expand
+    /// (it falls back to spec-wide when it cannot).
+    pivot_carriers: bool = false,
+    /// Pivot carriers already expanded into distance blocks (continuations).
+    expanded: bool = false,
 };
 
 pub fn encodeNoticeAlloc(alloc: Allocator, n: Notice) ![]u8 {
@@ -269,7 +274,10 @@ pub fn encodeNoticeAlloc(alloc: Allocator, n: Notice) ![]u8 {
     try ctx.appendJsonString(alloc, &out, n.next_row);
     try out.appendSlice(alloc, ",\"more_tuples\":\"");
     for (n.more_tuples) |t| try out.print(alloc, "{x}", .{&t});
-    try out.appendSlice(alloc, "\"}");
+    try out.appendSlice(alloc, "\"");
+    if (n.pivot_carriers) try out.appendSlice(alloc, ",\"pivot_carriers\":true");
+    if (n.expanded) try out.appendSlice(alloc, ",\"expanded\":true");
+    try out.appendSlice(alloc, "}");
     return try out.toOwnedSlice(alloc);
 }
 
@@ -340,6 +348,8 @@ pub fn decodeNoticeAlloc(alloc: Allocator, raw: []const u8) !DecodedNotice {
             for (list, 0..) |*d, i| _ = std.fmt.hexToBytes(d, v.string[i * 64 ..][0..64]) catch return error.InvalidContextNotice;
             break :blk list;
         },
+        .pivot_carriers = if (o.get("pivot_carriers")) |v| v == .bool and v.bool else false,
+        .expanded = if (o.get("expanded")) |v| v == .bool and v.bool else false,
     } };
 }
 
@@ -466,6 +476,7 @@ fn stage(alloc: Allocator, plan: *store.Plan, binding: SpecBinding, own_table_id
 fn stageMany(alloc: Allocator, plan: *store.Plan, binding: SpecBinding, own_table_id: []const u8, key: []const u8, tuple: Digest, more: []const Digest, change: ctx.ChangeKind, sequence: u64, result: *StageResult, prev_row: []const u8, next_row: []const u8) !void {
     const value = try encodeNoticeAlloc(alloc, .{
         .more_tuples = more,
+        .pivot_carriers = ctx.usesPivots(binding.source),
         .prev_row = prev_row,
         .next_row = next_row,
         .dependent_table_id = binding.dependent_table_id,
@@ -649,13 +660,14 @@ pub fn planApplyNoticeWithSources(
     alloc: Allocator,
     reader: store.Reader,
     plan: *store.Plan,
-    notice: Notice,
+    incoming: Notice,
     now_ms: u64,
     range_lower: []const u8,
     range_upper: []const u8,
     page: usize,
     sources: ?SourceLookup,
 ) !ApplyResult {
+    var notice = incoming;
     var rows_arena = std.heap.ArenaAllocator.init(alloc);
     defer rows_arena.deinit();
     var relevance_ctx: RelevanceContext = undefined;
@@ -672,6 +684,56 @@ pub fn planApplyNoticeWithSources(
         };
         relevance = .{ .ptr = &relevance_ctx, .relevant_fn = RelevanceContext.relevant };
     };
+    // Pivot-indexed `similar`: the source shipped carrier tuples and the
+    // row's vectors; expand them here into the row's distance blocks on this
+    // table's pivots (before and after the change).
+    if (!notice.all and !notice.expanded and notice.pivot_carriers) expand: {
+        const lookup = sources orelse {
+            notice.all = true;
+            break :expand;
+        };
+        const source = lookup.lookup_fn(lookup.ptr, notice.artifact, notice.spec) orelse {
+            notice.all = true;
+            break :expand;
+        };
+        if (!ctx.usesPivots(source)) {
+            notice.all = true;
+            break :expand;
+        }
+        const ra = rows_arena.allocator();
+        if (relevance == null or relevance_ctx.prev_unknown) {
+            // The previous vector is unknown: every subscriber may care.
+            notice.all = true;
+        } else {
+            const pivots = try store.loadPivotsAlloc(ra, reader, null, notice.spec);
+            var expanded = std.ArrayListUnmanaged(Digest).empty;
+            var carriers = std.ArrayListUnmanaged(Digest).empty;
+            try carriers.append(ra, notice.tuple);
+            try carriers.appendSlice(ra, notice.more_tuples);
+            for (carriers.items) |carrier| {
+                try expanded.append(ra, carrier);
+                for ([_]?std.json.Value{ relevance_ctx.prev, relevance_ctx.next }) |row| {
+                    const value = row orelse continue;
+                    const unit = (try ctx.rowUnitVectorAlloc(ra, source, value)) orelse continue;
+                    try ctx.pivotRowTuplesAlloc(ra, &expanded, carrier, pivots, unit);
+                }
+            }
+            std.mem.sort(Digest, expanded.items, {}, struct {
+                fn lt(_: void, l: Digest, r: Digest) bool {
+                    return std.mem.lessThan(u8, &l, &r);
+                }
+            }.lt);
+            var w: usize = 0;
+            for (expanded.items) |d| {
+                if (w != 0 and std.mem.eql(u8, &expanded.items[w - 1], &d)) continue;
+                expanded.items[w] = d;
+                w += 1;
+            }
+            notice.tuple = expanded.items[0];
+            notice.more_tuples = expanded.items[1..w];
+            notice.expanded = true;
+        }
+    }
     var result = ApplyResult{};
     errdefer result.deinit(alloc);
     var pending_continuation: ?[]u8 = null;
@@ -1086,4 +1148,155 @@ test "range-aware notices carry every touched block and page across them" {
     // dependent must be reached.
     for ([_][]const u8{ "d0", "d1", "d2", "d3" }) |d| try testing.expect(reached.contains(d));
     try testing.expect(!reached.contains("d9"));
+}
+
+fn applyAllAlloc(alloc: Allocator, s: *store.MemoryStore, notice_raw: []const u8, sources: ?SourceLookup) !std.StringHashMapUnmanaged(void) {
+    var reached = std.StringHashMapUnmanaged(void).empty;
+    errdefer reached.deinit(alloc);
+    var decoded = try decodeNoticeAlloc(alloc, notice_raw);
+    defer decoded.deinit();
+    var current: ?DecodedNotice = null;
+    defer if (current) |*c| c.deinit();
+    var rounds: usize = 0;
+    while (true) : (rounds += 1) {
+        if (rounds >= 64) return error.TestUnexpectedResult;
+        var p = store.Plan.init(alloc);
+        defer p.deinit();
+        var applied = try planApplyNoticeWithSources(alloc, s.reader(), &p, if (current) |c| c.notice else decoded.notice, 0, "", "", 4, sources);
+        defer applied.deinit(alloc);
+        for (applied.rebuild.items) |t| if (!reached.contains(t.doc_key)) try reached.put(alloc, try alloc.dupe(u8, t.doc_key), {});
+        try s.apply(&p);
+        const cont = applied.continuation orelse break;
+        const next = try decodeNoticeAlloc(alloc, cont);
+        if (current) |*c| c.deinit();
+        current = next;
+    }
+    return reached;
+}
+
+fn freeReached(alloc: Allocator, reached: *std.StringHashMapUnmanaged(void)) void {
+    var it = reached.keyIterator();
+    while (it.next()) |k| alloc.free(k.*);
+    reached.deinit(alloc);
+}
+
+test "token and pivot indexed notices reach only plausible dependents" {
+    const alloc = testing.allocator;
+    const cases = [_]struct { config: []const u8, deps: []const []const u8, row: []const u8, expect: []const bool }{
+        .{
+            .config =
+            \\{"sources":{"m":{"query":{"filter_query":{"field":"body","match":{"$source":"/q"},"operator":"and"}},"fields":["t"],"max_documents":100,"max_candidates":1000,"max_bytes":4096,"overflow":"error"}},
+            \\ "refresh":{"mode":"background","debounce_ms":0}}
+            ,
+            .deps = &.{ "{\"q\":\"solar panels\"}", "{\"q\":\"wind\"}", "{\"q\":\"panels\"}" },
+            .row = "{\"body\":\"new solar panels\",\"t\":\"x\"}",
+            .expect = &.{ true, false, true },
+        },
+        .{
+            .config =
+            \\{"sources":{"n":{"query":{"filter_query":{"field":"vec","similar":{"vector":{"$source":"/v"},"threshold":0.9,"dims":4,"model":"m"}}},"fields":["t"],"max_documents":100,"max_candidates":1000,"max_bytes":4096,"overflow":"error"}},
+            \\ "refresh":{"mode":"background","debounce_ms":0}}
+            ,
+            .deps = &.{ "{\"v\":[1,0,0,0]}", "{\"v\":[0,1,0,0]}", "{\"v\":[0,0,1,0]}", "{\"v\":[0.98,0.2,0,0]}" },
+            .row = "{\"vec\":[0.99,0.1,0,0],\"t\":\"x\"}",
+            .expect = &.{ true, false, false, true },
+        },
+    };
+    for (cases) |case| {
+        var s = store.MemoryStore{ .alloc = alloc };
+        defer s.deinit();
+        var parsed = try ctx.parseStoredJson(alloc, case.config);
+        defer parsed.deinit();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var buf: [16]u8 = undefined;
+        for (case.deps, 0..) |dep, i| {
+            var plan = store.Plan.init(alloc);
+            defer plan.deinit();
+            var bindings = try ctx.bindAlloc(alloc, &parsed, try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), dep, .{}));
+            defer bindings.deinit();
+            const tuples = try bindings.allTuplesAlloc(alloc);
+            defer alloc.free(tuples);
+            _ = try store.planRegister(alloc, s.reader(), &plan, try std.fmt.bufPrint(&buf, "d{d}", .{i}), "x", tuples, parsed.digest());
+            try s.apply(&plan);
+        }
+        var specs = try buildSourceSpecs(alloc, "t", &.{.{ .dependent_table_id = "", .artifact = "x", .stored_json = case.config }});
+        defer specs.deinit();
+        var stage_plan = store.Plan.init(alloc);
+        defer stage_plan.deinit();
+        const staged = try planStageNotices(alloc, s.reader(), &stage_plan, &specs, "t", 1, 0, &.{.{ .key = "row", .next = case.row }}, true);
+        try testing.expectEqual(@as(usize, 1), staged.notices);
+        const Lookup = struct {
+            source: *const ctx.Source,
+            fn get(p: *anyopaque, _: []const u8, _: Digest) ?*const ctx.Source {
+                const self: *@This() = @ptrCast(@alignCast(p));
+                return self.source;
+            }
+        };
+        var lookup = Lookup{ .source = &parsed.sources[0] };
+        var reached = try applyAllAlloc(alloc, &s, stage_plan.puts.items[0].value, .{ .ptr = &lookup, .lookup_fn = Lookup.get });
+        defer freeReached(alloc, &reached);
+        for (case.expect, 0..) |want, i| try testing.expectEqual(want, reached.contains(try std.fmt.bufPrint(&buf, "d{d}", .{i})));
+    }
+}
+
+test "pivot-indexed notices without residual lookup or with an unknown previous vector stay recall-safe" {
+    const alloc = testing.allocator;
+    const config =
+        \\{"sources":{"n":{"query":{"filter_query":{"field":"vec","similar":{"vector":{"$source":"/v"},"threshold":0.95,"dims":2,"model":"m"}}},"fields":["t"],"max_documents":100,"max_candidates":1000,"max_bytes":4096,"overflow":"error"}},
+        \\ "refresh":{"mode":"background","debounce_ms":0}}
+    ;
+    var s = store.MemoryStore{ .alloc = alloc };
+    defer s.deinit();
+    var parsed = try ctx.parseStoredJson(alloc, config);
+    defer parsed.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var plan = store.Plan.init(alloc);
+    defer plan.deinit();
+    var bindings = try ctx.bindAlloc(alloc, &parsed, try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"v\":[0,1]}", .{}));
+    defer bindings.deinit();
+    const tuples = try bindings.allTuplesAlloc(alloc);
+    defer alloc.free(tuples);
+    _ = try store.planRegister(alloc, s.reader(), &plan, "d0", "x", tuples, parsed.digest());
+    try s.apply(&plan);
+    try testing.expectEqual(@as(usize, 1), (try store.loadPivotsAlloc(arena.allocator(), s.reader(), null, parsed.sources[0].specDigest())).len);
+    var raw = try encodeNoticeAlloc(alloc, .{
+        .dependent_table_id = "",
+        .artifact = "x",
+        .source_name = "n",
+        .source_table_id = "t",
+        .key = "row",
+        .spec = parsed.sources[0].specDigest(),
+        .tuple = tuples[0].tuple,
+        .change = .member_changed,
+        .refresh = .{},
+        .sequence = 1,
+        .prev_row = "?",
+        .next_row = "{\"vec\":[1,0]}",
+        .pivot_carriers = true,
+    });
+    defer alloc.free(raw);
+    const Lookup = struct {
+        source: *const ctx.Source,
+        fn get(p: *anyopaque, _: []const u8, _: Digest) ?*const ctx.Source {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            return self.source;
+        }
+    };
+    var lookup = Lookup{ .source = &parsed.sources[0] };
+    // The previous vector may have been next to the dependent's query.
+    var reached = try applyAllAlloc(alloc, &s, raw, .{ .ptr = &lookup, .lookup_fn = Lookup.get });
+    defer freeReached(alloc, &reached);
+    try testing.expect(reached.contains("d0"));
+    // Without the declaration the carriers cannot be expanded: spec-wide.
+    var blind = try applyAllAlloc(alloc, &s, raw, null);
+    defer freeReached(alloc, &blind);
+    try testing.expect(blind.contains("d0"));
+    // Continuations keep their expansion.
+    alloc.free(raw);
+    raw = try encodeNoticeAlloc(alloc, .{ .dependent_table_id = "", .artifact = "x", .source_name = "n", .source_table_id = "t", .key = "row", .spec = @splat(1), .change = .member_changed, .refresh = .{}, .sequence = 1, .expanded = true });
+    var decoded = try decodeNoticeAlloc(alloc, raw);
+    defer decoded.deinit();
+    try testing.expect(decoded.notice.expanded);
 }

@@ -581,8 +581,8 @@ and next values determine exactly which dependents change:
 | --- | --- | --- |
 | `term`, `terms` | yes | equality values form the indexed subscription tuple |
 | `range`, `prefix` | yes | dyadic interval blocks subscribed per dependent, exact residual test at block edges; numeric bounds pushed into the storage scan filter |
-| `match` (filter mode) | yes | residual test with the pinned `antfly.context.simple.v1` analyzer (part of the source identity) |
-| `similar` (threshold) | yes | residual cosine/dot test against a vector stored in a document field; `model` names the embedding space and is part of the source identity |
+| `match` (filter mode) | yes | token-indexed subscriptions, exact residual test with the pinned `antfly.context.simple.v1` analyzer (part of the source identity) |
+| `similar` (threshold) | yes | cosine: pivot-distance blocks, exact residual test; dot: spec-wide tuple filtered per subscriber. The vector is read from a document field; `model` names the embedding space and is part of the source identity |
 | `order_by` top-N | yes | interval blocks from the recorded boundary; relevant only if the row ranks at or above it (ties by key) |
 | `graph`, depth 1-3 | yes | adjacency tuple per visited node plus document tuple per member; generated and field-derived edges with `include_generated` |
 | `_artifacts.<name>` fields and predicates | yes | logical rows include generated artifacts; generated records stage notices |
@@ -608,8 +608,28 @@ every window reaches nobody and a write inside one reaches only dependents
 whose block contains it; the stored residual still decides exactly at the
 block edges. Prefix conjuncts index the prefix's key interval; top-N
 dependents subscribe to `[boundary, max]` (descending) or `[min, boundary]`
-(ascending) once the result is full. Only `match` and `similar` without an
-equality conjunct still share the spec-wide tuple.
+(ascending) once the result is full.
+
+`match` is token-indexed: with `operator: and` every satisfying row contains
+each query token, so a dependent subscribes to one of them (the longest);
+with `or`, to each query token (up to 64, else the spec-wide tuple). A
+changed row touches one tuple per distinct analyzed token of its field.
+
+Cosine `similar` is bucketed by distance to pivots, exactly rather than by
+LSH. For unit vectors `cos(q, x) >= t` means `|x - q| <= r = sqrt(2 - 2t)`,
+so by the triangle inequality every satisfying row lies within `r` of the
+query's distance to any pivot. Pivots are unit vectors stored per spec in the
+dependent table's dependency store, append-only, taken from dependents' own
+queries when no existing pivot is within their radius (at most 8). A
+dependent subscribes to the dyadic cover (fixed-point distance keys) of its
+window around its nearest pivot. The source table ships one carrier tuple per
+equality value with the row's vectors in the notice, and the dependent table
+expands it into the row's distance blocks on every pivot before and after the
+change. A notice that cannot be expanded (unknown previous vector, missing
+declaration) falls back to the spec-wide fan-out. On clustered 256-dimension
+test data this leaves 54%, 100%, and 89% of non-matching rows reaching no
+subscriber at thresholds 0.5, 0.8, and 0.95. `dot` has no norm bound and
+keeps the spec-wide tuple, filtered per subscriber.
 
 Reads push predicates into storage. With a full-text index, string equality
 is served as an index prefilter; otherwise, and for range-only queries, the
@@ -770,9 +790,9 @@ not a decision explanation.
   table's context) and graph selectors (#1635).
 - Fan-out benchmarks (invalidation latency, rebuild latency, producer calls,
   subscription storage, bulk-update work).
-- Token-indexed `match` and LSH-bucketed `similar` subscriptions: without an
-  equality conjunct these still fan out to every dependent of the
-  declaration and are filtered per subscriber.
+- `similar` with `metric: dot` still fans out to every dependent of the
+  declaration (no norm bound to bucket by); declare `cosine` where the
+  embedding space allows it.
 
 ## Full-Text Routing From Enrichments
 

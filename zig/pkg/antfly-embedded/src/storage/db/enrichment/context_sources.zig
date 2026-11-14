@@ -1353,6 +1353,8 @@ pub const Bound = struct {
     residual: []const u8 = "",
     /// `similar`/`search`: query vector from the dependent row.
     query_vector: []const f32 = &.{},
+    /// Cosine `similar` index: pivot query carried with every tuple.
+    pivot: ?PivotQuery = null,
     /// `search`: query text.
     search_text: []const u8 = "",
 };
@@ -1371,7 +1373,7 @@ pub const Bindings = struct {
     pub fn allTuplesAlloc(self: *const Bindings, alloc: Allocator) ![]SubscriptionTuple {
         var list = std.ArrayListUnmanaged(SubscriptionTuple).empty;
         errdefer list.deinit(alloc);
-        for (self.items) |item| for (item.tuples) |tuple| try list.append(alloc, .{ .spec = item.spec, .tuple = tuple, .residual = item.residual });
+        for (self.items) |item| for (item.tuples) |tuple| try list.append(alloc, .{ .spec = item.spec, .tuple = tuple, .residual = item.residual, .pivot = item.pivot });
         sortUniqueTuples(&list);
         return try list.toOwnedSlice(alloc);
     }
@@ -1382,6 +1384,9 @@ pub const SubscriptionTuple = struct {
     tuple: Digest,
     /// Subscription value: the dependent's residual parameters (may be "").
     residual: []const u8 = "",
+    /// Set on a pivot *carrier*: the dependency store replaces it with the
+    /// dependent's pivot-distance blocks (`expandPivotTuplesAlloc`).
+    pivot: ?PivotQuery = null,
 
     pub fn lessThan(_: void, l: SubscriptionTuple, r: SubscriptionTuple) bool {
         return switch (std.mem.order(u8, &l.spec, &r.spec)) {
@@ -1475,7 +1480,12 @@ pub const Block = struct { level: u8, prefix: u64 };
 /// Canonical dyadic cover of `[lo, hi]` with at most `max_interval_blocks`
 /// blocks (coarsened by raising the minimum level when needed).
 pub fn coverBlocks(out: *std.ArrayListUnmanaged(Block), a: Allocator, lo: u64, hi: u64) !void {
-    var floor: u7 = 0;
+    return coverBlocksFloor(out, a, lo, hi, 0);
+}
+
+/// `coverBlocks` using no block finer than `min_floor`.
+fn coverBlocksFloor(out: *std.ArrayListUnmanaged(Block), a: Allocator, lo: u64, hi: u64, min_floor: u7) !void {
+    var floor: u7 = min_floor;
     while (true) : (floor += 1) {
         out.clearRetainingCapacity();
         const l0: u128 = lo >> @intCast(floor);
@@ -1625,6 +1635,203 @@ fn rowIntervalTuplesAlloc(a: Allocator, source: *const Source, bases: []const Di
     return out.items;
 }
 
+// Text and vector residuals are indexed too, with the same recall rule: a
+// dependent's tuples must be touched by every row that could satisfy its
+// predicate, before or after the change.
+//
+// `match` (pinned analyzer): with `and`, every satisfying row contains each
+// query token, so a dependent subscribes to one of them (the longest, which
+// is usually the rarest); with `or`, to each query token (up to
+// `max_match_tuples`, else the root). A row touches one tuple per distinct
+// token of its field plus the root.
+//
+// `similar` (cosine): for unit vectors `cos(q, x) >= t` iff
+// `|x - q| <= r = sqrt(2 - 2t)`, and by the triangle inequality every
+// satisfying row has `|d(x, p) - d(q, p)| <= r` for any pivot `p`. Pivots are
+// unit vectors stored per spec on the dependent side (append-only, taken
+// from dependents' own queries, at most `max_pivots`). A dependent subscribes
+// to the dyadic cover of `[d(q, p) - r, d(q, p) + r]` on its nearest pivot;
+// the source side ships one *carrier* tuple per equality base with the
+// row's vector in the notice, and the dependent side expands it into the
+// row's distance blocks on every pivot. This is exact bucketing, not LSH: no
+// satisfying row is ever missed, and the stored residual still decides.
+// `dot` has no such bound and keeps the spec-wide tuple.
+
+pub const max_match_tuples: usize = 64;
+pub const max_pivots: usize = 8;
+/// Distances in `[0, 2]` map to fixed-point keys with this many fraction bits.
+pub const pivot_fraction_bits: u6 = 15;
+const pivot_key_max: u64 = 2 << pivot_fraction_bits;
+/// Widening for floating-point error in the distance bound.
+const vector_epsilon: f64 = 1e-6;
+
+pub const PivotQuery = struct {
+    /// The dependent's normalized query vector.
+    unit: []const f32,
+    radius: f64,
+};
+
+const IndexKind = enum { equality, interval, ordered, tokens, vector };
+const IndexPlan = struct { kind: IndexKind, conjunct: usize = 0 };
+
+/// Which residual conjunct (if any) a source's subscriptions are indexed by.
+fn indexPlan(source: *const Source) IndexPlan {
+    if (intervalConjunct(source)) |i| return .{ .kind = .interval, .conjunct = i };
+    if (source.order_by != null) return .{ .kind = .ordered };
+    for (source.conjuncts, 0..) |c, i| if (c.op == .match) return .{ .kind = .tokens, .conjunct = i };
+    for (source.conjuncts, 0..) |c, i| if (c.op == .similar and c.similarity.metric == .cosine) return .{ .kind = .vector, .conjunct = i };
+    return .{ .kind = .equality };
+}
+
+fn rootTuple(base: Digest) Digest {
+    return blockTuple(base, 0, .{ .level = root_level, .prefix = 0 });
+}
+
+fn tokenTuple(base: Digest, token: []const u8) Digest {
+    var h = Sha256.init(.{});
+    hashField(&h, "token");
+    h.update(&base);
+    hashField(&h, token);
+    var out: Digest = undefined;
+    h.final(&out);
+    return out;
+}
+
+fn sortDigests(list: []Digest) void {
+    std.mem.sort(Digest, list, {}, struct {
+        fn lt(_: void, l: Digest, r: Digest) bool {
+            return std.mem.lessThan(u8, &l, &r);
+        }
+    }.lt);
+}
+
+fn tokenBoundTuplesAlloc(a: Allocator, bases: []const Digest, tokens: []const []const u8, op: MatchOperator) ![]const Digest {
+    if (tokens.len == 0) return &.{};
+    var out = std.ArrayListUnmanaged(Digest).empty;
+    switch (op) {
+        .@"and" => {
+            var pick = tokens[0];
+            for (tokens[1..]) |t| if (t.len > pick.len) {
+                pick = t;
+            };
+            for (bases) |base| try out.append(a, tokenTuple(base, pick));
+        },
+        .@"or" => for (bases) |base| {
+            if (tokens.len > max_match_tuples) {
+                try out.append(a, rootTuple(base));
+            } else for (tokens) |t| try out.append(a, tokenTuple(base, t));
+        },
+    }
+    sortDigests(out.items);
+    return out.items;
+}
+
+fn rowTokenTuplesAlloc(a: Allocator, c: Conjunct, bases: []const Digest, row: std.json.Value) !?[]Digest {
+    const value = resolveFieldPath(row, c.field) orelse return null;
+    var tokens = std.ArrayListUnmanaged([]const u8).empty;
+    switch (value) {
+        .string => |text| try tokens.appendSlice(a, try tokenizeAlloc(a, text)),
+        .array => |array| for (array.items) |item| if (item == .string) try tokens.appendSlice(a, try tokenizeAlloc(a, item.string)),
+        else => return null,
+    }
+    sortUniqueStrings(&tokens);
+    // No token: the row can satisfy neither `and` nor `or`.
+    if (tokens.items.len == 0) return null;
+    var out = std.ArrayListUnmanaged(Digest).empty;
+    for (bases) |base| {
+        try out.append(a, rootTuple(base));
+        for (tokens.items) |t| {
+            try out.append(a, tokenTuple(base, t));
+            if (out.items.len > max_row_interval_tuples) return error.ContextBudgetExceeded;
+        }
+    }
+    return out.items;
+}
+
+fn unitVectorAlloc(a: Allocator, v: []const f32) !?[]f32 {
+    var norm: f64 = 0;
+    for (v) |x| norm += @as(f64, x) * x;
+    if (v.len == 0 or norm == 0 or !std.math.isFinite(norm)) return null;
+    const inv = 1 / @sqrt(norm);
+    const out = try a.alloc(f32, v.len);
+    for (v, out) |x, *o| o.* = @floatCast(@as(f64, x) * inv);
+    return out;
+}
+
+fn cosineRadius(threshold: f64) f64 {
+    return @sqrt(@max(0, 2 - 2 * threshold));
+}
+
+pub fn pivotDistance(x: []const f32, p: []const f32) f64 {
+    var sum: f64 = 0;
+    for (x, p) |xi, pi| {
+        const d = @as(f64, xi) - pi;
+        sum += d * d;
+    }
+    return @sqrt(sum);
+}
+
+fn pivotKey(d: f64) u64 {
+    const scaled = @floor(@min(@max(d, 0), 2) * @as(f64, @floatFromInt(@as(u64, 1) << pivot_fraction_bits)));
+    return @intFromFloat(scaled);
+}
+
+fn pivotTag(pivot: usize) u8 {
+    return 0xc0 | @as(u8, @intCast(pivot));
+}
+
+/// A dependent's pivot blocks: the cover of its distance window around pivot
+/// `pivot` (the carrier itself when the window spans every distance).
+pub fn pivotBoundTuplesAlloc(a: Allocator, carrier: Digest, pivot: usize, distance: f64, radius: f64) ![]Digest {
+    const widened = radius + vector_epsilon;
+    var out = std.ArrayListUnmanaged(Digest).empty;
+    if (distance - widened <= 0 and distance + widened >= 2) {
+        try out.append(a, carrier);
+        return out.items;
+    }
+    var blocks = std.ArrayListUnmanaged(Block).empty;
+    try coverBlocks(&blocks, a, pivotKey(distance - widened), pivotKey(distance + widened));
+    for (blocks.items) |block| try out.append(a, if (block.level >= root_level) carrier else blockTuple(carrier, pivotTag(pivot), block));
+    return out.items;
+}
+
+/// Row side (applied by the dependent): the carrier plus the row's distance
+/// blocks on every pivot.
+pub fn pivotRowTuplesAlloc(a: Allocator, out: *std.ArrayListUnmanaged(Digest), carrier: Digest, pivots: []const []const f32, unit: []const f32) !void {
+    for (pivots, 0..) |p, j| {
+        if (p.len != unit.len) continue;
+        const k = pivotKey(pivotDistance(unit, p));
+        var level: u8 = 0;
+        while (level < root_level and (pivot_key_max >> @intCast(level)) != 0) : (level += 1) {
+            try out.append(a, blockTuple(carrier, pivotTag(j), .{ .level = level, .prefix = k >> @intCast(level) }));
+        }
+        // The first level whose block covers the whole domain.
+        try out.append(a, blockTuple(carrier, pivotTag(j), .{ .level = level, .prefix = 0 }));
+    }
+}
+
+/// Whether a source's subscriptions are pivot-indexed.
+pub fn usesPivots(source: *const Source) bool {
+    return indexPlan(source).kind == .vector;
+}
+
+/// The normalized vector a pivot-indexed source compares for `row`.
+pub fn rowUnitVectorAlloc(a: Allocator, source: *const Source, row: std.json.Value) !?[]f32 {
+    const plan = indexPlan(source);
+    if (plan.kind != .vector) return null;
+    const c = source.conjuncts[plan.conjunct];
+    const vector = (try vectorAt(a, row, c.field, c.similarity.dims)) orelse return null;
+    return unitVectorAlloc(a, vector);
+}
+
+fn rowVectorTuplesAlloc(a: Allocator, c: Conjunct, bases: []const Digest, row: std.json.Value) !?[]Digest {
+    const vector = (try vectorAt(a, row, c.field, c.similarity.dims)) orelse return null;
+    _ = (try unitVectorAlloc(a, vector)) orelse return null;
+    const out = try a.alloc(Digest, bases.len);
+    for (bases, out) |base, *o| o.* = rootTuple(base);
+    return out;
+}
+
 pub const max_row_interval_tuples: usize = 4096;
 
 fn queryTuple(spec: Digest, values: []const []const u8) Digest {
@@ -1739,6 +1946,9 @@ fn bindQuery(a: Allocator, bound: *Bound, source_doc: std.json.Value) !void {
     var residual = std.ArrayListUnmanaged(u8).empty;
     try residual.appendSlice(a, "{\"c\":[");
     var equality_sets = std.ArrayListUnmanaged([]const []const u8).empty;
+    const plan = indexPlan(source);
+    var index_tokens: []const []const u8 = &.{};
+    var index_vector: ?[]const f32 = null;
     for (source.conjuncts, 0..) |c, j| {
         if (j != 0) try residual.append(a, ',');
         values[j] = &.{};
@@ -1793,6 +2003,7 @@ fn bindQuery(a: Allocator, bound: *Bound, source_doc: std.json.Value) !void {
                 const text = if (v[0] == '"') try literalString(a, v) else "";
                 const tokens = try tokenizeAlloc(a, text);
                 if (tokens.len == 0) bound.unsatisfiable = true;
+                if (plan.kind == .tokens and plan.conjunct == j) index_tokens = tokens;
                 try residual.appendSlice(a, "{\"t\":[");
                 for (tokens, 0..) |t, k| {
                     if (k != 0) try residual.append(a, ',');
@@ -1806,6 +2017,7 @@ fn bindQuery(a: Allocator, bound: *Bound, source_doc: std.json.Value) !void {
                     break :blk &.{};
                 };
                 bound.query_vector = vector;
+                if (plan.kind == .vector and plan.conjunct == j) index_vector = vector;
                 try residual.appendSlice(a, "{\"v\":[");
                 for (vector, 0..) |f, k| {
                     if (k != 0) try residual.append(a, ',');
@@ -1829,7 +2041,18 @@ fn bindQuery(a: Allocator, bound: *Bound, source_doc: std.json.Value) !void {
     h.final(&bound.query_identity);
     if (!bound.unsatisfiable) {
         const bases = try expandTuplesAlloc(a, bound.spec, equality_sets.items, max_set_values);
-        if (intervalConjunct(source)) |j| {
+        if (plan.kind == .tokens) {
+            bound.tuples = try tokenBoundTuplesAlloc(a, bases, index_tokens, source.conjuncts[plan.conjunct].match_operator);
+        } else if (plan.kind == .vector) {
+            // A zero (or missing) query vector has no cosine with anything.
+            if (try unitVectorAlloc(a, index_vector orelse &.{})) |unit| {
+                bound.pivot = .{ .unit = unit, .radius = cosineRadius(source.conjuncts[plan.conjunct].similarity.threshold) };
+                const carriers = try a.alloc(Digest, bases.len);
+                for (bases, carriers) |base, *c| c.* = rootTuple(base);
+                sortDigests(carriers);
+                bound.tuples = carriers;
+            }
+        } else if (intervalConjunct(source)) |j| {
             const c = source.conjuncts[j];
             const interval: Interval = switch (c.op) {
                 .range => blk: {
@@ -2191,8 +2414,15 @@ pub fn rowTuplesAlloc(alloc: Allocator, source: *const Source, spec: Digest, row
         error.ContextBudgetExceeded => return .all,
         else => |e| return e,
     };
-    if (intervalField(source) != null) {
-        const interval = (rowIntervalTuplesAlloc(a, source, expanded, row) catch |err| switch (err) {
+    const plan = indexPlan(source);
+    if (plan.kind != .equality) {
+        const indexed = switch (plan.kind) {
+            .interval, .ordered => rowIntervalTuplesAlloc(a, source, expanded, row),
+            .tokens => rowTokenTuplesAlloc(a, source.conjuncts[plan.conjunct], expanded, row),
+            .vector => rowVectorTuplesAlloc(a, source.conjuncts[plan.conjunct], expanded, row),
+            .equality => unreachable,
+        };
+        const interval = (indexed catch |err| switch (err) {
             error.ContextBudgetExceeded => return .all,
             else => |e| return e,
         }) orelse return .none;
@@ -3030,4 +3260,140 @@ test "dyadic cover is exact and bounded" {
     try coverBlocks(&blocks, alloc, 3, 1 << 40);
     try testing.expect(blocks.items.len <= max_interval_blocks);
     for (blocks.items) |b| try testing.expect(b.level <= 64);
+}
+
+fn anyTupleShared(sub: []const Digest, row: []const Digest) bool {
+    for (sub) |s1| for (row) |r| if (std.mem.eql(u8, &s1, &r)) return true;
+    return false;
+}
+
+test "match subscriptions are token-indexed and never miss a satisfying row" {
+    const alloc = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "and", "or" }) |op| {
+        const raw = try std.fmt.allocPrint(a,
+            \\{{"m":{{"query":{{"filter_query":{{"field":"body","match":{{"$source":"/topic"}},"operator":"{s}"}}}},"fields":["t"]}}}}
+        , .{op});
+        var config = try parsePublicJson(alloc, raw, "");
+        defer config.deinit();
+        const source = &config.sources[0];
+        const spec = source.specDigest();
+        var solar = try bindTest(alloc, &config, "{\"topic\":\"solar panels\"}");
+        defer solar.deinit();
+        var wind = try bindTest(alloc, &config, "{\"topic\":\"wind\"}");
+        defer wind.deinit();
+        const is_and = std.mem.eql(u8, op, "and");
+        try testing.expectEqual(@as(usize, if (is_and) 1 else 2), solar.items[0].tuples.len);
+        for ([_]struct { v: []const u8, solar_and: bool, solar_or: bool, wind: bool }{
+            .{ .v = "{\"body\":\"Cheap SOLAR panels today\"}", .solar_and = true, .solar_or = true, .wind = false },
+            .{ .v = "{\"body\":\"solar only\"}", .solar_and = false, .solar_or = true, .wind = false },
+            .{ .v = "{\"body\":[\"wind farms\",\"and panels\"]}", .solar_and = true, .solar_or = true, .wind = true },
+            .{ .v = "{\"body\":\"tidal\"}", .solar_and = false, .solar_or = false, .wind = false },
+        }) |case| {
+            var row = try rowTuplesAlloc(alloc, source, spec, try parseValue(a, case.v));
+            defer row.deinit(alloc);
+            const tuples: []const Digest = if (row == .tuples) row.tuples else &.{};
+            // `and` subscribes to its longest token ("panels"): a row with that
+            // token is a candidate, the residual decides the rest.
+            try testing.expectEqual(if (is_and) case.solar_and else case.solar_or, anyTupleShared(solar.items[0].tuples, tuples));
+            try testing.expectEqual(case.wind, anyTupleShared(wind.items[0].tuples, tuples));
+            // Recall: whenever the predicate holds, a tuple is shared.
+            if (try rowMatches(alloc, &solar.items[0], try parseValue(a, case.v))) try testing.expect(anyTupleShared(solar.items[0].tuples, tuples));
+        }
+        var missing = try rowTuplesAlloc(alloc, source, spec, try parseValue(a, "{\"body\":42}"));
+        defer missing.deinit(alloc);
+        try testing.expect(missing == .none);
+    }
+}
+
+test "cosine similarity subscriptions bucket by pivot distance with exact recall" {
+    const alloc = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    const dims = 256;
+    // Clustered high-dimensional data, as real embeddings are.
+    var centers: [6][dims]f64 = undefined;
+    for (&centers) |*c| for (c) |*x| {
+        x.* = random.floatNorm(f64);
+    };
+    const Gen = struct {
+        fn near(r: std.Random, c: []const f64, spread: f64, out: []f64) void {
+            for (out, c) |*o, ci| o.* = ci + spread * r.floatNorm(f64);
+        }
+    };
+    for ([_]f64{ 0.5, 0.8, 0.95 }) |threshold| {
+        const raw = try std.fmt.allocPrint(a,
+            \\{{"n":{{"query":{{"filter_query":{{"field":"vec","similar":{{"vector":{{"$source":"/vec"}},"threshold":{d},"dims":{d},"model":"m"}}}}}},"fields":["q"]}}}}
+        , .{ threshold, dims });
+        var config = try parsePublicJson(alloc, raw, "");
+        defer config.deinit();
+        const source = &config.sources[0];
+        const spec = source.specDigest();
+        try testing.expect(usesPivots(source));
+        var pivots = std.ArrayListUnmanaged([]const f32).empty;
+        var pruned: usize = 0;
+        var non_matching: usize = 0;
+        for (0..30) |qi| {
+            var q: [dims]f64 = undefined;
+            Gen.near(random, &centers[qi % centers.len], 0.3, &q);
+            var bound = try bindTest(alloc, &config, try std.json.Stringify.valueAlloc(a, .{ .vec = q }, .{}));
+            defer bound.deinit();
+            const pq = bound.items[0].pivot.?;
+            try testing.expectEqual(@as(usize, 1), bound.items[0].tuples.len);
+            const carrier = bound.items[0].tuples[0];
+            // Store-side choice: nearest pivot, appending while room remains.
+            var best: ?usize = null;
+            var best_d: f64 = 3;
+            for (pivots.items, 0..) |p, j| {
+                const d = pivotDistance(pq.unit, p);
+                if (d < best_d) {
+                    best = j;
+                    best_d = d;
+                }
+            }
+            if ((best == null or best_d > pq.radius) and pivots.items.len < max_pivots) {
+                try pivots.append(a, try a.dupe(f32, pq.unit));
+                best = pivots.items.len - 1;
+                best_d = 0;
+            }
+            const sub = try pivotBoundTuplesAlloc(a, carrier, best.?, best_d, pq.radius);
+            try testing.expect(sub.len <= max_interval_blocks);
+            for (0..30) |ri| {
+                var x: [dims]f64 = undefined;
+                Gen.near(random, &centers[(qi + ri) % centers.len], random.float(f64) * 0.6, &x);
+                const row_value = try parseValue(a, try std.json.Stringify.valueAlloc(a, .{ .vec = x }, .{}));
+                var row = try rowTuplesAlloc(alloc, source, spec, row_value);
+                defer row.deinit(alloc);
+                try testing.expect(row == .tuples and row.tuples.len == 1);
+                var expanded = std.ArrayListUnmanaged(Digest).empty;
+                try expanded.append(a, row.tuples[0]);
+                try pivotRowTuplesAlloc(a, &expanded, row.tuples[0], pivots.items, (try rowUnitVectorAlloc(a, source, row_value)).?);
+                const shared = anyTupleShared(sub, expanded.items);
+                if (try rowMatches(alloc, &bound.items[0], row_value)) {
+                    try testing.expect(shared);
+                } else {
+                    non_matching += 1;
+                    if (!shared) pruned += 1;
+                }
+            }
+        }
+        // Most non-matching rows reach no subscriber at all.
+        try testing.expect(pruned * 2 > non_matching);
+    }
+    // `dot` has no norm bound: spec-wide tuple, filtered per subscriber.
+    var dot = try parsePublicJson(alloc,
+        \\{"n":{"query":{"filter_query":{"field":"vec","similar":{"vector":{"$source":"/vec"},"threshold":0.5,"metric":"dot","dims":2,"model":"m"}}},"fields":["q"]}}
+    , "");
+    defer dot.deinit();
+    try testing.expect(!usesPivots(&dot.sources[0]));
+    var db = try bindTest(alloc, &dot, "{\"vec\":[1,0]}");
+    defer db.deinit();
+    var far = try rowTuplesAlloc(alloc, &dot.sources[0], dot.sources[0].specDigest(), try parseValue(a, "{\"vec\":[-5,3]}"));
+    defer far.deinit(alloc);
+    try testing.expect(anyTupleShared(db.items[0].tuples, far.tuples));
 }

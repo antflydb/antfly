@@ -153887,6 +153887,71 @@ test "db context sources index range-only windows by interval and resolve them w
     }
 }
 
+test "db context sources index match tokens and cosine similarity pivots" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { declaration: []const u8, a: []const u8, b: []const u8, rows: []const u8, only_a: []const u8, both: []const u8, neither: []const u8 }{
+        .{
+            .declaration =
+            \\{"topic":{"query":{"filter_query":{"field":"text","match":{"$source":"/topic"},"operator":"and"}},"fields":["title"],"max_documents":10}}
+            ,
+            .a = "{\"body\":\"hello\",\"topic\":\"solar panels\"}",
+            .b = "{\"body\":\"hello\",\"topic\":\"wind\"}",
+            .rows = "{\"text\":\"solar panels and wind farms\",\"title\":\"t\"}",
+            .only_a = "{\"text\":\"cheap solar panels\",\"title\":\"a\"}",
+            .both = "{\"text\":\"wind or solar panels\",\"title\":\"ab\"}",
+            .neither = "{\"text\":\"tidal power\",\"title\":\"z\"}",
+        },
+        .{
+            .declaration =
+            \\{"near":{"query":{"filter_query":{"field":"vec","similar":{"vector":{"$source":"/q"},"threshold":0.6,"dims":3,"model":"m@1"}}},"fields":["title"],"max_documents":10}}
+            ,
+            .a = "{\"body\":\"hello\",\"q\":[1,0,0]}",
+            .b = "{\"body\":\"hello\",\"q\":[0,1,0]}",
+            .rows = "{\"vec\":[1,1,0],\"title\":\"t\"}",
+            .only_a = "{\"vec\":[1,0.1,0],\"title\":\"a\"}",
+            .both = "{\"vec\":[1,1,0.1],\"title\":\"ab\"}",
+            .neither = "{\"vec\":[0,0,1],\"title\":\"z\"}",
+        },
+    }) |case| {
+        var tmp = try TestDirectory.init("context-sources-token-pivot");
+        defer tmp.cleanup();
+        var producer = GateAssetProducer{};
+        producer.allowAll();
+        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        const declaration = try contextSourcesTestDeclarationAlloc(alloc, case.declaration);
+        defer alloc.free(declaration);
+        try db.addEnrichment(.{ .name = "summary", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}", .context_sources_json = declaration });
+        var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
+        try db.initOptionalEnrichmentRuntime(&config);
+        _ = try db.advanceContextShadowBackfill(64);
+        try db.batch(.{ .writes = &.{
+            .{ .key = "n:0", .value = case.rows },
+            .{ .key = "doc:a", .value = case.a },
+            .{ .key = "doc:b", .value = case.b },
+        }, .sync_level = .write });
+        try contextSourcesTestCatchUp(&db);
+        try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+        try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:b"));
+
+        try db.batch(.{ .writes = &.{.{ .key = "n:1", .value = case.neither }}, .sync_level = .write });
+        try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+        try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:b"));
+        try db.batch(.{ .writes = &.{.{ .key = "n:2", .value = case.only_a }}, .sync_level = .write });
+        try std.testing.expectEqual(context_dependency_store.Freshness.stale, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+        try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:b"));
+        try contextSourcesTestCatchUp(&db);
+        try db.batch(.{ .writes = &.{.{ .key = "n:3", .value = case.both }}, .sync_level = .write });
+        try std.testing.expectEqual(context_dependency_store.Freshness.stale, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+        try std.testing.expectEqual(context_dependency_store.Freshness.stale, try contextSourcesTestFreshness(&db, alloc, "doc:b"));
+        try contextSourcesTestCatchUp(&db);
+        // Moving a member out of a window is a change for that window only.
+        try db.batch(.{ .writes = &.{.{ .key = "n:2", .value = case.neither }}, .sync_level = .write });
+        try std.testing.expectEqual(context_dependency_store.Freshness.stale, try contextSourcesTestFreshness(&db, alloc, "doc:a"));
+        try std.testing.expectEqual(context_dependency_store.Freshness.current, try contextSourcesTestFreshness(&db, alloc, "doc:b"));
+    }
+}
+
 test "db context sources publish snapshot context as unverified with scheduled refresh" {
     const alloc = std.testing.allocator;
     var tmp = try TestDirectory.init("context-sources-snapshot");

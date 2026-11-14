@@ -294,7 +294,8 @@ pub fn resolveAlloc(alloc: Allocator, reader: Reader, bindings: *const ctx.Bindi
         // Graph and ordered sources replace their own tuples after reading.
         if (bound.source.kind == .graph or bound.source.order_by != null) continue;
         const residual = try a.dupe(u8, bound.residual);
-        for (bound.tuples) |t| try tuples.append(a, .{ .spec = bound.spec, .tuple = t, .residual = residual });
+        const pivot: ?ctx.PivotQuery = if (bound.pivot) |p| .{ .unit = try a.dupe(f32, p.unit), .radius = p.radius } else null;
+        for (bound.tuples) |t| try tuples.append(a, .{ .spec = bound.spec, .tuple = t, .residual = residual, .pivot = pivot });
     }
 
     for (bindings.items, 0..) |*bound, i| {
