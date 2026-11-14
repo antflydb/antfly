@@ -48181,6 +48181,20 @@ test "model aware media local source completes paged WAV decoding replay and fin
     defer lib_chunker.types.freeChunks(a, replay);
     try std.testing.expectEqualDeep(first.chunks[0].metadata.?.descriptor.coordinates, replay[0].metadata.?.descriptor.coordinates);
     try std.testing.expectEqual(@as(u64, 1), node.host_caches.local_source_verifications.hash_count.load(.monotonic));
+    // A raised caller ceiling must still obey a smaller node ceiling, and a
+    // deliberately smaller request budget must remain effective too. Exercise
+    // both through production decoding/collectors, without large allocations.
+    request.continuation = null;
+    const working_budget = request.max_working_bytes;
+    const node_budget = node.config.chunking_limits.max_working_bytes;
+    request.max_working_bytes = 1024 * 1024 * 1024;
+    node.config.chunking_limits.max_working_bytes = 1;
+    try std.testing.expectError(error.SharedAdmissionExceeded, node.chunkModelPageDirect(a, io, control, request, target));
+    node.config.chunking_limits.max_working_bytes = node_budget;
+    request.max_working_bytes = 1;
+    try std.testing.expectError(error.SharedAdmissionExceeded, node.chunkModelInputDirect(a, io, control, request, target));
+    try std.testing.expectError(error.SharedAdmissionExceeded, node.replayModelChunkDirect(a, io, control, request, target, first.plan_id, first.source_fingerprint, 0));
+    request.max_working_bytes = working_budget;
     control.content_security_json = "{\"allowed_paths\":[]}";
     try std.testing.expectError(error.PathNotAllowed, node.chunkModelPageDirect(a, io, control, request, target));
     control.content_security_json = policy;
