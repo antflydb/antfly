@@ -1,0 +1,121 @@
+---
+title: GLiDE typed decisions
+description: Serve Fastino GLiDE decision checkpoints through the typed decision API
+---
+
+[GLiDE](https://huggingface.co/fastino/GLiDE-0.4B) is a family of Fastino
+decision models. Given an input and typed questions, a GLiDE checkpoint returns a
+probability for every option of every question from one forward pass per
+question. It reads a 255-way decision readout and generates no text. Antfly serves GLiDE
+checkpoints natively through `/ai/v1/decisions` using the
+model-independent [typed decision contract](../../reference/decisions.md). They
+appear under deciders in model discovery.
+
+## Supported checkpoints
+
+| Checkpoint | Backbone | Prompt length | Longer prompts |
+| --- | --- | --- | --- |
+| `fastino/GLiDE-0.4B` | ModernBERT (Ettin) encoder, bidirectional | 7,999 tokens | Keeps the first 1,024 tokens and the end (question and options) |
+| `fastino/GLiDE-0.8B` | Qwen3.5 text backbone, non-causal full attention | 40,000 tokens | Rejected with HTTP 413 |
+| `fastino/GLiDE-2B` | Qwen3.5 text backbone (wider), non-causal full attention | 40,000 tokens | Rejected with HTTP 413 |
+
+Antfly recognizes a GLiDE directory from its `decision_config.json` (format 1,
+prompt format `quick-empty-think-medium-v1`) and `readout.safetensors`. The
+backbone in `config.json` must match the declared backbone. Download a
+checkpoint into the models directory; no conversion is needed:
+
+```sh
+hf download fastino/GLiDE-0.4B --local-dir ./models/GLiDE-0.4B
+antfly inference decisions ./models --request decision.json --backend metal
+```
+
+Text-only bf16 safetensors checkpoints are supported. NVFP4 checkpoints, looped
+variants and image inputs are rejected. Metal is the qualified backend for every
+checkpoint. GLiDE-0.4B also runs on the native CPU backend; GLiDE-0.8B and
+GLiDE-2B are Metal-only, and loading them on another backend fails instead of
+serving them. The decoder checkpoints run their bf16 projections directly from
+the mapped safetensors, so loading one reserves its weight size once (3.8 GB
+for GLiDE-2B) plus a small allowance for prepared tensors.
+
+GLiDE weights are licensed under the Fastino Community License, not Apache 2.0.
+Commercial use requires displaying "Built with Fastino GLiDE", and production
+commercial use by an entity with more than US$10 million in annual revenue requires
+a separate commercial agreement with Fastino. Read the checkpoint's `LICENSE`
+before deploying.
+
+## Request mapping
+
+GLiDE prompts are built exactly as the reference `glide` package builds them, with
+one prompt per (input, question). Prompt text and token ids are byte-identical to
+the reference. Public questions map to GLiDE options as follows:
+
+| Public question | GLiDE options |
+| --- | --- |
+| `choice` | `choices` in order. `(A) value: description`; a choice without a description renders `(A) value`. |
+| `predicate` | `(A) true: Yes`, `(B) false: No`. `probability` is p(true). |
+| `score` | `levels` in order as options `0`..`n-1`. The level text is `label: description` when both are given and differ, otherwise the label. A label that only repeats its index (`"0"`, `"1"`, ...) shows just the description. |
+
+The answer distribution is a softmax over the question's options of the readout
+logits, scaled by the checkpoint temperature. Answers use the typed decision
+response: `choice` and its probabilities, the expected zero-based `score` and
+labeled probabilities, and the predicate's true `probability`. `confidence` is
+the normalized inverse entropy of the distribution.
+
+Predicates always use the default option text `true: Yes` and `false: No`. The
+reference's own request format can replace that text (for example
+`"criteria": {"true": "Yes, there is a compliance risk", "false": "No compliance risk"}`).
+The public contract has no field for it, so put that wording into the predicate's
+`instructions`. The prompt then differs from a reference request that uses custom
+option text, and so do the probabilities. The reference format also accepts a JSON
+value as the state; to reproduce its prompt, send Python's
+`json.dumps(state, ensure_ascii=False)` rendering as the input string.
+It also accepts instructions given as objects. Embedding options,
+`multi_choice`, choice `examples`, `model_identity` and `long_document`
+windowing are rejected for GLiDE.
+
+## Batching and limits
+
+All prompts of a request (inputs × questions) are tokenized before execution,
+sorted by length and run in right-padded micro-batches of at most 16,384 padded
+tokens (the reference rule). Every micro-batch is admitted against the model's
+memory limits before it runs and is split further when it does not fit. Token
+`usage` counts every prompt's tokens, including the special tokens and
+after truncation.
+
+The public limits still apply: 128 inputs, 64 questions and 2–64 choices or
+levels per request. As for Laya, a configured per-item input token limit
+(`max_input_tokens_per_item`) applies to each rendered prompt, which includes
+the question's instructions and options, after the 0.4B's head and tail
+truncation.
+
+The decoder checkpoints accept prompts up to 40,000 tokens, but each prompt's
+planned workspace must also fit the server's scratch budget. The default budget
+is an eighth of the automatic memory envelope: 768 MiB on a 16 GB Mac and at
+most 1.5 GiB on larger machines. Under the default budget, a single prompt is
+admitted up to about these lengths:
+
+| Checkpoint | 768 MiB (16 GB Mac) | 1.5 GiB |
+| --- | --- | --- |
+| `GLiDE-0.8B` | 6,500 tokens | 11,600 tokens |
+| `GLiDE-2B` | 4,000 tokens | 7,700 tokens |
+
+Longer prompts return `400 MODEL_RESOURCE_LIMIT`. Raise the budget with
+`antfly inference run --scratch-budget-mb <MiB>`; a full 40,000-token prompt
+needs about 8 GiB (0.8B) or 11 GiB (2B). The live-memory check still applies, so
+the machine must also have that memory free.
+
+GLiDE-2B's resident weights also occupy most of the GPU memory domain on a 16 GB
+Mac (4.8 GB by default), which leaves about 0.8 GB for a forward's workspace.
+Longer GLiDE-2B prompts there also need `--backend-budget-mb`, for example
+`--backend-budget-mb 6144 --scratch-budget-mb 2048` for a 5,000-token prompt.
+
+## Validation
+
+Prompt text and token ids are compared byte for byte with captures from the
+reference package. The captures cover all three checkpoints, inputs up to 5,129
+tokens, truncated encoder prompts and whitespace runs. For eight reference requests
+translated to the public contract, Metal answers match the reference's CPU FP32
+probabilities to within 1e-6 (0.4B), 7e-6 (0.8B) and 6e-6 (2B), with the same
+top answer for every question. The 5,129-token GLiDE-2B request was run with
+`--backend-budget-mb 6144 --scratch-budget-mb 2048`; the default 16 GB Mac
+budgets reject it.
