@@ -1380,16 +1380,6 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 .max_tokens = decoded.metadata.value.max_tokens,
                 .source_fingerprint = decoded.metadata.value.source_fingerprint,
             };
-            const ReadCancellation = struct {
-                fn requested(raw: *const anyopaque) bool {
-                    const view: *const http_abi.CancellationView = @ptrCast(@alignCast(raw));
-                    return view.requested();
-                }
-            };
-            const executor_cancellation = inference.server.ExecutorCancellation{
-                .ptr = &context.cancellation,
-                .is_cancelled_fn = ReadCancellation.requested,
-            };
             // The override is an injected test executor with no model catalog.
             // Every production path resolves and enforces the concrete model
             // contract inside this ABI boundary.
@@ -1403,12 +1393,11 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 try validateEncodedReadCapabilities(read_capabilities, encoded_request);
             }
             if (operation == .read_encoded_images_reported and state.read_encoded_images_override == null) {
-                var batch = try state.node.readEncodedImagesReportedDirectWithContext(
+                var batch = try state.node.readEncodedImagesReportedDirectWithControl(
                     alloc,
                     decoded.metadata.value.model,
                     encoded_request,
-                    deadline_ns,
-                    executor_cancellation,
+                    execution_control,
                 );
                 defer batch.deinit(alloc);
                 break :blk try std.json.Stringify.valueAlloc(alloc, batch, .{});
@@ -1416,12 +1405,11 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             const result = if (state.read_encoded_images_override) |handler|
                 try handler.read(alloc, decoded.metadata.value.model, encoded_request)
             else result: {
-                const batch = try state.node.readEncodedImagesReportedDirectWithContext(
+                const batch = try state.node.readEncodedImagesReportedDirectWithControl(
                     alloc,
                     decoded.metadata.value.model,
                     encoded_request,
-                    deadline_ns,
-                    executor_cancellation,
+                    execution_control,
                 );
                 break :result batch.items;
             };

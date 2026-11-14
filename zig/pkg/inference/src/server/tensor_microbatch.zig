@@ -273,6 +273,10 @@ pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task
     if (permit) |borrowed| {
         if (!try borrowed.yieldExecution()) return direct(allocator, ticket);
     }
+    // Queue metadata retains its actual allocation, not a growth quantum of
+    // idle request-local capacity that could block the physical batch's peak.
+    if (@import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(allocator)) |workspace|
+        try workspace.trim();
     const Probe = struct {
         fn canceled(raw: *const anyopaque) bool {
             const active: *const Control = @ptrCast(@alignCast(raw));
@@ -311,8 +315,41 @@ pub fn run(broker: *micro.Broker, allocator: std.mem.Allocator, io: std.Io, task
 fn direct(allocator: std.mem.Allocator, ticket: Ticket) ![]Tensor {
     if (ticket.control) |control| try control.lock(ticket.gate) else platform.sync.lockYielding(ticket.gate);
     defer ticket.gate.unlock();
-    if (ticket.permit) |permit| return permit.runWithControl(ticket.inputs, allocator, ticket.control);
-    return ticket.session.runWithControl(ticket.inputs, allocator, ticket.control);
+    return runSerial(allocator, ticket.session, ticket.permit, ticket.inputs, ticket.control);
+}
+
+/// Called only after choosing physical serial execution. Queued/fused work
+/// uses its own allocator and lease, never a request-local borrowed estimate.
+pub fn runSerial(allocator: std.mem.Allocator, session: session_mod.Session, permit: ?*session_mod.RunPermit, inputs: []const Tensor, control: ?Control) ![]Tensor {
+    if (permit) |owned| return owned.runWithControl(inputs, allocator, control);
+    if (@import("../backends/admitted_allocator.zig").AdmittedAllocator.fromAllocator(allocator)) |workspace| {
+        if (session.backend() == .native and try workspace.canBorrowRun(session, try session.planRun(inputs, null))) {
+            // An encoder and decoder can be distinct native sessions. Bind the
+            // actual callee for this scope, without retaining a temporary sink.
+            const previous = workspace.session;
+            const previous_context = workspace.admission_context;
+            try workspace.bindSession(session.withAdmissionControl(control));
+            defer {
+                workspace.session = previous;
+                workspace.admission_context = previous_context;
+            }
+            var scope = try workspace.admitRun(try session.planRun(inputs, null));
+            defer scope.deinit();
+            return scope.permit.runWithControl(inputs, allocator, control);
+        }
+        if (session.run_admission != null) {
+            // KV/accelerator output leases are distinct from request scratch.
+            // Execute under that owner, transferring only the small container.
+            const work = platform.allocator.concurrentFallback();
+            const outputs = try session.runWithControl(inputs, work, control);
+            errdefer destroy(work, outputs);
+            const result = try allocator.dupe(Tensor, outputs);
+            workspace.trim() catch {};
+            work.free(outputs);
+            return result;
+        }
+    }
+    return session.runWithControl(inputs, allocator, control);
 }
 
 fn execute(_: *anyopaque, items: []const micro.ExecuteItem) void {

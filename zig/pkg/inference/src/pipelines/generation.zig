@@ -990,6 +990,46 @@ pub const GenerationResult = struct {
     }
 };
 
+/// Bounded diagnostics survive failures without retaining prompts or output.
+const GenerationFailureTrace = struct {
+    const Phase = enum { prompt_format, tokenize, multimodal_prepare, runtime_prepare, prefill, decode, text_decode };
+    enabled: bool = false,
+    phase: Phase = .prompt_format,
+    started_ns: u64 = 0,
+    phase_started_ns: u64 = 0,
+    elapsed_ns: [7]u64 = @splat(0),
+    decoded_tokens: usize = 0,
+
+    fn init(enabled: bool) @This() {
+        const now = if (enabled) platform.time.monotonicNs() else 0;
+        return .{ .enabled = enabled, .started_ns = now, .phase_started_ns = now };
+    }
+    fn mark(self: *@This(), phase: Phase) void {
+        if (self.enabled) self.markAt(phase, platform.time.monotonicNs());
+    }
+    fn markAt(self: *@This(), phase: Phase, now: u64) void {
+        self.elapsed_ns[@backingInt(self.phase)] +|= now -| self.phase_started_ns;
+        self.phase = phase;
+        self.phase_started_ns = now;
+    }
+    fn format(self: @This(), buffer: []u8, err: anyerror, now: u64) ![]const u8 {
+        var totals = self.elapsed_ns;
+        totals[@backingInt(self.phase)] +|= now -| self.phase_started_ns;
+        return std.fmt.bufPrint(buffer, "generate_failure error={s} phase={s} total_ms={d} prompt_format_ms={d} tokenize_ms={d} multimodal_prepare_ms={d} runtime_prepare_ms={d} prefill_ms={d} decode_ms={d} text_decode_ms={d} decoded_tokens={d}", .{
+            @errorName(err),                @tagName(self.phase),           (now -| self.started_ns) / std.time.ns_per_ms,
+            totals[0] / std.time.ns_per_ms, totals[1] / std.time.ns_per_ms, totals[2] / std.time.ns_per_ms,
+            totals[3] / std.time.ns_per_ms, totals[4] / std.time.ns_per_ms, totals[5] / std.time.ns_per_ms,
+            totals[6] / std.time.ns_per_ms, self.decoded_tokens,
+        });
+    }
+    fn report(self: @This(), err: anyerror) void {
+        if (!self.enabled) return;
+        var buffer: [640]u8 = undefined;
+        const line = self.format(&buffer, err, platform.time.monotonicNs()) catch return;
+        std.debug.print("{s}\n", .{line});
+    }
+};
+
 pub const GenerationTimingMs = struct {
     prompt_format: u64 = 0,
     tokenize: u64 = 0,
@@ -4226,6 +4266,7 @@ pub const NativeGenerationPipeline = struct {
     /// callers must keep the default so private Gemma4 channel tokens stay hidden.
     return_raw_token_ids: bool = false,
     print_timing: bool = false,
+    failure_trace: ?*GenerationFailureTrace = null,
     model_dir: ?[]const u8 = null,
     artifact_dir: ?[]const u8 = null,
     gguf_projector_path: ?[]const u8 = null,
@@ -5515,6 +5556,23 @@ pub const NativeGenerationPipeline = struct {
         on_token_fn: ?TokenCallback,
         on_token_ctx: ?*anyopaque,
     ) !GenerationResult {
+        var trace = GenerationFailureTrace.init(self.print_timing);
+        const previous = self.failure_trace;
+        self.failure_trace = if (self.print_timing) &trace else null;
+        defer self.failure_trace = previous;
+        return self.generateWithCallbackTraced(messages, config, on_token_fn, on_token_ctx) catch |err| {
+            trace.report(err);
+            return err;
+        };
+    }
+
+    fn generateWithCallbackTraced(
+        self: *NativeGenerationPipeline,
+        messages: []const Message,
+        config: GenerationConfig,
+        on_token_fn: ?TokenCallback,
+        on_token_ctx: ?*anyopaque,
+    ) !GenerationResult {
         try validateKvCachePolicy(config);
         const native_checkpoint = self.checkpoint_prepare != null or self.checkpoint_resume != null;
         if (native_checkpoint and (self.checkpoint_prepare != null and self.checkpoint_resume != null or
@@ -5615,6 +5673,7 @@ pub const NativeGenerationPipeline = struct {
             configPromptOpensGemma4FinalChannel(self.gpt_config, prompt);
         const canonical_prompt = if (self.gpt_config.usesGemma4Channels()) canonicalGemma4Prompt(prompt) else null;
         const formatted_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        if (self.failure_trace) |trace| trace.mark(.tokenize);
 
         var video_bytes: ?[]const u8 = null;
         for (messages) |message| if (message.video_bytes) |bytes| {
@@ -5743,6 +5802,7 @@ pub const NativeGenerationPipeline = struct {
         }
         if (self.execution_control) |control| try control.update(.tokenizing, 1, 1);
         const encoded_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        if (self.failure_trace) |trace| trace.mark(.multimodal_prepare);
 
         var actual_prompt_tokens: usize = 0;
         while (actual_prompt_tokens < encoded_attention_mask.len and encoded_attention_mask[actual_prompt_tokens] != 0) : (actual_prompt_tokens += 1) {}
@@ -6120,6 +6180,7 @@ pub const NativeGenerationPipeline = struct {
         );
 
         const runtime_prepare_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        if (self.failure_trace) |trace| trace.mark(.runtime_prepare);
         if (config.kv_cache_mode == .select_v1) {
             decode_state.selection_protected_spans = config.kv_protected_spans;
         }
@@ -6163,6 +6224,7 @@ pub const NativeGenerationPipeline = struct {
         const runtime_prepared = try self.prepareCompiledGenerationRuntime(runtime_prepare_token_hint);
         debugGenerationStage("prepare compiled generation runtime end prepared={}", .{runtime_prepared});
         const prefill_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        if (self.failure_trace) |trace| trace.mark(.prefill);
         if (runtime_prepared) {
             debugGenerationStage(
                 "prepared compiled generation runtime prompt_token_count={d} token_hint={d}",
@@ -6239,6 +6301,7 @@ pub const NativeGenerationPipeline = struct {
         const prefill_last_hidden = prefill_output.last_hidden;
         const prefill_last_hidden_rows = prefill_output.last_hidden_rows;
         const finished_prefill_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        if (self.failure_trace) |trace| trace.mark(.decode);
         defer if (prefill_last_logits) |logits| allocator.free(logits);
         defer if (prefill_last_hidden) |hidden| self.cb.free(hidden);
         if (config.qwen3vl_parity_logits_path) |path| {
@@ -6776,6 +6839,7 @@ pub const NativeGenerationPipeline = struct {
                     0;
                 var mtp_acceptance_gate_checked = false;
                 while (tokens_generated < max_tokens) {
+                    if (self.failure_trace) |trace| trace.decoded_tokens = tokens_generated;
                     if (self.execution_control) |control| try control.update(.executing, @intCast(tokens_generated), @intCast(max_tokens));
                     const remaining = max_tokens - tokens_generated;
                     const step_k = if (use_gemma4_mtp)
@@ -7136,6 +7200,7 @@ pub const NativeGenerationPipeline = struct {
         }
 
         const text_decode_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        if (self.failure_trace) |trace| trace.mark(.text_decode);
         const text = if (token_table) |*table| try table.decodeTokens(allocator, text_gen_ids) else try self.tokenizer.decode(allocator, text_gen_ids);
         errdefer allocator.free(text);
         const reasoning_text = if (reasoning_gen_token_ids.len > 0) blk: {
@@ -8429,6 +8494,7 @@ pub const NativeGenerationPipeline = struct {
     };
 
     fn noteDecodeProgressNoMicrobatch(self: *NativeGenerationPipeline, tokens_generated: usize) void {
+        if (self.failure_trace) |trace| trace.decoded_tokens = tokens_generated;
         if (self.scheduler) |scheduler| {
             if (self.scheduler_lease) |lease| {
                 scheduler.noteDecodeProgress(lease, tokens_generated);
@@ -8685,6 +8751,7 @@ pub const NativeGenerationPipeline = struct {
         }
 
         while (tokens_generated < max_tokens) {
+            if (self.failure_trace) |trace| trace.decoded_tokens = tokens_generated;
             // One direct-step sample includes a declined device fast path and
             // its fallback, excluding scheduler waits and scheduled dispatch.
             var direct_ns: u64 = 0;
@@ -21155,4 +21222,15 @@ test "image decode admission planning credit follows the fallback image executor
     for ([_]gpt_mod.ModelFamily{ .gemma, .qwen3_vl }) |family| {
         try std.testing.expectEqual(@as(usize, 0), fallbackImagePreparationBytes(.{ .family = family }, null, media));
     }
+}
+
+test "generation failure diagnostics retain active phase and bounded decode progress" {
+    var trace = GenerationFailureTrace{ .enabled = true, .started_ns = 0, .phase_started_ns = 0 };
+    trace.markAt(.prefill, 3 * std.time.ns_per_ms);
+    trace.markAt(.decode, 13 * std.time.ns_per_ms);
+    trace.decoded_tokens = 17;
+    var buffer: [640]u8 = undefined;
+    const line = try trace.format(&buffer, error.Timeout, 20 * std.time.ns_per_ms);
+    for ([_][]const u8{ "error=Timeout", "phase=decode", "total_ms=20", "prompt_format_ms=3", "prefill_ms=10", "decode_ms=7", "decoded_tokens=17" }) |expected|
+        try std.testing.expect(std.mem.indexOf(u8, line, expected) != null);
 }

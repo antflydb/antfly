@@ -45,8 +45,45 @@ pub const AdmittedAllocator = struct {
     const Reservation = struct { next: ?*Reservation, lease: ?memory.AdmissionLease, bytes: usize };
     pub const reservation_overhead = @sizeOf(Reservation);
 
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
     pub fn allocator(self: *@This()) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// Only recognize this exact owner, never an arbitrary wrapping allocator.
+    pub fn fromAllocator(value: std.mem.Allocator) ?*AdmittedAllocator {
+        if (value.vtable != &vtable) return null;
+        return @ptrCast(@alignCast(value.ptr));
+    }
+
+    /// Switch from load-time metadata admission to a loaded session without
+    /// releasing live allocations. Every retained lease must belong to the
+    /// same process ledger; custom rollback ledgers cannot be transferred.
+    pub fn bindSession(self: *@This(), session: sessions.Session) !void {
+        const admission = session.run_admission orelse return error.InvalidAdmissionLeaseReduction;
+        if (self.prepaid_host_bytes != 0 or self.rollback_admission != null or admission.backend_class != .cpu) return error.InvalidAdmissionLeaseReduction;
+        var reservation = self.reservations;
+        while (reservation) |node| : (reservation = node.next) {
+            const lease = node.lease orelse return error.InvalidAdmissionLeaseReduction;
+            if (lease.controller != admission.controller) return error.InvalidAdmissionLeaseReduction;
+        }
+        self.session = session;
+        self.admit = null;
+        self.admission_context = null;
+    }
+
+    /// Only plain CPU scratch can share this allocation ledger. KV outputs,
+    /// foreign domains and custom rollback ledgers retain execution ownership.
+    pub fn canBorrowRun(self: *const @This(), session: sessions.Session, request: sessions.RunRequest) !bool {
+        const admission = session.run_admission orelse return false;
+        if (admission.backend_class != .cpu or self.admit != null or self.rollback_admission != null or self.prepaid_host_bytes != 0) return false;
+        var reservation = self.reservations;
+        while (reservation) |node| : (reservation = node.next) {
+            const lease = node.lease orelse return false;
+            if (lease.controller != admission.controller or lease.retain_backend_class != .cpu) return false;
+        }
+        return (try admission.estimateRequest(request, session.outputInfo())).host_kv_bytes == 0;
     }
 
     pub fn allocationOverhead(alignment: std.mem.Alignment) usize {
@@ -486,4 +523,49 @@ test "admission growth discards recovered slack diagnostics and replaces unknown
     // The current attempt's real policy constraint replaces unknown details.
     try std.testing.expectError(error.ResourceLimitExceeded, session.admitHostPreprocess(20 * 1024));
     try std.testing.expectEqualDeep(memory.AdmissionAmounts.LimitExceeded{ .limit = .host, .requested_bytes = 110 * 1024, .limit_bytes = 100 * 1024 }, failure.snapshot().?);
+}
+
+test "CPU media workspace binds only its own ledger and returns encoder credit before decoding" {
+    const Provider = struct {
+        controller: memory.AdmissionController = .{},
+        fn acquire(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .scratch_limit_bytes = 512 * 1024 }, .{ .host_scratch_bytes = bytes }, false);
+        }
+        fn outputs(_: *anyopaque) []const @import("tensor.zig").TensorInfo {
+            return &.{};
+        }
+    };
+    var provider = Provider{};
+    var other: memory.AdmissionController = .{};
+    var vtable_: sessions.Session.VTable = undefined;
+    vtable_.outputInfo = Provider.outputs;
+    var session = sessions.Session{ .ptr = undefined, .vtable = &vtable_, .run_admission = .{ .controller = &other, .backend_class = .cpu, .limits = .{ .scratch_limit_bytes = 512 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var workspace = AdmittedAllocator{ .backing = std.testing.allocator, .admission_context = &provider, .admit = Provider.acquire, .trim_on_free = true };
+    defer workspace.deinit();
+    const a = workspace.allocator();
+    try std.testing.expect(AdmittedAllocator.fromAllocator(a) == &workspace);
+    try std.testing.expect(AdmittedAllocator.fromAllocator(std.testing.allocator) == null);
+    const metadata = try a.alloc(u8, 128);
+    defer a.free(metadata);
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, workspace.bindSession(session));
+    try std.testing.expect(workspace.admit != null);
+    session.run_admission.?.controller = &provider.controller;
+    try workspace.bindSession(session);
+    var scope = try workspace.admitRun(.{ .workspace_bytes = 256 * 1024, .output_bytes = 0 });
+    defer scope.deinit();
+    const prepaid_total = provider.controller.snapshot().host_scratch_bytes;
+    const output = try a.alloc(u8, 32 * 1024);
+    const transient = try a.alloc(u8, 128 * 1024);
+    // Physical allocations consume the estimate, rather than adding it again.
+    try std.testing.expectEqual(prepaid_total, provider.controller.snapshot().host_scratch_bytes);
+    a.free(transient);
+    scope.deinit();
+    try std.testing.expectEqual(@as(usize, 0), workspace.prepaid_host_bytes);
+    try std.testing.expect(provider.controller.snapshot().host_scratch_bytes < 64 * 1024);
+    @memset(output, 42);
+    for (output) |value| try std.testing.expectEqual(@as(u8, 42), value);
+    a.free(output);
+    try workspace.trim();
+    try std.testing.expect(provider.controller.snapshot().host_scratch_bytes < 4096);
 }
