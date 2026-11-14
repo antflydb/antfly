@@ -4,6 +4,7 @@
 import Foundation
 import Testing
 
+@testable import DictationApp
 @testable import DictationCore
 
 @Test func systemSpeechLanguageUsesSupportedEquivalentAndOrderedPreferences() throws {
@@ -120,4 +121,85 @@ import Testing
   #expect(throws: (any Error).self) {
     try SpeechLanguages.system(preferred: ["zh-Hant-TW"], supported: ["zh_CN"])
   }
+}
+
+@Test func languageContractsResolveCatalogAliasesAndRespectExplicitCapabilities() throws {
+  let json = """
+    {"data":[
+      {"id":"transcribers/whisper","backend_model":"openai/whisper-tiny","executor":"antfly"},
+      {"id":"transcribers/my-speech","backend_model":"openai/whisper-large-v3","executor":"antfly"},
+      {"id":"connections/audio/models/custom","backend_model":"whisper-1","executor":"openai"},
+      {"id":"transcribers/apple","executor":"apple"},
+      {"id":"transcribers/explicit","backend_model":"openai/whisper-tiny","dictation":{"live_preview":false,"recognition_hints":false,"language_format":"bcp47","language_detection":false}},
+      {"id":"transcribers/custom","backend_model":"opaque-model","dictation":{"live_preview":false,"recognition_hints":false,"language_format":"language_code","language_detection":true}},
+      {"id":"transcribers/english","backend_model":"openai/whisper-tiny.en"},
+      {"id":"transcribers/unknown","backend_model":"opaque-model"}
+    ]}
+    """
+  let catalog = try JSONDecoder().decode(ModelCatalog.self, from: Data(json.utf8))
+  for alias in [
+    "whisper", "transcribers/whisper", "my-speech", "transcribers/my-speech",
+    "connections/audio/models/custom",
+  ] {
+    let contract = SpeechLanguageContract(model: catalog.transcriber(alias), requested: alias)
+    #expect(contract.format == .languageCode && contract.detectsLanguage)
+    var preset = Preset(id: "test", name: "Test")
+    preset.model = alias
+    let resolved = try preset.resolvingLanguage(
+      preferred: ["fr-FR"], detectsLanguage: contract.detectsLanguage,
+      whisper: contract.format == .languageCode)
+    #expect(resolved.language == "fr" && preset.language.isEmpty)
+    preset.speechLanguageChoice = .detect
+    #expect(
+      try preset.resolvingLanguage(detectsLanguage: contract.detectsLanguage).language.isEmpty)
+  }
+  let explicit = SpeechLanguageContract(
+    model: catalog.transcriber("explicit"), requested: "explicit")
+  #expect(explicit.format == .bcp47 && !explicit.detectsLanguage)
+  let custom = SpeechLanguageContract(model: catalog.transcriber("custom"), requested: "custom")
+  #expect(custom.format == .languageCode && custom.detectsLanguage)
+  let english = SpeechLanguageContract(model: catalog.transcriber("english"), requested: "english")
+  #expect(english.format == .languageCode && !english.detectsLanguage)
+  for alias in ["apple", "unknown"] {
+    let contract = SpeechLanguageContract(model: catalog.transcriber(alias), requested: alias)
+    #expect(contract.format == .bcp47 && !contract.detectsLanguage)
+  }
+  let legacy = SpeechLanguageContract(model: nil, requested: "transcribers/whisper")
+  #expect(legacy.format == .languageCode && legacy.detectsLanguage)
+  let raw = SpeechLanguageContract(model: nil, requested: "openai/whisper-base")
+  #expect(raw.format == .languageCode && raw.detectsLanguage)
+}
+
+@Test @MainActor func storeLanguageResolutionUsesTheCatalogBehindAliases() async throws {
+  let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: root) }
+  let store = Store(directory: root, registerHotkey: false)
+  store.config.connectionMode = .external
+  let json = """
+    {"data":[
+      {"id":"transcribers/whisper","backend_model":"openai/whisper-tiny"},
+      {"id":"transcribers/private","backend_model":"openai/whisper-large-v3"},
+      {"id":"transcribers/whisper-named-but-not-whisper","backend_model":"other-asr"},
+      {"id":"transcribers/future","backend_model":"openai/whisper-tiny","dictation":{"live_preview":false,"recognition_hints":false,"language_format":"future-format","language_detection":false}}
+    ]}
+    """
+  store.models = try JSONDecoder().decode(ModelCatalog.self, from: Data(json.utf8)).data
+  for alias in ["whisper", "private", "transcribers/private"] {
+    var preset = Preset(id: "alias", name: "Alias")
+    preset.model = alias
+    preset.language = "fr_FR"
+    #expect(try store.resolvedPreset(preset).language == "fr")
+    #expect(store.supportsLanguageDetection(preset))
+    preset.speechLanguageChoice = .detect
+    #expect(try store.resolvedPreset(preset).language.isEmpty)
+  }
+  for alias in ["whisper-named-but-not-whisper", "future"] {
+    var preset = Preset(id: "other", name: "Other")
+    preset.model = alias
+    preset.language = "fr_FR"
+    #expect(try store.resolvedPreset(preset).language == "fr-FR")
+    #expect(!store.supportsLanguageDetection(preset))
+  }
+  await store.prepareToQuit()
 }

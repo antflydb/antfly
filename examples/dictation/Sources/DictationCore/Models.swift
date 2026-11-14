@@ -331,6 +331,7 @@ public struct DiscoveredModel: Decodable, Identifiable, Sendable {
     public var live_preview: Bool
     public var recognition_hints: Bool
     public var language_detection: Bool?
+    public var language_format: String?
     public var readiness_error: String?
     public var native_status: NativeSpeechStatus?
     public var executor: String?
@@ -338,6 +339,7 @@ public struct DiscoveredModel: Decodable, Identifiable, Sendable {
   public var id: String
   public var task: String?
   public var executor: String?
+  public var backend_model: String?
   public var dictation: DictationCapabilities?
   public var availability: String?
   public var executorName: String { executor ?? dictation?.executor ?? "runtime" }

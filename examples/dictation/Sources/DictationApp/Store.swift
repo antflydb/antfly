@@ -1551,18 +1551,20 @@ struct PreparedModelSetup: Sendable {
       processing: processing ?? setupProcessingResolution)
   }
   func supportsLanguageDetection(_ preset: Preset) -> Bool {
-    ModelCatalog(data: models).transcriber(preset.model)?.dictation?.language_detection == true
-      || (config.usesManagedRuntime && preset.model == "transcribers/whisper")
+    SpeechLanguageContract(
+      model: ModelCatalog(data: models).transcriber(preset.model), requested: preset.model
+    ).detectsLanguage
   }
   func resolvedPreset(_ preset: Preset) throws -> Preset {
     let model = ModelCatalog(data: models).transcriber(preset.model)
     let apple = model?.isAppleSpeech == true || preset.model == "transcribers/apple-speech"
+    let language = SpeechLanguageContract(model: model, requested: preset.model)
     return try preset.resolvingLanguage(
       preferred: config.usesManagedRuntime && apple
         ? nativePreferredSpeechLanguages ?? Locale.preferredLanguages : Locale.preferredLanguages,
       supported: config.usesManagedRuntime && apple ? nativeSpeechLanguages : nil,
-      detectsLanguage: supportsLanguageDetection(preset),
-      whisper: preset.model == "transcribers/whisper" || preset.model.hasPrefix("openai/whisper-"))
+      detectsLanguage: language.detectsLanguage,
+      whisper: language.format == .languageCode)
   }
   func speechLanguageLabel(_ code: String, for preset: Preset) -> String {
     let name = SpeechLanguages.name(code)

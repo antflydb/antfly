@@ -744,3 +744,14 @@ words stay separated in mixed-language dictation.
 Cancel and **Use original now** signal the live pipeline before waiting for its
 consumers. Canceling a submission also cancels its independent cleanup worker;
 owned teardown drains recognition, cleanup, and transport work, including on quit.
+
+Language formatting follows the discovered transcriber’s canonical identity and
+`backend_model`, so `whisper`, `transcribers/whisper`, and a custom alias backed by
+`openai/whisper-*` send language codes such as `fr` rather than `fr-FR`. The alias
+itself remains the request model. Apple and unknown engines retain full locale
+identifiers. Explicit `dictation.language_format` (`language_code` or `bcp47`) and
+`dictation.language_detection` override known-model defaults; explicit false for
+detection is respected, and English-only Whisper backends do not infer detection.
+Unknown advertised formats retain the full identifier instead of guessing. These
+fields are optional: existing released catalogs already supply backend identity,
+and older known canonical Whisper identifiers retain compatibility.

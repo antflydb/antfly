@@ -115,3 +115,42 @@ extension Preset {
     return resolved.language
   }
 }
+
+/// Language contracts follow the resolved backend, never the spelling of a
+/// user-defined alias. Optional advertised capabilities override known-model
+/// compatibility rules, including explicit false for detection.
+public struct SpeechLanguageContract: Sendable {
+  public enum Format: String, Sendable {
+    case languageCode = "language_code"
+    case bcp47
+  }
+  public let format: Format
+  public let detectsLanguage: Bool
+
+  public init(model: DiscoveredModel?, requested: String) {
+    let backend = model?.backend_model?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let identifier = backend.flatMap { $0.isEmpty ? nil : $0 } ?? model?.id ?? requested
+    // A real catalog backend takes precedence over the public alias, even if
+    // that alias happens to be named whisper. Unknown backends stay unchanged.
+    let knownWhisper: Bool
+    if backend?.isEmpty == false {
+      knownWhisper = Self.isWhisper(identifier)
+    } else if model?.isAppleSpeech == true {
+      knownWhisper = false
+    } else {
+      knownWhisper = Self.isWhisper(identifier) || identifier == "transcribers/whisper"
+    }
+    if let advertised = model?.dictation?.language_format {
+      format = Format(rawValue: advertised) ?? .bcp47
+    } else {
+      format = knownWhisper ? .languageCode : .bcp47
+    }
+    detectsLanguage =
+      model?.dictation?.language_detection
+      ?? (knownWhisper && !identifier.hasSuffix(".en"))
+  }
+  private static func isWhisper(_ identifier: String) -> Bool {
+    let name = identifier.hasPrefix("openai/") ? String(identifier.dropFirst(7)) : identifier
+    return name == "whisper" || name.hasPrefix("whisper-")
+  }
+}
