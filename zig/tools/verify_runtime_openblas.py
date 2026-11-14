@@ -57,6 +57,11 @@ PROBE = r"""
 const std = @import("std");
 const native = @import("native");
 const linalg = @import("inference_linalg");
+test "native CPU budget honors the explicit worker ceiling even without BLAS" {
+    const raw = std.c.getenv("ANTFLY_INFERENCE_CPU_THREADS") orelse return;
+    const limit = try std.fmt.parseInt(usize, std.mem.span(raw), 10);
+    try std.testing.expect(linalg.pool.cachedCpuCount() <= limit);
+}
 test "concurrent first use publishes one complete BLAS policy" {
     const expected = std.mem.eql(u8, std.mem.span(std.c.getenv("EXPECT_BLAS").?), "true");
     var runtime = std.Io.Threaded.init(std.testing.allocator, .{});

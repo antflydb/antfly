@@ -97,7 +97,9 @@ fn hierarchyLimit(mount: []const u8, root: []const u8, process: []const u8, v2: 
 }
 
 pub fn effective(affinity: usize) usize {
-    if (comptime builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return affinity;
+    // Linux affinity, environment and cgroup quotas have the same contract on
+    // Arm and x86. Architecture must not bypass the process worker ceiling.
+    if (comptime builtin.os.tag != .linux) return affinity;
     var result: usize = @max(1, @min(affinity, 8));
     if (builtin.link_libc) {
         if (std.c.getenv("ANTFLY_INFERENCE_CPU_THREADS")) |raw| {
