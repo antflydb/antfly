@@ -1954,6 +1954,12 @@ test "lite subtree deletion bounds heap across private batches and preserves sna
         var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
         defer docs.close();
         docs.file.page_cache_enabled.store(false, .monotonic);
+        // perf/lwa-txn-overlay: see the matching comment in "lite subtree
+        // deletion rolls back earlier private batches on failure" -- keep
+        // the background idle-flush timer from folding the overlay (and
+        // bumping `commit_sequence` an extra time) during this test's own
+        // run.
+        docs.ride_along_idle_ns = 10 * std.time.ns_per_s;
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const mutations = try arena.allocator().alloc(native.CatalogMutation, count);
@@ -1999,6 +2005,13 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
     var docs = try docstore.Store.createWithOptions(a, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
     defer docs.close();
     docs.file.page_cache_enabled.store(false, .monotonic);
+    // perf/lwa-txn-overlay: long enough that the background idle-flush
+    // timer (`maybeCheckpointRedoLogOnIdleTurn`, woken every
+    // `ride_along_idle_ns`) cannot opportunistically fold the overlay
+    // during this test's own run, which would add an extra, unrelated
+    // `commit_sequence` bump on top of the one this test's own assertions
+    // are about (same pattern as the "ride along" tests use).
+    docs.ride_along_idle_ns = 10 * std.time.ns_per_s;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const mutations = try arena.allocator().alloc(native.CatalogMutation, 2048);
@@ -2010,11 +2023,18 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
     const pinned = docs.file.activeCheckpoint();
     const size = (try docs.file.file.stat(std.testing.io)).size;
     var store = Store.initWithNamespace(a, &docs, "/scope");
-    const before = docs.file.test_page_writes.load(.monotonic);
-    docs.file.test_page_write_fail_after = 30;
+    // perf/lwa-txn-overlay: under the redo log (the default), a deleteTree
+    // batch's mutations divert logically (`appendLogicalMutation`), never
+    // building a real page at all -- `test_page_write_fail_after` (the
+    // page-shaped fault hook) can never fire on this path, so this test
+    // used to exercise nothing under the true default. Switched to
+    // `test_logical_write_fail_after` (added alongside the logical
+    // diversion path itself), which fires mid-batch the same way.
+    const before = docs.file.test_logical_mutations.load(.monotonic);
+    docs.file.test_logical_write_fail_after = 30;
     try std.testing.expectError(error.TestPageWriteFailure, store.storage().deleteTree("/scope"));
-    docs.file.test_page_write_fail_after = null;
-    try std.testing.expect(docs.file.test_page_writes.load(.monotonic) > before);
+    docs.file.test_logical_write_fail_after = null;
+    try std.testing.expect(docs.file.test_logical_mutations.load(.monotonic) > before);
     try std.testing.expectEqual(pinned.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
     try std.testing.expectEqual(size, (try docs.file.file.stat(std.testing.io)).size);
     try std.testing.expect((try docs.checkWithCancel(null)).valid);
