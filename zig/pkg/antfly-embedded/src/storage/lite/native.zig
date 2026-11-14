@@ -15305,7 +15305,22 @@ pub const NativeFile = struct {
         if (value.len == 0) return error.InvalidNativeValueChain;
         const chunk_size = self.maxValuePagePayloadBytes();
         if (chunk_size == 0) return error.InvalidNativePageLength;
-        var batch = PageWriteBatch{ .file = self };
+        // See `PageAllocator.diverting`'s own doc comment: this batch's
+        // pages are the one page-shaped exception a diverting transactional
+        // commit still makes (an external value chain under the inline
+        // threshold, via `writeDocumentValue`/`writeCatalogValue`). Unlike
+        // `ExtentAppender.init`/`writeValueTree` (the >=64 KiB value-tree
+        // path), this standalone batch literal was never threaded with
+        // `page_allocator.diverting` when 4a7817f3dd scoped diversion to
+        // the owning allocator -- it silently kept `diverting`'s `false`
+        // default, so every sub-64-KiB external value always took the
+        // real-pwrite branch regardless of `self.file.redo`, even during an
+        // ordinary diverting commit. That starves the redo log of the
+        // page-shaped bytes `maybeAutoCheckpointRedoLog`'s own 25%-remaining
+        // backstop is supposed to react to, so a write pattern built almost
+        // entirely from such values never opportunistically checkpoints at
+        // all and instead runs straight into the page/storage budget wall.
+        var batch = PageWriteBatch{ .file = self, .diverting = page_allocator.diverting };
         var page = try page_allocator.allocate();
         const root = page;
         var offset: usize = 0;
