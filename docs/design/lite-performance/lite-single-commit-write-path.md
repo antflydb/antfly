@@ -2732,6 +2732,73 @@ full_index writes survive a crash during ride-along merge and
 retirement") now pass as a side effect; the two target tests remain
 among the 13 for the independent reasons above.
 
+**Regression (`perf/lwa-eos-regress`): the ledger-only split above was
+reverted, then restored.** A later pass (085e219bff) switched
+`Store.startMaintenanceAssumeLocked` from
+`retirementNeedsServiceLedgerOnlyWithCancel` back to the full,
+redo-aware `retirementNeedsServiceWithCancel`, reasoning that
+upgrading this function's own lock to `lockStoreExclusive` (closing a
+real, separate TOCTOU race -- this read of `self.file` against a live
+commit's briefly released sync window, `commit_in_sync != 0`) had
+also closed the race that justifies staying ledger-only here. It had
+not: the race `retirementNeedsServiceLedgerOnlyWithCancel`'s own doc
+comment describes is the background `maintenanceLoop`'s *later work*
+racing a still-in-flight redo commit, not this decision read, and
+`lockStoreExclusive` says nothing about what the loop does once
+started. Reverting to the full signal reliably reproduced it again:
+deterministic `EndOfStream`/`OutcomeUnknown` crash-sweep failures,
+including on the sweep's own uncrashed run -- `crash sweep: dense
+native-catalog dimension replacement delete (#1216)` and its
+admit-and-delete sibling, `crash sweep exhaustive: full text
+synchronous visibility`, `crash sweep: full text with non-durable
+commit`. Fixed by reverting `startMaintenanceAssumeLocked` alone back
+to the ledger-only signal (085e219bff's other fix, the
+`lockStoreExclusive` upgrade for both of that commit's call sites, is
+independently correct and stays). New plain, non-sweep regression
+test: "startMaintenanceAssumeLocked stays on the ledger-only
+retirement signal under redo" (`docstore.zig`) -- with a redo log but
+no ledger-level retirement debt at all (no checkpoint fold has ever
+run), overwrites one key enough times to supersede a redo-overlay
+version and asserts the full signal sees "needs service" while the
+ledger-only signal, and `maintenance_started`, do not.
+
+**Not fully closed.** The background-loop/live-redo-commit race
+itself is still undiagnosed. It is also reachable through perfectly
+legitimate *ledger*-level retirement debt, not just the redo-only debt
+this split guards against: with reclamation genuinely due (real
+pages to retire -- the ordinary case once an index delete's own
+scope-removal has run), `retirementNeedsServiceLedgerOnlyWithCancel`
+correctly returns `true` too, the background loop starts the same way
+it always could, and the same class of failure can still surface --
+reproduced directly against `crash sweep: dense native-catalog
+dimension replacement delete (#1216)` even with this fix applied, now
+confined to specific barriers (a real injected crash plus recovery,
+not the sweep's own uncrashed run) rather than to every run
+unconditionally. `crash sweep: dense native-catalog dimension
+replacement admit and delete (#1216)` surfaces a different residual
+symptom the same way (`RepairTransitionConflict`/`IndexRebuilding` on
+an uncrashed run, not `EndOfStream`). Both predate this session's own
+changes -- the identical barrier-0 shape was already reproducible,
+intermittently, on integration before 085e219bff
+(`7965150ff0`, roughly one run in three) -- so this fix restores that
+original, latent failure rate rather than introducing it; it does not
+remove it. The deepest candidate is the delete path's own two-commit
+sequence (`HBCIndex.deleteNativeCatalogScopeForRemoval`'s scope
+removal, then the separate catalog-removal commit
+`persistCatalogExcludingWithAtomicMutation`): the background loop's
+`lockStoreExclusive` only ever excludes it from a commit's own
+briefly released sync window, not from the gap *between* two
+sequential commits belonging to one logical, multi-step operation, so
+a reclaim pass that runs in that gap sees a checkpoint state the
+second commit still depends on. Not confirmed by instrumentation --
+inferred from the two call sites' own documented ordering requirement
+and from `lockStoreExclusive`'s scope, which this session did not
+have the budget to trace further. Revisit together with whichever
+session next touches `perf/lwa-writer-race`'s own territory (the
+write-serialization race this same background-loop/live-commit
+interaction has overlapped since §9.7d's first pass) or the
+multi-commit delete-index sequence directly.
+
 ### 9.7e Transaction isolation and the large-transaction fallback (`perf/lwa-txn-overlay`)
 
 Two gaps in the redo log's transaction model, found via
