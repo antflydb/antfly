@@ -828,7 +828,7 @@ def test_system_catalog_scoped_permissions_and_row_filters(request, fixture_name
         },
     )
     api.put(
-        "/auth/v1/users/reader/row-filters/*?database=tenant&namespace=allowed",
+        "/auth/v1/users/reader/row-filters/*?database=tenant&namespace=allowed&all_tables=true",
         {"term": {"tenant_id": "a"}},
     )
     api.put(
